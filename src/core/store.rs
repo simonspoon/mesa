@@ -72,7 +72,8 @@ const MIGRATIONS: &[&str] = &["
         blocked_by INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         PRIMARY KEY (task_id, blocked_by)
     );
-"];
+",
+    "ALTER TABLE projects ADD COLUMN docs_path TEXT;"];
 
 /// Selects full task rows including the derived `blocked` flag.
 const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
@@ -102,6 +103,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
+        docs_path: row.get(3)?,
     })
 }
 
@@ -111,6 +113,8 @@ pub struct ProjectPatch {
     pub name: Option<String>,
     /// `Some(None)` clears the description.
     pub description: Option<Option<String>>,
+    /// `Some(None)` clears the docs path.
+    pub docs_path: Option<Option<String>>,
 }
 
 /// Fields to change on a task; `None` means leave unchanged.
@@ -153,10 +157,15 @@ impl Store {
 
     // ---- projects ----
 
-    pub fn create_project(&mut self, name: &str, description: Option<&str>) -> Result<Project> {
+    pub fn create_project(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        docs_path: Option<&str>,
+    ) -> Result<Project> {
         self.conn.execute(
-            "INSERT INTO projects (name, description) VALUES (?1, ?2)",
-            (name, description),
+            "INSERT INTO projects (name, description, docs_path) VALUES (?1, ?2, ?3)",
+            (name, description, docs_path),
         )?;
         self.get_project(self.conn.last_insert_rowid())
     }
@@ -164,7 +173,7 @@ impl Store {
     pub fn get_project(&self, id: i64) -> Result<Project> {
         self.conn
             .query_row(
-                "SELECT id, name, description FROM projects WHERE id = ?1",
+                "SELECT id, name, description, docs_path FROM projects WHERE id = ?1",
                 [id],
                 row_to_project,
             )
@@ -179,7 +188,7 @@ impl Store {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, description FROM projects ORDER BY id")?;
+            .prepare("SELECT id, name, description, docs_path FROM projects ORDER BY id")?;
         let rows = stmt.query_map([], row_to_project)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -192,9 +201,12 @@ impl Store {
         if let Some(description) = &patch.description {
             project.description = description.clone();
         }
+        if let Some(docs_path) = &patch.docs_path {
+            project.docs_path = docs_path.clone();
+        }
         self.conn.execute(
-            "UPDATE projects SET name = ?1, description = ?2 WHERE id = ?3",
-            (&project.name, &project.description, id),
+            "UPDATE projects SET name = ?1, description = ?2, docs_path = ?3 WHERE id = ?4",
+            (&project.name, &project.description, &project.docs_path, id),
         )?;
         Ok(project)
     }
@@ -487,7 +499,7 @@ mod tests {
     #[test]
     fn project_crud_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("alpha", Some("first")).unwrap();
+        let p = store.create_project("alpha", Some("first"), None).unwrap();
         assert_eq!(p.name, "alpha");
         assert_eq!(p.description.as_deref(), Some("first"));
 
@@ -500,6 +512,7 @@ mod tests {
                 &ProjectPatch {
                     name: Some("beta".into()),
                     description: Some(None),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -517,9 +530,73 @@ mod tests {
     }
 
     #[test]
+    fn project_docs_path_round_trip_and_clear() {
+        let (mut store, _dir) = temp_store();
+        // set at creation
+        let p = store
+            .create_project("docs", None, Some("/tmp/pm-docs"))
+            .unwrap();
+        assert_eq!(p.docs_path.as_deref(), Some("/tmp/pm-docs"));
+        assert_eq!(store.get_project(p.id).unwrap(), p);
+
+        // unset by default
+        let q = store.create_project("bare", None, None).unwrap();
+        assert_eq!(q.docs_path, None);
+
+        // set via update; other fields untouched
+        let updated = store
+            .update_project(
+                q.id,
+                &ProjectPatch {
+                    docs_path: Some(Some("/elsewhere".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.docs_path.as_deref(), Some("/elsewhere"));
+        assert_eq!(updated.name, "bare");
+
+        // Some(None) clears, matching description semantics
+        let cleared = store
+            .update_project(
+                q.id,
+                &ProjectPatch {
+                    docs_path: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.docs_path, None);
+        assert_eq!(store.get_project(q.id).unwrap(), cleared);
+    }
+
+    #[test]
+    fn migration_2_preserves_v1_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        // Build a v1 database by hand: only the first migration applied.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO projects (name, description) VALUES ('old', 'kept')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "old");
+        assert_eq!(projects[0].description.as_deref(), Some("kept"));
+        assert_eq!(projects[0].docs_path, None);
+    }
+
+    #[test]
     fn task_crud_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let t = store
             .create_task(
                 p.id,
@@ -580,8 +657,8 @@ mod tests {
     #[test]
     fn parent_must_be_in_same_project() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None).unwrap();
-        let p2 = store.create_project("p2", None).unwrap();
+        let p1 = store.create_project("p1", None, None).unwrap();
+        let p2 = store.create_project("p2", None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
 
@@ -623,7 +700,7 @@ mod tests {
     #[test]
     fn delete_task_cascades_subtasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let root = add_task(&mut store, p.id, "root");
         let child = store
             .create_task(p.id, "child", None, Priority::Medium, &[], Some(root.id))
@@ -654,8 +731,8 @@ mod tests {
     #[test]
     fn delete_project_cascades_tasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("doomed", Some("desc")).unwrap();
-        let keep = store.create_project("keeper", None).unwrap();
+        let p = store.create_project("doomed", Some("desc"), None).unwrap();
+        let keep = store.create_project("keeper", None, None).unwrap();
         let t1 = add_task(&mut store, p.id, "one");
         let t2 = store
             .create_task(p.id, "two", None, Priority::Medium, &[], Some(t1.id))
@@ -680,7 +757,7 @@ mod tests {
     #[test]
     fn self_edge_rejected_as_cycle() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
         let err = store.add_dependency(t.id, t.id).unwrap_err();
         assert!(matches!(err, Error::Cycle(_)));
@@ -690,7 +767,7 @@ mod tests {
     #[test]
     fn cycle_rejected_naming_the_edge() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -711,7 +788,7 @@ mod tests {
     #[test]
     fn duplicate_edge_is_idempotent() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let first = store.add_dependency(a.id, b.id).unwrap();
@@ -728,7 +805,7 @@ mod tests {
     #[test]
     fn blocked_is_derived_from_dependency_status() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let task = add_task(&mut store, p.id, "task");
         let dep1 = add_task(&mut store, p.id, "dep1");
         let dep2 = add_task(&mut store, p.id, "dep2");
@@ -776,7 +853,7 @@ mod tests {
     #[test]
     fn unblock_removes_edge_and_missing_edge_is_not_found() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         store.add_dependency(a.id, b.id).unwrap();
@@ -791,7 +868,7 @@ mod tests {
     #[test]
     fn list_blockers_returns_direct_blockers_only() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None).unwrap();
+        let p = store.create_project("p", None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -810,7 +887,7 @@ mod tests {
     #[test]
     fn backup_round_trip() {
         let (mut store, dir) = temp_store();
-        let p = store.create_project("p", Some("kept")).unwrap();
+        let p = store.create_project("p", Some("kept"), None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         store.add_dependency(a.id, b.id).unwrap();

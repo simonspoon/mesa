@@ -74,6 +74,8 @@ pub struct Project {
     pub id: i64,
     pub name: String,
     pub description: Option<String>,
+    /// Filesystem directory holding the project's PM documents, if configured.
+    pub docs_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

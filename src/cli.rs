@@ -98,6 +98,9 @@ EXAMPLES
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
+        /// Directory holding the project's PM documents (need not exist yet)
+        #[arg(long)]
+        docs_path: Option<String>,
     },
     /// List all projects as a bare JSON array
     List,
@@ -109,7 +112,8 @@ EXAMPLES
     /// Update fields on a project; prints the full updated project
     ///
     /// Only the flags you pass change; at least one is required.
-    /// `--description ""` clears the description.
+    /// `--description ""` clears the description; `--docs-path ""` clears
+    /// the docs path.
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
         /// Project id
@@ -120,6 +124,9 @@ EXAMPLES
         /// New description; pass "" to clear it
         #[arg(long, group = "fields")]
         description: Option<String>,
+        /// New docs directory; pass "" to clear it
+        #[arg(long, group = "fields")]
+        docs_path: Option<String>,
     },
     /// Delete a project AND all its tasks (no confirmation)
     ///
@@ -364,8 +371,16 @@ fn execute(command: Command) -> Result<()> {
 fn run_project(cmd: ProjectCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
-        ProjectCmd::Create { name, description } => {
-            print_json(&store.create_project(&name, description.as_deref())?);
+        ProjectCmd::Create {
+            name,
+            description,
+            docs_path,
+        } => {
+            print_json(&store.create_project(
+                &name,
+                description.as_deref(),
+                docs_path.as_deref(),
+            )?);
         }
         ProjectCmd::List => print_json(&store.list_projects()?),
         ProjectCmd::Show { id } => print_json(&store.get_project(id)?),
@@ -373,10 +388,12 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             id,
             name,
             description,
+            docs_path,
         } => {
             let patch = ProjectPatch {
                 name,
                 description: description.map(clear_if_empty),
+                docs_path: docs_path.map(clear_if_empty),
             };
             print_json(&store.update_project(id, &patch)?);
         }

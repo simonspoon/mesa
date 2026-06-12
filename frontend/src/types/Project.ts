@@ -5,4 +5,8 @@ export type Project = {
  * ids are SQLite rowids, well within JS safe-integer range, so they are
  * exported as `number` rather than ts-rs's default `bigint` for i64.
  */
-id: number, name: string, description: string | null, };
+id: number, name: string, description: string | null, 
+/**
+ * Filesystem directory holding the project's PM documents, if configured.
+ */
+docs_path: string | null, };

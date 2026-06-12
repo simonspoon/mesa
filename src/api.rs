@@ -23,7 +23,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::core::{Error, Priority, ProjectPatch, Status, Store, TaskPatch, TaskSummary};
+use crate::core::{Error, Priority, Project, ProjectPatch, Status, Store, TaskPatch, TaskSummary};
 
 /// The Vite build output, embedded into the binary at compile time.
 /// `scripts/build.sh` guarantees `frontend/dist` is built before the release
@@ -67,6 +67,8 @@ fn router(state: AppState) -> Router {
             "/api/projects/{id}",
             get(show_project).patch(update_project).delete(delete_project),
         )
+        .route("/api/projects/{id}/docs", get(list_docs))
+        .route("/api/projects/{id}/docs/{*path}", get(show_doc))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route(
             "/api/tasks/{id}",
@@ -196,6 +198,8 @@ struct ProjectCreate {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    docs_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +208,8 @@ struct ProjectUpdate {
     name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    docs_path: Option<Option<String>>,
 }
 
 async fn list_projects(State(state): State<AppState>) -> ApiResult<Response> {
@@ -217,7 +223,11 @@ async fn create_project(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let project = store.create_project(&body.name, body.description.as_deref())?;
+    let project = store.create_project(
+        &body.name,
+        body.description.as_deref(),
+        body.docs_path.as_deref(),
+    )?;
     Ok((StatusCode::CREATED, Json(project)).into_response())
 }
 
@@ -238,6 +248,7 @@ async fn update_project(
     let patch = ProjectPatch {
         name: body.name,
         description: body.description,
+        docs_path: body.docs_path,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_project(id, &patch)?).into_response())
@@ -250,6 +261,108 @@ async fn delete_project(
     let mut store = state.store.lock().unwrap();
     let (project, tasks) = store.delete_project(id)?;
     Ok(Json(json!({"project": project, "tasks": tasks})).into_response())
+}
+
+// ---- project docs (spec Requirements 4 and 5: read-only viewer routes) ----
+
+/// Resolves the project's docs directory or fails with the Requirement 4
+/// error contract: unset docs_path → 422 validation, missing directory → 404.
+fn docs_root(project: &Project) -> ApiResult<std::path::PathBuf> {
+    let Some(docs_path) = &project.docs_path else {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!("project {} has no docs_path configured", project.id),
+        });
+    };
+    let root = std::path::PathBuf::from(docs_path);
+    if !root.is_dir() {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: format!("docs_path {docs_path} does not exist"),
+        });
+    }
+    Ok(root)
+}
+
+/// Collects files under `dir` recursively as paths relative to `root`,
+/// skipping dot-files and dot-directories (spec Assumption 1).
+fn collect_docs(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_docs(root, &path, out)?;
+        } else if path.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Content-Type by extension; `text/plain` fallback (spec Requirement 5).
+/// Deliberately no `image/svg+xml` or `text/html`: a viewer has no need to
+/// serve script-bearing formats (spec Assumption 2).
+fn doc_content_type(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("md") | Some("markdown") => "text/markdown; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("json") => "application/json",
+        _ => "text/plain; charset=utf-8",
+    }
+}
+
+async fn list_docs(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let project = state.store.lock().unwrap().get_project(id)?;
+    let root = docs_root(&project)?;
+    let mut paths = Vec::new();
+    collect_docs(&root, &root, &mut paths).map_err(Error::Io)?;
+    paths.sort();
+    Ok(Json(paths).into_response())
+}
+
+async fn show_doc(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(i64, String)>,
+) -> ApiResult<Response> {
+    let project = state.store.lock().unwrap().get_project(id)?;
+    let root = docs_root(&project)?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("doc {path} not found"),
+    };
+    // Mechanical confinement (spec Requirement 5): canonicalize both ends
+    // and require the target to sit under the root — rejecting `..`,
+    // absolute paths, and symlinks escaping the docs directory alike.
+    let root = root.canonicalize().map_err(|_| not_found())?;
+    let target = root.join(&path).canonicalize().map_err(|_| not_found())?;
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err(not_found());
+    }
+    let bytes = std::fs::read(&target).map_err(Error::Io)?;
+    Ok((
+        [(header::CONTENT_TYPE, doc_content_type(&path))],
+        bytes,
+    )
+        .into_response())
 }
 
 // ---- tasks ----

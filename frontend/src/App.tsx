@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import './App.css'
-import { ProjectsPage } from './pages/ProjectsPage'
+import { getTask } from './api'
+import { Sidebar } from './components/Sidebar'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
-import { TaskDetailPage } from './pages/TaskDetailPage'
+import { useFetch } from './useFetch'
 
-// Hash-based routing: #/ (projects), #/projects/:id, #/tasks/:id.
+// Hash-based routing: #/ (placeholder), #/projects/:id,
+// #/projects/:id/tasks/:tid (task open in the side panel).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -15,18 +17,44 @@ function useHashPath(): string {
   return path
 }
 
+// Legacy #/tasks/:id links: resolve the task's project, then rewrite the
+// hash into the panel route.
+function LegacyTaskRedirect({ taskId }: { taskId: number }) {
+  const { data: task, error } = useFetch(
+    () => getTask(taskId),
+    `legacy-task-${taskId}`,
+  )
+  useEffect(() => {
+    if (task) {
+      window.location.hash = `#/projects/${task.project_id}/tasks/${task.id}`
+    }
+  }, [task])
+  if (error) return <p className="error">{error}</p>
+  return <p className="muted">Loading…</p>
+}
+
 function App() {
   const path = useHashPath()
-  const projectMatch = /^\/projects\/(\d+)$/.exec(path)
-  const taskMatch = /^\/tasks\/(\d+)$/.exec(path)
+  // Bumped after project create/rename/delete so the sidebar refetches.
+  const [navVersion, setNavVersion] = useState(0)
+
+  const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
+  const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
+  const activeProjectId = projectMatch ? Number(projectMatch[1]) : null
 
   let page
   if (projectMatch) {
-    page = <ProjectTasksPage projectId={Number(projectMatch[1])} />
-  } else if (taskMatch) {
-    page = <TaskDetailPage taskId={Number(taskMatch[1])} />
+    page = (
+      <ProjectTasksPage
+        projectId={Number(projectMatch[1])}
+        taskId={projectMatch[2] ? Number(projectMatch[2]) : null}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (legacyTaskMatch) {
+    page = <LegacyTaskRedirect taskId={Number(legacyTaskMatch[1])} />
   } else {
-    page = <ProjectsPage />
+    page = <p className="muted placeholder">Select a project.</p>
   }
 
   return (
@@ -36,7 +64,10 @@ function App() {
           mesa
         </a>
       </header>
-      <main>{page}</main>
+      <div className="shell-body">
+        <Sidebar activeProjectId={activeProjectId} version={navVersion} />
+        <main>{page}</main>
+      </div>
     </>
   )
 }

@@ -28,7 +28,9 @@ function Card({ task }: { task: TaskSummary }) {
       {...listeners}
       {...attributes}
     >
-      <a href={`#/tasks/${task.id}`}>{task.title}</a>
+      <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
+        {task.title}
+      </a>
       <div>
         <span className="badge">{task.priority}</span>
         {task.blocked && <span className="badge blocked">blocked</span>}

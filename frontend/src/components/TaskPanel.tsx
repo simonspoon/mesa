@@ -7,13 +7,13 @@ import {
   listTasks,
   updateTask,
 } from '../api'
-import { ConfirmDelete } from '../components/ConfirmDelete'
-import { InlineEdit } from '../components/InlineEdit'
+import { parseTags } from '../tags'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
-import { parseTags } from '../tags'
 import { useFetch } from '../useFetch'
-import { TaskRow } from './ProjectTasksPage'
+import { ConfirmDelete } from './ConfirmDelete'
+import { InlineEdit } from './InlineEdit'
+import { TaskRow } from './TaskRow'
 
 const STATUSES: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
@@ -59,7 +59,19 @@ function CreateSubtaskForm({
   )
 }
 
-export function TaskDetailPage({ taskId }: { taskId: number }) {
+/**
+ * Task detail in the right-hand panel. Mutations call `onChanged` so the
+ * project view's list/board refetches alongside the panel's own refetch.
+ */
+export function TaskPanel({
+  taskId,
+  onClose,
+  onChanged,
+}: {
+  taskId: number
+  onClose: () => void
+  onChanged: () => void
+}) {
   const [selectError, setSelectError] = useState<string | null>(null)
   const { data, error, refetch } = useFetch(async () => {
     const task = await getTask(taskId)
@@ -72,17 +84,42 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
     return { task, subtasks, blockers }
   }, `task-${taskId}`)
 
-  if (error) return <p className="error">{error}</p>
-  if (!data) return <p className="muted">Loading…</p>
+  const head = (
+    <p className="panel-head">
+      <button className="panel-close" onClick={onClose}>
+        ✕
+      </button>
+    </p>
+  )
+
+  if (error)
+    return (
+      <>
+        {head}
+        <p className="error">{error}</p>
+      </>
+    )
+  if (!data)
+    return (
+      <>
+        {head}
+        <p className="muted">Loading…</p>
+      </>
+    )
 
   const { task, subtasks, blockers } = data
+
+  function changed() {
+    refetch()
+    onChanged()
+  }
 
   // Status/priority save on change; errors land in the shared slot below.
   function patchSelect(patch: Parameters<typeof updateTask>[1]) {
     updateTask(taskId, patch).then(
       () => {
         setSelectError(null)
-        refetch()
+        changed()
       },
       (e: unknown) => {
         setSelectError(e instanceof Error ? e.message : String(e))
@@ -92,14 +129,12 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
 
   return (
     <>
-      <p>
-        <a href={`#/projects/${task.project_id}`}>← back to project</a>
-      </p>
+      {head}
       <h1>
         #{task.id}{' '}
         <InlineEdit
           value={task.title}
-          onSave={(title) => updateTask(taskId, { title }).then(refetch)}
+          onSave={(title) => updateTask(taskId, { title }).then(changed)}
         />
       </h1>
       <p className="task-controls">
@@ -133,12 +168,17 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
         <InlineEdit
           value={task.tags.join(', ')}
           placeholder="none — click to add"
-          onSave={(t) => updateTask(taskId, { tags: parseTags(t) }).then(refetch)}
+          onSave={(t) =>
+            updateTask(taskId, { tags: parseTags(t) }).then(changed)
+          }
         />
       </p>
       {task.parent_id !== null && (
         <p className="muted">
-          Subtask of <a href={`#/tasks/${task.parent_id}`}>task #{task.parent_id}</a>
+          Subtask of{' '}
+          <a href={`#/projects/${task.project_id}/tasks/${task.parent_id}`}>
+            task #{task.parent_id}
+          </a>
         </p>
       )}
       <p className="description">
@@ -147,7 +187,9 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
           multiline
           placeholder="no description — click to add"
           onSave={(d) =>
-            updateTask(taskId, { description: d === '' ? null : d }).then(refetch)
+            updateTask(taskId, { description: d === '' ? null : d }).then(
+              changed,
+            )
           }
         />
       </p>
@@ -157,7 +199,8 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
           message={`Deletes this task and ${subtasks.length} subtask(s).`}
           onDelete={() =>
             deleteTask(taskId).then(() => {
-              window.location.hash = `#/projects/${task.project_id}`
+              onChanged()
+              onClose()
             })
           }
         />
@@ -167,7 +210,7 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
       <CreateSubtaskForm
         projectId={task.project_id}
         parentId={taskId}
-        onCreated={refetch}
+        onCreated={changed}
       />
       {subtasks.length === 0 ? (
         <p className="muted">None.</p>
@@ -186,7 +229,7 @@ export function TaskDetailPage({ taskId }: { taskId: number }) {
         <ul className="card-list">
           {blockers.map((b) => (
             <li key={b.id}>
-              <a href={`#/tasks/${b.id}`}>
+              <a href={`#/projects/${b.project_id}/tasks/${b.id}`}>
                 #{b.id} {b.title}
               </a>{' '}
               <span className={`badge status-${b.status}`}>{b.status}</span>

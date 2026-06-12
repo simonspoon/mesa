@@ -362,3 +362,121 @@ main {
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* ---- Docs tab ---- */
+
+.docs-path-row {
+  font-size: 0.85rem;
+}
+
+.docs-view {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.doc-tree-pane {
+  flex: none;
+  width: 16rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  clip-path: var(--cut);
+  padding: 0.75rem;
+  overflow-wrap: break-word;
+}
+
+.doc-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.doc-tree .doc-tree {
+  padding-left: 1rem;
+}
+
+.doc-tree summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.doc-tree summary:hover {
+  text-shadow: 0 0 8px var(--cyan-dim);
+}
+
+/* Files read as links, not chunky buttons. */
+.doc-file {
+  background: none;
+  border: none;
+  clip-path: none;
+  padding: 0 0.2rem;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 0.95rem;
+  color: var(--text);
+  text-align: left;
+}
+
+.doc-file:hover:not(:disabled) {
+  background: none;
+  box-shadow: none;
+  text-shadow: 0 0 8px var(--cyan);
+  color: var(--cyan);
+}
+
+.doc-file.active {
+  color: var(--cyan);
+  text-shadow: 0 0 8px var(--cyan);
+}
+
+.doc-viewer {
+  flex: 1;
+  min-width: 0;
+}
+
+.doc-plain {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.doc-image {
+  max-width: 100%;
+}
+
+.doc-markdown table {
+  border-collapse: collapse;
+}
+
+.doc-markdown th,
+.doc-markdown td {
+  border: 1px solid var(--border);
+  padding: 0.25rem 0.6rem;
+}
+
+.doc-markdown pre {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  overflow-x: auto;
+}
+
+.doc-markdown pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.doc-markdown blockquote {
+  margin: 0 0 0 0.25rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border-bright);
+  color: var(--muted);
+}
+
+.doc-mermaid {
+  display: block;
+}
+
+.doc-mermaid svg {
+  max-width: 100%;
+}

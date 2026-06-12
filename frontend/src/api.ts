@@ -93,6 +93,40 @@ export function listDependencies(id: number): Promise<Task[]> {
   return request(`/api/tasks/${id}/dependencies`)
 }
 
+/** Sorted file paths (relative to the project's docs_path), recursive. */
+export function listDocs(projectId: number): Promise<string[]> {
+  return request(`/api/projects/${projectId}/docs`)
+}
+
+/** URL of a doc's raw content (used directly as an <img> src). */
+export function docUrl(projectId: number, path: string): string {
+  const encoded = path.split('/').map(encodeURIComponent).join('/')
+  return `/api/projects/${projectId}/docs/${encoded}`
+}
+
+/** Fetches a doc's raw bytes (the docs content route is not JSON). */
+export async function getDoc(
+  projectId: number,
+  path: string,
+): Promise<ArrayBuffer> {
+  const res = await fetch(docUrl(projectId, path))
+  if (!res.ok) {
+    let code = 'http_error'
+    let message = `${res.status} ${res.statusText}`
+    try {
+      const body = (await res.json()) as {
+        error?: { code?: string; message?: string }
+      }
+      if (body.error?.code) code = body.error.code
+      if (body.error?.message) message = body.error.message
+    } catch {
+      // non-JSON error body: keep the HTTP status line as the message
+    }
+    throw new ApiError(code, message, res.status)
+  }
+  return res.arrayBuffer()
+}
+
 // Mutation request shapes. These are inputs to PATCH/POST, not API payload
 // mirrors, so they are hand-written (responses use the generated types).
 // PATCH semantics: an absent field is left unchanged (JSON.stringify drops
@@ -101,6 +135,7 @@ export function listDependencies(id: number): Promise<Task[]> {
 export interface ProjectPatch {
   name?: string
   description?: string | null
+  docs_path?: string | null
 }
 
 export interface TaskCreate {

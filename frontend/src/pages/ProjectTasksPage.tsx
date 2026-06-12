@@ -1,6 +1,15 @@
 import { useState } from 'react'
-import { getProject, listTasks } from '../api'
+import {
+  createTask,
+  deleteProject,
+  getProject,
+  listTasks,
+  updateProject,
+} from '../api'
+import { ConfirmDelete } from '../components/ConfirmDelete'
+import { InlineEdit } from '../components/InlineEdit'
 import { KanbanBoard } from '../KanbanBoard'
+import { parseTags } from '../tags'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import type { TaskSummary } from '../types/TaskSummary'
@@ -25,6 +34,70 @@ export function TaskRow({ task }: { task: TaskSummary }) {
   )
 }
 
+function CreateTaskForm({
+  projectId,
+  onCreated,
+}: {
+  projectId: number
+  onCreated: () => void
+}) {
+  const [title, setTitle] = useState('')
+  const [priority, setPriority] = useState<Priority>('medium')
+  const [tags, setTags] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault()
+    createTask({
+      project_id: projectId,
+      title,
+      priority,
+      tags: parseTags(tags),
+    }).then(
+      () => {
+        setTitle('')
+        setPriority('medium')
+        setTags('')
+        setError(null)
+        onCreated()
+      },
+      (err: unknown) => {
+        setError(err instanceof Error ? err.message : String(err))
+      },
+    )
+  }
+
+  return (
+    <form className="create-form" onSubmit={submit}>
+      <input
+        type="text"
+        value={title}
+        placeholder="new task title"
+        required
+        onChange={(e) => setTitle(e.target.value)}
+      />
+      <select
+        value={priority}
+        onChange={(e) => setPriority(e.target.value as Priority)}
+      >
+        {PRIORITIES.map((p) => (
+          <option key={p} value={p}>
+            {p}
+          </option>
+        ))}
+      </select>
+      <input
+        type="text"
+        value={tags}
+        placeholder="tags, comma-separated"
+        onChange={(e) => setTags(e.target.value)}
+      />
+      <button type="submit">create</button>
+      {error && <span className="error">{error}</span>}
+    </form>
+  )
+}
+
 export function ProjectTasksPage({ projectId }: { projectId: number }) {
   // Status and tag are passed through to the API's query filters; priority
   // is filtered client-side (the API has no priority filter).
@@ -33,10 +106,11 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
   const [tag, setTag] = useState('')
   const [view, setView] = useState<'list' | 'board'>('list')
 
-  const { data: project, error: projectError } = useFetch(
-    () => getProject(projectId),
-    `project-${projectId}`,
-  )
+  const {
+    data: project,
+    error: projectError,
+    refetch: refetchProject,
+  } = useFetch(() => getProject(projectId), `project-${projectId}`)
   // The board always shows every status column, so it fetches unfiltered;
   // the list filters apply only to the list view.
   const { data: tasks, error: tasksError, refetch } = useFetch(
@@ -52,11 +126,22 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
       ? `board-${projectId}`
       : `tasks-${projectId}-${status}-${tag}`,
   )
+  // Unfiltered count for the delete confirmation: the list fetch above may
+  // be filtered, but the cascade destroys every task in the project.
+  const { data: allTasks, refetch: refetchCount } = useFetch(
+    () => listTasks({ project: projectId }),
+    `count-${projectId}`,
+  )
 
   const error = projectError ?? tasksError
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
+
+  function onTasksChanged() {
+    refetch()
+    refetchCount()
+  }
 
   const listView = (
     <>
@@ -116,8 +201,45 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
 
   return (
     <>
-      <h1>{project ? project.name : `Project ${projectId}`}</h1>
-      {project?.description && <p className="muted">{project.description}</p>}
+      <h1>
+        {project ? (
+          <InlineEdit
+            value={project.name}
+            onSave={(name) =>
+              updateProject(projectId, { name }).then(refetchProject)
+            }
+          />
+        ) : (
+          `Project ${projectId}`
+        )}
+      </h1>
+      {project && (
+        <p className="muted">
+          <InlineEdit
+            value={project.description ?? ''}
+            multiline
+            placeholder="no description — click to add"
+            onSave={(d) =>
+              updateProject(projectId, {
+                description: d === '' ? null : d,
+              }).then(refetchProject)
+            }
+          />
+        </p>
+      )}
+      <p>
+        <ConfirmDelete
+          label="delete project"
+          message={`Deletes this project and ${allTasks?.length ?? '?'} task(s).`}
+          onDelete={() =>
+            deleteProject(projectId).then(() => {
+              window.location.hash = '#/'
+            })
+          }
+        />
+      </p>
+
+      <CreateTaskForm projectId={projectId} onCreated={onTasksChanged} />
 
       <div className="tabs">
         <button
@@ -138,7 +260,7 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
         !tasks ? (
           <p className="muted">Loading…</p>
         ) : (
-          <KanbanBoard tasks={tasks} onMoved={refetch} />
+          <KanbanBoard tasks={tasks} onMoved={onTasksChanged} />
         )
       ) : (
         listView

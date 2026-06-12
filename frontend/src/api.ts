@@ -2,6 +2,7 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
+import type { Priority } from './types/Priority'
 import type { Project } from './types/Project'
 import type { Status } from './types/Status'
 import type { Task } from './types/Task'
@@ -16,6 +17,14 @@ export class ApiError extends Error {
     super(message)
     this.code = code
     this.status = status
+  }
+}
+
+function jsonInit(method: string, body: unknown): RequestInit {
+  return {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   }
 }
 
@@ -82,4 +91,70 @@ export function updateTaskStatus(id: number, status: Status): Promise<Task> {
 /** The full task objects `id` is directly blocked by. */
 export function listDependencies(id: number): Promise<Task[]> {
   return request(`/api/tasks/${id}/dependencies`)
+}
+
+// Mutation request shapes. These are inputs to PATCH/POST, not API payload
+// mirrors, so they are hand-written (responses use the generated types).
+// PATCH semantics: an absent field is left unchanged (JSON.stringify drops
+// `undefined`), an explicit `null` clears it.
+
+export interface ProjectPatch {
+  name?: string
+  description?: string | null
+}
+
+export interface TaskCreate {
+  project_id: number
+  title: string
+  description?: string
+  priority?: Priority
+  tags?: string[]
+  parent_id?: number
+}
+
+export interface TaskPatch {
+  title?: string
+  description?: string | null
+  status?: Status
+  priority?: Priority
+  tags?: string[]
+}
+
+export function createProject(
+  name: string,
+  description?: string,
+): Promise<Project> {
+  return request('/api/projects', jsonInit('POST', { name, description }))
+}
+
+export function updateProject(id: number, patch: ProjectPatch): Promise<Project> {
+  return request(`/api/projects/${id}`, jsonInit('PATCH', patch))
+}
+
+/** Returns the destroyed records: the project plus all cascaded tasks. */
+export function deleteProject(
+  id: number,
+): Promise<{ project: Project; tasks: Task[] }> {
+  return request(`/api/projects/${id}`, {
+    method: 'DELETE',
+    // No body, but the server's guard requires JSON Content-Type on all
+    // mutating methods (src/api.rs Requirement 7 middleware).
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+export function createTask(body: TaskCreate): Promise<Task> {
+  return request('/api/tasks', jsonInit('POST', body))
+}
+
+export function updateTask(id: number, patch: TaskPatch): Promise<Task> {
+  return request(`/api/tasks/${id}`, jsonInit('PATCH', patch))
+}
+
+/** Returns the destroyed records: the task plus all cascaded subtasks. */
+export function deleteTask(id: number): Promise<Task[]> {
+  return request(`/api/tasks/${id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+  })
 }

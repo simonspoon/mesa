@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { getProject, listTasks } from '../api'
+import { KanbanBoard } from '../KanbanBoard'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import type { TaskSummary } from '../types/TaskSummary'
@@ -30,19 +31,26 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
   const [status, setStatus] = useState<Status | ''>('')
   const [priority, setPriority] = useState<Priority | ''>('')
   const [tag, setTag] = useState('')
+  const [view, setView] = useState<'list' | 'board'>('list')
 
   const { data: project, error: projectError } = useFetch(
     () => getProject(projectId),
     `project-${projectId}`,
   )
-  const { data: tasks, error: tasksError } = useFetch(
+  // The board always shows every status column, so it fetches unfiltered;
+  // the list filters apply only to the list view.
+  const { data: tasks, error: tasksError, refetch } = useFetch(
     () =>
-      listTasks({
-        project: projectId,
-        status: status === '' ? undefined : status,
-        tag: tag === '' ? undefined : tag,
-      }),
-    `tasks-${projectId}-${status}-${tag}`,
+      view === 'board'
+        ? listTasks({ project: projectId })
+        : listTasks({
+            project: projectId,
+            status: status === '' ? undefined : status,
+            tag: tag === '' ? undefined : tag,
+          }),
+    view === 'board'
+      ? `board-${projectId}`
+      : `tasks-${projectId}-${status}-${tag}`,
   )
 
   const error = projectError ?? tasksError
@@ -50,11 +58,8 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
 
-  return (
+  const listView = (
     <>
-      <h1>{project ? project.name : `Project ${projectId}`}</h1>
-      {project?.description && <p className="muted">{project.description}</p>}
-
       <div className="filters">
         <label>
           Status{' '}
@@ -105,6 +110,38 @@ export function ProjectTasksPage({ projectId }: { projectId: number }) {
             <TaskRow key={t.id} task={t} />
           ))}
         </ul>
+      )}
+    </>
+  )
+
+  return (
+    <>
+      <h1>{project ? project.name : `Project ${projectId}`}</h1>
+      {project?.description && <p className="muted">{project.description}</p>}
+
+      <div className="tabs">
+        <button
+          className={view === 'list' ? 'active' : ''}
+          onClick={() => setView('list')}
+        >
+          List
+        </button>
+        <button
+          className={view === 'board' ? 'active' : ''}
+          onClick={() => setView('board')}
+        >
+          Board
+        </button>
+      </div>
+
+      {view === 'board' ? (
+        !tasks ? (
+          <p className="muted">Loading…</p>
+        ) : (
+          <KanbanBoard tasks={tasks} onMoved={refetch} />
+        )
+      ) : (
+        listView
       )}
     </>
   )

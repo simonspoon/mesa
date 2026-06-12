@@ -19,8 +19,11 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string): Promise<T> {
-  const res = await fetch(path, { headers: { Accept: 'application/json' } })
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    ...init,
+    headers: { Accept: 'application/json', ...init?.headers },
+  })
   if (!res.ok) {
     let code = 'http_error'
     let message = `${res.status} ${res.statusText}`
@@ -65,6 +68,15 @@ export function listTasks(filters: TaskFilters = {}): Promise<TaskSummary[]> {
 
 export function getTask(id: number): Promise<Task> {
   return request(`/api/tasks/${id}`)
+}
+
+/** Moves a task to a new status (kanban drop): PATCH /api/tasks/:id. */
+export function updateTaskStatus(id: number, status: Status): Promise<Task> {
+  return request(`/api/tasks/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  })
 }
 
 /** The full task objects `id` is directly blocked by. */

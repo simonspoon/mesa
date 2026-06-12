@@ -1,20 +1,23 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 /**
  * Runs `load` on mount, whenever `key` changes, and on window focus —
  * agents mutate the DB underneath the UI, so views refetch on refocus
- * (spec Requirement 10).
+ * (spec Requirement 10). `refetch` re-runs `load` without clearing the
+ * current data (used after mutations like a kanban drop).
  */
 export function useFetch<T>(
   load: () => Promise<T>,
   key: string,
-): { data: T | null; error: string | null } {
+): { data: T | null; error: string | null; refetch: () => void } {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
   // `load` closes over per-render state; the ref keeps the latest one
   // without making it an effect dependency (the `key` controls refetching).
   const loadRef = useRef(load)
   loadRef.current = load
+  // Points at the current effect's `run` so `refetch` respects cancellation.
+  const runRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     let cancelled = false
@@ -33,6 +36,7 @@ export function useFetch<T>(
         },
       )
     }
+    runRef.current = run
     run()
     window.addEventListener('focus', run)
     return () => {
@@ -41,5 +45,7 @@ export function useFetch<T>(
     }
   }, [key])
 
-  return { data, error }
+  const refetch = useCallback(() => runRef.current(), [])
+
+  return { data, error, refetch }
 }

@@ -61,7 +61,15 @@ enum Command {
     #[command(subcommand)]
     Task(TaskCmd),
     /// Start the HTTP server and web UI
-    Serve,
+    ///
+    /// Binds 127.0.0.1 only. Requests must carry a Host header of
+    /// localhost:<port> or 127.0.0.1:<port>; mutating requests must set
+    /// Content-Type: application/json.
+    Serve {
+        /// Port to bind on 127.0.0.1
+        #[arg(long, default_value_t = 7770)]
+        port: u16,
+    },
     /// Snapshot the database to a file (safe while the server runs)
     ///
     /// Uses SQLite `VACUUM INTO`, which is safe under WAL mode — unlike
@@ -343,9 +351,7 @@ fn execute(command: Command) -> Result<()> {
     match command {
         Command::Project(cmd) => run_project(cmd),
         Command::Task(cmd) => run_task(cmd),
-        Command::Serve => Err(Error::Validation(
-            "`mesa serve` is not implemented yet".into(),
-        )),
+        Command::Serve { port } => crate::api::serve(port),
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;

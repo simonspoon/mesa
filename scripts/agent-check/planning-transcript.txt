@@ -1,0 +1,65 @@
+ASSISTANT: I'll start with recon on `notes.sh`.
+TOOL_USE(Bash): ls /Users/simonspoon/inaros/projects/tmp-agent-check-yu0qXv
+TOOL_RESULT:  mesa.db
+ notes.sh
+TOOL_USE(Read): /Users/simonspoon/inaros/projects/tmp-agent-check-yu0qXv/notes.sh
+TOOL_RESULT: 1	#!/usr/bin/env bash
+2	# notes.sh — append-only notes. Usage: notes.sh add <text> | notes.sh list
+3	case "${1:-}" in
+4	  add) shift; echo "$*" >> notes.txt ;;
+5	  list) nl -ba notes.txt 2>/dev/null ;;
+6	  *) echo "usage: notes.sh add <text> | notes.sh list" >&2; exit 2 ;;
+7	esac
+8	
+TOOL_USE(Write): /Users/simonspoon/inaros/projects/tmp-agent-check-yu0qXv/pm-docs/specs/2026-06-12-notes-delete-command.md
+TOOL_RESULT: File created successfully at: /Users/simonspoon/inaros/projects/tmp-agent-check-yu0qXv/pm-docs/specs/2026-06-12-notes-delete-command.md (file state is current in your context — no need to Read it back)
+ASSISTANT: Spec written to `pm-docs/specs/2026-06-12-notes-delete-command.md`. Since you asked me to default all open choices, I skipped the question rounds and recorded each default under Assumptions. The key sections, verbatim:
+
+## Goal
+
+`notes.sh delete <n>` removes the note shown at number `<n>` in `notes.sh list` output, so users can prune notes without editing `notes.txt` by hand. After deletion, `list` renumbers naturally (numbers are generated at display time, not stored).
+
+## Non-goals
+
+- Delete by text/pattern match.
+- Deleting multiple notes or ranges in one invocation.
+- Confirmation prompts, undo, or backups of `notes.txt`.
+- GNU/Linux `sed` portability (script targets the macOS environment it lives in).
+- Any restructuring of the existing `add`/`list` code.
+
+## Assumptions
+
+User instructed: "Default any open choices without asking me." Defaults chosen:
+
+- Assuming the command is named `delete` (not `rm`/`remove`) — correct me if wrong.
+- Assuming invalid or out-of-range numbers are an error (exit 1), not a silent no-op — correct me if wrong.
+- Assuming no confirmation prompt before deleting — correct me if wrong.
+- Assuming BSD `sed -i ''` is acceptable since the project lives on macOS; portable temp-file shuffling is unnecessary complexity — correct me if wrong.
+- Assuming blank lines (addable via `notes.sh add` with no text) count as notes, matching what `nl -ba` displays — correct me if wrong.
+
+One mechanics note that made this easy: `list` uses `nl -ba`, which numbers every physical line, so the displayed number is exactly the line number in `notes.txt` — deletion is a one-line `sed` with no renumbering logic. If the assumptions look right, say the word and I'll implement against the spec's verification checks.
+RESULT (success): Spec written to `pm-docs/specs/2026-06-12-notes-delete-command.md`. Since you asked me to default all open choices, I skipped the question rounds and recorded each default under Assumptions. The key sections, verbatim:
+
+## Goal
+
+`notes.sh delete <n>` removes the note shown at number `<n>` in `notes.sh list` output, so users can prune notes without editing `notes.txt` by hand. After deletion, `list` renumbers naturally (numbers are generated at display time, not stored).
+
+## Non-goals
+
+- Delete by text/pattern match.
+- Deleting multiple notes or ranges in one invocation.
+- Confirmation prompts, undo, or backups of `notes.txt`.
+- GNU/Linux `sed` portability (script targets the macOS environment it lives in).
+- Any restructuring of the existing `add`/`list` code.
+
+## Assumptions
+
+User instructed: "Default any open choices without asking me." Defaults chosen:
+
+- Assuming the command is named `delete` (not `rm`/`remove`) — correct me if wrong.
+- Assuming invalid or out-of-range numbers are an error (exit 1), not a silent no-op — correct me if wrong.
+- Assuming no confirmation prompt before deleting — correct me if wrong.
+- Assuming BSD `sed -i ''` is acceptable since the project lives on macOS; portable temp-file shuffling is unnecessary complexity — correct me if wrong.
+- Assuming blank lines (addable via `notes.sh add` with no text) count as notes, matching what `nl -ba` displays — correct me if wrong.
+
+One mechanics note that made this easy: `list` uses `nl -ba`, which numbers every physical line, so the displayed number is exactly the line number in `notes.txt` — deletion is a one-line `sed` with no renumbering logic. If the assumptions look right, say the word and I'll implement against the spec's verification checks.

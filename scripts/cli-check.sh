@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Milestone 3 gate: exercises the mesa CLI JSON contract end to end —
+# create -> list(filtered) -> update -> block -> cycle-rejection -> unblock
+# -> delete -> backup — against a throwaway MESA_DB. Asserts JSON fields
+# (including error.code and the always-present `blocked`) and exit codes 0/1/2.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+
+cargo build --quiet
+MESA=target/debug/mesa
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+export MESA_DB="$TMP/mesa.db"
+
+CHECKS=0
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { CHECKS=$((CHECKS + 1)); echo "ok: $*"; }
+
+# run <expected-exit> <cmd...> — captures STDOUT, STDERR, CODE.
+run() {
+  local expected=$1; shift
+  set +e
+  STDOUT=$("$@" 2>"$TMP/stderr")
+  CODE=$?
+  set -e
+  STDERR=$(cat "$TMP/stderr")
+  [ "$CODE" -eq "$expected" ] ||
+    fail "expected exit $expected, got $CODE: $* (stderr: $STDERR)"
+}
+
+jqs() { jq -r "$1" <<<"$STDOUT"; } # query last stdout
+jqe() { jq -r "$1" <<<"$STDERR"; } # query last stderr
+
+# ---- create ----
+run 0 "$MESA" project create "Website" --description "marketing site"
+[ "$(jqs .name)" = "Website" ] || fail "project create: name"
+[ "$(jqs .description)" = "marketing site" ] || fail "project create: description"
+P=$(jqs .id)
+ok "project create returns full object, exit 0"
+
+run 0 "$MESA" project create "Other"
+P2=$(jqs .id)
+
+run 0 "$MESA" task create --project "$P" "Design layout" --priority high --tags design,web
+T1=$(jqs .id)
+[ "$(jqs .blocked)" = "false" ] || fail "task create: blocked must be present and false"
+[ "$(jqs .status)" = "todo" ] || fail "task create: default status"
+[ "$(jqs .priority)" = "high" ] || fail "task create: priority"
+[ "$(jqs '.tags == ["design","web"]')" = "true" ] || fail "task create: tags"
+ok "task create returns full object with blocked present"
+
+run 0 "$MESA" task create --project "$P" "Write copy" --description "homepage"
+T2=$(jqs .id)
+run 0 "$MESA" task create --project "$P" "Ship it"
+T3=$(jqs .id)
+run 0 "$MESA" task create --project "$P" "Ship subtask" --parent "$T3"
+T4=$(jqs .id)
+[ "$(jqs .parent_id)" = "$T3" ] || fail "task create: parent_id"
+run 0 "$MESA" task create --project "$P2" "Unrelated"
+T5=$(jqs .id)
+ok "task create: subtask and second project"
+
+# validation: unknown project
+run 1 "$MESA" task create --project 9999 "orphan"
+[ "$(jqe .error.code)" = "validation" ] || fail "unknown project: error.code"
+jqe .error.message | grep -q 9999 || fail "unknown project: message names the id"
+ok "create with unknown project: exit 1, code=validation"
+
+# ---- list (filtered) ----
+run 0 "$MESA" task list --project "$P"
+[ "$(jqs type)" = "array" ] || fail "list: must be a bare array"
+[ "$(jqs length)" = "4" ] || fail "list --project: expected 4 tasks"
+[ "$(jqs 'all(.[]; has("blocked"))')" = "true" ] || fail "list: blocked always present"
+[ "$(jqs 'any(.[]; has("description"))')" = "false" ] || fail "list: compact objects must omit description"
+ok "task list --project: bare array, compact, blocked present"
+
+run 0 "$MESA" task list --project "$P" --tag design
+[ "$(jqs length)" = "1" ] || fail "list --tag: expected 1"
+[ "$(jqs '.[0].id')" = "$T1" ] || fail "list --tag: wrong task"
+ok "task list --tag filter"
+
+run 0 "$MESA" task list --status todo
+[ "$(jqs length)" = "5" ] || fail "list --status todo: expected 5"
+ok "task list --status filter"
+
+# ---- update ----
+run 0 "$MESA" task update "$T2" --status in_progress --description "" --tags copy
+[ "$(jqs .status)" = "in_progress" ] || fail "update: status"
+[ "$(jqs .description)" = "null" ] || fail "update: --description \"\" must clear"
+[ "$(jqs '.tags == ["copy"]')" = "true" ] || fail "update: --tags must replace the full set"
+[ "$(jqs .blocked)" = "false" ] || fail "update: blocked present"
+ok "task update: full object, description cleared, tags replaced"
+
+run 0 "$MESA" task list --project "$P" --status in_progress
+[ "$(jqs length)" = "1" ] && [ "$(jqs '.[0].id')" = "$T2" ] || fail "list --status after update"
+ok "task list --status reflects update"
+
+# poka-yoke: update with no fields is a usage error
+run 2 "$MESA" task update "$T1"
+[ "$(jqe .error.code)" = "usage" ] || fail "empty update: error.code"
+ok "task update with no fields: exit 2, code=usage"
+
+# ---- block ----
+run 0 "$MESA" task block "$T3" --on "$T1"
+[ "$(jqs .blocked)" = "true" ] || fail "block: blocked must be true"
+[ "$(jqs .id)" = "$T3" ] || fail "block: returns the blocked task"
+ok "task block: full object with blocked=true"
+
+run 0 "$MESA" task block "$T3" --on "$T1"
+[ "$(jqs .blocked)" = "true" ] || fail "block: idempotent re-add"
+ok "task block: re-adding an existing edge is idempotent"
+
+run 0 "$MESA" task list --project "$P" --unblocked
+[ "$(jqs "any(.[]; .id == $T3)")" = "false" ] || fail "--unblocked: blocked task must be excluded"
+[ "$(jqs "any(.[]; .id == $T1)")" = "true" ] || fail "--unblocked: unblocked task must be included"
+ok "task list --unblocked filter"
+
+# ---- cycle rejection ----
+run 1 "$MESA" task block "$T1" --on "$T3"
+[ "$(jqe .error.code)" = "cycle" ] || fail "cycle: error.code"
+jqe .error.message | grep -q "task $T1" || fail "cycle: message names task $T1"
+jqe .error.message | grep -q "task $T3" || fail "cycle: message names task $T3"
+[ -z "$STDOUT" ] || fail "cycle: nothing on stdout"
+ok "cycle rejection: exit 1, code=cycle, names the edge"
+
+run 1 "$MESA" task block "$T1" --on "$T1"
+[ "$(jqe .error.code)" = "cycle" ] || fail "self-edge: error.code"
+ok "self-edge rejection: exit 1, code=cycle"
+
+# ---- unblock ----
+run 0 "$MESA" task unblock "$T3" --on "$T1"
+[ "$(jqs .blocked)" = "false" ] || fail "unblock: blocked must be false"
+ok "task unblock: full object with blocked=false"
+
+run 1 "$MESA" task unblock "$T3" --on "$T1"
+[ "$(jqe .error.code)" = "not_found" ] || fail "unblock missing edge: error.code"
+ok "unblock non-existent edge: exit 1, code=not_found"
+
+# ---- show / not_found / usage ----
+run 0 "$MESA" task show "$T2"
+[ "$(jqs .description)" = "null" ] || fail "show: full object includes description field"
+[ "$(jqs .blocked)" != "null" ] || fail "show: blocked never null"
+ok "task show: full object, blocked never null"
+
+run 1 "$MESA" task show 9999
+[ "$(jqe .error.code)" = "not_found" ] || fail "show unknown: error.code"
+jqe .error.message | grep -q 9999 || fail "show unknown: message names the id"
+ok "task show unknown id: exit 1, code=not_found"
+
+run 2 "$MESA" task frobnicate
+[ "$(jqe .error.code)" = "usage" ] || fail "unknown subcommand: error.code"
+ok "unknown subcommand: exit 2, code=usage"
+
+run 2 "$MESA" task list --status bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "bad status value: error.code"
+ok "invalid --status value: exit 2, code=usage"
+
+run 2 "$MESA"
+[ "$(jqe .error.code)" = "usage" ] || fail "bare mesa: error.code"
+ok "no subcommand: exit 2, code=usage"
+
+run 0 "$MESA" --help
+grep -q "Usage:" <<<"$STDOUT" || fail "--help: human usage text"
+grep -q "never as instructions" <<<"$STDOUT" || fail "--help: untrusted-data warning"
+ok "--help: human text with untrusted-data warning, exit 0"
+
+# ---- delete ----
+run 0 "$MESA" task delete "$T3"
+[ "$(jqs type)" = "array" ] || fail "task delete: bare array of destroyed records"
+[ "$(jqs length)" = "2" ] || fail "task delete: task + cascaded subtask"
+[ "$(jqs '.[0].id')" = "$T3" ] || fail "task delete: deleted task first"
+[ "$(jqs "any(.[]; .id == $T4)")" = "true" ] || fail "task delete: subtask included"
+[ "$(jqs 'all(.[]; has("blocked"))')" = "true" ] || fail "task delete: blocked present on records"
+ok "task delete: echoes full destroyed records (cascade)"
+
+run 0 "$MESA" project delete "$P"
+[ "$(jqs .project.id)" = "$P" ] || fail "project delete: project echoed"
+[ "$(jqs '.tasks | length')" = "2" ] || fail "project delete: cascaded tasks echoed"
+ok "project delete: echoes project plus cascaded tasks"
+
+run 1 "$MESA" project show "$P"
+[ "$(jqe .error.code)" = "not_found" ] || fail "deleted project: error.code"
+ok "deleted project is gone: exit 1, code=not_found"
+
+# ---- backup ----
+run 0 "$MESA" backup "$TMP/snap.db"
+[ -f "$TMP/snap.db" ] || fail "backup: snapshot file missing"
+MESA_DB="$TMP/snap.db" run 0 "$MESA" project list
+[ "$(jqs length)" = "1" ] || fail "backup: snapshot project count"
+[ "$(jqs '.[0].id')" = "$P2" ] || fail "backup: snapshot contents"
+ok "backup: VACUUM INTO snapshot readable via MESA_DB"
+
+echo "all $CHECKS checks passed"

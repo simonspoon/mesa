@@ -8,6 +8,8 @@
 //! - Status codes: 404 unknown path id, 422 validation errors and unknown
 //!   body ids, 409 cycle. Error bodies use the CLI shape:
 //!   `{"error": {"code": "...", "message": "..."}}`.
+//! - The built frontend (`frontend/dist`, embedded at compile time) is served
+//!   at `/`, with SPA fallback to `index.html` (spec Requirement 9).
 
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +24,13 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{Error, Priority, ProjectPatch, Status, Store, TaskPatch, TaskSummary};
+
+/// The Vite build output, embedded into the binary at compile time.
+/// `scripts/build.sh` guarantees `frontend/dist` is built before the release
+/// compile; debug builds read the folder from disk at runtime instead.
+#[derive(rust_embed::RustEmbed, Clone)]
+#[folder = "frontend/dist"]
+struct Assets;
 
 #[derive(Clone)]
 struct AppState {
@@ -66,6 +75,13 @@ fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
+        // Everything outside /api is the embedded SPA; unknown paths fall
+        // back to index.html with 200 so client-side routes deep-link.
+        .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
+            Some("index.html".to_owned()),
+            axum_embed::FallbackBehavior::Ok,
+            Some("index.html".to_owned()),
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }

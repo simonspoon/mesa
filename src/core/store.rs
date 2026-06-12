@@ -409,6 +409,18 @@ impl Store {
         self.get_task(task_id)
     }
 
+    /// Lists the tasks that `task_id` is directly blocked by.
+    pub fn list_blockers(&self, task_id: i64) -> Result<Vec<Task>> {
+        self.get_task(task_id)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks t \
+             JOIN dependencies d ON d.blocked_by = t.id \
+             WHERE d.task_id = ?1 ORDER BY t.id"
+        ))?;
+        let rows = stmt.query_map([task_id], row_to_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// True if a path blocker_id -> ... -> task_id already exists along
     /// blocked-by edges, i.e. adding (task_id blocked by blocker_id) would
     /// close a cycle. DFS over the full edge set.
@@ -774,6 +786,25 @@ mod tests {
 
         let err = store.remove_dependency(a.id, b.id).unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn list_blockers_returns_direct_blockers_only() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let a = add_task(&mut store, p.id, "a");
+        let b = add_task(&mut store, p.id, "b");
+        let c = add_task(&mut store, p.id, "c");
+        store.add_dependency(a.id, b.id).unwrap(); // a blocked by b
+        store.add_dependency(b.id, c.id).unwrap(); // b blocked by c (transitive for a)
+
+        let blockers = store.list_blockers(a.id).unwrap();
+        let ids: Vec<i64> = blockers.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![b.id]); // direct only, not c
+        assert!(blockers[0].blocked); // b itself is blocked by c
+
+        assert!(store.list_blockers(c.id).unwrap().is_empty());
+        assert!(matches!(store.list_blockers(999), Err(Error::NotFound(_))));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::core::{Error, Priority, ProjectPatch, Status, Store, Task, TaskPatch};
+use crate::core::{Error, Priority, ProjectPatch, Status, Store, TaskPatch, TaskSummary};
 
 #[derive(Clone)]
 struct AppState {
@@ -65,6 +65,7 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
+        .route("/api/tasks/{id}/dependencies", get(list_dependencies))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -170,20 +171,6 @@ where
     D: Deserializer<'de>,
 {
     Deserialize::deserialize(de).map(Some)
-}
-
-/// Compact task object for list responses: full object minus `description`.
-fn compact(t: &Task) -> serde_json::Value {
-    json!({
-        "id": t.id,
-        "project_id": t.project_id,
-        "parent_id": t.parent_id,
-        "title": t.title,
-        "status": t.status,
-        "priority": t.priority,
-        "tags": t.tags,
-        "blocked": t.blocked,
-    })
 }
 
 // ---- projects ----
@@ -304,14 +291,14 @@ async fn list_tasks(
     Query(q): Query<TaskQuery>,
 ) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
-    let tasks: Vec<_> = store
+    let tasks: Vec<TaskSummary> = store
         .list_tasks()?
         .iter()
         .filter(|t| q.project.is_none_or(|p| t.project_id == p))
         .filter(|t| q.status.is_none_or(|s| t.status == s))
         .filter(|t| q.tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
         .filter(|t| !q.unblocked || !t.blocked)
-        .map(compact)
+        .map(TaskSummary::from)
         .collect();
     Ok(Json(tasks).into_response())
 }
@@ -359,6 +346,15 @@ async fn update_task(
 async fn delete_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_task(id)?).into_response())
+}
+
+/// Lists the full task objects this task is directly blocked by.
+async fn list_dependencies(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_blockers(id)?).into_response())
 }
 
 async fn block_task(

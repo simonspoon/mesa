@@ -445,6 +445,8 @@ async fn create_task(
         body.priority.unwrap_or(Priority::Medium),
         &body.tags,
         body.parent_id,
+        None,
+        None,
     )?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
 }
@@ -467,6 +469,8 @@ async fn update_task(
         priority: body.priority,
         tags: body.tags,
         parent_id: body.parent_id,
+        acceptance: None,
+        artifact: None,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_task(id, &patch)?).into_response())

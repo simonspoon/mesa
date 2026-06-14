@@ -28,9 +28,21 @@ the structure of separate crates. See `Cargo.toml`.
   that drifts from the dependency edges. Every task object always carries the
   field so consumers never have to special-case its absence.
 - **All mutations go through `Store`.** Nothing writes the database except
-  `Store` methods (`src/core/store.rs`). This is held deliberately so a future
-  append-only events/activity log (deferred, not rejected) has exactly one
-  insertion point. Do not open a second write path.
+  `Store` methods (`src/core/store.rs`). This single insertion point is what
+  lets the append-only status-event log stay correct: `create_task` and
+  `update_task` write a `task_events` row in the same transaction as the task
+  write, so an event is recorded for every creation (`from_status` null) and
+  every real status change and nothing else. Do not open a second write path.
+- **The status-event log is append-only.** `task_events` rows are only inserted
+  (by `create_task`/`update_task` in `src/core/store.rs`); no code path updates
+  or deletes them except the `ON DELETE CASCADE` when the parent task is
+  deleted. Read them via `Store::list_events` / `mesa task events`.
+- **`created_at`/`updated_at` live on the task row** (`src/core/store.rs`),
+  written DB-side with `datetime('now')` (UTC) on insert and on every
+  `update_task`. The migration backfills pre-feature rows with a constant
+  sentinel because SQLite forbids `CURRENT_TIMESTAMP` in `ALTER ADD COLUMN`.
+  `acceptance` (definition-of-done) and `artifact` (free-text work receipt) are
+  nullable task columns mesa stores but never interprets.
 - **Schema migrations are a `user_version`-indexed array of SQL strings**
   (`MIGRATIONS` in `src/core/store.rs`), run on `Store` open. Adding a migration
   = appending one string; never edit a shipped migration in place.
@@ -49,6 +61,13 @@ the structure of separate crates. See `Cargo.toml`.
   stable `code`. There is no human/table mode by design (`jq` covers reading).
 - **Exit codes are part of the contract:** 0 success, 1 domain/runtime error,
   2 usage error — agents branch on these, so they are load-bearing, not cosmetic.
+- **`next` and `import` selection/insertion logic lives in `Store`, not the CLI.**
+  `task next` (deterministic next actionable task, or a counts object when none)
+  and `task import` (one atomic transaction over a JSON task graph with
+  client-supplied local `ref`s) are `Store::next_task`/`Store::import_tasks`
+  (`src/core/store.rs`); the CLI just (de)serializes. This keeps the rule that
+  handlers carry no business logic and stops the two surfaces diverging — even
+  though `next`/`import`/`events` are CLI-only (no API route) by design.
 
 ## api (`src/api.rs`)
 

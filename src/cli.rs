@@ -15,7 +15,9 @@ use clap::error::ErrorKind;
 use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
-use crate::core::{Error, Priority, ProjectPatch, Result, Status, Store, Task, TaskPatch};
+use crate::core::{
+    Error, ImportDoc, NextResult, Priority, ProjectPatch, Result, Status, Store, Task, TaskPatch,
+};
 
 const TOP_AFTER_HELP: &str = "\
 OUTPUT
@@ -37,7 +39,7 @@ EXAMPLES
   mesa project create \"Website redesign\" --description \"Q3 marketing site\"
   mesa task create --project 1 \"Draft homepage copy\" --tags writing,web
   mesa task list --project 1 --status todo --unblocked
-  mesa task block 3 --on 1        # task 3 now waits on task 1
+  mesa task block 3 --by 1        # task 3 is blocked by task 1
   mesa backup /tmp/mesa-snap.db
 
 SECURITY
@@ -168,6 +170,12 @@ EXAMPLES
         /// Parent task id (makes this a subtask; same project required)
         #[arg(long)]
         parent: Option<i64>,
+        /// Definition-of-done for this task; free text
+        #[arg(long)]
+        acceptance: Option<String>,
+        /// Work receipt (commit SHA / PR URL / path); free text
+        #[arg(long)]
+        artifact: Option<String>,
     },
     /// List tasks as a bare JSON array of compact objects (no description)
     ///
@@ -192,6 +200,40 @@ EXAMPLES
         #[arg(long)]
         unblocked: bool,
     },
+    /// Print the next actionable task (todo + unblocked) as a full JSON object
+    ///
+    /// Selection is deterministic: among actionable tasks (optionally scoped to
+    /// --project), order by priority (high>medium>low) then ascending id, and
+    /// print the first as a full task object. When none is actionable, prints a
+    /// status object `{"next": null, "blocked": N, "in_progress": M, "todo": T}`
+    /// (counts scoped to the same filter) so the caller can tell "all done"
+    /// (all zero) from "work in flight" (in_progress>0) from "stuck" (blocked>0).
+    /// Exit code is 0 whether or not a task is returned.
+    #[command(after_help = "\
+EXAMPLES
+  mesa task next                 # next actionable task across all projects
+  mesa task next --project 1     # next actionable task in project 1")]
+    Next {
+        /// Only consider tasks in this project
+        #[arg(long)]
+        project: Option<i64>,
+    },
+    /// Import a task graph from a JSON document on stdin (one transaction)
+    ///
+    /// Reads one JSON document of the shape
+    ///   {"project": <id>, "tasks": [{"ref": "a", "title": "...",
+    ///     "description"?, "acceptance"?, "priority"?, "tags"?: [...],
+    ///     "parent"?: <ref>, "blocked_by"?: [<ref>...]}, ...]}
+    /// and creates every task and dependency atomically: on any error nothing
+    /// is created. Tasks reference each other by their client-supplied `ref`
+    /// (a string key), resolved to real ids during import, so a dependency need
+    /// not know the created id in advance. Prints the created tasks as a JSON
+    /// array of full objects. Malformed JSON exits 2; a domain error exits 1.
+    #[command(after_help = "\
+EXAMPLES
+  echo '{\"project\":1,\"tasks\":[{\"ref\":\"a\",\"title\":\"design\"},\
+{\"ref\":\"b\",\"title\":\"build\",\"blocked_by\":[\"a\"]}]}' | mesa task import")]
+    Import,
     /// Print one task as a full JSON object (includes description)
     Show {
         /// Task id
@@ -233,6 +275,12 @@ EXAMPLES
         /// Detach the task from its parent
         #[arg(long, group = "fields")]
         no_parent: bool,
+        /// New definition-of-done; pass "" to clear it
+        #[arg(long, group = "fields")]
+        acceptance: Option<String>,
+        /// New work receipt; pass "" to clear it
+        #[arg(long, group = "fields")]
+        artifact: Option<String>,
     },
     /// Delete a task AND all its subtasks (no confirmation)
     ///
@@ -251,13 +299,13 @@ EXAMPLES
     /// (exit 1, code "cycle"). Re-adding an existing edge succeeds.
     #[command(after_help = "\
 EXAMPLES
-  mesa task block 3 --on 1     # task 3 waits on task 1")]
+  mesa task block 3 --by 1     # task 3 is blocked by task 1")]
     Block {
-        /// Task that becomes blocked
+        /// Task that becomes blocked (`<id>` is blocked by `<other>`)
         id: i64,
         /// Task it is blocked by
         #[arg(long)]
-        on: i64,
+        by: i64,
     },
     /// Remove a blocked-by edge between two tasks
     ///
@@ -271,6 +319,19 @@ EXAMPLES
         /// Blocker to remove
         #[arg(long)]
         on: i64,
+    },
+    /// Print the status-change event log as a JSON array, oldest first
+    ///
+    /// With a task id, prints that task's events; without one, prints every
+    /// task's events. Each row records a status change: the creation event has
+    /// a null `from_status`.
+    #[command(after_help = "\
+EXAMPLES
+  mesa task events       # every task's events
+  mesa task events 3     # task 3's events")]
+    Events {
+        /// Task id; omit for every task's events
+        id: Option<i64>,
     },
 }
 
@@ -306,6 +367,7 @@ fn compact(t: &Task) -> serde_json::Value {
         "status": t.status,
         "priority": t.priority,
         "tags": t.tags,
+        "acceptance": t.acceptance,
         "blocked": t.blocked,
     })
 }
@@ -415,6 +477,8 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             priority,
             tags,
             parent,
+            acceptance,
+            artifact,
         } => {
             let tags = tags.map(parse_tags).unwrap_or_default();
             print_json(&store.create_task(
@@ -424,6 +488,8 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 priority,
                 &tags,
                 parent,
+                acceptance.as_deref(),
+                artifact.as_deref(),
             )?);
         }
         TaskCmd::List {
@@ -443,6 +509,33 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 .collect();
             print_json(&tasks);
         }
+        TaskCmd::Next { project } => match store.next_task(project)? {
+            NextResult::Task(task) => print_json(&task),
+            NextResult::None {
+                blocked,
+                in_progress,
+                todo,
+            } => print_json(&json!({
+                "next": null,
+                "blocked": blocked,
+                "in_progress": in_progress,
+                "todo": todo,
+            })),
+        },
+        TaskCmd::Import => {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+            let doc: ImportDoc = match serde_json::from_str(&input) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    // Malformed/invalid JSON is a usage error (exit 2), matching
+                    // clap's handling of bad input.
+                    print_error("usage", &format!("invalid import JSON: {e}"));
+                    std::process::exit(2);
+                }
+            };
+            print_json(&store.import_tasks(&doc)?);
+        }
         TaskCmd::Show { id } => print_json(&store.get_task(id)?),
         TaskCmd::Update {
             id,
@@ -453,6 +546,8 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             tags,
             parent,
             no_parent,
+            acceptance,
+            artifact,
         } => {
             let patch = TaskPatch {
                 title,
@@ -465,12 +560,15 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 } else {
                     parent.map(Some)
                 },
+                acceptance: acceptance.map(clear_if_empty),
+                artifact: artifact.map(clear_if_empty),
             };
             print_json(&store.update_task(id, &patch)?);
         }
         TaskCmd::Delete { id } => print_json(&store.delete_task(id)?),
-        TaskCmd::Block { id, on } => print_json(&store.add_dependency(id, on)?),
+        TaskCmd::Block { id, by } => print_json(&store.add_dependency(id, by)?),
         TaskCmd::Unblock { id, on } => print_json(&store.remove_dependency(id, on)?),
+        TaskCmd::Events { id } => print_json(&store.list_events(id)?),
     }
     Ok(())
 }

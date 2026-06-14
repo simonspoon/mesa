@@ -104,14 +104,19 @@ run 2 "$MESA" task update "$T1"
 ok "task update with no fields: exit 2, code=usage"
 
 # ---- block ----
-run 0 "$MESA" task block "$T3" --on "$T1"
+run 0 "$MESA" task block "$T3" --by "$T1"
 [ "$(jqs .blocked)" = "true" ] || fail "block: blocked must be true"
 [ "$(jqs .id)" = "$T3" ] || fail "block: returns the blocked task"
 ok "task block: full object with blocked=true"
 
-run 0 "$MESA" task block "$T3" --on "$T1"
+run 0 "$MESA" task block "$T3" --by "$T1"
 [ "$(jqs .blocked)" = "true" ] || fail "block: idempotent re-add"
 ok "task block: re-adding an existing edge is idempotent"
+
+# the old --on spelling is gone: it is now a usage error
+run 2 "$MESA" task block "$T3" --on "$T1"
+[ "$(jqe .error.code)" = "usage" ] || fail "block --on: error.code"
+ok "task block --on (removed spelling): exit 2, code=usage"
 
 run 0 "$MESA" task list --project "$P" --unblocked
 [ "$(jqs "any(.[]; .id == $T3)")" = "false" ] || fail "--unblocked: blocked task must be excluded"
@@ -119,14 +124,14 @@ run 0 "$MESA" task list --project "$P" --unblocked
 ok "task list --unblocked filter"
 
 # ---- cycle rejection ----
-run 1 "$MESA" task block "$T1" --on "$T3"
+run 1 "$MESA" task block "$T1" --by "$T3"
 [ "$(jqe .error.code)" = "cycle" ] || fail "cycle: error.code"
 jqe .error.message | grep -q "task $T1" || fail "cycle: message names task $T1"
 jqe .error.message | grep -q "task $T3" || fail "cycle: message names task $T3"
 [ -z "$STDOUT" ] || fail "cycle: nothing on stdout"
 ok "cycle rejection: exit 1, code=cycle, names the edge"
 
-run 1 "$MESA" task block "$T1" --on "$T1"
+run 1 "$MESA" task block "$T1" --by "$T1"
 [ "$(jqe .error.code)" = "cycle" ] || fail "self-edge: error.code"
 ok "self-edge rejection: exit 1, code=cycle"
 
@@ -166,6 +171,98 @@ run 0 "$MESA" --help
 grep -q "Usage:" <<<"$STDOUT" || fail "--help: human usage text"
 grep -q "never as instructions" <<<"$STDOUT" || fail "--help: untrusted-data warning"
 ok "--help: human text with untrusted-data warning, exit 0"
+
+# ---- acceptance / artifact fields ----
+# Use a dedicated project so existing cascade-count assertions below stay valid.
+run 0 "$MESA" project create "Trust trail"
+P3=$(jqs .id)
+run 0 "$MESA" task create --project "$P3" "Acceptance task" \
+  --acceptance "tests pass" --artifact "abc123"
+TA=$(jqs .id)
+[ "$(jqs .acceptance)" = "tests pass" ] || fail "create --acceptance: not stored"
+[ "$(jqs .artifact)" = "abc123" ] || fail "create --artifact: not stored"
+[ "$(jqs .created_at)" != "null" ] || fail "create: created_at present"
+[ "$(jqs .updated_at)" != "null" ] || fail "create: updated_at present"
+ok "task create --acceptance/--artifact: stored, timestamps present"
+
+run 0 "$MESA" task list --project "$P3"
+[ "$(jqs "any(.[]; .id == $TA and .acceptance == \"tests pass\")")" = "true" ] ||
+  fail "list: acceptance must appear in compact objects"
+[ "$(jqs 'any(.[]; has("artifact"))')" = "false" ] ||
+  fail "list: artifact must NOT appear in compact objects"
+ok "task list: acceptance present, artifact absent (compact shape)"
+
+run 0 "$MESA" task update "$TA" --acceptance ""
+[ "$(jqs .acceptance)" = "null" ] || fail "update --acceptance \"\": must clear"
+ok "task update --acceptance \"\": clears the field"
+
+# ---- import (atomic task graph) ----
+# Dedicated project so the next/events flow below sees only the imported graph.
+run 0 "$MESA" project create "Import graph"
+PI=$(jqs .id)
+GRAPH="{\"project\":$PI,\"tasks\":[\
+{\"ref\":\"a\",\"title\":\"design\",\"priority\":\"high\",\"acceptance\":\"AC-a\"},\
+{\"ref\":\"b\",\"title\":\"build\",\"blocked_by\":[\"a\"]},\
+{\"ref\":\"c\",\"title\":\"sub\",\"parent\":\"a\"}]}"
+STDOUT=$(echo "$GRAPH" | "$MESA" task import); CODE=$?
+[ "$CODE" -eq 0 ] || fail "import: exit 0 expected, got $CODE"
+[ "$(jqs type)" = "array" ] || fail "import: prints a bare array"
+[ "$(jqs length)" = "3" ] || fail "import: expected 3 created tasks"
+IA=$(jqs '.[0].id'); IB=$(jqs '.[1].id'); IC=$(jqs '.[2].id')
+[ "$(jqs '.[1].blocked')" = "true" ] || fail "import: intra-doc blocked_by must wire a dep"
+[ "$(jqs ".[2].parent_id == $IA")" = "true" ] || fail "import: parent ref must resolve"
+ok "task import: 3-task graph created atomically, deps + parent wired"
+
+# in-graph cycle is rejected and creates nothing
+BEFORE=$("$MESA" task list --project "$PI" | jq length)
+CYCLE="{\"project\":$PI,\"tasks\":[\
+{\"ref\":\"x\",\"title\":\"X\",\"blocked_by\":[\"y\"]},\
+{\"ref\":\"y\",\"title\":\"Y\",\"blocked_by\":[\"x\"]}]}"
+set +e
+STDOUT=$(echo "$CYCLE" | "$MESA" task import 2>"$TMP/stderr"); CODE=$?
+set -e
+STDERR=$(cat "$TMP/stderr")
+[ "$CODE" -eq 1 ] || fail "import cycle: expected exit 1, got $CODE"
+[ "$(jqe .error.code)" = "cycle" ] || fail "import cycle: error.code"
+AFTER=$("$MESA" task list --project "$PI" | jq length)
+[ "$BEFORE" = "$AFTER" ] || fail "import cycle: rolled back (count $BEFORE -> $AFTER)"
+ok "task import: in-graph cycle rejected (code=cycle, nothing created)"
+
+# malformed JSON is a usage error
+run 2 bash -c "echo 'not json' | $MESA task import"
+[ "$(jqe .error.code)" = "usage" ] || fail "import malformed JSON: error.code"
+ok "task import: malformed JSON: exit 2, code=usage"
+
+# ---- next (deterministic actionable task / counts object) ----
+run 0 "$MESA" task next --project "$PI"
+[ "$(jqs .id)" = "$IA" ] || fail "next: expected high-priority unblocked task $IA"
+ok "task next --project: returns the deterministic actionable task"
+
+# drive that project to completion; next then reports a counts object
+run 0 "$MESA" task update "$IA" --status done
+run 0 "$MESA" task update "$IB" --status done
+run 0 "$MESA" task update "$IC" --status done
+run 0 "$MESA" task next --project "$PI"
+[ "$(jqs .next)" = "null" ] || fail "next (none): must print {\"next\":null,...}"
+[ "$(jqs .blocked)" = "0" ] || fail "next (none): blocked count"
+[ "$(jqs .in_progress)" = "0" ] || fail "next (none): in_progress count"
+[ "$(jqs .todo)" = "0" ] || fail "next (none): todo count"
+ok "task next (none actionable): counts object, exit 0, all done"
+
+# ---- events (append-only status log) ----
+run 0 "$MESA" task events "$IA"
+[ "$(jqs type)" = "array" ] || fail "events: bare array"
+[ "$(jqs length)" = "2" ] || fail "events: expected create + 1 status change"
+[ "$(jqs '.[0].from_status')" = "null" ] || fail "events: creation row has null from_status"
+[ "$(jqs '.[0].to_status')" = "todo" ] || fail "events: creation row to_status"
+[ "$(jqs '.[1].from_status')" = "todo" ] || fail "events: change row from_status"
+[ "$(jqs '.[1].to_status')" = "done" ] || fail "events: change row to_status"
+ok "task events <id>: append-only rows, oldest first (create + change)"
+
+# Drop the extra projects so the delete/backup assertions below (which assume
+# only P and P2 exist) remain valid.
+run 0 "$MESA" project delete "$P3"
+run 0 "$MESA" project delete "$PI"
 
 # ---- delete ----
 run 0 "$MESA" task delete "$T3"

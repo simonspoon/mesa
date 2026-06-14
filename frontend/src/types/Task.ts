@@ -4,6 +4,22 @@ import type { Status } from "./Status";
 
 export type Task = { id: number, project_id: number, parent_id: number | null, title: string, description: string | null, status: Status, priority: Priority, tags: Array<string>, 
 /**
+ * Definition-of-done for this task; free text, unstructured.
+ */
+acceptance: string | null, 
+/**
+ * Free-text receipt of completed work (commit SHA / PR URL / path).
+ */
+artifact: string | null, 
+/**
+ * When the task row was inserted (SQLite `datetime` text, UTC).
+ */
+created_at: string, 
+/**
+ * When the task row was last updated (SQLite `datetime` text, UTC).
+ */
+updated_at: string, 
+/**
  * Derived: true if any dependency is not done/cancelled. Always present.
  */
 blocked: boolean, };

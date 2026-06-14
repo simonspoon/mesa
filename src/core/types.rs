@@ -92,8 +92,31 @@ pub struct Task {
     pub status: Status,
     pub priority: Priority,
     pub tags: Vec<String>,
+    /// Definition-of-done for this task; free text, unstructured.
+    pub acceptance: Option<String>,
+    /// Free-text receipt of completed work (commit SHA / PR URL / path).
+    pub artifact: Option<String>,
+    /// When the task row was inserted (SQLite `datetime` text, UTC).
+    pub created_at: String,
+    /// When the task row was last updated (SQLite `datetime` text, UTC).
+    pub updated_at: String,
     /// Derived: true if any dependency is not done/cancelled. Always present.
     pub blocked: bool,
+}
+
+/// An append-only record of a task's status change. `from_status` is null for
+/// the row written when the task is created.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct TaskEvent {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub task_id: i64,
+    pub from_status: Option<Status>,
+    pub to_status: Status,
+    /// When the change happened (SQLite `datetime` text, UTC).
+    pub at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -120,6 +143,8 @@ pub struct TaskSummary {
     pub status: Status,
     pub priority: Priority,
     pub tags: Vec<String>,
+    /// Definition-of-done, surfaced in `list` so agents see it without `show`.
+    pub acceptance: Option<String>,
     pub blocked: bool,
 }
 
@@ -133,6 +158,7 @@ impl From<&Task> for TaskSummary {
             status: t.status,
             priority: t.priority,
             tags: t.tags.clone(),
+            acceptance: t.acceptance.clone(),
             blocked: t.blocked,
         }
     }

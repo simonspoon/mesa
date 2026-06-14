@@ -6,4 +6,8 @@ import type { Status } from "./Status";
  * Compact task object for `list` responses (Requirement 6): the full object
  * minus `description`.
  */
-export type TaskSummary = { id: number, project_id: number, parent_id: number | null, title: string, status: Status, priority: Priority, tags: Array<string>, blocked: boolean, };
+export type TaskSummary = { id: number, project_id: number, parent_id: number | null, title: string, status: Status, priority: Priority, tags: Array<string>, 
+/**
+ * Definition-of-done, surfaced in `list` so agents see it without `show`.
+ */
+acceptance: string | null, blocked: boolean, };

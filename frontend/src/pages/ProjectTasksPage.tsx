@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import { deleteProject, getProject, listTasks, updateProject } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { CreateTaskPanel } from '../components/CreateTaskPanel'
-import { DocsTab } from '../components/DocsTab'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskPanel } from '../components/TaskPanel'
 import { TaskRow } from '../components/TaskRow'
@@ -28,7 +27,7 @@ export function ProjectTasksPage({
   const [status, setStatus] = useState<Status | ''>('')
   const [priority, setPriority] = useState<Priority | ''>('')
   const [tag, setTag] = useState('')
-  const [view, setView] = useState<'list' | 'board' | 'docs'>('list')
+  const [view, setView] = useState<'list' | 'board'>('list')
   // Create-form panel state is ephemeral (spec Assumption 2); the task
   // panel is URL-driven via `taskId`. Latest action wins: opening a task
   // closes the create form.
@@ -192,20 +191,6 @@ export function ProjectTasksPage({
             />
           </p>
         )}
-        {project && (
-          <p className="muted docs-path-row">
-            docs path:{' '}
-            <InlineEdit
-              value={project.docs_path ?? ''}
-              placeholder="no docs path — click to set"
-              onSave={(d) =>
-                updateProject(projectId, {
-                  docs_path: d === '' ? null : d,
-                }).then(refetchProject)
-              }
-            />
-          </p>
-        )}
         <p className="project-actions">
           <button onClick={openCreate}>add task</button>
           <ConfirmDelete
@@ -233,20 +218,9 @@ export function ProjectTasksPage({
           >
             Board
           </button>
-          <button
-            className={view === 'docs' ? 'active' : ''}
-            onClick={() => setView('docs')}
-          >
-            Docs
-          </button>
         </div>
 
-        {view === 'docs' ? (
-          <DocsTab
-            projectId={projectId}
-            docsPath={project?.docs_path ?? null}
-          />
-        ) : view === 'board' ? (
+        {view === 'board' ? (
           !tasks ? (
             <p className="muted">Loading…</p>
           ) : (

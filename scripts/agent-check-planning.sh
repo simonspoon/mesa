@@ -2,8 +2,8 @@
 # Docs-tab spec Implementation 7 (panel, Hamel): agent acceptance test for the
 # pm-docs/ convention. A fresh headless Claude session runs in a small fixture
 # project under ~/inaros (so the root CLAUDE.md Project Documents rule is in
-# scope), with the planning skill available and a mesa project whose docs_path
-# is set. It is prompted to plan a small feature and write the spec file — but
+# scope), with the planning skill available and a mesa project created.
+# It is prompted to plan a small feature and write the spec file — but
 # never told WHERE. Pass: the spec lands under pm-docs/specs/ unprompted.
 # Saves the transcript and a pass/fail summary under scripts/agent-check/.
 set -euo pipefail
@@ -35,7 +35,7 @@ EOF
 chmod +x "$TMP/notes.sh"
 mkdir -p "$TMP/.claude/skills"
 cp -R "$REPO/.claude/skills/planning" "$TMP/.claude/skills/planning"
-mesa project create notes --docs-path "$TMP/pm-docs" >/dev/null
+mesa project create notes >/dev/null
 
 PROMPT="/planning add a delete command to notes.sh that removes a note by its list number. Default any open choices without asking me; do write the spec file."
 
@@ -74,7 +74,7 @@ SUMMARY="$OUT/planning-summary.md"
   echo "Prompt: $PROMPT"
   echo
   echo "Context: fixture project under ~/inaros (root CLAUDE.md in scope),"
-  echo "planning skill copied in, mesa project 'notes' with docs_path set."
+  echo "planning skill copied in, mesa project 'notes' created."
   echo "The prompt asks for a spec file but never names a location."
   echo
 } >"$SUMMARY"

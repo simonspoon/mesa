@@ -77,11 +77,17 @@ invariants you must not break — read them before changing `src/`:
   `{"error": {"code", "message"}}` on stderr.
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Error codes: `not_found | validation | cycle | conflict | usage`.
-- **API security boundary** = Host-header allowlist + Content-Type gate, not the
-  localhost bind. Middleware in `src/api.rs` rejects requests whose `Host` is not
-  `localhost:<port>`/`127.0.0.1:<port>` (DNS rebinding) and requires
-  `Content-Type: application/json` on mutating methods (cross-site form posts).
-  No auth. Removing either check removes the boundary.
+- **API security boundary is mode-dependent** (`serve` default vs `serve --lan`),
+  enforced by middleware in `src/api.rs`, not by the bind address. Two checks:
+  - **Host-header allowlist** (DNS-rebinding defense): rejects requests whose
+    `Host` is not `localhost:<port>`/`127.0.0.1:<port>`. Enforced in default mode
+    (bind 127.0.0.1); **skipped** under `--lan` (bind 0.0.0.0), an opt-in,
+    no-auth "trust every device on the LAN" choice. The flag flips bind + Host
+    policy together (`AppState.lan`); they are two halves of one posture.
+  - **Content-Type gate** (cross-site form posts): requires
+    `Content-Type: application/json` on mutating methods. Enforced in BOTH modes.
+  No auth in either mode. Removing the Content-Type check, or letting `--lan`
+  leak into default mode, removes the boundary.
 - **Concurrency safety** = WAL + `busy_timeout = 5000` (`src/core/store.rs`).
   Concurrent CLI + server writes queue instead of `SQLITE_BUSY`. The web UI does
   not live-sync — it refetches on window focus.

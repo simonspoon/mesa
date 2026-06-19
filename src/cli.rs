@@ -68,13 +68,24 @@ enum Command {
     Storyboard(StoryboardCmd),
     /// Start the HTTP server and web UI
     ///
-    /// Binds 127.0.0.1 only. Requests must carry a Host header of
-    /// localhost:<port> or 127.0.0.1:<port>; mutating requests must set
+    /// By default binds 127.0.0.1 only (loopback): reachable solely from this
+    /// machine, and requests must carry a Host header of localhost:<port> or
+    /// 127.0.0.1:<port>. Mutating requests always require
     /// Content-Type: application/json.
+    ///
+    /// With --lan, binds 0.0.0.0 so other devices on your local network can
+    /// reach the web UI, and the Host-header check is skipped. WARNING: LAN
+    /// mode has NO authentication — every device on your network has full read
+    /// and write access to all your data. Only use it on networks you trust.
     Serve {
-        /// Port to bind on 127.0.0.1
+        /// Port to bind
         #[arg(long, default_value_t = 7770)]
         port: u16,
+        /// Make the server reachable from other devices on your local network
+        /// (binds 0.0.0.0 and skips the Host-header check). No authentication:
+        /// anyone on the network gets full read/write access.
+        #[arg(long, default_value_t = false)]
+        lan: bool,
     },
     /// Snapshot the database to a file (safe while the server runs)
     ///
@@ -650,7 +661,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Project(cmd) => run_project(cmd),
         Command::Task(cmd) => run_task(cmd),
         Command::Storyboard(cmd) => run_storyboard(cmd),
-        Command::Serve { port } => crate::api::serve(port),
+        Command::Serve { port, lan } => crate::api::serve(port, lan),
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;

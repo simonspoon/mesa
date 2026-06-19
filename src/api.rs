@@ -1,10 +1,14 @@
 //! HTTP API: an axum router under `/api` over the same `Store` as the CLI.
 //!
 //! Contract (spec Requirements 7 and 8):
-//! - Bound to 127.0.0.1; requests whose `Host` header is not
-//!   `localhost:<port>` or `127.0.0.1:<port>` are rejected (DNS rebinding).
+//! - Default (loopback) mode: bound to 127.0.0.1; requests whose `Host` header
+//!   is not `localhost:<port>` or `127.0.0.1:<port>` are rejected (DNS
+//!   rebinding).
+//! - LAN mode (`serve --lan`): bound to 0.0.0.0 so other devices on the local
+//!   network can reach it; the Host-header check is skipped (the user has opted
+//!   into no-auth LAN trust — there is no enumerable allowlist of LAN hosts).
 //! - Mutating methods (POST/PUT/PATCH/DELETE) require
-//!   `Content-Type: application/json` (cross-site form posts).
+//!   `Content-Type: application/json` (cross-site form posts) in BOTH modes.
 //! - Status codes: 404 unknown path id, 422 validation errors and unknown
 //!   body ids, 409 cycle. Error bodies use the CLI shape:
 //!   `{"error": {"code": "...", "message": "..."}}`.
@@ -39,24 +43,28 @@ struct Assets;
 struct AppState {
     store: Arc<Mutex<Store>>,
     port: u16,
+    lan: bool,
 }
 
-/// Opens the default store and serves the API on 127.0.0.1:<port>, blocking
-/// until the process is killed.
-pub fn serve(port: u16) -> crate::core::Result<()> {
+/// Opens the default store and serves the API, blocking until the process is
+/// killed. Binds 127.0.0.1 by default; with `lan`, binds 0.0.0.0 so other
+/// devices on the local network can reach it (no auth — see `serve --help`).
+pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
     let store = Store::open_default()?;
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         port,
+        lan,
     };
+    let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let listener = tokio::net::TcpListener::bind((host, port)).await?;
         println!(
             "{}",
-            json!({"listening": format!("http://127.0.0.1:{port}")})
+            json!({"listening": format!("http://{host}:{port}")})
         );
         axum::serve(listener, router(state)).await?;
         Ok(())
@@ -105,22 +113,28 @@ fn router(state: AppState) -> Router {
 }
 
 /// Requirement 7 middleware: Host allowlist + Content-Type gate.
+///
+/// The Host allowlist is enforced only in default (loopback) mode. In LAN mode
+/// (`state.lan`) it is skipped — LAN hosts are not enumerable and the user has
+/// opted into no-auth LAN trust. The Content-Type gate runs in both modes.
 async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let port = state.port;
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    if host != format!("localhost:{port}") && host != format!("127.0.0.1:{port}") {
-        return ApiError {
-            status: StatusCode::FORBIDDEN,
-            code: "validation",
-            message: format!(
-                "rejected Host header {host:?}: must be localhost:{port} or 127.0.0.1:{port}"
-            ),
+    if !state.lan {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        if host != format!("localhost:{port}") && host != format!("127.0.0.1:{port}") {
+            return ApiError {
+                status: StatusCode::FORBIDDEN,
+                code: "validation",
+                message: format!(
+                    "rejected Host header {host:?}: must be localhost:{port} or 127.0.0.1:{port}"
+                ),
+            }
+            .into_response();
         }
-        .into_response();
     }
     let mutating = matches!(
         *req.method(),

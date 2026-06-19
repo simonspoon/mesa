@@ -3,10 +3,13 @@ import './App.css'
 import { getTask } from './api'
 import { Sidebar } from './components/Sidebar'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
+import { StoryboardListPage } from './pages/StoryboardListPage'
+import { StoryboardPage } from './pages/StoryboardPage'
 import { useFetch } from './useFetch'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
-// #/projects/:id/tasks/:tid (task open in the side panel).
+// #/projects/:id/tasks/:tid (task open in the side panel),
+// #/projects/:id/storyboards, #/projects/:id/storyboards/:sid.
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -38,12 +41,29 @@ function App() {
   // Bumped after project create/rename/delete so the sidebar refetches.
   const [navVersion, setNavVersion] = useState(0)
 
+  const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
+  const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
-  const activeProjectId = projectMatch ? Number(projectMatch[1]) : null
+  const activeProjectId = storyboardMatch
+    ? Number(storyboardMatch[1])
+    : storyboardListMatch
+      ? Number(storyboardListMatch[1])
+      : projectMatch
+        ? Number(projectMatch[1])
+        : null
 
   let page
-  if (projectMatch) {
+  if (storyboardMatch) {
+    page = (
+      <StoryboardPage
+        projectId={Number(storyboardMatch[1])}
+        storyboardId={Number(storyboardMatch[2])}
+      />
+    )
+  } else if (storyboardListMatch) {
+    page = <StoryboardListPage projectId={Number(storyboardListMatch[1])} />
+  } else if (projectMatch) {
     page = (
       <ProjectTasksPage
         projectId={Number(projectMatch[1])}

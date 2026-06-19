@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use super::types::{Priority, Project, Status, Task, TaskEvent};
+use super::types::{
+    Frame, FrameEdge, Priority, Project, Status, Storyboard, StoryboardEvent, StoryboardView, Task,
+    TaskEvent,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -87,7 +90,52 @@ const MIGRATIONS: &[&str] = &["
         at          TEXT NOT NULL
     );
     ",
-    "ALTER TABLE projects DROP COLUMN docs_path;"];
+    "ALTER TABLE projects DROP COLUMN docs_path;",
+    "
+    CREATE TABLE storyboards (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title       TEXT NOT NULL,
+        description TEXT,
+        author      TEXT,
+        created_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z',
+        updated_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+    );
+    CREATE TABLE frames (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        storyboard_id INTEGER NOT NULL REFERENCES storyboards(id) ON DELETE CASCADE,
+        title         TEXT NOT NULL,
+        body          TEXT,
+        x             REAL NOT NULL DEFAULT 0,
+        y             REAL NOT NULL DEFAULT 0,
+        w             REAL NOT NULL DEFAULT 240,
+        h             REAL NOT NULL DEFAULT 140,
+        color         TEXT,
+        task_id       INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+        author        TEXT,
+        created_at    TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z',
+        updated_at    TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+    );
+    CREATE TABLE frame_edges (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        storyboard_id INTEGER NOT NULL REFERENCES storyboards(id) ON DELETE CASCADE,
+        from_frame    INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+        to_frame      INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+        label         TEXT,
+        author        TEXT,
+        created_at    TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+    );
+    ",
+    "
+    CREATE TABLE storyboard_events (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        storyboard_id INTEGER NOT NULL REFERENCES storyboards(id) ON DELETE CASCADE,
+        actor         TEXT,
+        action        TEXT NOT NULL,
+        summary       TEXT NOT NULL,
+        at            TEXT NOT NULL
+    );
+    "];
 
 /// Selects full task rows including the derived `blocked` flag.
 const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
@@ -137,6 +185,103 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+const STORYBOARD_COLUMNS: &str = "id, project_id, title, description, author, created_at, updated_at";
+const FRAME_COLUMNS: &str =
+    "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at";
+const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at";
+const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
+
+fn row_to_storyboard(row: &rusqlite::Row<'_>) -> rusqlite::Result<Storyboard> {
+    Ok(Storyboard {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        author: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
+    Ok(Frame {
+        id: row.get(0)?,
+        storyboard_id: row.get(1)?,
+        title: row.get(2)?,
+        body: row.get(3)?,
+        x: row.get(4)?,
+        y: row.get(5)?,
+        w: row.get(6)?,
+        h: row.get(7)?,
+        color: row.get(8)?,
+        task_id: row.get(9)?,
+        author: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
+    Ok(FrameEdge {
+        id: row.get(0)?,
+        storyboard_id: row.get(1)?,
+        from_frame: row.get(2)?,
+        to_frame: row.get(3)?,
+        label: row.get(4)?,
+        author: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn row_to_storyboard_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoryboardEvent> {
+    Ok(StoryboardEvent {
+        id: row.get(0)?,
+        storyboard_id: row.get(1)?,
+        actor: row.get(2)?,
+        action: row.get(3)?,
+        summary: row.get(4)?,
+        at: row.get(5)?,
+    })
+}
+
+/// Appends one change-history row for a storyboard. Operates on any
+/// `Connection` (including an open transaction) so a mutation and its event
+/// commit atomically.
+fn insert_storyboard_event(
+    conn: &Connection,
+    storyboard_id: i64,
+    actor: Option<&str>,
+    action: &str,
+    summary: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO storyboard_events (storyboard_id, actor, action, summary, at) \
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        (storyboard_id, actor, action, summary),
+    )?;
+    Ok(())
+}
+
+/// Reads a storyboard's frames, ordered by id. Operates on any `Connection`
+/// (including an open transaction) so a delete can echo an atomic snapshot.
+fn read_frames(conn: &Connection, storyboard_id: i64) -> Result<Vec<Frame>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {FRAME_COLUMNS} FROM frames WHERE storyboard_id = ?1 ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([storyboard_id], row_to_frame)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Reads a storyboard's edges, ordered by id. Operates on any `Connection`
+/// (including an open transaction).
+fn read_edges(conn: &Connection, storyboard_id: i64) -> Result<Vec<FrameEdge>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EDGE_COLUMNS} FROM frame_edges WHERE storyboard_id = ?1 ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([storyboard_id], row_to_edge)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Fields to change on a project; `None` means leave unchanged.
 #[derive(Debug, Default, Clone)]
 pub struct ProjectPatch {
@@ -162,6 +307,57 @@ pub struct TaskPatch {
     pub acceptance: Option<Option<String>>,
     /// `Some(None)` clears the artifact (work-receipt) field.
     pub artifact: Option<Option<String>>,
+}
+
+/// Fields to change on a storyboard; `None` means leave unchanged. A
+/// storyboard's project and `author` (its creator) are immutable, so there is
+/// deliberately no field for either.
+#[derive(Debug, Default, Clone)]
+pub struct StoryboardPatch {
+    pub title: Option<String>,
+    /// `Some(None)` clears the description.
+    pub description: Option<Option<String>>,
+}
+
+/// A new frame to add to a storyboard. Coordinates and size are caller-supplied
+/// (the CLI/API apply sensible defaults); `task_id`, if given, must reference a
+/// task in the storyboard's project.
+#[derive(Debug, Clone)]
+pub struct FrameNew {
+    pub title: String,
+    pub body: Option<String>,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub color: Option<String>,
+    pub task_id: Option<i64>,
+    pub author: Option<String>,
+}
+
+/// Fields to change on a frame; `None` means leave unchanged. A frame's
+/// storyboard and `author` are immutable.
+#[derive(Debug, Default, Clone)]
+pub struct FramePatch {
+    pub title: Option<String>,
+    /// `Some(None)` clears the body.
+    pub body: Option<Option<String>>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub w: Option<f64>,
+    pub h: Option<f64>,
+    /// `Some(None)` clears the colour.
+    pub color: Option<Option<String>>,
+    /// `Some(None)` unlinks the frame from its task.
+    pub task_id: Option<Option<i64>>,
+}
+
+/// Fields to change on an edge; `None` means leave unchanged. Only the label is
+/// mutable — endpoints and author are fixed at creation.
+#[derive(Debug, Default, Clone)]
+pub struct EdgePatch {
+    /// `Some(None)` clears the label.
+    pub label: Option<Option<String>>,
 }
 
 /// Result of `next_task`: either the single actionable task, or — when none is
@@ -707,6 +903,500 @@ impl Store {
     /// close a cycle. DFS over the full edge set.
     fn would_cycle(&self, task_id: i64, blocker_id: i64) -> Result<bool> {
         would_cycle(&self.conn, task_id, blocker_id)
+    }
+
+    // ---- storyboards ----
+
+    /// Creates a storyboard in an existing project. The project is fixed at
+    /// creation (immutable thereafter), mirroring tasks.
+    pub fn create_storyboard(
+        &mut self,
+        project_id: i64,
+        title: &str,
+        description: Option<&str>,
+        author: Option<&str>,
+    ) -> Result<Storyboard> {
+        let project_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |r| r.get(0),
+        )?;
+        if !project_exists {
+            return Err(Error::Validation(format!("project {project_id} not found")));
+        }
+        let id = {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO storyboards (project_id, title, description, author, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'))",
+                (project_id, title, description, author),
+            )?;
+            let id = tx.last_insert_rowid();
+            insert_storyboard_event(
+                &tx,
+                id,
+                author,
+                "storyboard_created",
+                &format!("created storyboard '{title}'"),
+            )?;
+            tx.commit()?;
+            id
+        };
+        self.get_storyboard(id)
+    }
+
+    pub fn get_storyboard(&self, id: i64) -> Result<Storyboard> {
+        self.conn
+            .query_row(
+                &format!("SELECT {STORYBOARD_COLUMNS} FROM storyboards WHERE id = ?1"),
+                [id],
+                row_to_storyboard,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("storyboard {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Lists storyboards, newest activity is not implied — ordered by id.
+    /// Scoped to `project` if given. Frames and edges are omitted (the compact
+    /// list shape); use `get_storyboard_view` for a board's full contents.
+    pub fn list_storyboards(&self, project: Option<i64>) -> Result<Vec<Storyboard>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STORYBOARD_COLUMNS} FROM storyboards \
+             WHERE (?1 IS NULL OR project_id = ?1) ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([project], row_to_storyboard)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Returns a board's full contents: the storyboard plus its frames and
+    /// edges (each ordered by id). `NotFound` if the board is absent.
+    pub fn get_storyboard_view(&self, id: i64) -> Result<StoryboardView> {
+        let storyboard = self.get_storyboard(id)?;
+        let frames = read_frames(&self.conn, id)?;
+        let edges = read_edges(&self.conn, id)?;
+        Ok(StoryboardView {
+            storyboard,
+            frames,
+            edges,
+        })
+    }
+
+    pub fn update_storyboard(
+        &mut self,
+        id: i64,
+        patch: &StoryboardPatch,
+        actor: Option<&str>,
+    ) -> Result<Storyboard> {
+        let current = self.get_storyboard(id)?;
+        let mut sb = current.clone();
+        if let Some(title) = &patch.title {
+            sb.title = title.clone();
+        }
+        if let Some(description) = &patch.description {
+            sb.description = description.clone();
+        }
+        // No-op patch: change nothing and log nothing, so the history records
+        // only real edits (and the CLI and API agree on the outcome).
+        if sb == current {
+            return Ok(current);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE storyboards SET title = ?1, description = ?2, updated_at = datetime('now') \
+             WHERE id = ?3",
+            (&sb.title, &sb.description, id),
+        )?;
+        insert_storyboard_event(&tx, id, actor, "storyboard_edited", "edited board details")?;
+        tx.commit()?;
+        self.get_storyboard(id)
+    }
+
+    /// Deletes a storyboard and all its frames, edges, and history (cascade).
+    /// Returns the full destroyed contents so the transcript stays a recoverable
+    /// record. The echo read and the delete run in one transaction, so the
+    /// echoed contents exactly match what was destroyed even under a concurrent
+    /// writer. No change-history row is written: the board's history dies with
+    /// it, and the delete echo is the recoverable record.
+    pub fn delete_storyboard(&mut self, id: i64) -> Result<StoryboardView> {
+        let tx = self.conn.transaction()?;
+        let storyboard = tx
+            .query_row(
+                &format!("SELECT {STORYBOARD_COLUMNS} FROM storyboards WHERE id = ?1"),
+                [id],
+                row_to_storyboard,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("storyboard {id} not found"))
+                }
+                e => Error::Db(e),
+            })?;
+        let frames = read_frames(&tx, id)?;
+        let edges = read_edges(&tx, id)?;
+        tx.execute("DELETE FROM storyboards WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(StoryboardView {
+            storyboard,
+            frames,
+            edges,
+        })
+    }
+
+    /// Lists a storyboard's change history, oldest first. `NotFound` if the
+    /// board is absent.
+    pub fn list_storyboard_events(&self, storyboard_id: i64) -> Result<Vec<StoryboardEvent>> {
+        self.get_storyboard(storyboard_id)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STORYBOARD_EVENT_COLUMNS} FROM storyboard_events \
+             WHERE storyboard_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([storyboard_id], row_to_storyboard_event)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- frames ----
+
+    /// Adds a frame to an existing storyboard. An unknown storyboard is a
+    /// validation error (the id is a request parameter, like a task's project).
+    /// A `task_id`, if given, must reference a task in the board's project.
+    pub fn create_frame(&mut self, storyboard_id: i64, new: &FrameNew) -> Result<Frame> {
+        let project_id = match self.get_storyboard(storyboard_id) {
+            Ok(sb) => sb.project_id,
+            Err(Error::NotFound(_)) => {
+                return Err(Error::Validation(format!(
+                    "storyboard {storyboard_id} not found"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(task_id) = new.task_id {
+            self.check_frame_task(task_id, project_id)?;
+        }
+        let id = {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO frames \
+                 (storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
+                rusqlite::params![
+                    storyboard_id,
+                    new.title,
+                    new.body,
+                    new.x,
+                    new.y,
+                    new.w,
+                    new.h,
+                    new.color,
+                    new.task_id,
+                    new.author,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            insert_storyboard_event(
+                &tx,
+                storyboard_id,
+                new.author.as_deref(),
+                "frame_added",
+                &format!("added frame '{}' (#{id})", new.title),
+            )?;
+            tx.commit()?;
+            id
+        };
+        self.get_frame(id)
+    }
+
+    pub fn get_frame(&self, id: i64) -> Result<Frame> {
+        self.conn
+            .query_row(
+                &format!("SELECT {FRAME_COLUMNS} FROM frames WHERE id = ?1"),
+                [id],
+                row_to_frame,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("frame {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    pub fn update_frame(
+        &mut self,
+        id: i64,
+        patch: &FramePatch,
+        actor: Option<&str>,
+    ) -> Result<Frame> {
+        let current = self.get_frame(id)?;
+        let mut f = current.clone();
+        if let Some(title) = &patch.title {
+            f.title = title.clone();
+        }
+        if let Some(body) = &patch.body {
+            f.body = body.clone();
+        }
+        if let Some(x) = patch.x {
+            f.x = x;
+        }
+        if let Some(y) = patch.y {
+            f.y = y;
+        }
+        if let Some(w) = patch.w {
+            f.w = w;
+        }
+        if let Some(h) = patch.h {
+            f.h = h;
+        }
+        if let Some(color) = &patch.color {
+            f.color = color.clone();
+        }
+        if let Some(task_id) = patch.task_id {
+            if let Some(tid) = task_id {
+                let sb = self.get_storyboard(f.storyboard_id)?;
+                self.check_frame_task(tid, sb.project_id)?;
+            }
+            f.task_id = task_id;
+        }
+        // No-op patch (every field re-set to its current value): change nothing
+        // and log nothing, so the history records only real edits.
+        if f == current {
+            return Ok(current);
+        }
+        // A change touching only geometry is a "move"; anything else is an edit.
+        let only_geometry = patch.title.is_none()
+            && patch.body.is_none()
+            && patch.color.is_none()
+            && patch.task_id.is_none()
+            && (patch.x.is_some() || patch.y.is_some() || patch.w.is_some() || patch.h.is_some());
+        let (action, summary) = if only_geometry {
+            ("frame_moved", format!("moved frame '{}' (#{id})", f.title))
+        } else {
+            ("frame_edited", format!("edited frame '{}' (#{id})", f.title))
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE frames SET title = ?1, body = ?2, x = ?3, y = ?4, w = ?5, h = ?6, \
+             color = ?7, task_id = ?8, updated_at = datetime('now') WHERE id = ?9",
+            rusqlite::params![
+                f.title, f.body, f.x, f.y, f.w, f.h, f.color, f.task_id, id,
+            ],
+        )?;
+        insert_storyboard_event(&tx, f.storyboard_id, actor, action, &summary)?;
+        tx.commit()?;
+        self.get_frame(id)
+    }
+
+    /// Deletes a frame and the edges touching it (cascade). Returns the frame
+    /// and the destroyed edges so the transcript is a recoverable record.
+    pub fn delete_frame(
+        &mut self,
+        id: i64,
+        actor: Option<&str>,
+    ) -> Result<(Frame, Vec<FrameEdge>)> {
+        let frame = self.get_frame(id)?;
+        let tx = self.conn.transaction()?;
+        // Snapshot the touching edges and delete the frame in one transaction,
+        // so the echo exactly matches the edges the cascade destroys.
+        let edges = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {EDGE_COLUMNS} FROM frame_edges \
+                 WHERE from_frame = ?1 OR to_frame = ?1 ORDER BY id"
+            ))?;
+            let rows = stmt.query_map([id], row_to_edge)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute("DELETE FROM frames WHERE id = ?1", [id])?;
+        insert_storyboard_event(
+            &tx,
+            frame.storyboard_id,
+            actor,
+            "frame_removed",
+            &format!("removed frame '{}' (#{id})", frame.title),
+        )?;
+        tx.commit()?;
+        Ok((frame, edges))
+    }
+
+    /// Validates that `task_id` exists and belongs to `project_id` (a frame may
+    /// only link a task in its board's project), mirroring `check_parent`.
+    fn check_frame_task(&self, task_id: i64, project_id: i64) -> Result<()> {
+        let task_project: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(Error::Db(e)),
+            })?;
+        let Some(task_project) = task_project else {
+            return Err(Error::Validation(format!("task {task_id} not found")));
+        };
+        if task_project != project_id {
+            return Err(Error::Validation(format!(
+                "task {task_id} belongs to project {task_project}, not the storyboard's \
+                 project {project_id}: a frame may only link a task in its own project"
+            )));
+        }
+        Ok(())
+    }
+
+    // ---- edges ----
+
+    /// Connects two frames of the same storyboard with a directed edge. Rejects
+    /// an unknown board, a self-edge, or an endpoint that is not a frame of this
+    /// board — all validation errors. Cycles are allowed.
+    pub fn create_edge(
+        &mut self,
+        storyboard_id: i64,
+        from_frame: i64,
+        to_frame: i64,
+        label: Option<&str>,
+        author: Option<&str>,
+    ) -> Result<FrameEdge> {
+        let storyboard_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM storyboards WHERE id = ?1)",
+            [storyboard_id],
+            |r| r.get(0),
+        )?;
+        if !storyboard_exists {
+            return Err(Error::Validation(format!(
+                "storyboard {storyboard_id} not found"
+            )));
+        }
+        if from_frame == to_frame {
+            return Err(Error::Validation(format!(
+                "frame {from_frame} cannot connect to itself"
+            )));
+        }
+        self.check_frame_in_storyboard(from_frame, storyboard_id, "from")?;
+        self.check_frame_in_storyboard(to_frame, storyboard_id, "to")?;
+        let summary = match label {
+            Some(l) if !l.is_empty() => {
+                format!("connected #{from_frame} \u{2192} #{to_frame} ({l})")
+            }
+            _ => format!("connected #{from_frame} \u{2192} #{to_frame}"),
+        };
+        let id = {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO frame_edges (storyboard_id, from_frame, to_frame, label, author, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                (storyboard_id, from_frame, to_frame, label, author),
+            )?;
+            let id = tx.last_insert_rowid();
+            insert_storyboard_event(&tx, storyboard_id, author, "edge_added", &summary)?;
+            tx.commit()?;
+            id
+        };
+        self.get_edge(id)
+    }
+
+    pub fn get_edge(&self, id: i64) -> Result<FrameEdge> {
+        self.conn
+            .query_row(
+                &format!("SELECT {EDGE_COLUMNS} FROM frame_edges WHERE id = ?1"),
+                [id],
+                row_to_edge,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("edge {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    pub fn update_edge(
+        &mut self,
+        id: i64,
+        patch: &EdgePatch,
+        actor: Option<&str>,
+    ) -> Result<FrameEdge> {
+        let current = self.get_edge(id)?;
+        let mut edge = current.clone();
+        if let Some(label) = &patch.label {
+            edge.label = label.clone();
+        }
+        // No-op patch: change nothing and log nothing.
+        if edge == current {
+            return Ok(current);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE frame_edges SET label = ?1 WHERE id = ?2",
+            (&edge.label, id),
+        )?;
+        insert_storyboard_event(
+            &tx,
+            edge.storyboard_id,
+            actor,
+            "edge_relabeled",
+            &format!(
+                "relabeled edge #{} \u{2192} #{}",
+                edge.from_frame, edge.to_frame
+            ),
+        )?;
+        tx.commit()?;
+        self.get_edge(id)
+    }
+
+    pub fn delete_edge(&mut self, id: i64, actor: Option<&str>) -> Result<FrameEdge> {
+        let edge = self.get_edge(id)?;
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM frame_edges WHERE id = ?1", [id])?;
+        insert_storyboard_event(
+            &tx,
+            edge.storyboard_id,
+            actor,
+            "edge_removed",
+            &format!(
+                "removed edge #{} \u{2192} #{}",
+                edge.from_frame, edge.to_frame
+            ),
+        )?;
+        tx.commit()?;
+        Ok(edge)
+    }
+
+    /// Validates that `frame_id` exists and belongs to `storyboard_id`. `which`
+    /// ("from"/"to") names the offending endpoint in the error message.
+    fn check_frame_in_storyboard(
+        &self,
+        frame_id: i64,
+        storyboard_id: i64,
+        which: &str,
+    ) -> Result<()> {
+        let frame_board: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT storyboard_id FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(Error::Db(e)),
+            })?;
+        let Some(frame_board) = frame_board else {
+            return Err(Error::Validation(format!(
+                "{which} frame {frame_id} not found"
+            )));
+        };
+        if frame_board != storyboard_id {
+            return Err(Error::Validation(format!(
+                "{which} frame {frame_id} belongs to storyboard {frame_board}, not \
+                 storyboard {storyboard_id}: an edge must connect two frames of the same board"
+            )));
+        }
+        Ok(())
     }
 
     // ---- backup ----
@@ -1511,5 +2201,500 @@ mod tests {
         // reopening an already-migrated db must not fail
         let store = Store::open(&path).unwrap();
         assert!(store.list_projects().unwrap().is_empty());
+    }
+
+    // ---- storyboards ----
+
+    fn frame_new(title: &str) -> FrameNew {
+        FrameNew {
+            title: title.into(),
+            body: None,
+            x: 10.0,
+            y: 20.0,
+            w: 240.0,
+            h: 140.0,
+            color: None,
+            task_id: None,
+            author: None,
+        }
+    }
+
+    #[test]
+    fn storyboard_crud_round_trip_with_view() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "flow", Some("the happy path"), Some("agent-1"))
+            .unwrap();
+        assert_eq!(sb.title, "flow");
+        assert_eq!(sb.description.as_deref(), Some("the happy path"));
+        assert_eq!(sb.author.as_deref(), Some("agent-1"));
+        assert_eq!(sb.created_at, sb.updated_at);
+
+        assert_eq!(store.get_storyboard(sb.id).unwrap(), sb);
+        assert_eq!(store.list_storyboards(None).unwrap(), vec![sb.clone()]);
+        assert_eq!(store.list_storyboards(Some(p.id)).unwrap(), vec![sb.clone()]);
+        assert!(store.list_storyboards(Some(p.id + 1)).unwrap().is_empty());
+
+        // empty board view
+        let view = store.get_storyboard_view(sb.id).unwrap();
+        assert_eq!(view.storyboard, sb);
+        assert!(view.frames.is_empty());
+        assert!(view.edges.is_empty());
+
+        let updated = store
+            .update_storyboard(
+                sb.id,
+                &StoryboardPatch {
+                    title: Some("renamed".into()),
+                    description: Some(None),
+                },
+                Some("agent-2"),
+            )
+            .unwrap();
+        assert_eq!(updated.title, "renamed");
+        assert_eq!(updated.description, None);
+        // author is immutable; project is immutable.
+        assert_eq!(updated.author.as_deref(), Some("agent-1"));
+        assert_eq!(updated.project_id, p.id);
+
+        let destroyed = store.delete_storyboard(sb.id).unwrap();
+        assert_eq!(destroyed.storyboard.id, sb.id);
+        assert!(matches!(
+            store.get_storyboard(sb.id),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn create_storyboard_unknown_project_is_validation_error() {
+        let (mut store, _dir) = temp_store();
+        let err = store
+            .create_storyboard(999, "orphan", None, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn frame_crud_and_view_ordering() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+
+        let f1 = store
+            .create_frame(
+                sb.id,
+                &FrameNew {
+                    body: Some("note".into()),
+                    color: Some("#00e5ff".into()),
+                    author: Some("user".into()),
+                    ..frame_new("first")
+                },
+            )
+            .unwrap();
+        assert_eq!(f1.title, "first");
+        assert_eq!(f1.body.as_deref(), Some("note"));
+        assert_eq!(f1.x, 10.0);
+        assert_eq!(f1.h, 140.0);
+        assert_eq!(f1.color.as_deref(), Some("#00e5ff"));
+        assert_eq!(f1.task_id, None);
+
+        let f2 = store.create_frame(sb.id, &frame_new("second")).unwrap();
+
+        // The view lists frames by id.
+        let view = store.get_storyboard_view(sb.id).unwrap();
+        let ids: Vec<i64> = view.frames.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![f1.id, f2.id]);
+
+        // Move + relabel + clear body.
+        let moved = store
+            .update_frame(
+                f1.id,
+                &FramePatch {
+                    title: Some("renamed".into()),
+                    body: Some(None),
+                    x: Some(99.5),
+                    y: Some(88.0),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(moved.title, "renamed");
+        assert_eq!(moved.body, None);
+        assert_eq!(moved.x, 99.5);
+        assert_eq!(moved.y, 88.0);
+        // untouched dimensions persist
+        assert_eq!(moved.w, 240.0);
+
+        let (deleted, edges) = store.delete_frame(f2.id, None).unwrap();
+        assert_eq!(deleted.id, f2.id);
+        assert!(edges.is_empty());
+        assert!(matches!(store.get_frame(f2.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn create_frame_unknown_storyboard_is_validation_error() {
+        let (mut store, _dir) = temp_store();
+        let err = store.create_frame(999, &frame_new("x")).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn frame_task_link_must_be_same_project_and_nulls_on_task_delete() {
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None).unwrap();
+        let p2 = store.create_project("p2", None).unwrap();
+        let sb = store.create_storyboard(p1.id, "b", None, None).unwrap();
+        let t1 = add_task(&mut store, p1.id, "in p1");
+        let t2 = add_task(&mut store, p2.id, "in p2");
+
+        // cross-project link rejected
+        let err = store
+            .create_frame(
+                sb.id,
+                &FrameNew {
+                    task_id: Some(t2.id),
+                    ..frame_new("bad")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // unknown task rejected
+        let err = store
+            .create_frame(
+                sb.id,
+                &FrameNew {
+                    task_id: Some(9999),
+                    ..frame_new("bad")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // same-project link accepted
+        let f = store
+            .create_frame(
+                sb.id,
+                &FrameNew {
+                    task_id: Some(t1.id),
+                    ..frame_new("good")
+                },
+            )
+            .unwrap();
+        assert_eq!(f.task_id, Some(t1.id));
+
+        // update cross-project link rejected
+        let err = store
+            .update_frame(
+                f.id,
+                &FramePatch {
+                    task_id: Some(Some(t2.id)),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // deleting the linked task nulls the reference (ON DELETE SET NULL)
+        store.delete_task(t1.id).unwrap();
+        assert_eq!(store.get_frame(f.id).unwrap().task_id, None);
+    }
+
+    #[test]
+    fn edge_crud_rejects_self_and_foreign_frames_and_allows_cycles() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let other = store.create_storyboard(p.id, "other", None, None).unwrap();
+        let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        let foreign = store.create_frame(other.id, &frame_new("foreign")).unwrap();
+
+        // self-edge rejected
+        let err = store.create_edge(sb.id, a.id, a.id, None, None).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // endpoint not on this board rejected
+        let err = store
+            .create_edge(sb.id, a.id, foreign.id, None, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // unknown storyboard rejected
+        let err = store.create_edge(999, a.id, b.id, None, None).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // valid edge, and the reverse edge too: cycles are allowed
+        let e1 = store
+            .create_edge(sb.id, a.id, b.id, Some("then"), Some("user"))
+            .unwrap();
+        assert_eq!(e1.from_frame, a.id);
+        assert_eq!(e1.to_frame, b.id);
+        assert_eq!(e1.label.as_deref(), Some("then"));
+        let e2 = store.create_edge(sb.id, b.id, a.id, None, None).unwrap();
+
+        let view = store.get_storyboard_view(sb.id).unwrap();
+        assert_eq!(view.edges.len(), 2);
+
+        // relabel + clear
+        let relabelled = store
+            .update_edge(
+                e1.id,
+                &EdgePatch {
+                    label: Some(Some("next".into())),
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(relabelled.label.as_deref(), Some("next"));
+        let cleared = store
+            .update_edge(e1.id, &EdgePatch { label: Some(None) }, None)
+            .unwrap();
+        assert_eq!(cleared.label, None);
+
+        let deleted = store.delete_edge(e2.id, None).unwrap();
+        assert_eq!(deleted.id, e2.id);
+        assert!(matches!(store.get_edge(e2.id), Err(Error::NotFound(_))));
+        assert_eq!(store.get_storyboard_view(sb.id).unwrap().edges.len(), 1);
+    }
+
+    #[test]
+    fn delete_frame_cascades_edges_and_echoes_them() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        let c = store.create_frame(sb.id, &frame_new("c")).unwrap();
+        let e_ab = store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
+        let e_ba = store.create_edge(sb.id, b.id, a.id, None, None).unwrap();
+        let e_bc = store.create_edge(sb.id, b.id, c.id, None, None).unwrap();
+
+        // deleting b removes the two edges touching it, not e? none other; a-c has none
+        let (deleted, edges) = store.delete_frame(b.id, None).unwrap();
+        assert_eq!(deleted.id, b.id);
+        let edge_ids: HashSet<i64> = edges.iter().map(|e| e.id).collect();
+        assert_eq!(edge_ids, HashSet::from([e_ab.id, e_ba.id, e_bc.id]));
+
+        // a and c survive; no edges remain
+        assert_eq!(store.get_frame(a.id).unwrap().id, a.id);
+        assert_eq!(store.get_frame(c.id).unwrap().id, c.id);
+        assert!(store.get_storyboard_view(sb.id).unwrap().edges.is_empty());
+    }
+
+    #[test]
+    fn delete_storyboard_cascades_and_echoes_full_view() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
+
+        let view = store.delete_storyboard(sb.id).unwrap();
+        assert_eq!(view.frames.len(), 2);
+        assert_eq!(view.edges.len(), 1);
+        // gone, with frames and edges cascaded
+        assert!(matches!(
+            store.get_storyboard(sb.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(store.get_frame(a.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn delete_project_cascades_storyboards() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("doomed", None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
+
+        store.delete_project(p.id).unwrap();
+        assert!(matches!(
+            store.get_storyboard(sb.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(store.get_frame(a.id), Err(Error::NotFound(_))));
+        assert!(matches!(store.get_edge(1), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn storyboard_change_history_records_actor_and_actions() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "flow", None, Some("agent-1"))
+            .unwrap();
+        let a = store
+            .create_frame(
+                sb.id,
+                &FrameNew {
+                    author: Some("user".into()),
+                    ..frame_new("a")
+                },
+            )
+            .unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        let e = store
+            .create_edge(sb.id, a.id, b.id, Some("then"), Some("user"))
+            .unwrap();
+
+        // a move (geometry only) vs an edit (a field change)
+        store
+            .update_frame(
+                a.id,
+                &FramePatch {
+                    x: Some(200.0),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        store
+            .update_frame(
+                a.id,
+                &FramePatch {
+                    title: Some("A!".into()),
+                    ..Default::default()
+                },
+                Some("agent-2"),
+            )
+            .unwrap();
+        store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    label: Some(Some("next".into())),
+                },
+                Some("user"),
+            )
+            .unwrap();
+        store.delete_edge(e.id, Some("agent-2")).unwrap();
+
+        let events = store.list_storyboard_events(sb.id).unwrap();
+        let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                "storyboard_created",
+                "frame_added",
+                "frame_added",
+                "edge_added",
+                "frame_moved",
+                "frame_edited",
+                "edge_relabeled",
+                "edge_removed",
+            ]
+        );
+        // attribution: who did what
+        assert_eq!(events[0].actor.as_deref(), Some("agent-1"));
+        assert_eq!(events[1].actor.as_deref(), Some("user"));
+        assert_eq!(events[2].actor, None); // frame b had no author
+        assert_eq!(events[5].actor.as_deref(), Some("agent-2")); // the edit
+        assert_eq!(events[7].actor.as_deref(), Some("agent-2")); // the delete
+        // summaries carry a human-readable line
+        assert!(events[4].summary.contains("moved frame"));
+        assert!(events[1].summary.contains("added frame 'a'"));
+
+        // deleting a frame logs a removal on the surviving board
+        store.delete_frame(a.id, Some("user")).unwrap();
+        let events = store.list_storyboard_events(sb.id).unwrap();
+        assert_eq!(events.last().unwrap().action, "frame_removed");
+        assert_eq!(events.last().unwrap().actor.as_deref(), Some("user"));
+
+        // history dies with the board; unknown board is NotFound
+        assert!(matches!(
+            store.list_storyboard_events(9999),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_storyboard_cascades_its_change_history() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        store.create_frame(sb.id, &frame_new("a")).unwrap();
+        assert!(!store.list_storyboard_events(sb.id).unwrap().is_empty());
+        store.delete_storyboard(sb.id).unwrap();
+        // a fresh board reuses no rows; the orphaned events are gone
+        let sb2 = store.create_storyboard(p.id, "b2", None, None).unwrap();
+        let events = store.list_storyboard_events(sb2.id).unwrap();
+        assert_eq!(events.len(), 1); // only its own creation
+        assert_eq!(events[0].action, "storyboard_created");
+    }
+
+    #[test]
+    fn no_op_update_changes_nothing_and_logs_nothing() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", Some("d"), None)
+            .unwrap();
+        let f = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let g = store.create_frame(sb.id, &frame_new("g")).unwrap();
+        let e = store
+            .create_edge(sb.id, f.id, g.id, Some("lbl"), None)
+            .unwrap();
+        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let frame_updated_at = store.get_frame(f.id).unwrap().updated_at;
+
+        // Re-set every field to its current value: no change, no event, and
+        // updated_at is not bumped.
+        store
+            .update_storyboard(
+                sb.id,
+                &StoryboardPatch {
+                    title: Some("b".into()),
+                    description: Some(Some("d".into())),
+                },
+                Some("noop"),
+            )
+            .unwrap();
+        store
+            .update_frame(
+                f.id,
+                &FramePatch {
+                    title: Some("a".into()),
+                    x: Some(f.x),
+                    ..Default::default()
+                },
+                Some("noop"),
+            )
+            .unwrap();
+        store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    label: Some(Some("lbl".into())),
+                },
+                Some("noop"),
+            )
+            .unwrap();
+        assert_eq!(store.list_storyboard_events(sb.id).unwrap().len(), before);
+        assert_eq!(store.get_frame(f.id).unwrap().updated_at, frame_updated_at);
+
+        // A real change still logs one event.
+        store
+            .update_frame(
+                f.id,
+                &FramePatch {
+                    x: Some(f.x + 5.0),
+                    ..Default::default()
+                },
+                Some("mover"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_storyboard_events(sb.id).unwrap().len(),
+            before + 1
+        );
     }
 }

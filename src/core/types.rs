@@ -161,3 +161,105 @@ impl From<&Task> for TaskSummary {
         }
     }
 }
+
+/// A visual storyboard: a freeform spatial canvas of frames (cards) and the
+/// directed edges between them. Belongs to a project, fixed at creation (like a
+/// task). `author` is a free-text actor id — an agent name or "user" — naming
+/// who created the board. Collaboration is asynchronous and attribution-based:
+/// many agents and users edit one board over time; there is no live-sync, no
+/// auth, and no locking (consistent with the rest of mesa).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct Storyboard {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub project_id: i64,
+    pub title: String,
+    pub description: Option<String>,
+    /// Free-text actor id that created the board (an agent name or "user").
+    pub author: Option<String>,
+    /// When the board was created (SQLite `datetime` text, UTC).
+    pub created_at: String,
+    /// When the board was last changed (SQLite `datetime` text, UTC).
+    pub updated_at: String,
+}
+
+/// One card on a storyboard, positioned freely on the canvas. `x`/`y` are the
+/// top-left corner and `w`/`h` the size, in abstract canvas units the web
+/// renders as pixels. `body` is free text (markdown by convention). `task_id`
+/// optionally links the frame to an existing task in the *same project* — a
+/// soft reference that is set to null if the task is later deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct Frame {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub storyboard_id: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// Free-text colour hint for the web canvas (a CSS colour, e.g. `#00e5ff`).
+    pub color: Option<String>,
+    #[ts(type = "number | null")]
+    pub task_id: Option<i64>,
+    /// Free-text actor id that created the frame (an agent name or "user").
+    pub author: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A directed connection from one frame to another on the same storyboard.
+/// Unlike task dependencies, storyboard edges may form cycles freely — a
+/// storyboard is a freeform diagram, not a dependency graph. Self-edges
+/// (`from_frame == to_frame`) are the only rejected shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FrameEdge {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub storyboard_id: i64,
+    #[ts(type = "number")]
+    pub from_frame: i64,
+    #[ts(type = "number")]
+    pub to_frame: i64,
+    pub label: Option<String>,
+    /// Free-text actor id that created the edge (an agent name or "user").
+    pub author: Option<String>,
+    pub created_at: String,
+}
+
+/// The full contents of one storyboard: the board plus all of its frames and
+/// edges. Returned by `show` and echoed by `delete`, so a client renders (or
+/// recovers) an entire canvas from a single object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct StoryboardView {
+    pub storyboard: Storyboard,
+    pub frames: Vec<Frame>,
+    pub edges: Vec<FrameEdge>,
+}
+
+/// One entry in a storyboard's append-only change history. `actor` is the
+/// free-text id of whoever made the change (an agent name or "user"); it is the
+/// collaboration record — who did what, when. `action` is a stable machine
+/// token (e.g. `frame_added`, `frame_moved`, `edge_added`); `summary` is a
+/// human-readable one-liner for the web history view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct StoryboardEvent {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub storyboard_id: i64,
+    pub actor: Option<String>,
+    pub action: String,
+    pub summary: String,
+    /// When the change happened (SQLite `datetime` text, UTC).
+    pub at: String,
+}

@@ -193,6 +193,9 @@ export function ProjectTasksPage({
         )}
         <p className="project-actions">
           <button onClick={openCreate}>add task</button>
+          <a className="action-link" href={`#/projects/${projectId}/storyboards`}>
+            storyboards →
+          </a>
           <ConfirmDelete
             label="delete project"
             message={`Deletes this project and ${allTasks?.length ?? '?'} task(s).`}

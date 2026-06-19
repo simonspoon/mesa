@@ -18,12 +18,15 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::core::{Error, Priority, ProjectPatch, Status, Store, TaskPatch, TaskSummary};
+use crate::core::{
+    EdgePatch, Error, FrameNew, FramePatch, Priority, ProjectPatch, Status, Store, StoryboardPatch,
+    TaskPatch, TaskSummary,
+};
 
 /// The Vite build output, embedded into the binary at compile time.
 /// `scripts/build.sh` guarantees `frontend/dist` is built before the release
@@ -75,6 +78,21 @@ fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
+        .route(
+            "/api/storyboards",
+            get(list_storyboards).post(create_storyboard),
+        )
+        .route(
+            "/api/storyboards/{id}",
+            get(show_storyboard)
+                .patch(update_storyboard)
+                .delete(delete_storyboard),
+        )
+        .route("/api/storyboards/{id}/frames", post(create_frame))
+        .route("/api/storyboards/{id}/edges", post(create_edge))
+        .route("/api/storyboards/{id}/events", get(list_storyboard_events))
+        .route("/api/frames/{id}", patch(update_frame).delete(delete_frame))
+        .route("/api/edges/{id}", patch(update_edge).delete(delete_edge))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -395,4 +413,255 @@ async fn unblock_task(
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.remove_dependency(id, body.on)?).into_response())
+}
+
+// ---- storyboards ----
+
+#[derive(Deserialize)]
+struct StoryboardQuery {
+    #[serde(default)]
+    project: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct StoryboardCreate {
+    project_id: i64,
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Optional `?author=` for the change history on body-less mutations (DELETE).
+#[derive(Deserialize)]
+struct ActorQuery {
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StoryboardUpdate {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    description: Option<Option<String>>,
+    /// Recorded as the change author; does not alter the board's own author.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FrameCreate {
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    w: Option<f64>,
+    #[serde(default)]
+    h: Option<f64>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    task_id: Option<i64>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FrameUpdate {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    body: Option<Option<String>>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    w: Option<f64>,
+    #[serde(default)]
+    h: Option<f64>,
+    #[serde(default, deserialize_with = "double_option")]
+    color: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    task_id: Option<Option<i64>>,
+    /// Recorded as the change author; does not alter the frame's own author.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EdgeCreate {
+    from_frame: i64,
+    to_frame: i64,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EdgeUpdate {
+    #[serde(default, deserialize_with = "double_option")]
+    label: Option<Option<String>>,
+    /// Recorded as the change author.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+async fn list_storyboards(
+    State(state): State<AppState>,
+    Query(q): Query<StoryboardQuery>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_storyboards(q.project)?).into_response())
+}
+
+async fn create_storyboard(
+    State(state): State<AppState>,
+    body: Result<Json<StoryboardCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let storyboard = store.create_storyboard(
+        body.project_id,
+        &body.title,
+        body.description.as_deref(),
+        body.author.as_deref(),
+    )?;
+    Ok((StatusCode::CREATED, Json(storyboard)).into_response())
+}
+
+/// Returns the board's full contents: {storyboard, frames, edges}.
+async fn show_storyboard(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_storyboard_view(id)?).into_response())
+}
+
+async fn update_storyboard(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<StoryboardUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let patch = StoryboardPatch {
+        title: body.title,
+        description: body.description,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_storyboard(id, &patch, body.author.as_deref())?).into_response())
+}
+
+async fn delete_storyboard(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.delete_storyboard(id)?).into_response())
+}
+
+/// Storyboard change history (who/what/when), oldest first.
+async fn list_storyboard_events(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_storyboard_events(id)?).into_response())
+}
+
+async fn create_frame(
+    State(state): State<AppState>,
+    Path(storyboard_id): Path<i64>,
+    payload: Result<Json<FrameCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(payload) = payload?;
+    let new = FrameNew {
+        title: payload.title,
+        body: payload.body,
+        x: payload.x.unwrap_or(40.0),
+        y: payload.y.unwrap_or(40.0),
+        w: payload.w.unwrap_or(240.0),
+        h: payload.h.unwrap_or(140.0),
+        color: payload.color,
+        task_id: payload.task_id,
+        author: payload.author,
+    };
+    let mut store = state.store.lock().unwrap();
+    let frame = store.create_frame(storyboard_id, &new)?;
+    Ok((StatusCode::CREATED, Json(frame)).into_response())
+}
+
+async fn update_frame(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    payload: Result<Json<FrameUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(payload) = payload?;
+    let patch = FramePatch {
+        title: payload.title,
+        body: payload.body,
+        x: payload.x,
+        y: payload.y,
+        w: payload.w,
+        h: payload.h,
+        color: payload.color,
+        task_id: payload.task_id,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_frame(id, &patch, payload.author.as_deref())?).into_response())
+}
+
+async fn delete_frame(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<ActorQuery>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    let (frame, edges) = store.delete_frame(id, q.author.as_deref())?;
+    Ok(Json(json!({"frame": frame, "edges": edges})).into_response())
+}
+
+async fn create_edge(
+    State(state): State<AppState>,
+    Path(storyboard_id): Path<i64>,
+    body: Result<Json<EdgeCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let edge = store.create_edge(
+        storyboard_id,
+        body.from_frame,
+        body.to_frame,
+        body.label.as_deref(),
+        body.author.as_deref(),
+    )?;
+    Ok((StatusCode::CREATED, Json(edge)).into_response())
+}
+
+async fn update_edge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<EdgeUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let patch = EdgePatch { label: body.label };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_edge(id, &patch, body.author.as_deref())?).into_response())
+}
+
+async fn delete_edge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<ActorQuery>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.delete_edge(id, q.author.as_deref())?).into_response())
 }

@@ -2,9 +2,14 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
+import type { Frame } from './types/Frame'
+import type { FrameEdge } from './types/FrameEdge'
 import type { Priority } from './types/Priority'
 import type { Project } from './types/Project'
 import type { Status } from './types/Status'
+import type { Storyboard } from './types/Storyboard'
+import type { StoryboardEvent } from './types/StoryboardEvent'
+import type { StoryboardView } from './types/StoryboardView'
 import type { Task } from './types/Task'
 import type { TaskSummary } from './types/TaskSummary'
 
@@ -157,4 +162,138 @@ export function deleteTask(id: number): Promise<Task[]> {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+// ---- storyboards ----
+// The guard middleware requires a JSON Content-Type on every mutating method,
+// so even body-less DELETEs send the header (src/api.rs Requirement 7).
+
+function jsonDelete(): RequestInit {
+  return { method: 'DELETE', headers: { 'Content-Type': 'application/json' } }
+}
+
+/** `?author=` query for the change history on body-less DELETEs. */
+function actorQuery(author?: string): string {
+  return author ? `?author=${encodeURIComponent(author)}` : ''
+}
+
+export function listStoryboards(project?: number): Promise<Storyboard[]> {
+  const qs = project !== undefined ? `?project=${project}` : ''
+  return request(`/api/storyboards${qs}`)
+}
+
+/** A board's full contents in one object: the board plus its frames and edges. */
+export function getStoryboard(id: number): Promise<StoryboardView> {
+  return request(`/api/storyboards/${id}`)
+}
+
+/** The board's change history (who/what/when), oldest first. */
+export function listStoryboardEvents(id: number): Promise<StoryboardEvent[]> {
+  return request(`/api/storyboards/${id}/events`)
+}
+
+export interface StoryboardCreate {
+  project_id: number
+  title: string
+  description?: string
+  author?: string
+}
+
+export function createStoryboard(body: StoryboardCreate): Promise<Storyboard> {
+  return request('/api/storyboards', jsonInit('POST', body))
+}
+
+export interface StoryboardPatch {
+  title?: string
+  description?: string | null
+}
+
+export function updateStoryboard(
+  id: number,
+  patch: StoryboardPatch,
+  author?: string,
+): Promise<Storyboard> {
+  return request(`/api/storyboards/${id}`, jsonInit('PATCH', { ...patch, author }))
+}
+
+/** Returns the destroyed contents: the board plus all cascaded frames/edges. */
+export function deleteStoryboard(id: number): Promise<StoryboardView> {
+  return request(`/api/storyboards/${id}`, jsonDelete())
+}
+
+export interface FrameCreate {
+  title: string
+  body?: string
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+  color?: string
+  task_id?: number
+  author?: string
+}
+
+export function createFrame(
+  storyboardId: number,
+  body: FrameCreate,
+): Promise<Frame> {
+  return request(`/api/storyboards/${storyboardId}/frames`, jsonInit('POST', body))
+}
+
+export interface FramePatch {
+  title?: string
+  body?: string | null
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+  color?: string | null
+  task_id?: number | null
+}
+
+export function updateFrame(
+  id: number,
+  patch: FramePatch,
+  author?: string,
+): Promise<Frame> {
+  return request(`/api/frames/${id}`, jsonInit('PATCH', { ...patch, author }))
+}
+
+/** Returns the destroyed frame and the edges that cascaded with it. */
+export function deleteFrame(
+  id: number,
+  author?: string,
+): Promise<{ frame: Frame; edges: FrameEdge[] }> {
+  return request(`/api/frames/${id}${actorQuery(author)}`, jsonDelete())
+}
+
+export interface EdgeCreate {
+  from_frame: number
+  to_frame: number
+  label?: string
+  author?: string
+}
+
+export function createEdge(
+  storyboardId: number,
+  body: EdgeCreate,
+): Promise<FrameEdge> {
+  return request(`/api/storyboards/${storyboardId}/edges`, jsonInit('POST', body))
+}
+
+export interface EdgePatch {
+  label?: string | null
+}
+
+export function updateEdge(
+  id: number,
+  patch: EdgePatch,
+  author?: string,
+): Promise<FrameEdge> {
+  return request(`/api/edges/${id}`, jsonInit('PATCH', { ...patch, author }))
+}
+
+/** Returns the destroyed edge. */
+export function deleteEdge(id: number, author?: string): Promise<FrameEdge> {
+  return request(`/api/edges/${id}${actorQuery(author)}`, jsonDelete())
 }

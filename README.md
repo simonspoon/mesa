@@ -117,9 +117,9 @@ mesa serve --port 7770     # HTTP API + web UI on http://127.0.0.1:7770
 ```
 
 The server binds `127.0.0.1` only and exposes a REST API under `/api`
-(`/api/projects`, `/api/tasks`, plus `block`/`unblock`/`dependencies` actions),
-with the React web UI served at `/`. The web UI does not live-sync; it refetches
-on window focus.
+(`/api/projects`, `/api/tasks`, plus `block`/`unblock`/`dependencies` actions,
+and `/api/storyboards` with its `frames`/`edges`/`events`), with the React web
+UI served at `/`. The web UI does not live-sync; it refetches on window focus.
 
 **Security boundary** (there is no auth — it is a localhost tool):
 
@@ -139,6 +139,37 @@ on window focus.
   rejected. `blocked` is true while any blocker is not `done`/`cancelled`, and is
   derived on every read.
 - **Task event** — an append-only log of status changes (`mesa task events`).
+- **Storyboard** — a freeform visual canvas belonging to a project: **frames**
+  (cards at an `x/y` position, optionally linking a task in the same project)
+  joined by directed **edges** (arrows, with optional labels). Cycles between
+  frames are allowed (it is a diagram, not a dependency graph). Every change is
+  recorded in a **change history** that attributes who did what, when — so
+  agents and people building the same board over time can see each other's
+  edits. The web renders the graph as a draggable canvas; agents read and write
+  it as JSON.
+
+## Storyboards
+
+```bash
+# Create a board, add two frames, connect them — all stamped with an author
+SB=$(mesa storyboard create --project 1 "Onboarding flow" --author agent-7 | jq .id)
+A=$(mesa storyboard frame create --storyboard "$SB" "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
+B=$(mesa storyboard frame create --storyboard "$SB" "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
+mesa storyboard edge create --storyboard "$SB" --from "$A" --to "$B" --label "then" --author agent-7
+
+# Read the whole board in one call: {storyboard, frames, edges}
+mesa storyboard show "$SB"
+
+# See who changed what, when (the collaboration log)
+mesa storyboard events "$SB"
+```
+
+Frames carry free-text bodies (markdown by convention) and a colour; edges may
+form cycles. `mesa storyboard delete` cascades the board's frames, edges, and
+history, echoing the full destroyed contents. The web UI (under a project's
+**storyboards →** link) lets a person add and drag frames, draw and delete
+connections, edit a frame, and view the history — building the same board an
+agent drives from the CLI.
 
 ## Development
 
@@ -147,6 +178,7 @@ cargo test                  # Rust tests; store logic lives in src/core/store.rs
 cargo test <name>           # single test by name substring
 
 scripts/cli-check.sh        # CLI JSON-contract end-to-end gate
+scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)

@@ -16,7 +16,8 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    Error, ImportDoc, NextResult, Priority, ProjectPatch, Result, Status, Store, Task, TaskPatch,
+    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, Priority, ProjectPatch, Result,
+    Status, Store, StoryboardPatch, Task, TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -62,6 +63,9 @@ enum Command {
     /// Create, list, inspect, update, delete, and (un)block tasks
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Create and edit visual storyboards (frames + connecting edges)
+    #[command(subcommand)]
+    Storyboard(StoryboardCmd),
     /// Start the HTTP server and web UI
     ///
     /// Binds 127.0.0.1 only. Requests must carry a Host header of
@@ -328,6 +332,238 @@ EXAMPLES
     },
 }
 
+#[derive(Subcommand)]
+enum StoryboardCmd {
+    /// Create a storyboard in a project; prints the full created storyboard
+    ///
+    /// A storyboard belongs to exactly one project, fixed at creation. It is a
+    /// freeform canvas of frames (cards) and the edges between them; add those
+    /// with `storyboard frame create` and `storyboard edge create`.
+    #[command(after_help = "\
+EXAMPLES
+  mesa storyboard create --project 1 \"Onboarding flow\"
+  mesa storyboard create --project 1 \"Checkout\" --author agent-7")]
+    Create {
+        /// Project the storyboard belongs to (immutable after creation)
+        #[arg(long)]
+        project: i64,
+        /// Storyboard title
+        title: String,
+        /// Optional free-text description
+        #[arg(long)]
+        description: Option<String>,
+        /// Free-text actor id of the creator (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List storyboards as a bare JSON array (no frames/edges; use `show`)
+    List {
+        /// Only storyboards in this project
+        #[arg(long)]
+        project: Option<i64>,
+    },
+    /// Print a storyboard's full contents: {storyboard, frames, edges}
+    Show {
+        /// Storyboard id
+        id: i64,
+    },
+    /// Update a storyboard's title/description; prints the full storyboard
+    ///
+    /// Only the flags you pass change; at least one is required. The project
+    /// and author are immutable. `--description ""` clears the description.
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Storyboard id
+        id: i64,
+        /// New title
+        #[arg(long, group = "fields")]
+        title: Option<String>,
+        /// New description; pass "" to clear it
+        #[arg(long, group = "fields")]
+        description: Option<String>,
+        /// Free-text actor id for the change history (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Delete a storyboard AND all its frames and edges (no confirmation)
+    ///
+    /// Cascades immediately, including the change history. The output echoes the
+    /// full destroyed contents ({storyboard, frames, edges}) so the transcript
+    /// is a recoverable record.
+    Delete {
+        /// Storyboard id
+        id: i64,
+    },
+    /// Print a storyboard's change history as a JSON array, oldest first
+    ///
+    /// Each row records one change — who, what, when: {id, storyboard_id, actor,
+    /// action, summary, at}. `action` is a stable token (storyboard_created,
+    /// storyboard_edited, frame_added, frame_moved, frame_edited, frame_removed,
+    /// edge_added, edge_relabeled, edge_removed). This is the collaboration
+    /// record across agents and users.
+    Events {
+        /// Storyboard id
+        id: i64,
+    },
+    /// Create, update, and delete frames (cards) on a storyboard
+    #[command(subcommand)]
+    Frame(FrameCmd),
+    /// Create, update, and delete edges (connections) between frames
+    #[command(subcommand)]
+    Edge(EdgeCmd),
+}
+
+#[derive(Subcommand)]
+enum FrameCmd {
+    /// Add a frame to a storyboard; prints the full created frame
+    ///
+    /// Position (--x/--y) and size (--w/--h) are abstract canvas units the web
+    /// renders as pixels. `--task` links the frame to a task in the same
+    /// project (a soft reference, cleared if that task is later deleted).
+    #[command(after_help = "\
+EXAMPLES
+  mesa storyboard frame create --storyboard 1 \"Land on home\" --x 40 --y 40
+  mesa storyboard frame create --storyboard 1 \"Sign up\" --task 7 --color '#ff2bd6'")]
+    Create {
+        /// Storyboard the frame belongs to (immutable after creation)
+        #[arg(long)]
+        storyboard: i64,
+        /// Frame title
+        title: String,
+        /// Optional free-text body (markdown by convention)
+        #[arg(long)]
+        body: Option<String>,
+        /// X position of the top-left corner (canvas units)
+        #[arg(long, default_value_t = 40.0)]
+        x: f64,
+        /// Y position of the top-left corner (canvas units)
+        #[arg(long, default_value_t = 40.0)]
+        y: f64,
+        /// Width (canvas units)
+        #[arg(long, default_value_t = 240.0)]
+        w: f64,
+        /// Height (canvas units)
+        #[arg(long, default_value_t = 140.0)]
+        h: f64,
+        /// Optional colour hint (a CSS colour, e.g. '#00e5ff')
+        #[arg(long)]
+        color: Option<String>,
+        /// Optional task id to link (must be in the storyboard's project)
+        #[arg(long)]
+        task: Option<i64>,
+        /// Free-text actor id of the creator (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Update a frame; prints the full updated frame
+    ///
+    /// Only the flags you pass change; at least one is required. The storyboard
+    /// and author are immutable. `--body ""`/`--color ""` clear those fields;
+    /// `--no-task` unlinks the task.
+    #[command(after_help = "\
+EXAMPLES
+  mesa storyboard frame update 3 --x 120 --y 80     # move it
+  mesa storyboard frame update 3 --title \"Revised\" --no-task")]
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Frame id
+        id: i64,
+        /// New title
+        #[arg(long, group = "fields")]
+        title: Option<String>,
+        /// New body; pass "" to clear it
+        #[arg(long, group = "fields")]
+        body: Option<String>,
+        /// New X position (canvas units)
+        #[arg(long, group = "fields")]
+        x: Option<f64>,
+        /// New Y position (canvas units)
+        #[arg(long, group = "fields")]
+        y: Option<f64>,
+        /// New width (canvas units)
+        #[arg(long, group = "fields")]
+        w: Option<f64>,
+        /// New height (canvas units)
+        #[arg(long, group = "fields")]
+        h: Option<f64>,
+        /// New colour hint; pass "" to clear it
+        #[arg(long, group = "fields")]
+        color: Option<String>,
+        /// New linked task id (must be in the storyboard's project)
+        #[arg(long, group = "fields", conflicts_with = "no_task")]
+        task: Option<i64>,
+        /// Unlink the frame from its task
+        #[arg(long, group = "fields")]
+        no_task: bool,
+        /// Free-text actor id for the change history (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Delete a frame AND the edges touching it (no confirmation)
+    ///
+    /// The output echoes the destroyed frame and edges ({frame, edges}) so the
+    /// transcript is a recoverable record.
+    Delete {
+        /// Frame id
+        id: i64,
+        /// Free-text actor id for the change history (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EdgeCmd {
+    /// Connect two frames of a storyboard with a directed edge
+    ///
+    /// Both frames must belong to the storyboard. Self-edges are rejected
+    /// (code "validation"); cycles are allowed (a storyboard is a freeform
+    /// diagram, not a dependency graph).
+    #[command(after_help = "\
+EXAMPLES
+  mesa storyboard edge create --storyboard 1 --from 3 --to 4 --label \"then\"")]
+    Create {
+        /// Storyboard both frames belong to
+        #[arg(long)]
+        storyboard: i64,
+        /// Source frame id
+        #[arg(long)]
+        from: i64,
+        /// Destination frame id
+        #[arg(long)]
+        to: i64,
+        /// Optional edge label
+        #[arg(long)]
+        label: Option<String>,
+        /// Free-text actor id of the creator (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Update an edge's label; prints the full updated edge
+    ///
+    /// `--label ""` clears the label. Endpoints are immutable (delete and
+    /// re-create to re-route an edge).
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Edge id
+        id: i64,
+        /// New label; pass "" to clear it
+        #[arg(long, group = "fields")]
+        label: Option<String>,
+        /// Free-text actor id for the change history (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Delete an edge; echoes the destroyed edge
+    Delete {
+        /// Edge id
+        id: i64,
+        /// Free-text actor id for the change history (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+}
+
 fn parse_status(s: &str) -> std::result::Result<Status, String> {
     Status::parse(s).ok_or_else(|| format!("'{s}' is not one of todo|in_progress|done|cancelled"))
 }
@@ -413,6 +649,7 @@ fn execute(command: Command) -> Result<()> {
     match command {
         Command::Project(cmd) => run_project(cmd),
         Command::Task(cmd) => run_task(cmd),
+        Command::Storyboard(cmd) => run_storyboard(cmd),
         Command::Serve { port } => crate::api::serve(port),
         Command::Backup { path } => {
             let store = Store::open_default()?;
@@ -552,6 +789,128 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
         TaskCmd::Block { id, by } => print_json(&store.add_dependency(id, by)?),
         TaskCmd::Unblock { id, on } => print_json(&store.remove_dependency(id, on)?),
         TaskCmd::Events { id } => print_json(&store.list_events(id)?),
+    }
+    Ok(())
+}
+
+fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        StoryboardCmd::Create {
+            project,
+            title,
+            description,
+            author,
+        } => print_json(&store.create_storyboard(
+            project,
+            &title,
+            description.as_deref(),
+            author.as_deref(),
+        )?),
+        StoryboardCmd::List { project } => print_json(&store.list_storyboards(project)?),
+        StoryboardCmd::Show { id } => print_json(&store.get_storyboard_view(id)?),
+        StoryboardCmd::Update {
+            id,
+            title,
+            description,
+            author,
+        } => {
+            let patch = StoryboardPatch {
+                title,
+                description: description.map(clear_if_empty),
+            };
+            print_json(&store.update_storyboard(id, &patch, author.as_deref())?);
+        }
+        StoryboardCmd::Delete { id } => print_json(&store.delete_storyboard(id)?),
+        StoryboardCmd::Events { id } => print_json(&store.list_storyboard_events(id)?),
+        StoryboardCmd::Frame(cmd) => run_frame(&mut store, cmd)?,
+        StoryboardCmd::Edge(cmd) => run_edge(&mut store, cmd)?,
+    }
+    Ok(())
+}
+
+fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
+    match cmd {
+        FrameCmd::Create {
+            storyboard,
+            title,
+            body,
+            x,
+            y,
+            w,
+            h,
+            color,
+            task,
+            author,
+        } => {
+            let new = FrameNew {
+                title,
+                body,
+                x,
+                y,
+                w,
+                h,
+                color,
+                task_id: task,
+                author,
+            };
+            print_json(&store.create_frame(storyboard, &new)?);
+        }
+        FrameCmd::Update {
+            id,
+            title,
+            body,
+            x,
+            y,
+            w,
+            h,
+            color,
+            task,
+            no_task,
+            author,
+        } => {
+            let patch = FramePatch {
+                title,
+                body: body.map(clear_if_empty),
+                x,
+                y,
+                w,
+                h,
+                color: color.map(clear_if_empty),
+                task_id: if no_task { Some(None) } else { task.map(Some) },
+            };
+            print_json(&store.update_frame(id, &patch, author.as_deref())?);
+        }
+        FrameCmd::Delete { id, author } => {
+            let (frame, edges) = store.delete_frame(id, author.as_deref())?;
+            print_json(&json!({"frame": frame, "edges": edges}));
+        }
+    }
+    Ok(())
+}
+
+fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
+    match cmd {
+        EdgeCmd::Create {
+            storyboard,
+            from,
+            to,
+            label,
+            author,
+        } => print_json(&store.create_edge(
+            storyboard,
+            from,
+            to,
+            label.as_deref(),
+            author.as_deref(),
+        )?),
+        EdgeCmd::Update { id, label, author } => {
+            let patch = EdgePatch {
+                label: label.map(clear_if_empty),
+            };
+            print_json(&store.update_edge(id, &patch, author.as_deref())?);
+        }
+        EdgeCmd::Delete { id, author } => print_json(&store.delete_edge(id, author.as_deref())?),
     }
     Ok(())
 }

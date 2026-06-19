@@ -2,6 +2,10 @@ mod store;
 mod types;
 
 pub use store::{
-    Error, ImportDoc, NextResult, ProjectPatch, Result, Store, TaskPatch, default_db_path,
+    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, ProjectPatch, Result, Store,
+    StoryboardPatch, TaskPatch, default_db_path,
 };
-pub use types::{Dependency, Priority, Project, Status, Task, TaskSummary};
+pub use types::{
+    Dependency, Frame, FrameEdge, Priority, Project, Status, Storyboard, StoryboardEvent,
+    StoryboardView, Task, TaskSummary,
+};

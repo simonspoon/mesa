@@ -362,3 +362,223 @@ main {
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* ---- storyboards ---- */
+
+.action-link {
+  align-self: center;
+}
+
+.storyboard-meta {
+  font-size: 0.75rem;
+  margin-top: 0.2rem;
+}
+
+/* Toolbar full-width, then the canvas and the (optional) editor panel share
+   the next row. */
+.storyboard {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.storyboard-toolbar {
+  flex: 1 1 100%;
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+
+.storyboard-toolbar button.active {
+  color: var(--magenta);
+  border-color: var(--magenta);
+  box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
+}
+
+.storyboard-scroll {
+  flex: 1 1 24rem;
+  min-width: 0;
+  overflow: auto;
+  max-height: calc(100vh - 18rem);
+  min-height: 24rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.storyboard-canvas {
+  position: relative;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.edge-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.edge-line {
+  stroke: var(--cyan-dim);
+  stroke-width: 2;
+}
+
+.edge-layer #arrow path {
+  fill: var(--cyan);
+}
+
+.edge-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: center;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  padding: 0 0.2rem;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.edge-del {
+  padding: 0 0.3rem;
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
+.frame {
+  position: absolute;
+  background: var(--panel-raised);
+  border: 1px solid var(--border-bright);
+  clip-path: var(--cut);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.45);
+  transition: box-shadow 0.15s;
+}
+
+.frame.selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+.frame.connect-from {
+  border-color: var(--magenta);
+  box-shadow: 0 0 16px rgba(255, 43, 214, 0.5);
+}
+
+.frame-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  background: rgba(0, 229, 255, 0.06);
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.frame-header:active {
+  cursor: grabbing;
+}
+
+.frame-title {
+  font-family: var(--font-display);
+  font-size: 0.78rem;
+  color: var(--text-h);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-id {
+  font-size: 0.7rem;
+  flex: none;
+}
+
+.frame-body {
+  flex: 1;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.8rem;
+  overflow: hidden;
+  white-space: pre-wrap;
+}
+
+.frame-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.7rem;
+}
+
+.frame-field {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.task-input {
+  width: 6rem;
+}
+
+.author-field input {
+  width: 8rem;
+}
+
+.storyboard-history {
+  flex: 1 1 100%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 0.5rem 1rem;
+  max-height: 16rem;
+  overflow: auto;
+}
+
+.storyboard-history h2 {
+  margin: 0.25rem 0 0.5rem;
+}
+
+.history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.history-list li {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.history-at {
+  flex: none;
+  font-size: 0.75rem;
+  width: 11rem;
+}
+
+.history-actor {
+  flex: none;
+  width: 7rem;
+  color: var(--cyan);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-summary {
+  flex: 1;
+}

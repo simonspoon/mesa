@@ -21,6 +21,9 @@ cargo test <name>            # single test by name substring
 # CLI JSON-contract end-to-end gate (create→list→block→cycle→delete→backup)
 scripts/cli-check.sh
 
+# Storyboard CLI JSON-contract gate (board/frame/edge CRUD, cascade, history)
+scripts/storyboard-check.sh
+
 # Concurrency gate: 20 interleaved CLI + API writes against one db
 scripts/concurrent-check.sh
 
@@ -92,6 +95,34 @@ invariants you must not break — read them before changing `src/`:
 - A task's project is immutable after creation.
 - A subtask shares its parent's project.
 - Dependency self-edges and cycles are rejected (`cycle`).
+
+### Storyboards (freeform visual canvas)
+
+A **storyboard** is a freeform spatial canvas of **frames** (cards at `x/y`) and
+directed **frame_edges** between them — a Miro/Excalidraw-lite graph, distinct
+from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
+`storyboard_events` (migration index 4 = the boards, 5 = the change history).
+
+- A storyboard belongs to a project, immutable after creation (like a task).
+- A frame may optionally link a task **in the same project** (validated in
+  `Store`); the link is `ON DELETE SET NULL`, so deleting the task clears it.
+- Edges connect two frames **of the same board**; self-edges are rejected
+  (`validation`). **Cycles are allowed** — a storyboard is a diagram, not a
+  dependency graph, so there is deliberately no `would_cycle` check here.
+- **Every storyboard/frame/edge mutation appends a `storyboard_events` row**
+  (the change history) inside the same transaction: `actor` (free-text "who"),
+  a stable `action` token, and a human `summary`. This is the collaboration
+  record. `delete_storyboard` cascades frames/edges/events and writes no event
+  (the history dies with the board; the delete echo is the recoverable record).
+- CLI: `mesa storyboard {create,list,show,update,delete,events}` plus nested
+  `frame {create,update,delete}` and `edge {create,update,delete}`. `show`/
+  `delete` print the full `{storyboard, frames, edges}` view; `frame delete`
+  echoes `{frame, edges}`; `events` prints the change log. Mutating commands
+  take `--author` for attribution.
+- API: `/api/storyboards` CRUD, `/api/storyboards/{id}/{frames,edges,events}`,
+  `/api/frames/{id}`, `/api/edges/{id}`. Mutations attribute via an `author`
+  body field (POST/PATCH) or `?author=` query (DELETE); it sets the change
+  actor and never mutates an entity's own immutable `author`.
 
 ## Untrusted input
 

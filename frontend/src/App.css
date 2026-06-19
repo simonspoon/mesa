@@ -394,14 +394,36 @@ main {
   box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
 }
 
-.storyboard-scroll {
+/* Viewport: fixed-size window onto the canvas. Native scroll is gone; the
+   content layer inside is moved/scaled by a CSS transform (pan & zoom). */
+.storyboard-viewport {
   flex: 1 1 24rem;
   min-width: 0;
-  overflow: auto;
-  max-height: calc(100vh - 18rem);
+  overflow: hidden;
+  /* Positioning context for the absolutely-placed content layer, so its
+     top:0/left:0 origin coincides with the viewport (the pan/zoom transform
+     and the reset/fit math both assume the content origin is the viewport
+     top-left). */
+  position: relative;
+  height: calc(100vh - 18rem);
   min-height: 24rem;
   border: 1px solid var(--border);
   background: var(--panel);
+  cursor: grab;
+  touch-action: none;
+}
+
+.storyboard-viewport.panning {
+  cursor: grabbing;
+}
+
+/* Pan/zoom transform layer: translate + scale, origin top-left. Holds the edge
+   SVG, edge labels and frames so they all move/scale together. */
+.storyboard-content {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
 }
 
 .storyboard-canvas {

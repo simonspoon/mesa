@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   createEdge,
   createFrame,
@@ -6,6 +6,7 @@ import {
   deleteFrame,
   updateFrame,
 } from './api'
+import { loadBoardView, saveBoardView } from './boardView'
 import { ConfirmDelete } from './components/ConfirmDelete'
 import { InlineEdit } from './components/InlineEdit'
 import type { Frame } from './types/Frame'
@@ -35,6 +36,33 @@ type Drag = {
   curX: number
   curY: number
   moved: boolean
+}
+
+/** Pan/zoom view transform applied to the content layer as
+ *  `translate(tx, ty) scale(scale)` with transform-origin 0 0. This is a pure
+ *  view layer over the saved frame x/y (never persisted on the board). Later
+ *  stories read/persist this same shape, so it is kept as one structured value. */
+type ViewTransform = {
+  tx: number
+  ty: number
+  scale: number
+}
+
+const MIN_SCALE = 0.25
+const MAX_SCALE = 3
+const ZOOM_STEP = 0.0015 // per wheel deltaY unit
+const clampScale = (s: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s))
+
+const DEFAULT_TRANSFORM: ViewTransform = { tx: 0, ty: 0, scale: 1 }
+
+/** Pan gesture in progress: where the pointer went down and the transform at
+ *  that moment. Pan moves the view by the raw client delta (screen-space). */
+type Pan = {
+  pointerId: number
+  startX: number
+  startY: number
+  tx: number
+  ty: number
 }
 
 /**
@@ -70,6 +98,43 @@ export function StoryboardCanvas({
   )
   const dragRef = useRef<Drag | null>(null)
   const justDragged = useRef(false)
+
+  // Pan/zoom view transform (story 01). Browser-local view state (story 03):
+  // restored from localStorage on open and persisted on change, keyed by board.
+  // Held in React state so it survives the parent's refetch-on-mutation (the
+  // component is not remounted across `onChanged`); the lazy init seeds the
+  // first board, and the effect below re-seeds when the board id changes
+  // (boards switch in place, without a remount).
+  const [transform, setTransform] = useState<ViewTransform>(
+    () => loadBoardView(storyboardId) ?? DEFAULT_TRANSFORM,
+  )
+  const [panning, setPanning] = useState(false)
+  const viewportRef = useRef<HTMLDivElement | null>(null)
+  const panRef = useRef<Pan | null>(null)
+
+  // Reseed the view when the board changes without a remount, then persist the
+  // current view per board on every change. `transformBoard` records which
+  // board the live `transform` value belongs to (advanced only by the persist
+  // effect, once `transform` has actually been replaced with the new board's
+  // view). On a board switch the reseed loads and applies the new board's saved
+  // view; the persist runs only when `transform` and `storyboardId` agree, so
+  // the outgoing board's transform is never written under the new board's key.
+  const transformBoard = useRef(storyboardId)
+  useEffect(() => {
+    if (transformBoard.current !== storyboardId) {
+      setTransform(loadBoardView(storyboardId) ?? DEFAULT_TRANSFORM)
+    }
+  }, [storyboardId])
+  useEffect(() => {
+    if (transformBoard.current !== storyboardId) {
+      // First render after a board switch, before the reseed's setTransform has
+      // landed: `transform` still belongs to the previous board — don't write
+      // it under the new key. The reseed's state update re-runs this effect.
+      transformBoard.current = storyboardId
+      return
+    }
+    saveBoardView(storyboardId, transform)
+  }, [storyboardId, transform])
 
   function showError(e: unknown) {
     setError(e instanceof Error ? e.message : String(e))
@@ -151,8 +216,13 @@ export function StoryboardCanvas({
   function onPointerMove(e: React.PointerEvent, f: Frame) {
     const d = dragRef.current
     if (!d || d.id !== f.id) return
-    const nx = d.ox + (e.clientX - d.startX)
-    const ny = d.oy + (e.clientY - d.startY)
+    // Frames live inside the scaled content layer, so a board-space delta shows
+    // on screen as delta * scale. To keep the card under the cursor 1:1, convert
+    // the client (screen) delta back to board space by dividing by the current
+    // scale. The pan offset (tx/ty) is a constant translation that cancels out
+    // in a delta, so it never enters the saved x/y.
+    const nx = d.ox + (e.clientX - d.startX) / transform.scale
+    const ny = d.oy + (e.clientY - d.startY) / transform.scale
     d.curX = nx
     d.curY = ny
     if (!d.moved && (Math.abs(nx - d.ox) > 3 || Math.abs(ny - d.oy) > 3)) {
@@ -193,6 +263,101 @@ export function StoryboardCanvas({
     }, showError)
   }
 
+  // Wheel zoom centred on the cursor: keep the world point under the pointer
+  // fixed on screen while scale changes. world = (screen - t) / scale, so after
+  // scaling we solve t' = screen - world * scale'. Bound as a native non-passive
+  // listener so preventDefault() actually suppresses page scroll (React's
+  // synthetic onWheel is passive and cannot).
+  useEffect(() => {
+    const el = viewportRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const px = e.clientX - rect.left
+      const py = e.clientY - rect.top
+      setTransform((t) => {
+        const next = clampScale(t.scale * Math.exp(-e.deltaY * ZOOM_STEP))
+        if (next === t.scale) return t
+        const wx = (px - t.tx) / t.scale
+        const wy = (py - t.ty) / t.scale
+        return { scale: next, tx: px - wx * next, ty: py - wy * next }
+      })
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
+
+  // Pan starts only when the pointer goes down on empty canvas (not on a frame)
+  // and not in connect-mode; frame drags own their own pointer handlers. Pan
+  // translates the view by the raw client delta (screen-space, scale-free).
+  function onViewportPointerDown(e: React.PointerEvent) {
+    if (e.button !== 0 || connectMode) return
+    // Empty canvas only: not on a frame, not on an edge label/control.
+    if ((e.target as HTMLElement).closest('.frame, .edge-label')) return
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    panRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      tx: transform.tx,
+      ty: transform.ty,
+    }
+    setPanning(true)
+  }
+
+  function onViewportPointerMove(e: React.PointerEvent) {
+    const p = panRef.current
+    if (!p || p.pointerId !== e.pointerId) return
+    setTransform((t) => ({
+      ...t,
+      tx: p.tx + (e.clientX - p.startX),
+      ty: p.ty + (e.clientY - p.startY),
+    }))
+  }
+
+  function onViewportPointerUp(e: React.PointerEvent) {
+    const p = panRef.current
+    if (!p || p.pointerId !== e.pointerId) return
+    panRef.current = null
+    ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+    setPanning(false)
+  }
+
+  // Reset / fit: bring the cards back into the viewport at a sensible zoom in
+  // one action. Computes the bounding box of the placed frames (board space),
+  // picks a scale that fits it within the viewport with margin (clamped to the
+  // shared [MIN,MAX] range, never zooming past 100%), and centres it. With no
+  // frames there is nothing to fit, so fall back to the default origin view.
+  // This goes through `setTransform`, so the persist effect (story 03) writes
+  // the reset view to localStorage — the reset is what gets remembered.
+  const FIT_MARGIN = 48 // board-space padding around the cards' bounding box
+  function resetView() {
+    const el = viewportRef.current
+    if (!el || placed.length === 0) {
+      setTransform(DEFAULT_TRANSFORM)
+      return
+    }
+    const minX = Math.min(...placed.map((f) => f.x))
+    const minY = Math.min(...placed.map((f) => f.y))
+    const maxX = Math.max(...placed.map((f) => f.x + f.w))
+    const maxY = Math.max(...placed.map((f) => f.y + f.h))
+    const bw = maxX - minX + FIT_MARGIN * 2
+    const bh = maxY - minY + FIT_MARGIN * 2
+    const rect = el.getBoundingClientRect()
+    // Fit the box to the viewport, but never zoom in past 100% — a single small
+    // card should not blow up to fill the screen.
+    const scale = clampScale(Math.min(rect.width / bw, rect.height / bh, 1))
+    // Centre the box: place its scaled centre at the viewport centre.
+    const cxBox = minX - FIT_MARGIN + bw / 2
+    const cyBox = minY - FIT_MARGIN + bh / 2
+    setTransform({
+      scale,
+      tx: rect.width / 2 - cxBox * scale,
+      ty: rect.height / 2 - cyBox * scale,
+    })
+  }
+
   return (
     <div className={`storyboard${selected ? ' has-panel' : ''}`}>
       <div className="storyboard-toolbar">
@@ -202,6 +367,9 @@ export function StoryboardCanvas({
           onClick={toggleConnect}
         >
           {connectMode ? 'connecting…' : 'connect'}
+        </button>
+        <button onClick={resetView} title="Reset zoom and recentre on the cards">
+          reset view
         </button>
         <span className="muted">
           {connectMode
@@ -213,8 +381,21 @@ export function StoryboardCanvas({
         {error && <span className="error">{error}</span>}
       </div>
 
-      <div className="storyboard-scroll">
-        <div className="storyboard-canvas" style={{ width, height }}>
+      <div
+        ref={viewportRef}
+        className={`storyboard-viewport${panning ? ' panning' : ''}`}
+        onPointerDown={onViewportPointerDown}
+        onPointerMove={onViewportPointerMove}
+        onPointerUp={onViewportPointerUp}
+      >
+        <div
+          className="storyboard-content"
+          style={{
+            transform: `translate(${transform.tx}px, ${transform.ty}px) scale(${transform.scale})`,
+            transformOrigin: '0 0',
+          }}
+        >
+          <div className="storyboard-canvas" style={{ width, height }}>
           <svg className="edge-layer" width={width} height={height}>
             <defs>
               <marker
@@ -308,6 +489,7 @@ export function StoryboardCanvas({
               </div>
             </div>
           ))}
+          </div>
         </div>
       </div>
 

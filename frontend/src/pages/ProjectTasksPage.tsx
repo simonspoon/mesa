@@ -9,6 +9,8 @@ import { KanbanBoard } from '../KanbanBoard'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
+import { StoryboardBoardView } from './StoryboardBoardView'
+import { StoryboardListView } from './StoryboardListView'
 
 const STATUSES: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
@@ -16,10 +18,16 @@ const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 export function ProjectTasksPage({
   projectId,
   taskId,
+  storyboards,
+  storyboardId,
   onProjectsChanged,
 }: {
   projectId: number
   taskId: number | null
+  // Storyboards is a URL-driven view (refresh-/back-stable): `storyboards` is
+  // true on the boards routes, `storyboardId` selects a single board's canvas.
+  storyboards: boolean
+  storyboardId: number | null
   onProjectsChanged: () => void
 }) {
   // Status and tag are passed through to the API's query filters; priority
@@ -27,6 +35,9 @@ export function ProjectTasksPage({
   const [status, setStatus] = useState<Status | ''>('')
   const [priority, setPriority] = useState<Priority | ''>('')
   const [tag, setTag] = useState('')
+  // List/Board is an in-place toggle held in local state; Storyboards is
+  // URL-driven (the `storyboards` prop). `view` only distinguishes list vs
+  // board — when Storyboards is active it governs neither tab's content.
   const [view, setView] = useState<'list' | 'board'>('list')
   // Create-form panel state is ephemeral (spec Assumption 2); the task
   // panel is URL-driven via `taskId`. Latest action wins: opening a task
@@ -68,7 +79,9 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  const error = projectError ?? tasksError
+  // Storyboards is its own view with its own fetches/error handling, so a
+  // failed task fetch must not block it; only surface it on the task views.
+  const error = projectError ?? (storyboards ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
@@ -76,6 +89,14 @@ export function ProjectTasksPage({
   function onTasksChanged() {
     refetch()
     refetchCount()
+  }
+
+  // Switch to a task view (List/Board). When a storyboards route is open this
+  // also returns the hash to the project URL so the switch happens in place,
+  // matching how the tabs toggle among any views (M5 symmetric return).
+  function selectView(next: 'list' | 'board') {
+    setView(next)
+    if (storyboards) window.location.hash = `#/projects/${projectId}`
   }
 
   function closePanel() {
@@ -212,29 +233,40 @@ export function ProjectTasksPage({
 
         <div className="tabs">
           <button
-            className={view === 'list' ? 'active' : ''}
-            onClick={() => setView('list')}
+            className={!storyboards && view === 'list' ? 'active' : ''}
+            onClick={() => selectView('list')}
           >
             List
           </button>
           <button
-            className={view === 'board' ? 'active' : ''}
-            onClick={() => setView('board')}
+            className={!storyboards && view === 'board' ? 'active' : ''}
+            onClick={() => selectView('board')}
           >
             Board
           </button>
-          {/* Navigates to the separate boards area (not an in-place view
-              toggle); rendered as a peer button to match List/Board styling. */}
+          {/* Third in-place view: drives the URL (boards/canvas are refresh-
+              and back-stable) while keeping this frame around the content. */}
           <button
+            className={storyboards ? 'active' : ''}
             onClick={() => {
-              window.location.hash = `#/projects/${projectId}/storyboards`
+              if (!storyboards)
+                window.location.hash = `#/projects/${projectId}/storyboards`
             }}
           >
             Storyboards
           </button>
         </div>
 
-        {view === 'board' ? (
+        {storyboards ? (
+          storyboardId !== null ? (
+            <StoryboardBoardView
+              projectId={projectId}
+              storyboardId={storyboardId}
+            />
+          ) : (
+            <StoryboardListView projectId={projectId} />
+          )
+        ) : view === 'board' ? (
           !tasks ? (
             <p className="muted">Loading…</p>
           ) : (

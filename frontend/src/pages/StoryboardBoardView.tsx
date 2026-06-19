@@ -44,11 +44,14 @@ function StoryboardHistory({
 }
 
 /**
- * One storyboard: its title/description header, the change-history log, and the
- * freeform canvas. The canvas owns frame/edge editing; this page owns the
- * board-level fields and the "who am I" author field stamped on every change.
+ * One storyboard rendered in place inside ProjectTasksPage's frame: its
+ * title/description header, the change-history log, and the freeform canvas.
+ * The canvas owns frame/edge editing; this owns the board-level fields and the
+ * "who am I" author field stamped on every change. The project header + tab row
+ * supply the surrounding chrome, so there is no back link here — switching views
+ * is done via the tabs, and the boards index is reachable via "← storyboards".
  */
-export function StoryboardPage({
+export function StoryboardBoardView({
   projectId,
   storyboardId,
 }: {
@@ -80,14 +83,14 @@ export function StoryboardPage({
       <p>
         <a href={`#/projects/${projectId}/storyboards`}>← storyboards</a>
       </p>
-      <h1>
+      <h2 className="storyboard-title">
         <InlineEdit
           value={board.title}
           onSave={(title) =>
             updateStoryboard(storyboardId, { title }, actor).then(refresh)
           }
         />
-      </h1>
+      </h2>
       <p className="muted">
         <InlineEdit
           value={board.description ?? ''}

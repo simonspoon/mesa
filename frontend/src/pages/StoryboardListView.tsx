@@ -5,9 +5,11 @@ import { useFetch } from '../useFetch'
 
 /**
  * Lists a project's storyboards and creates new ones. A board is a freeform
- * canvas; this page is just the index — the canvas lives in StoryboardPage.
+ * canvas; this is just the index — the canvas lives in StoryboardView. Rendered
+ * in place inside ProjectTasksPage's frame (project header + tab row supply the
+ * surrounding chrome), so it carries no header or back link of its own.
  */
-export function StoryboardListPage({ projectId }: { projectId: number }) {
+export function StoryboardListView({ projectId }: { projectId: number }) {
   const { data: boards, error, refetch } = useFetch(
     () => listStoryboards(projectId),
     `storyboards-${projectId}`,
@@ -32,11 +34,7 @@ export function StoryboardListPage({ projectId }: { projectId: number }) {
   }
 
   return (
-    <div className="project-main">
-      <p>
-        <a href={`#/projects/${projectId}`}>← tasks</a>
-      </p>
-      <h1>Storyboards</h1>
+    <>
       <form className="create-form" onSubmit={submit}>
         <input
           type="text"
@@ -80,6 +78,6 @@ export function StoryboardListPage({ projectId }: { projectId: number }) {
           ))}
         </ul>
       )}
-    </div>
+    </>
   )
 }

@@ -3,8 +3,6 @@ import './App.css'
 import { getTask } from './api'
 import { Sidebar } from './components/Sidebar'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
-import { StoryboardListPage } from './pages/StoryboardListPage'
-import { StoryboardPage } from './pages/StoryboardPage'
 import { useFetch } from './useFetch'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
@@ -55,19 +53,34 @@ function App() {
 
   let page
   if (storyboardMatch) {
+    // Single board: in-place storyboard view inside the project page frame.
     page = (
-      <StoryboardPage
+      <ProjectTasksPage
         projectId={Number(storyboardMatch[1])}
+        taskId={null}
+        storyboards
         storyboardId={Number(storyboardMatch[2])}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
   } else if (storyboardListMatch) {
-    page = <StoryboardListPage projectId={Number(storyboardListMatch[1])} />
+    // Boards index: in-place storyboards view inside the project page frame.
+    page = (
+      <ProjectTasksPage
+        projectId={Number(storyboardListMatch[1])}
+        taskId={null}
+        storyboards
+        storyboardId={null}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
   } else if (projectMatch) {
     page = (
       <ProjectTasksPage
         projectId={Number(projectMatch[1])}
         taskId={projectMatch[2] ? Number(projectMatch[2]) : null}
+        storyboards={false}
+        storyboardId={null}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { deleteProject, getProject, listTasks, updateProject } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { CreateTaskPanel } from '../components/CreateTaskPanel'
@@ -32,9 +32,14 @@ export function ProjectTasksPage({
   // panel is URL-driven via `taskId`. Latest action wins: opening a task
   // closes the create form.
   const [creating, setCreating] = useState(false)
-  useEffect(() => {
+  // Latest action wins: opening a task (taskId becomes non-null) closes the
+  // create form. Adjust the state during render off the changed prop rather
+  // than in an effect (avoids a cascading re-render).
+  const [prevTaskId, setPrevTaskId] = useState(taskId)
+  if (taskId !== prevTaskId) {
+    setPrevTaskId(taskId)
     if (taskId !== null) setCreating(false)
-  }, [taskId])
+  }
 
   const {
     data: project,

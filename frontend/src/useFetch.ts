@@ -12,17 +12,26 @@ export function useFetch<T>(
 ): { data: T | null; error: string | null; refetch: () => void } {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Clear stale data/error when the `key` changes by adjusting state during
+  // render off the changed prop, not in the effect (avoids a cascading
+  // re-render). The effect below then performs the actual fetch.
+  const [prevKey, setPrevKey] = useState(key)
+  if (key !== prevKey) {
+    setPrevKey(key)
+    setData(null)
+    setError(null)
+  }
   // `load` closes over per-render state; the ref keeps the latest one
   // without making it an effect dependency (the `key` controls refetching).
   const loadRef = useRef(load)
-  loadRef.current = load
+  useEffect(() => {
+    loadRef.current = load
+  })
   // Points at the current effect's `run` so `refetch` respects cancellation.
   const runRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     let cancelled = false
-    setData(null)
-    setError(null)
     const run = () => {
       loadRef.current().then(
         (d) => {

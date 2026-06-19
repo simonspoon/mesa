@@ -193,9 +193,6 @@ export function ProjectTasksPage({
         )}
         <p className="project-actions">
           <button onClick={openCreate}>add task</button>
-          <a className="action-link" href={`#/projects/${projectId}/storyboards`}>
-            storyboards →
-          </a>
           <ConfirmDelete
             label="delete project"
             message={`Deletes this project and ${allTasks?.length ?? '?'} task(s).`}
@@ -220,6 +217,15 @@ export function ProjectTasksPage({
             onClick={() => setView('board')}
           >
             Board
+          </button>
+          {/* Navigates to the separate boards area (not an in-place view
+              toggle); rendered as a peer button to match List/Board styling. */}
+          <button
+            onClick={() => {
+              window.location.hash = `#/projects/${projectId}/storyboards`
+            }}
+          >
+            Storyboards
           </button>
         </div>
 

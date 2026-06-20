@@ -30,6 +30,7 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
       {...listeners}
       {...attributes}
     >
+      <span className="card-id muted">#{task.id}</span>
       <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
         {task.title}
       </a>

@@ -343,13 +343,15 @@ export function StoryboardCanvas({
     setPanning(false)
   }
 
-  // Reset / fit: bring the cards back into the viewport at a sensible zoom in
-  // one action. Computes the bounding box of the placed frames (board space),
-  // picks a scale that fits it within the viewport with margin (clamped to the
-  // shared [MIN,MAX] range, never zooming past 100%), and centres it. With no
-  // frames there is nothing to fit, so fall back to the default origin view.
-  // This goes through `setTransform`, so the persist effect (story 03) writes
-  // the reset view to localStorage — the reset is what gets remembered.
+  // Reset / fit: frame the whole board in one action. Computes the bounding box
+  // of the placed frames (board space) plus a margin, picks the largest scale
+  // that fits that box within the available viewport (so the content fills the
+  // space as fully as possible, clamped to the shared [MIN,MAX] range), and
+  // centres it. With no frames there is nothing to fit, so fall back to the
+  // default origin view. This goes through `setTransform`, so the persist effect
+  // (story 03) writes the reset view to localStorage — the reset is remembered.
+  // The viewport's getBoundingClientRect picks up its real size in both normal
+  // and expanded modes, so the same math fits to whatever space is available.
   const FIT_MARGIN = 48 // board-space padding around the cards' bounding box
   function resetView() {
     const el = viewportRef.current
@@ -364,9 +366,10 @@ export function StoryboardCanvas({
     const bw = maxX - minX + FIT_MARGIN * 2
     const bh = maxY - minY + FIT_MARGIN * 2
     const rect = el.getBoundingClientRect()
-    // Fit the box to the viewport, but never zoom in past 100% — a single small
-    // card should not blow up to fill the screen.
-    const scale = clampScale(Math.min(rect.width / bw, rect.height / bh, 1))
+    // Largest scale that keeps the whole box on screen (limiting dimension
+    // wins). Clamped to [MIN,MAX]: a small board zooms in to fill, a huge one
+    // zooms out so nothing is clipped. No 100% cap — filling the space is the goal.
+    const scale = clampScale(Math.min(rect.width / bw, rect.height / bh))
     // Centre the box: place its scaled centre at the viewport centre.
     const cxBox = minX - FIT_MARGIN + bw / 2
     const cyBox = minY - FIT_MARGIN + bh / 2

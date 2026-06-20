@@ -28,8 +28,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    EdgePatch, Error, FrameNew, FramePatch, Priority, ProjectPatch, Status, Store, StoryboardPatch,
-    TaskPatch, TaskSummary,
+    EdgePatch, Error, FrameNew, FramePatch, PostPatch, Priority, ProjectPatch, Status, Store,
+    StoryboardPatch, TaskPatch, TaskSummary,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -101,6 +101,12 @@ fn router(state: AppState) -> Router {
         .route("/api/storyboards/{id}/events", get(list_storyboard_events))
         .route("/api/frames/{id}", patch(update_frame).delete(delete_frame))
         .route("/api/edges/{id}", patch(update_edge).delete(delete_edge))
+        .route("/api/posts", get(list_posts).post(create_post))
+        .route(
+            "/api/posts/{id}",
+            get(show_post).patch(update_post).delete(delete_post),
+        )
+        .route("/api/posts/{id}/replies", post(reply_post))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -678,4 +684,117 @@ async fn delete_edge(
 ) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_edge(id, q.author.as_deref())?).into_response())
+}
+
+// ---- posts (bulletin board) ----
+
+#[derive(Deserialize)]
+struct PostQuery {
+    #[serde(default)]
+    project: Option<i64>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PostCreate {
+    project_id: i64,
+    body: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReplyCreate {
+    body: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PostUpdate {
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    title: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    tag: Option<Option<String>>,
+}
+
+async fn list_posts(
+    State(state): State<AppState>,
+    Query(q): Query<PostQuery>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_posts(q.project, q.tag.as_deref(), q.author.as_deref())?).into_response())
+}
+
+async fn create_post(
+    State(state): State<AppState>,
+    body: Result<Json<PostCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let post = store.create_post(
+        body.project_id,
+        body.author.as_deref(),
+        body.title.as_deref(),
+        body.tag.as_deref(),
+        &body.body,
+    )?;
+    Ok((StatusCode::CREATED, Json(post)).into_response())
+}
+
+/// Reply to a post; the reply inherits the target's project.
+async fn reply_post(
+    State(state): State<AppState>,
+    Path(parent_id): Path<i64>,
+    body: Result<Json<ReplyCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let post = store.reply_to_post(
+        parent_id,
+        body.author.as_deref(),
+        body.title.as_deref(),
+        body.tag.as_deref(),
+        &body.body,
+    )?;
+    Ok((StatusCode::CREATED, Json(post)).into_response())
+}
+
+/// Returns a post with its replies: {post, replies}.
+async fn show_post(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_post_thread(id)?).into_response())
+}
+
+async fn update_post(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<PostUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let patch = PostPatch {
+        title: body.title,
+        tag: body.tag,
+        body: body.body,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_post(id, &patch)?).into_response())
+}
+
+async fn delete_post(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.delete_post(id)?).into_response())
 }

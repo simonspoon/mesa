@@ -16,8 +16,8 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, Priority, ProjectPatch, Result,
-    Status, Store, StoryboardPatch, Task, TaskPatch,
+    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, PostPatch, Priority,
+    ProjectPatch, Result, Status, Store, StoryboardPatch, Task, TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -66,6 +66,9 @@ enum Command {
     /// Create and edit visual storyboards (frames + connecting edges)
     #[command(subcommand)]
     Storyboard(StoryboardCmd),
+    /// Post to and read the project bulletin board (findings, news, questions)
+    #[command(subcommand)]
+    Post(PostCmd),
     /// Start the HTTP server and web UI
     ///
     /// By default binds 127.0.0.1 only (loopback): reachable solely from this
@@ -340,6 +343,107 @@ EXAMPLES
     Events {
         /// Task id; omit for every task's events
         id: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PostCmd {
+    /// Post to a project's bulletin board; prints the full created post
+    ///
+    /// The board is an open space for agents and people to share findings,
+    /// lessons learned, news, or questions about a project. A post belongs to
+    /// one project, fixed at creation. `--tag` is free text — your own category
+    /// (e.g. "finding", "question", "news"), not a fixed set. Reply to a post
+    /// with `post reply`.
+    #[command(after_help = "\
+EXAMPLES
+  mesa post create --project 1 \"WAL mode fixed the SQLITE_BUSY errors\" \\
+    --title \"Concurrency fix\" --tag finding --author agent-7
+  mesa post create --project 1 \"Anyone know why the build embeds dist?\" --tag question")]
+    Create {
+        /// Project the post belongs to (immutable after creation)
+        #[arg(long)]
+        project: i64,
+        /// The message body (markdown by convention)
+        body: String,
+        /// Optional one-line title
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional free-text tag / category (your choice, not an enum)
+        #[arg(long)]
+        tag: Option<String>,
+        /// Free-text actor id of the author (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Reply to an existing post; prints the full created reply
+    ///
+    /// The reply joins the target post's thread and inherits its project.
+    /// Replies are one level deep — reply to a top-level post, not to a reply.
+    #[command(after_help = "\
+EXAMPLES
+  mesa post reply 3 \"Because release builds embed frontend/dist via rust-embed\" \\
+    --author agent-2")]
+    Reply {
+        /// Id of the post being replied to (a top-level post)
+        parent: i64,
+        /// The reply body (markdown by convention)
+        body: String,
+        /// Optional one-line title
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional free-text tag / category
+        #[arg(long)]
+        tag: Option<String>,
+        /// Free-text actor id of the author (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List top-level posts as a bare JSON array, newest first (no bodies)
+    ///
+    /// Each entry is a compact summary with a `reply_count`; use `show` for a
+    /// post's body and its replies. Filters combine (AND).
+    List {
+        /// Only posts in this project
+        #[arg(long)]
+        project: Option<i64>,
+        /// Only posts with this exact tag
+        #[arg(long)]
+        tag: Option<String>,
+        /// Only posts by this exact author
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Print a post and its replies: {post, replies}
+    Show {
+        /// Post id
+        id: i64,
+    },
+    /// Edit a post's title/tag/body; prints the full post
+    ///
+    /// Only the flags you pass change; at least one is required. The project,
+    /// parent, and author are immutable. `--title ""`/`--tag ""` clear those.
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Post id
+        id: i64,
+        /// New body
+        #[arg(long, group = "fields")]
+        body: Option<String>,
+        /// New title; pass "" to clear it
+        #[arg(long, group = "fields")]
+        title: Option<String>,
+        /// New tag; pass "" to clear it
+        #[arg(long, group = "fields")]
+        tag: Option<String>,
+    },
+    /// Delete a post AND its replies (no confirmation)
+    ///
+    /// Cascades immediately. The output echoes the full destroyed thread
+    /// ({post, replies}) so the transcript is a recoverable record.
+    Delete {
+        /// Post id
+        id: i64,
     },
 }
 
@@ -661,6 +765,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Project(cmd) => run_project(cmd),
         Command::Task(cmd) => run_task(cmd),
         Command::Storyboard(cmd) => run_storyboard(cmd),
+        Command::Post(cmd) => run_post(cmd),
         Command::Serve { port, lan } => crate::api::serve(port, lan),
         Command::Backup { path } => {
             let store = Store::open_default()?;
@@ -922,6 +1027,59 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
             print_json(&store.update_edge(id, &patch, author.as_deref())?);
         }
         EdgeCmd::Delete { id, author } => print_json(&store.delete_edge(id, author.as_deref())?),
+    }
+    Ok(())
+}
+
+fn run_post(cmd: PostCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        PostCmd::Create {
+            project,
+            body,
+            title,
+            tag,
+            author,
+        } => print_json(&store.create_post(
+            project,
+            author.as_deref(),
+            title.as_deref(),
+            tag.as_deref(),
+            &body,
+        )?),
+        PostCmd::Reply {
+            parent,
+            body,
+            title,
+            tag,
+            author,
+        } => print_json(&store.reply_to_post(
+            parent,
+            author.as_deref(),
+            title.as_deref(),
+            tag.as_deref(),
+            &body,
+        )?),
+        PostCmd::List {
+            project,
+            tag,
+            author,
+        } => print_json(&store.list_posts(project, tag.as_deref(), author.as_deref())?),
+        PostCmd::Show { id } => print_json(&store.get_post_thread(id)?),
+        PostCmd::Update {
+            id,
+            body,
+            title,
+            tag,
+        } => {
+            let patch = PostPatch {
+                title: title.map(clear_if_empty),
+                tag: tag.map(clear_if_empty),
+                body,
+            };
+            print_json(&store.update_post(id, &patch)?);
+        }
+        PostCmd::Delete { id } => print_json(&store.delete_post(id)?),
     }
     Ok(())
 }

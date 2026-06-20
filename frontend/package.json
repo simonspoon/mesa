@@ -14,7 +14,8 @@
     "@fontsource/orbitron": "^5.2.8",
     "@fontsource/share-tech-mono": "^5.2.7",
     "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "react-dom": "^19.2.6",
+    "react-markdown": "^10.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

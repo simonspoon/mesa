@@ -610,10 +610,50 @@ main {
   white-space: nowrap;
 }
 
+/* Inline-editable connector label: render compactly, no block wrapper. */
+.edge-label-text {
+  cursor: text;
+}
+.edge-label-text.editing input {
+  width: 7rem;
+  font-size: 0.75rem;
+}
+
+/* Connector delete control (#19): hidden until the label / connector is
+   hovered (or the label is focused-within, e.g. while editing), so it does not
+   clutter the canvas or invite accidental clicks. Hidden only — deletion still
+   works the moment it is revealed. */
 .edge-del {
   padding: 0 0.3rem;
   font-size: 0.7rem;
   line-height: 1.4;
+  visibility: hidden;
+}
+
+.edge-label:hover .edge-del,
+.edge-label:focus-within .edge-del {
+  visibility: visible;
+}
+
+/* Empty connector label (#17): show nothing on the line by default so blank
+   edges stay uncluttered, but keep the element present and hoverable (no
+   visibility:hidden / display:none on the container) so the editable label and
+   delete control can be revealed on hover / focus to add a label. */
+.edge-label.empty {
+  background: transparent;
+  border-color: transparent;
+}
+.edge-label.empty .edge-label-text {
+  opacity: 0;
+}
+.edge-label.empty:hover,
+.edge-label.empty:focus-within {
+  background: var(--panel-raised);
+  border-color: var(--border);
+}
+.edge-label.empty:hover .edge-label-text,
+.edge-label.empty:focus-within .edge-label-text {
+  opacity: 1;
 }
 
 .frame {
@@ -659,9 +699,9 @@ main {
   font-family: var(--font-display);
   font-size: 0.78rem;
   color: var(--text-h);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Wrap rather than ellipsis-clip so the full title is visible (#20). */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .frame-id {
@@ -673,8 +713,39 @@ main {
   flex: 1;
   padding: 0.4rem 0.5rem;
   font-size: 0.8rem;
-  overflow: hidden;
+  /* No overflow clipping: the card grows to fit (#20). Long unbroken words
+     wrap instead of forcing horizontal overflow. */
+  overflow-wrap: anywhere;
+}
+
+/* Rendered markdown inside cards (#21). Tight, card-appropriate spacing for the
+   block elements react-markdown emits; the source text stays plain markdown. */
+.frame-title :where(p),
+.frame-body :where(p) {
+  margin: 0;
+}
+.frame-body :where(p) + :where(p) {
+  margin-top: 0.4rem;
+}
+.frame-body :where(h1, h2, h3, h4, h5, h6) {
+  margin: 0.2rem 0;
+  font-size: 0.9rem;
+}
+.frame-body :where(ul, ol) {
+  margin: 0.2rem 0;
+  padding-left: 1.1rem;
+}
+.frame-body :where(code) {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.95em;
+}
+.frame-body :where(pre) {
+  overflow-x: auto;
   white-space: pre-wrap;
+}
+.frame-body :where(a),
+.frame-title :where(a) {
+  color: var(--cyan);
 }
 
 .frame-foot {

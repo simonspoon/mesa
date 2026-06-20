@@ -4,11 +4,13 @@ import {
   createFrame,
   deleteEdge,
   deleteFrame,
+  updateEdge,
   updateFrame,
 } from './api'
 import { loadBoardView, saveBoardView } from './boardView'
 import { ConfirmDelete } from './components/ConfirmDelete'
 import { InlineEdit } from './components/InlineEdit'
+import { Markdown } from './components/Markdown'
 import type { Frame } from './types/Frame'
 import type { StoryboardView } from './types/StoryboardView'
 
@@ -266,6 +268,21 @@ export function StoryboardCanvas({
     }, showError)
   }
 
+  /** Save an edited connector label. Empty string clears it (null). Returns the
+   *  promise so InlineEdit can surface a save error / stay open on failure. */
+  function editEdgeLabel(id: number, next: string) {
+    return updateEdge(id, { label: next === '' ? null : next }, author).then(
+      () => {
+        setError(null)
+        onChanged()
+      },
+      (e) => {
+        showError(e)
+        throw e
+      },
+    )
+  }
+
   // Wheel zoom centred on the cursor: keep the world point under the pointer
   // fixed on screen while scale changes. world = (screen - t) / scale, so after
   // scaling we solve t' = screen - world * scale'. Bound as a native non-passive
@@ -488,16 +505,29 @@ export function StoryboardCanvas({
             const from = byId.get(e.from_frame)
             const to = byId.get(e.to_frame)
             if (!from || !to) return null
-            const end = borderPoint(from, to)
-            const mx = (cx(from) + end.x) / 2
-            const my = (cy(from) + end.y) / 2
+            // Midpoint of the drawn line's VISIBLE segment, which runs
+            // border-to-border (source border point → target border point), so
+            // the label sits dead-centre on the line rather than skewed toward
+            // the source. The label lives in the scaled content layer, so this
+            // board-space point keeps it centred on the connector through every
+            // pan / zoom / frame move.
+            const sourceBorder = borderPoint(to, from)
+            const targetBorder = borderPoint(from, to)
+            const mx = (sourceBorder.x + targetBorder.x) / 2
+            const my = (sourceBorder.y + targetBorder.y) / 2
+            const isEmpty = !(e.label && e.label.trim())
             return (
               <div
                 key={`edge-${e.id}`}
-                className="edge-label"
+                className={'edge-label' + (isEmpty ? ' empty' : '')}
                 style={{ left: mx, top: my }}
               >
-                {e.label && <span>{e.label}</span>}
+                <InlineEdit
+                  className="edge-label-text"
+                  value={e.label ?? ''}
+                  placeholder="label"
+                  onSave={(next) => editEdgeLabel(e.id, next)}
+                />
                 <button
                   className="edge-del"
                   title="delete edge"
@@ -520,8 +550,11 @@ export function StoryboardCanvas({
               style={{
                 left: f.x,
                 top: f.y,
+                // Auto-size to fit content (#20): the frame's stored `w` caps the
+                // width (text wraps rather than growing unbounded) and `h` is a
+                // floor; the card grows taller as needed so nothing is clipped.
                 width: f.w,
-                height: f.h,
+                minHeight: f.h,
                 borderColor: f.color ?? undefined,
               }}
               onClick={() => clickFrame(f)}
@@ -532,10 +565,16 @@ export function StoryboardCanvas({
                 onPointerMove={(e) => onPointerMove(e, f)}
                 onPointerUp={(e) => onPointerUp(e, f)}
               >
-                <span className="frame-title">{f.title}</span>
+                <span className="frame-title">
+                  <Markdown text={f.title} />
+                </span>
                 <span className="frame-id muted">#{f.id}</span>
               </div>
-              {f.body && <div className="frame-body">{f.body}</div>}
+              {f.body && (
+                <div className="frame-body">
+                  <Markdown text={f.body} />
+                </div>
+              )}
               <div className="frame-foot muted">
                 {f.task_id !== null && (
                   <span className="badge">task #{f.task_id}</span>

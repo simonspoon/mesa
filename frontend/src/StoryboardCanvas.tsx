@@ -152,8 +152,19 @@ export function StoryboardCanvas({
   const byId = new Map(placed.map((f) => [f.id, f]))
   const selected = selectedId === null ? undefined : byId.get(selectedId)
 
-  const width = Math.max(1200, ...placed.map((f) => f.x + f.w + 80))
-  const height = Math.max(640, ...placed.map((f) => f.y + f.h + 80))
+  // Board bounding box in board-space. Frames can be dragged to NEGATIVE x/y;
+  // the SVG connector layer must span that region too, else any line at x<0 /
+  // y<0 is clipped and only its (overflow-visible) label div shows — a label
+  // floating with no connector under it. minX/minY stay 0 for all-positive
+  // boards (no needless shift); they go negative only when a frame crosses the
+  // origin, and the SVG is offset + viewBox'd to match (see edge-layer below).
+  const PAD = 80
+  const minX = Math.min(0, ...placed.map((f) => f.x - PAD))
+  const minY = Math.min(0, ...placed.map((f) => f.y - PAD))
+  const maxX = Math.max(1200, ...placed.map((f) => f.x + f.w + PAD))
+  const maxY = Math.max(640, ...placed.map((f) => f.y + f.h + PAD))
+  const width = maxX - minX
+  const height = maxY - minY
 
   function addFrame() {
     const n = view.frames.length
@@ -468,7 +479,13 @@ export function StoryboardCanvas({
           }}
         >
           <div className="storyboard-canvas" style={{ width, height }}>
-          <svg className="edge-layer" width={width} height={height}>
+          <svg
+            className="edge-layer"
+            width={width}
+            height={height}
+            viewBox={`${minX} ${minY} ${width} ${height}`}
+            style={{ left: minX, top: minY }}
+          >
             <defs>
               <marker
                 id="arrow"

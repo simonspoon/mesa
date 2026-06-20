@@ -34,6 +34,28 @@ header {
   margin-top: 0;
 }
 
+/* Collapsible Projects nav heading: a toggle caret beside the label (S9). */
+.nav-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.nav-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.nav-toggle:hover {
+  color: var(--cyan);
+}
+
 .nav-projects {
   list-style: none;
   margin: 0;
@@ -132,6 +154,29 @@ main {
   flex-wrap: wrap;
 }
 
+/* Primary create action, sitting just under the view tabs (S5). */
+.task-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0 0 1rem;
+}
+
+/* Discrete, de-emphasized destructive control in the project footer (S8). */
+.project-danger {
+  margin-top: 2.5rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.project-danger:hover {
+  opacity: 1;
+}
+
 .muted {
   color: var(--muted);
 }
@@ -159,6 +204,13 @@ main {
 .card-list li:hover {
   border-color: var(--border-bright);
   box-shadow: 0 0 10px rgba(0, 229, 255, 0.1);
+}
+
+/* Subtask nested under its parent: indented one level with a connector rail
+   (S6, one level only). */
+.card-list li.subtask-row {
+  margin-left: 1.5rem;
+  border-left: 2px solid var(--cyan-dim);
 }
 
 .filters {
@@ -296,6 +348,12 @@ main {
   cursor: grabbing;
   border-color: var(--cyan);
   box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+/* Subtask card nested under its parent within a column (S6). */
+.kanban-card.subtask-card {
+  margin-left: 1rem;
+  border-left: 2px solid var(--cyan-dim);
 }
 
 /* ---- CRUD controls ---- */

@@ -20,6 +20,8 @@ export function Sidebar({
   )
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
+  // Ephemeral collapse state (spec S9; persistence is a nice-to-have).
+  const [collapsed, setCollapsed] = useState(false)
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -37,8 +39,18 @@ export function Sidebar({
 
   return (
     <nav className="sidebar">
-      <h2>Projects</h2>
-      {error ? (
+      <h2 className="nav-heading">
+        <button
+          type="button"
+          className="nav-toggle"
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed((c) => !c)}
+        >
+          {collapsed ? '▸' : '▾'}
+        </button>
+        Projects
+      </h2>
+      {collapsed ? null : error ? (
         <p className="error">{error}</p>
       ) : !projects ? (
         <p className="muted">Loading…</p>
@@ -58,17 +70,21 @@ export function Sidebar({
           ))}
         </ul>
       )}
-      <form className="nav-create" onSubmit={submit}>
-        <input
-          type="text"
-          value={name}
-          placeholder="new project"
-          required
-          onChange={(e) => setName(e.target.value)}
-        />
-        <button type="submit">+</button>
-      </form>
-      {createError && <p className="error">{createError}</p>}
+      {!collapsed && (
+        <>
+          <form className="nav-create" onSubmit={submit}>
+            <input
+              type="text"
+              value={name}
+              placeholder="new project"
+              required
+              onChange={(e) => setName(e.target.value)}
+            />
+            <button type="submit">+</button>
+          </form>
+          {createError && <p className="error">{createError}</p>}
+        </>
+      )}
     </nav>
   )
 }

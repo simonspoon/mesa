@@ -28,13 +28,21 @@ function CreateSubtaskForm({
   onCreated: () => void
 }) {
   const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
   const [error, setError] = useState<string | null>(null)
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
-    createTask({ project_id: projectId, title, parent_id: parentId }).then(
+    createTask({
+      project_id: projectId,
+      title,
+      parent_id: parentId,
+      // Omit when empty, matching CreateTaskPanel.
+      ...(description === '' ? {} : { description }),
+    }).then(
       () => {
         setTitle('')
+        setDescription('')
         setError(null)
         onCreated()
       },
@@ -52,6 +60,11 @@ function CreateSubtaskForm({
         placeholder="new subtask title"
         required
         onChange={(e) => setTitle(e.target.value)}
+      />
+      <textarea
+        value={description}
+        placeholder="description (optional)"
+        onChange={(e) => setDescription(e.target.value)}
       />
       <button type="submit">add subtask</button>
       {error && <span className="error">{error}</span>}

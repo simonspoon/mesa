@@ -14,7 +14,7 @@ import type { TaskSummary } from './types/TaskSummary'
 
 const COLUMNS: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
 
-function Card({ task }: { task: TaskSummary }) {
+function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } =
     useDraggable({ id: task.id })
   const style = transform
@@ -24,7 +24,9 @@ function Card({ task }: { task: TaskSummary }) {
     <li
       ref={setNodeRef}
       style={style}
-      className={`kanban-card${isDragging ? ' dragging' : ''}`}
+      className={`kanban-card${isDragging ? ' dragging' : ''}${
+        depth > 0 ? ' subtask-card' : ''
+      }`}
       {...listeners}
       {...attributes}
     >
@@ -39,6 +41,32 @@ function Card({ task }: { task: TaskSummary }) {
   )
 }
 
+// Order a column's tasks so each subtask sits directly under its parent,
+// indented one level (spec S6). A subtask whose parent is in another column
+// (different status) stays at the top level so it is never dropped.
+function nestColumn(
+  tasks: TaskSummary[],
+): { task: TaskSummary; depth: number }[] {
+  const byParent = new Map<number, TaskSummary[]>()
+  for (const t of tasks) {
+    if (t.parent_id !== null) {
+      const group = byParent.get(t.parent_id) ?? []
+      group.push(t)
+      byParent.set(t.parent_id, group)
+    }
+  }
+  const present = new Set(tasks.map((t) => t.id))
+  const out: { task: TaskSummary; depth: number }[] = []
+  for (const t of tasks) {
+    if (t.parent_id !== null && present.has(t.parent_id)) continue
+    out.push({ task: t, depth: 0 })
+    for (const child of byParent.get(t.id) ?? []) {
+      out.push({ task: child, depth: 1 })
+    }
+  }
+  return out
+}
+
 function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
   const { setNodeRef, isOver } = useDroppable({ id: status })
   return (
@@ -47,8 +75,8 @@ function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
         {status} <span className="muted">{tasks.length}</span>
       </h2>
       <ul>
-        {tasks.map((t) => (
-          <Card key={t.id} task={t} />
+        {nestColumn(tasks).map(({ task, depth }) => (
+          <Card key={task.id} task={task} depth={depth} />
         ))}
       </ul>
     </div>

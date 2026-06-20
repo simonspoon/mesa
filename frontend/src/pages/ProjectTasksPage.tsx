@@ -12,8 +12,39 @@ import { useFetch } from '../useFetch'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
 
+import type { TaskSummary } from '../types/TaskSummary'
+
 const STATUSES: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
+
+// Order tasks so each subtask sits directly under its parent, indented one
+// level (spec S6, one level only). Parents keep the incoming order; a subtask
+// whose parent is absent from the list (filtered out) stays in place at the
+// top level so it is never dropped.
+function nestSubtasks(
+  tasks: TaskSummary[],
+): { task: TaskSummary; depth: number }[] {
+  const byParent = new Map<number, TaskSummary[]>()
+  for (const t of tasks) {
+    if (t.parent_id !== null) {
+      const group = byParent.get(t.parent_id) ?? []
+      group.push(t)
+      byParent.set(t.parent_id, group)
+    }
+  }
+  const present = new Set(tasks.map((t) => t.id))
+  const out: { task: TaskSummary; depth: number }[] = []
+  for (const t of tasks) {
+    // Skip subtasks whose parent is also in the list; they are emitted under
+    // the parent below. Orphaned subtasks fall through at depth 0.
+    if (t.parent_id !== null && present.has(t.parent_id)) continue
+    out.push({ task: t, depth: 0 })
+    for (const child of byParent.get(t.id) ?? []) {
+      out.push({ task: child, depth: 1 })
+    }
+  }
+  return out
+}
 
 export function ProjectTasksPage({
   projectId,
@@ -177,8 +208,8 @@ export function ProjectTasksPage({
         <p className="muted">No tasks match.</p>
       ) : (
         <ul className="card-list">
-          {visible.map((t) => (
-            <TaskRow key={t.id} task={t} />
+          {nestSubtasks(visible).map(({ task, depth }) => (
+            <TaskRow key={task.id} task={task} depth={depth} />
           ))}
         </ul>
       )}
@@ -217,20 +248,6 @@ export function ProjectTasksPage({
             />
           </p>
         )}
-        <p className="project-actions">
-          <button onClick={openCreate}>add task</button>
-          <ConfirmDelete
-            label="delete project"
-            message={`Deletes this project and ${allTasks?.length ?? '?'} task(s).`}
-            onDelete={() =>
-              deleteProject(projectId).then(() => {
-                onProjectsChanged()
-                window.location.hash = '#/'
-              })
-            }
-          />
-        </p>
-
         <div className="tabs">
           <button
             className={!storyboards && view === 'list' ? 'active' : ''}
@@ -257,6 +274,14 @@ export function ProjectTasksPage({
           </button>
         </div>
 
+        {/* Create action lives where the user is working: below the tabs, on
+            the List/Board views only (spec S5), not on Storyboards. */}
+        {!storyboards && (
+          <p className="task-actions">
+            <button onClick={openCreate}>add task</button>
+          </p>
+        )}
+
         {storyboards ? (
           storyboardId !== null ? (
             <StoryboardBoardView
@@ -275,6 +300,21 @@ export function ProjectTasksPage({
         ) : (
           listView
         )}
+
+        {/* Destructive action tucked away, de-emphasized (spec S8): rarely
+            used, kept reachable in a low-key project footer. */}
+        <p className="project-danger">
+          <ConfirmDelete
+            label="delete project"
+            message={`Deletes this project and ${allTasks?.length ?? '?'} task(s).`}
+            onDelete={() =>
+              deleteProject(projectId).then(() => {
+                onProjectsChanged()
+                window.location.hash = '#/'
+              })
+            }
+          />
+        </p>
       </div>
       {panel && <aside className="side-panel">{panel}</aside>}
     </div>

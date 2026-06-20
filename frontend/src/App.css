@@ -28,31 +28,49 @@ header {
   border-right: 1px solid var(--border);
   background: rgba(6, 10, 16, 0.6);
   padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  transition: width 0.15s ease, padding 0.15s ease;
+}
+
+/* Collapsed: the pane shrinks to a thin strip, handing its width back to the
+   main content area; only the expand toggle remains. */
+.sidebar.collapsed {
+  width: 2.6rem;
+  padding: 0.6rem 0.3rem;
+  align-items: center;
 }
 
 .sidebar h2 {
   margin-top: 0;
 }
 
-/* Collapsible Projects nav heading: a toggle caret beside the label (S9). */
 .nav-heading {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
+  margin-top: 0.25rem;
 }
 
+/* Collapse toggle: a quiet caret that sits at the pane's top-right (pointing
+   left to collapse), centred when the pane is collapsed (pointing right). */
 .nav-toggle {
+  align-self: flex-end;
   background: none;
   border: none;
+  clip-path: none;
   padding: 0;
   margin: 0;
-  font: inherit;
+  font-size: 1rem;
   line-height: 1;
   color: var(--muted);
   cursor: pointer;
 }
 
-.nav-toggle:hover {
+.sidebar.collapsed .nav-toggle {
+  align-self: center;
+}
+
+.nav-toggle:hover:not(:disabled) {
+  background: none;
+  box-shadow: none;
   color: var(--cyan);
 }
 
@@ -428,8 +446,8 @@ main {
   margin-top: 0.2rem;
 }
 
-/* Toolbar full-width, then the canvas and the (optional) editor panel share
-   the next row. */
+/* The canvas and the (optional) editor panel share a row; all canvas controls
+   now live as overlays inside the viewport itself (no separate toolbar row). */
 .storyboard {
   display: flex;
   flex-wrap: wrap;
@@ -437,19 +455,73 @@ main {
   align-items: flex-start;
 }
 
-.storyboard-toolbar {
-  flex: 1 1 100%;
+/* In-canvas control cluster, pinned to the viewport's top-left corner above the
+   pan/zoom layer. Buttons stack vertically; the hint/error wrap beneath them. */
+.canvas-controls {
+  position: absolute;
+  top: 0.6rem;
+  left: 0.6rem;
+  z-index: 5;
   display: flex;
-  gap: 0.75rem;
-  align-items: center;
-  flex-wrap: wrap;
-  margin: 0.5rem 0;
+  flex-direction: column;
+  gap: 0.4rem;
+  width: 9.5rem;
 }
 
-.storyboard-toolbar button.active {
+.canvas-controls button {
+  width: 100%;
+  background: rgba(6, 10, 16, 0.85);
+}
+
+.canvas-controls button.active {
   color: var(--magenta);
   border-color: var(--magenta);
   box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
+}
+
+.canvas-hint {
+  font-size: 0.72rem;
+  line-height: 1.3;
+}
+
+/* Expand/collapse toggle, pinned to the viewport's top-right corner. */
+.canvas-expand {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.6rem;
+  z-index: 5;
+  background: rgba(6, 10, 16, 0.85);
+}
+
+.canvas-expand.active {
+  color: var(--magenta);
+  border-color: var(--magenta);
+  box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
+}
+
+/* Expanded mode: the storyboard takes over the whole window. The root pins to
+   the viewport and the canvas viewport fills the remaining space; the editor
+   panel (if open) overlays the right edge. */
+.storyboard.expanded {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  margin: 0;
+  padding: 0.6rem;
+  gap: 0.6rem;
+  background: var(--bg);
+  flex-wrap: nowrap;
+}
+
+.storyboard.expanded .storyboard-viewport {
+  flex: 1 1 auto;
+  height: 100%;
+}
+
+.storyboard.expanded .side-panel {
+  position: static;
+  height: 100%;
+  overflow: auto;
 }
 
 /* Viewport: fixed-size window onto the canvas. Native scroll is gone; the

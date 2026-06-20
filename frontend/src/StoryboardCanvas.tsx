@@ -91,6 +91,9 @@ export function StoryboardCanvas({
   const [connectMode, setConnectMode] = useState(false)
   const [connectFrom, setConnectFrom] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Expanded mode: the canvas takes over the whole window (CSS fixes the root to
+  // the viewport). Purely a view-layer toggle, never persisted on the board.
+  const [expanded, setExpanded] = useState(false)
   // Live position of the frame currently being dragged; overlays the server
   // position so the drag is smooth without copying the whole frame list.
   const [dragPos, setDragPos] = useState<{ id: number; x: number; y: number } | null>(
@@ -288,13 +291,29 @@ export function StoryboardCanvas({
     return () => el.removeEventListener('wheel', onWheel)
   }, [])
 
+  // Escape leaves expanded (whole-window) mode — the usual way out of a takeover
+  // view. Only bound while expanded so it never swallows Escape elsewhere.
+  useEffect(() => {
+    if (!expanded) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setExpanded(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [expanded])
+
   // Pan starts only when the pointer goes down on empty canvas (not on a frame)
   // and not in connect-mode; frame drags own their own pointer handlers. Pan
   // translates the view by the raw client delta (screen-space, scale-free).
   function onViewportPointerDown(e: React.PointerEvent) {
     if (e.button !== 0 || connectMode) return
-    // Empty canvas only: not on a frame, not on an edge label/control.
-    if ((e.target as HTMLElement).closest('.frame, .edge-label')) return
+    // Empty canvas only: not on a frame, edge label, or an in-canvas control.
+    if (
+      (e.target as HTMLElement).closest(
+        '.frame, .edge-label, .canvas-controls, .canvas-expand',
+      )
+    )
+      return
     ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
     panRef.current = {
       pointerId: e.pointerId,
@@ -359,28 +378,11 @@ export function StoryboardCanvas({
   }
 
   return (
-    <div className={`storyboard${selected ? ' has-panel' : ''}`}>
-      <div className="storyboard-toolbar">
-        <button onClick={addFrame}>add frame</button>
-        <button
-          className={connectMode ? 'active' : ''}
-          onClick={toggleConnect}
-        >
-          {connectMode ? 'connecting…' : 'connect'}
-        </button>
-        <button onClick={resetView} title="Reset zoom and recentre on the cards">
-          reset view
-        </button>
-        <span className="muted">
-          {connectMode
-            ? connectFrom === null
-              ? 'click a frame to start an edge'
-              : 'click the target frame'
-            : 'drag a frame to move it · click to edit'}
-        </span>
-        {error && <span className="error">{error}</span>}
-      </div>
-
+    <div
+      className={`storyboard${selected ? ' has-panel' : ''}${
+        expanded ? ' expanded' : ''
+      }`}
+    >
       <div
         ref={viewportRef}
         className={`storyboard-viewport${panning ? ' panning' : ''}`}
@@ -388,6 +390,44 @@ export function StoryboardCanvas({
         onPointerMove={onViewportPointerMove}
         onPointerUp={onViewportPointerUp}
       >
+        {/* In-canvas controls, pinned top-left over the pan/zoom layer. */}
+        <div className="canvas-controls">
+          <button onClick={addFrame}>add frame</button>
+          <button
+            className={connectMode ? 'active' : ''}
+            onClick={toggleConnect}
+          >
+            {connectMode ? 'connecting…' : 'connect'}
+          </button>
+          <button
+            onClick={resetView}
+            title="Reset zoom and recentre on the cards"
+          >
+            reset view
+          </button>
+          <span className="canvas-hint muted">
+            {connectMode
+              ? connectFrom === null
+                ? 'click a frame to start an edge'
+                : 'click the target frame'
+              : 'drag a frame to move it · click to edit'}
+          </span>
+          {error && <span className="error">{error}</span>}
+        </div>
+
+        {/* Expand toggle, pinned top-right: take over the whole window. */}
+        <button
+          className={`canvas-expand${expanded ? ' active' : ''}`}
+          onClick={() => setExpanded((x) => !x)}
+          title={
+            expanded
+              ? 'Collapse the canvas (Esc)'
+              : 'Expand the canvas to fill the window'
+          }
+        >
+          {expanded ? 'collapse' : 'expand'}
+        </button>
+
         <div
           className="storyboard-content"
           style={{

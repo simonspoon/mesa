@@ -38,40 +38,40 @@ export function Sidebar({
   }
 
   return (
-    <nav className="sidebar">
-      <h2 className="nav-heading">
-        <button
-          type="button"
-          className="nav-toggle"
-          aria-expanded={!collapsed}
-          onClick={() => setCollapsed((c) => !c)}
-        >
-          {collapsed ? '▸' : '▾'}
-        </button>
-        Projects
-      </h2>
-      {collapsed ? null : error ? (
-        <p className="error">{error}</p>
-      ) : !projects ? (
-        <p className="muted">Loading…</p>
-      ) : projects.length === 0 ? (
-        <p className="muted">No projects yet.</p>
-      ) : (
-        <ul className="nav-projects">
-          {projects.map((p) => (
-            <li key={p.id}>
-              <a
-                className={p.id === activeProjectId ? 'active' : ''}
-                href={`#/projects/${p.id}`}
-              >
-                {p.name}
-              </a>
-            </li>
-          ))}
-        </ul>
-      )}
+    <nav className={`sidebar${collapsed ? ' collapsed' : ''}`}>
+      <button
+        type="button"
+        className="nav-toggle"
+        aria-expanded={!collapsed}
+        aria-label={collapsed ? 'Expand projects nav' : 'Collapse projects nav'}
+        title={collapsed ? 'Expand projects nav' : 'Collapse projects nav'}
+        onClick={() => setCollapsed((c) => !c)}
+      >
+        {collapsed ? '▸' : '◂'}
+      </button>
       {!collapsed && (
         <>
+          <h2 className="nav-heading">Projects</h2>
+          {error ? (
+            <p className="error">{error}</p>
+          ) : !projects ? (
+            <p className="muted">Loading…</p>
+          ) : projects.length === 0 ? (
+            <p className="muted">No projects yet.</p>
+          ) : (
+            <ul className="nav-projects">
+              {projects.map((p) => (
+                <li key={p.id}>
+                  <a
+                    className={p.id === activeProjectId ? 'active' : ''}
+                    href={`#/projects/${p.id}`}
+                  >
+                    {p.name}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
           <form className="nav-create" onSubmit={submit}>
             <input
               type="text"

@@ -390,6 +390,18 @@ export function StoryboardCanvas({
         onPointerMove={onViewportPointerMove}
         onPointerUp={onViewportPointerUp}
       >
+        {/* Infinite graph-paper grid filling the whole viewport. Lives on a
+            fixed full-size layer (behind the content) but its size/position
+            track the pan/zoom transform, so the lines stay aligned with the
+            frames at every zoom level. */}
+        <div
+          className="storyboard-grid"
+          style={{
+            backgroundSize: `${32 * transform.scale}px ${32 * transform.scale}px`,
+            backgroundPosition: `${transform.tx}px ${transform.ty}px`,
+          }}
+        />
+
         {/* In-canvas controls, pinned top-left over the pan/zoom layer. */}
         <div className="canvas-controls">
           <button onClick={addFrame}>add frame</button>

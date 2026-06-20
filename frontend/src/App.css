@@ -558,10 +558,20 @@ main {
 
 .storyboard-canvas {
   position: relative;
+}
+
+/* Infinite graph-paper grid. Pinned to the viewport so it always fills the
+   whole visible area, but background-size/position are driven inline from the
+   pan/zoom transform so the lines pan and zoom in lockstep with the frames.
+   Sits behind the content layer and ignores pointer events so it never
+   interferes with panning, frame drag or connect mode. */
+.storyboard-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
   background-image:
     linear-gradient(var(--grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size: 32px 32px;
 }
 
 .edge-layer {

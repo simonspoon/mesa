@@ -102,6 +102,10 @@ export function ProjectTasksPage({
     view === 'board'
       ? `board-${projectId}`
       : `tasks-${projectId}-${status}-${tag}`,
+    // Live-sync the List/Board: agents mutate the DB underneath the UI, so
+    // poll for changes instead of waiting for a window refocus. No-op polls
+    // are dropped in useFetch, so an unchanged view never re-renders.
+    { pollMs: 3000 },
   )
   // Unfiltered count for the delete confirmation: the list fetch above may
   // be filtered, but the cascade destroys every task in the project.

@@ -9,6 +9,8 @@ import { KanbanBoard } from '../KanbanBoard'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
+import { BulletinListView } from './BulletinListView'
+import { BulletinThreadView } from './BulletinThreadView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
 
@@ -51,6 +53,8 @@ export function ProjectTasksPage({
   taskId,
   storyboards,
   storyboardId,
+  posts,
+  postId,
   onProjectsChanged,
 }: {
   projectId: number
@@ -59,6 +63,10 @@ export function ProjectTasksPage({
   // true on the boards routes, `storyboardId` selects a single board's canvas.
   storyboards: boolean
   storyboardId: number | null
+  // Bulletin is the other URL-driven view: `posts` is true on the board routes,
+  // `postId` selects a single thread.
+  posts: boolean
+  postId: number | null
   onProjectsChanged: () => void
 }) {
   // Status and tag are passed through to the API's query filters; priority
@@ -114,9 +122,10 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  // Storyboards is its own view with its own fetches/error handling, so a
-  // failed task fetch must not block it; only surface it on the task views.
-  const error = projectError ?? (storyboards ? null : tasksError)
+  // Storyboards and Bulletin are their own views with their own fetches/error
+  // handling, so a failed task fetch must not block them; only surface it on
+  // the task views (List/Board).
+  const error = projectError ?? (storyboards || posts ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
@@ -131,7 +140,7 @@ export function ProjectTasksPage({
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectView(next: 'list' | 'board') {
     setView(next)
-    if (storyboards) window.location.hash = `#/projects/${projectId}`
+    if (storyboards || posts) window.location.hash = `#/projects/${projectId}`
   }
 
   function closePanel() {
@@ -254,19 +263,21 @@ export function ProjectTasksPage({
         )}
         <div className="tabs">
           <button
-            className={!storyboards && view === 'list' ? 'active' : ''}
+            className={!storyboards && !posts && view === 'list' ? 'active' : ''}
             onClick={() => selectView('list')}
           >
             List
           </button>
           <button
-            className={!storyboards && view === 'board' ? 'active' : ''}
+            className={
+              !storyboards && !posts && view === 'board' ? 'active' : ''
+            }
             onClick={() => selectView('board')}
           >
             Board
           </button>
-          {/* Third in-place view: drives the URL (boards/canvas are refresh-
-              and back-stable) while keeping this frame around the content. */}
+          {/* URL-driven in-place views (refresh-/back-stable) that keep this
+              frame around their content, like List/Board above. */}
           <button
             className={storyboards ? 'active' : ''}
             onClick={() => {
@@ -276,17 +287,39 @@ export function ProjectTasksPage({
           >
             Storyboards
           </button>
+          <button
+            className={posts ? 'active' : ''}
+            onClick={() => {
+              if (!posts)
+                window.location.hash = `#/projects/${projectId}/posts`
+            }}
+          >
+            Bulletin
+          </button>
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
-            the List/Board views only (spec S5), not on Storyboards. */}
-        {!storyboards && (
+            the List/Board views only (spec S5), not on Storyboards/Bulletin
+            (those carry their own create forms). */}
+        {!storyboards && !posts && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
         )}
 
-        {storyboards ? (
+        {posts ? (
+          postId !== null ? (
+            // key on postId so a thread→thread navigation remounts and never
+            // leaks the open reply/editor state across posts (cf. TaskPanel).
+            <BulletinThreadView
+              key={postId}
+              projectId={projectId}
+              postId={postId}
+            />
+          ) : (
+            <BulletinListView projectId={projectId} />
+          )
+        ) : storyboards ? (
           storyboardId !== null ? (
             <StoryboardBoardView
               projectId={projectId}

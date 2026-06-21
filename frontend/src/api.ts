@@ -4,6 +4,9 @@
 
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
+import type { Post } from './types/Post'
+import type { PostSummary } from './types/PostSummary'
+import type { PostThread } from './types/PostThread'
 import type { Priority } from './types/Priority'
 import type { Project } from './types/Project'
 import type { Status } from './types/Status'
@@ -296,4 +299,67 @@ export function updateEdge(
 /** Returns the destroyed edge. */
 export function deleteEdge(id: number, author?: string): Promise<FrameEdge> {
   return request(`/api/edges/${id}${actorQuery(author)}`, jsonDelete())
+}
+
+// ---- posts (bulletin board) ----
+
+export interface PostFilters {
+  project?: number
+  tag?: string
+  author?: string
+}
+
+/** Top-level posts only (newest first), as compact summaries with reply_count. */
+export function listPosts(filters: PostFilters = {}): Promise<PostSummary[]> {
+  const params = new URLSearchParams()
+  if (filters.project !== undefined) params.set('project', String(filters.project))
+  if (filters.tag !== undefined && filters.tag !== '') params.set('tag', filters.tag)
+  if (filters.author !== undefined && filters.author !== '')
+    params.set('author', filters.author)
+  const qs = params.toString()
+  return request(`/api/posts${qs ? `?${qs}` : ''}`)
+}
+
+/** A post with its direct replies: {post, replies}. */
+export function getPost(id: number): Promise<PostThread> {
+  return request(`/api/posts/${id}`)
+}
+
+export interface PostCreate {
+  project_id: number
+  body: string
+  title?: string
+  tag?: string
+  author?: string
+}
+
+export function createPost(body: PostCreate): Promise<Post> {
+  return request('/api/posts', jsonInit('POST', body))
+}
+
+export interface ReplyCreate {
+  body: string
+  title?: string
+  tag?: string
+  author?: string
+}
+
+/** Posts a reply that inherits the parent's project. */
+export function replyToPost(parentId: number, body: ReplyCreate): Promise<Post> {
+  return request(`/api/posts/${parentId}/replies`, jsonInit('POST', body))
+}
+
+export interface PostPatch {
+  body?: string
+  title?: string | null
+  tag?: string | null
+}
+
+export function updatePost(id: number, patch: PostPatch): Promise<Post> {
+  return request(`/api/posts/${id}`, jsonInit('PATCH', patch))
+}
+
+/** Returns the destroyed thread: the post plus all cascaded replies. */
+export function deletePost(id: number): Promise<PostThread> {
+  return request(`/api/posts/${id}`, jsonDelete())
 }

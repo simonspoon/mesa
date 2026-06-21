@@ -8,7 +8,7 @@
 //! - Errors are `{"error": {"code", "message"}}` on stderr; clap usage errors
 //!   are intercepted into the same shape (exit 2). `--help` stays human text.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
@@ -111,16 +111,42 @@ enum ProjectCmd {
     #[command(after_help = "\
 EXAMPLES
   mesa project create \"Website redesign\"
-  mesa project create \"API v2\" --description \"second public API\"")]
+  mesa project create \"API v2\" --description \"second public API\"
+
+By default the current directory's git repo is bound to the new project via its
+root (first) commit hash, so every clone/worktree of the same source later
+resolves here (see `mesa project resolve`). Binding a commit already held by
+another project fails with `conflict`. Use --no-git to skip, or --root-commit to
+bind an explicit hash instead of detecting it.")]
     Create {
         /// Project name
         name: String,
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
+        /// Bind this exact root commit hash instead of detecting it from cwd
+        #[arg(long, conflicts_with = "no_git")]
+        root_commit: Option<String>,
+        /// Do not bind any repo to the project
+        #[arg(long)]
+        no_git: bool,
     },
     /// List all projects as a bare JSON array
     List,
+    /// Resolve the project bound to a repo's root commit; prints the full project
+    ///
+    /// Computes the root (first) commit of the git repo at PATH (default: cwd)
+    /// and prints the project bound to it. Errors `not_found` if none is bound,
+    /// or `validation` if PATH is not inside a git repo. Run this before
+    /// creating a project so the same source never spawns a duplicate.
+    #[command(after_help = "\
+EXAMPLES
+  mesa project resolve            # which project owns the current directory?
+  mesa project resolve ../other   # ...owns ../other")]
+    Resolve {
+        /// Directory inside the repo to resolve (default: current directory)
+        path: Option<PathBuf>,
+    },
     /// Print one project as a full JSON object
     Show {
         /// Project id
@@ -140,6 +166,9 @@ EXAMPLES
         /// New description; pass "" to clear it
         #[arg(long, group = "fields")]
         description: Option<String>,
+        /// Bind this root commit hash; pass "" to clear the binding
+        #[arg(long, group = "fields")]
+        root_commit: Option<String>,
     },
     /// Delete a project AND all its tasks (no confirmation)
     ///
@@ -701,6 +730,29 @@ fn clear_if_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// The root (first) commit of the git repo at `path` (default: cwd), or `None`
+/// if it is not a git repo or git is unavailable. Uses `--reverse` and takes the
+/// first line so a repo with several root commits resolves deterministically to
+/// its oldest one. This hash is the project's stable identity across checkouts.
+fn git_root_commit(path: Option<&Path>) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(p) = path {
+        cmd.arg("-C").arg(p);
+    }
+    cmd.args(["rev-list", "--max-parents=0", "--reverse", "HEAD"]);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// Compact task object for `list`: full object minus `description`.
 fn compact(t: &Task) -> serde_json::Value {
     json!({
@@ -732,6 +784,7 @@ fn error_code(err: &Error) -> &'static str {
         Error::NotFound(_) => "not_found",
         Error::Validation(_) => "validation",
         Error::Cycle(_) => "cycle",
+        Error::Conflict(_) => "conflict",
         Error::Db(_) | Error::Io(_) => "conflict",
     }
 }
@@ -779,19 +832,44 @@ fn execute(command: Command) -> Result<()> {
 fn run_project(cmd: ProjectCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
-        ProjectCmd::Create { name, description } => {
-            print_json(&store.create_project(&name, description.as_deref())?);
+        ProjectCmd::Create {
+            name,
+            description,
+            root_commit,
+            no_git,
+        } => {
+            let root_commit = if no_git {
+                None
+            } else {
+                // An explicit (even empty) --root-commit suppresses auto-detect;
+                // "" means "no binding", mirroring `update --root-commit ""`.
+                match root_commit {
+                    Some(hash) => clear_if_empty(hash),
+                    None => git_root_commit(None),
+                }
+            };
+            print_json(&store.create_project(&name, description.as_deref(), root_commit.as_deref())?);
         }
         ProjectCmd::List => print_json(&store.list_projects()?),
+        ProjectCmd::Resolve { path } => {
+            let commit = git_root_commit(path.as_deref()).ok_or_else(|| {
+                Error::Validation(
+                    "not a git repository (or git unavailable); cannot resolve a project".into(),
+                )
+            })?;
+            print_json(&store.find_project_by_root_commit(&commit)?);
+        }
         ProjectCmd::Show { id } => print_json(&store.get_project(id)?),
         ProjectCmd::Update {
             id,
             name,
             description,
+            root_commit,
         } => {
             let patch = ProjectPatch {
                 name,
                 description: description.map(clear_if_empty),
+                root_commit: root_commit.map(clear_if_empty),
             };
             print_json(&store.update_project(id, &patch)?);
         }

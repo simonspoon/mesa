@@ -5,4 +5,11 @@ export type Project = {
  * ids are SQLite rowids, well within JS safe-integer range, so they are
  * exported as `number` rather than ts-rs's default `bigint` for i64.
  */
-id: number, name: string, description: string | null, };
+id: number, name: string, description: string | null, 
+/**
+ * Root (first) commit hash of the source repo this project tracks, if any.
+ * Stable across clones/worktrees/moved folders, so every checkout of the
+ * same source resolves to one project. Set at create time or via update;
+ * unique across projects (a commit binds to exactly one project).
+ */
+root_commit: string | null, };

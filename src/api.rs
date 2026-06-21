@@ -74,6 +74,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/projects/resolve", get(resolve_project))
         .route(
             "/api/projects/{id}",
             get(show_project).patch(update_project).delete(delete_project),
@@ -185,6 +186,7 @@ impl From<Error> for ApiError {
             Error::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Error::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation"),
             Error::Cycle(_) => (StatusCode::CONFLICT, "cycle"),
+            Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Error::Db(_) | Error::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "conflict"),
         };
         ApiError {
@@ -234,6 +236,10 @@ struct ProjectCreate {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    /// Optional root-commit binding. The caller computes the hash (the server
+    /// has no cwd/git context); the API only stores and enforces uniqueness.
+    #[serde(default)]
+    root_commit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -242,6 +248,13 @@ struct ProjectUpdate {
     name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    root_commit: Option<Option<String>>,
+}
+
+#[derive(Deserialize)]
+struct ProjectResolve {
+    commit: String,
 }
 
 async fn list_projects(State(state): State<AppState>) -> ApiResult<Response> {
@@ -255,8 +268,17 @@ async fn create_project(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let project = store.create_project(&body.name, body.description.as_deref())?;
+    let project =
+        store.create_project(&body.name, body.description.as_deref(), body.root_commit.as_deref())?;
     Ok((StatusCode::CREATED, Json(project)).into_response())
+}
+
+async fn resolve_project(
+    State(state): State<AppState>,
+    Query(q): Query<ProjectResolve>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.find_project_by_root_commit(&q.commit)?).into_response())
 }
 
 async fn show_project(
@@ -276,6 +298,7 @@ async fn update_project(
     let patch = ProjectPatch {
         name: body.name,
         description: body.description,
+        root_commit: body.root_commit,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_project(id, &patch)?).into_response())

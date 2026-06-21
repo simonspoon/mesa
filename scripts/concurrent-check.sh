@@ -33,7 +33,7 @@ export MESA_DB="$TMP/mesa.db"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # ---- seed: one project, five tasks ----
-P=$("$MESA" project create "Concurrency" | jq .id)
+P=$("$MESA" project create "Concurrency" --no-git | jq .id)
 TASKS=()
 for i in 1 2 3 4 5; do
   TASKS+=("$("$MESA" task create --project "$P" "task $i" | jq .id)")

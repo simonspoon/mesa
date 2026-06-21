@@ -35,13 +35,13 @@ jqs() { jq -r "$1" <<<"$STDOUT"; } # query last stdout
 jqe() { jq -r "$1" <<<"$STDERR"; } # query last stderr
 
 # ---- create ----
-run 0 "$MESA" project create "Website" --description "marketing site"
+run 0 "$MESA" project create "Website" --description "marketing site" --no-git
 [ "$(jqs .name)" = "Website" ] || fail "project create: name"
 [ "$(jqs .description)" = "marketing site" ] || fail "project create: description"
 P=$(jqs .id)
 ok "project create returns full object, exit 0"
 
-run 0 "$MESA" project create "Other"
+run 0 "$MESA" project create "Other" --no-git
 P2=$(jqs .id)
 
 run 0 "$MESA" task create --project "$P" "Design layout" --priority high --tags design,web
@@ -174,7 +174,7 @@ ok "--help: human text with untrusted-data warning, exit 0"
 
 # ---- acceptance / artifact fields ----
 # Use a dedicated project so existing cascade-count assertions below stay valid.
-run 0 "$MESA" project create "Trust trail"
+run 0 "$MESA" project create "Trust trail" --no-git
 P3=$(jqs .id)
 run 0 "$MESA" task create --project "$P3" "Acceptance task" \
   --acceptance "tests pass" --artifact "abc123"
@@ -198,7 +198,7 @@ ok "task update --acceptance \"\": clears the field"
 
 # ---- import (atomic task graph) ----
 # Dedicated project so the next/events flow below sees only the imported graph.
-run 0 "$MESA" project create "Import graph"
+run 0 "$MESA" project create "Import graph" --no-git
 PI=$(jqs .id)
 GRAPH="{\"project\":$PI,\"tasks\":[\
 {\"ref\":\"a\",\"title\":\"design\",\"priority\":\"high\",\"acceptance\":\"AC-a\"},\
@@ -258,6 +258,39 @@ run 0 "$MESA" task events "$IA"
 [ "$(jqs '.[1].from_status')" = "todo" ] || fail "events: change row from_status"
 [ "$(jqs '.[1].to_status')" = "done" ] || fail "events: change row to_status"
 ok "task events <id>: append-only rows, oldest first (create + change)"
+
+# ---- root-commit binding & resolve (source-to-project identity) ----
+# Isolated db + a throwaway git repo so this can't perturb the P/P2 counts the
+# delete/backup assertions below depend on.
+MESA_ABS="$(pwd)/$MESA"
+RDB="$TMP/resolve.db"
+MESA_DB="$RDB" run 0 "$MESA" project create "Bound" --root-commit deadbeefcafe
+[ "$(jqs .root_commit)" = "deadbeefcafe" ] || fail "create --root-commit: stored"
+MESA_DB="$RDB" run 1 "$MESA" project create "Dup" --root-commit deadbeefcafe
+[ "$(jqe .error.code)" = "conflict" ] || fail "duplicate root commit: error.code=conflict"
+ok "root-commit binding: stored + duplicate rejected (conflict)"
+
+# An explicit empty --root-commit means "no binding", not an empty-string bind
+# (mirrors `update --root-commit ""`); two of them must not collide.
+MESA_DB="$RDB" run 0 "$MESA" project create "Empty A" --root-commit ""
+[ "$(jqs .root_commit)" = "null" ] || fail "create --root-commit \"\": must not bind"
+MESA_DB="$RDB" run 0 "$MESA" project create "Empty B" --root-commit ""
+ok "create --root-commit \"\": treated as no binding, no collision"
+
+REPO="$TMP/repo"
+mkdir -p "$REPO/sub"
+git -C "$REPO" init -q
+git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+RC=$(git -C "$REPO" rev-list --max-parents=0 --reverse HEAD | head -1)
+MESA_DB="$RDB" run 0 bash -c "cd '$REPO' && '$MESA_ABS' project create 'Repo proj'"
+[ "$(jqs .root_commit)" = "$RC" ] || fail "create auto-binds cwd root commit"
+RPID=$(jqs .id)
+MESA_DB="$RDB" run 0 "$MESA" project resolve "$REPO/sub"
+[ "$(jqs .id)" = "$RPID" ] || fail "resolve: subdir maps to its repo's project"
+ok "resolve: a git checkout maps back to its one project"
+MESA_DB="$RDB" run 1 "$MESA" project resolve "$TMP"
+[ "$(jqe .error.code)" = "validation" ] || fail "resolve non-git: error.code=validation"
+ok "resolve: non-git path errors validation"
 
 # Drop the extra projects so the delete/backup assertions below (which assume
 # only P and P2 exist) remain valid.

@@ -36,9 +36,9 @@ jqs() { jq -r "$1" <<<"$STDOUT"; }
 jqe() { jq -r "$1" <<<"$STDERR"; }
 
 # ---- setup: two projects, one task in each ----
-run 0 "$MESA" project create "Board project"
+run 0 "$MESA" project create "Board project" --no-git
 P=$(jqs .id)
-run 0 "$MESA" project create "Other project"
+run 0 "$MESA" project create "Other project" --no-git
 P2=$(jqs .id)
 run 0 "$MESA" task create --project "$P" "Linked task"
 TASK=$(jqs .id)

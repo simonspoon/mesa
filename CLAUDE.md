@@ -101,6 +101,16 @@ invariants you must not break — read them before changing `src/`:
 - A task's project is immutable after creation.
 - A subtask shares its parent's project.
 - Dependency self-edges and cycles are rejected (`cycle`).
+- A project may bind a **`root_commit`** — the repo's first/root commit hash, the
+  stable identity of "this source code" across clones, worktrees, and moved
+  folders. A commit binds to **at most one project** (DB-unique; second bind ⇒
+  `conflict`). This is how an agent maps its working directory to the right
+  project instead of spawning a duplicate: `mesa project resolve [path]` computes
+  the root commit (`git rev-list --max-parents=0 --reverse HEAD`, oldest) and
+  returns the bound project. `project create` auto-binds the cwd repo unless
+  `--no-git`/`--root-commit`; `project update --root-commit ""` clears it. The
+  git computation lives in the CLI; `Store`/API treat `root_commit` as an opaque
+  unique string (API: `GET /api/projects/resolve?commit=<sha>`).
 
 ### Storyboards (freeform visual canvas)
 

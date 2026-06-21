@@ -74,6 +74,11 @@ pub struct Project {
     pub id: i64,
     pub name: String,
     pub description: Option<String>,
+    /// Root (first) commit hash of the source repo this project tracks, if any.
+    /// Stable across clones/worktrees/moved folders, so every checkout of the
+    /// same source resolves to one project. Set at create time or via update;
+    /// unique across projects (a commit binds to exactly one project).
+    pub root_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

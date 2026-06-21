@@ -4,6 +4,7 @@
 
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
+import type { InboxItem } from './types/InboxItem'
 import type { Post } from './types/Post'
 import type { PostSummary } from './types/PostSummary'
 import type { PostThread } from './types/PostThread'
@@ -362,4 +363,38 @@ export function updatePost(id: number, patch: PostPatch): Promise<Post> {
 /** Returns the destroyed thread: the post plus all cascaded replies. */
 export function deletePost(id: number): Promise<PostThread> {
   return request(`/api/posts/${id}`, jsonDelete())
+}
+
+// ---- inbox (global update requests) ----
+
+/** Inbox items, newest first. With `project`, only items assigned there. */
+export function listInbox(project?: number): Promise<InboxItem[]> {
+  const qs = project !== undefined ? `?project=${project}` : ''
+  return request(`/api/inbox${qs}`)
+}
+
+export function getInboxItem(id: number): Promise<InboxItem> {
+  return request(`/api/inbox/${id}`)
+}
+
+export interface InboxCreate {
+  body: string
+  author?: string
+}
+
+export function createInboxItem(body: InboxCreate): Promise<InboxItem> {
+  return request('/api/inbox', jsonInit('POST', body))
+}
+
+/** Route an item to a project (number) or back to the unassigned inbox (null). */
+export function assignInboxItem(
+  id: number,
+  projectId: number | null,
+): Promise<InboxItem> {
+  return request(`/api/inbox/${id}`, jsonInit('PATCH', { project_id: projectId }))
+}
+
+/** Returns the destroyed item. */
+export function deleteInboxItem(id: number): Promise<InboxItem> {
+  return request(`/api/inbox/${id}`, jsonDelete())
 }

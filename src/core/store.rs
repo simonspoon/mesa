@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::types::{
-    Frame, FrameEdge, Post, PostSummary, PostThread, Priority, Project, Status, Storyboard,
-    StoryboardEvent, StoryboardView, Task, TaskEvent,
+    Frame, FrameEdge, InboxItem, Post, PostSummary, PostThread, Priority, Project, Status,
+    Storyboard, StoryboardEvent, StoryboardView, Task, TaskEvent,
 };
 
 #[derive(Debug)]
@@ -156,6 +156,16 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE projects ADD COLUMN root_commit TEXT;
     CREATE UNIQUE INDEX idx_projects_root_commit
         ON projects(root_commit) WHERE root_commit IS NOT NULL;
+    ",
+    "
+    CREATE TABLE inbox (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        author      TEXT,
+        body        TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z',
+        updated_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+    );
     "];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -216,6 +226,18 @@ const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, auth
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
 const POST_COLUMNS: &str =
     "id, project_id, parent_id, author, title, tag, body, created_at, updated_at";
+const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at";
+
+fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
+    Ok(InboxItem {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        author: row.get(2)?,
+        body: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
 
 fn row_to_post(row: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
     Ok(Post {
@@ -1730,6 +1752,77 @@ impl Store {
         Ok(parent_project)
     }
 
+    // ---- inbox (global update requests) ----
+
+    /// Adds an item to the global inbox: a free-text update request not yet tied
+    /// to any project. New items are always unassigned (`project_id` null); a
+    /// person routes them to a project later via `assign_inbox_item`. The single
+    /// write path for inbox items.
+    pub fn create_inbox_item(&mut self, author: Option<&str>, body: &str) -> Result<InboxItem> {
+        self.conn.execute(
+            "INSERT INTO inbox (project_id, author, body, created_at, updated_at) \
+             VALUES (NULL, ?1, ?2, datetime('now'), datetime('now'))",
+            (author, body),
+        )?;
+        self.get_inbox_item(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_inbox_item(&self, id: i64) -> Result<InboxItem> {
+        self.conn
+            .query_row(
+                &format!("SELECT {INBOX_COLUMNS} FROM inbox WHERE id = ?1"),
+                [id],
+                row_to_inbox_item,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("inbox item {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Lists inbox items, newest first. With `project` given, only the items
+    /// assigned to that project; otherwise the whole inbox (assigned and not).
+    pub fn list_inbox_items(&self, project: Option<i64>) -> Result<Vec<InboxItem>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {INBOX_COLUMNS} FROM inbox \
+             WHERE (?1 IS NULL OR project_id = ?1) ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([project], row_to_inbox_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Routes an inbox item to a project (`Some`) or returns it to the
+    /// unassigned inbox (`None`); bumps `updated_at`. Assigning to an unknown
+    /// project is a `validation` error, mirroring a task's `--project`.
+    pub fn assign_inbox_item(&mut self, id: i64, project_id: Option<i64>) -> Result<InboxItem> {
+        self.get_inbox_item(id)?;
+        if let Some(pid) = project_id {
+            let project_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [pid],
+                |r| r.get(0),
+            )?;
+            if !project_exists {
+                return Err(Error::Validation(format!("project {pid} not found")));
+            }
+        }
+        self.conn.execute(
+            "UPDATE inbox SET project_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            (project_id, id),
+        )?;
+        self.get_inbox_item(id)
+    }
+
+    /// Deletes an inbox item; returns the destroyed record (the recoverable
+    /// echo — there is no history table for the inbox).
+    pub fn delete_inbox_item(&mut self, id: i64) -> Result<InboxItem> {
+        let item = self.get_inbox_item(id)?;
+        self.conn.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
+        Ok(item)
+    }
+
     // ---- backup ----
 
     /// Snapshots the database to `path` via `VACUUM INTO` (safe under WAL).
@@ -3237,5 +3330,82 @@ mod tests {
         let post = store.create_post(p.id, None, None, None, "hi").unwrap();
         store.delete_project(p.id).unwrap();
         assert!(matches!(store.get_post(post.id), Err(Error::NotFound(_))));
+    }
+
+    // ---- inbox (global update requests) ----
+
+    #[test]
+    fn inbox_add_assign_and_delete_round_trip() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None).unwrap();
+
+        // New items land unassigned in the global inbox.
+        let item = store
+            .create_inbox_item(Some("agent-7"), "deploy v2 to staging")
+            .unwrap();
+        assert_eq!(item.project_id, None);
+        assert_eq!(item.author.as_deref(), Some("agent-7"));
+        assert_eq!(item.body, "deploy v2 to staging");
+
+        // The whole inbox lists it (no project filter).
+        let all = store.list_inbox_items(None).unwrap();
+        assert_eq!(all.iter().map(|i| i.id).collect::<Vec<_>>(), vec![item.id]);
+        // ...but a project filter excludes the still-unassigned item.
+        assert!(store.list_inbox_items(Some(p.id)).unwrap().is_empty());
+
+        // A person routes it to a project.
+        let assigned = store.assign_inbox_item(item.id, Some(p.id)).unwrap();
+        assert_eq!(assigned.project_id, Some(p.id));
+        assert_eq!(
+            store
+                .list_inbox_items(Some(p.id))
+                .unwrap()
+                .iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>(),
+            vec![item.id]
+        );
+
+        // ...and can clear the assignment again.
+        let cleared = store.assign_inbox_item(item.id, None).unwrap();
+        assert_eq!(cleared.project_id, None);
+
+        // Delete echoes the destroyed record.
+        let destroyed = store.delete_inbox_item(item.id).unwrap();
+        assert_eq!(destroyed.id, item.id);
+        assert!(matches!(
+            store.get_inbox_item(item.id),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn list_inbox_items_newest_first() {
+        let (mut store, _dir) = temp_store();
+        let a = store.create_inbox_item(None, "one").unwrap();
+        let b = store.create_inbox_item(None, "two").unwrap();
+        let all = store.list_inbox_items(None).unwrap();
+        assert_eq!(all.iter().map(|i| i.id).collect::<Vec<_>>(), vec![b.id, a.id]);
+    }
+
+    #[test]
+    fn assign_inbox_item_unknown_project_is_validation_error() {
+        let (mut store, _dir) = temp_store();
+        let item = store.create_inbox_item(None, "orphan").unwrap();
+        let err = store.assign_inbox_item(item.id, Some(999)).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn deleting_a_project_unassigns_its_inbox_items() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None).unwrap();
+        let item = store.create_inbox_item(None, "hi").unwrap();
+        store.assign_inbox_item(item.id, Some(p.id)).unwrap();
+        // The inbox is global: deleting the project returns the item to
+        // unassigned rather than destroying the update request.
+        store.delete_project(p.id).unwrap();
+        assert_eq!(store.get_inbox_item(item.id).unwrap().project_id, None);
     }
 }

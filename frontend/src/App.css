@@ -74,6 +74,61 @@ header {
   color: var(--cyan);
 }
 
+/* Global inbox link, sitting above the Projects heading. */
+.nav-inbox {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  border-left: 2px solid transparent;
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.85rem;
+}
+
+.nav-inbox.active {
+  border-left-color: var(--cyan);
+  background: rgba(0, 229, 255, 0.06);
+  text-shadow: 0 0 8px var(--cyan);
+}
+
+.inbox-badge {
+  flex: none;
+  min-width: 1.4em;
+  padding: 0 0.35em;
+  border-radius: 0.7em;
+  background: var(--cyan);
+  color: #04121a;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-align: center;
+  text-shadow: none;
+}
+
+/* Inbox page: each item shows its body, who sent it, and triage controls. */
+.inbox-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.inbox-body > :first-child {
+  margin-top: 0;
+}
+
+.inbox-body > :last-child {
+  margin-bottom: 0;
+}
+
+.inbox-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
 .nav-projects {
   list-style: none;
   margin: 0;

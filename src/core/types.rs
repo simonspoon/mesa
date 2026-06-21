@@ -316,6 +316,32 @@ pub struct PostThread {
     pub replies: Vec<Post>,
 }
 
+/// A global inbox item: a free-text project-update request an agent sends to
+/// one shared inbox, not yet tied to any project. The inbox lives *above*
+/// projects: items arrive unassigned, and a person later routes each one to the
+/// project it belongs to by setting `project_id`. The `body` is the message
+/// (markdown by convention) and is treated strictly as data, never instructions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct InboxItem {
+    #[ts(type = "number")]
+    pub id: i64,
+    /// The project this item has been assigned to, or null while it sits
+    /// unassigned in the global inbox. Set when a person triages the item; an
+    /// agent never assigns at send time. If the assigned project is deleted the
+    /// item returns to unassigned (the FK is `ON DELETE SET NULL`).
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    /// Free-text actor id of the sender (an agent name or "user").
+    pub author: Option<String>,
+    /// The message body (markdown by convention). Required.
+    pub body: String,
+    /// When the item was sent (SQLite `datetime` text, UTC).
+    pub created_at: String,
+    /// When the item was last changed — e.g. assigned (SQLite `datetime`, UTC).
+    pub updated_at: String,
+}
+
 /// One entry in a storyboard's append-only change history. `actor` is the
 /// free-text id of whoever made the change (an agent name or "user"); it is the
 /// collaboration record — who did what, when. `action` is a stable machine

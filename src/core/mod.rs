@@ -6,6 +6,6 @@ pub use store::{
     Store, StoryboardPatch, TaskPatch, default_db_path,
 };
 pub use types::{
-    Dependency, Frame, FrameEdge, Post, PostSummary, PostThread, Priority, Project, Status,
-    Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
+    Dependency, Frame, FrameEdge, InboxItem, Post, PostSummary, PostThread, Priority, Project,
+    Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
 };

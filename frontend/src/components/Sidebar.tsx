@@ -1,23 +1,33 @@
 import { useState } from 'react'
-import { createProject, listProjects } from '../api'
+import { createProject, listInbox, listProjects } from '../api'
 import { useFetch } from '../useFetch'
 
 /**
- * Persistent left nav: every project by name plus a compact create form.
- * `version` is bumped by pages after project rename/delete so the list
- * refetches (it is part of the useFetch key).
+ * Persistent left nav: a global Inbox link above every project by name, plus a
+ * compact create form. `version` is bumped by pages after project rename/delete
+ * so the list refetches (it is part of the useFetch key). The inbox count
+ * live-polls so the badge of items needing triage stays current as agents send.
  */
 export function Sidebar({
   activeProjectId,
+  inboxActive,
   version,
 }: {
   activeProjectId: number | null
+  inboxActive: boolean
   version: number
 }) {
   const { data: projects, error, refetch } = useFetch(
     () => listProjects(),
     `projects-${version}`,
   )
+  const { data: inbox } = useFetch(() => listInbox(), 'inbox-nav', {
+    pollMs: 5000,
+  })
+  // Badge counts items still awaiting triage (no project assigned yet).
+  const unassigned = inbox
+    ? inbox.filter((i) => i.project_id === null).length
+    : 0
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
   // Ephemeral collapse state (spec S9; persistence is a nice-to-have).
@@ -51,6 +61,13 @@ export function Sidebar({
       </button>
       {!collapsed && (
         <>
+          <a
+            className={`nav-inbox${inboxActive ? ' active' : ''}`}
+            href="#/inbox"
+          >
+            Inbox
+            {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+          </a>
           <h2 className="nav-heading">Projects</h2>
           {error ? (
             <p className="error">{error}</p>

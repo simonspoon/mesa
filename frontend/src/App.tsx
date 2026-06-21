@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import './App.css'
 import { getTask } from './api'
 import { Sidebar } from './components/Sidebar'
+import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { useFetch } from './useFetch'
 
@@ -40,6 +41,7 @@ function App() {
   // Bumped after project create/rename/delete so the sidebar refetches.
   const [navVersion, setNavVersion] = useState(0)
 
+  const inboxMatch = /^\/inbox$/.exec(path)
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)
@@ -59,7 +61,11 @@ function App() {
             : null
 
   let page
-  if (storyboardMatch) {
+  if (inboxMatch) {
+    // Global inbox: lives above projects, so it renders on its own (no project
+    // frame) and carries no active project in the nav.
+    page = <InboxView />
+  } else if (storyboardMatch) {
     // Single board: in-place storyboard view inside the project page frame.
     page = (
       <ProjectTasksPage
@@ -137,7 +143,11 @@ function App() {
         </a>
       </header>
       <div className="shell-body">
-        <Sidebar activeProjectId={activeProjectId} version={navVersion} />
+        <Sidebar
+          activeProjectId={activeProjectId}
+          inboxActive={inboxMatch !== null}
+          version={navVersion}
+        />
         <main>{page}</main>
       </div>
     </>

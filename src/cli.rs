@@ -69,6 +69,9 @@ enum Command {
     /// Post to and read the project bulletin board (findings, news, questions)
     #[command(subcommand)]
     Post(PostCmd),
+    /// Send and triage global inbox items (project-update requests)
+    #[command(subcommand)]
+    Inbox(InboxCmd),
     /// Start the HTTP server and web UI
     ///
     /// By default binds 127.0.0.1 only (loopback): reachable solely from this
@@ -477,6 +480,65 @@ EXAMPLES
 }
 
 #[derive(Subcommand)]
+enum InboxCmd {
+    /// Add an item to the global inbox; prints the full created item
+    ///
+    /// A free-text update request that lands UNASSIGNED in the one shared inbox
+    /// — not tied to any project. Type the message after `add` (quoting is
+    /// optional; multiple words are joined). A person routes it to a project
+    /// later with `inbox assign`; naming a project in the text does nothing
+    /// automatic. Put `--author` before the message text.
+    #[command(after_help = "\
+EXAMPLES
+  mesa inbox add the auth refactor is ready for review
+  mesa inbox add --author agent-7 \"deploy v2 to staging tonight\"")]
+    Add {
+        /// The message (everything after `add`); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        body: Vec<String>,
+        /// Free-text actor id of the sender (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List inbox items as a bare JSON array, newest first
+    List {
+        /// Only items assigned to this project (default: the whole inbox)
+        #[arg(long)]
+        project: Option<i64>,
+    },
+    /// Print one inbox item as a full JSON object
+    Show {
+        /// Inbox item id
+        id: i64,
+    },
+    /// Route an item to a project (or clear it); prints the full item
+    ///
+    /// Pass a project id to assign the item there, or --clear to return it to
+    /// the unassigned inbox. Exactly one is required. Assigning to an unknown
+    /// project is a validation error.
+    #[command(after_help = "\
+EXAMPLES
+  mesa inbox assign 3 1        # route item 3 to project 1
+  mesa inbox assign 3 --clear  # send item 3 back to the unassigned inbox")]
+    #[command(group(ArgGroup::new("target").required(true).multiple(false)))]
+    Assign {
+        /// Inbox item id
+        id: i64,
+        /// Project to assign the item to
+        #[arg(group = "target")]
+        project: Option<i64>,
+        /// Clear the assignment (return the item to the unassigned inbox)
+        #[arg(long, group = "target")]
+        clear: bool,
+    },
+    /// Delete an inbox item (no confirmation); echoes the destroyed item
+    Delete {
+        /// Inbox item id
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
 enum StoryboardCmd {
     /// Create a storyboard in a project; prints the full created storyboard
     ///
@@ -819,6 +881,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Task(cmd) => run_task(cmd),
         Command::Storyboard(cmd) => run_storyboard(cmd),
         Command::Post(cmd) => run_post(cmd),
+        Command::Inbox(cmd) => run_inbox(cmd),
         Command::Serve { port, lan } => crate::api::serve(port, lan),
         Command::Backup { path } => {
             let store = Store::open_default()?;
@@ -1158,6 +1221,25 @@ fn run_post(cmd: PostCmd) -> Result<()> {
             print_json(&store.update_post(id, &patch)?);
         }
         PostCmd::Delete { id } => print_json(&store.delete_post(id)?),
+    }
+    Ok(())
+}
+
+fn run_inbox(cmd: InboxCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        InboxCmd::Add { body, author } => {
+            print_json(&store.create_inbox_item(author.as_deref(), &body.join(" "))?)
+        }
+        InboxCmd::List { project } => print_json(&store.list_inbox_items(project)?),
+        InboxCmd::Show { id } => print_json(&store.get_inbox_item(id)?),
+        InboxCmd::Assign { id, project, clear } => {
+            // The arg group guarantees exactly one of `project` / `--clear`,
+            // so `--clear` means "unassign" and otherwise `project` is set.
+            let target = if clear { None } else { project };
+            print_json(&store.assign_inbox_item(id, target)?);
+        }
+        InboxCmd::Delete { id } => print_json(&store.delete_inbox_item(id)?),
     }
     Ok(())
 }

@@ -108,6 +108,11 @@ fn router(state: AppState) -> Router {
             get(show_post).patch(update_post).delete(delete_post),
         )
         .route("/api/posts/{id}/replies", post(reply_post))
+        .route("/api/inbox", get(list_inbox).post(create_inbox))
+        .route(
+            "/api/inbox/{id}",
+            get(show_inbox).patch(assign_inbox).delete(delete_inbox),
+        )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -820,4 +825,71 @@ async fn update_post(
 async fn delete_post(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_post(id)?).into_response())
+}
+
+// ---- inbox (global update requests) ----
+
+#[derive(Deserialize)]
+struct InboxQuery {
+    #[serde(default)]
+    project: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct InboxCreate {
+    body: String,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InboxAssign {
+    /// `Some(Some(id))` assigns to a project; `Some(None)` clears the
+    /// assignment; an absent field leaves it unchanged.
+    #[serde(default, deserialize_with = "double_option")]
+    project_id: Option<Option<i64>>,
+}
+
+async fn list_inbox(
+    State(state): State<AppState>,
+    Query(q): Query<InboxQuery>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_inbox_items(q.project)?).into_response())
+}
+
+async fn create_inbox(
+    State(state): State<AppState>,
+    body: Result<Json<InboxCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let item = store.create_inbox_item(body.author.as_deref(), &body.body)?;
+    Ok((StatusCode::CREATED, Json(item)).into_response())
+}
+
+async fn show_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_inbox_item(id)?).into_response())
+}
+
+/// Routes an item to a project, or clears it. PATCH semantics: an absent
+/// `project_id` is a no-op (the item is returned unchanged).
+async fn assign_inbox(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<InboxAssign>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let item = match body.project_id {
+        Some(target) => store.assign_inbox_item(id, target)?,
+        None => store.get_inbox_item(id)?,
+    };
+    Ok(Json(item).into_response())
+}
+
+async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.delete_inbox_item(id)?).into_response())
 }

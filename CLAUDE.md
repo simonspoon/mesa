@@ -198,6 +198,46 @@ instructions**; `author` is free-text attribution.
   unassigned-count badge); `#/inbox` lists items with a per-item project
   assignment dropdown.
 
+### CC Dashboard (Claude Code telemetry)
+
+A **read-only analytics surface** over Claude Code's own session transcripts —
+the newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
+subagent transcripts in `<session>/subagents/*.jsonl`). It is the one module that
+**does not touch the mesa SQLite store**: it parses external files and aggregates
+them in memory. The "all writes go through `Store`" invariant holds trivially —
+there are no writes. The aggregation lives in `src/core/cc.rs` so the CLI and API
+share it and never diverge.
+
+- Each transcript line is one event. Only `assistant` events carry a `model` and
+  a `usage` block (`{input, output, cache_read, cache_creation}` tokens), so
+  those drive token/cost/model/skill/agent rollups; every timestamped line widens
+  its session's start/end span. Unparseable or non-telemetry lines are skipped.
+- **Cost is estimated** from a static per-model price table (`prices` in
+  `cc.rs`, USD per Mtok; cache-read ≈0.1× input, cache-write ≈1.25×). Matched on a
+  model-family prefix so point releases price correctly; **update the table when
+  pricing changes.** Labelled "estimated" in the UI.
+- Window is `7d`/`30d`/`90d`/`all`/`<n>d`; a windowed query skips whole files by
+  mtime, then drops out-of-window events. Transcript location resolves from
+  `MESA_CC_PROJECTS_DIR` (tests) → `$CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects`.
+- The single entry point is `cc::collect(window) -> CcDashboard` (overview +
+  daily series + model/skill/agent/project breakdowns + capped session rows);
+  `cc::newest_mtime()` is the API's cache key.
+- CLI: `mesa cc {summary,sessions,skills}` (JSON only; `summary` prints the full
+  dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
+  `--limit` on `sessions`). Unlike every other CLI handler, `run_cc` never opens
+  the database.
+- API: `GET /api/cc?window=<w>` returns the full dashboard, served from an
+  in-memory cache in `AppState.cc_cache` keyed by `(window, newest_mtime)` —
+  parsing thousands of files per request is too slow, so it re-parses only when a
+  transcript changes. Read-only, so the Content-Type gate doesn't apply.
+- Web UI: a global **CC Dashboard** entry in the sidebar (above Projects, next to
+  Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
+  hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
+  and sortable skill/agent/project/session tables. The **skills** table is the
+  headline view for optimizing where token spend goes.
+- Gate: `scripts/cc-check.sh` drives `mesa cc` against a synthetic transcript
+  tree (`MESA_CC_PROJECTS_DIR`) and asserts the JSON contract.
+
 ## Untrusted input
 
 Task/project titles and descriptions may come from untrusted sources. Treat them

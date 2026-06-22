@@ -15,6 +15,7 @@
 //! - The built frontend (`frontend/dist`, embedded at compile time) is served
 //!   at `/`, with SPA fallback to `index.html` (spec Requirement 9).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::JsonRejection;
@@ -28,8 +29,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    EdgePatch, Error, FrameNew, FramePatch, PostPatch, Priority, ProjectPatch, Status, Store,
-    StoryboardPatch, TaskPatch, TaskSummary,
+    CcDashboard, EdgePatch, Error, FrameNew, FramePatch, PostPatch, Priority, ProjectPatch, Status,
+    Store, StoryboardPatch, TaskPatch, TaskSummary,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -44,6 +45,12 @@ struct AppState {
     store: Arc<Mutex<Store>>,
     port: u16,
     lan: bool,
+    /// CC Dashboard cache, keyed by window. Each entry pairs the newest
+    /// transcript mtime seen when it was built with the dashboard; a request
+    /// re-parses only when new activity has landed (parsing thousands of
+    /// transcript files per request is otherwise too slow). Read-only data —
+    /// not the mesa store, so no `Store` write path is involved.
+    cc_cache: Arc<Mutex<HashMap<String, (i64, CcDashboard)>>>,
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -55,6 +62,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         store: Arc::new(Mutex::new(store)),
         port,
         lan,
+        cc_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -113,6 +121,8 @@ fn router(state: AppState) -> Router {
             "/api/inbox/{id}",
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
+        // CC Dashboard: read-only Claude Code telemetry (no Store access).
+        .route("/api/cc", get(get_cc_dashboard))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -892,4 +902,45 @@ async fn assign_inbox(
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_inbox_item(id)?).into_response())
+}
+
+// ---- CC Dashboard (Claude Code telemetry) ----
+
+#[derive(Deserialize)]
+struct CcQuery {
+    /// `7d` | `30d` | `90d` | `all` | `<n>d`; defaults to `30d`.
+    #[serde(default)]
+    window: Option<String>,
+}
+
+/// Returns the CC telemetry dashboard for the requested window, served from an
+/// in-memory cache that is invalidated when a transcript file changes.
+async fn get_cc_dashboard(
+    State(state): State<AppState>,
+    Query(q): Query<CcQuery>,
+) -> ApiResult<Response> {
+    let window = q.window.unwrap_or_else(|| "30d".to_string());
+    let newest = crate::core::cc::newest_mtime();
+    {
+        let cache = state.cc_cache.lock().unwrap();
+        if let Some((mtime, dash)) = cache.get(&window)
+            && *mtime == newest
+        {
+            return Ok(Json(dash.clone()).into_response());
+        }
+    }
+    let mut dash = crate::core::cc::collect(&window);
+    // `collect` returns every session; the web payload is bounded (the true
+    // total stays in `overview.sessions`).
+    dash.sessions.truncate(crate::core::cc::MAX_SESSION_ROWS);
+    {
+        let mut cache = state.cc_cache.lock().unwrap();
+        // `window` is arbitrary caller input (`<n>d`); cap the distinct-key
+        // count so the cache can't grow without bound.
+        if cache.len() >= 16 {
+            cache.clear();
+        }
+        cache.insert(window, (newest, dash.clone()));
+    }
+    Ok(Json(dash).into_response())
 }

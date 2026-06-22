@@ -342,6 +342,183 @@ pub struct InboxItem {
     pub updated_at: String,
 }
 
+// ---- CC Dashboard (Claude Code telemetry) ----
+//
+// Read-only analytics derived from Claude Code's own session transcripts
+// (`~/.claude/projects/**/*.jsonl`), not from the mesa store. Aggregated in
+// `core::cc` and surfaced by `mesa cc` (CLI) and `GET /api/cc` (web). All token
+// counts are i64 (well within JS safe-integer range); costs are estimated from a
+// static per-model price table and are labelled as estimates in the UI.
+
+/// A four-way token split shared by every CC aggregate. `cache_read` is context
+/// served from the prompt cache (cheap); `cache_creation` is context written to
+/// it (a premium over plain input).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcTokens {
+    #[ts(type = "number")]
+    pub input: i64,
+    #[ts(type = "number")]
+    pub output: i64,
+    #[ts(type = "number")]
+    pub cache_read: i64,
+    #[ts(type = "number")]
+    pub cache_creation: i64,
+}
+
+/// Headline figures for the selected time window.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcOverview {
+    /// Distinct Claude Code sessions active in the window.
+    #[ts(type = "number")]
+    pub sessions: i64,
+    /// Calendar days with any activity.
+    #[ts(type = "number")]
+    pub active_days: i64,
+    /// Assistant turns that reported token usage.
+    #[ts(type = "number")]
+    pub messages: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    /// Estimated spend in USD (static price table; see `core::cc`).
+    pub est_cost_usd: f64,
+    pub avg_session_minutes: f64,
+    pub median_session_minutes: f64,
+    pub avg_tokens_per_session: f64,
+    /// cache_read / (cache_read + input): how much input was served from cache.
+    pub cache_hit_ratio: f64,
+    pub first_activity: Option<String>,
+    pub last_activity: Option<String>,
+}
+
+/// One day's totals (the daily activity series).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcDayPoint {
+    /// `YYYY-MM-DD` (UTC).
+    pub date: String,
+    #[ts(type = "number")]
+    pub sessions: i64,
+    #[ts(type = "number")]
+    pub messages: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+}
+
+/// Usage rolled up by model id.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcModelStat {
+    pub model: String,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub sessions: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+}
+
+/// Usage rolled up by `attributionSkill` — the skill-optimization view.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSkillStat {
+    pub skill: String,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub sessions: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+}
+
+/// Usage rolled up by `attributionAgent` (subagents).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcAgentStat {
+    pub agent: String,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub sessions: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+}
+
+/// Usage rolled up by working directory (`cwd`).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcProjectStat {
+    /// Short name (last path component of `cwd`).
+    pub project: String,
+    /// Full working-directory path (disambiguates same-named folders).
+    pub path: String,
+    #[ts(type = "number")]
+    pub sessions: i64,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+}
+
+/// One session row for the sessions table.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionRow {
+    pub session_id: String,
+    /// First/last event timestamps (ISO-8601 UTC, as recorded by Claude Code).
+    pub start: String,
+    pub end: String,
+    pub duration_minutes: f64,
+    pub models: Vec<String>,
+    #[ts(type = "number")]
+    pub messages: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+    pub cwd: Option<String>,
+    pub project: Option<String>,
+    pub git_branch: Option<String>,
+    pub entrypoint: Option<String>,
+    /// True if any of the session's events came from a subagent (`isSidechain`).
+    /// Subagent transcripts reuse the parent's `sessionId`, so this is "the
+    /// session used a subagent", not "the session *is* a sidechain".
+    pub used_subagent: bool,
+}
+
+/// The full CC dashboard payload returned by `mesa cc summary` and `GET /api/cc`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcDashboard {
+    /// Unix seconds at which this snapshot was computed.
+    #[ts(type = "number")]
+    pub generated_at_unix: i64,
+    /// The requested window token (`7d`/`30d`/`90d`/`all`/`<n>d`).
+    pub window: String,
+    /// Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
+    pub since: Option<String>,
+    pub overview: CcOverview,
+    pub daily: Vec<CcDayPoint>,
+    pub models: Vec<CcModelStat>,
+    pub skills: Vec<CcSkillStat>,
+    pub agents: Vec<CcAgentStat>,
+    pub projects: Vec<CcProjectStat>,
+    /// Sessions newest-first, capped (see `core::cc`); `overview.sessions` holds
+    /// the true total.
+    pub sessions: Vec<CcSessionRow>,
+}
+
 /// One entry in a storyboard's append-only change history. `actor` is the
 /// free-text id of whoever made the change (an agent name or "user"); it is the
 /// collaboration record — who did what, when. `action` is a stable machine

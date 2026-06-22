@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import './App.css'
 import { getTask } from './api'
 import { Sidebar } from './components/Sidebar'
+import { CCDashboardView } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { useFetch } from './useFetch'
@@ -42,6 +43,7 @@ function App() {
   const [navVersion, setNavVersion] = useState(0)
 
   const inboxMatch = /^\/inbox$/.exec(path)
+  const ccMatch = /^\/cc$/.exec(path)
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)
@@ -65,6 +67,9 @@ function App() {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
     page = <InboxView />
+  } else if (ccMatch) {
+    // CC Dashboard: global telemetry view, also above projects.
+    page = <CCDashboardView />
   } else if (storyboardMatch) {
     // Single board: in-place storyboard view inside the project page frame.
     page = (
@@ -146,6 +151,7 @@ function App() {
         <Sidebar
           activeProjectId={activeProjectId}
           inboxActive={inboxMatch !== null}
+          ccActive={ccMatch !== null}
           version={navVersion}
         />
         <main>{page}</main>

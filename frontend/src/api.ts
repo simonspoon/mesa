@@ -2,6 +2,7 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
+import type { CcDashboard } from './types/CcDashboard'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
 import type { InboxItem } from './types/InboxItem'
@@ -397,4 +398,11 @@ export function assignInboxItem(
 /** Returns the destroyed item. */
 export function deleteInboxItem(id: number): Promise<InboxItem> {
   return request(`/api/inbox/${id}`, jsonDelete())
+}
+
+// ---- CC Dashboard (Claude Code telemetry) ----
+
+/** Claude Code telemetry for a window (`7d` | `30d` | `90d` | `all`). */
+export function getCcDashboard(window: string): Promise<CcDashboard> {
+  return request(`/api/cc?window=${encodeURIComponent(window)}`)
 }

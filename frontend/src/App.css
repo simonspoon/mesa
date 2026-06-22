@@ -975,3 +975,213 @@ main {
   display: flex;
   gap: 0.5rem;
 }
+
+/* ---- CC Dashboard ---- */
+
+.cc-dashboard-page {
+  padding: 1.25rem 1.5rem 3rem;
+  max-width: 1200px;
+}
+
+.cc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.cc-window {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.cc-window button.active {
+  color: var(--bg);
+  background: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan-dim);
+}
+
+/* KPI strip */
+.cc-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0 1.25rem;
+}
+
+.cc-kpi {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  clip-path: var(--cut);
+  padding: 0.7rem 0.9rem;
+}
+
+.cc-kpi-value {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  color: var(--text-h);
+  text-shadow: 0 0 10px var(--cyan-dim);
+  line-height: 1.1;
+}
+
+.cc-kpi-label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+  color: var(--cyan);
+  margin-top: 0.25rem;
+}
+
+.cc-kpi-sub {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+/* Panels + layout */
+.cc-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.cc-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  clip-path: var(--cut);
+  padding: 1rem 1.1rem 1.1rem;
+  margin-bottom: 1rem;
+}
+
+.cc-panel h2 {
+  margin: 0 0 0.6rem;
+}
+
+.cc-span2 {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 860px) {
+  .cc-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.cc-hint {
+  margin: -0.2rem 0 0.7rem;
+  font-size: 0.8rem;
+}
+
+/* Charts */
+.bars {
+  width: 100%;
+  display: block;
+}
+
+.cc-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+
+.cc-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 0.7rem;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
+.cc-legend li {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.swatch {
+  width: 11px;
+  height: 11px;
+  display: inline-block;
+  border-radius: 2px;
+}
+
+.cc-donut-wrap {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.cc-legend-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  flex: 1;
+  min-width: 180px;
+  font-size: 0.8rem;
+}
+
+.cc-legend-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.15rem 0;
+}
+
+.cc-legend-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* Tables */
+.cc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.cc-table th,
+.cc-table td {
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.cc-table th {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.7rem;
+  color: var(--cyan);
+  font-weight: normal;
+}
+
+.cc-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.cc-table th.sortable:hover {
+  color: var(--text-h);
+}
+
+.cc-table td.num,
+.cc-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cc-table tbody tr:hover {
+  background: rgba(0, 229, 255, 0.05);
+}

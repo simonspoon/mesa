@@ -72,6 +72,9 @@ enum Command {
     /// Send and triage global inbox items (project-update requests)
     #[command(subcommand)]
     Inbox(InboxCmd),
+    /// Claude Code telemetry: sessions, tokens, models, skills, agents, cost
+    #[command(subcommand)]
+    Cc(CcCmd),
     /// Start the HTTP server and web UI
     ///
     /// By default binds 127.0.0.1 only (loopback): reachable solely from this
@@ -539,6 +542,40 @@ EXAMPLES
 }
 
 #[derive(Subcommand)]
+enum CcCmd {
+    /// Print the full dashboard as one JSON object (overview + breakdowns)
+    ///
+    /// Reads Claude Code's own session transcripts under ~/.claude/projects and
+    /// aggregates them. This is read-only telemetry, not mesa data — no project
+    /// or task is touched. Costs are estimates from a static price table.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc summary                 # last 30 days
+  mesa cc summary --window all    # everything
+  mesa cc summary --window 7d")]
+    Summary {
+        /// Time window: 7d | 30d | 90d | all | <n>d
+        #[arg(long, default_value = "30d")]
+        window: String,
+    },
+    /// Print per-session rows as a bare JSON array, newest first
+    Sessions {
+        /// Time window: 7d | 30d | 90d | all | <n>d
+        #[arg(long, default_value = "30d")]
+        window: String,
+        /// Cap the number of rows
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Print per-skill usage as a bare JSON array, highest token use first
+    Skills {
+        /// Time window: 7d | 30d | 90d | all | <n>d
+        #[arg(long, default_value = "30d")]
+        window: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum StoryboardCmd {
     /// Create a storyboard in a project; prints the full created storyboard
     ///
@@ -882,6 +919,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Storyboard(cmd) => run_storyboard(cmd),
         Command::Post(cmd) => run_post(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
+        Command::Cc(cmd) => run_cc(cmd),
         Command::Serve { port, lan } => crate::api::serve(port, lan),
         Command::Backup { path } => {
             let store = Store::open_default()?;
@@ -1221,6 +1259,23 @@ fn run_post(cmd: PostCmd) -> Result<()> {
             print_json(&store.update_post(id, &patch)?);
         }
         PostCmd::Delete { id } => print_json(&store.delete_post(id)?),
+    }
+    Ok(())
+}
+
+/// CC telemetry commands read transcripts directly (no Store), so unlike every
+/// other handler this one never opens the database.
+fn run_cc(cmd: CcCmd) -> Result<()> {
+    match cmd {
+        CcCmd::Summary { window } => print_json(&crate::core::cc::collect(&window)),
+        CcCmd::Sessions { window, limit } => {
+            let mut rows = crate::core::cc::collect(&window).sessions;
+            if let Some(n) = limit {
+                rows.truncate(n);
+            }
+            print_json(&rows);
+        }
+        CcCmd::Skills { window } => print_json(&crate::core::cc::collect(&window).skills),
     }
     Ok(())
 }

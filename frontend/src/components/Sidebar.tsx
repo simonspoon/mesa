@@ -11,10 +11,12 @@ import { useFetch } from '../useFetch'
 export function Sidebar({
   activeProjectId,
   inboxActive,
+  ccActive,
   version,
 }: {
   activeProjectId: number | null
   inboxActive: boolean
+  ccActive: boolean
   version: number
 }) {
   const { data: projects, error, refetch } = useFetch(
@@ -67,6 +69,9 @@ export function Sidebar({
           >
             Inbox
             {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+          </a>
+          <a className={`nav-inbox${ccActive ? ' active' : ''}`} href="#/cc">
+            CC Dashboard
           </a>
           <h2 className="nav-heading">Projects</h2>
           {error ? (

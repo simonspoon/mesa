@@ -653,6 +653,13 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // `collect()` reads the global MESA_CC_PROJECTS_DIR env var, and cargo runs
+    // tests in parallel — so every test that points it at a temp dir must hold
+    // this lock for the set→collect→unset window, or one test's dir leaks into
+    // another's `collect()`. Recover from poison so a panic in one test fails
+    // only that test, not every other test queued on the lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn write_jsonl(dir: &Path, name: &str, lines: &[&str]) {
         let path = dir.join(name);
         let mut f = fs::File::create(path).unwrap();
@@ -686,6 +693,7 @@ mod tests {
 
     #[test]
     fn folds_transcripts_into_dashboard() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("-some-project");
         fs::create_dir_all(&proj).unwrap();
@@ -699,7 +707,7 @@ mod tests {
                 r#"{"type":"assistant","isSidechain":true,"sessionId":"s1","timestamp":"2026-06-15T01:10:00.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
             ],
         );
-        // SAFETY: single-threaded test; restore is not needed across the suite.
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
         }
@@ -726,6 +734,7 @@ mod tests {
 
     #[test]
     fn window_filters_old_events() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("p")).unwrap();
         write_jsonl(

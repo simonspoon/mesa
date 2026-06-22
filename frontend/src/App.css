@@ -1089,6 +1089,51 @@ main {
   margin-top: 0.3rem;
 }
 
+/* Diverging daily chart: a narrow scale column on each side of the bars.
+   Left scales input/output (downward half), right scales cache (upward half);
+   "0" sits on the centre baseline. */
+.cc-diverge {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.cc-diverge .bars {
+  flex: 1;
+  min-width: 0;
+  /* Fixed render height — preserveAspectRatio="none" squishes the bars to fit,
+     so the chart keeps a small footprint instead of scaling with its width. */
+  height: 120px;
+}
+
+.cc-diverge-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-size: 0.66rem;
+  color: var(--muted);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cc-diverge-axis.right {
+  text-align: left;
+}
+
+.cc-diverge-axis .cap {
+  color: var(--text);
+}
+
+.cc-diverge-axis .cap em {
+  display: block;
+  font-style: normal;
+  color: var(--muted);
+}
+
+.cc-diverge-axis .unit {
+  min-height: 0.66rem;
+}
+
 .cc-legend {
   display: flex;
   flex-wrap: wrap;

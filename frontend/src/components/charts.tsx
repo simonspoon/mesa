@@ -65,48 +65,73 @@ export function Donut({
   )
 }
 
-/** One column of a stacked bar chart: a label plus its coloured segments. */
-export type StackedBar = { label: string; segments: Slice[] }
+/**
+ * One day of the diverging chart: segments stacked upward from a centre baseline
+ * and segments stacked downward. The two halves are scaled independently so a
+ * small series (input/output) stays readable next to a large one (cache).
+ */
+export type DivergingBar = { label: string; up: Slice[]; down: Slice[] }
 
 /**
- * Stacked vertical bars scaled to the tallest column. Rendered in a 100×height
- * viewBox stretched to the container width, so it's responsive without JS.
+ * Diverging stacked bars about a centre baseline. The upper half (`up`) and the
+ * lower half (`down`) each get their own scale and half of `height`, so the two
+ * series read on independent axes — the caller labels the max of each side. A
+ * compact alternative to one stacked bar when the segments span wildly different
+ * magnitudes. Rendered in a 100×height viewBox stretched to the container width
+ * (preserveAspectRatio="none"); the baseline keeps a constant 1px via
+ * vector-effect.
  */
-export function StackedBars({
+export function DivergingBars({
   bars,
-  height = 160,
+  height = 120,
 }: {
-  bars: StackedBar[]
+  bars: DivergingBar[]
   height?: number
 }) {
-  const totals = bars.map((b) => b.segments.reduce((s, x) => s + x.value, 0))
-  const max = Math.max(1, ...totals)
+  const sum = (xs: Slice[]) => xs.reduce((s, x) => s + x.value, 0)
+  const upMax = Math.max(1, ...bars.map((b) => sum(b.up)))
+  const downMax = Math.max(1, ...bars.map((b) => sum(b.down)))
   const n = Math.max(1, bars.length)
   const bw = 100 / n
   const gap = Math.min(bw * 0.25, 1.5)
-  // Flatten to absolute rects up front (pure prefix-sums; no mutation).
+  const mid = height / 2 // baseline; up region is [0, mid], down region [mid, height]
+  // Flatten both halves to absolute rects up front (pure prefix-sums).
   const rects = bars.flatMap((b, i) => {
     const x = i * bw + gap / 2
     const w = bw - gap
-    const hs = b.segments.map((seg) => (seg.value / max) * height)
-    return b.segments.map((seg, j) => {
-      const below = hs.slice(0, j + 1).reduce((a, c) => a + c, 0)
+    const up = b.up.map((seg, j) => {
+      const below = sum(b.up.slice(0, j)) // already-stacked height below this seg
+      const h = (seg.value / upMax) * mid
       return {
-        key: `${b.label}-${seg.label}`,
+        key: `${b.label}-u-${seg.label}`,
         x,
-        y: height - below,
+        y: mid - (below / upMax) * mid - h,
         w,
-        h: hs[j],
+        h,
         color: seg.color,
         title: `${b.label} · ${seg.label}`,
       }
     })
+    const down = b.down.map((seg, j) => {
+      const above = sum(b.down.slice(0, j))
+      const h = (seg.value / downMax) * (height - mid)
+      return {
+        key: `${b.label}-d-${seg.label}`,
+        x,
+        y: mid + (above / downMax) * (height - mid),
+        w,
+        h,
+        color: seg.color,
+        title: `${b.label} · ${seg.label}`,
+      }
+    })
+    return [...up, ...down]
   })
   return (
     <svg
       viewBox={`0 0 100 ${height}`}
       preserveAspectRatio="none"
-      className="bars"
+      className="bars diverging"
       role="img"
     >
       {rects.map((r) => (
@@ -114,6 +139,15 @@ export function StackedBars({
           <title>{r.title}</title>
         </rect>
       ))}
+      <line
+        x1={0}
+        y1={mid}
+        x2={100}
+        y2={mid}
+        stroke="var(--border)"
+        strokeWidth={1}
+        vectorEffect="non-scaling-stroke"
+      />
     </svg>
   )
 }

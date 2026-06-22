@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { getCcDashboard } from '../api'
-import { Donut, StackedBars, type Slice } from '../components/charts'
+import { Donut, DivergingBars, type Slice } from '../components/charts'
 import type { CcDashboard } from '../types/CcDashboard'
 import { useFetch } from '../useFetch'
 
@@ -180,16 +180,23 @@ export function CCDashboardView() {
 function Dashboard({ data }: { data: CcDashboard }) {
   const o = data.overview
 
-  // Daily activity: one stacked bar per day, segmented by token type.
+  // Daily activity: one diverging bar per day. Cache (read + write) stacks
+  // upward on the right-axis scale, input/output stacks downward on the
+  // left-axis scale — independent scales so the small in/out series stays
+  // legible next to the much larger cache series.
   const bars = data.daily.map((d) => ({
     label: d.date,
-    segments: [
-      { label: TOK.input.label, value: d.tokens.input, color: TOK.input.color },
+    up: [
       { label: TOK.cache_read.label, value: d.tokens.cache_read, color: TOK.cache_read.color },
       { label: TOK.cache_creation.label, value: d.tokens.cache_creation, color: TOK.cache_creation.color },
+    ],
+    down: [
+      { label: TOK.input.label, value: d.tokens.input, color: TOK.input.color },
       { label: TOK.output.label, value: d.tokens.output, color: TOK.output.color },
     ],
   }))
+  const upMax = Math.max(0, ...bars.map((b) => b.up.reduce((s, x) => s + x.value, 0)))
+  const downMax = Math.max(0, ...bars.map((b) => b.down.reduce((s, x) => s + x.value, 0)))
 
   // Model split donut (top models by tokens; rest folded into "other").
   const modelSlices: Slice[] = data.models.slice(0, 6).map((m, i) => ({
@@ -218,7 +225,25 @@ function Dashboard({ data }: { data: CcDashboard }) {
         <section className="cc-panel cc-span2">
           <h2>Daily token usage</h2>
           <Legend />
-          <StackedBars bars={bars} height={170} />
+          <div className="cc-diverge">
+            <div className="cc-diverge-axis" aria-hidden>
+              <span className="unit" />
+              <span>0</span>
+              <span className="cap">
+                {fmtTok(downMax)}
+                <em>in/out</em>
+              </span>
+            </div>
+            <DivergingBars bars={bars} height={120} />
+            <div className="cc-diverge-axis right" aria-hidden>
+              <span className="cap">
+                {fmtTok(upMax)}
+                <em>cache</em>
+              </span>
+              <span>0</span>
+              <span className="unit" />
+            </div>
+          </div>
           <div className="cc-axis">
             <span>{data.daily[0]?.date ?? ''}</span>
             <span>{data.daily[data.daily.length - 1]?.date ?? ''}</span>

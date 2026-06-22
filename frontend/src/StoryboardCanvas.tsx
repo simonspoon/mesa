@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   createEdge,
   createFrame,
@@ -104,6 +104,63 @@ export function StoryboardCanvas({
   const dragRef = useRef<Drag | null>(null)
   const justDragged = useRef(false)
 
+  // Real rendered frame heights. A frame's stored `h` is only a *floor*
+  // (`minHeight` below); markdown content makes the card grow taller, so the
+  // stored `h` understates a tall card. Connector geometry keys off the true
+  // box, else `cy`/`borderPoint` use a too-short box: the line meets an
+  // interior point and the (border-to-border) label drifts toward the source.
+  // offsetHeight is the pre-transform layout height (CSS scale doesn't change
+  // it), so it's already board-space. A ResizeObserver re-measures on growth.
+  const frameEls = useRef(new Map<number, HTMLDivElement>())
+  const roRef = useRef<ResizeObserver | null>(null)
+  const [heights, setHeights] = useState<Map<number, number>>(new Map())
+  const measure = useCallback(() => {
+    setHeights((prev) => {
+      const next = new Map(prev)
+      let changed = false
+      for (const [id, el] of frameEls.current) {
+        if (next.get(id) !== el.offsetHeight) {
+          next.set(id, el.offsetHeight)
+          changed = true
+        }
+      }
+      for (const id of [...next.keys()]) {
+        if (!frameEls.current.has(id)) {
+          next.delete(id)
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+  }, [])
+  useEffect(() => {
+    const ro = new ResizeObserver(measure)
+    roRef.current = ro
+    for (const el of frameEls.current.values()) ro.observe(el)
+    measure()
+    return () => {
+      ro.disconnect()
+      roRef.current = null
+    }
+  }, [measure])
+  const registerFrame = useCallback(
+    (id: number) => (el: HTMLDivElement | null) => {
+      const map = frameEls.current
+      if (el) {
+        map.set(id, el)
+        roRef.current?.observe(el)
+      } else {
+        const prev = map.get(id)
+        if (prev) roRef.current?.unobserve(prev)
+        map.delete(id)
+      }
+    },
+    [],
+  )
+  // Effective height for geometry: the measured render height when it exceeds
+  // the stored floor, else the floor.
+  const effH = (f: Frame) => Math.max(f.h, heights.get(f.id) ?? 0)
+
   // Pan/zoom view transform (story 01). Browser-local view state (story 03):
   // restored from localStorage on open and persisted on change, keyed by board.
   // Held in React state so it survives the parent's refetch-on-mutation (the
@@ -149,7 +206,10 @@ export function StoryboardCanvas({
   const placed: Frame[] = view.frames.map((f) =>
     dragPos && dragPos.id === f.id ? { ...f, x: dragPos.x, y: dragPos.y } : f,
   )
-  const byId = new Map(placed.map((f) => [f.id, f]))
+  // Geometry frames carry the *effective* (rendered) height so connector ends
+  // land on the real card edges; rendering (below) still uses the stored `h` as
+  // a floor via `minHeight`.
+  const byId = new Map(placed.map((f) => [f.id, { ...f, h: effH(f) }]))
   const selected = selectedId === null ? undefined : byId.get(selectedId)
 
   // Board bounding box in board-space. Frames can be dragged to NEGATIVE x/y;
@@ -162,7 +222,7 @@ export function StoryboardCanvas({
   const minX = Math.min(0, ...placed.map((f) => f.x - PAD))
   const minY = Math.min(0, ...placed.map((f) => f.y - PAD))
   const maxX = Math.max(1200, ...placed.map((f) => f.x + f.w + PAD))
-  const maxY = Math.max(640, ...placed.map((f) => f.y + f.h + PAD))
+  const maxY = Math.max(640, ...placed.map((f) => f.y + effH(f) + PAD))
   const width = maxX - minX
   const height = maxY - minY
 
@@ -390,7 +450,7 @@ export function StoryboardCanvas({
     const minX = Math.min(...placed.map((f) => f.x))
     const minY = Math.min(...placed.map((f) => f.y))
     const maxX = Math.max(...placed.map((f) => f.x + f.w))
-    const maxY = Math.max(...placed.map((f) => f.y + f.h))
+    const maxY = Math.max(...placed.map((f) => f.y + effH(f)))
     const bw = maxX - minX + FIT_MARGIN * 2
     const bh = maxY - minY + FIT_MARGIN * 2
     const rect = el.getBoundingClientRect()
@@ -503,13 +563,18 @@ export function StoryboardCanvas({
               const from = byId.get(e.from_frame)
               const to = byId.get(e.to_frame)
               if (!from || !to) return null
+              // Both ends on the card borders (not the hidden centres): the
+              // arrowhead lands on the target edge and the tail starts at the
+              // source edge, so the visible segment is border-to-border and the
+              // label (same midpoint) sits dead-centre on it.
+              const start = borderPoint(to, from)
               const end = borderPoint(from, to)
               return (
                 <line
                   key={`edge-line-${e.id}`}
                   className="edge-line"
-                  x1={cx(from)}
-                  y1={cy(from)}
+                  x1={start.x}
+                  y1={start.y}
                   x2={end.x}
                   y2={end.y}
                   markerEnd="url(#arrow)"
@@ -559,6 +624,7 @@ export function StoryboardCanvas({
           {placed.map((f) => (
             <div
               key={`frame-${f.id}`}
+              ref={registerFrame(f.id)}
               className={
                 'frame' +
                 (selectedId === f.id ? ' selected' : '') +

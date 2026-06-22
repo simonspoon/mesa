@@ -30,68 +30,59 @@ header {
   padding: 1rem;
   display: flex;
   flex-direction: column;
-  transition: width 0.15s ease, padding 0.15s ease;
 }
 
-/* Collapsed: the pane shrinks to a thin strip, handing its width back to the
-   main content area; only the expand toggle remains. */
-.sidebar.collapsed {
-  width: 2.6rem;
-  padding: 0.6rem 0.3rem;
-  align-items: center;
-}
-
-.sidebar h2 {
-  margin-top: 0;
-}
-
-.nav-heading {
-  margin-top: 0.25rem;
-}
-
-/* Collapse toggle: a quiet caret that sits at the pane's top-right (pointing
-   left to collapse), centred when the pane is collapsed (pointing right). */
-.nav-toggle {
-  align-self: flex-end;
-  background: none;
-  border: none;
-  clip-path: none;
-  padding: 0;
-  margin: 0;
-  font-size: 1rem;
-  line-height: 1;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.sidebar.collapsed .nav-toggle {
-  align-self: center;
-}
-
-.nav-toggle:hover:not(:disabled) {
-  background: none;
-  box-shadow: none;
-  color: var(--cyan);
-}
-
-/* Global inbox link, sitting above the Projects heading. */
-.nav-inbox {
+/* The three top-level nav entries (Inbox, CC Dashboard, Projects) share one
+   style. Projects is a <button> disclosure header, so reset button chrome to
+   match the <a> links exactly. */
+.nav-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+  width: 100%;
   padding: 0.25rem 0.5rem;
+  border: none;
   border-left: 2px solid transparent;
+  border-radius: 0;
+  clip-path: none;
+  background: none;
+  box-shadow: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
   font-family: var(--font-display);
   text-transform: uppercase;
   letter-spacing: 0.12em;
   font-size: 0.85rem;
 }
 
-.nav-inbox.active {
+.nav-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-item:hover:not(:disabled) {
+  background: rgba(0, 229, 255, 0.04);
+  box-shadow: none;
+  color: var(--cyan);
+}
+
+.nav-item.active {
   border-left-color: var(--cyan);
   background: rgba(0, 229, 255, 0.06);
   text-shadow: 0 0 8px var(--cyan);
+}
+
+/* Projects header: spacing above the simple links, with its disclosure caret. */
+.nav-section {
+  margin-top: 0.5rem;
+}
+
+.nav-caret {
+  flex: none;
+  color: var(--muted);
 }
 
 .inbox-badge {
@@ -131,7 +122,7 @@ header {
 
 .nav-projects {
   list-style: none;
-  margin: 0;
+  margin: 0.25rem 0 0;
   padding: 0;
 }
 

@@ -3,10 +3,12 @@ import { createProject, listInbox, listProjects } from '../api'
 import { useFetch } from '../useFetch'
 
 /**
- * Persistent left nav: a global Inbox link above every project by name, plus a
- * compact create form. `version` is bumped by pages after project rename/delete
- * so the list refetches (it is part of the useFetch key). The inbox count
- * live-polls so the badge of items needing triage stays current as agents send.
+ * Persistent left nav: three top-level entries sharing one `.nav-item` style —
+ * the global Inbox, the CC Dashboard, and Projects. Projects owns a subnav (the
+ * project list + create form), so its row is a disclosure header that collapses
+ * its subnav. `version` is bumped by pages after project rename/delete so the
+ * list refetches (it is part of the useFetch key). The inbox count live-polls so
+ * the badge of items needing triage stays current as agents send.
  */
 export function Sidebar({
   activeProjectId,
@@ -32,8 +34,8 @@ export function Sidebar({
     : 0
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
-  // Ephemeral collapse state (spec S9; persistence is a nice-to-have).
-  const [collapsed, setCollapsed] = useState(false)
+  // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
+  const [projectsCollapsed, setProjectsCollapsed] = useState(false)
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -50,30 +52,25 @@ export function Sidebar({
   }
 
   return (
-    <nav className={`sidebar${collapsed ? ' collapsed' : ''}`}>
+    <nav className="sidebar">
+      <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
+        <span className="nav-item-label">Inbox</span>
+        {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+      </a>
+      <a className={`nav-item${ccActive ? ' active' : ''}`} href="#/cc">
+        <span className="nav-item-label">CC Dashboard</span>
+      </a>
       <button
         type="button"
-        className="nav-toggle"
-        aria-expanded={!collapsed}
-        aria-label={collapsed ? 'Expand projects nav' : 'Collapse projects nav'}
-        title={collapsed ? 'Expand projects nav' : 'Collapse projects nav'}
-        onClick={() => setCollapsed((c) => !c)}
+        className="nav-item nav-section"
+        aria-expanded={!projectsCollapsed}
+        onClick={() => setProjectsCollapsed((c) => !c)}
       >
-        {collapsed ? '▸' : '◂'}
+        <span className="nav-item-label">Projects</span>
+        <span className="nav-caret">{projectsCollapsed ? '▸' : '▾'}</span>
       </button>
-      {!collapsed && (
+      {!projectsCollapsed && (
         <>
-          <a
-            className={`nav-inbox${inboxActive ? ' active' : ''}`}
-            href="#/inbox"
-          >
-            Inbox
-            {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
-          </a>
-          <a className={`nav-inbox${ccActive ? ' active' : ''}`} href="#/cc">
-            CC Dashboard
-          </a>
-          <h2 className="nav-heading">Projects</h2>
           {error ? (
             <p className="error">{error}</p>
           ) : !projects ? (

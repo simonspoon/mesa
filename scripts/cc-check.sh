@@ -62,4 +62,38 @@ assert any(s["skill"]=="build" for s in rows), rows
 print("skills ok")
 ' || fail "skills shape"
 
+# live: the synthetic session above is days old, so a default-window live view is
+# well-formed but empty. A second transcript stamped "now" must show up as one
+# active live session with a per-minute spark.
+"$BIN" cc live | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for k in ["generated_at_unix","window_minutes","bucket_seconds","active_seconds","active_count","live_count","total_tokens","est_cost_usd","tokens_per_min","sessions"]:
+    assert k in d, f"missing key {k}"
+assert d["window_minutes"]==15, d["window_minutes"]
+assert d["live_count"]==0 and d["sessions"]==[], "old transcripts are not live"
+print("live (empty) ok")
+' || fail "live empty shape"
+
+NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+mkdir -p "$TMP/-now-project"
+cat > "$TMP/-now-project/live.jsonl" <<JSONL
+{"type":"assistant","sessionId":"now1","timestamp":"$NOW","cwd":"/home/me/now","gitBranch":"main","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+JSONL
+
+"$BIN" cc live --minutes 15 | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["live_count"]==1, d["live_count"]
+assert d["active_count"]==1, d["active_count"]
+s=d["sessions"][0]
+assert s["session_id"]=="now1", s
+assert s["status"]=="active", s["status"]
+assert s["project"]=="now", s["project"]
+assert s["total_tokens"]==150, s["total_tokens"]
+assert len(s["spark"])==15, len(s["spark"])
+assert sum(s["spark"])==150, s["spark"]
+print("live (active) ok")
+' || fail "live active shape"
+
 echo "ok: cc-check passed"

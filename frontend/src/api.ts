@@ -3,6 +3,7 @@
 // hand-write payload shapes here (spec Requirement 12).
 
 import type { CcDashboard } from './types/CcDashboard'
+import type { CcLive } from './types/CcLive'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
 import type { InboxItem } from './types/InboxItem'
@@ -405,4 +406,9 @@ export function deleteInboxItem(id: number): Promise<InboxItem> {
 /** Claude Code telemetry for a window (`7d` | `30d` | `90d` | `all`). */
 export function getCcDashboard(window: string): Promise<CcDashboard> {
   return request(`/api/cc?window=${encodeURIComponent(window)}`)
+}
+
+/** Currently-running Claude Code sessions over the last `minutes`. */
+export function getCcLive(minutes: number): Promise<CcLive> {
+  return request(`/api/cc/live?minutes=${minutes}`)
 }

@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import { getCcDashboard } from '../api'
-import { Donut, DivergingBars, type Slice } from '../components/charts'
+import { getCcDashboard, getCcLive } from '../api'
+import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
 import type { CcDashboard } from '../types/CcDashboard'
+import type { CcLiveSession } from '../types/CcLiveSession'
 import { useFetch } from '../useFetch'
 
 // CC Dashboard: telemetry over Claude Code's own session transcripts — sessions,
@@ -49,6 +50,9 @@ const fmtUsd = (n: number) =>
 const fmtMin = (n: number) =>
   n >= 60 ? `${(n / 60).toFixed(1)}h` : `${Math.round(n)}m`
 const fmtPct = (n: number) => `${(n * 100).toFixed(1)}%`
+const fmtAgo = (s: number) =>
+  s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`
+const shortModel = (m: string) => m.replace('claude-', '')
 
 // ---- generic sortable table ----
 
@@ -166,6 +170,8 @@ export function CCDashboardView() {
         static price table.
       </p>
 
+      <LiveSessions />
+
       {error ? (
         <p className="error">{error}</p>
       ) : !data ? (
@@ -173,6 +179,114 @@ export function CCDashboardView() {
       ) : (
         <Dashboard data={data} />
       )}
+    </div>
+  )
+}
+
+// ---- Live sessions ----
+//
+// A near-real-time view of sessions with transcript activity in the last N
+// minutes, polled every 5s on its own (cheap) endpoint so it stays fresh
+// without re-parsing the whole dashboard. Each session shows a per-minute token
+// "heartbeat" plus active/idle status (active = an event within ~90s).
+
+const LIVE_WINDOWS: { m: number; label: string }[] = [
+  { m: 15, label: '15m' },
+  { m: 60, label: '1h' },
+]
+
+function LiveSessions() {
+  const [mins, setMins] = useState(15)
+  const { data, error } = useFetch(() => getCcLive(mins), `cc-live-${mins}`, {
+    pollMs: 5000,
+  })
+
+  return (
+    <section className="cc-panel cc-live">
+      <div className="cc-live-head">
+        <h2>
+          <span className={`live-dot ${data && data.active_count > 0 ? 'on' : 'off'}`} />
+          Live Sessions
+        </h2>
+        <div className="cc-live-meta">
+          {data && (
+            <>
+              <span>
+                <strong>{fmtInt(data.active_count)}</strong> active
+              </span>
+              <span>
+                <strong>{fmtInt(data.live_count)}</strong> live
+              </span>
+              <span>
+                <strong>{fmtTok(Math.round(data.tokens_per_min))}</strong>/min
+              </span>
+              <span>
+                <strong>{fmtUsd(data.est_cost_usd)}</strong>
+              </span>
+            </>
+          )}
+          <div className="cc-window">
+            {LIVE_WINDOWS.map((w) => (
+              <button
+                key={w.m}
+                type="button"
+                className={w.m === mins ? 'active' : ''}
+                onClick={() => setMins(w.m)}
+              >
+                {w.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <p className="muted cc-hint">
+        Sessions active in the last {mins < 60 ? `${mins} minutes` : `${mins / 60} hour`}.
+        Refreshes every 5s; the bars are tokens per minute.
+      </p>
+
+      {error ? (
+        <p className="error">{error}</p>
+      ) : !data ? (
+        <p className="muted">Loading…</p>
+      ) : data.sessions.length === 0 ? (
+        <p className="muted">No sessions active in this window.</p>
+      ) : (
+        <div className="cc-live-list">
+          {data.sessions.map((s) => (
+            <LiveCard key={s.session_id} s={s} />
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function LiveCard({ s }: { s: CcLiveSession }) {
+  const active = s.status === 'active'
+  return (
+    <div className={`cc-live-card ${active ? 'active' : 'idle'}`}>
+      <div className="cc-live-card-top">
+        <span className={`live-dot ${active ? 'on' : 'idle'}`} title={s.status} />
+        <span className="cc-live-project" title={s.cwd ?? undefined}>
+          {s.project ?? '—'}
+        </span>
+        {s.git_branch && <span className="cc-live-branch">{s.git_branch}</span>}
+        {s.used_subagent && <span className="cc-badge">subagent</span>}
+        <span className="cc-live-models">{s.models.map(shortModel).join(', ')}</span>
+        <span className="cc-live-ago">{fmtAgo(s.idle_seconds)}</span>
+      </div>
+      <Sparkbars values={s.spark} color={active ? 'var(--green)' : 'var(--amber)'} />
+      <div className="cc-live-stats">
+        <span>
+          <em>{fmtInt(s.messages)}</em> msgs
+        </span>
+        <span>
+          <em>{fmtTok(s.total_tokens)}</em> tok
+        </span>
+        <span>
+          <em>{fmtUsd(s.est_cost_usd)}</em>
+        </span>
+      </div>
     </div>
   )
 }

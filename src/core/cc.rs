@@ -25,8 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use super::types::{
-    CcAgentStat, CcDashboard, CcDayPoint, CcModelStat, CcOverview, CcProjectStat, CcSessionRow,
-    CcSkillStat, CcTokens,
+    CcAgentStat, CcDashboard, CcDayPoint, CcLive, CcLiveSession, CcModelStat, CcOverview,
+    CcProjectStat, CcSessionRow, CcSkillStat, CcTokens,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -191,6 +191,17 @@ struct Agg {
 /// boundary, not in `collect`.
 pub const MAX_SESSION_ROWS: usize = 250;
 
+/// Default recency window (minutes) for [`live`] when a caller doesn't specify.
+pub const DEFAULT_LIVE_MINUTES: i64 = 15;
+/// Upper bound on the live window, so an over-large `minutes` can't blow up the
+/// per-session spark vectors (one bucket per minute).
+pub const MAX_LIVE_MINUTES: i64 = 1440;
+/// Within this gap since its newest event, a live session is "active" (working);
+/// beyond it the session is merely "idle" but still live.
+const ACTIVE_SECS: i64 = 90;
+/// Width of one `spark` bucket — one bar per minute.
+const LIVE_BUCKET_SECS: i64 = 60;
+
 /// Build the dashboard for `window` (`7d`/`30d`/`90d`/`all`/`<n>d`). Returns
 /// **all** session rows (newest first); callers that need a bounded payload cap
 /// `sessions` themselves (see [`MAX_SESSION_ROWS`]).
@@ -237,6 +248,171 @@ pub fn newest_mtime() -> i64 {
         }
     }
     newest
+}
+
+// ---- live sessions ----
+
+#[derive(Default)]
+struct LiveAcc {
+    has_ts: bool,
+    start_ts: i64,
+    end_ts: i64,
+    start_str: String,
+    end_str: String,
+    models: BTreeSet<String>,
+    messages: i64,
+    tokens: Tok,
+    cost: f64,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    sidechain: bool,
+    /// One total-token bucket per window minute (oldest→newest).
+    spark: Vec<i64>,
+}
+
+/// Build the live-sessions view over the last `window_minutes` (clamped to
+/// `[1, MAX_LIVE_MINUTES]`). Like [`collect`] it skips whole files whose mtime
+/// predates the window, so it stays cheap enough to poll on a short interval —
+/// only sessions with a *recent* event are parsed at all.
+pub fn live(window_minutes: i64) -> CcLive {
+    let now = now_unix();
+    let win = window_minutes.clamp(1, MAX_LIVE_MINUTES);
+    let n_buckets = win as usize;
+    // Bucket 0 covers the oldest in-window minute; the cutoff is its start.
+    let first_min = now.div_euclid(60) - (win - 1);
+    let cutoff = first_min * 60;
+
+    let mut sessions: HashMap<String, LiveAcc> = HashMap::new();
+    if let Some(root) = projects_dir() {
+        for f in collect_files(&root) {
+            if file_mtime(&f).is_some_and(|m| m < cutoff) {
+                continue;
+            }
+            parse_live_file(&f, cutoff, first_min, n_buckets, &mut sessions);
+        }
+    }
+
+    let mut total_tokens = 0i64;
+    let mut total_cost = 0.0;
+    let mut active_count = 0i64;
+    let mut rows: Vec<CcLiveSession> = sessions
+        .into_iter()
+        .map(|(session_id, s)| {
+            let idle = (now - s.end_ts).max(0);
+            let active = idle <= ACTIVE_SECS;
+            if active {
+                active_count += 1;
+            }
+            let total = s.tokens.total();
+            total_tokens += total;
+            total_cost += s.cost;
+            CcLiveSession {
+                session_id,
+                project: s.cwd.as_deref().map(short_project),
+                cwd: s.cwd,
+                git_branch: s.git_branch,
+                models: s.models.into_iter().collect(),
+                started: s.start_str,
+                last_activity: s.end_str,
+                idle_seconds: idle,
+                status: if active { "active" } else { "idle" }.to_string(),
+                messages: s.messages,
+                total_tokens: total,
+                tokens: s.tokens.to_cc(),
+                est_cost_usd: round4(s.cost),
+                used_subagent: s.sidechain,
+                spark: s.spark,
+            }
+        })
+        .collect();
+    // Active sessions first, then the most recently active (smallest idle gap).
+    rows.sort_by(|a, b| {
+        (a.status != "active", a.idle_seconds).cmp(&(b.status != "active", b.idle_seconds))
+    });
+
+    CcLive {
+        generated_at_unix: now,
+        window_minutes: win,
+        bucket_seconds: LIVE_BUCKET_SECS,
+        active_seconds: ACTIVE_SECS,
+        active_count,
+        live_count: rows.len() as i64,
+        total_tokens,
+        est_cost_usd: round4(total_cost),
+        tokens_per_min: round2(total_tokens as f64 / win as f64),
+        sessions: rows,
+    }
+}
+
+fn parse_live_file(
+    path: &Path,
+    cutoff: i64,
+    first_min: i64,
+    n_buckets: usize,
+    sessions: &mut HashMap<String, LiveAcc>,
+) {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let raw: RawLine = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let (Some(sid), Some(ts_str)) = (raw.session_id.as_ref(), raw.timestamp.as_ref()) else {
+            continue;
+        };
+        let ts = match parse_ts(ts_str) {
+            Some(t) => t,
+            None => continue,
+        };
+        if ts < cutoff {
+            continue;
+        }
+
+        let s = sessions
+            .entry(sid.clone())
+            .or_insert_with(|| LiveAcc { spark: vec![0; n_buckets], ..Default::default() });
+        if !s.has_ts || ts < s.start_ts {
+            s.start_ts = ts;
+            s.start_str = ts_str.clone();
+        }
+        if !s.has_ts || ts > s.end_ts {
+            s.end_ts = ts;
+            s.end_str = ts_str.clone();
+        }
+        s.has_ts = true;
+        if s.cwd.is_none() {
+            s.cwd = raw.cwd.clone();
+        }
+        if s.git_branch.is_none() {
+            s.git_branch = raw.git_branch.clone().filter(|g| !g.is_empty());
+        }
+        if raw.is_sidechain == Some(true) {
+            s.sidechain = true;
+        }
+
+        let Some(usage) = raw.message.as_ref().and_then(|m| m.usage.as_ref()) else {
+            continue;
+        };
+        let Some(model) = raw.message.as_ref().and_then(|m| m.model.clone()) else {
+            continue;
+        };
+        s.models.insert(model.clone());
+        s.messages += 1;
+        s.tokens.add(usage);
+        s.cost += estimate_cost(&model, usage);
+        let idx = (ts.div_euclid(60) - first_min).clamp(0, n_buckets as i64 - 1) as usize;
+        s.spark[idx] += usage.input_tokens
+            + usage.output_tokens
+            + usage.cache_read_input_tokens
+            + usage.cache_creation_input_tokens;
+    }
 }
 
 fn parse_file(path: &Path, cutoff: Option<i64>, agg: &mut Agg) {
@@ -730,6 +906,54 @@ mod tests {
         let row = &d.sessions[0];
         assert_eq!(row.project.as_deref(), Some("widget"));
         assert!(row.used_subagent);
+    }
+
+    // Build an ISO-8601 UTC timestamp `secs_ago` seconds before now, so a test
+    // transcript can land inside (or outside) the live window deterministically.
+    fn iso_at(secs_ago: i64) -> String {
+        let e = now_unix() - secs_ago;
+        let tod = e.rem_euclid(86_400);
+        format!("{}T{:02}:{:02}:{:02}.000Z", fmt_date(e), tod / 3600, (tod % 3600) / 60, tod % 60)
+    }
+
+    #[test]
+    fn live_picks_up_recent_sessions() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-live-project");
+        fs::create_dir_all(&proj).unwrap();
+        let recent = format!(
+            r#"{{"type":"assistant","sessionId":"live1","timestamp":"{}","cwd":"/home/me/work/widget","gitBranch":"main","message":{{"model":"claude-opus-4-8","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#,
+            iso_at(30)
+        );
+        let stale = format!(
+            r#"{{"type":"assistant","sessionId":"old1","timestamp":"{}","message":{{"model":"claude-opus-4-8","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#,
+            iso_at(20 * 60)
+        );
+        write_jsonl(&proj, "live.jsonl", &[recent.as_str()]);
+        write_jsonl(&proj, "old.jsonl", &[stale.as_str()]);
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
+        }
+        let l = live(15);
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        // Only the 30-s-old session is inside the 15-minute window.
+        assert_eq!(l.live_count, 1);
+        assert_eq!(l.active_count, 1);
+        assert_eq!(l.window_minutes, 15);
+        let s = &l.sessions[0];
+        assert_eq!(s.session_id, "live1");
+        assert_eq!(s.status, "active");
+        assert_eq!(s.total_tokens, 150);
+        assert!(s.idle_seconds <= ACTIVE_SECS);
+        assert_eq!(s.project.as_deref(), Some("widget"));
+        // One bucket per window minute; the 30-s-old event lands in one of the
+        // last two minute buckets (depending on where "now" sits in its minute).
+        assert_eq!(s.spark.len(), 15);
+        assert_eq!(s.spark.iter().sum::<i64>(), 150);
+        assert_eq!(s.spark[13] + s.spark[14], 150);
     }
 
     #[test]

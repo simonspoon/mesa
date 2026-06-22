@@ -519,6 +519,76 @@ pub struct CcDashboard {
     pub sessions: Vec<CcSessionRow>,
 }
 
+/// One currently-running Claude Code session — a session whose newest transcript
+/// event lands inside the live window. The `spark` is a per-minute token series
+/// (oldest→newest, one entry per bucket of [`CcLive::bucket_seconds`]) so the UI
+/// can draw a heartbeat of recent activity.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcLiveSession {
+    pub session_id: String,
+    /// Short name (last path component of `cwd`).
+    pub project: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub models: Vec<String>,
+    /// First/last in-window event timestamps (ISO-8601 UTC).
+    pub started: String,
+    pub last_activity: String,
+    /// Seconds since the last event (`now - last_event`); small ⇒ actively working.
+    #[ts(type = "number")]
+    pub idle_seconds: i64,
+    /// `active` (idle within [`CcLive::active_seconds`]) or `idle`.
+    pub status: String,
+    /// Assistant turns inside the window.
+    #[ts(type = "number")]
+    pub messages: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+    /// True if any in-window event came from a subagent (`isSidechain`).
+    pub used_subagent: bool,
+    /// Per-minute total-token buckets over the window, oldest→newest.
+    #[ts(type = "Array<number>")]
+    pub spark: Vec<i64>,
+}
+
+/// The live-sessions payload (`mesa cc live` / `GET /api/cc/live`): the slice of
+/// the CC dashboard restricted to sessions active in the last `window_minutes`.
+/// Cheap to compute (skips files whose mtime predates the window) so the UI can
+/// poll it on a short interval for a near-real-time view.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcLive {
+    /// Unix seconds at which this snapshot was computed.
+    #[ts(type = "number")]
+    pub generated_at_unix: i64,
+    /// Recency window: a session is "live" if its newest event is within this.
+    #[ts(type = "number")]
+    pub window_minutes: i64,
+    /// Width of each `spark` bucket, in seconds.
+    #[ts(type = "number")]
+    pub bucket_seconds: i64,
+    /// A session counts as `active` (vs merely `idle`/live) within this gap.
+    #[ts(type = "number")]
+    pub active_seconds: i64,
+    /// Sessions with an event in the active gap.
+    #[ts(type = "number")]
+    pub active_count: i64,
+    /// Total live sessions (== `sessions.len()`).
+    #[ts(type = "number")]
+    pub live_count: i64,
+    /// Tokens across all live sessions within the window.
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+    /// Combined burn rate over the window (`total_tokens / window_minutes`).
+    pub tokens_per_min: f64,
+    /// Live sessions, active first then most-recent first.
+    pub sessions: Vec<CcLiveSession>,
+}
+
 /// One entry in a storyboard's append-only change history. `actor` is the
 /// free-text id of whoever made the change (an agent name or "user"); it is the
 /// collaboration record — who did what, when. `action` is a stable machine

@@ -123,6 +123,8 @@ fn router(state: AppState) -> Router {
         )
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc", get(get_cc_dashboard))
+        // Live sessions: cheap, frequently-polled slice of the telemetry.
+        .route("/api/cc/live", get(get_cc_live))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -943,4 +945,19 @@ async fn get_cc_dashboard(
         cache.insert(window, (newest, dash.clone()));
     }
     Ok(Json(dash).into_response())
+}
+
+#[derive(Deserialize)]
+struct CcLiveQuery {
+    /// Recency window in minutes; defaults to `cc::DEFAULT_LIVE_MINUTES`.
+    #[serde(default)]
+    minutes: Option<i64>,
+}
+
+/// Returns the currently-running sessions. Computed fresh each call (it only
+/// parses recently-modified transcripts) so the UI can poll it on a short
+/// interval; no cache. Read-only, so the Content-Type gate doesn't apply.
+async fn get_cc_live(Query(q): Query<CcLiveQuery>) -> ApiResult<Response> {
+    let minutes = q.minutes.unwrap_or(crate::core::cc::DEFAULT_LIVE_MINUTES);
+    Ok(Json(crate::core::cc::live(minutes)).into_response())
 }

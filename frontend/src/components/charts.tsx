@@ -66,6 +66,50 @@ export function Donut({
 }
 
 /**
+ * A compact "heartbeat" sparkline of per-bucket values (e.g. tokens per minute),
+ * drawn as thin bars normalised to the series max. Oldest→newest, left→right.
+ * Stretched to the container width via preserveAspectRatio="none"; an empty or
+ * all-zero series renders a flat baseline.
+ */
+export function Sparkbars({
+  values,
+  height = 34,
+  color = 'var(--cyan)',
+}: {
+  values: number[]
+  height?: number
+  color?: string
+}) {
+  const n = Math.max(1, values.length)
+  const max = Math.max(1, ...values)
+  const bw = 100 / n
+  const gap = Math.min(bw * 0.3, 1.2)
+  return (
+    <svg
+      viewBox={`0 0 100 ${height}`}
+      preserveAspectRatio="none"
+      className="spark"
+      role="img"
+    >
+      {values.map((v, i) => {
+        // Floor a nonzero value to 1px so any activity is visible.
+        const h = v > 0 ? Math.max((v / max) * height, 1) : 0
+        return (
+          <rect
+            key={i}
+            x={i * bw + gap / 2}
+            y={height - h}
+            width={bw - gap}
+            height={h}
+            fill={color}
+          />
+        )
+      })}
+    </svg>
+  )
+}
+
+/**
  * One day of the diverging chart: segments stacked upward from a centre baseline
  * and segments stacked downward. The two halves are scaled independently so a
  * small series (input/output) stays readable next to a large one (cache).

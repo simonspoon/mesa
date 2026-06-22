@@ -573,6 +573,15 @@ EXAMPLES
         #[arg(long, default_value = "30d")]
         window: String,
     },
+    /// Print currently-running sessions (the live-sessions object)
+    ///
+    /// Sessions whose newest transcript event lands inside the last `--minutes`,
+    /// each with a per-minute token "spark" and active/idle status.
+    Live {
+        /// Recency window in minutes (1..=1440)
+        #[arg(long, default_value_t = crate::core::cc::DEFAULT_LIVE_MINUTES)]
+        minutes: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1276,6 +1285,7 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
             print_json(&rows);
         }
         CcCmd::Skills { window } => print_json(&crate::core::cc::collect(&window).skills),
+        CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
     }
     Ok(())
 }

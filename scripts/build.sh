@@ -57,10 +57,14 @@ if [ ! -d frontend/node_modules ]; then
 fi
 npm --prefix frontend run build
 
-# rust-embed reads frontend/dist during macro expansion, which cargo does not
-# track; touch the source file holding the derive so a rebuilt dist is always
-# re-embedded.
-touch src/api.rs
+# rust-embed reads frontend/dist during macro expansion, baking the files into
+# the binary, but registers no dependency on them — so cargo cannot tell when a
+# rebuilt frontend should re-embed. Bumping the derive file's mtime (`touch`) is
+# not enough: under checksum-based freshness the unchanged content still looks
+# fresh and the stale dist stays embedded. Drop this crate's release artifacts so
+# the next build is forced to recompile src/api.rs and re-read frontend/dist.
+# (Only mesa's own units are removed; cached dependencies keep the rebuild cheap.)
+cargo clean --release -p mesa
 cargo build --release
 
 echo "ok: target/release/mesa"

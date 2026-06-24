@@ -283,8 +283,7 @@ function SubscriptionCard() {
       </div>
       {error ? (
         <p className="muted cc-hint">
-          Usage unavailable — needs the local Claude Code OAuth token. Open Claude
-          Code to refresh it, then reload.
+          Usage unavailable — {error}
         </p>
       ) : !data ? (
         <p className="muted">Loading…</p>

@@ -971,7 +971,101 @@ main {
 
 .cc-dashboard-page {
   padding: 1.25rem 1.5rem 3rem;
-  max-width: 1200px;
+}
+
+/* Top row: Live Sessions beside the subscription-limits card, full width. */
+.cc-top {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+  gap: 1rem;
+  align-items: start;
+  margin-bottom: 1rem;
+}
+
+.cc-top > .cc-panel {
+  margin-bottom: 0;
+}
+
+@media (max-width: 1100px) {
+  .cc-top {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Subscription-limits card */
+.cc-sub-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.85rem;
+}
+
+.cc-sub-head h2 {
+  margin: 0;
+}
+
+.cc-sub-row {
+  margin-bottom: 0.85rem;
+}
+
+.cc-sub-rowtop {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.3rem;
+}
+
+.cc-sub-label {
+  font-size: 0.82rem;
+  color: var(--text-h);
+}
+
+.cc-sub-pct {
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  color: var(--text-h);
+}
+
+.cc-sub-track {
+  height: 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.cc-sub-fill {
+  height: 100%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan-dim);
+  transition: width 0.4s ease;
+}
+
+.cc-sub-fill.warn {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber);
+}
+
+.cc-sub-fill.crit {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+}
+
+.cc-sub-reset {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+
+.cc-sub-extra {
+  font-size: 0.78rem;
+  margin-top: 0.6rem;
+}
+
+.cc-sub-foot {
+  font-size: 0.72rem;
+  margin-top: 0.7rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
 }
 
 .cc-head {
@@ -1049,10 +1143,6 @@ main {
 
 .cc-panel h2 {
   margin: 0 0 0.6rem;
-}
-
-.cc-span2 {
-  grid-column: 1 / -1;
 }
 
 @media (max-width: 860px) {

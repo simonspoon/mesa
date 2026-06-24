@@ -76,7 +76,9 @@ invariants you must not break — read them before changing `src/`:
   `description`); `delete` echoes the full destroyed record(s). Errors are
   `{"error": {"code", "message"}}` on stderr.
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
-  error. Error codes: `not_found | validation | cycle | conflict | usage`.
+  error. Error codes: `not_found | validation | cycle | conflict | usage`, plus
+  `unavailable` scoped to the live `cc usage` / `GET /api/cc/usage` endpoint (a
+  missing token or unreachable upstream; see the CC Dashboard section).
 - **API security boundary is mode-dependent** (`serve` default vs `serve --lan`),
   enforced by middleware in `src/api.rs`, not by the bind address. Two checks:
   - **Host-header allowlist** (DNS-rebinding defense): rejects requests whose
@@ -237,6 +239,25 @@ share it and never diverge.
   headline view for optimizing where token spend goes.
 - Gate: `scripts/cc-check.sh` drives `mesa cc` against a synthetic transcript
   tree (`MESA_CC_PROJECTS_DIR`) and asserts the JSON contract.
+
+#### Subscription usage (the one network read)
+
+`mesa cc usage` / `GET /api/cc/usage` shows live **plan-limit utilization** (the
+5-hour and weekly windows, reset times, extra-usage credits) — the data behind
+Claude Code's own `/usage`. This is the **only** part of mesa that makes an
+outbound network call: it is **not** in transcripts, so `core::usage` fetches it
+from Anthropic's OAuth usage endpoint (`https://api.anthropic.com/api/oauth/usage`,
+header `anthropic-beta: oauth-2025-04-20`). It authenticates with the **local
+Claude Code OAuth token** read from the macOS Keychain (`security -s "Claude
+Code-credentials"`) or `~/.claude/.credentials.json`; the token never leaves the
+process — only the usage numbers reach the client. Like the CLI's git calls, it
+**shells out to `curl`** rather than adding a TLS dependency. `plan_tier` is read
+from `~/.claude.json`. Overrides for tests: `MESA_CC_TOKEN`, `MESA_CC_USAGE_URL`.
+The API caches the result for 60s (`AppState.usage_cache`) so UI polling doesn't
+hammer the endpoint; a missing token / unreachable upstream is a **502
+`{"error":{"code":"unavailable",…}}`** (CLI: same error JSON, exit 1) — a new
+error code scoped to this endpoint, which the web card renders as "unavailable".
+The Web UI shows it as the **Subscription Limits** card beside Live Sessions.
 
 ## Untrusted input
 

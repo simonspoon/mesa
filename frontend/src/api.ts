@@ -4,6 +4,7 @@
 
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
+import type { CcUsage } from './types/CcUsage'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
 import type { InboxItem } from './types/InboxItem'
@@ -411,4 +412,9 @@ export function getCcDashboard(window: string): Promise<CcDashboard> {
 /** Currently-running Claude Code sessions over the last `minutes`. */
 export function getCcLive(minutes: number): Promise<CcLive> {
   return request(`/api/cc/live?minutes=${minutes}`)
+}
+
+/** Live subscription usage (plan limits + reset times), fetched from Anthropic. */
+export function getCcUsage(): Promise<CcUsage> {
+  return request('/api/cc/usage')
 }

@@ -582,6 +582,13 @@ EXAMPLES
         #[arg(long, default_value_t = crate::core::cc::DEFAULT_LIVE_MINUTES)]
         minutes: i64,
     },
+    /// Print live subscription usage (plan limits + reset times) as one JSON object
+    ///
+    /// Fetches Anthropic's `/usage` data using the local Claude Code OAuth token
+    /// (macOS Keychain or ~/.claude/.credentials.json). Unlike the other `cc`
+    /// subcommands this is a network read; on a missing token or unreachable
+    /// upstream it prints `{"error":{"code":"unavailable",...}}` and exits 1.
+    Usage,
 }
 
 #[derive(Subcommand)]
@@ -1286,6 +1293,13 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
         }
         CcCmd::Skills { window } => print_json(&crate::core::cc::collect(&window).skills),
         CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
+        CcCmd::Usage => match crate::core::usage::fetch() {
+            Ok(usage) => print_json(&usage),
+            Err(message) => {
+                print_error("unavailable", &message);
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
 }

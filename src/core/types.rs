@@ -589,6 +589,52 @@ pub struct CcLive {
     pub sessions: Vec<CcLiveSession>,
 }
 
+/// Live Claude Code subscription usage — the `/usage` data fetched from
+/// Anthropic's OAuth usage endpoint (`mesa cc usage` / `GET /api/cc/usage`).
+/// Unlike the rest of the CC dashboard, which parses local transcripts, this is
+/// a live network read (see `core::usage`). `utilization` is 0–100 percent of
+/// the plan limit; `resets_at` is ISO-8601 UTC.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcUsage {
+    /// Rolling 5-hour session window.
+    pub five_hour: Option<CcUsageWindow>,
+    /// Rolling 7-day window (all models).
+    pub seven_day: Option<CcUsageWindow>,
+    /// Rolling 7-day window scoped to Opus, when the plan meters it separately.
+    pub seven_day_opus: Option<CcUsageWindow>,
+    /// Rolling 7-day window scoped to Sonnet, when metered separately.
+    pub seven_day_sonnet: Option<CcUsageWindow>,
+    /// Pay-as-you-go extra-usage credits, when enabled on the plan.
+    pub extra_usage: Option<CcUsageExtra>,
+    /// Human plan label (e.g. "Max 20x"), from `~/.claude.json`, when known.
+    pub plan_tier: Option<String>,
+    /// Unix seconds at which this snapshot was fetched.
+    #[ts(type = "number")]
+    pub fetched_at_unix: i64,
+}
+
+/// One rate-limit window: how much of the plan limit is used and when it resets.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcUsageWindow {
+    /// Percent of the plan limit consumed (0–100).
+    pub utilization: f64,
+    /// When the window resets (ISO-8601 UTC), if known.
+    pub resets_at: Option<String>,
+}
+
+/// Pay-as-you-go extra-usage credit balance.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcUsageExtra {
+    pub is_enabled: bool,
+    /// Monthly credit cap in `currency`, if set.
+    pub monthly_limit: Option<f64>,
+    pub used_credits: f64,
+    pub currency: String,
+}
+
 /// One entry in a storyboard's append-only change history. `actor` is the
 /// free-text id of whoever made the change (an agent name or "user"); it is the
 /// collaboration record — who did what, when. `action` is a stable machine

@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { getCcDashboard, getCcLive } from '../api'
+import { getCcDashboard, getCcLive, getCcUsage } from '../api'
 import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
 import type { CcDashboard } from '../types/CcDashboard'
 import type { CcLiveSession } from '../types/CcLiveSession'
+import type { CcUsageWindow } from '../types/CcUsageWindow'
 import { useFetch } from '../useFetch'
 
 // CC Dashboard: telemetry over Claude Code's own session transcripts — sessions,
@@ -170,16 +171,140 @@ export function CCDashboardView() {
         static price table.
       </p>
 
-      <LiveSessions />
+      {error && <p className="error">{error}</p>}
 
+      <div className="cc-top">
+        <LiveSessions />
+        <SubscriptionCard />
+      </div>
+
+      {!data && !error && <p className="muted">Loading…</p>}
+      {data && <Dashboard data={data} />}
+    </div>
+  )
+}
+
+// The daily diverging-bar chart. Cache (read + write) stacks upward on the
+// right-axis scale, input/output stacks downward on the left-axis scale —
+// independent scales so the small in/out series stays legible next to the
+// much larger cache series.
+function DailyChart({ data }: { data: CcDashboard }) {
+  const bars = data.daily.map((d) => ({
+    label: d.date,
+    up: [
+      { label: TOK.cache_read.label, value: d.tokens.cache_read, color: TOK.cache_read.color },
+      { label: TOK.cache_creation.label, value: d.tokens.cache_creation, color: TOK.cache_creation.color },
+    ],
+    down: [
+      { label: TOK.input.label, value: d.tokens.input, color: TOK.input.color },
+      { label: TOK.output.label, value: d.tokens.output, color: TOK.output.color },
+    ],
+  }))
+  const upMax = Math.max(0, ...bars.map((b) => b.up.reduce((s, x) => s + x.value, 0)))
+  const downMax = Math.max(0, ...bars.map((b) => b.down.reduce((s, x) => s + x.value, 0)))
+
+  return (
+    <>
+      <Legend />
+      <div className="cc-diverge">
+        <div className="cc-diverge-axis" aria-hidden>
+          <span className="unit" />
+          <span>0</span>
+          <span className="cap">
+            {fmtTok(downMax)}
+            <em>in/out</em>
+          </span>
+        </div>
+        <DivergingBars bars={bars} height={120} />
+        <div className="cc-diverge-axis right" aria-hidden>
+          <span className="cap">
+            {fmtTok(upMax)}
+            <em>cache</em>
+          </span>
+          <span>0</span>
+          <span className="unit" />
+        </div>
+      </div>
+      <div className="cc-axis">
+        <span>{data.daily[0]?.date ?? ''}</span>
+        <span>{data.daily[data.daily.length - 1]?.date ?? ''}</span>
+      </div>
+    </>
+  )
+}
+
+// ---- Subscription limits ----
+//
+// Live Claude Code plan-limit utilization (5-hour + weekly windows, reset
+// times, extra-usage credits), fetched from Anthropic's usage endpoint via the
+// API (which reuses the local OAuth token). Polled on the server's cache TTL.
+// `utilization` is already a 0–100 percentage of the plan limit.
+
+// "resets in 1h 48m" / "2d 4h"; collapses to a coarse unit past a day.
+function fmtReset(iso: string): string {
+  const ms = new Date(iso).getTime() - Date.now()
+  if (Number.isNaN(ms)) return ''
+  if (ms <= 0) return 'resetting…'
+  const mins = Math.floor(ms / 60000)
+  if (mins < 60) return `resets in ${mins}m`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `resets in ${hrs}h ${mins % 60}m`
+  return `resets in ${Math.floor(hrs / 24)}d ${hrs % 24}h`
+}
+
+function UsageBar({ label, w }: { label: string; w: CcUsageWindow }) {
+  const pct = Math.max(0, Math.min(100, w.utilization))
+  const sev = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : 'ok'
+  // Guard on the formatted output, not just presence: a present-but-unparseable
+  // resets_at yields '' and should hide the row, not render an empty div.
+  const reset = w.resets_at ? fmtReset(w.resets_at) : ''
+  return (
+    <div className="cc-sub-row">
+      <div className="cc-sub-rowtop">
+        <span className="cc-sub-label">{label}</span>
+        <span className="cc-sub-pct">{pct.toFixed(0)}%</span>
+      </div>
+      <div className="cc-sub-track">
+        <div className={`cc-sub-fill ${sev}`} style={{ width: `${pct}%` }} />
+      </div>
+      {reset && <div className="cc-sub-reset">{reset}</div>}
+    </div>
+  )
+}
+
+function SubscriptionCard() {
+  // Poll on the server's cache TTL (60s); each miss hits Anthropic's endpoint.
+  const { data, error } = useFetch(getCcUsage, 'cc-usage', { pollMs: 60000 })
+  return (
+    <section className="cc-panel cc-sub">
+      <div className="cc-sub-head">
+        <h2>Subscription Limits</h2>
+        {data?.plan_tier && <span className="cc-badge">{data.plan_tier}</span>}
+      </div>
       {error ? (
-        <p className="error">{error}</p>
+        <p className="muted cc-hint">
+          Usage unavailable — needs the local Claude Code OAuth token. Open Claude
+          Code to refresh it, then reload.
+        </p>
       ) : !data ? (
         <p className="muted">Loading…</p>
       ) : (
-        <Dashboard data={data} />
+        <>
+          {data.five_hour && <UsageBar label="5-hour session" w={data.five_hour} />}
+          {data.seven_day && <UsageBar label="Weekly · all models" w={data.seven_day} />}
+          {data.seven_day_opus && <UsageBar label="Weekly · Opus" w={data.seven_day_opus} />}
+          {data.seven_day_sonnet && (
+            <UsageBar label="Weekly · Sonnet" w={data.seven_day_sonnet} />
+          )}
+          {data.extra_usage?.is_enabled && (
+            <div className="cc-sub-extra muted">
+              Extra-usage credits on · {fmtUsd(data.extra_usage.used_credits)} used
+            </div>
+          )}
+          <div className="cc-sub-foot muted">live from Anthropic · % of plan limit</div>
+        </>
       )}
-    </div>
+    </section>
   )
 }
 
@@ -294,24 +419,6 @@ function LiveCard({ s }: { s: CcLiveSession }) {
 function Dashboard({ data }: { data: CcDashboard }) {
   const o = data.overview
 
-  // Daily activity: one diverging bar per day. Cache (read + write) stacks
-  // upward on the right-axis scale, input/output stacks downward on the
-  // left-axis scale — independent scales so the small in/out series stays
-  // legible next to the much larger cache series.
-  const bars = data.daily.map((d) => ({
-    label: d.date,
-    up: [
-      { label: TOK.cache_read.label, value: d.tokens.cache_read, color: TOK.cache_read.color },
-      { label: TOK.cache_creation.label, value: d.tokens.cache_creation, color: TOK.cache_creation.color },
-    ],
-    down: [
-      { label: TOK.input.label, value: d.tokens.input, color: TOK.input.color },
-      { label: TOK.output.label, value: d.tokens.output, color: TOK.output.color },
-    ],
-  }))
-  const upMax = Math.max(0, ...bars.map((b) => b.up.reduce((s, x) => s + x.value, 0)))
-  const downMax = Math.max(0, ...bars.map((b) => b.down.reduce((s, x) => s + x.value, 0)))
-
   // Model split donut (top models by tokens; rest folded into "other").
   const modelSlices: Slice[] = data.models.slice(0, 6).map((m, i) => ({
     label: m.model,
@@ -326,44 +433,7 @@ function Dashboard({ data }: { data: CcDashboard }) {
 
   return (
     <>
-      <div className="cc-kpis">
-        <Kpi label="Sessions" value={fmtInt(o.sessions)} sub={`${o.active_days} active days`} />
-        <Kpi label="Messages" value={fmtInt(o.messages)} sub={`${fmtInt(Math.round(o.avg_tokens_per_session))} tok/session`} />
-        <Kpi label="Tokens" value={fmtTok(o.total_tokens)} sub={`${fmtTok(o.tokens.input)} in · ${fmtTok(o.tokens.output)} out`} />
-        <Kpi label="Est. cost" value={fmtUsd(o.est_cost_usd)} sub="estimated" />
-        <Kpi label="Cache hit" value={fmtPct(o.cache_hit_ratio)} sub={`${fmtTok(o.tokens.cache_read)} cached`} />
-        <Kpi label="Avg session" value={fmtMin(o.avg_session_minutes)} sub={`median ${fmtMin(o.median_session_minutes)}`} />
-      </div>
-
       <div className="cc-grid">
-        <section className="cc-panel cc-span2">
-          <h2>Daily token usage</h2>
-          <Legend />
-          <div className="cc-diverge">
-            <div className="cc-diverge-axis" aria-hidden>
-              <span className="unit" />
-              <span>0</span>
-              <span className="cap">
-                {fmtTok(downMax)}
-                <em>in/out</em>
-              </span>
-            </div>
-            <DivergingBars bars={bars} height={120} />
-            <div className="cc-diverge-axis right" aria-hidden>
-              <span className="cap">
-                {fmtTok(upMax)}
-                <em>cache</em>
-              </span>
-              <span>0</span>
-              <span className="unit" />
-            </div>
-          </div>
-          <div className="cc-axis">
-            <span>{data.daily[0]?.date ?? ''}</span>
-            <span>{data.daily[data.daily.length - 1]?.date ?? ''}</span>
-          </div>
-        </section>
-
         <section className="cc-panel">
           <h2>Models</h2>
           <div className="cc-donut-wrap">
@@ -379,6 +449,20 @@ function Dashboard({ data }: { data: CcDashboard }) {
             </ul>
           </div>
         </section>
+
+        <section className="cc-panel cc-daily">
+          <h2>Daily token usage</h2>
+          <DailyChart data={data} />
+        </section>
+      </div>
+
+      <div className="cc-kpis">
+        <Kpi label="Sessions" value={fmtInt(o.sessions)} sub={`${o.active_days} active days`} />
+        <Kpi label="Messages" value={fmtInt(o.messages)} sub={`${fmtInt(Math.round(o.avg_tokens_per_session))} tok/session`} />
+        <Kpi label="Tokens" value={fmtTok(o.total_tokens)} sub={`${fmtTok(o.tokens.input)} in · ${fmtTok(o.tokens.output)} out`} />
+        <Kpi label="Est. cost" value={fmtUsd(o.est_cost_usd)} sub="estimated" />
+        <Kpi label="Cache hit" value={fmtPct(o.cache_hit_ratio)} sub={`${fmtTok(o.tokens.cache_read)} cached`} />
+        <Kpi label="Avg session" value={fmtMin(o.avg_session_minutes)} sub={`median ${fmtMin(o.median_session_minutes)}`} />
       </div>
 
       <section className="cc-panel">

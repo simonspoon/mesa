@@ -29,8 +29,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    CcDashboard, EdgePatch, Error, FrameNew, FramePatch, PostPatch, Priority, ProjectPatch, Status,
-    Store, StoryboardPatch, TaskPatch, TaskSummary,
+    CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch, PostPatch, Priority,
+    ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -51,6 +51,10 @@ struct AppState {
     /// transcript files per request is otherwise too slow). Read-only data —
     /// not the mesa store, so no `Store` write path is involved.
     cc_cache: Arc<Mutex<HashMap<String, (i64, CcDashboard)>>>,
+    /// Live subscription-usage cache: `(fetched_unix, data)`. The UI polls this,
+    /// but each fetch hits Anthropic's usage endpoint, so a short TTL throttles
+    /// outbound calls. Read-only live data — not the mesa store.
+    usage_cache: Arc<Mutex<Option<(i64, CcUsage)>>>,
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -63,6 +67,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         port,
         lan,
         cc_cache: Arc::new(Mutex::new(HashMap::new())),
+        usage_cache: Arc::new(Mutex::new(None)),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -122,6 +127,7 @@ fn router(state: AppState) -> Router {
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
+        .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
         // Live sessions: cheap, frequently-polled slice of the telemetry.
         .route("/api/cc/live", get(get_cc_live))
@@ -960,4 +966,50 @@ struct CcLiveQuery {
 async fn get_cc_live(Query(q): Query<CcLiveQuery>) -> ApiResult<Response> {
     let minutes = q.minutes.unwrap_or(crate::core::cc::DEFAULT_LIVE_MINUTES);
     Ok(Json(crate::core::cc::live(minutes)).into_response())
+}
+
+/// How long a fetched usage snapshot is reused before re-fetching from Anthropic.
+const USAGE_TTL_SECS: i64 = 60;
+
+/// Returns live Claude Code subscription usage (plan limits + reset times),
+/// fetched from Anthropic's usage endpoint and cached for [`USAGE_TTL_SECS`] so
+/// polling the UI doesn't hammer it. Read-only, so the Content-Type gate doesn't
+/// apply. When the token is missing or the upstream is unreachable, responds
+/// `502 {"error": {"code": "unavailable", ...}}`.
+async fn get_cc_usage(State(state): State<AppState>) -> ApiResult<Response> {
+    let now = unix_secs();
+    {
+        let cache = state.usage_cache.lock().unwrap();
+        if let Some((at, usage)) = cache.as_ref()
+            && now - *at < USAGE_TTL_SECS
+        {
+            return Ok(Json(usage.clone()).into_response());
+        }
+    }
+    // The fetch shells out to `curl` (blocking, up to 10s); keep it off the async
+    // worker thread.
+    let usage = tokio::task::spawn_blocking(crate::core::usage::fetch)
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "conflict",
+            message: format!("usage fetch panicked: {e}"),
+        })?
+        .map_err(|message| ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        })?;
+    {
+        let mut cache = state.usage_cache.lock().unwrap();
+        *cache = Some((now, usage.clone()));
+    }
+    Ok(Json(usage).into_response())
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

@@ -92,6 +92,11 @@ mesa backup /tmp/mesa-snap.db
   ```
 - **Exit codes are load-bearing:** `0` success, `1` domain/runtime error,
   `2` usage error.
+- **Long text from a file.** On `task create`/`update`, `--description-file
+  <path>` and `--acceptance-file <path>` read the field from a file (`-` =
+  stdin) instead of an inline arg, so multi-line text with shell metacharacters
+  (backticks, `$()`, `<>`) round-trips verbatim. Each conflicts with its inline
+  flag (`--description` / `--acceptance`); only one field may read `-` per call.
 
 Run `mesa <command> --help` for the full, self-documenting reference.
 

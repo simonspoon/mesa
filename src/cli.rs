@@ -207,6 +207,9 @@ EXAMPLES
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
+        /// Read the description from a file (`-` = stdin); conflicts with --description
+        #[arg(long, value_name = "PATH", conflicts_with = "description")]
+        description_file: Option<String>,
         /// Priority: low|medium|high
         #[arg(long, value_parser = parse_priority, default_value = "medium")]
         priority: Priority,
@@ -219,6 +222,9 @@ EXAMPLES
         /// Definition-of-done for this task; free text
         #[arg(long)]
         acceptance: Option<String>,
+        /// Read the acceptance from a file (`-` = stdin); conflicts with --acceptance
+        #[arg(long, value_name = "PATH", conflicts_with = "acceptance")]
+        acceptance_file: Option<String>,
         /// Work receipt (commit SHA / PR URL / path); free text
         #[arg(long)]
         artifact: Option<String>,
@@ -306,6 +312,9 @@ EXAMPLES
         /// New description; pass "" to clear it
         #[arg(long, group = "fields")]
         description: Option<String>,
+        /// Read the new description from a file (`-` = stdin); conflicts with --description
+        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "description")]
+        description_file: Option<String>,
         /// New status: todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status, group = "fields")]
         status: Option<Status>,
@@ -324,6 +333,9 @@ EXAMPLES
         /// New definition-of-done; pass "" to clear it
         #[arg(long, group = "fields")]
         acceptance: Option<String>,
+        /// Read the new definition-of-done from a file (`-` = stdin); conflicts with --acceptance
+        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "acceptance")]
+        acceptance_file: Option<String>,
         /// New work receipt; pass "" to clear it
         #[arg(long, group = "fields")]
         artifact: Option<String>,
@@ -845,6 +857,40 @@ fn clear_if_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Resolve a free-text field that may be given inline (`Option<String>`) or read
+/// from a file/stdin (`--*-file <path>`, `-` = stdin). clap's `conflicts_with`
+/// already rejects passing both the inline and `-file` form, so at most one of
+/// `inline`/`file` is `Some`. Returns the resolved body, or `None` if neither
+/// source was given. A file is read verbatim so shell-hostile text (backticks,
+/// `$()`, `<>`) round-trips byte-for-byte. `stdin_used` guards against two
+/// fields in one invocation both reading `-` (stdin can only be consumed once).
+fn resolve_field(
+    inline: Option<String>,
+    file: Option<String>,
+    stdin_used: &mut bool,
+) -> Result<Option<String>> {
+    if inline.is_some() {
+        return Ok(inline);
+    }
+    let Some(path) = file else { return Ok(None) };
+    if path == "-" {
+        if *stdin_used {
+            // Two fields cannot both read stdin in one call — a usage error.
+            print_error("usage", "only one field can read from stdin ('-') per invocation");
+            std::process::exit(2);
+        }
+        *stdin_used = true;
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        Ok(Some(buf))
+    } else {
+        // Missing/unreadable path is a domain error (exit 1).
+        let buf = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Validation(format!("cannot read {path}: {e}")))?;
+        Ok(Some(buf))
+    }
+}
+
 /// The root (first) commit of the git repo at `path` (default: cwd), or `None`
 /// if it is not a git repo or git is unavailable. Uses `--reverse` and takes the
 /// first line so a repo with several root commits resolves deterministically to
@@ -1005,12 +1051,17 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             project,
             title,
             description,
+            description_file,
             priority,
             tags,
             parent,
             acceptance,
+            acceptance_file,
             artifact,
         } => {
+            let mut stdin_used = false;
+            let description = resolve_field(description, description_file, &mut stdin_used)?;
+            let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
             let tags = tags.map(parse_tags).unwrap_or_default();
             print_json(&store.create_task(
                 project,
@@ -1072,14 +1123,19 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             id,
             title,
             description,
+            description_file,
             status,
             priority,
             tags,
             parent,
             no_parent,
             acceptance,
+            acceptance_file,
             artifact,
         } => {
+            let mut stdin_used = false;
+            let description = resolve_field(description, description_file, &mut stdin_used)?;
+            let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
             let patch = TaskPatch {
                 title,
                 description: description.map(clear_if_empty),

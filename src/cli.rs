@@ -203,9 +203,10 @@ EXAMPLES
         #[arg(long)]
         project: i64,
         /// Task title
+        #[arg(allow_hyphen_values = true)]
         title: String,
         /// Optional free-text description
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
         /// Read the description from a file (`-` = stdin); conflicts with --description
         #[arg(long, value_name = "PATH", conflicts_with = "description")]
@@ -220,7 +221,7 @@ EXAMPLES
         #[arg(long)]
         parent: Option<i64>,
         /// Definition-of-done for this task; free text
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         acceptance: Option<String>,
         /// Read the acceptance from a file (`-` = stdin); conflicts with --acceptance
         #[arg(long, value_name = "PATH", conflicts_with = "acceptance")]
@@ -307,10 +308,10 @@ EXAMPLES
         /// Task id
         id: i64,
         /// New title
-        #[arg(long, group = "fields")]
+        #[arg(long, group = "fields", allow_hyphen_values = true)]
         title: Option<String>,
         /// New description; pass "" to clear it
-        #[arg(long, group = "fields")]
+        #[arg(long, group = "fields", allow_hyphen_values = true)]
         description: Option<String>,
         /// Read the new description from a file (`-` = stdin); conflicts with --description
         #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "description")]
@@ -331,7 +332,7 @@ EXAMPLES
         #[arg(long, group = "fields")]
         no_parent: bool,
         /// New definition-of-done; pass "" to clear it
-        #[arg(long, group = "fields")]
+        #[arg(long, group = "fields", allow_hyphen_values = true)]
         acceptance: Option<String>,
         /// Read the new definition-of-done from a file (`-` = stdin); conflicts with --acceptance
         #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "acceptance")]
@@ -412,6 +413,7 @@ EXAMPLES
         #[arg(long)]
         project: i64,
         /// The message body (markdown by convention)
+        #[arg(allow_hyphen_values = true)]
         body: String,
         /// Optional one-line title
         #[arg(long)]
@@ -435,6 +437,7 @@ EXAMPLES
         /// Id of the post being replied to (a top-level post)
         parent: i64,
         /// The reply body (markdown by convention)
+        #[arg(allow_hyphen_values = true)]
         body: String,
         /// Optional one-line title
         #[arg(long)]
@@ -475,7 +478,7 @@ EXAMPLES
         /// Post id
         id: i64,
         /// New body
-        #[arg(long, group = "fields")]
+        #[arg(long, group = "fields", allow_hyphen_values = true)]
         body: Option<String>,
         /// New title; pass "" to clear it
         #[arg(long, group = "fields")]

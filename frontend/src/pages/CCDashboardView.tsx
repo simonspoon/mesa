@@ -465,45 +465,47 @@ function Dashboard({ data }: { data: CcDashboard }) {
         <Kpi label="Avg session" value={fmtMin(o.avg_session_minutes)} sub={`median ${fmtMin(o.median_session_minutes)}`} />
       </div>
 
-      <section className="cc-panel">
-        <h2>Skills</h2>
-        <p className="muted cc-hint">
-          Where token spend goes by skill — the lever for optimization. Click a
-          column to sort.
-        </p>
-        <DataTable
-          rows={data.skills}
-          rowKey={(s) => s.skill}
-          initialKey="tokens"
-          empty="No skill-attributed usage in this window."
-          cols={[
-            { key: 'skill', label: 'Skill', render: (s) => s.skill, sort: (s) => s.skill },
-            { key: 'sessions', label: 'Sessions', numeric: true, render: (s) => fmtInt(s.sessions), sort: (s) => s.sessions },
-            { key: 'messages', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
-            { key: 'tokens', label: 'Tokens', numeric: true, render: (s) => fmtTok(s.total_tokens), sort: (s) => s.total_tokens },
-            { key: 'avg', label: 'Avg/msg', numeric: true, render: (s) => fmtTok(Math.round(s.total_tokens / Math.max(1, s.messages))), sort: (s) => s.total_tokens / Math.max(1, s.messages) },
-            { key: 'cost', label: 'Est. cost', numeric: true, render: (s) => fmtUsd(s.est_cost_usd), sort: (s) => s.est_cost_usd },
-          ]}
-        />
-      </section>
+      <div className="cc-pair">
+        <section className="cc-panel">
+          <h2>Skills</h2>
+          <p className="muted cc-hint">
+            Where token spend goes by skill — the lever for optimization. Click a
+            column to sort.
+          </p>
+          <DataTable
+            rows={data.skills}
+            rowKey={(s) => s.skill}
+            initialKey="tokens"
+            empty="No skill-attributed usage in this window."
+            cols={[
+              { key: 'skill', label: 'Skill', render: (s) => s.skill, sort: (s) => s.skill },
+              { key: 'sessions', label: 'Sessions', numeric: true, render: (s) => fmtInt(s.sessions), sort: (s) => s.sessions },
+              { key: 'messages', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
+              { key: 'tokens', label: 'Tokens', numeric: true, render: (s) => fmtTok(s.total_tokens), sort: (s) => s.total_tokens },
+              { key: 'avg', label: 'Avg/msg', numeric: true, render: (s) => fmtTok(Math.round(s.total_tokens / Math.max(1, s.messages))), sort: (s) => s.total_tokens / Math.max(1, s.messages) },
+              { key: 'cost', label: 'Est. cost', numeric: true, render: (s) => fmtUsd(s.est_cost_usd), sort: (s) => s.est_cost_usd },
+            ]}
+          />
+        </section>
 
-      <section className="cc-panel">
-        <h2>Agents</h2>
-        <p className="muted cc-hint">Usage by subagent (attributionAgent).</p>
-        <DataTable
-          rows={data.agents}
-          rowKey={(a) => a.agent}
-          initialKey="tokens"
-          empty="No agent-attributed usage in this window."
-          cols={[
-            { key: 'agent', label: 'Agent', render: (a) => a.agent, sort: (a) => a.agent },
-            { key: 'sessions', label: 'Sessions', numeric: true, render: (a) => fmtInt(a.sessions), sort: (a) => a.sessions },
-            { key: 'messages', label: 'Msgs', numeric: true, render: (a) => fmtInt(a.messages), sort: (a) => a.messages },
-            { key: 'tokens', label: 'Tokens', numeric: true, render: (a) => fmtTok(a.total_tokens), sort: (a) => a.total_tokens },
-            { key: 'cost', label: 'Est. cost', numeric: true, render: (a) => fmtUsd(a.est_cost_usd), sort: (a) => a.est_cost_usd },
-          ]}
-        />
-      </section>
+        <section className="cc-panel">
+          <h2>Agents</h2>
+          <p className="muted cc-hint">Usage by subagent (attributionAgent).</p>
+          <DataTable
+            rows={data.agents}
+            rowKey={(a) => a.agent}
+            initialKey="tokens"
+            empty="No agent-attributed usage in this window."
+            cols={[
+              { key: 'agent', label: 'Agent', render: (a) => a.agent, sort: (a) => a.agent },
+              { key: 'sessions', label: 'Sessions', numeric: true, render: (a) => fmtInt(a.sessions), sort: (a) => a.sessions },
+              { key: 'messages', label: 'Msgs', numeric: true, render: (a) => fmtInt(a.messages), sort: (a) => a.messages },
+              { key: 'tokens', label: 'Tokens', numeric: true, render: (a) => fmtTok(a.total_tokens), sort: (a) => a.total_tokens },
+              { key: 'cost', label: 'Est. cost', numeric: true, render: (a) => fmtUsd(a.est_cost_usd), sort: (a) => a.est_cost_usd },
+            ]}
+          />
+        </section>
+      </div>
 
       <section className="cc-panel">
         <h2>Projects</h2>

@@ -32,6 +32,38 @@ header {
   flex-direction: column;
 }
 
+/* Collapsed sidebar: shrink to just the re-expand handle. */
+.sidebar.collapsed {
+  width: auto;
+  padding: 0.5rem 0.35rem;
+}
+
+/* Collapse/expand handle: chromeless, right-aligned above the nav entries. */
+.sidebar-toggle {
+  align-self: flex-end;
+  width: auto;
+  padding: 0.1rem 0.4rem;
+  border: none;
+  border-radius: 0;
+  clip-path: none;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.sidebar.collapsed .sidebar-toggle {
+  align-self: center;
+}
+
+.sidebar-toggle:hover {
+  background: none;
+  box-shadow: none;
+  color: var(--cyan);
+}
+
 /* The three top-level nav entries (Inbox, CC Dashboard, Projects) share one
    style. Projects is a <button> disclosure header, so reset button chrome to
    match the <a> links exactly. */

@@ -43,7 +43,9 @@ function App() {
   const [navVersion, setNavVersion] = useState(0)
 
   const inboxMatch = /^\/inbox$/.exec(path)
-  const ccMatch = /^\/cc$/.exec(path)
+  // CC Dashboard is the default landing view: the root path (#/ or empty) shows
+  // it, and the brand link points back here.
+  const ccMatch = /^\/(cc)?$/.exec(path)
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)

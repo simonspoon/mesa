@@ -4,7 +4,7 @@ import { useFetch } from '../useFetch'
 
 /**
  * Persistent left nav: three top-level entries sharing one `.nav-item` style —
- * the global Inbox, the CC Dashboard, and Projects. Projects owns a subnav (the
+ * the CC Dashboard, the global Inbox, and Projects. Projects owns a subnav (the
  * project list + create form), so its row is a disclosure header that collapses
  * its subnav. `version` is bumped by pages after project rename/delete so the
  * list refetches (it is part of the useFetch key). The inbox count live-polls so
@@ -36,6 +36,25 @@ export function Sidebar({
   const [createError, setCreateError] = useState<string | null>(null)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
+  // Full-sidebar collapse: hides the whole nav to give the main content area
+  // the extra width, leaving only a thin re-expand handle.
+  const [collapsed, setCollapsed] = useState(false)
+
+  if (collapsed) {
+    return (
+      <nav className="sidebar collapsed">
+        <button
+          type="button"
+          className="sidebar-toggle"
+          aria-label="Expand sidebar"
+          title="Expand sidebar"
+          onClick={() => setCollapsed(false)}
+        >
+          »
+        </button>
+      </nav>
+    )
+  }
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -53,12 +72,21 @@ export function Sidebar({
 
   return (
     <nav className="sidebar">
+      <button
+        type="button"
+        className="sidebar-toggle"
+        aria-label="Collapse sidebar"
+        title="Collapse sidebar"
+        onClick={() => setCollapsed(true)}
+      >
+        «
+      </button>
+      <a className={`nav-item${ccActive ? ' active' : ''}`} href="#/cc">
+        <span className="nav-item-label">CC Dashboard</span>
+      </a>
       <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
         <span className="nav-item-label">Inbox</span>
         {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
-      </a>
-      <a className={`nav-item${ccActive ? ' active' : ''}`} href="#/cc">
-        <span className="nav-item-label">CC Dashboard</span>
       </a>
       <button
         type="button"

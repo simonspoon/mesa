@@ -77,7 +77,7 @@ export function ProjectTasksPage({
   // List/Board is an in-place toggle held in local state; Storyboards is
   // URL-driven (the `storyboards` prop). `view` only distinguishes list vs
   // board — when Storyboards is active it governs neither tab's content.
-  const [view, setView] = useState<'list' | 'board'>('list')
+  const [view, setView] = useState<'list' | 'board'>('board')
   // Create-form panel state is ephemeral (spec Assumption 2); the task
   // panel is URL-driven via `taskId`. Latest action wins: opening a task
   // closes the create form.
@@ -263,18 +263,18 @@ export function ProjectTasksPage({
         )}
         <div className="tabs">
           <button
-            className={!storyboards && !posts && view === 'list' ? 'active' : ''}
-            onClick={() => selectView('list')}
-          >
-            List
-          </button>
-          <button
             className={
               !storyboards && !posts && view === 'board' ? 'active' : ''
             }
             onClick={() => selectView('board')}
           >
             Board
+          </button>
+          <button
+            className={!storyboards && !posts && view === 'list' ? 'active' : ''}
+            onClick={() => selectView('list')}
+          >
+            List
           </button>
           {/* URL-driven in-place views (refresh-/back-stable) that keep this
               frame around their content, like List/Board above. */}

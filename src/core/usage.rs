@@ -4,7 +4,8 @@
 //! makes ONE outbound HTTPS GET to Anthropic's OAuth usage endpoint to fetch the
 //! live rate-limit utilization (5-hour and 7-day windows, reset times, extra-
 //! usage credits). It authenticates with the local Claude Code OAuth token —
-//! read from the macOS Keychain (`security`) or `~/.claude/.credentials.json` —
+//! the `CLAUDE_CODE_OAUTH_TOKEN` env var (a long-lived `claude setup-token`), the
+//! macOS Keychain (`security`), or `~/.claude/.credentials.json` —
 //! and shells out to `curl` (the same shell-out posture the CLI uses for `git`),
 //! so mesa needs no TLS dependency. Only the usage numbers reach the client; the
 //! token never leaves this process.
@@ -146,10 +147,18 @@ fn parse(bytes: &[u8]) -> Result<CcUsage, String> {
     })
 }
 
-/// The Claude Code OAuth access token: `MESA_CC_TOKEN` override → macOS Keychain
-/// → `~/.claude/.credentials.json`. Returns `None` if none is available.
+/// The Claude Code OAuth access token: `MESA_CC_TOKEN` override →
+/// `CLAUDE_CODE_OAUTH_TOKEN` (the long-lived token Claude Code itself honors) →
+/// macOS Keychain → `~/.claude/.credentials.json`. Returns `None` if none is
+/// available. The env-var forms are bare token strings (not the credentials JSON).
 fn token() -> Option<String> {
     if let Ok(t) = std::env::var("MESA_CC_TOKEN") {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    // Long-lived OAuth token (`claude setup-token`); same env var Claude Code reads.
+    if let Ok(t) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
         if !t.is_empty() {
             return Some(t);
         }

@@ -248,7 +248,8 @@ Claude Code's own `/usage`. This is the **only** part of mesa that makes an
 outbound network call: it is **not** in transcripts, so `core::usage` fetches it
 from Anthropic's OAuth usage endpoint (`https://api.anthropic.com/api/oauth/usage`,
 header `anthropic-beta: oauth-2025-04-20`). It authenticates with the **local
-Claude Code OAuth token** read from the macOS Keychain (`security -s "Claude
+Claude Code OAuth token** read from `CLAUDE_CODE_OAUTH_TOKEN` (a long-lived
+`claude setup-token`), else the macOS Keychain (`security -s "Claude
 Code-credentials"`) or `~/.claude/.credentials.json`; the token never leaves the
 process — only the usage numbers reach the client. Like the CLI's git calls, it
 **shells out to `curl`** rather than adding a TLS dependency. `plan_tier` is read

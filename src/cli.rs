@@ -529,25 +529,20 @@ EXAMPLES
         /// Inbox item id
         id: i64,
     },
-    /// Route an item to a project (or clear it); prints the full item
+    /// Assign an item to a project: convert it into a todo task there
     ///
-    /// Pass a project id to assign the item there, or --clear to return it to
-    /// the unassigned inbox. Exactly one is required. Assigning to an unknown
-    /// project is a validation error.
+    /// Routing an item to a project turns it into a todo task in that project
+    /// (title from the item's body, full body as the task description) and
+    /// removes it from the inbox. Prints the created task. Assigning to an
+    /// unknown project is a validation error.
     #[command(after_help = "\
 EXAMPLES
-  mesa inbox assign 3 1        # route item 3 to project 1
-  mesa inbox assign 3 --clear  # send item 3 back to the unassigned inbox")]
-    #[command(group(ArgGroup::new("target").required(true).multiple(false)))]
+  mesa inbox assign 3 1        # convert item 3 into a todo task in project 1")]
     Assign {
         /// Inbox item id
         id: i64,
-        /// Project to assign the item to
-        #[arg(group = "target")]
-        project: Option<i64>,
-        /// Clear the assignment (return the item to the unassigned inbox)
-        #[arg(long, group = "target")]
-        clear: bool,
+        /// Project to convert the item into a task in
+        project: i64,
     },
     /// Delete an inbox item (no confirmation); echoes the destroyed item
     Delete {
@@ -1373,11 +1368,10 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
         }
         InboxCmd::List { project } => print_json(&store.list_inbox_items(project)?),
         InboxCmd::Show { id } => print_json(&store.get_inbox_item(id)?),
-        InboxCmd::Assign { id, project, clear } => {
-            // The arg group guarantees exactly one of `project` / `--clear`,
-            // so `--clear` means "unassign" and otherwise `project` is set.
-            let target = if clear { None } else { project };
-            print_json(&store.assign_inbox_item(id, target)?);
+        InboxCmd::Assign { id, project } => {
+            // Assigning converts the item into a todo task in the project and
+            // deletes it from the inbox; the created task is what we echo.
+            print_json(&store.assign_inbox_item(id, project)?);
         }
         InboxCmd::Delete { id } => print_json(&store.delete_inbox_item(id)?),
     }

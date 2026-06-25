@@ -389,11 +389,11 @@ export function createInboxItem(body: InboxCreate): Promise<InboxItem> {
   return request('/api/inbox', jsonInit('POST', body))
 }
 
-/** Route an item to a project (number) or back to the unassigned inbox (null). */
-export function assignInboxItem(
-  id: number,
-  projectId: number | null,
-): Promise<InboxItem> {
+/**
+ * Assign an item to a project: converts it into a todo task there and removes
+ * it from the inbox. Resolves to the created task.
+ */
+export function assignInboxItem(id: number, projectId: number): Promise<Task> {
   return request(`/api/inbox/${id}`, jsonInit('PATCH', { project_id: projectId }))
 }
 

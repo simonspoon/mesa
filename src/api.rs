@@ -862,10 +862,8 @@ struct InboxCreate {
 
 #[derive(Deserialize)]
 struct InboxAssign {
-    /// `Some(Some(id))` assigns to a project; `Some(None)` clears the
-    /// assignment; an absent field leaves it unchanged.
-    #[serde(default, deserialize_with = "double_option")]
-    project_id: Option<Option<i64>>,
+    /// The project to convert this item into a todo task in. Required.
+    project_id: i64,
 }
 
 async fn list_inbox(
@@ -891,8 +889,8 @@ async fn show_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiRe
     Ok(Json(store.get_inbox_item(id)?).into_response())
 }
 
-/// Routes an item to a project, or clears it. PATCH semantics: an absent
-/// `project_id` is a no-op (the item is returned unchanged).
+/// Assigns an item to a project by converting it into a todo task there and
+/// removing it from the inbox; returns the created task.
 async fn assign_inbox(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -900,11 +898,8 @@ async fn assign_inbox(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let item = match body.project_id {
-        Some(target) => store.assign_inbox_item(id, target)?,
-        None => store.get_inbox_item(id)?,
-    };
-    Ok(Json(item).into_response())
+    let task = store.assign_inbox_item(id, body.project_id)?;
+    Ok(Json(task).into_response())
 }
 
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {

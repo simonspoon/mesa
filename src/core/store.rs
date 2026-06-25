@@ -239,6 +239,26 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
     })
 }
 
+/// Splits an inbox item's free-text body into a `(title, description)` pair for
+/// the task it converts into. The title is the first non-empty line, trimmed and
+/// truncated to 120 chars (an ellipsis marks a cut); the description is the full
+/// body verbatim, kept only when it carries more than the title (multi-line or
+/// truncated) so a one-line item doesn't duplicate itself.
+fn inbox_body_to_task(body: &str) -> (String, Option<String>) {
+    let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let title: String = if first.chars().count() > 120 {
+        first.chars().take(119).collect::<String>() + "…"
+    } else {
+        first.to_string()
+    };
+    let description = if body.trim() == title {
+        None
+    } else {
+        Some(body.to_string())
+    };
+    (title, description)
+}
+
 fn row_to_post(row: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
     Ok(Post {
         id: row.get(0)?,
@@ -1793,26 +1813,61 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Routes an inbox item to a project (`Some`) or returns it to the
-    /// unassigned inbox (`None`); bumps `updated_at`. Assigning to an unknown
-    /// project is a `validation` error, mirroring a task's `--project`.
-    pub fn assign_inbox_item(&mut self, id: i64, project_id: Option<i64>) -> Result<InboxItem> {
-        self.get_inbox_item(id)?;
-        if let Some(pid) = project_id {
-            let project_exists: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                [pid],
-                |r| r.get(0),
-            )?;
-            if !project_exists {
-                return Err(Error::Validation(format!("project {pid} not found")));
-            }
-        }
-        self.conn.execute(
-            "UPDATE inbox SET project_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-            (project_id, id),
+    /// Routes an inbox item to a project by **converting it into a todo task**
+    /// in that project and then deleting the item — it "moves" out of the inbox
+    /// and becomes actionable work on the board. The task's title is the item's
+    /// body (first line, truncated), its description the full body verbatim;
+    /// priority defaults to medium. Returns the created `Task`. Assigning to an
+    /// unknown project is a `validation` error, mirroring a task's `--project`.
+    /// Atomic: the task insert (with its creation event) and the inbox delete
+    /// happen in one transaction, so a triaged item never vanishes without a
+    /// task to show for it.
+    pub fn assign_inbox_item(&mut self, id: i64, project_id: i64) -> Result<Task> {
+        let item = self.get_inbox_item(id)?;
+        let project_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |r| r.get(0),
         )?;
-        self.get_inbox_item(id)
+        if !project_exists {
+            return Err(Error::Validation(format!("project {project_id} not found")));
+        }
+        let (title, description) = inbox_body_to_task(&item.body);
+        let tx = self.conn.transaction()?;
+        // Claim the item by deleting it FIRST, inside the transaction: if a
+        // concurrent assign already converted it, this affects 0 rows and we
+        // bail before creating a (duplicate) task. The body was read above and
+        // is immutable, so reading it outside the tx is safe.
+        let claimed = tx.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
+        if claimed == 0 {
+            return Err(Error::NotFound(format!("inbox item {id} not found")));
+        }
+        tx.execute(
+            "INSERT INTO tasks \
+             (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
+              created_at, updated_at) \
+             VALUES (?1, NULL, ?2, ?3, ?4, '[]', NULL, NULL, datetime('now'), datetime('now'))",
+            (
+                project_id,
+                &title,
+                description.as_deref(),
+                Priority::Medium.as_str(),
+            ),
+        )?;
+        let task_id = tx.last_insert_rowid();
+        // Creation event: NULL from_status -> the row's initial (default) status.
+        let initial_status: String = tx.query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO task_events (task_id, from_status, to_status, at) \
+             VALUES (?1, NULL, ?2, datetime('now'))",
+            (task_id, initial_status),
+        )?;
+        tx.commit()?;
+        self.get_task(task_id)
     }
 
     /// Deletes an inbox item; returns the destroyed record (the recoverable
@@ -3335,9 +3390,8 @@ mod tests {
     // ---- inbox (global update requests) ----
 
     #[test]
-    fn inbox_add_assign_and_delete_round_trip() {
+    fn inbox_add_delete_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
 
         // New items land unassigned in the global inbox.
         let item = store
@@ -3350,25 +3404,6 @@ mod tests {
         // The whole inbox lists it (no project filter).
         let all = store.list_inbox_items(None).unwrap();
         assert_eq!(all.iter().map(|i| i.id).collect::<Vec<_>>(), vec![item.id]);
-        // ...but a project filter excludes the still-unassigned item.
-        assert!(store.list_inbox_items(Some(p.id)).unwrap().is_empty());
-
-        // A person routes it to a project.
-        let assigned = store.assign_inbox_item(item.id, Some(p.id)).unwrap();
-        assert_eq!(assigned.project_id, Some(p.id));
-        assert_eq!(
-            store
-                .list_inbox_items(Some(p.id))
-                .unwrap()
-                .iter()
-                .map(|i| i.id)
-                .collect::<Vec<_>>(),
-            vec![item.id]
-        );
-
-        // ...and can clear the assignment again.
-        let cleared = store.assign_inbox_item(item.id, None).unwrap();
-        assert_eq!(cleared.project_id, None);
 
         // Delete echoes the destroyed record.
         let destroyed = store.delete_inbox_item(item.id).unwrap();
@@ -3377,6 +3412,37 @@ mod tests {
             store.get_inbox_item(item.id),
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn assigning_an_inbox_item_converts_it_to_a_todo_task() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None).unwrap();
+
+        // A multi-line item: title is the first line, description the full body.
+        let item = store
+            .create_inbox_item(Some("agent-7"), "ship the auth fix\nmore detail here")
+            .unwrap();
+
+        let task = store.assign_inbox_item(item.id, p.id).unwrap();
+        assert_eq!(task.project_id, p.id);
+        assert_eq!(task.status, Status::Todo);
+        assert_eq!(task.priority, Priority::Medium);
+        assert_eq!(task.title, "ship the auth fix");
+        assert_eq!(task.description.as_deref(), Some("ship the auth fix\nmore detail here"));
+
+        // The item has moved out of the inbox entirely.
+        assert!(matches!(
+            store.get_inbox_item(item.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(store.list_inbox_items(None).unwrap().is_empty());
+
+        // A single-line item yields a task with no separate description.
+        let single = store.create_inbox_item(None, "quick note").unwrap();
+        let t2 = store.assign_inbox_item(single.id, p.id).unwrap();
+        assert_eq!(t2.title, "quick note");
+        assert_eq!(t2.description, None);
     }
 
     #[test]
@@ -3392,20 +3458,10 @@ mod tests {
     fn assign_inbox_item_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let item = store.create_inbox_item(None, "orphan").unwrap();
-        let err = store.assign_inbox_item(item.id, Some(999)).unwrap_err();
+        let err = store.assign_inbox_item(item.id, 999).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
-    }
-
-    #[test]
-    fn deleting_a_project_unassigns_its_inbox_items() {
-        let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
-        let item = store.create_inbox_item(None, "hi").unwrap();
-        store.assign_inbox_item(item.id, Some(p.id)).unwrap();
-        // The inbox is global: deleting the project returns the item to
-        // unassigned rather than destroying the update request.
-        store.delete_project(p.id).unwrap();
-        assert_eq!(store.get_inbox_item(item.id).unwrap().project_id, None);
+        // The failed assignment left the item untouched in the inbox.
+        assert!(store.get_inbox_item(item.id).is_ok());
     }
 }

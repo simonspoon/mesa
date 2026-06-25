@@ -35,7 +35,7 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
         {task.title}
       </a>
       <div>
-        <span className="badge">{task.priority}</span>
+        <span className={`badge priority-${task.priority}`}>{task.priority}</span>
         {task.blocked && <span className="badge blocked">blocked</span>}
       </div>
     </li>

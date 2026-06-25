@@ -45,19 +45,19 @@ export function InboxView() {
     )
   }
 
+  // Assigning converts the item into a todo task in the chosen project and
+  // removes it from the inbox, so we just refetch (the item drops off the list).
   function assign(id: number, value: string) {
-    assignInboxItem(id, value === '' ? null : Number(value)).then(refetch)
+    if (value === '') return
+    assignInboxItem(id, Number(value)).then(refetch)
   }
-
-  const projectName = (id: number) =>
-    projects?.find((p) => p.id === id)?.name ?? `project ${id}`
 
   return (
     <div className="inbox-page">
       <h1>Inbox</h1>
       <p className="muted">
         Update requests agents send to the shared inbox. Assign each to a project
-        to route it.
+        to turn it into a todo task there.
       </p>
 
       <form className="create-form" onSubmit={submit}>
@@ -97,24 +97,15 @@ export function InboxView() {
               <div className="muted storyboard-meta">
                 {item.author && <span>from {item.author} · </span>}
                 <span>sent {item.created_at}</span>
-                {item.project_id !== null && (
-                  <span>
-                    {' '}
-                    ·{' '}
-                    <a href={`#/projects/${item.project_id}`}>
-                      → {projectName(item.project_id)}
-                    </a>
-                  </span>
-                )}
               </div>
               <div className="inbox-actions">
                 <label>
-                  Project{' '}
+                  Assign to{' '}
                   <select
-                    value={item.project_id ?? ''}
+                    value=""
                     onChange={(e) => assign(item.id, e.target.value)}
                   >
-                    <option value="">— unassigned —</option>
+                    <option value="">— pick a project —</option>
                     {projects?.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}

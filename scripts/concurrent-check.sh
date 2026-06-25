@@ -36,7 +36,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 P=$("$MESA" project create "Concurrency" --no-git | jq .id)
 TASKS=()
 for i in 1 2 3 4 5; do
-  TASKS+=("$("$MESA" task create --project "$P" "task $i" | jq .id)")
+  TASKS+=("$("$MESA" task create --project "$P" --title "task $i" | jq .id)")
 done
 
 # ---- start the server ----

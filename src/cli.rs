@@ -38,7 +38,7 @@ DATABASE
 
 EXAMPLES
   mesa project create \"Website redesign\" --description \"Q3 marketing site\"
-  mesa task create --project 1 \"Draft homepage copy\" --tags writing,web
+  mesa task create --project 1 --title \"Draft homepage copy\" --tags writing,web
   mesa task list --project 1 --status todo --unblocked
   mesa task block 3 --by 1        # task 3 is blocked by task 1
   mesa backup /tmp/mesa-snap.db
@@ -195,15 +195,15 @@ enum TaskCmd {
     /// (--parent) must be in the same project as its parent.
     #[command(after_help = "\
 EXAMPLES
-  mesa task create --project 1 \"Draft homepage copy\"
-  mesa task create --project 1 \"Review copy\" --priority high --tags writing,review
-  mesa task create --project 1 \"Outline\" --parent 7   # subtask of task 7")]
+  mesa task create --project 1 --title \"Draft homepage copy\"
+  mesa task create --project 1 --title \"Review copy\" --priority high --tags writing,review
+  mesa task create --project 1 --title \"Outline\" --parent 7   # subtask of task 7")]
     Create {
         /// Project the task belongs to (immutable after creation)
         #[arg(long)]
         project: i64,
         /// Task title
-        #[arg(allow_hyphen_values = true)]
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
         /// Optional free-text description
         #[arg(long, allow_hyphen_values = true)]
@@ -615,13 +615,14 @@ enum StoryboardCmd {
     /// with `storyboard frame create` and `storyboard edge create`.
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard create --project 1 \"Onboarding flow\"
-  mesa storyboard create --project 1 \"Checkout\" --author agent-7")]
+  mesa storyboard create --project 1 --title \"Onboarding flow\"
+  mesa storyboard create --project 1 --title \"Checkout\" --author agent-7")]
     Create {
         /// Project the storyboard belongs to (immutable after creation)
         #[arg(long)]
         project: i64,
         /// Storyboard title
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
         /// Optional free-text description
         #[arg(long)]
@@ -696,13 +697,14 @@ enum FrameCmd {
     /// project (a soft reference, cleared if that task is later deleted).
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard frame create --storyboard 1 \"Land on home\" --x 40 --y 40
-  mesa storyboard frame create --storyboard 1 \"Sign up\" --task 7 --color '#ff2bd6'")]
+  mesa storyboard frame create --storyboard 1 --title \"Land on home\" --x 40 --y 40
+  mesa storyboard frame create --storyboard 1 --title \"Sign up\" --task 7 --color '#ff2bd6'")]
     Create {
         /// Storyboard the frame belongs to (immutable after creation)
         #[arg(long)]
         storyboard: i64,
         /// Frame title
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
         /// Optional free-text body (markdown by convention)
         #[arg(long)]

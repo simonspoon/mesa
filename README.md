@@ -66,7 +66,7 @@ Every command prints JSON to stdout. Mutations and `show` print the full object;
 ```bash
 # Create a project and a task in it
 mesa project create "Website redesign" --description "Q3 marketing site"
-mesa task create --project 1 "Draft homepage copy" --tags writing,web
+mesa task create --project 1 --title "Draft homepage copy" --tags writing,web
 
 # Query: open, unblocked tasks in project 1
 mesa task list --project 1 --status todo --unblocked
@@ -157,9 +157,9 @@ UI served at `/`. The web UI does not live-sync; it refetches on window focus.
 
 ```bash
 # Create a board, add two frames, connect them — all stamped with an author
-SB=$(mesa storyboard create --project 1 "Onboarding flow" --author agent-7 | jq .id)
-A=$(mesa storyboard frame create --storyboard "$SB" "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
-B=$(mesa storyboard frame create --storyboard "$SB" "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
+SB=$(mesa storyboard create --project 1 --title "Onboarding flow" --author agent-7 | jq .id)
+A=$(mesa storyboard frame create --storyboard "$SB" --title "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
+B=$(mesa storyboard frame create --storyboard "$SB" --title "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
 mesa storyboard edge create --storyboard "$SB" --from "$A" --to "$B" --label "then" --author agent-7
 
 # Read the whole board in one call: {storyboard, frames, edges}

@@ -44,7 +44,7 @@ ok "project create returns full object, exit 0"
 run 0 "$MESA" project create "Other" --no-git
 P2=$(jqs .id)
 
-run 0 "$MESA" task create --project "$P" "Design layout" --priority high --tags design,web
+run 0 "$MESA" task create --project "$P" --title "Design layout" --priority high --tags design,web
 T1=$(jqs .id)
 [ "$(jqs .blocked)" = "false" ] || fail "task create: blocked must be present and false"
 [ "$(jqs .status)" = "todo" ] || fail "task create: default status"
@@ -52,19 +52,19 @@ T1=$(jqs .id)
 [ "$(jqs '.tags == ["design","web"]')" = "true" ] || fail "task create: tags"
 ok "task create returns full object with blocked present"
 
-run 0 "$MESA" task create --project "$P" "Write copy" --description "homepage"
+run 0 "$MESA" task create --project "$P" --title "Write copy" --description "homepage"
 T2=$(jqs .id)
-run 0 "$MESA" task create --project "$P" "Ship it"
+run 0 "$MESA" task create --project "$P" --title "Ship it"
 T3=$(jqs .id)
-run 0 "$MESA" task create --project "$P" "Ship subtask" --parent "$T3"
+run 0 "$MESA" task create --project "$P" --title "Ship subtask" --parent "$T3"
 T4=$(jqs .id)
 [ "$(jqs .parent_id)" = "$T3" ] || fail "task create: parent_id"
-run 0 "$MESA" task create --project "$P2" "Unrelated"
+run 0 "$MESA" task create --project "$P2" --title "Unrelated"
 T5=$(jqs .id)
 ok "task create: subtask and second project"
 
 # validation: unknown project
-run 1 "$MESA" task create --project 9999 "orphan"
+run 1 "$MESA" task create --project 9999 --title "orphan"
 [ "$(jqe .error.code)" = "validation" ] || fail "unknown project: error.code"
 jqe .error.message | grep -q 9999 || fail "unknown project: message names the id"
 ok "create with unknown project: exit 1, code=validation"
@@ -176,7 +176,7 @@ ok "--help: human text with untrusted-data warning, exit 0"
 # Use a dedicated project so existing cascade-count assertions below stay valid.
 run 0 "$MESA" project create "Trust trail" --no-git
 P3=$(jqs .id)
-run 0 "$MESA" task create --project "$P3" "Acceptance task" \
+run 0 "$MESA" task create --project "$P3" --title "Acceptance task" \
   --acceptance "tests pass" --artifact "abc123"
 TA=$(jqs .id)
 [ "$(jqs .acceptance)" = "tests pass" ] || fail "create --acceptance: not stored"

@@ -40,13 +40,13 @@ run 0 "$MESA" project create "Board project" --no-git
 P=$(jqs .id)
 run 0 "$MESA" project create "Other project" --no-git
 P2=$(jqs .id)
-run 0 "$MESA" task create --project "$P" "Linked task"
+run 0 "$MESA" task create --project "$P" --title "Linked task"
 TASK=$(jqs .id)
-run 0 "$MESA" task create --project "$P2" "Foreign task"
+run 0 "$MESA" task create --project "$P2" --title "Foreign task"
 FTASK=$(jqs .id)
 
 # ---- storyboard create ----
-run 0 "$MESA" storyboard create --project "$P" "Onboarding" \
+run 0 "$MESA" storyboard create --project "$P" --title "Onboarding" \
   --description "the happy path" --author agent-1
 [ "$(jqs .title)" = "Onboarding" ] || fail "storyboard create: title"
 [ "$(jqs .description)" = "the happy path" ] || fail "storyboard create: description"
@@ -57,12 +57,12 @@ SB=$(jqs .id)
 ok "storyboard create: full object with author + timestamps"
 
 # unknown project is a validation error
-run 1 "$MESA" storyboard create --project 9999 "orphan"
+run 1 "$MESA" storyboard create --project 9999 --title "orphan"
 [ "$(jqe .error.code)" = "validation" ] || fail "unknown project: error.code"
 ok "storyboard create unknown project: exit 1, code=validation"
 
 # ---- storyboard list (bare array, no frames/edges) ----
-run 0 "$MESA" storyboard create --project "$P" "Second board"
+run 0 "$MESA" storyboard create --project "$P" --title "Second board"
 SB2=$(jqs .id)
 run 0 "$MESA" storyboard list --project "$P"
 [ "$(jqs type)" = "array" ] || fail "list: bare array"
@@ -71,7 +71,7 @@ run 0 "$MESA" storyboard list --project "$P"
 ok "storyboard list --project: bare array, frames omitted"
 
 # ---- frames ----
-run 0 "$MESA" storyboard frame create --storyboard "$SB" "Land on home" --author user
+run 0 "$MESA" storyboard frame create --storyboard "$SB" --title "Land on home" --author user
 F1=$(jqs .id)
 [ "$(jqs '.x == 40')" = "true" ] || fail "frame create: default x"
 [ "$(jqs '.y == 40')" = "true" ] || fail "frame create: default y"
@@ -80,7 +80,7 @@ F1=$(jqs .id)
 [ "$(jqs .storyboard_id)" = "$SB" ] || fail "frame create: storyboard_id"
 ok "frame create: full object with default geometry"
 
-run 0 "$MESA" storyboard frame create --storyboard "$SB" "Sign up" \
+run 0 "$MESA" storyboard frame create --storyboard "$SB" --title "Sign up" \
   --x 360 --y 60 --color '#ff2bd6' --task "$TASK"
 F2=$(jqs .id)
 [ "$(jqs '.x == 360')" = "true" ] || fail "frame create: explicit x"
@@ -89,12 +89,12 @@ F2=$(jqs .id)
 ok "frame create: explicit geometry, colour, same-project task link"
 
 # cross-project task link rejected
-run 1 "$MESA" storyboard frame create --storyboard "$SB" "Bad" --task "$FTASK"
+run 1 "$MESA" storyboard frame create --storyboard "$SB" --title "Bad" --task "$FTASK"
 [ "$(jqe .error.code)" = "validation" ] || fail "cross-project task: error.code"
 ok "frame create cross-project task: exit 1, code=validation"
 
 # unknown storyboard rejected (validation, like a task's unknown project)
-run 1 "$MESA" storyboard frame create --storyboard 9999 "Bad"
+run 1 "$MESA" storyboard frame create --storyboard 9999 --title "Bad"
 [ "$(jqe .error.code)" = "validation" ] || fail "unknown storyboard: error.code"
 ok "frame create unknown storyboard: exit 1, code=validation"
 
@@ -134,7 +134,7 @@ run 1 "$MESA" storyboard edge create --storyboard "$SB" --from "$F1" --to "$F1"
 ok "edge create self-edge: exit 1, code=validation"
 
 # endpoint not on this board rejected
-run 0 "$MESA" storyboard frame create --storyboard "$SB2" "Foreign frame"
+run 0 "$MESA" storyboard frame create --storyboard "$SB2" --title "Foreign frame"
 FF=$(jqs .id)
 run 1 "$MESA" storyboard edge create --storyboard "$SB" --from "$F1" --to "$FF"
 [ "$(jqe .error.code)" = "validation" ] || fail "foreign frame edge: error.code"
@@ -207,7 +207,7 @@ run 0 "$MESA" storyboard show "$SB"
 ok "frame delete cascaded its edges"
 
 # ---- delete edge echo ----
-run 0 "$MESA" storyboard frame create --storyboard "$SB2" "Frame B"
+run 0 "$MESA" storyboard frame create --storyboard "$SB2" --title "Frame B"
 FB=$(jqs .id)
 run 0 "$MESA" storyboard edge create --storyboard "$SB2" --from "$FF" --to "$FB"
 E3=$(jqs .id)

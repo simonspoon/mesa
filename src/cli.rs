@@ -197,6 +197,7 @@ enum TaskCmd {
 EXAMPLES
   mesa task create --project 1 --title \"Draft homepage copy\"
   mesa task create --project 1 --title \"Review copy\" --priority high --tags writing,review
+  mesa task create --project 1 --title \"In flight\" --status in_progress  # straight into a column
   mesa task create --project 1 --title \"Outline\" --parent 7   # subtask of task 7")]
     Create {
         /// Project the task belongs to (immutable after creation)
@@ -214,6 +215,9 @@ EXAMPLES
         /// Priority: low|medium|high
         #[arg(long, value_parser = parse_priority, default_value = "medium")]
         priority: Priority,
+        /// Initial status: todo|in_progress|done|cancelled (default todo)
+        #[arg(long, value_parser = parse_status, default_value = "todo")]
+        status: Status,
         /// Comma-separated tags, e.g. --tags writing,web
         #[arg(long)]
         tags: Option<String>,
@@ -1053,6 +1057,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             description,
             description_file,
             priority,
+            status,
             tags,
             parent,
             acceptance,
@@ -1072,6 +1077,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 parent,
                 acceptance.as_deref(),
                 artifact.as_deref(),
+                Some(status),
             )?);
         }
         TaskCmd::List {

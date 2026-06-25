@@ -678,6 +678,7 @@ impl Store {
         parent_id: Option<i64>,
         acceptance: Option<&str>,
         artifact: Option<&str>,
+        status: Option<Status>,
     ) -> Result<Task> {
         let project_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
@@ -695,8 +696,8 @@ impl Store {
         tx.execute(
             "INSERT INTO tasks \
              (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
-              created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
+              status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
             (
                 project_id,
                 parent_id,
@@ -706,6 +707,7 @@ impl Store {
                 tags_json,
                 acceptance,
                 artifact,
+                status.unwrap_or(Status::Todo).as_str(),
             ),
         )?;
         let id = tx.last_insert_rowid();
@@ -1964,7 +1966,7 @@ mod tests {
 
     fn add_task(store: &mut Store, project_id: i64, title: &str) -> Task {
         store
-            .create_task(project_id, title, None, Priority::Medium, &[], None, None, None)
+            .create_task(project_id, title, None, Priority::Medium, &[], None, None, None, None)
             .unwrap()
     }
 
@@ -2105,6 +2107,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(t.title, "write tests");
@@ -2150,10 +2153,42 @@ mod tests {
     fn create_task_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let err = store
-            .create_task(999, "orphan", None, Priority::Medium, &[], None, None, None)
+            .create_task(999, "orphan", None, Priority::Medium, &[], None, None, None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn create_with_status_lands_in_that_column_and_logs_creation_event() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None).unwrap();
+        let t = store
+            .create_task(
+                p.id,
+                "in flight",
+                None,
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                Some(Status::InProgress),
+            )
+            .unwrap();
+        assert_eq!(t.status, Status::InProgress);
+
+        // The creation event records the requested status (NULL from_status).
+        let events = store.list_events(Some(t.id)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].from_status, None);
+        assert_eq!(events[0].to_status, Status::InProgress);
+
+        // None preserves the schema default (todo).
+        let d = store
+            .create_task(p.id, "later", None, Priority::Medium, &[], None, None, None, None)
+            .unwrap();
+        assert_eq!(d.status, Status::Todo);
     }
 
     #[test]
@@ -2166,7 +2201,7 @@ mod tests {
 
         // create: cross-project parent rejected
         let err = store
-            .create_task(p2.id, "sub", None, Priority::Medium, &[], Some(t1.id), None, None)
+            .create_task(p2.id, "sub", None, Priority::Medium, &[], Some(t1.id), None, None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
@@ -2184,7 +2219,7 @@ mod tests {
 
         // same-project parent accepted, and can be detached again
         let sub = store
-            .create_task(p1.id, "sub", None, Priority::Medium, &[], Some(t1.id), None, None)
+            .create_task(p1.id, "sub", None, Priority::Medium, &[], Some(t1.id), None, None, None)
             .unwrap();
         assert_eq!(sub.parent_id, Some(t1.id));
         let detached = store
@@ -2205,10 +2240,10 @@ mod tests {
         let p = store.create_project("p", None, None).unwrap();
         let root = add_task(&mut store, p.id, "root");
         let child = store
-            .create_task(p.id, "child", None, Priority::Medium, &[], Some(root.id), None, None)
+            .create_task(p.id, "child", None, Priority::Medium, &[], Some(root.id), None, None, None)
             .unwrap();
         let grandchild = store
-            .create_task(p.id, "grandchild", None, Priority::Medium, &[], Some(child.id), None, None)
+            .create_task(p.id, "grandchild", None, Priority::Medium, &[], Some(child.id), None, None, None)
             .unwrap();
         let bystander = add_task(&mut store, p.id, "bystander");
         // bystander is blocked by child; the edge must go when child goes
@@ -2237,7 +2272,7 @@ mod tests {
         let keep = store.create_project("keeper", None, None).unwrap();
         let t1 = add_task(&mut store, p.id, "one");
         let t2 = store
-            .create_task(p.id, "two", None, Priority::Medium, &[], Some(t1.id), None, None)
+            .create_task(p.id, "two", None, Priority::Medium, &[], Some(t1.id), None, None, None)
             .unwrap();
         let survivor = add_task(&mut store, keep.id, "survivor");
 
@@ -2496,7 +2531,7 @@ mod tests {
         priority: Priority,
     ) -> Task {
         store
-            .create_task(project_id, title, None, priority, &[], None, None, None)
+            .create_task(project_id, title, None, priority, &[], None, None, None, None)
             .unwrap()
     }
 

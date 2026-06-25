@@ -347,6 +347,8 @@ struct TaskCreate {
     #[serde(default)]
     priority: Option<Priority>,
     #[serde(default)]
+    status: Option<Status>,
+    #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
     parent_id: Option<i64>,
@@ -418,6 +420,7 @@ async fn create_task(
         body.parent_id,
         None,
         None,
+        body.status,
     )?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
 }

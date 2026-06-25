@@ -519,6 +519,30 @@ pub struct CcDashboard {
     pub sessions: Vec<CcSessionRow>,
 }
 
+/// One subagent (sidechain) currently running under a live session — surfaced as
+/// a concise line under the session's card. Keyed by the transcript `agentId`;
+/// `agent`/`skill` come from its `attributionAgent`/`attributionSkill`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcLiveSubagent {
+    pub agent_id: String,
+    /// Agent type, e.g. "general-purpose" / "Explore" (from `attributionAgent`).
+    pub agent: Option<String>,
+    /// Skill driving it, when attributed (from `attributionSkill`).
+    pub skill: Option<String>,
+    pub models: Vec<String>,
+    /// This subagent's newest in-window event timestamp (ISO-8601 UTC).
+    pub last_activity: String,
+    /// Seconds since this subagent's last event (`now - last_event`).
+    #[ts(type = "number")]
+    pub idle_seconds: i64,
+    /// Assistant turns this subagent produced inside the window.
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+}
+
 /// One currently-running Claude Code session — a session whose newest transcript
 /// event lands inside the live window. The `spark` is a per-minute token series
 /// (oldest→newest, one entry per bucket of [`CcLive::bucket_seconds`]) so the UI
@@ -549,6 +573,10 @@ pub struct CcLiveSession {
     pub est_cost_usd: f64,
     /// True if any in-window event came from a subagent (`isSidechain`).
     pub used_subagent: bool,
+    /// Subagents currently running under this session (active within
+    /// [`CcLive::active_seconds`]), most-recently-active first. Rendered as
+    /// concise lines under the session card.
+    pub subagents: Vec<CcLiveSubagent>,
     /// Per-minute total-token buckets over the window, oldest→newest.
     #[ts(type = "Array<number>")]
     pub spark: Vec<i64>,

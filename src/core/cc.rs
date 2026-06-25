@@ -25,8 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use super::types::{
-    CcAgentStat, CcDashboard, CcDayPoint, CcLive, CcLiveSession, CcModelStat, CcOverview,
-    CcProjectStat, CcSessionRow, CcSkillStat, CcTokens,
+    CcAgentStat, CcDashboard, CcDayPoint, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat,
+    CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -46,6 +46,9 @@ struct RawLine {
     entrypoint: Option<String>,
     #[serde(default)]
     is_sidechain: Option<bool>,
+    /// Stable id of a subagent run; present only on subagent (sidechain) lines.
+    #[serde(default)]
+    agent_id: Option<String>,
     #[serde(default)]
     attribution_skill: Option<String>,
     #[serde(default)]
@@ -266,8 +269,22 @@ struct LiveAcc {
     cwd: Option<String>,
     git_branch: Option<String>,
     sidechain: bool,
+    /// Subagents seen under this session, keyed by `agentId`.
+    subagents: HashMap<String, SubAcc>,
     /// One total-token bucket per window minute (oldest→newest).
     spark: Vec<i64>,
+}
+
+/// Per-subagent accumulator within a live session (keyed by `agentId`).
+#[derive(Default)]
+struct SubAcc {
+    agent: Option<String>,
+    skill: Option<String>,
+    models: BTreeSet<String>,
+    last_ts: i64,
+    last_str: String,
+    messages: i64,
+    tokens: Tok,
 }
 
 /// Build the live-sessions view over the last `window_minutes` (clamped to
@@ -306,6 +323,31 @@ pub fn live(window_minutes: i64) -> CcLive {
             let total = s.tokens.total();
             total_tokens += total;
             total_cost += s.cost;
+            // Only subagents active within the live gap are "currently running".
+            let mut subagents: Vec<CcLiveSubagent> = s
+                .subagents
+                .into_iter()
+                .filter_map(|(agent_id, sub)| {
+                    let idle = (now - sub.last_ts).max(0);
+                    (idle <= ACTIVE_SECS).then(|| CcLiveSubagent {
+                        agent_id,
+                        agent: sub.agent,
+                        skill: sub.skill,
+                        models: sub.models.into_iter().collect(),
+                        last_activity: sub.last_str,
+                        idle_seconds: idle,
+                        messages: sub.messages,
+                        total_tokens: sub.tokens.total(),
+                    })
+                })
+                .collect();
+            // Tiebreak on agent_id so ties don't flicker between polls (HashMap
+            // iteration order is otherwise non-deterministic).
+            subagents.sort_by(|a, b| {
+                a.idle_seconds
+                    .cmp(&b.idle_seconds)
+                    .then_with(|| a.agent_id.cmp(&b.agent_id))
+            });
             CcLiveSession {
                 session_id,
                 project: s.cwd.as_deref().map(short_project),
@@ -321,6 +363,7 @@ pub fn live(window_minutes: i64) -> CcLive {
                 tokens: s.tokens.to_cc(),
                 est_cost_usd: round4(s.cost),
                 used_subagent: s.sidechain,
+                subagents,
                 spark: s.spark,
             }
         })
@@ -396,6 +439,23 @@ fn parse_live_file(
         if raw.is_sidechain == Some(true) {
             s.sidechain = true;
         }
+        // Subagent lines carry an `agentId`; track each subagent's recency and
+        // attribution so the UI can list the ones currently running. Recency is
+        // updated for every line (including the user/attachment lines that have
+        // no usage), so a just-spawned subagent shows as running immediately.
+        if let Some(aid) = raw.agent_id.as_ref() {
+            let sub = s.subagents.entry(aid.clone()).or_default();
+            if ts >= sub.last_ts {
+                sub.last_ts = ts;
+                sub.last_str = ts_str.clone();
+            }
+            if sub.agent.is_none() {
+                sub.agent = raw.attribution_agent.clone();
+            }
+            if sub.skill.is_none() {
+                sub.skill = raw.attribution_skill.clone();
+            }
+        }
 
         let Some(usage) = raw.message.as_ref().and_then(|m| m.usage.as_ref()) else {
             continue;
@@ -407,6 +467,15 @@ fn parse_live_file(
         s.messages += 1;
         s.tokens.add(usage);
         s.cost += estimate_cost(&model, usage);
+        // The entry was already created above for any line carrying an `agentId`,
+        // so reuse it by mutable handle (no second insert, no clone).
+        if let Some(aid) = raw.agent_id.as_ref()
+            && let Some(sub) = s.subagents.get_mut(aid)
+        {
+            sub.models.insert(model);
+            sub.messages += 1;
+            sub.tokens.add(usage);
+        }
         let idx = (ts.div_euclid(60) - first_min).clamp(0, n_buckets as i64 - 1) as usize;
         s.spark[idx] += usage.input_tokens
             + usage.output_tokens
@@ -954,6 +1023,51 @@ mod tests {
         assert_eq!(s.spark.len(), 15);
         assert_eq!(s.spark.iter().sum::<i64>(), 150);
         assert_eq!(s.spark[13] + s.spark[14], 150);
+    }
+
+    #[test]
+    fn live_lists_running_subagents() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-live-project");
+        let subs = proj.join("sess").join("subagents");
+        fs::create_dir_all(&subs).unwrap();
+        // Parent session: one recent assistant turn.
+        let parent = format!(
+            r#"{{"type":"assistant","sessionId":"sess","timestamp":"{}","cwd":"/home/me/work/widget","message":{{"model":"claude-opus-4-8","usage":{{"input_tokens":100,"output_tokens":50}}}}}}"#,
+            iso_at(20)
+        );
+        write_jsonl(&proj, "sess.jsonl", &[parent.as_str()]);
+        // A subagent under the same session: recent (running) + attributed.
+        let running = format!(
+            r#"{{"type":"assistant","isSidechain":true,"sessionId":"sess","agentId":"agent-aaa","attributionAgent":"Explore","attributionSkill":"code-review","timestamp":"{}","message":{{"model":"claude-haiku-4-5","usage":{{"input_tokens":10,"output_tokens":20}}}}}}"#,
+            iso_at(15)
+        );
+        // A second subagent that finished long ago — must NOT be listed.
+        let stale = format!(
+            r#"{{"type":"assistant","isSidechain":true,"sessionId":"sess","agentId":"agent-bbb","attributionAgent":"Plan","timestamp":"{}","message":{{"model":"claude-haiku-4-5","usage":{{"input_tokens":5,"output_tokens":5}}}}}}"#,
+            iso_at(10 * 60)
+        );
+        write_jsonl(&subs, "agent-aaa.jsonl", &[running.as_str()]);
+        write_jsonl(&subs, "agent-bbb.jsonl", &[stale.as_str()]);
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
+        }
+        let l = live(15);
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        let s = l.sessions.iter().find(|s| s.session_id == "sess").unwrap();
+        assert!(s.used_subagent);
+        // Only the running subagent is surfaced; the stale one is filtered out.
+        assert_eq!(s.subagents.len(), 1);
+        let sub = &s.subagents[0];
+        assert_eq!(sub.agent_id, "agent-aaa");
+        assert_eq!(sub.agent.as_deref(), Some("Explore"));
+        assert_eq!(sub.skill.as_deref(), Some("code-review"));
+        assert_eq!(sub.total_tokens, 30);
+        assert_eq!(sub.messages, 1);
+        assert!(sub.idle_seconds <= ACTIVE_SECS);
     }
 
     #[test]

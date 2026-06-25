@@ -1378,6 +1378,56 @@ main {
   font-family: var(--font-display);
 }
 
+/* Subagents currently running under a live session — concise attached lines. */
+.cc-live-subs {
+  margin-top: 0.5rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.cc-live-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+  padding-left: 0.4rem;
+}
+
+.cc-live-sub .live-dot {
+  flex: none;
+}
+
+.cc-live-sub-name {
+  color: var(--text);
+  font-family: var(--font-display);
+  white-space: nowrap;
+}
+
+.cc-live-sub-skill {
+  color: var(--cyan);
+  white-space: nowrap;
+}
+
+.cc-live-sub-models {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 7rem;
+}
+
+.cc-live-sub-tok {
+  white-space: nowrap;
+}
+
+.cc-live-sub-ago {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 /* Charts */
 .bars {
   width: 100%;

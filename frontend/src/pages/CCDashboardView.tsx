@@ -411,6 +411,22 @@ function LiveCard({ s }: { s: CcLiveSession }) {
           <em>{fmtUsd(s.est_cost_usd)}</em>
         </span>
       </div>
+      {s.subagents.length > 0 && (
+        <div className="cc-live-subs">
+          {s.subagents.map((sa) => (
+            <div className="cc-live-sub" key={sa.agent_id}>
+              <span className="live-dot on" title="running" />
+              <span className="cc-live-sub-name">{sa.agent ?? 'subagent'}</span>
+              {sa.skill && <span className="cc-live-sub-skill">/{sa.skill}</span>}
+              {sa.models.length > 0 && (
+                <span className="cc-live-sub-models">{sa.models.map(shortModel).join(', ')}</span>
+              )}
+              <span className="cc-live-sub-tok">{fmtTok(sa.total_tokens)} tok</span>
+              <span className="cc-live-sub-ago">{fmtAgo(sa.idle_seconds)}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

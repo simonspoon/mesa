@@ -16,6 +16,7 @@
 //!   at `/`, with SPA fallback to `index.html` (spec Requirement 9).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::JsonRejection;
@@ -53,8 +54,17 @@ struct AppState {
     cc_cache: Arc<Mutex<HashMap<String, (i64, CcDashboard)>>>,
     /// Live subscription-usage cache: `(fetched_unix, data)`. The UI polls this,
     /// but each fetch hits Anthropic's usage endpoint, so a short TTL throttles
-    /// outbound calls. Read-only live data — not the mesa store.
+    /// outbound calls. Read-only live data — not the mesa store. Concurrent
+    /// reads never multiply outbound calls: stale-but-present cache is served
+    /// immediately while a single background refresh runs (see `get_cc_usage`).
     usage_cache: Arc<Mutex<Option<(i64, CcUsage)>>>,
+    /// Single-flight guard for the upstream usage fetch: serializes the
+    /// blocking `curl` so concurrent cold/refresh requests collapse to one
+    /// outbound call instead of a thundering herd (the 429 source).
+    usage_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True while a background (serve-stale) refresh is in flight, so repeated
+    /// polls spawn at most one refresh task.
+    usage_refreshing: Arc<AtomicBool>,
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -68,6 +78,8 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         lan,
         cc_cache: Arc::new(Mutex::new(HashMap::new())),
         usage_cache: Arc::new(Mutex::new(None)),
+        usage_lock: Arc::new(tokio::sync::Mutex::new(())),
+        usage_refreshing: Arc::new(AtomicBool::new(false)),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -976,13 +988,54 @@ const USAGE_TTL_SECS: i64 = 60;
 /// `502 {"error": {"code": "unavailable", ...}}`.
 async fn get_cc_usage(State(state): State<AppState>) -> ApiResult<Response> {
     let now = unix_secs();
-    {
-        let cache = state.usage_cache.lock().unwrap();
-        if let Some((at, usage)) = cache.as_ref()
-            && now - *at < USAGE_TTL_SECS
-        {
-            return Ok(Json(usage.clone()).into_response());
+    let cached = state.usage_cache.lock().unwrap().clone();
+    match cached {
+        // Fresh: serve straight from cache.
+        Some((at, usage)) if now - at < USAGE_TTL_SECS => Ok(Json(usage).into_response()),
+        // Stale-but-present: serve stale immediately and refresh behind it, so
+        // the client never waits and N concurrent polls cause at most one
+        // outbound call (the `swap` admits a single background refresh).
+        Some((_, stale)) => {
+            if !state.usage_refreshing.swap(true, Ordering::SeqCst) {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    // Reset the flag on the way out — including via panic
+                    // unwind (e.g. a poisoned cache mutex), so a single failed
+                    // refresh can't disable all future ones.
+                    let _reset = ResetOnDrop(&state.usage_refreshing);
+                    let _ = refresh_usage(&state).await;
+                });
+            }
+            Ok(Json(stale).into_response())
         }
+        // Cold (no cache yet): fetch synchronously, single-flighted so a burst
+        // of first-time requests still makes one upstream call.
+        None => Ok(Json(refresh_usage(&state).await?).into_response()),
+    }
+}
+
+/// Clears the `usage_refreshing` flag when dropped, so the background-refresh
+/// slot is freed even if the refresh task panics mid-flight.
+struct ResetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Fetches live usage from Anthropic and updates the cache, serializing the
+/// blocking `curl` behind `usage_lock` so concurrent callers collapse to one
+/// outbound call. Waiters re-check the cache after acquiring the lock and
+/// return the just-fetched value without hitting the network again.
+async fn refresh_usage(state: &AppState) -> Result<CcUsage, ApiError> {
+    let _guard = state.usage_lock.lock().await;
+    // A peer may have refreshed while we waited for the lock.
+    let now = unix_secs();
+    if let Some((at, usage)) = state.usage_cache.lock().unwrap().as_ref()
+        && now - *at < USAGE_TTL_SECS
+    {
+        return Ok(usage.clone());
     }
     // The fetch shells out to `curl` (blocking, up to 10s); keep it off the async
     // worker thread.
@@ -998,11 +1051,8 @@ async fn get_cc_usage(State(state): State<AppState>) -> ApiResult<Response> {
             code: "unavailable",
             message,
         })?;
-    {
-        let mut cache = state.usage_cache.lock().unwrap();
-        *cache = Some((now, usage.clone()));
-    }
-    Ok(Json(usage).into_response())
+    *state.usage_cache.lock().unwrap() = Some((unix_secs(), usage.clone()));
+    Ok(usage)
 }
 
 fn unix_secs() -> i64 {

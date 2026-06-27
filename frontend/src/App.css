@@ -173,6 +173,12 @@ header {
   text-shadow: 0 0 8px var(--cyan);
 }
 
+/* CC Dashboard sub-pages: indent the fixed sub-links beneath the main entry so
+   the nesting reads as belonging to the dashboard. */
+.nav-subnav a {
+  padding-left: 1.25rem;
+}
+
 .nav-create {
   display: flex;
   gap: 0.5rem;

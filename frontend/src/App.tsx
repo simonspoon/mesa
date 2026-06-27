@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import './App.css'
 import { getTask } from './api'
 import { Sidebar } from './components/Sidebar'
-import { CCDashboardView } from './pages/CCDashboardView'
+import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { useFetch } from './useFetch'
@@ -44,8 +44,11 @@ function App() {
 
   const inboxMatch = /^\/inbox$/.exec(path)
   // CC Dashboard is the default landing view: the root path (#/ or empty) shows
-  // it, and the brand link points back here.
-  const ccMatch = /^\/(cc)?$/.exec(path)
+  // the overview, and the brand link points back here. The three sub-pages
+  // (#/cc/skills-agents, #/cc/projects, #/cc/sessions) carry the table views;
+  // capture group 1 is the active sub-page, undefined for the overview.
+  const ccMatch = /^\/(?:cc(?:\/(skills-agents|projects|sessions))?)?$/.exec(path)
+  const ccTab = ccMatch ? ((ccMatch[1] ?? 'overview') as CcTab) : null
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)
@@ -70,8 +73,9 @@ function App() {
     // frame) and carries no active project in the nav.
     page = <InboxView />
   } else if (ccMatch) {
-    // CC Dashboard: global telemetry view, also above projects.
-    page = <CCDashboardView />
+    // CC Dashboard: global telemetry view, also above projects. `ccTab` is
+    // non-null whenever ccMatch is.
+    page = <CCDashboardView tab={ccTab!} />
   } else if (storyboardMatch) {
     // Single board: in-place storyboard view inside the project page frame.
     page = (
@@ -153,7 +157,7 @@ function App() {
         <Sidebar
           activeProjectId={activeProjectId}
           inboxActive={inboxMatch !== null}
-          ccActive={ccMatch !== null}
+          ccTab={ccTab}
           version={navVersion}
         />
         <main>{page}</main>

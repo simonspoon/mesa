@@ -143,7 +143,12 @@ function Kpi({ label, value, sub }: { label: string; value: string; sub?: string
   )
 }
 
-export function CCDashboardView() {
+// The dashboard is split into an overview (charts + KPIs, plus the live and
+// subscription cards) and three table sub-pages. All share one windowed fetch;
+// the route picks which body renders. The window selector stays on every page.
+export type CcTab = 'overview' | 'skills-agents' | 'projects' | 'sessions'
+
+export function CCDashboardView({ tab }: { tab: CcTab }) {
   const [window, setWindow] = useState('30d')
   const { data, error } = useFetch(() => getCcDashboard(window), `cc-${window}`, {
     pollMs: 20000,
@@ -166,20 +171,27 @@ export function CCDashboardView() {
           ))}
         </div>
       </div>
-      <p className="muted">
-        Telemetry from Claude Code session transcripts. Costs are estimates from a
-        static price table.
-      </p>
+      {tab === 'overview' && (
+        <p className="muted">
+          Telemetry from Claude Code session transcripts. Costs are estimates
+          from a static price table.
+        </p>
+      )}
 
       {error && <p className="error">{error}</p>}
 
-      <div className="cc-top">
-        <LiveSessions />
-        <SubscriptionCard />
-      </div>
+      {tab === 'overview' && (
+        <div className="cc-top">
+          <LiveSessions />
+          <SubscriptionCard />
+        </div>
+      )}
 
       {!data && !error && <p className="muted">Loading…</p>}
-      {data && <Dashboard data={data} />}
+      {data && tab === 'overview' && <Overview data={data} />}
+      {data && tab === 'skills-agents' && <SkillsAgents data={data} />}
+      {data && tab === 'projects' && <ProjectsPanel data={data} />}
+      {data && tab === 'sessions' && <SessionsPanel data={data} />}
     </div>
   )
 }
@@ -431,7 +443,8 @@ function LiveCard({ s }: { s: CcLiveSession }) {
   )
 }
 
-function Dashboard({ data }: { data: CcDashboard }) {
+// Overview (#/cc): the model donut, daily-usage chart, and headline KPI cards.
+function Overview({ data }: { data: CcDashboard }) {
   const o = data.overview
 
   // Model split donut (top models by tokens; rest folded into "other").
@@ -479,90 +492,106 @@ function Dashboard({ data }: { data: CcDashboard }) {
         <Kpi label="Cache hit" value={fmtPct(o.cache_hit_ratio)} sub={`${fmtTok(o.tokens.cache_read)} cached`} />
         <Kpi label="Avg session" value={fmtMin(o.avg_session_minutes)} sub={`median ${fmtMin(o.median_session_minutes)}`} />
       </div>
+    </>
+  )
+}
 
-      <div className="cc-pair">
-        <section className="cc-panel">
-          <h2>Skills</h2>
-          <p className="muted cc-hint">
-            Where token spend goes by skill — the lever for optimization. Click a
-            column to sort.
-          </p>
-          <DataTable
-            rows={data.skills}
-            rowKey={(s) => s.skill}
-            initialKey="tokens"
-            empty="No skill-attributed usage in this window."
-            cols={[
-              { key: 'skill', label: 'Skill', render: (s) => s.skill, sort: (s) => s.skill },
-              { key: 'sessions', label: 'Sessions', numeric: true, render: (s) => fmtInt(s.sessions), sort: (s) => s.sessions },
-              { key: 'messages', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
-              { key: 'tokens', label: 'Tokens', numeric: true, render: (s) => fmtTok(s.total_tokens), sort: (s) => s.total_tokens },
-              { key: 'avg', label: 'Avg/msg', numeric: true, render: (s) => fmtTok(Math.round(s.total_tokens / Math.max(1, s.messages))), sort: (s) => s.total_tokens / Math.max(1, s.messages) },
-              { key: 'cost', label: 'Est. cost', numeric: true, render: (s) => fmtUsd(s.est_cost_usd), sort: (s) => s.est_cost_usd },
-            ]}
-          />
-        </section>
-
-        <section className="cc-panel">
-          <h2>Agents</h2>
-          <p className="muted cc-hint">Usage by subagent (attributionAgent).</p>
-          <DataTable
-            rows={data.agents}
-            rowKey={(a) => a.agent}
-            initialKey="tokens"
-            empty="No agent-attributed usage in this window."
-            cols={[
-              { key: 'agent', label: 'Agent', render: (a) => a.agent, sort: (a) => a.agent },
-              { key: 'sessions', label: 'Sessions', numeric: true, render: (a) => fmtInt(a.sessions), sort: (a) => a.sessions },
-              { key: 'messages', label: 'Msgs', numeric: true, render: (a) => fmtInt(a.messages), sort: (a) => a.messages },
-              { key: 'tokens', label: 'Tokens', numeric: true, render: (a) => fmtTok(a.total_tokens), sort: (a) => a.total_tokens },
-              { key: 'cost', label: 'Est. cost', numeric: true, render: (a) => fmtUsd(a.est_cost_usd), sort: (a) => a.est_cost_usd },
-            ]}
-          />
-        </section>
-      </div>
-
+// Skills/Agents (#/cc/skills-agents): the two attribution tables side by side.
+function SkillsAgents({ data }: { data: CcDashboard }) {
+  return (
+    <div className="cc-pair">
       <section className="cc-panel">
-        <h2>Projects</h2>
-        <DataTable
-          rows={data.projects}
-          rowKey={(p) => p.path}
-          initialKey="tokens"
-          empty="No project activity in this window."
-          cols={[
-            { key: 'project', label: 'Project', render: (p) => <span title={p.path}>{p.project}</span>, sort: (p) => p.project },
-            { key: 'sessions', label: 'Sessions', numeric: true, render: (p) => fmtInt(p.sessions), sort: (p) => p.sessions },
-            { key: 'messages', label: 'Msgs', numeric: true, render: (p) => fmtInt(p.messages), sort: (p) => p.messages },
-            { key: 'tokens', label: 'Tokens', numeric: true, render: (p) => fmtTok(p.total_tokens), sort: (p) => p.total_tokens },
-            { key: 'cost', label: 'Est. cost', numeric: true, render: (p) => fmtUsd(p.est_cost_usd), sort: (p) => p.est_cost_usd },
-          ]}
-        />
-      </section>
-
-      <section className="cc-panel">
-        <h2>Sessions</h2>
+        <h2>Skills</h2>
         <p className="muted cc-hint">
-          {data.sessions.length < o.sessions
-            ? `Showing ${data.sessions.length} of ${fmtInt(o.sessions)} (most recent).`
-            : `${data.sessions.length} sessions.`}
+          Where token spend goes by skill — the lever for optimization. Click a
+          column to sort.
         </p>
         <DataTable
-          rows={data.sessions}
-          rowKey={(s) => s.session_id}
-          initialKey="start"
-          empty="No sessions in this window."
+          rows={data.skills}
+          rowKey={(s) => s.skill}
+          initialKey="tokens"
+          empty="No skill-attributed usage in this window."
           cols={[
-            { key: 'start', label: 'Started', render: (s) => s.start.replace('T', ' ').slice(0, 16), sort: (s) => s.start },
-            { key: 'project', label: 'Project', render: (s) => s.project ?? '—', sort: (s) => s.project ?? '' },
-            { key: 'models', label: 'Model(s)', render: (s) => s.models.map((m) => m.replace('claude-', '')).join(', ') },
-            { key: 'dur', label: 'Duration', numeric: true, render: (s) => fmtMin(s.duration_minutes), sort: (s) => s.duration_minutes },
-            { key: 'msgs', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
+            { key: 'skill', label: 'Skill', render: (s) => s.skill, sort: (s) => s.skill },
+            { key: 'sessions', label: 'Sessions', numeric: true, render: (s) => fmtInt(s.sessions), sort: (s) => s.sessions },
+            { key: 'messages', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
             { key: 'tokens', label: 'Tokens', numeric: true, render: (s) => fmtTok(s.total_tokens), sort: (s) => s.total_tokens },
+            { key: 'avg', label: 'Avg/msg', numeric: true, render: (s) => fmtTok(Math.round(s.total_tokens / Math.max(1, s.messages))), sort: (s) => s.total_tokens / Math.max(1, s.messages) },
             { key: 'cost', label: 'Est. cost', numeric: true, render: (s) => fmtUsd(s.est_cost_usd), sort: (s) => s.est_cost_usd },
           ]}
         />
       </section>
-    </>
+
+      <section className="cc-panel">
+        <h2>Agents</h2>
+        <p className="muted cc-hint">Usage by subagent (attributionAgent).</p>
+        <DataTable
+          rows={data.agents}
+          rowKey={(a) => a.agent}
+          initialKey="tokens"
+          empty="No agent-attributed usage in this window."
+          cols={[
+            { key: 'agent', label: 'Agent', render: (a) => a.agent, sort: (a) => a.agent },
+            { key: 'sessions', label: 'Sessions', numeric: true, render: (a) => fmtInt(a.sessions), sort: (a) => a.sessions },
+            { key: 'messages', label: 'Msgs', numeric: true, render: (a) => fmtInt(a.messages), sort: (a) => a.messages },
+            { key: 'tokens', label: 'Tokens', numeric: true, render: (a) => fmtTok(a.total_tokens), sort: (a) => a.total_tokens },
+            { key: 'cost', label: 'Est. cost', numeric: true, render: (a) => fmtUsd(a.est_cost_usd), sort: (a) => a.est_cost_usd },
+          ]}
+        />
+      </section>
+    </div>
+  )
+}
+
+// Projects (#/cc/projects): token spend grouped by working directory.
+function ProjectsPanel({ data }: { data: CcDashboard }) {
+  return (
+    <section className="cc-panel">
+      <h2>Projects</h2>
+      <DataTable
+        rows={data.projects}
+        rowKey={(p) => p.path}
+        initialKey="tokens"
+        empty="No project activity in this window."
+        cols={[
+          { key: 'project', label: 'Project', render: (p) => <span title={p.path}>{p.project}</span>, sort: (p) => p.project },
+          { key: 'sessions', label: 'Sessions', numeric: true, render: (p) => fmtInt(p.sessions), sort: (p) => p.sessions },
+          { key: 'messages', label: 'Msgs', numeric: true, render: (p) => fmtInt(p.messages), sort: (p) => p.messages },
+          { key: 'tokens', label: 'Tokens', numeric: true, render: (p) => fmtTok(p.total_tokens), sort: (p) => p.total_tokens },
+          { key: 'cost', label: 'Est. cost', numeric: true, render: (p) => fmtUsd(p.est_cost_usd), sort: (p) => p.est_cost_usd },
+        ]}
+      />
+    </section>
+  )
+}
+
+// Sessions (#/cc/sessions): the capped most-recent session rows.
+function SessionsPanel({ data }: { data: CcDashboard }) {
+  const o = data.overview
+  return (
+    <section className="cc-panel">
+      <h2>Sessions</h2>
+      <p className="muted cc-hint">
+        {data.sessions.length < o.sessions
+          ? `Showing ${data.sessions.length} of ${fmtInt(o.sessions)} (most recent).`
+          : `${data.sessions.length} sessions.`}
+      </p>
+      <DataTable
+        rows={data.sessions}
+        rowKey={(s) => s.session_id}
+        initialKey="start"
+        empty="No sessions in this window."
+        cols={[
+          { key: 'start', label: 'Started', render: (s) => s.start.replace('T', ' ').slice(0, 16), sort: (s) => s.start },
+          { key: 'project', label: 'Project', render: (s) => s.project ?? '—', sort: (s) => s.project ?? '' },
+          { key: 'models', label: 'Model(s)', render: (s) => s.models.map((m) => m.replace('claude-', '')).join(', ') },
+          { key: 'dur', label: 'Duration', numeric: true, render: (s) => fmtMin(s.duration_minutes), sort: (s) => s.duration_minutes },
+          { key: 'msgs', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
+          { key: 'tokens', label: 'Tokens', numeric: true, render: (s) => fmtTok(s.total_tokens), sort: (s) => s.total_tokens },
+          { key: 'cost', label: 'Est. cost', numeric: true, render: (s) => fmtUsd(s.est_cost_usd), sort: (s) => s.est_cost_usd },
+        ]}
+      />
+    </section>
   )
 }
 

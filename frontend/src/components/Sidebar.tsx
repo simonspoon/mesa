@@ -1,24 +1,36 @@
 import { useState } from 'react'
 import { createProject, listInbox, listProjects } from '../api'
+import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
+
+// CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
+// overview (charts + KPIs); these are the table views split out beneath it.
+const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
+  { tab: 'skills-agents', label: 'Skills / Agents', hash: '#/cc/skills-agents' },
+  { tab: 'projects', label: 'Projects', hash: '#/cc/projects' },
+  { tab: 'sessions', label: 'Sessions', hash: '#/cc/sessions' },
+]
 
 /**
  * Persistent left nav: three top-level entries sharing one `.nav-item` style —
- * the CC Dashboard, the global Inbox, and Projects. Projects owns a subnav (the
- * project list + create form), so its row is a disclosure header that collapses
- * its subnav. `version` is bumped by pages after project rename/delete so the
- * list refetches (it is part of the useFetch key). The inbox count live-polls so
- * the badge of items needing triage stays current as agents send.
+ * the CC Dashboard, the global Inbox, and Projects. The CC Dashboard owns a
+ * fixed subnav of its sub-pages; Projects owns a subnav (the project list +
+ * create form), so its row is a disclosure header that collapses its subnav.
+ * `ccTab` is the active CC sub-page (or null when off the dashboard) and drives
+ * which CC link is highlighted. `version` is bumped by pages after project
+ * rename/delete so the list refetches (it is part of the useFetch key). The
+ * inbox count live-polls so the badge of items needing triage stays current as
+ * agents send.
  */
 export function Sidebar({
   activeProjectId,
   inboxActive,
-  ccActive,
+  ccTab,
   version,
 }: {
   activeProjectId: number | null
   inboxActive: boolean
-  ccActive: boolean
+  ccTab: CcTab | null
   version: number
 }) {
   const { data: projects, error, refetch } = useFetch(
@@ -81,9 +93,21 @@ export function Sidebar({
       >
         «
       </button>
-      <a className={`nav-item${ccActive ? ' active' : ''}`} href="#/cc">
+      <a
+        className={`nav-item${ccTab === 'overview' ? ' active' : ''}`}
+        href="#/cc"
+      >
         <span className="nav-item-label">CC Dashboard</span>
       </a>
+      <ul className="nav-projects nav-subnav">
+        {CC_SUBNAV.map((s) => (
+          <li key={s.tab}>
+            <a className={ccTab === s.tab ? 'active' : ''} href={s.hash}>
+              {s.label}
+            </a>
+          </li>
+        ))}
+      </ul>
       <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
         <span className="nav-item-label">Inbox</span>
         {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}

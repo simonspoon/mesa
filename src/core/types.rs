@@ -79,6 +79,67 @@ pub struct Project {
     /// same source resolves to one project. Set at create time or via update;
     /// unique across projects (a commit binds to exactly one project).
     pub root_commit: Option<String>,
+    /// Last-known working folder of this project on this machine (the repo
+    /// toplevel). Machine-local convenience, not identity (that is
+    /// `root_commit`): it anchors the Agents surface — which Claude Code
+    /// sessions belong here, and where new ones start. Auto-learned on
+    /// `project create` and refreshed by `project resolve`.
+    pub local_path: Option<String>,
+}
+
+/// One live Claude Code session as reported by `claude agents --json`.
+/// Parsed from that external CLI output and re-served to the web UI verbatim,
+/// so field names stay camelCase end to end (serde renames both directions).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSession {
+    /// OS process id; absent once the session's process has exited.
+    #[ts(type = "number | null")]
+    #[serde(default)]
+    pub pid: Option<i64>,
+    /// Short job id (`claude attach <id>`); background sessions only, so this
+    /// is also the "attachable" marker.
+    #[serde(default)]
+    pub id: Option<String>,
+    pub cwd: String,
+    /// `background` (started with `--bg`, attachable) or `interactive`
+    /// (someone's own terminal — listed, but not attachable).
+    pub kind: String,
+    /// Session start, milliseconds since epoch.
+    #[ts(type = "number")]
+    pub started_at: i64,
+    pub session_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// e.g. `busy` | `idle`; absent once the process has exited.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// e.g. `working` | `blocked` | `done` | `failed` | `stopped`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// What a blocked session is waiting on (e.g. "permission prompt").
+    #[serde(default)]
+    pub waiting_for: Option<String>,
+}
+
+/// The Agents view for one project: the folder sessions are matched under
+/// (the project's `local_path`) and the live sessions running there. `path`
+/// is null when the project has no `local_path` — then `agents` is empty and
+/// the UI explains how to link a folder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectAgents {
+    pub path: Option<String>,
+    pub agents: Vec<AgentSession>,
+}
+
+/// Receipt for a newly started background session: the short job id usable
+/// with `claude attach/logs/stop` and the attach WebSocket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct AgentSpawned {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

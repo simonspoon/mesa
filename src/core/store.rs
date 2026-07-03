@@ -166,6 +166,9 @@ const MIGRATIONS: &[&str] = &["
         created_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z',
         updated_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
     );
+    ",
+    "
+    ALTER TABLE projects ADD COLUMN local_path TEXT;
     "];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -208,7 +211,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
     })
 }
 
-const PROJECT_COLUMNS: &str = "id, name, description, root_commit";
+const PROJECT_COLUMNS: &str = "id, name, description, root_commit, local_path";
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -216,6 +219,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         name: row.get(1)?,
         description: row.get(2)?,
         root_commit: row.get(3)?,
+        local_path: row.get(4)?,
     })
 }
 
@@ -383,6 +387,9 @@ pub struct ProjectPatch {
     /// `Some(None)` clears the binding; `Some(Some(hash))` (re)binds. Binding a
     /// hash already held by another project is a `conflict`.
     pub root_commit: Option<Option<String>>,
+    /// `Some(None)` clears the last-known working folder; `Some(Some(dir))`
+    /// records it. Machine-local, not unique — no conflict checking.
+    pub local_path: Option<Option<String>>,
 }
 
 /// Fields to change on a task; `None` means leave unchanged.
@@ -538,14 +545,16 @@ impl Store {
         name: &str,
         description: Option<&str>,
         root_commit: Option<&str>,
+        local_path: Option<&str>,
     ) -> Result<Project> {
         if let Some(hash) = root_commit {
             self.ensure_commit_free(hash, None)?;
         }
         self.conn
             .execute(
-                "INSERT INTO projects (name, description, root_commit) VALUES (?1, ?2, ?3)",
-                (name, description, root_commit),
+                "INSERT INTO projects (name, description, root_commit, local_path) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                (name, description, root_commit, local_path),
             )
             .map_err(|e| match root_commit {
                 Some(hash) => Self::map_commit_conflict(e, hash),
@@ -637,10 +646,20 @@ impl Store {
             }
             project.root_commit = root_commit.clone();
         }
+        if let Some(local_path) = &patch.local_path {
+            project.local_path = local_path.clone();
+        }
         self.conn
             .execute(
-                "UPDATE projects SET name = ?1, description = ?2, root_commit = ?3 WHERE id = ?4",
-                (&project.name, &project.description, &project.root_commit, id),
+                "UPDATE projects SET name = ?1, description = ?2, root_commit = ?3, \
+                 local_path = ?4 WHERE id = ?5",
+                (
+                    &project.name,
+                    &project.description,
+                    &project.root_commit,
+                    &project.local_path,
+                    id,
+                ),
             )
             .map_err(|e| match &project.root_commit {
                 Some(hash) => Self::map_commit_conflict(e, hash),
@@ -1973,7 +1992,7 @@ mod tests {
     #[test]
     fn project_crud_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("alpha", Some("first"), None).unwrap();
+        let p = store.create_project("alpha", Some("first"), None, None).unwrap();
         assert_eq!(p.name, "alpha");
         assert_eq!(p.description.as_deref(), Some("first"));
 
@@ -2004,10 +2023,49 @@ mod tests {
     }
 
     #[test]
+    fn local_path_records_updates_and_clears() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("alpha", None, None, Some("/tmp/checkout"))
+            .unwrap();
+        assert_eq!(p.local_path.as_deref(), Some("/tmp/checkout"));
+        assert_eq!(store.get_project(p.id).unwrap(), p);
+
+        // Machine-local, not unique: two projects may share a folder.
+        let q = store
+            .create_project("beta", None, None, Some("/tmp/checkout"))
+            .unwrap();
+        assert_eq!(q.local_path.as_deref(), Some("/tmp/checkout"));
+
+        // Patch semantics match description/root_commit: set, then clear.
+        let moved = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(Some("/tmp/elsewhere".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.local_path.as_deref(), Some("/tmp/elsewhere"));
+        let cleared = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.local_path, None);
+        assert_eq!(store.get_project(p.id).unwrap(), cleared);
+    }
+
+    #[test]
     fn root_commit_binds_resolves_and_rejects_duplicates() {
         let (mut store, _dir) = temp_store();
         let p = store
-            .create_project("alpha", None, Some("abc123"))
+            .create_project("alpha", None, Some("abc123"), None)
             .unwrap();
         assert_eq!(p.root_commit.as_deref(), Some("abc123"));
 
@@ -2020,12 +2078,12 @@ mod tests {
 
         // The same source code must not spawn a second project.
         assert!(matches!(
-            store.create_project("dup", None, Some("abc123")),
+            store.create_project("dup", None, Some("abc123"), None),
             Err(Error::Conflict(_))
         ));
 
         // Another project cannot steal the binding...
-        let q = store.create_project("beta", None, None).unwrap();
+        let q = store.create_project("beta", None, None, None).unwrap();
         assert!(matches!(
             store.update_project(
                 q.id,
@@ -2096,7 +2154,7 @@ mod tests {
     #[test]
     fn task_crud_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let t = store
             .create_task(
                 p.id,
@@ -2162,7 +2220,7 @@ mod tests {
     #[test]
     fn create_with_status_lands_in_that_column_and_logs_creation_event() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let t = store
             .create_task(
                 p.id,
@@ -2194,8 +2252,8 @@ mod tests {
     #[test]
     fn parent_must_be_in_same_project() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None).unwrap();
-        let p2 = store.create_project("p2", None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
 
@@ -2237,7 +2295,7 @@ mod tests {
     #[test]
     fn delete_task_cascades_subtasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let root = add_task(&mut store, p.id, "root");
         let child = store
             .create_task(p.id, "child", None, Priority::Medium, &[], Some(root.id), None, None, None)
@@ -2268,8 +2326,8 @@ mod tests {
     #[test]
     fn delete_project_cascades_tasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("doomed", Some("desc"), None).unwrap();
-        let keep = store.create_project("keeper", None, None).unwrap();
+        let p = store.create_project("doomed", Some("desc"), None, None).unwrap();
+        let keep = store.create_project("keeper", None, None, None).unwrap();
         let t1 = add_task(&mut store, p.id, "one");
         let t2 = store
             .create_task(p.id, "two", None, Priority::Medium, &[], Some(t1.id), None, None, None)
@@ -2294,7 +2352,7 @@ mod tests {
     #[test]
     fn self_edge_rejected_as_cycle() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
         let err = store.add_dependency(t.id, t.id).unwrap_err();
         assert!(matches!(err, Error::Cycle(_)));
@@ -2304,7 +2362,7 @@ mod tests {
     #[test]
     fn cycle_rejected_naming_the_edge() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -2325,7 +2383,7 @@ mod tests {
     #[test]
     fn duplicate_edge_is_idempotent() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let first = store.add_dependency(a.id, b.id).unwrap();
@@ -2342,7 +2400,7 @@ mod tests {
     #[test]
     fn blocked_is_derived_from_dependency_status() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let task = add_task(&mut store, p.id, "task");
         let dep1 = add_task(&mut store, p.id, "dep1");
         let dep2 = add_task(&mut store, p.id, "dep2");
@@ -2390,7 +2448,7 @@ mod tests {
     #[test]
     fn unblock_removes_edge_and_missing_edge_is_not_found() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         store.add_dependency(a.id, b.id).unwrap();
@@ -2405,7 +2463,7 @@ mod tests {
     #[test]
     fn list_blockers_returns_direct_blockers_only() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -2424,7 +2482,7 @@ mod tests {
     #[test]
     fn backup_round_trip() {
         let (mut store, dir) = temp_store();
-        let p = store.create_project("p", Some("kept"), None).unwrap();
+        let p = store.create_project("p", Some("kept"), None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         store.add_dependency(a.id, b.id).unwrap();
@@ -2443,7 +2501,7 @@ mod tests {
     #[test]
     fn status_events_logged_on_create_and_real_status_changes() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
 
         // Creation event: NULL -> initial status (todo).
@@ -2483,7 +2541,7 @@ mod tests {
     #[test]
     fn update_without_status_change_writes_no_event_but_bumps_updated_at() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
         let before = store.get_task(t.id).unwrap();
         assert_eq!(before.created_at, before.updated_at);
@@ -2512,7 +2570,7 @@ mod tests {
     #[test]
     fn list_events_all_tasks_and_unknown_task() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         // Two creation events across all tasks, oldest first.
@@ -2538,7 +2596,7 @@ mod tests {
     #[test]
     fn next_task_orders_by_priority_then_id_and_excludes_non_actionable() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         // Lower id, but medium priority; the high-priority task wins despite
         // its higher id.
         let _med = create_with_priority(&mut store, p.id, "med", Priority::Medium);
@@ -2587,7 +2645,7 @@ mod tests {
     #[test]
     fn next_task_counts_when_none_actionable() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a"); // will block b
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -2629,8 +2687,8 @@ mod tests {
     #[test]
     fn next_task_respects_project_filter() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None).unwrap();
-        let p2 = store.create_project("p2", None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
         let in_p2 = create_with_priority(&mut store, p2.id, "p2 high", Priority::High);
         let in_p1 = add_task(&mut store, p1.id, "p1 task");
 
@@ -2660,7 +2718,7 @@ mod tests {
     #[test]
     fn import_creates_graph_atomically_and_wires_parent_and_deps() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         // a (parent) -> b (child of a, blocked by c) ; c (high priority).
         let doc = ImportDoc {
             project: p.id,
@@ -2704,7 +2762,7 @@ mod tests {
     #[test]
     fn import_in_graph_cycle_is_rejected_and_creates_nothing() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         // a blocked by b, b blocked by a -> cycle within the document.
         let doc = ImportDoc {
             project: p.id,
@@ -2729,7 +2787,7 @@ mod tests {
     #[test]
     fn import_rejects_unknown_project_and_bad_refs_leaving_db_empty() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
 
         // unknown project: nothing created.
         let bad_project = ImportDoc {
@@ -2804,7 +2862,7 @@ mod tests {
     #[test]
     fn storyboard_crud_round_trip_with_view() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "flow", Some("the happy path"), Some("agent-1"))
             .unwrap();
@@ -2861,7 +2919,7 @@ mod tests {
     #[test]
     fn frame_crud_and_view_ordering() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
 
         let f1 = store
@@ -2927,8 +2985,8 @@ mod tests {
     #[test]
     fn frame_task_link_must_be_same_project_and_nulls_on_task_delete() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None).unwrap();
-        let p2 = store.create_project("p2", None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
         let sb = store.create_storyboard(p1.id, "b", None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
@@ -2990,7 +3048,7 @@ mod tests {
     #[test]
     fn edge_crud_rejects_self_and_foreign_frames_and_allows_cycles() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
         let other = store.create_storyboard(p.id, "other", None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
@@ -3048,7 +3106,7 @@ mod tests {
     #[test]
     fn delete_frame_cascades_edges_and_echoes_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
@@ -3072,7 +3130,7 @@ mod tests {
     #[test]
     fn delete_storyboard_cascades_and_echoes_full_view() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
@@ -3092,7 +3150,7 @@ mod tests {
     #[test]
     fn delete_project_cascades_storyboards() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("doomed", None, None).unwrap();
+        let p = store.create_project("doomed", None, None, None).unwrap();
         let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
@@ -3110,7 +3168,7 @@ mod tests {
     #[test]
     fn storyboard_change_history_records_actor_and_actions() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "flow", None, Some("agent-1"))
             .unwrap();
@@ -3201,7 +3259,7 @@ mod tests {
     #[test]
     fn delete_storyboard_cascades_its_change_history() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
         store.create_frame(sb.id, &frame_new("a")).unwrap();
         assert!(!store.list_storyboard_events(sb.id).unwrap().is_empty());
@@ -3216,7 +3274,7 @@ mod tests {
     #[test]
     fn no_op_update_changes_nothing_and_logs_nothing() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", Some("d"), None)
             .unwrap();
@@ -3285,7 +3343,7 @@ mod tests {
     #[test]
     fn post_crud_round_trip_with_thread() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
 
         let post = store
             .create_post(
@@ -3348,7 +3406,7 @@ mod tests {
     #[test]
     fn list_posts_filters_by_tag_and_author_newest_first() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let a = store
             .create_post(p.id, Some("a"), None, Some("news"), "one")
             .unwrap();
@@ -3380,7 +3438,7 @@ mod tests {
     #[test]
     fn reply_to_unknown_or_nested_parent_is_validation_error() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
 
         // unknown parent → validation (a reply is a creation referencing a
         // parent, like a task's --parent), not not_found.
@@ -3392,7 +3450,7 @@ mod tests {
 
         // a reply inherits its parent's project — confirm that rather than
         // rejecting a cross-project reply (which is now impossible to express).
-        let p2 = store.create_project("p2", None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
         let other = store
             .create_post(p2.id, None, None, None, "in p2")
             .unwrap();
@@ -3416,7 +3474,7 @@ mod tests {
     #[test]
     fn deleting_a_project_cascades_its_posts() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
         let post = store.create_post(p.id, None, None, None, "hi").unwrap();
         store.delete_project(p.id).unwrap();
         assert!(matches!(store.get_post(post.id), Err(Error::NotFound(_))));
@@ -3452,7 +3510,7 @@ mod tests {
     #[test]
     fn assigning_an_inbox_item_converts_it_to_a_todo_task() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None).unwrap();
+        let p = store.create_project("p", None, None, None).unwrap();
 
         // A multi-line item: title is the first line, description the full body.
         let item = store

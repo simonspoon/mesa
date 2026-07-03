@@ -27,6 +27,10 @@ scripts/storyboard-check.sh
 # Concurrency gate: 20 interleaved CLI + API writes against one db
 scripts/concurrent-check.sh
 
+# Agents-surface gate: local_path plumbing + /api/projects/{id}/agents contract
+# against a stub `claude` binary (MESA_CLAUDE_BIN)
+scripts/agents-check.sh
+
 # Frontend (run from frontend/)
 npm --prefix frontend run dev     # Vite dev server; proxies /api → 127.0.0.1:7770 (needs `mesa serve`)
 npm --prefix frontend run build   # tsc -b && vite build
@@ -77,8 +81,10 @@ invariants you must not break — read them before changing `src/`:
   `{"error": {"code", "message"}}` on stderr.
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Error codes: `not_found | validation | cycle | conflict | usage`, plus
-  `unavailable` scoped to the live `cc usage` / `GET /api/cc/usage` endpoint (a
-  missing token or unreachable upstream; see the CC Dashboard section).
+  `unavailable` scoped to the surfaces that depend on something outside mesa:
+  the live `cc usage` / `GET /api/cc/usage` endpoint (missing token or
+  unreachable upstream; see the CC Dashboard section) and the agents endpoints
+  (the `claude` CLI missing or failing; see the Agents section).
 - **API security boundary is mode-dependent** (`serve` default vs `serve --lan`),
   enforced by middleware in `src/api.rs`, not by the bind address. Two checks:
   - **Host-header allowlist** (DNS-rebinding defense): rejects requests whose
@@ -113,6 +119,17 @@ invariants you must not break — read them before changing `src/`:
   `--no-git`/`--root-commit`; `project update --root-commit ""` clears it. The
   git computation lives in the CLI; `Store`/API treat `root_commit` as an opaque
   unique string (API: `GET /api/projects/resolve?commit=<sha>`).
+- A project may also record a **`local_path`** — the last-known working folder
+  (repo toplevel) of the project on this machine. Convenience, not identity:
+  machine-local, not unique, no validation in `Store` (the CLI canonicalizes
+  and checks `--path` args; the API stores what it is given). Auto-learned on
+  `project create` (unless `--no-git`/`--root-commit`/`--path`) and cleared with
+  `project update --path ""`. `project resolve` self-heals it **only when unset
+  or stale** (the stored directory no longer exists): many worktrees of one
+  repo share a `root_commit` and resolve to the same project, so overwriting on
+  every resolve would let them thrash the anchor — the first still-present
+  checkout stays it; a moved/deleted one re-anchors to the live checkout. It
+  anchors the Agents surface (see below).
 
 ### Storyboards (freeform visual canvas)
 
@@ -211,6 +228,60 @@ instructions**; `author` is free-text attribution.
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unassigned-count badge); `#/inbox` lists items, each with an "Assign to"
   project dropdown that converts the item to a todo task on selection.
+
+### Agents (live Claude Code sessions per project)
+
+The **Agents** tab on a project page (web UI, `#/projects/:id/agents`) lists
+the Claude Code sessions running under the project's `local_path`, starts new
+background ones, and embeds a terminal attached to a running one. Like the CC
+Dashboard it reads **external** state — here by shelling out to the `claude`
+CLI (`src/core/agents.rs`; `MESA_CLAUDE_BIN` overrides the binary for tests) —
+and touches the mesa store only to read `local_path`. There is deliberately no
+`mesa agent` CLI: an agent in a terminal would just use `claude` directly.
+
+- `GET /api/projects/{id}/agents` → `{path, agents}` via
+  `claude agents --json --cwd <local_path>` (sessions started under that
+  folder, background and interactive). Cached 2s per folder in
+  `AppState.agents_cache` (each list call costs ~0.5s of node startup; the UI
+  polls every 3s). No `local_path` → `{path: null, agents: []}`, not an error.
+- `POST /api/projects/{id}/agents` (body `{prompt?}`) → runs `claude --bg` in
+  `local_path` and returns `{id}` — the short job id parsed from the
+  "backgrounded · <id>" receipt. Without a prompt the session starts idle.
+  No/missing `local_path` is `validation`; a failing/missing `claude` CLI is
+  **502 `unavailable`** on both endpoints.
+- `GET /api/agents/{id}/attach?cols=&rows=` upgrades to a **WebSocket bridged
+  onto `claude attach <id>` in a PTY** (`bridge_attach` in `src/api.rs`,
+  portable-pty): server→client binary frames are raw terminal output;
+  client→server binary frames are keystrokes, text frames are JSON control
+  (`{"resize":{cols,rows}}`). Closing the socket kills only the attach client —
+  the background session keeps running (claude's own attach/detach contract).
+  Only background sessions (those with a short `id`) are attachable;
+  interactive ones are listed as not-attachable.
+- **All three agent routes share one access gate**, `require_local_agent_access`
+  (both `serve` modes), because terminal access is code execution — a strictly
+  stronger capability than the task CRUD the rest of the API exposes. It stacks
+  three checks, each closing a distinct hole:
+  - `require_loopback` (peer address via `ConnectInfo`) — refuses LAN peers even
+    under `--lan`. Do not relax this to the Host-header check.
+  - `require_local_host` (Host allowlist) — the DNS-rebinding defense the global
+    `guard` drops under `--lan`. A same-origin GET carries no Origin and the
+    peer is the victim's own loopback, so only the Host header (the page's
+    rebound hostname, not `localhost`) still distinguishes a rebinding page.
+  - `require_local_origin` (Origin allowlist) — refuses cross-site fetch/
+    WebSocket where the Host is genuinely local but the page Origin is foreign;
+    WebSockets are exempt from CORS, so the attach socket leans on this
+    entirely. Origin-less non-browser clients (curl, native) pass.
+- **Writing a project's `local_path` is loopback-only** (`require_local_path_write`
+  on `create`/`update`, both modes): it is the folder `claude --bg` runs in —
+  an execution anchor, not mere data — so a LAN peer (who under `--lan` can
+  otherwise write any project field) must not point a future locally-triggered
+  agent at a directory of their choosing. Every other project field stays
+  writable under `--lan`.
+- Web UI: `AgentsView` (list + start form, 3s poll) and `AgentTerminal`
+  (xterm.js + fit addon over the attach socket) under the project tabs. The
+  vite dev proxy has `ws: true` for this socket.
+- Gate: `scripts/agents-check.sh` (stub `claude`, asserts the JSON contract and
+  the local_path CLI plumbing). The WS bridge itself is verified by live QA.
 
 ### CC Dashboard (Claude Code telemetry)
 

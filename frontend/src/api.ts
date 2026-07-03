@@ -2,6 +2,7 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
+import type { AgentSpawned } from './types/AgentSpawned'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
@@ -9,6 +10,7 @@ import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
 import type { InboxItem } from './types/InboxItem'
 import type { Post } from './types/Post'
+import type { ProjectAgents } from './types/ProjectAgents'
 import type { PostSummary } from './types/PostSummary'
 import type { PostThread } from './types/PostThread'
 import type { Priority } from './types/Priority'
@@ -113,6 +115,7 @@ export function listDependencies(id: number): Promise<Task[]> {
 export interface ProjectPatch {
   name?: string
   description?: string | null
+  local_path?: string | null
 }
 
 export interface TaskCreate {
@@ -169,6 +172,21 @@ export function deleteTask(id: number): Promise<Task[]> {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+// ---- agents (live Claude Code sessions; loopback-only endpoints) ----
+
+/** The live Claude Code sessions under the project's folder. */
+export function getProjectAgents(id: number): Promise<ProjectAgents> {
+  return request(`/api/projects/${id}/agents`)
+}
+
+/** Starts a background `claude --bg` session in the project's folder. */
+export function spawnProjectAgent(
+  id: number,
+  body: { prompt?: string } = {},
+): Promise<AgentSpawned> {
+  return request(`/api/projects/${id}/agents`, jsonInit('POST', body))
 }
 
 // ---- storyboards ----

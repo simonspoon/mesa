@@ -9,6 +9,7 @@ import { KanbanBoard } from '../KanbanBoard'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
+import { AgentsView } from './AgentsView'
 import { BulletinListView } from './BulletinListView'
 import { BulletinThreadView } from './BulletinThreadView'
 import { StoryboardBoardView } from './StoryboardBoardView'
@@ -55,6 +56,7 @@ export function ProjectTasksPage({
   storyboardId,
   posts,
   postId,
+  agents,
   onProjectsChanged,
 }: {
   projectId: number
@@ -67,6 +69,9 @@ export function ProjectTasksPage({
   // `postId` selects a single thread.
   posts: boolean
   postId: number | null
+  // Agents is the third URL-driven view: live Claude Code sessions under the
+  // project's folder, with an embedded terminal.
+  agents: boolean
   onProjectsChanged: () => void
 }) {
   // Status and tag are passed through to the API's query filters; priority
@@ -122,10 +127,11 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  // Storyboards and Bulletin are their own views with their own fetches/error
-  // handling, so a failed task fetch must not block them; only surface it on
-  // the task views (List/Board).
-  const error = projectError ?? (storyboards || posts ? null : tasksError)
+  // Storyboards, Bulletin, and Agents are their own views with their own
+  // fetches/error handling, so a failed task fetch must not block them; only
+  // surface it on the task views (List/Board).
+  const error =
+    projectError ?? (storyboards || posts || agents ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
@@ -140,7 +146,8 @@ export function ProjectTasksPage({
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectView(next: 'list' | 'board') {
     setView(next)
-    if (storyboards || posts) window.location.hash = `#/projects/${projectId}`
+    if (storyboards || posts || agents)
+      window.location.hash = `#/projects/${projectId}`
   }
 
   function closePanel() {
@@ -264,14 +271,20 @@ export function ProjectTasksPage({
         <div className="tabs">
           <button
             className={
-              !storyboards && !posts && view === 'board' ? 'active' : ''
+              !storyboards && !posts && !agents && view === 'board'
+                ? 'active'
+                : ''
             }
             onClick={() => selectView('board')}
           >
             Board
           </button>
           <button
-            className={!storyboards && !posts && view === 'list' ? 'active' : ''}
+            className={
+              !storyboards && !posts && !agents && view === 'list'
+                ? 'active'
+                : ''
+            }
             onClick={() => selectView('list')}
           >
             List
@@ -296,18 +309,29 @@ export function ProjectTasksPage({
           >
             Bulletin
           </button>
+          <button
+            className={agents ? 'active' : ''}
+            onClick={() => {
+              if (!agents)
+                window.location.hash = `#/projects/${projectId}/agents`
+            }}
+          >
+            Agents
+          </button>
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
-            the List/Board views only (spec S5), not on Storyboards/Bulletin
-            (those carry their own create forms). */}
-        {!storyboards && !posts && (
+            the List/Board views only (spec S5), not on Storyboards/Bulletin/
+            Agents (those carry their own create forms). */}
+        {!storyboards && !posts && !agents && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
         )}
 
-        {posts ? (
+        {agents ? (
+          <AgentsView projectId={projectId} />
+        ) : posts ? (
           postId !== null ? (
             // key on postId so a thread→thread navigation remounts and never
             // leaks the open reply/editor state across posts (cf. TaskPanel).

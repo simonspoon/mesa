@@ -10,7 +10,8 @@ import { useFetch } from './useFetch'
 // Hash-based routing: #/ (placeholder), #/projects/:id,
 // #/projects/:id/tasks/:tid (task open in the side panel),
 // #/projects/:id/storyboards, #/projects/:id/storyboards/:sid,
-// #/projects/:id/posts, #/projects/:id/posts/:pid (bulletin board).
+// #/projects/:id/posts, #/projects/:id/posts/:pid (bulletin board),
+// #/projects/:id/agents (live Claude Code sessions + embedded terminal).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -53,6 +54,7 @@ function App() {
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)
   const postListMatch = /^\/projects\/(\d+)\/posts$/.exec(path)
+  const agentsMatch = /^\/projects\/(\d+)\/agents$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
   const activeProjectId = storyboardMatch
@@ -63,9 +65,11 @@ function App() {
         ? Number(postMatch[1])
         : postListMatch
           ? Number(postListMatch[1])
-          : projectMatch
-            ? Number(projectMatch[1])
-            : null
+          : agentsMatch
+            ? Number(agentsMatch[1])
+            : projectMatch
+              ? Number(projectMatch[1])
+              : null
 
   let page
   if (inboxMatch) {
@@ -86,6 +90,7 @@ function App() {
         storyboardId={Number(storyboardMatch[2])}
         posts={false}
         postId={null}
+        agents={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -99,6 +104,7 @@ function App() {
         storyboardId={null}
         posts={false}
         postId={null}
+        agents={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -112,6 +118,7 @@ function App() {
         storyboardId={null}
         posts
         postId={Number(postMatch[2])}
+        agents={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -125,6 +132,21 @@ function App() {
         storyboardId={null}
         posts
         postId={null}
+        agents={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (agentsMatch) {
+    // Live Claude Code sessions, in place inside the project page frame.
+    page = (
+      <ProjectTasksPage
+        projectId={Number(agentsMatch[1])}
+        taskId={null}
+        storyboards={false}
+        storyboardId={null}
+        posts={false}
+        postId={null}
+        agents
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -137,6 +159,7 @@ function App() {
         storyboardId={null}
         posts={false}
         postId={null}
+        agents={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )

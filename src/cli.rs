@@ -136,6 +136,11 @@ bind an explicit hash instead of detecting it.")]
         /// Do not bind any repo to the project
         #[arg(long)]
         no_git: bool,
+        /// Record this directory as the project's working folder (anchors the
+        /// Agents surface). Default: the cwd repo's toplevel when auto-binding
+        /// git; none otherwise.
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// List all projects as a bare JSON array
     List,
@@ -175,6 +180,10 @@ EXAMPLES
         /// Bind this root commit hash; pass "" to clear the binding
         #[arg(long, group = "fields")]
         root_commit: Option<String>,
+        /// Record this directory as the project's working folder; pass "" to
+        /// clear it
+        #[arg(long, group = "fields")]
+        path: Option<String>,
     },
     /// Delete a project AND all its tasks (no confirmation)
     ///
@@ -918,6 +927,39 @@ fn git_root_commit(path: Option<&Path>) -> Option<String> {
         .map(String::from)
 }
 
+/// The repo's toplevel working directory (worktree-aware); `None` outside a
+/// repo or when git is unavailable. This is what `local_path` records — the
+/// folder, not wherever inside it the command ran.
+fn git_toplevel(path: Option<&Path>) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(p) = path {
+        cmd.arg("-C").arg(p);
+    }
+    cmd.args(["rev-parse", "--show-toplevel"]);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Canonicalizes an explicit `--path` argument; `validation` if it does not
+/// exist or is not a directory.
+fn canonical_dir(path: &Path) -> Result<String> {
+    let canon = std::fs::canonicalize(path)
+        .map_err(|e| Error::Validation(format!("--path {}: {e}", path.display())))?;
+    if !canon.is_dir() {
+        return Err(Error::Validation(format!(
+            "--path {} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(canon.to_string_lossy().into_owned())
+}
+
 /// Compact task object for `list`: full object minus `description`.
 fn compact(t: &Task) -> serde_json::Value {
     json!({
@@ -1004,7 +1046,12 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             description,
             root_commit,
             no_git,
+            path,
         } => {
+            // An explicit --root-commit or --no-git says "I am describing
+            // somewhere else", so it suppresses ALL cwd auto-detection —
+            // including the working-folder default below.
+            let auto_detect = !no_git && root_commit.is_none();
             let root_commit = if no_git {
                 None
             } else {
@@ -1015,7 +1062,16 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                     None => git_root_commit(None),
                 }
             };
-            print_json(&store.create_project(&name, description.as_deref(), root_commit.as_deref())?);
+            let local_path = match &path {
+                Some(dir) => Some(canonical_dir(dir)?),
+                None => auto_detect.then(|| git_toplevel(None)).flatten(),
+            };
+            print_json(&store.create_project(
+                &name,
+                description.as_deref(),
+                root_commit.as_deref(),
+                local_path.as_deref(),
+            )?);
         }
         ProjectCmd::List => print_json(&store.list_projects()?),
         ProjectCmd::Resolve { path } => {
@@ -1024,7 +1080,31 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                     "not a git repository (or git unavailable); cannot resolve a project".into(),
                 )
             })?;
-            print_json(&store.find_project_by_root_commit(&commit)?);
+            let project = store.find_project_by_root_commit(&commit)?;
+            // Self-heal the recorded working folder, but ONLY when it is unset
+            // or stale (the stored directory no longer exists). Many worktrees
+            // of one repo share a root_commit and so resolve to this same
+            // project; overwriting on every resolve would let them thrash the
+            // single Agents anchor. Keeping an existing, still-present path
+            // means the first-linked checkout stays the anchor, while a
+            // moved/deleted checkout (path gone) re-anchors to the live one.
+            let stale = match &project.local_path {
+                None => true,
+                Some(p) => !std::path::Path::new(p).is_dir(),
+            };
+            let toplevel = git_toplevel(path.as_deref());
+            let project = match toplevel {
+                Some(dir) if stale && project.local_path.as_deref() != Some(dir.as_str()) => store
+                    .update_project(
+                        project.id,
+                        &ProjectPatch {
+                            local_path: Some(Some(dir)),
+                            ..Default::default()
+                        },
+                    )?,
+                _ => project,
+            };
+            print_json(&project);
         }
         ProjectCmd::Show { id } => print_json(&store.get_project(id)?),
         ProjectCmd::Update {
@@ -1032,11 +1112,18 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             name,
             description,
             root_commit,
+            path,
         } => {
+            let local_path = match path {
+                None => None,
+                Some(p) if p.is_empty() => Some(None),
+                Some(p) => Some(Some(canonical_dir(Path::new(&p))?)),
+            };
             let patch = ProjectPatch {
                 name,
                 description: description.map(clear_if_empty),
                 root_commit: root_commit.map(clear_if_empty),
+                local_path,
             };
             print_json(&store.update_project(id, &patch)?);
         }

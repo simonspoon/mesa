@@ -12,4 +12,12 @@ id: number, name: string, description: string | null,
  * same source resolves to one project. Set at create time or via update;
  * unique across projects (a commit binds to exactly one project).
  */
-root_commit: string | null, };
+root_commit: string | null, 
+/**
+ * Last-known working folder of this project on this machine (the repo
+ * toplevel). Machine-local convenience, not identity (that is
+ * `root_commit`): it anchors the Agents surface — which Claude Code
+ * sessions belong here, and where new ones start. Auto-learned on
+ * `project create` and refreshed by `project resolve`.
+ */
+local_path: string | null, };

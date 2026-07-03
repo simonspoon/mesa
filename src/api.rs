@@ -16,22 +16,28 @@
 //!   at `/`, with SPA fallback to `index.html` (spec Requirement 9).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch, PostPatch, Priority,
-    ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary,
+    AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
+    PostPatch, Priority, ProjectAgents, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch,
+    TaskSummary, agents,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -65,6 +71,18 @@ struct AppState {
     /// True while a background (serve-stale) refresh is in flight, so repeated
     /// polls spawn at most one refresh task.
     usage_refreshing: Arc<AtomicBool>,
+    /// Live Claude Code sessions per project folder, keyed by `local_path`.
+    /// Each `claude agents --json` call costs ~0.5s of node startup, so a short
+    /// TTL (see [`AGENTS_TTL`]) collapses concurrent polls — multiple open
+    /// tabs, or several clients on the same folder — into one subprocess per
+    /// window. A project that changes `local_path` orphans its old key; the
+    /// insert path caps the map so those can't grow without bound.
+    agents_cache: Arc<Mutex<HashMap<String, (Instant, Vec<AgentSession>)>>>,
+    /// Bumped whenever a spawn invalidates the list cache. A concurrent list
+    /// whose subprocess started before the spawn checks this before caching,
+    /// so it can't reinsert a pre-spawn snapshot after the invalidation and
+    /// briefly hide the just-created session.
+    agents_gen: Arc<AtomicU64>,
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -80,6 +98,8 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         usage_cache: Arc::new(Mutex::new(None)),
         usage_lock: Arc::new(tokio::sync::Mutex::new(())),
         usage_refreshing: Arc::new(AtomicBool::new(false)),
+        agents_cache: Arc::new(Mutex::new(HashMap::new())),
+        agents_gen: Arc::new(AtomicU64::new(0)),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -91,7 +111,13 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
             "{}",
             json!({"listening": format!("http://{host}:{port}")})
         );
-        axum::serve(listener, router(state)).await?;
+        // ConnectInfo carries the peer address so the agent endpoints can
+        // stay loopback-only even under --lan (see `require_loopback`).
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     })
 }
@@ -138,6 +164,13 @@ fn router(state: AppState) -> Router {
             "/api/inbox/{id}",
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
+        // Agents: live Claude Code sessions under a project's folder. All
+        // three routes are loopback-only (terminal access = code execution).
+        .route(
+            "/api/projects/{id}/agents",
+            get(list_project_agents).post(spawn_project_agent),
+        )
+        .route("/api/agents/{id}/attach", get(attach_agent))
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -275,6 +308,10 @@ struct ProjectCreate {
     /// has no cwd/git context); the API only stores and enforces uniqueness.
     #[serde(default)]
     root_commit: Option<String>,
+    /// Optional working-folder binding; like `root_commit`, the caller knows
+    /// where the project lives, the API only records it.
+    #[serde(default)]
+    local_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -285,6 +322,8 @@ struct ProjectUpdate {
     description: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     root_commit: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    local_path: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -299,12 +338,20 @@ async fn list_projects(State(state): State<AppState>) -> ApiResult<Response> {
 
 async fn create_project(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Result<Json<ProjectCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
+    if body.local_path.is_some() {
+        require_local_path_write(&addr)?;
+    }
     let mut store = state.store.lock().unwrap();
-    let project =
-        store.create_project(&body.name, body.description.as_deref(), body.root_commit.as_deref())?;
+    let project = store.create_project(
+        &body.name,
+        body.description.as_deref(),
+        body.root_commit.as_deref(),
+        body.local_path.as_deref(),
+    )?;
     Ok((StatusCode::CREATED, Json(project)).into_response())
 }
 
@@ -326,14 +373,19 @@ async fn show_project(
 
 async fn update_project(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(id): Path<i64>,
     body: Result<Json<ProjectUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
+    if body.local_path.is_some() {
+        require_local_path_write(&addr)?;
+    }
     let patch = ProjectPatch {
         name: body.name,
         description: body.description,
         root_commit: body.root_commit,
+        local_path: body.local_path,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_project(id, &patch)?).into_response())
@@ -920,6 +972,447 @@ async fn assign_inbox(
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_inbox_item(id)?).into_response())
+}
+
+// ---- agents (live Claude Code sessions under a project's folder) ----
+
+#[derive(Deserialize)]
+struct AgentSpawnBody {
+    /// Optional first prompt; without one the session starts idle, ready for
+    /// the first message over an attach.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttachQuery {
+    /// Initial terminal size, so the TUI's first paint fits the client.
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+/// How long a listed-sessions snapshot is reused per folder. Kept below the
+/// UI's 3s poll so a single tab always sees near-live data (it re-runs the
+/// ~0.5s `claude agents` each poll); the cache's job is to collapse *concurrent*
+/// polls — multiple tabs or clients on the same folder within the window — into
+/// one subprocess, not to skip a lone tab's polls.
+const AGENTS_TTL: Duration = Duration::from_secs(2);
+
+/// Terminal access is code execution on this machine — a strictly stronger
+/// capability than the task CRUD the rest of the API exposes. So the agent
+/// endpoints are never served to LAN peers, even under `--lan` (where this
+/// check is the only thing that bites; in default mode the bind is loopback
+/// anyway).
+fn require_loopback(addr: &SocketAddr) -> Result<(), ApiError> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: "agent endpoints are loopback-only; connect from this machine".into(),
+    })
+}
+
+/// A project's `local_path` is the folder `claude --bg`/`claude agents` run
+/// in — an execution input, not mere task data. So writing it is loopback-only
+/// even under `--lan`, mirroring the agent endpoints: a LAN peer (who under
+/// `--lan` can otherwise write any project field) must not be able to point a
+/// future locally-triggered agent at a directory of their choosing.
+fn require_local_path_write(addr: &SocketAddr) -> Result<(), ApiError> {
+    require_loopback(addr).map_err(|_| ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: "local_path is an agent execution anchor; it can only be set from this machine"
+            .into(),
+    })
+}
+
+/// The Host-allowlist half of the DNS-rebinding defense, scoped to the agent
+/// endpoints so it runs in BOTH modes. The global `guard` skips the Host check
+/// under `--lan`, which would leave a rebinding page (evil.com rebound to
+/// 127.0.0.1) able to reach these routes: `require_loopback` sees the local
+/// peer and same-origin GETs carry no Origin, so only the Host header — which
+/// a browser sets to the page's rebound hostname, not `localhost` — still
+/// distinguishes it. Mirrors the allowlist in `guard`.
+fn require_local_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if host == format!("localhost:{port}") || host == format!("127.0.0.1:{port}") {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: format!(
+            "rejected Host {host:?}: agent endpoints require localhost:{port} or 127.0.0.1:{port}"
+        ),
+    })
+}
+
+/// The full access gate shared by all three agent routes: local TCP peer
+/// (`require_loopback`) + local Host (`require_local_host`, closing the
+/// `--lan` DNS-rebinding gap) + local Origin (`require_local_origin`, closing
+/// cross-site fetch/WebSocket). Terminal access is code execution, so these
+/// stack in both modes.
+fn require_local_agent_access(
+    addr: &SocketAddr,
+    headers: &HeaderMap,
+    port: u16,
+) -> Result<(), ApiError> {
+    require_loopback(addr)?;
+    require_local_host(headers, port)?;
+    require_local_origin(headers)?;
+    Ok(())
+}
+
+/// Blocks cross-site WebSocket hijacking on the attach socket. WebSockets are
+/// exempt from CORS and browsers send `Host: <target>` on them, so the Host
+/// allowlist and Content-Type gate protect nothing here — but browsers DO
+/// always send the page's `Origin`. A local origin (the embedded UI, or the
+/// vite dev server) is allowed on any port; a missing Origin means a
+/// non-browser client (curl, native), which is fine — anything local already
+/// has a terminal of its own. This runs in BOTH modes, so a DNS-rebinding
+/// page is refused even under `--lan`.
+fn require_local_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    const LOCAL: [&str; 6] = [
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://[::1]",
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://[::1]",
+    ];
+    let local = LOCAL.iter().any(|base| {
+        origin == *base
+            || origin
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with(':'))
+    });
+    if local {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: format!("rejected WebSocket Origin {origin:?}: must be a local page"),
+    })
+}
+
+/// The claude CLI missing or misbehaving is an upstream problem, reported like
+/// a dead usage endpoint: 502 `unavailable`.
+fn agents_unavailable(message: String) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        code: "unavailable",
+        message,
+    }
+}
+
+/// Lists the live Claude Code sessions running under this project's
+/// `local_path`. A project without one gets `{path: null, agents: []}` — the
+/// UI explains how to link a folder rather than erroring on every poll.
+async fn list_project_agents(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_local_agent_access(&addr, &headers, state.port)?;
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let Some(path) = local_path else {
+        return Ok(Json(ProjectAgents {
+            path: None,
+            agents: vec![],
+        })
+        .into_response());
+    };
+    // A recorded folder that no longer exists (checkout moved/deleted) has no
+    // sessions under it. Return that plainly instead of 502-ing every 3s poll
+    // when `claude agents --cwd <gone>` errors — the path is still surfaced so
+    // the UI shows where it looked. `resolve` re-learns the path when the user
+    // runs it in the moved checkout.
+    if !std::path::Path::new(&path).is_dir() {
+        return Ok(Json(ProjectAgents {
+            path: Some(path),
+            agents: vec![],
+        })
+        .into_response());
+    }
+    {
+        let cache = state.agents_cache.lock().unwrap();
+        if let Some((at, sessions)) = cache.get(&path)
+            && at.elapsed() < AGENTS_TTL
+        {
+            return Ok(Json(ProjectAgents {
+                path: Some(path.clone()),
+                agents: sessions.clone(),
+            })
+            .into_response());
+        }
+    }
+    // The list shells out to `claude` (blocking, ~0.5s); keep it off the
+    // async worker threads. Snapshot the invalidation generation first: if a
+    // spawn bumps it while our subprocess runs, our snapshot may predate the
+    // new session, so we skip caching (serve it, but don't poison the cache).
+    let gen0 = state.agents_gen.load(Ordering::SeqCst);
+    let dir = path.clone();
+    let sessions = tokio::task::spawn_blocking(move || agents::list_under(&dir))
+        .await
+        .map_err(|e| agents_unavailable(format!("agents list panicked: {e}")))?
+        .map_err(agents_unavailable)?;
+    if state.agents_gen.load(Ordering::SeqCst) == gen0 {
+        let mut cache = state.agents_cache.lock().unwrap();
+        // Keys are per-folder; a project that changes local_path leaves its
+        // old key behind. Cap the map so those can't accumulate unbounded
+        // (mirrors cc_cache).
+        if cache.len() >= 64 {
+            cache.retain(|_, (at, _)| at.elapsed() < AGENTS_TTL);
+        }
+        cache.insert(path.clone(), (Instant::now(), sessions.clone()));
+    }
+    Ok(Json(ProjectAgents {
+        path: Some(path),
+        agents: sessions,
+    })
+    .into_response())
+}
+
+/// Starts a new background session (`claude --bg`) in the project's folder
+/// and returns the short job id.
+async fn spawn_project_agent(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<AgentSpawnBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_agent_access(&addr, &headers, state.port)?;
+    let Json(body) = body?;
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let Some(path) = local_path else {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "project {id} has no local_path; run `mesa project resolve` in its repo \
+                 or `mesa project update {id} --path <dir>`"
+            ),
+        });
+    };
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!("project {id} local_path {path:?} is not a directory on this machine"),
+        });
+    }
+    let dir = path.clone();
+    let job = tokio::task::spawn_blocking(move || agents::spawn_bg(&dir, body.prompt.as_deref()))
+        .await
+        .map_err(|e| agents_unavailable(format!("agent spawn panicked: {e}")))?
+        .map_err(agents_unavailable)?;
+    // Drop the cached list so the next poll shows the new session immediately,
+    // and bump the generation so a list request in flight since before this
+    // spawn won't reinsert its pre-spawn snapshot over the invalidation.
+    state.agents_cache.lock().unwrap().remove(&path);
+    state.agents_gen.fetch_add(1, Ordering::SeqCst);
+    Ok((StatusCode::CREATED, Json(AgentSpawned { id: job })).into_response())
+}
+
+/// Upgrades to a WebSocket bridged onto `claude attach <id>` in a PTY — the
+/// embedded terminal. Closing the socket kills only the attach client; the
+/// background session keeps running (claude's own attach/detach contract).
+async fn attach_agent(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+    Query(q): Query<AttachQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    require_local_agent_access(&addr, &headers, state.port)?;
+    // The id lands on `claude attach`'s argv — no shell is involved, but
+    // constrain it anyway so arbitrary strings never reach an exec. A leading
+    // `-` is refused too, so the id can never be parsed as a `claude attach`
+    // flag (the id charset otherwise allows `-`).
+    if id.is_empty()
+        || id.len() > 64
+        || id.starts_with('-')
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!("invalid agent id {id:?}"),
+        });
+    }
+    let size = PtySize {
+        rows: q.rows.unwrap_or(40),
+        cols: q.cols.unwrap_or(120),
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    Ok(ws.on_upgrade(move |socket| async move {
+        if let Err(err) = bridge_attach(socket, id, size).await {
+            eprintln!("agent attach bridge: {err}");
+        }
+    }))
+}
+
+/// Client→server text frames carry JSON control; today that is only
+/// `{"resize": {"cols": N, "rows": N}}`. Binary frames are keystrokes.
+#[derive(Deserialize)]
+struct AttachControl {
+    #[serde(default)]
+    resize: Option<AttachResize>,
+}
+
+#[derive(Deserialize)]
+struct AttachResize {
+    cols: u16,
+    rows: u16,
+}
+
+/// Runs `claude attach <id>` inside a PTY and pumps bytes between it and the
+/// WebSocket: server→client binary frames are raw terminal output;
+/// client→server binary frames are keystrokes, text frames are control (see
+/// [`AttachControl`]). Returns when either side closes; the attach child is
+/// killed on the way out (the background session survives — verified claude
+/// behavior: "The session keeps running either way").
+async fn bridge_attach(mut socket: WebSocket, id: String, size: PtySize) -> Result<(), String> {
+    let pty = native_pty_system();
+    let pair = pty.openpty(size).map_err(|e| format!("openpty: {e}"))?;
+    let mut cmd = CommandBuilder::new(agents::claude_bin());
+    cmd.args(["attach", &id]);
+    cmd.env("TERM", "xterm-256color");
+    // Give the child a stable cwd: attach resolves the job from claude's
+    // global registry, and the server's own cwd may be anywhere.
+    if let Some(dirs) = directories::BaseDirs::new() {
+        cmd.cwd(dirs.home_dir());
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn claude attach: {e}"))?;
+    drop(pair.slave);
+    let master = pair.master;
+    // Once the child is spawned, every error path must reap it — dropping the
+    // master SIGHUPs the child but nothing else waits on it, so a bare return
+    // would leave a zombie in the long-lived server process. These two calls
+    // are dup(2)-backed and fail exactly under fd exhaustion, when a leak
+    // would compound the problem.
+    let reap = |mut child: Box<dyn portable_pty::Child + Send + Sync>, msg: String| {
+        let _ = child.kill();
+        let _ = child.wait();
+        msg
+    };
+    let mut reader = match master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => return Err(reap(child, format!("pty reader: {e}"))),
+    };
+    let mut writer = match master.take_writer() {
+        Ok(w) => w,
+        Err(e) => return Err(reap(child, format!("pty writer: {e}"))),
+    };
+
+    // Output pump: blocking PTY reads on a plain thread, handed to the async
+    // loop over a bounded channel (a stalled websocket applies backpressure).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 || out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    // Keystroke pump: blocking PTY writes on their own thread.
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        while let Ok(bytes) = in_rx.recv() {
+            if writer
+                .write_all(&bytes)
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Keepalive: a half-open peer (killed tab, laptop sleep, yanked network)
+    // sends no Close frame, and an idle PTY sends no output, so neither pump
+    // arm would ever fire — the child + PTY + pump threads would leak for the
+    // OS connection lifetime. Ping periodically and give up if nothing is
+    // heard back for a few intervals (the browser auto-answers a Ping with a
+    // Pong, which lands in the `socket.recv` arm and refreshes `last_seen`).
+    let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_seen = Instant::now();
+    loop {
+        tokio::select! {
+            chunk = out_rx.recv() => match chunk {
+                Some(bytes) => {
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // PTY closed: the attach client exited (e.g. `claude stop`).
+                None => break,
+            },
+            msg = socket.recv() => {
+                // Any inbound frame (including a Pong) proves the peer is live.
+                if matches!(msg, Some(Ok(_))) {
+                    last_seen = Instant::now();
+                }
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if in_tx.send(bytes.to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(ctl) = serde_json::from_str::<AttachControl>(&text)
+                            && let Some(r) = ctl.resize
+                        {
+                            let _ = master.resize(PtySize {
+                                rows: r.rows,
+                                cols: r.cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {} // ping/pong: axum answers pings itself
+                }
+            }
+            _ = keepalive.tick() => {
+                if last_seen.elapsed() > Duration::from_secs(90)
+                    || socket.send(Message::Ping(Vec::new().into())).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    // Detach: kill our attach client and reap it off the async threads. The
+    // background session itself is untouched.
+    tokio::task::spawn_blocking(move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 // ---- CC Dashboard (Claude Code telemetry) ----

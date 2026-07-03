@@ -162,6 +162,7 @@ EXAMPLES
         path: Option<PathBuf>,
     },
     /// Print one project as a full JSON object
+    #[command(visible_alias = "get")]
     Show {
         /// Project id
         id: i64,
@@ -304,6 +305,7 @@ EXAMPLES
 {\"ref\":\"b\",\"title\":\"build\",\"blocked_by\":[\"a\"]}]}' | mesa task import")]
     Import,
     /// Print one task as a full JSON object (includes description)
+    #[command(visible_alias = "get")]
     Show {
         /// Task id
         id: i64,
@@ -481,6 +483,7 @@ EXAMPLES
         author: Option<String>,
     },
     /// Print a post and its replies: {post, replies}
+    #[command(visible_alias = "get")]
     Show {
         /// Post id
         id: i64,
@@ -541,6 +544,7 @@ EXAMPLES
         project: Option<i64>,
     },
     /// Print one inbox item as a full JSON object
+    #[command(visible_alias = "get")]
     Show {
         /// Inbox item id
         id: i64,
@@ -649,6 +653,7 @@ EXAMPLES
         project: Option<i64>,
     },
     /// Print a storyboard's full contents: {storyboard, frames, edges}
+    #[command(visible_alias = "get")]
     Show {
         /// Storyboard id
         id: i64,

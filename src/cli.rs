@@ -85,14 +85,17 @@ enum Command {
     /// With --lan, binds 0.0.0.0 so other devices on your local network can
     /// reach the web UI, and the Host-header check is skipped. WARNING: LAN
     /// mode has NO authentication — every device on your network has full read
-    /// and write access to all your data. Only use it on networks you trust.
+    /// and write access to all your data AND can open a terminal into any
+    /// project's folder (the Agents tab runs `claude` there), i.e. run code on
+    /// this machine. Only use it on networks you trust.
     Serve {
         /// Port to bind
         #[arg(long, default_value_t = 7770)]
         port: u16,
         /// Make the server reachable from other devices on your local network
         /// (binds 0.0.0.0 and skips the Host-header check). No authentication:
-        /// anyone on the network gets full read/write access.
+        /// anyone on the network gets full read/write access to your data and
+        /// can run code via the Agents terminal.
         #[arg(long, default_value_t = false)]
         lan: bool,
     },

@@ -174,7 +174,7 @@ export function deleteTask(id: number): Promise<Task[]> {
   })
 }
 
-// ---- agents (live Claude Code sessions; loopback-only endpoints) ----
+// ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----
 
 /** The live Claude Code sessions under the project's folder. */
 export function getProjectAgents(id: number): Promise<ProjectAgents> {

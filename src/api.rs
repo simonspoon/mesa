@@ -111,8 +111,9 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
             "{}",
             json!({"listening": format!("http://{host}:{port}")})
         );
-        // ConnectInfo carries the peer address so the agent endpoints can
-        // stay loopback-only even under --lan (see `require_loopback`).
+        // ConnectInfo carries the peer address so the agent endpoints and
+        // local_path writes can be gated on loopback in default mode (see
+        // `require_agent_access` / `require_local_path_write`).
         axum::serve(
             listener,
             router(state).into_make_service_with_connect_info::<SocketAddr>(),
@@ -165,7 +166,9 @@ fn router(state: AppState) -> Router {
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
         // Agents: live Claude Code sessions under a project's folder. All
-        // three routes are loopback-only (terminal access = code execution).
+        // three routes share `require_agent_access` (terminal access = code
+        // execution): loopback-only in default mode, LAN-page-authenticated
+        // under `--lan`.
         .route(
             "/api/projects/{id}/agents",
             get(list_project_agents).post(spawn_project_agent),
@@ -339,11 +342,12 @@ async fn list_projects(State(state): State<AppState>) -> ApiResult<Response> {
 async fn create_project(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Result<Json<ProjectCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     if body.local_path.is_some() {
-        require_local_path_write(&addr)?;
+        require_local_path_write(&state, &addr, &headers)?;
     }
     let mut store = state.store.lock().unwrap();
     let project = store.create_project(
@@ -375,11 +379,12 @@ async fn update_project(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
     body: Result<Json<ProjectUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     if body.local_path.is_some() {
-        require_local_path_write(&addr)?;
+        require_local_path_write(&state, &addr, &headers)?;
     }
     let patch = ProjectPatch {
         name: body.name,
@@ -1001,10 +1006,12 @@ struct AttachQuery {
 const AGENTS_TTL: Duration = Duration::from_secs(2);
 
 /// Terminal access is code execution on this machine — a strictly stronger
-/// capability than the task CRUD the rest of the API exposes. So the agent
-/// endpoints are never served to LAN peers, even under `--lan` (where this
-/// check is the only thing that bites; in default mode the bind is loopback
-/// anyway).
+/// capability than the task CRUD the rest of the API exposes. In default
+/// (loopback) mode the agent endpoints are never served to non-local peers.
+/// Under `--lan` the user has opted into no-auth LAN trust, and that trust
+/// extends to the agent endpoints (so the web UI works from another machine);
+/// what `--lan` does NOT extend to is the browser-as-confused-deputy attacks,
+/// which [`require_agent_access`] still blocks per-mode.
 fn require_loopback(addr: &SocketAddr) -> Result<(), ApiError> {
     if addr.ip().is_loopback() {
         return Ok(());
@@ -1018,25 +1025,37 @@ fn require_loopback(addr: &SocketAddr) -> Result<(), ApiError> {
 
 /// A project's `local_path` is the folder `claude --bg`/`claude agents` run
 /// in — an execution input, not mere task data. So writing it is loopback-only
-/// even under `--lan`, mirroring the agent endpoints: a LAN peer (who under
-/// `--lan` can otherwise write any project field) must not be able to point a
-/// future locally-triggered agent at a directory of their choosing.
-fn require_local_path_write(addr: &SocketAddr) -> Result<(), ApiError> {
+/// even under `--lan`: a LAN peer (who under `--lan` can otherwise write any
+/// project field) must not be able to point a future locally-triggered agent
+/// at a directory of their choosing. Under `--lan` the loopback peer alone is
+/// not enough: the global `guard` skips its Host check there, so a
+/// DNS-rebinding page on THIS machine reaches us with a loopback peer and its
+/// own hostname in Host — the same confused-deputy the agent routes block —
+/// hence the Host/Origin checks stack on top (in default mode `guard` already
+/// pinned the Host).
+fn require_local_path_write(
+    state: &AppState,
+    addr: &SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
     require_loopback(addr).map_err(|_| ApiError {
         status: StatusCode::FORBIDDEN,
         code: "validation",
         message: "local_path is an agent execution anchor; it can only be set from this machine"
             .into(),
-    })
+    })?;
+    if state.lan {
+        require_lan_page_access(addr, headers, state.port)?;
+    }
+    Ok(())
 }
 
-/// The Host-allowlist half of the DNS-rebinding defense, scoped to the agent
-/// endpoints so it runs in BOTH modes. The global `guard` skips the Host check
-/// under `--lan`, which would leave a rebinding page (evil.com rebound to
-/// 127.0.0.1) able to reach these routes: `require_loopback` sees the local
+/// The Host-allowlist half of the DNS-rebinding defense for the agent
+/// endpoints in default (loopback) mode: `require_loopback` sees the local
 /// peer and same-origin GETs carry no Origin, so only the Host header — which
 /// a browser sets to the page's rebound hostname, not `localhost` — still
-/// distinguishes it. Mirrors the allowlist in `guard`.
+/// distinguishes a rebinding page. Mirrors the allowlist in `guard`. Under
+/// `--lan` the wider `require_lan_agent_host` runs instead.
 fn require_local_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
@@ -1054,30 +1073,140 @@ fn require_local_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError> {
     })
 }
 
-/// The full access gate shared by all three agent routes: local TCP peer
-/// (`require_loopback`) + local Host (`require_local_host`, closing the
-/// `--lan` DNS-rebinding gap) + local Origin (`require_local_origin`, closing
-/// cross-site fetch/WebSocket). Terminal access is code execution, so these
-/// stack in both modes.
-fn require_local_agent_access(
+/// The full access gate shared by all three agent routes, per serve mode.
+///
+/// Default (loopback) mode: local TCP peer (`require_loopback`) + local Host
+/// (`require_local_host`) + local Origin (`require_local_origin`) — terminal
+/// access never leaves this machine.
+///
+/// `--lan` mode: LAN peers are allowed (the opt-in "trust every device on the
+/// LAN" posture now includes the terminal, so the web UI works from another
+/// machine), but the browser-as-confused-deputy holes stay closed:
+/// - DNS rebinding: `require_lan_agent_host` — the Host must be `localhost` or
+///   an IP literal on the serve port. A rebound page's requests carry its own
+///   DNS hostname in Host (that's the name the browser resolved), never an IP
+///   literal, so this refuses it without needing to enumerate LAN addresses.
+/// - Cross-site fetch/WebSocket: `require_origin_matches_host` — a browser
+///   Origin must be local or exactly the host the request was addressed to.
+fn require_agent_access(
+    state: &AppState,
     addr: &SocketAddr,
     headers: &HeaderMap,
-    port: u16,
 ) -> Result<(), ApiError> {
+    if state.lan {
+        return require_lan_page_access(addr, headers, state.port);
+    }
     require_loopback(addr)?;
-    require_local_host(headers, port)?;
+    require_local_host(headers, state.port)?;
     require_local_origin(headers)?;
     Ok(())
 }
 
-/// Blocks cross-site WebSocket hijacking on the attach socket. WebSockets are
-/// exempt from CORS and browsers send `Host: <target>` on them, so the Host
-/// allowlist and Content-Type gate protect nothing here — but browsers DO
-/// always send the page's `Origin`. A local origin (the embedded UI, or the
-/// vite dev server) is allowed on any port; a missing Origin means a
+/// The `--lan` page-authenticity gate, shared by the agent routes and the
+/// `local_path` write. Under `--lan` we serve remote LAN browsers, so we cannot
+/// demand a loopback peer; instead we require the request to have come from a
+/// page THIS server served. The two checks are ordered and interdependent:
+/// `require_lan_agent_host` first pins the Host to `localhost`/an IP-literal on
+/// our port (a rebinding page can only send its own DNS name), THEN
+/// `require_origin_matches_host` confirms a browser Origin equals that vetted
+/// Host (or is a local page from a loopback peer). Order is load-bearing — the
+/// Origin match trusts the Host, so the Host must be validated first.
+fn require_lan_page_access(
+    addr: &SocketAddr,
+    headers: &HeaderMap,
+    port: u16,
+) -> Result<(), ApiError> {
+    require_lan_agent_host(headers, port)?;
+    require_origin_matches_host(addr, headers)?;
+    Ok(())
+}
+
+/// The `--lan` half of the DNS-rebinding defense: accept `localhost:<port>` or
+/// any `<ip>:<port>` / `[<ipv6>]:<port>` Host (the IP a LAN browser typed is
+/// the server's own — an attacker cannot serve a page from it), refuse
+/// DNS-name Hosts (the only kind a rebinding page can send). The port must be
+/// ours: an IP Host on a foreign port is some other service's origin, not a
+/// page this server handed out.
+fn require_lan_agent_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    // `localhost:<port>` without allocating a `format!` per request.
+    if host.strip_prefix("localhost:").and_then(|p| p.parse::<u16>().ok()) == Some(port) {
+        return Ok(());
+    }
+    // SocketAddr's parser accepts exactly `<ipv4>:<port>` and `[<ipv6>]:<port>`.
+    if let Ok(sock) = host.parse::<SocketAddr>() {
+        if sock.port() == port {
+            return Ok(());
+        }
+    }
+    // Browsers omit `:80` from Host on the default HTTP port, so serving on 80
+    // yields portless forms: `localhost`, `192.168.1.50`, `[::1]`.
+    if port == 80 {
+        let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+        if host == "localhost"
+            || host.parse::<std::net::IpAddr>().is_ok()
+            || bare.is_some_and(|h| h.parse::<std::net::Ipv6Addr>().is_ok())
+        {
+            return Ok(());
+        }
+    }
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: format!(
+            "rejected Host {host:?}: this endpoint under --lan requires localhost:{port} or an \
+             IP-literal host on port {port} (DNS-rebinding defense) — browse the UI by IP, e.g. \
+             http://<machine-ip>:{port}"
+        ),
+    })
+}
+
+/// The `--lan` cross-site check: a browser Origin must match the request's Host
+/// — i.e. the page came from this very server, by whatever IP the browser used
+/// to reach it — OR be a local page (embedded UI / vite dev on another port)
+/// **from a loopback peer**. The loopback scope on the local-page bypass is
+/// load-bearing: a REMOTE browser showing a hostile `localhost:*` page could
+/// otherwise pass it and open the attach socket cross-origin (the WebSocket is
+/// exempt from CORS, so this is its only cross-site defense). A legit remote
+/// page's Origin equals the Host it was served from, so it still passes the
+/// Host-match branch. Origin-less non-browser clients pass, as in default mode.
+/// Depends on the caller having vetted the Host first (see
+/// [`require_lan_page_access`]): the Host-match branch trusts the Host value.
+fn require_origin_matches_host(addr: &SocketAddr, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    if addr.ip().is_loopback() && require_local_origin(headers).is_ok() {
+        return Ok(());
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let origin_host = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    if !host.is_empty() && origin_host == host {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: format!(
+            "rejected Origin {origin:?}: this endpoint requires a page served by this host"
+        ),
+    })
+}
+
+/// Blocks cross-site fetch/WebSocket in default mode: a browser Origin must be
+/// a local page (the embedded UI, or the vite dev server, on any port). The
+/// attach WebSocket is exempt from CORS and browsers send `Host: <target>` on
+/// it, so neither the Host allowlist nor the Content-Type gate protect it —
+/// but browsers DO always send the page's `Origin`. A missing Origin means a
 /// non-browser client (curl, native), which is fine — anything local already
-/// has a terminal of its own. This runs in BOTH modes, so a DNS-rebinding
-/// page is refused even under `--lan`.
+/// has a terminal of its own. Under `--lan`, `require_origin_matches_host`
+/// wraps this (loopback-scoped) and adds the Host-match branch for remote pages.
 fn require_local_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return Ok(());
@@ -1102,7 +1231,7 @@ fn require_local_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     Err(ApiError {
         status: StatusCode::FORBIDDEN,
         code: "validation",
-        message: format!("rejected WebSocket Origin {origin:?}: must be a local page"),
+        message: format!("rejected Origin {origin:?}: must be a local page"),
     })
 }
 
@@ -1125,7 +1254,7 @@ async fn list_project_agents(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    require_local_agent_access(&addr, &headers, state.port)?;
+    require_agent_access(&state, &addr, &headers)?;
     let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
     let Some(path) = local_path else {
         return Ok(Json(ProjectAgents {
@@ -1194,7 +1323,7 @@ async fn spawn_project_agent(
     Path(id): Path<i64>,
     body: Result<Json<AgentSpawnBody>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_agent_access(&addr, &headers, state.port)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
     let Some(path) = local_path else {
@@ -1238,7 +1367,7 @@ async fn attach_agent(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    require_local_agent_access(&addr, &headers, state.port)?;
+    require_agent_access(&state, &addr, &headers)?;
     // The id lands on `claude attach`'s argv — no shell is involved, but
     // constrain it anyway so arbitrary strings never reach an exec. A leading
     // `-` is refused too, so the id can never be parsed as a `claude attach`
@@ -1553,4 +1682,96 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The `--lan` agent-access gate. These are peer-address-sensitive, which
+    //! `scripts/agents-check.sh` cannot exercise (a same-machine curl is always
+    //! a loopback peer), so the cross-origin-attach hole lives or dies here.
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn hdrs(host: Option<&str>, origin: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = host {
+            h.insert(header::HOST, v.parse().unwrap());
+        }
+        if let Some(v) = origin {
+            h.insert(header::ORIGIN, v.parse().unwrap());
+        }
+        h
+    }
+    fn loopback() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55555)
+    }
+    fn lan_peer() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 55555)
+    }
+
+    #[test]
+    fn lan_host_accepts_localhost_and_ip_literals_on_our_port() {
+        assert!(require_lan_agent_host(&hdrs(Some("localhost:7770"), None), 7770).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50:7770"), None), 7770).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("[::1]:7770"), None), 7770).is_ok());
+    }
+
+    #[test]
+    fn lan_host_rejects_dns_names_and_foreign_ports() {
+        // A DNS-name Host is the only shape a rebinding page can send.
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 7770).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example:7770"), None), 7770).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50:999"), None), 7770).is_err());
+    }
+
+    #[test]
+    fn lan_host_port_80_accepts_portless_forms_but_not_dns_names() {
+        assert!(require_lan_agent_host(&hdrs(Some("localhost"), None), 80).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50"), None), 80).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("[::1]"), None), 80).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 80).is_err());
+    }
+
+    #[test]
+    fn origin_absent_passes() {
+        let h = hdrs(Some("192.168.1.50:7770"), None);
+        assert!(require_origin_matches_host(&lan_peer(), &h).is_ok());
+    }
+
+    #[test]
+    fn legit_remote_page_origin_equals_host_passes() {
+        let h = hdrs(Some("192.168.1.50:7770"), Some("http://192.168.1.50:7770"));
+        assert!(require_origin_matches_host(&lan_peer(), &h).is_ok());
+    }
+
+    #[test]
+    fn local_origin_bypass_honored_only_from_loopback_peer() {
+        // vite dev proxy: localhost:5173 Origin, loopback peer → allowed.
+        let h = hdrs(Some("127.0.0.1:7770"), Some("http://localhost:5173"));
+        assert!(require_origin_matches_host(&loopback(), &h).is_ok());
+    }
+
+    #[test]
+    fn cross_origin_attach_from_remote_peer_is_refused() {
+        // THE hole this test guards: a remote browser showing a hostile
+        // localhost:* page, addressing the server by IP. Must NOT pass.
+        let h = hdrs(Some("192.168.1.50:7770"), Some("http://localhost:3000"));
+        assert!(require_origin_matches_host(&lan_peer(), &h).is_err());
+        assert!(require_lan_page_access(&lan_peer(), &h, 7770).is_err());
+    }
+
+    #[test]
+    fn foreign_origin_refused_from_either_peer() {
+        let h = hdrs(Some("192.168.1.50:7770"), Some("https://evil.example"));
+        assert!(require_origin_matches_host(&lan_peer(), &h).is_err());
+        assert!(require_origin_matches_host(&loopback(), &h).is_err());
+    }
+
+    #[test]
+    fn lan_page_access_allows_legit_remote_and_local_pages() {
+        let remote = hdrs(Some("192.168.1.50:7770"), Some("http://192.168.1.50:7770"));
+        assert!(require_lan_page_access(&lan_peer(), &remote, 7770).is_ok());
+        let dev = hdrs(Some("127.0.0.1:7770"), Some("http://localhost:5173"));
+        assert!(require_lan_page_access(&loopback(), &dev, 7770).is_ok());
+    }
 }

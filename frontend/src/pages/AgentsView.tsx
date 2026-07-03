@@ -8,6 +8,14 @@ function agentLabel(a: AgentSession): string {
   return a.name ?? a.id ?? a.sessionId.slice(0, 8)
 }
 
+/** Session location, relative to the project folder when inside it —
+ * `claude agents --cwd` includes sessions under subfolders/worktrees, and the
+ * cwd is the only thing telling two of them apart. Root itself → omitted. */
+function cwdSuffix(cwd: string, root: string): string | null {
+  if (cwd === root) return null
+  return cwd.startsWith(root + '/') ? cwd.slice(root.length + 1) : cwd
+}
+
 function startedAgo(ms: number): string {
   const mins = Math.max(0, Math.round((Date.now() - ms) / 60000))
   if (mins < 1) return 'just now'
@@ -18,10 +26,11 @@ function startedAgo(ms: number): string {
 }
 
 /**
- * The Agents tab: live Claude Code sessions running under this project's
- * folder (local_path), a start button for new background sessions, and an
- * embedded terminal attached to the selected one. Rendered in place inside
- * ProjectTasksPage's frame, like StoryboardListView.
+ * The Agents tab: an embedded terminal attached to the selected live Claude
+ * Code session fills the main area (bounded to the viewport — xterm scrolls,
+ * the page doesn't), with the session list and start form in a sub nav on the
+ * right. Rendered in place inside ProjectTasksPage's frame, like
+ * StoryboardListView.
  */
 export function AgentsView({ projectId }: { projectId: number }) {
   const { data, error, refetch } = useFetch(
@@ -100,6 +109,8 @@ export function AgentsView({ projectId }: { projectId: number }) {
 
   const agents = [...data.agents].sort((a, b) => b.startedAt - a.startedAt)
   const selected = agents.find((a) => a.id !== null && a.id === selectedId)
+  // Narrowed const so the map callback below sees a non-null folder.
+  const projectPath = data.path
 
   // The embedded terminal is independent of the list fetch and the folder
   // link — its WebSocket/`claude attach` child stays alive on its own. So it
@@ -119,75 +130,93 @@ export function AgentsView({ projectId }: { projectId: number }) {
     </div>
   )
 
-  if (data.path === null) {
-    return (
-      <>
-        <p className="muted">
-          This project has no linked folder, so mesa cannot see its agents. Run{' '}
-          <code>mesa project resolve</code> inside the repo, or{' '}
-          <code>mesa project update {projectId} --path &lt;dir&gt;</code>, to
-          link one.
-        </p>
-        {terminalPanel}
-      </>
-    )
-  }
-
   return (
-    <>
-      <form className="create-form" onSubmit={start}>
-        <input
-          type="text"
-          value={prompt}
-          placeholder="optional first prompt — blank starts an idle session"
-          onChange={(e) => setPrompt(e.target.value)}
-        />
-        <button type="submit" disabled={starting}>
-          {starting ? 'starting…' : 'start agent'}
-        </button>
-        {startError && <span className="error">{startError}</span>}
-      </form>
-      <p className="muted agents-path">sessions under {data.path}</p>
-      {/* Non-fatal: the last good list is still shown above/below. */}
-      {error && <p className="error agents-poll-error">{error}</p>}
+    <div className="agents-layout">
+      <div className="agents-main">
+        {terminalPanel || (
+          <div className="agents-placeholder muted">
+            {projectPath === null ? (
+              <p>
+                This project has no linked folder, so mesa cannot see its
+                agents. Run <code>mesa project resolve</code> inside the repo,
+                or <code>mesa project update {projectId} --path &lt;dir&gt;</code>
+                , to link one.
+              </p>
+            ) : agents.length === 0 ? (
+              <p>
+                No agents running in this project&apos;s folder — start one on
+                the right.
+              </p>
+            ) : (
+              <p>No session attached — pick one on the right.</p>
+            )}
+          </div>
+        )}
+      </div>
 
-      {agents.length === 0 ? (
-        <p className="muted">No agents running in this project&apos;s folder.</p>
-      ) : (
-        <ul className="card-list agent-list">
-          {agents.map((a) => (
-            <li
-              key={a.sessionId}
-              className={
-                (a.id !== null ? 'attachable' : '') +
-                (a.id !== null && a.id === selectedId ? ' selected' : '')
-              }
-              onClick={() => {
-                if (a.id !== null) setSelectedId(a.id)
-              }}
-            >
-              <span className="agent-name">{agentLabel(a)}</span>
-              <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
-              {a.status && (
-                <span className={`badge agent-status-${a.status}`}>
-                  {a.status}
-                </span>
-              )}
-              {a.state && a.state !== a.status && (
-                <span className={`badge agent-state-${a.state}`}>{a.state}</span>
-              )}
-              {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
-              <div className="muted agent-meta">
-                {a.id ?? a.sessionId.slice(0, 8)} · started{' '}
-                {startedAgo(a.startedAt)} · {a.cwd}
-                {a.id === null && ' · external terminal — not attachable'}
-              </div>
-            </li>
-          ))}
-        </ul>
+      {projectPath !== null && (
+        <nav className="agents-subnav">
+          <form className="agents-start" onSubmit={start}>
+            <input
+              type="text"
+              value={prompt}
+              placeholder="optional first prompt — blank starts idle"
+              onChange={(e) => setPrompt(e.target.value)}
+            />
+            <button type="submit" disabled={starting}>
+              {starting ? 'starting…' : 'start agent'}
+            </button>
+            {startError && <span className="error">{startError}</span>}
+          </form>
+          <p className="muted agents-path">sessions under {projectPath}</p>
+          {/* Non-fatal: the last good list is still shown around it. */}
+          {error && <p className="error agents-poll-error">{error}</p>}
+
+          {agents.length === 0 ? (
+            <p className="muted">No agents running.</p>
+          ) : (
+            <ul className="card-list agent-list">
+              {agents.map((a) => (
+                <li
+                  key={a.sessionId}
+                  className={
+                    (a.id !== null ? 'attachable' : '') +
+                    (a.id !== null && a.id === selectedId ? ' selected' : '')
+                  }
+                  onClick={() => {
+                    if (a.id !== null) setSelectedId(a.id)
+                  }}
+                >
+                  <span className="agent-name">{agentLabel(a)}</span>
+                  <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
+                  {a.status && (
+                    <span className={`badge agent-status-${a.status}`}>
+                      {a.status}
+                    </span>
+                  )}
+                  {a.state && a.state !== a.status && (
+                    <span className={`badge agent-state-${a.state}`}>
+                      {a.state}
+                    </span>
+                  )}
+                  {a.waitingFor && (
+                    <span className="badge blocked">{a.waitingFor}</span>
+                  )}
+                  <div className="muted agent-meta">
+                    {a.id ?? a.sessionId.slice(0, 8)} · started{' '}
+                    {startedAgo(a.startedAt)}
+                    {(() => {
+                      const suffix = cwdSuffix(a.cwd, projectPath)
+                      return suffix !== null ? ` · ${suffix}` : null
+                    })()}
+                    {a.id === null && ' · external terminal — not attachable'}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </nav>
       )}
-
-      {terminalPanel}
-    </>
+    </div>
   )
 }

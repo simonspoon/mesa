@@ -257,29 +257,51 @@ and touches the mesa store only to read `local_path`. There is deliberately no
   the background session keeps running (claude's own attach/detach contract).
   Only background sessions (those with a short `id`) are attachable;
   interactive ones are listed as not-attachable.
-- **All three agent routes share one access gate**, `require_local_agent_access`
-  (both `serve` modes), because terminal access is code execution — a strictly
-  stronger capability than the task CRUD the rest of the API exposes. It stacks
-  three checks, each closing a distinct hole:
-  - `require_loopback` (peer address via `ConnectInfo`) — refuses LAN peers even
-    under `--lan`. Do not relax this to the Host-header check.
-  - `require_local_host` (Host allowlist) — the DNS-rebinding defense the global
-    `guard` drops under `--lan`. A same-origin GET carries no Origin and the
-    peer is the victim's own loopback, so only the Host header (the page's
-    rebound hostname, not `localhost`) still distinguishes a rebinding page.
-  - `require_local_origin` (Origin allowlist) — refuses cross-site fetch/
-    WebSocket where the Host is genuinely local but the page Origin is foreign;
-    WebSockets are exempt from CORS, so the attach socket leans on this
-    entirely. Origin-less non-browser clients (curl, native) pass.
+- **All three agent routes share one mode-dependent access gate**,
+  `require_agent_access`. Terminal access is code execution — a strictly
+  stronger capability than the task CRUD the rest of the API exposes — so the
+  browser-as-confused-deputy holes stay closed in BOTH modes; what differs is
+  who may connect:
+  - **Default (loopback) mode** stacks three checks: `require_loopback` (peer
+    address via `ConnectInfo` — refuses any non-local peer), `require_local_host`
+    (Host allowlist — the DNS-rebinding defense: a same-origin GET carries no
+    Origin and the peer is the victim's own loopback, so only the Host header,
+    the page's rebound hostname rather than `localhost`, still distinguishes a
+    rebinding page), and `require_local_origin` (Origin allowlist — refuses
+    cross-site fetch/WebSocket; WebSockets are exempt from CORS, so the attach
+    socket leans on this entirely; Origin-less non-browser clients pass).
+  - **`--lan` mode** serves LAN peers (the opt-in "trust every device on the
+    LAN" posture includes the terminal, so the web UI — including attach — works
+    from a remote machine), but composes two ordered, interdependent checks
+    (`require_lan_page_access`, also reused by the `local_path` write) that keep
+    hostile *pages* out: `require_lan_agent_host` — Host must be
+    `localhost:<port>` or an IP-literal on the serve port (plus the portless
+    forms browsers send when the port is 80), which kills DNS rebinding without
+    enumerating LAN addresses (a rebound page's requests carry its own DNS
+    hostname, never an IP literal; browse the UI by IP from remote machines) —
+    **then** `require_origin_matches_host` — a browser Origin must exactly match
+    that vetted Host, **or** be a local page (embedded UI / vite dev) from a
+    **loopback peer**. The loopback scope on the local-page allowance is
+    load-bearing: without it a *remote* browser showing a hostile `localhost:*`
+    page would pass and open the attach WebSocket cross-origin (the WS is exempt
+    from CORS). Order matters — the Origin match trusts the Host, so the Host is
+    validated first. The peer-sensitive branch is pinned by `src/api.rs` unit
+    tests (the shell gate always sees a loopback peer).
 - **Writing a project's `local_path` is loopback-only** (`require_local_path_write`
   on `create`/`update`, both modes): it is the folder `claude --bg` runs in —
   an execution anchor, not mere data — so a LAN peer (who under `--lan` can
   otherwise write any project field) must not point a future locally-triggered
-  agent at a directory of their choosing. Every other project field stays
-  writable under `--lan`.
-- Web UI: `AgentsView` (list + start form, 3s poll) and `AgentTerminal`
-  (xterm.js + fit addon over the attach socket) under the project tabs. The
-  vite dev proxy has `ws: true` for this socket.
+  agent at a directory of their choosing. Under `--lan` the loopback peer alone
+  is not enough (the global `guard` skips its Host check there, so a
+  DNS-rebinding page on the server's own machine arrives with a loopback peer),
+  so the agent routes' Host/Origin checks stack on top. Every other project
+  field stays writable under `--lan`.
+- Web UI: `AgentsView` under the project tabs — the attached terminal
+  (`AgentTerminal`, xterm.js + fit addon over the attach socket) fills the main
+  area, viewport-bound (the terminal scrolls, the page doesn't), with the
+  session list + start form in a sub nav on the right (3s poll). All terminal
+  I/O rides the server-side WebSocket bridge, so it works from remote machines
+  under `--lan`. The vite dev proxy has `ws: true` for this socket.
 - Gate: `scripts/agents-check.sh` (stub `claude`, asserts the JSON contract and
   the local_path CLI plumbing). The WS bridge itself is verified by live QA.
 

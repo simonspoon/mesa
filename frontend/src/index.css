@@ -20,6 +20,10 @@
   --red: #ff3b5c;
   --font-display: 'Orbitron', sans-serif;
   --font-mono: 'Share Tech Mono', monospace;
+  /* A project-tab body pane that fills the viewport below the header/tabs/
+     chrome and scrolls internally (storyboard canvas, agents terminal). */
+  --tab-viewport-height: calc(100vh - 18rem);
+  --tab-viewport-min: 24rem;
   /* Angular corner cut shared by panels, cards, and buttons. */
   --cut: polygon(
     0 0,

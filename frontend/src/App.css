@@ -641,8 +641,8 @@ main {
      and the reset/fit math both assume the content origin is the viewport
      top-left). */
   position: relative;
-  height: calc(100vh - 18rem);
-  min-height: 24rem;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
   border: 1px solid var(--border);
   background: var(--panel);
   cursor: grab;
@@ -1590,11 +1590,58 @@ main {
   background: rgba(0, 229, 255, 0.05);
 }
 
-/* ---- Agents tab: live Claude Code sessions + embedded terminal ---- */
+/* ---- Agents tab: embedded terminal (main) + session sub nav (right) ---- */
+
+/* Viewport-bound like the storyboard canvas (shares --tab-viewport-*): the
+   terminal fills this box and scrolls internally (xterm scrollback); the page
+   itself never scrolls. */
+.agents-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: stretch;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
+}
+
+.agents-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.agents-subnav {
+  flex: none;
+  width: 19rem;
+  overflow-y: auto;
+  padding-left: 1rem;
+  border-left: 1px solid var(--border);
+  /* Error banners and paths carry unbroken tokens (fs paths, claude stderr);
+     wrap them instead of growing a horizontal scrollbar in the column. */
+  overflow-wrap: anywhere;
+}
+
+.agents-start {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.agents-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 2rem;
+  border: 1px dashed var(--border);
+}
 
 .agents-path {
   font-size: 0.8rem;
   font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .agent-list li.attachable {
@@ -1655,10 +1702,20 @@ main {
 }
 
 .agent-terminal-panel {
-  margin-top: 1rem;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border-bright);
   background: var(--bg);
   box-shadow: 0 0 12px rgba(0, 229, 255, 0.1);
+}
+
+.agent-terminal {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .agent-terminal-header {
@@ -1688,8 +1745,12 @@ main {
   margin: 0.25rem 0;
 }
 
-/* xterm needs an explicitly sized box to fit into. */
+/* xterm needs an explicitly sized box to fit into: this one flex-fills the
+   panel (which fills .agents-main), so the terminal is exactly the viewport
+   space left over — never taller. */
 .agent-terminal-screen {
-  height: 60vh;
+  flex: 1;
+  min-height: 0;
   padding: 0.4rem;
+  overflow: hidden;
 }

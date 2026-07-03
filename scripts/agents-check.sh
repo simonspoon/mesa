@@ -221,10 +221,15 @@ ws() { # ws <path> [origin] -> HTTP status of the upgrade attempt
   fail "WS attach: leading-dash id must be refused (422)"
 ok "WS attach handshake: local/absent Origin upgrade, foreign Origin 403, bad/dash id 422"
 
-# ---- --lan: agent routes keep a Host allowlist the rest of the API drops ----
-# Under --lan the global Host check is skipped (a normal route accepts any
-# Host), but the agent routes must STILL demand a local Host — else a
-# DNS-rebinding page (Host = its rebound hostname) reaches them.
+# ---- --lan: agent routes open to the LAN, rebinding/cross-site still shut ----
+# Under --lan the agent endpoints serve remote browsers (that is the opt-in
+# posture), addressed by IP: the Host must be localhost or an IP literal on
+# the serve port — a DNS-rebinding page can only send its own DNS hostname —
+# and a browser Origin must be local or match the Host exactly.
+# NOTE: every curl below originates on this machine, so the server always sees
+# a LOOPBACK peer. The peer-sensitive case — a REMOTE browser showing a hostile
+# localhost:* page — cannot be forged here; it is pinned by the Rust unit tests
+# in src/api.rs (`cross_origin_attach_from_remote_peer_is_refused`).
 LAN_PORT=17772
 MESA_CLAUDE_BIN="$STUB_DIR/claude" "$MESA" serve --lan --port "$LAN_PORT" >/dev/null 2>&1 &
 LAN_PID=$!
@@ -232,16 +237,70 @@ for _ in $(seq 1 50); do
   curl -sf -H "Host: 127.0.0.1:$LAN_PORT" "http://127.0.0.1:$LAN_PORT/api/projects" >/dev/null 2>&1 && break
   sleep 0.1
 done
-lan_status() { # lan_status <path> <host>
-  curl -s -o /dev/null -w '%{http_code}' -H "Host: $2" "http://127.0.0.1:$LAN_PORT$1"
+curl -sf -H "Host: 127.0.0.1:$LAN_PORT" "http://127.0.0.1:$LAN_PORT/api/projects" >/dev/null ||
+  fail "--lan server did not start"
+
+# One request helper for every --lan HTTP probe (method + host + optional
+# origin + optional json body).
+lan_req() { # lan_req <method> <path> <host> [origin] [json-body]
+  local method=$1 path=$2 host=$3 origin=${4:-} body=${5:-}
+  local args=(-s -o /dev/null -w '%{http_code}' -X "$method" -H "Host: $host")
+  [ -n "$origin" ] && args+=(-H "Origin: $origin")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" "http://127.0.0.1:$LAN_PORT$path"
 }
-[ "$(lan_status "/api/projects" 'evil.example')" = "200" ] ||
+
+[ "$(lan_req GET "/api/projects" 'evil.example')" = "200" ] ||
   fail "--lan: normal route must accept any Host (global check skipped)"
-[ "$(lan_status "/api/projects/$P/agents" 'evil.example')" = "403" ] ||
-  fail "--lan: agent route must reject a foreign Host (rebinding defense)"
-[ "$(lan_status "/api/projects/$P/agents" "127.0.0.1:$LAN_PORT")" = "200" ] ||
+[ "$(lan_req GET "/api/projects/$P/agents" 'evil.example')" = "403" ] ||
+  fail "--lan: agent route must reject a DNS-name Host (rebinding defense)"
+# The rebinding-shaped Host a real browser sends includes the page's port —
+# pin it so a port-suffix-only reimplementation can't sneak past.
+[ "$(lan_req GET "/api/projects/$P/agents" "evil.example:$LAN_PORT")" = "403" ] ||
+  fail "--lan: agent route must reject a DNS-name Host even on our port (rebinding defense)"
+[ "$(lan_req GET "/api/projects/$P/agents" "127.0.0.1:$LAN_PORT")" = "200" ] ||
   fail "--lan: agent route must accept a local Host"
+[ "$(lan_req GET "/api/projects/$P/agents" "192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: agent route must accept an IP-literal Host (remote browser by IP)"
+[ "$(lan_req GET "/api/projects/$P/agents" '192.0.2.7:999')" = "403" ] ||
+  fail "--lan: agent route must reject an IP Host on a foreign port"
+[ "$(lan_req GET "/api/projects/$P/agents" "192.0.2.7:$LAN_PORT" "http://192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: agent route must accept an Origin matching the Host (remote UI page)"
+[ "$(lan_req GET "/api/projects/$P/agents" "192.0.2.7:$LAN_PORT" 'https://evil.example')" = "403" ] ||
+  fail "--lan: agent route must reject a foreign Origin (cross-site defense)"
+[ "$(lan_req GET "/api/projects/$P/agents" "192.0.2.7:$LAN_PORT" "http://localhost:5173")" = "200" ] ||
+  fail "--lan: agent route must still accept a local (vite dev) Origin from a loopback peer"
+
+# local_path is an execution anchor: under --lan a rebinding page (loopback
+# peer, DNS-name Host) or a cross-site page (foreign Origin) must not be able to
+# write it — same Host/Origin discriminator as the agent routes, on top of the
+# loopback-peer requirement.
+[ "$(lan_req PATCH "/api/projects/$P" "evil.example:$LAN_PORT" '' "{\"local_path\":\"$TMP\"}")" = "403" ] ||
+  fail "--lan: local_path write must reject a DNS-name Host (rebinding defense)"
+[ "$(lan_req PATCH "/api/projects/$P" "127.0.0.1:$LAN_PORT" 'https://evil.example' "{\"local_path\":\"$TOPLEVEL\"}")" = "403" ] ||
+  fail "--lan: local_path write must reject a foreign Origin (cross-site defense)"
+[ "$(lan_req PATCH "/api/projects/$P" "127.0.0.1:$LAN_PORT" '' "{\"local_path\":\"$TOPLEVEL\"}")" = "200" ] ||
+  fail "--lan: local_path write must pass from a local client"
+[ "$(lan_req PATCH "/api/projects/$P" "evil.example:$LAN_PORT" '' '{"name":"Repo proj"}')" = "200" ] ||
+  fail "--lan: non-local_path project fields must stay writable under any Host"
+
+# The attach WebSocket shares the same gate; pin that it enforces it under --lan.
+lan_ws() { # lan_ws <path> <host> [origin]
+  local args=(-s -o /dev/null -w '%{http_code}' --max-time 3
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket'
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='
+    -H "Host: $2")
+  [ -n "${3:-}" ] && args+=(-H "Origin: $3")
+  curl "${args[@]}" "http://127.0.0.1:$LAN_PORT$1"
+}
+[ "$(lan_ws /api/agents/deadbeef/attach "192.0.2.7:$LAN_PORT" "http://192.0.2.7:$LAN_PORT")" = "101" ] ||
+  fail "--lan: attach must upgrade for an Origin matching the Host (remote UI page)"
+[ "$(lan_ws /api/agents/deadbeef/attach "192.0.2.7:$LAN_PORT" 'https://evil.example')" = "403" ] ||
+  fail "--lan: attach must refuse a foreign Origin (cross-site WS hijack)"
+[ "$(lan_ws /api/agents/deadbeef/attach 'evil.example')" = "403" ] ||
+  fail "--lan: attach must refuse a DNS-name Host (rebinding defense)"
+
 kill "$LAN_PID" 2>/dev/null; LAN_PID=""
-ok "--lan: agent routes keep a Host allowlist even though the rest of the API drops it"
+ok "--lan: agent routes + local_path writes + attach serve local/IP clients; rebinding & cross-site shapes stay 403"
 
 echo "ALL OK ($CHECKS checks)"

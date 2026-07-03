@@ -165,3 +165,19 @@ select {
 select option {
   background: var(--panel);
 }
+
+/* Mobile browsers resize 100vh under their dynamic toolbars; prefer the
+   dynamic viewport unit for viewport-bound panes where supported. */
+@supports (height: 100dvh) {
+  :root {
+    --tab-viewport-height: calc(100dvh - 18rem);
+  }
+}
+
+/* fixed background-attachment forces full repaints per scroll frame on
+   mobile (and iOS Safari ignores it); let the grid scroll with the page. */
+@media (max-width: 600px) {
+  body {
+    background-attachment: scroll;
+  }
+}

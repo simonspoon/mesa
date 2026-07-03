@@ -1,10 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createProject, listInbox, listProjects } from '../api'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
 
 // CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
 // overview (charts + KPIs); these are the table views split out beneath it.
+// Phone-width check (matches the @media blocks in App.css): below this the
+// expanded sidebar overlays the content as a drawer, so it starts collapsed
+// and closes itself after navigation.
+const isPhone = () => window.matchMedia('(max-width: 600px)').matches
+
 const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
   { tab: 'skills-agents', label: 'Skills / Agents', hash: '#/cc/skills-agents' },
   { tab: 'projects', label: 'Projects', hash: '#/cc/projects' },
@@ -50,7 +55,17 @@ export function Sidebar({
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
   // Full-sidebar collapse: hides the whole nav to give the main content area
   // the extra width, leaving only a thin re-expand handle.
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed, setCollapsed] = useState(isPhone)
+
+  // On phones the expanded sidebar is an overlay drawer; close it once the
+  // user has picked a destination so it doesn't sit over the new page.
+  useEffect(() => {
+    const onNav = () => {
+      if (isPhone()) setCollapsed(true)
+    }
+    window.addEventListener('hashchange', onNav)
+    return () => window.removeEventListener('hashchange', onNav)
+  }, [])
 
   if (collapsed) {
     return (

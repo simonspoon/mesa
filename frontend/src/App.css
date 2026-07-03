@@ -399,6 +399,8 @@ main {
   display: flex;
   gap: 0.5rem;
   margin: 1rem 0;
+  /* Five view tabs outgrow a phone screen; wrap instead of overflowing. */
+  flex-wrap: wrap;
 }
 
 .tabs button {
@@ -1753,4 +1755,132 @@ main {
   min-height: 0;
   padding: 0.4rem;
   overflow: hidden;
+}
+
+/* ---- narrow screens (task 191: mobile support) ----
+   Kept at the end of the file so these override the desktop rules above at
+   equal specificity. Two tiers: ≤860px (narrow/tablet) and ≤600px (phone). */
+
+@media (max-width: 860px) {
+  .kanban {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* The right-hand editor column (task panel, frame editor) is wider than the
+     screen here; present it as a bottom sheet over the content instead. Both
+     panels already carry a close control. Also overrides the static panel of
+     the expanded storyboard (z-index 1000). */
+  .side-panel,
+  .storyboard.expanded .side-panel {
+    position: fixed;
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    height: auto;
+    max-height: 70vh;
+    overflow-y: auto;
+    z-index: 1100;
+    clip-path: none;
+    border: none;
+    border-top: 1px solid var(--border-bright);
+    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
+  }
+
+  /* Agents tab: terminal keeps the viewport-bound box, session list flows
+     beneath it instead of squeezing it from the right. */
+  .agents-layout {
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+
+  .agents-main {
+    flex: none;
+    height: var(--tab-viewport-height);
+    min-height: var(--tab-viewport-min);
+  }
+
+  .agents-subnav {
+    width: auto;
+    overflow-y: visible;
+    padding-left: 0;
+    border-left: none;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+}
+
+@media (max-width: 600px) {
+  :root {
+    /* Header + tabs + chrome are tighter on a phone; let viewport-bound panes
+       (storyboard canvas, agents terminal) fit without forcing page scroll. */
+    --tab-viewport-min: 16rem;
+  }
+
+  header {
+    padding: 0.5rem 0.75rem;
+  }
+
+  main {
+    padding: 0.75rem 0.75rem 3rem;
+  }
+
+  h1 {
+    font-size: 1.2rem;
+  }
+
+  /* The expanded sidebar overlays the page as a drawer (it starts collapsed
+     on phones and closes itself after navigation — Sidebar.tsx); the
+     collapsed rail stays in-flow so the reopen handle is always visible. */
+  .sidebar:not(.collapsed) {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(16rem, 85vw);
+    min-height: 0;
+    overflow-y: auto;
+    z-index: 1200;
+    background: rgba(6, 10, 16, 0.97);
+    border-right: 1px solid var(--border-bright);
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.6);
+  }
+
+  .kanban {
+    grid-template-columns: 1fr;
+  }
+
+  .kanban-column {
+    min-height: 4rem;
+  }
+
+  .side-panel,
+  .storyboard.expanded .side-panel {
+    max-height: 80vh;
+  }
+
+  .cc-dashboard-page {
+    padding: 0.75rem 0.75rem 3rem;
+  }
+
+  /* Wide tables (sessions, skills) scroll inside their panel, not the page. */
+  .cc-panel {
+    overflow-x: auto;
+  }
+
+  /* History rows carry fixed-width timestamp/actor columns; let them wrap. */
+  .history-list li {
+    flex-wrap: wrap;
+  }
+
+  .history-at,
+  .history-actor {
+    width: auto;
+  }
+
+  .canvas-controls {
+    width: 8rem;
+  }
 }

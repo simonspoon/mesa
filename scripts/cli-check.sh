@@ -292,6 +292,18 @@ MESA_DB="$RDB" run 1 "$MESA" project resolve "$TMP"
 [ "$(jqe .error.code)" = "validation" ] || fail "resolve non-git: error.code=validation"
 ok "resolve: non-git path errors validation"
 
+# --path <dir> detects the auto-bound root commit from <dir>, not from the cwd
+# repo (regression: used to bind whatever repo the command happened to run in).
+REPO2="$TMP/repo2"
+mkdir -p "$REPO2"
+git -C "$REPO2" init -q
+# distinct message so this root commit can't hash-collide with $REPO's
+git -C "$REPO2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init2
+RC2=$(git -C "$REPO2" rev-list --max-parents=0 --reverse HEAD | head -1)
+MESA_DB="$RDB" run 0 "$MESA" project create "Path proj" --path "$REPO2"
+[ "$(jqs .root_commit)" = "$RC2" ] || fail "create --path: root commit from --path dir, not cwd"
+ok "create --path: auto-binds the --path directory's repo"
+
 # Drop the extra projects so the delete/backup assertions below (which assume
 # only P and P2 exist) remain valid.
 run 0 "$MESA" project delete "$P3"

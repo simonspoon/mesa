@@ -122,26 +122,29 @@ EXAMPLES
   mesa project create \"Website redesign\"
   mesa project create \"API v2\" --description \"second public API\"
 
-By default the current directory's git repo is bound to the new project via its
-root (first) commit hash, so every clone/worktree of the same source later
-resolves here (see `mesa project resolve`). Binding a commit already held by
-another project fails with `conflict`. Use --no-git to skip, or --root-commit to
-bind an explicit hash instead of detecting it.")]
+By default the current directory's git repo (or the --path directory's, when
+given) is bound to the new project via its root (first) commit hash, so every
+clone/worktree of the same source later resolves here (see `mesa project
+resolve`). Binding a commit already held by another project fails with
+`conflict`. Use --no-git to skip, or --root-commit to bind an explicit hash
+instead of detecting it.")]
     Create {
         /// Project name
         name: String,
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
-        /// Bind this exact root commit hash instead of detecting it from cwd
+        /// Bind this exact root commit hash instead of detecting it from
+        /// cwd/--path
         #[arg(long, conflicts_with = "no_git")]
         root_commit: Option<String>,
         /// Do not bind any repo to the project
         #[arg(long)]
         no_git: bool,
         /// Record this directory as the project's working folder (anchors the
-        /// Agents surface). Default: the cwd repo's toplevel when auto-binding
-        /// git; none otherwise.
+        /// Agents surface); the auto-detected root commit comes from its repo,
+        /// not cwd's. Default: the cwd repo's toplevel when auto-binding git;
+        /// none otherwise.
         #[arg(long)]
         path: Option<PathBuf>,
     },
@@ -1118,7 +1121,9 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 // "" means "no binding", mirroring `update --root-commit ""`.
                 match root_commit {
                     Some(hash) => clear_if_empty(hash),
-                    None => git_root_commit(None),
+                    // --path names the project's repo, so the identity is
+                    // detected there, not from whatever cwd ran the command.
+                    None => git_root_commit(path.as_deref()),
                 }
             };
             let local_path = match &path {

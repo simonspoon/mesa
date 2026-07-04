@@ -134,6 +134,35 @@ pub struct ProjectAgents {
     pub agents: Vec<AgentSession>,
 }
 
+/// Working-tree git status of one repo folder (see `core::git`). Decorative
+/// sidebar data: absence (no repo, no git) is represented by omission, not by
+/// a degenerate value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitStatus {
+    /// Current branch name; short commit id when HEAD is detached.
+    pub branch: String,
+    /// Changed + untracked + conflicted paths (working tree and index).
+    #[ts(type = "number")]
+    pub dirty: i64,
+    /// Commits ahead of upstream; 0 when no upstream is set.
+    #[ts(type = "number")]
+    pub ahead: i64,
+    /// Commits behind upstream; 0 when no upstream is set.
+    #[ts(type = "number")]
+    pub behind: i64,
+}
+
+/// One row of `GET /api/git-status`: the status of one project's
+/// `local_path`. Projects without a live repo folder are omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectGitStatus {
+    #[ts(type = "number")]
+    pub project_id: i64,
+    pub git: GitStatus,
+}
+
 /// Receipt for a newly started background session: the short job id usable
 /// with `claude attach/logs/stop` and the attach WebSocket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

@@ -12,6 +12,7 @@ import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
 import type { Post } from './types/Post'
 import type { ProjectAgents } from './types/ProjectAgents'
+import type { ProjectGitStatus } from './types/ProjectGitStatus'
 import type { PostSummary } from './types/PostSummary'
 import type { PostThread } from './types/PostThread'
 import type { Priority } from './types/Priority'
@@ -183,6 +184,11 @@ export function deleteTask(id: number): Promise<Task[]> {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+/** Git status of each project's local_path; projects without a repo omitted. */
+export function getGitStatus(): Promise<ProjectGitStatus[]> {
+  return request('/api/git-status')
 }
 
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----

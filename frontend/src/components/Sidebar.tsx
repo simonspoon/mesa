@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { createProject, listInbox, listProjects, listTasks } from '../api'
+import { createProject, getGitStatus, listInbox, listProjects, listTasks } from '../api'
+import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
 
@@ -27,6 +28,23 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
  * inbox count live-polls so the badge of items needing triage stays current as
  * agents send.
  */
+/**
+ * One-line git summary under a project name: branch, a dirty marker with the
+ * changed-path count, and ahead/behind arrows when an upstream is set.
+ * Renders nothing when the project has no live repo.
+ */
+function GitLine({ git }: { git: GitStatus | undefined }) {
+  if (!git) return null
+  return (
+    <span className="nav-git">
+      <span className="nav-git-branch">{git.branch}</span>
+      {git.dirty > 0 && <span className="nav-git-dirty">±{git.dirty}</span>}
+      {git.ahead > 0 && <span>↑{git.ahead}</span>}
+      {git.behind > 0 && <span>↓{git.behind}</span>}
+    </span>
+  )
+}
+
 export function Sidebar({
   activeProjectId,
   inboxActive,
@@ -57,6 +75,15 @@ export function Sidebar({
   const todoCounts = new Map<number, number>()
   for (const t of todos ?? []) {
     todoCounts.set(t.project_id, (todoCounts.get(t.project_id) ?? 0) + 1)
+  }
+  // Git status per project (branch + dirty/ahead/behind) under each name.
+  // Server caches per folder, so a slower poll than the badges is plenty.
+  const { data: gitStatuses } = useFetch(() => getGitStatus(), 'git-nav', {
+    pollMs: 10000,
+  })
+  const gitByProject = new Map<number, GitStatus>()
+  for (const g of gitStatuses ?? []) {
+    gitByProject.set(g.project_id, g.git)
   }
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
@@ -167,6 +194,7 @@ export function Sidebar({
                         {todoCounts.get(p.id)}
                       </span>
                     )}
+                    <GitLine git={gitByProject.get(p.id)} />
                   </a>
                 </li>
               ))}

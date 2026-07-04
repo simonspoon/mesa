@@ -36,8 +36,8 @@ use serde_json::json;
 
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
-    PostPatch, Priority, ProjectAgents, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch,
-    TaskSummary, agents, hooks,
+    GitStatus, PostPatch, Priority, ProjectAgents, ProjectGitStatus, ProjectPatch, Status, Store,
+    StoryboardPatch, TaskPatch, TaskSummary, agents, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -78,6 +78,12 @@ struct AppState {
     /// window. A project that changes `local_path` orphans its old key; the
     /// insert path caps the map so those can't grow without bound.
     agents_cache: Arc<Mutex<HashMap<String, (Instant, Vec<AgentSession>)>>>,
+    /// Working-tree git status per project folder, keyed by `local_path`
+    /// (sidebar decoration). `None` is a cached miss — a folder that is not a
+    /// repo — so non-repo paths don't respawn git on every poll. Same
+    /// shape/TTL rationale as `agents_cache`: collapse concurrent polls into
+    /// one subprocess per folder per window.
+    git_cache: Arc<Mutex<HashMap<String, (Instant, Option<GitStatus>)>>>,
     /// Bumped whenever a spawn invalidates the list cache. A concurrent list
     /// whose subprocess started before the spawn checks this before caching,
     /// so it can't reinsert a pre-spawn snapshot after the invalidation and
@@ -100,6 +106,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         usage_refreshing: Arc::new(AtomicBool::new(false)),
         agents_cache: Arc::new(Mutex::new(HashMap::new())),
         agents_gen: Arc::new(AtomicU64::new(0)),
+        git_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -177,6 +184,9 @@ fn router(state: AppState) -> Router {
             get(list_project_agents).post(spawn_project_agent),
         )
         .route("/api/agents/{id}/attach", get(attach_agent))
+        // Sidebar decoration: working-tree git status of each project's
+        // `local_path`. Read-only external state (shells `git status`).
+        .route("/api/git-status", get(get_git_status))
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -1045,6 +1055,60 @@ struct AttachQuery {
 /// polls — multiple tabs or clients on the same folder within the window — into
 /// one subprocess, not to skip a lone tab's polls.
 const AGENTS_TTL: Duration = Duration::from_secs(2);
+
+/// How long one folder's git status is reused. The sidebar polls every 10s
+/// from possibly several tabs; `git status` walks the whole working tree, so
+/// unlike AGENTS_TTL this also skips a lone tab's back-to-back polls.
+const GIT_TTL: Duration = Duration::from_secs(5);
+
+/// Working-tree git status for every project whose `local_path` is a live
+/// git repo; other projects are omitted (no repo folder is not an error —
+/// this is sidebar decoration, so the poll must stay quiet). Like the agents
+/// list this reads external state, but it is plain read-only data — no code
+/// execution — so it sits behind the global guard only, like the project
+/// list that already exposes `local_path` itself.
+async fn get_git_status(State(state): State<AppState>) -> ApiResult<Response> {
+    let projects = state.store.lock().unwrap().list_projects()?;
+    let mut rows = Vec::new();
+    for p in projects {
+        let Some(path) = p.local_path else { continue };
+        if !std::path::Path::new(&path).is_dir() {
+            continue;
+        }
+        let cached = {
+            let cache = state.git_cache.lock().unwrap();
+            cache
+                .get(&path)
+                .filter(|(at, _)| at.elapsed() < GIT_TTL)
+                .map(|(_, s)| s.clone())
+        };
+        let status = match cached {
+            Some(s) => s,
+            None => {
+                // Blocking subprocess (like the agents list) — keep it off
+                // the async workers. A panic just means "no status this poll".
+                let dir = path.clone();
+                let s = tokio::task::spawn_blocking(move || git::status_of(&dir))
+                    .await
+                    .unwrap_or(None);
+                let mut cache = state.git_cache.lock().unwrap();
+                // Cap stale keys from renamed local_paths (mirrors agents_cache).
+                if cache.len() >= 64 {
+                    cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+                }
+                cache.insert(path, (Instant::now(), s.clone()));
+                s
+            }
+        };
+        if let Some(git) = status {
+            rows.push(ProjectGitStatus {
+                project_id: p.id,
+                git,
+            });
+        }
+    }
+    Ok(Json(rows).into_response())
+}
 
 /// Terminal access is code execution on this machine — a strictly stronger
 /// capability than the task CRUD the rest of the API exposes. In default

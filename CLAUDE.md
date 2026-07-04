@@ -133,7 +133,11 @@ invariants you must not break — read them before changing `src/`:
   repo share a `root_commit` and resolve to the same project, so overwriting on
   every resolve would let them thrash the anchor — the first still-present
   checkout stays it; a moved/deleted one re-anchors to the live checkout. It
-  anchors the Agents surface (see below).
+  anchors the Agents surface (see below). The web UI sidebar also decorates
+  each project with the working-tree git status of its `local_path`
+  (`GET /api/git-status`, `src/core/git.rs` — a read-only shell-out to
+  `git status --porcelain=v2 --branch`, cached 5s per folder; projects
+  without a live repo are omitted, never errors).
 
 ### Storyboards (freeform visual canvas)
 

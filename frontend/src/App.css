@@ -161,9 +161,30 @@ header {
 .nav-projects a {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  /* wrap so the full-width git line lands under the name + badge row */
+  flex-wrap: wrap;
+  gap: 0 0.4rem;
   padding: 0.25rem 0.5rem;
   border-left: 2px solid transparent;
+}
+
+/* Git status under the project name: quiet telemetry, not a call to action. */
+.nav-git {
+  flex-basis: 100%;
+  display: flex;
+  gap: 0.5em;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: inherit;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+.nav-git-branch {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nav-git-dirty {
+  color: var(--amber);
 }
 .nav-project-name {
   flex: 1;

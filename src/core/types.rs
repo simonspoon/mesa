@@ -163,6 +163,54 @@ pub struct ProjectGitStatus {
     pub git: GitStatus,
 }
 
+/// One changed/untracked/conflicted path from `git status --porcelain=v2`
+/// (see `core::git::view_of`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitFile {
+    /// Two-char XY status pair, verbatim from porcelain v2:
+    /// '1' lines → XY (e.g. "M.", ".M", "MM"), '2' lines → XY (e.g. "R."),
+    /// '?' lines → "??", 'u' lines → XY (e.g. "UU").
+    /// X = staged column, Y = unstaged column, '.' = unchanged.
+    pub status: String,
+    /// Current path (rename target for '2' lines).
+    pub path: String,
+    /// Rename/copy source path ('2' lines only), else None.
+    pub orig_path: Option<String>,
+}
+
+/// The live repo behind a project's `local_path`: the sidebar summary plus
+/// the per-file change list (see `core::git::view_of`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitRepoView {
+    /// Reuses the existing GitStatus (branch, dirty, ahead, behind).
+    pub status: GitStatus,
+    /// Same order git printed them (stable enough; UI does not re-sort).
+    pub files: Vec<GitFile>,
+}
+
+/// `GET /api/projects/{id}/git` response. Mirrors ProjectAgents' empty-state
+/// pattern: path null = no local_path; path set + repo null = folder gone
+/// or not a git repo. Never an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectGitView {
+    pub path: Option<String>,
+    pub repo: Option<GitRepoView>,
+}
+
+/// `GET /api/projects/{id}/git/diff` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitFileDiff {
+    pub path: String,
+    /// Unified diff, plain text, possibly "" (no content change, or the
+    /// underlying git call failed — quiet, never an error). Binary files
+    /// carry git's own "Binary files ... differ" line.
+    pub diff: String,
+}
+
 /// Receipt for a newly started background session: the short job id usable
 /// with `claude attach/logs/stop` and the attach WebSocket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

@@ -452,14 +452,18 @@ enum PostCmd {
 EXAMPLES
   mesa post create --project 1 \"WAL mode fixed the SQLITE_BUSY errors\" \\
     --title \"Concurrency fix\" --tag finding --author agent-7
-  mesa post create --project 1 \"Anyone know why the build embeds dist?\" --tag question")]
+  mesa post create --project 1 \"Anyone know why the build embeds dist?\" --tag question
+  mesa post create --project 1 --body-file findings.md --tag finding   # body from a file")]
     Create {
         /// Project the post belongs to, by id or name (immutable after creation)
         #[arg(long)]
         project: String,
         /// The message body (markdown by convention)
-        #[arg(allow_hyphen_values = true)]
-        body: String,
+        #[arg(allow_hyphen_values = true, required_unless_present = "body_file")]
+        body: Option<String>,
+        /// Read the body from a file (`-` = stdin); conflicts with the positional body
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<String>,
         /// Optional one-line title
         #[arg(long)]
         title: Option<String>,
@@ -482,8 +486,11 @@ EXAMPLES
         /// Id of the post being replied to (a top-level post)
         parent: i64,
         /// The reply body (markdown by convention)
-        #[arg(allow_hyphen_values = true)]
-        body: String,
+        #[arg(allow_hyphen_values = true, required_unless_present = "body_file")]
+        body: Option<String>,
+        /// Read the body from a file (`-` = stdin); conflicts with the positional body
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<String>,
         /// Optional one-line title
         #[arg(long)]
         title: Option<String>,
@@ -1460,29 +1467,40 @@ fn run_post(cmd: PostCmd) -> Result<()> {
         PostCmd::Create {
             project,
             body,
+            body_file,
             title,
             tag,
             author,
-        } => print_json(&store.create_post(
-            resolve_project(&store, &project)?,
-            author.as_deref(),
-            title.as_deref(),
-            tag.as_deref(),
-            &body,
-        )?),
+        } => {
+            let mut stdin_used = false;
+            // clap enforces exactly one of the positional body / --body-file.
+            let body = resolve_field(body, body_file, &mut stdin_used)?.unwrap_or_default();
+            print_json(&store.create_post(
+                resolve_project(&store, &project)?,
+                author.as_deref(),
+                title.as_deref(),
+                tag.as_deref(),
+                &body,
+            )?)
+        }
         PostCmd::Reply {
             parent,
             body,
+            body_file,
             title,
             tag,
             author,
-        } => print_json(&store.reply_to_post(
-            parent,
-            author.as_deref(),
-            title.as_deref(),
-            tag.as_deref(),
-            &body,
-        )?),
+        } => {
+            let mut stdin_used = false;
+            let body = resolve_field(body, body_file, &mut stdin_used)?.unwrap_or_default();
+            print_json(&store.reply_to_post(
+                parent,
+                author.as_deref(),
+                title.as_deref(),
+                tag.as_deref(),
+                &body,
+            )?)
+        }
         PostCmd::List {
             project,
             tag,

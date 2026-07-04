@@ -410,6 +410,23 @@ EXAMPLES
         /// Task id; omit for every task's events
         id: Option<i64>,
     },
+    /// Fire the task-execute hook for a task; prints the run outcome
+    ///
+    /// Runs the shell command configured under "task-execute" in the hooks
+    /// file (hooks.json beside the database; MESA_HOOKS_FILE overrides) with
+    /// the full task JSON on stdin, MESA_HOOK/MESA_TASK_ID/MESA_TASK_TITLE/
+    /// MESA_PROJECT_ID/MESA_DB in the environment, and the project's
+    /// local_path as the working directory when set. The hook's own exit code
+    /// lands in `exit_code` — a nonzero hook still exits 0 here. No hook
+    /// configured is an error (code "validation").
+    #[command(after_help = "\
+EXAMPLES
+  echo '{\"task-execute\": \"say \\\"executing task $MESA_TASK_ID\\\"\"}' > ~/'Library/Application Support/mesa/hooks.json'
+  mesa task execute 3")]
+    Execute {
+        /// Task id
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1257,6 +1274,27 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
         TaskCmd::Block { id, by } => print_json(&store.add_dependency(id, by)?),
         TaskCmd::Unblock { id, on } => print_json(&store.remove_dependency(id, on)?),
         TaskCmd::Events { id } => print_json(&store.list_events(id)?),
+        TaskCmd::Execute { id } => {
+            let task = store.get_task(id)?;
+            let project_dir = store.get_project(task.project_id)?.local_path;
+            let command = crate::core::hooks::command_for(crate::core::hooks::TASK_EXECUTE)
+                .map_err(Error::Validation)?
+                .ok_or_else(|| {
+                    Error::Validation(format!(
+                        "no task-execute hook configured; add {{\"task-execute\": \"<command>\"}} to {}",
+                        crate::core::hooks::hooks_file().display()
+                    ))
+                })?;
+            match crate::core::hooks::run_task_execute(&command, &task, project_dir.as_deref()) {
+                Ok(run) => print_json(&run),
+                // A shell that cannot spawn is an upstream failure, like a
+                // dead usage endpoint: code "unavailable", exit 1.
+                Err(message) => {
+                    print_error("unavailable", &message);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     Ok(())
 }

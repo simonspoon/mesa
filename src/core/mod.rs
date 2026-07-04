@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod cc;
+pub mod hooks;
 mod store;
 mod types;
 pub mod usage;
@@ -11,6 +12,7 @@ pub use store::{
 pub use types::{
     AgentSession, AgentSpawned, CcAgentStat, CcDashboard, CcDayPoint, CcModelStat, CcOverview,
     CcProjectStat, CcSessionRow, CcSkillStat, CcTokens, CcUsage, CcUsageExtra, CcUsageWindow,
-    Dependency, Frame, FrameEdge, InboxItem, Post, PostSummary, PostThread, Priority, Project,
+    Dependency, Frame, FrameEdge, HookRun, InboxItem, Post, PostSummary, PostThread, Priority,
+    Project,
     ProjectAgents, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
 };

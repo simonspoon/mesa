@@ -37,7 +37,7 @@ use serde_json::json;
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
     PostPatch, Priority, ProjectAgents, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch,
-    TaskSummary, agents,
+    TaskSummary, agents, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -136,6 +136,10 @@ fn router(state: AppState) -> Router {
             "/api/tasks/{id}",
             get(show_task).patch(update_task).delete(delete_task),
         )
+        // Fires the user-configured task-execute hook (a shell command from
+        // the local hooks.json) — code execution, so it shares the agents'
+        // mode-dependent access gate.
+        .route("/api/tasks/{id}/execute", post(execute_task))
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
@@ -522,6 +526,50 @@ async fn update_task(
 async fn delete_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_task(id)?).into_response())
+}
+
+/// Fires the task-execute hook for one task (the UI's Execute button): the
+/// shell command configured in the local hooks.json, run with the task JSON
+/// on stdin from the project's `local_path`. Triggering local code execution
+/// is the agents' capability class, so it shares `require_agent_access`. The
+/// hook's own exit code is data in the 200 response; no hook configured is
+/// 422, a shell that cannot spawn is 502 `unavailable`.
+async fn execute_task(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let (task, project_dir) = {
+        let store = state.store.lock().unwrap();
+        let task = store.get_task(id)?;
+        let dir = store.get_project(task.project_id)?.local_path;
+        (task, dir)
+    };
+    let command = hooks::command_for(hooks::TASK_EXECUTE)
+        .map_err(|message| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        })?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "no task-execute hook configured; add {{\"task-execute\": \"<command>\"}} to {}",
+                hooks::hooks_file().display()
+            ),
+        })?;
+    // The hook is an arbitrary blocking subprocess; keep it off the async
+    // workers like the agents/usage shell-outs.
+    let run = tokio::task::spawn_blocking(move || {
+        hooks::run_task_execute(&command, &task, project_dir.as_deref())
+    })
+    .await
+    .map_err(|e| agents_unavailable(format!("hook run panicked: {e}")))?
+    .map_err(agents_unavailable)?;
+    Ok(Json(run).into_response())
 }
 
 /// Lists the full task objects this task is directly blocked by.

@@ -8,6 +8,7 @@ import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
+import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
 import type { Post } from './types/Post'
 import type { ProjectAgents } from './types/ProjectAgents'
@@ -164,6 +165,16 @@ export function createTask(body: TaskCreate): Promise<Task> {
 
 export function updateTask(id: number, patch: TaskPatch): Promise<Task> {
   return request(`/api/tasks/${id}`, jsonInit('PATCH', patch))
+}
+
+/**
+ * Fires the task-execute hook (the shell command configured in the server's
+ * local hooks.json). Resolves to the captured run — a nonzero exit_code is
+ * carried inside, not thrown. Rejects with `validation` when no hook is
+ * configured. Loopback/LAN-page gated like the agents endpoints.
+ */
+export function executeTask(id: number): Promise<HookRun> {
+  return request(`/api/tasks/${id}/execute`, jsonInit('POST', {}))
 }
 
 /** Returns the destroyed records: the task plus all cascaded subtasks. */

@@ -142,6 +142,24 @@ pub struct AgentSpawned {
     pub id: String,
 }
 
+/// The captured outcome of one hook command run (see `core::hooks`). A
+/// nonzero `exit_code` is the hook's own result, not a transport failure —
+/// the CLI and API report it inside this object with a success status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct HookRun {
+    /// Hook point name, e.g. "task-execute".
+    pub hook: String,
+    /// The configured shell command that ran.
+    pub command: String,
+    /// Process exit code; -1 when the hook was killed by a signal.
+    pub exit_code: i32,
+    /// Captured stdout, truncated to 64 KiB.
+    pub stdout: String,
+    /// Captured stderr, truncated to 64 KiB.
+    pub stderr: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct Task {

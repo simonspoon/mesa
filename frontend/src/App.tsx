@@ -11,7 +11,8 @@ import { useFetch } from './useFetch'
 // #/projects/:id/tasks/:tid (task open in the side panel),
 // #/projects/:id/storyboards, #/projects/:id/storyboards/:sid,
 // #/projects/:id/posts, #/projects/:id/posts/:pid (bulletin board),
-// #/projects/:id/agents (live Claude Code sessions + embedded terminal).
+// #/projects/:id/agents (live Claude Code sessions + embedded terminal),
+// #/projects/:id/git (working-tree status + per-file diffs).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -55,6 +56,7 @@ function App() {
   const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)
   const postListMatch = /^\/projects\/(\d+)\/posts$/.exec(path)
   const agentsMatch = /^\/projects\/(\d+)\/agents$/.exec(path)
+  const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
   const activeProjectId = storyboardMatch
@@ -67,9 +69,11 @@ function App() {
           ? Number(postListMatch[1])
           : agentsMatch
             ? Number(agentsMatch[1])
-            : projectMatch
-              ? Number(projectMatch[1])
-              : null
+            : gitMatch
+              ? Number(gitMatch[1])
+              : projectMatch
+                ? Number(projectMatch[1])
+                : null
 
   let page
   if (inboxMatch) {
@@ -91,6 +95,7 @@ function App() {
         posts={false}
         postId={null}
         agents={false}
+        git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -105,6 +110,7 @@ function App() {
         posts={false}
         postId={null}
         agents={false}
+        git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -119,6 +125,7 @@ function App() {
         posts
         postId={Number(postMatch[2])}
         agents={false}
+        git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -133,6 +140,7 @@ function App() {
         posts
         postId={null}
         agents={false}
+        git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -147,6 +155,22 @@ function App() {
         posts={false}
         postId={null}
         agents
+        git={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (gitMatch) {
+    // Working-tree git view, in place inside the project page frame.
+    page = (
+      <ProjectTasksPage
+        projectId={Number(gitMatch[1])}
+        taskId={null}
+        storyboards={false}
+        storyboardId={null}
+        posts={false}
+        postId={null}
+        agents={false}
+        git
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -160,6 +184,7 @@ function App() {
         posts={false}
         postId={null}
         agents={false}
+        git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )

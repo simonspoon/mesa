@@ -8,11 +8,13 @@ import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
+import type { GitFileDiff } from './types/GitFileDiff'
 import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
 import type { Post } from './types/Post'
 import type { ProjectAgents } from './types/ProjectAgents'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
+import type { ProjectGitView } from './types/ProjectGitView'
 import type { PostSummary } from './types/PostSummary'
 import type { PostThread } from './types/PostThread'
 import type { Priority } from './types/Priority'
@@ -189,6 +191,28 @@ export function deleteTask(id: number): Promise<Task[]> {
 /** Git status of each project's local_path; projects without a repo omitted. */
 export function getGitStatus(): Promise<ProjectGitStatus[]> {
   return request('/api/git-status')
+}
+
+/**
+ * Working-tree view of the project's local_path repo: branch summary plus the
+ * changed/untracked file list. Empty states are data, never errors:
+ * path null = no local_path; path set + repo null = folder gone / not a repo.
+ */
+export function getProjectGit(id: number): Promise<ProjectGitView> {
+  return request(`/api/projects/${id}/git`)
+}
+
+/**
+ * Unified diff (vs HEAD; untracked files as all-added) for one path from the
+ * status list. Non-listed paths are 404 — the UI only asks for listed files.
+ */
+export function getProjectGitDiff(
+  id: number,
+  path: string,
+): Promise<GitFileDiff> {
+  return request(
+    `/api/projects/${id}/git/diff?path=${encodeURIComponent(path)}`,
+  )
 }
 
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----

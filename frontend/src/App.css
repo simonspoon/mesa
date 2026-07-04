@@ -439,7 +439,7 @@ main {
   display: flex;
   gap: 0.5rem;
   margin: 1rem 0;
-  /* Five view tabs outgrow a phone screen; wrap instead of overflowing. */
+  /* Six view tabs outgrow a phone screen; wrap instead of overflowing. */
   flex-wrap: wrap;
 }
 
@@ -1797,6 +1797,99 @@ main {
   overflow: hidden;
 }
 
+/* ---- Git tab: changed-file list (left) + diff pane (right) ---- */
+
+.git-repo-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  margin: 0 0 0.75rem;
+}
+
+.git-branch {
+  color: var(--cyan);
+}
+
+.git-ahead,
+.git-behind {
+  color: var(--amber);
+}
+
+.git-repo-path {
+  overflow-wrap: anywhere;
+}
+
+/* Viewport-bound like the agents layout (shares --tab-viewport-*): the file
+   list and diff pane scroll internally; the page itself never scrolls. */
+.git-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: stretch;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
+}
+
+.git-file-list {
+  flex: none;
+  width: 19rem;
+  overflow-y: auto;
+  /* Paths are unbroken tokens; wrap them instead of growing a scrollbar. */
+  overflow-wrap: anywhere;
+}
+
+.git-file-list li {
+  cursor: pointer;
+}
+
+.git-file-list li.selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan-dim);
+}
+
+/* Raw porcelain-v2 XY pair ('M.', '.M', '??', …): the '.' placeholder is
+   positional, so render it verbatim in a fixed-width face. */
+.badge.git-status-badge {
+  font-family: var(--font-mono);
+  text-transform: none;
+}
+
+.git-file-path {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-h);
+}
+
+.git-file-label {
+  font-size: 0.75rem;
+  margin-top: 0.2rem;
+}
+
+.git-diff-pane {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 0.5rem 0.75rem;
+}
+
+/* Diff text is untrusted plain text: <pre> keeps it verbatim (no wrapping —
+   the pane scrolls both ways). */
+.git-diff-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.git-placeholder {
+  padding: 2rem;
+  border: 1px dashed var(--border);
+  text-align: center;
+}
+
 /* ---- narrow screens (task 191: mobile support) ----
    Kept at the end of the file so these override the desktop rules above at
    equal specificity. Two tiers: ≤860px (narrow/tablet) and ≤600px (phone). */
@@ -1849,6 +1942,23 @@ main {
     border-left: none;
     padding-top: 0.75rem;
     border-top: 1px solid var(--border);
+  }
+
+  /* Git tab: file list flows above, diff keeps a viewport-bound box below. */
+  .git-layout {
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+
+  .git-file-list {
+    width: auto;
+    overflow-y: visible;
+  }
+
+  .git-diff-pane {
+    height: var(--tab-viewport-height);
+    min-height: var(--tab-viewport-min);
   }
 }
 

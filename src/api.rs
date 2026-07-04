@@ -36,8 +36,9 @@ use serde_json::json;
 
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
-    GitStatus, PostPatch, Priority, ProjectAgents, ProjectGitStatus, ProjectPatch, Status, Store,
-    StoryboardPatch, TaskPatch, TaskSummary, agents, git, hooks,
+    GitFileDiff, GitRepoView, GitStatus, PostPatch, Priority, ProjectAgents, ProjectGitStatus,
+    ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary, agents,
+    git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -84,6 +85,12 @@ struct AppState {
     /// shape/TTL rationale as `agents_cache`: collapse concurrent polls into
     /// one subprocess per folder per window.
     git_cache: Arc<Mutex<HashMap<String, (Instant, Option<GitStatus>)>>>,
+    /// Full working-tree view (branch + changed-file list) per project folder,
+    /// keyed by `local_path` — backs the project git tab. Separate from
+    /// `git_cache` (which stores the sidebar's `GitStatus`) so the two
+    /// handlers stay decoupled; same TTL/shape rationale. `None` is a cached
+    /// miss (not a repo). Diffs are not cached — on-demand, one file, cheap.
+    git_view_cache: Arc<Mutex<HashMap<String, (Instant, Option<GitRepoView>)>>>,
     /// Bumped whenever a spawn invalidates the list cache. A concurrent list
     /// whose subprocess started before the spawn checks this before caching,
     /// so it can't reinsert a pre-spawn snapshot after the invalidation and
@@ -107,6 +114,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         agents_cache: Arc::new(Mutex::new(HashMap::new())),
         agents_gen: Arc::new(AtomicU64::new(0)),
         git_cache: Arc::new(Mutex::new(HashMap::new())),
+        git_view_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -187,6 +195,11 @@ fn router(state: AppState) -> Router {
         // Sidebar decoration: working-tree git status of each project's
         // `local_path`. Read-only external state (shells `git status`).
         .route("/api/git-status", get(get_git_status))
+        // Project git tab: working-tree view (branch + changed files) and a
+        // per-file unified diff. Read-only external state like /api/git-status,
+        // so the same standard guard only — no agent access gate.
+        .route("/api/projects/{id}/git", get(get_project_git))
+        .route("/api/projects/{id}/git/diff", get(get_project_git_diff))
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -1108,6 +1121,104 @@ async fn get_git_status(State(state): State<AppState>) -> ApiResult<Response> {
         }
     }
     Ok(Json(rows).into_response())
+}
+
+/// Resolves a project's `local_path` and the working-tree view behind it,
+/// through `git_view_cache`: `(None, None)` when no folder is linked,
+/// `(Some(path), None)` when the folder is gone or not a git repo — quiet
+/// empty shapes, never an error (agents-endpoint posture). Unknown project
+/// id still surfaces as `not_found` via `get_project`.
+async fn project_git_view(
+    state: &AppState,
+    id: i64,
+) -> ApiResult<(Option<String>, Option<GitRepoView>)> {
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let Some(path) = local_path else {
+        return Ok((None, None));
+    };
+    if !std::path::Path::new(&path).is_dir() {
+        return Ok((Some(path), None));
+    }
+    let cached = {
+        let cache = state.git_view_cache.lock().unwrap();
+        cache
+            .get(&path)
+            .filter(|(at, _)| at.elapsed() < GIT_TTL)
+            .map(|(_, v)| v.clone())
+    };
+    let view = match cached {
+        Some(v) => v,
+        None => {
+            // Blocking subprocess (like the sidebar status) — keep it off the
+            // async workers. A panic just means "no view this request".
+            let dir = path.clone();
+            let v = tokio::task::spawn_blocking(move || git::view_of(&dir))
+                .await
+                .unwrap_or(None);
+            let mut cache = state.git_view_cache.lock().unwrap();
+            // Cap stale keys from renamed local_paths (mirrors git_cache).
+            if cache.len() >= 64 {
+                cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+            }
+            cache.insert(path.clone(), (Instant::now(), v.clone()));
+            v
+        }
+    };
+    Ok((Some(path), view))
+}
+
+/// Working-tree view (branch + changed-file list) of this project's
+/// `local_path` for the git tab. Read-only external state behind the
+/// standard guard only, like `/api/git-status`.
+async fn get_project_git(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let (path, repo) = project_git_view(&state, id).await?;
+    Ok(Json(ProjectGitView { path, repo }).into_response())
+}
+
+#[derive(Deserialize)]
+struct GitDiffQuery {
+    path: Option<String>,
+}
+
+/// Unified diff for one file from the project's git status list. `?path=`
+/// must be byte-equal to a listed file's `path` (or rename `orig_path`) —
+/// git's own status output is the allowlist, so this can never read a file
+/// git didn't report (`../…`, absolute paths, and clean files are all
+/// non-members → `not_found`). A failed/empty underlying diff is `diff: ""`,
+/// never an error.
+async fn get_project_git_diff(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<GitDiffQuery>,
+) -> ApiResult<Response> {
+    let wanted = q.path.ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let (path, repo) = project_git_view(&state, id).await?;
+    let file = repo.as_ref().and_then(|r| {
+        r.files
+            .iter()
+            .find(|f| f.path == wanted || f.orig_path.as_deref() == Some(wanted.as_str()))
+    });
+    let (Some(dir), Some(file)) = (path, file) else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: format!("path not in git status: {wanted}"),
+        });
+    };
+    let untracked = file.status == "??";
+    let target = wanted.clone();
+    let diff = tokio::task::spawn_blocking(move || git::diff_of(&dir, &target, untracked))
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    Ok(Json(GitFileDiff { path: wanted, diff }).into_response())
 }
 
 /// Terminal access is code execution on this machine — a strictly stronger

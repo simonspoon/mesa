@@ -751,10 +751,28 @@ impl Store {
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
-                    Error::NotFound(format!("task {id} not found"))
+                    Error::NotFound(self.task_not_found_message(id))
                 }
                 e => Error::Db(e),
             })
+    }
+
+    /// A not-found message with a lead: the id-nearest existing task, so a
+    /// typo'd id self-corrects instead of dead-ending.
+    fn task_not_found_message(&self, id: i64) -> String {
+        let nearest = self.conn.query_row(
+            "SELECT id, title FROM tasks ORDER BY ABS(id - ?1), id LIMIT 1",
+            [id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        );
+        match nearest {
+            Ok((near_id, title)) => {
+                let short: String = title.chars().take(60).collect();
+                let ellipsis = if title.chars().count() > 60 { "…" } else { "" };
+                format!("task {id} not found; nearest existing task is {near_id} \"{short}{ellipsis}\"")
+            }
+            Err(_) => format!("task {id} not found; no tasks exist yet"),
+        }
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
@@ -2205,6 +2223,42 @@ mod tests {
         let deleted = store.delete_task(t.id).unwrap();
         assert_eq!(deleted, vec![updated]);
         assert!(matches!(store.get_task(t.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn task_not_found_message_leads_to_nearest_task() {
+        let (mut store, _dir) = temp_store();
+
+        // Empty db: no lead to give.
+        let err = store.get_task(42).unwrap_err();
+        assert!(matches!(&err, Error::NotFound(m) if m.contains("no tasks exist")));
+
+        let p = store.create_project("alpha", None, None, None).unwrap();
+        let t1 = add_task(&mut store, p.id, "close one");
+        let _t2 = add_task(&mut store, p.id, "far away");
+
+        // A typo'd id points at the id-nearest existing task.
+        let err = store.get_task(t1.id + 100).unwrap_err();
+        match &err {
+            Error::NotFound(m) => {
+                assert!(m.contains(&format!("nearest existing task is {}", t1.id + 1)));
+                assert!(m.contains("far away"));
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // Long titles are truncated in the lead.
+        let long_title = "x".repeat(200);
+        let t3 = add_task(&mut store, p.id, &long_title);
+        let err = store.get_task(t3.id + 1).unwrap_err();
+        match &err {
+            Error::NotFound(m) => {
+                assert!(m.contains(&"x".repeat(60)));
+                assert!(!m.contains(&"x".repeat(61)));
+                assert!(m.contains('…'));
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

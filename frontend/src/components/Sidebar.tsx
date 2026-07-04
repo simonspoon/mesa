@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { createProject, listInbox, listProjects } from '../api'
+import { createProject, listInbox, listProjects, listTasks } from '../api'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
 
@@ -49,6 +49,15 @@ export function Sidebar({
   const unassigned = inbox
     ? inbox.filter((i) => i.project_id === null).length
     : 0
+  // Per-project todo counts for the project rows; polls like the inbox badge
+  // so counts stay current as agents create/close tasks.
+  const { data: todos } = useFetch(() => listTasks({ status: 'todo' }), 'todo-nav', {
+    pollMs: 5000,
+  })
+  const todoCounts = new Map<number, number>()
+  for (const t of todos ?? []) {
+    todoCounts.set(t.project_id, (todoCounts.get(t.project_id) ?? 0) + 1)
+  }
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
@@ -152,7 +161,12 @@ export function Sidebar({
                     className={p.id === activeProjectId ? 'active' : ''}
                     href={`#/projects/${p.id}`}
                   >
-                    {p.name}
+                    <span className="nav-project-name">{p.name}</span>
+                    {(todoCounts.get(p.id) ?? 0) > 0 && (
+                      <span className="inbox-badge todo-badge">
+                        {todoCounts.get(p.id)}
+                      </span>
+                    )}
                   </a>
                 </li>
               ))}

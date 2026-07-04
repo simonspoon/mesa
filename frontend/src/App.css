@@ -159,12 +159,23 @@ header {
 }
 
 .nav-projects a {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   padding: 0.25rem 0.5rem;
   border-left: 2px solid transparent;
+}
+.nav-project-name {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Per-project todo count: same shape as the inbox badge, muted palette —
+   informational, not a call to action. */
+.todo-badge {
+  background: rgba(0, 229, 255, 0.14);
+  color: var(--muted);
 }
 
 .nav-projects a.active {

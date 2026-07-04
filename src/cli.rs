@@ -213,9 +213,9 @@ EXAMPLES
   mesa task create --project 1 --title \"In flight\" --status in_progress  # straight into a column
   mesa task create --project 1 --title \"Outline\" --parent 7   # subtask of task 7")]
     Create {
-        /// Project the task belongs to (immutable after creation)
+        /// Project the task belongs to, by id or name (immutable after creation)
         #[arg(long)]
-        project: i64,
+        project: String,
         /// Task title
         #[arg(long, allow_hyphen_values = true)]
         title: String,
@@ -257,9 +257,9 @@ EXAMPLES
   mesa task list --project 1 --status todo --unblocked
   mesa task list --tag writing")]
     List {
-        /// Only tasks in this project
+        /// Only tasks in this project (id or name)
         #[arg(long)]
-        project: Option<i64>,
+        project: Option<String>,
         /// Only tasks with this status: todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
@@ -284,9 +284,9 @@ EXAMPLES
   mesa task next                 # next actionable task across all projects
   mesa task next --project 1     # next actionable task in project 1")]
     Next {
-        /// Only consider tasks in this project
+        /// Only consider tasks in this project (id or name)
         #[arg(long)]
-        project: Option<i64>,
+        project: Option<String>,
     },
     /// Import a task graph from a JSON document on stdin (one transaction)
     ///
@@ -332,7 +332,12 @@ EXAMPLES
         #[arg(long, group = "fields", allow_hyphen_values = true)]
         description: Option<String>,
         /// Read the new description from a file (`-` = stdin); conflicts with --description
-        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "description")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            group = "fields",
+            conflicts_with = "description"
+        )]
         description_file: Option<String>,
         /// New status: todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status, group = "fields")]
@@ -353,7 +358,12 @@ EXAMPLES
         #[arg(long, group = "fields", allow_hyphen_values = true)]
         acceptance: Option<String>,
         /// Read the new definition-of-done from a file (`-` = stdin); conflicts with --acceptance
-        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "acceptance")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            group = "fields",
+            conflicts_with = "acceptance"
+        )]
         acceptance_file: Option<String>,
         /// New work receipt; pass "" to clear it
         #[arg(long, group = "fields")]
@@ -444,9 +454,9 @@ EXAMPLES
     --title \"Concurrency fix\" --tag finding --author agent-7
   mesa post create --project 1 \"Anyone know why the build embeds dist?\" --tag question")]
     Create {
-        /// Project the post belongs to (immutable after creation)
+        /// Project the post belongs to, by id or name (immutable after creation)
         #[arg(long)]
-        project: i64,
+        project: String,
         /// The message body (markdown by convention)
         #[arg(allow_hyphen_values = true)]
         body: String,
@@ -489,9 +499,9 @@ EXAMPLES
     /// Each entry is a compact summary with a `reply_count`; use `show` for a
     /// post's body and its replies. Filters combine (AND).
     List {
-        /// Only posts in this project
+        /// Only posts in this project (id or name)
         #[arg(long)]
-        project: Option<i64>,
+        project: Option<String>,
         /// Only posts with this exact tag
         #[arg(long)]
         tag: Option<String>,
@@ -556,9 +566,9 @@ EXAMPLES
     },
     /// List inbox items as a bare JSON array, newest first
     List {
-        /// Only items assigned to this project (default: the whole inbox)
+        /// Only items assigned to this project, by id or name (default: the whole inbox)
         #[arg(long)]
-        project: Option<i64>,
+        project: Option<String>,
     },
     /// Print one inbox item as a full JSON object
     #[command(visible_alias = "get")]
@@ -578,8 +588,8 @@ EXAMPLES
     Assign {
         /// Inbox item id
         id: i64,
-        /// Project to convert the item into a task in
-        project: i64,
+        /// Project to convert the item into a task in (id or name)
+        project: String,
     },
     /// Delete an inbox item (no confirmation); echoes the destroyed item
     Delete {
@@ -650,9 +660,9 @@ EXAMPLES
   mesa storyboard create --project 1 --title \"Onboarding flow\"
   mesa storyboard create --project 1 --title \"Checkout\" --author agent-7")]
     Create {
-        /// Project the storyboard belongs to (immutable after creation)
+        /// Project the storyboard belongs to, by id or name (immutable after creation)
         #[arg(long)]
-        project: i64,
+        project: String,
         /// Storyboard title
         #[arg(long, allow_hyphen_values = true)]
         title: String,
@@ -665,9 +675,9 @@ EXAMPLES
     },
     /// List storyboards as a bare JSON array (no frames/edges; use `show`)
     List {
-        /// Only storyboards in this project
+        /// Only storyboards in this project (id or name)
         #[arg(long)]
-        project: Option<i64>,
+        project: Option<String>,
     },
     /// Print a storyboard's full contents: {storyboard, frames, edges}
     #[command(visible_alias = "get")]
@@ -914,7 +924,10 @@ fn resolve_field(
     if path == "-" {
         if *stdin_used {
             // Two fields cannot both read stdin in one call — a usage error.
-            print_error("usage", "only one field can read from stdin ('-') per invocation");
+            print_error(
+                "usage",
+                "only one field can read from stdin ('-') per invocation",
+            );
             std::process::exit(2);
         }
         *stdin_used = true;
@@ -985,6 +998,20 @@ fn canonical_dir(path: &Path) -> Result<String> {
     Ok(canon.to_string_lossy().into_owned())
 }
 
+/// Resolves a project argument — a numeric id or a project name — to the id.
+/// Anything non-numeric is looked up by name (case-insensitive exact match).
+fn resolve_project(store: &Store, arg: &str) -> Result<i64> {
+    match arg.parse::<i64>() {
+        Ok(id) => Ok(id),
+        Err(_) => Ok(store.find_project_by_name(arg)?.id),
+    }
+}
+
+/// `resolve_project` for optional filters, preserving `None`.
+fn resolve_project_opt(store: &Store, arg: Option<&str>) -> Result<Option<i64>> {
+    arg.map(|a| resolve_project(store, a)).transpose()
+}
+
 /// Compact task object for `list`: full object minus `description`.
 fn compact(t: &Task) -> serde_json::Value {
     json!({
@@ -1005,10 +1032,7 @@ fn print_json<T: serde::Serialize>(value: &T) {
 }
 
 fn print_error(code: &str, message: &str) {
-    eprintln!(
-        "{}",
-        json!({"error": {"code": code, "message": message}})
-    );
+    eprintln!("{}", json!({"error": {"code": code, "message": message}}));
 }
 
 fn error_code(err: &Error) -> &'static str {
@@ -1026,7 +1050,10 @@ pub fn run() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => {
             // --help / --version stay human text on stdout, exit 0.
-            if matches!(err.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
                 let _ = err.print();
                 return ExitCode::SUCCESS;
             }
@@ -1180,6 +1207,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             let description = resolve_field(description, description_file, &mut stdin_used)?;
             let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
             let tags = tags.map(parse_tags).unwrap_or_default();
+            let project = resolve_project(&store, &project)?;
             print_json(&store.create_task(
                 project,
                 &title,
@@ -1198,6 +1226,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             tag,
             unblocked,
         } => {
+            let project = resolve_project_opt(&store, project.as_deref())?;
             let tasks: Vec<_> = store
                 .list_tasks()?
                 .iter()
@@ -1209,19 +1238,21 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 .collect();
             print_json(&tasks);
         }
-        TaskCmd::Next { project } => match store.next_task(project)? {
-            NextResult::Task(task) => print_json(&task),
-            NextResult::None {
-                blocked,
-                in_progress,
-                todo,
-            } => print_json(&json!({
-                "next": null,
-                "blocked": blocked,
-                "in_progress": in_progress,
-                "todo": todo,
-            })),
-        },
+        TaskCmd::Next { project } => {
+            match store.next_task(resolve_project_opt(&store, project.as_deref())?)? {
+                NextResult::Task(task) => print_json(&task),
+                NextResult::None {
+                    blocked,
+                    in_progress,
+                    todo,
+                } => print_json(&json!({
+                    "next": null,
+                    "blocked": blocked,
+                    "in_progress": in_progress,
+                    "todo": todo,
+                })),
+            }
+        }
         TaskCmd::Import => {
             let mut input = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
@@ -1308,12 +1339,14 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             description,
             author,
         } => print_json(&store.create_storyboard(
-            project,
+            resolve_project(&store, &project)?,
             &title,
             description.as_deref(),
             author.as_deref(),
         )?),
-        StoryboardCmd::List { project } => print_json(&store.list_storyboards(project)?),
+        StoryboardCmd::List { project } => {
+            print_json(&store.list_storyboards(resolve_project_opt(&store, project.as_deref())?)?)
+        }
         StoryboardCmd::Show { id } => print_json(&store.get_storyboard_view(id)?),
         StoryboardCmd::Update {
             id,
@@ -1431,7 +1464,7 @@ fn run_post(cmd: PostCmd) -> Result<()> {
             tag,
             author,
         } => print_json(&store.create_post(
-            project,
+            resolve_project(&store, &project)?,
             author.as_deref(),
             title.as_deref(),
             tag.as_deref(),
@@ -1454,7 +1487,11 @@ fn run_post(cmd: PostCmd) -> Result<()> {
             project,
             tag,
             author,
-        } => print_json(&store.list_posts(project, tag.as_deref(), author.as_deref())?),
+        } => print_json(&store.list_posts(
+            resolve_project_opt(&store, project.as_deref())?,
+            tag.as_deref(),
+            author.as_deref(),
+        )?),
         PostCmd::Show { id } => print_json(&store.get_post_thread(id)?),
         PostCmd::Update {
             id,
@@ -1505,11 +1542,14 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
         InboxCmd::Add { body, author } => {
             print_json(&store.create_inbox_item(author.as_deref(), &body.join(" "))?)
         }
-        InboxCmd::List { project } => print_json(&store.list_inbox_items(project)?),
+        InboxCmd::List { project } => {
+            print_json(&store.list_inbox_items(resolve_project_opt(&store, project.as_deref())?)?)
+        }
         InboxCmd::Show { id } => print_json(&store.get_inbox_item(id)?),
         InboxCmd::Assign { id, project } => {
             // Assigning converts the item into a todo task in the project and
             // deletes it from the inbox; the created task is what we echo.
+            let project = resolve_project(&store, &project)?;
             print_json(&store.assign_inbox_item(id, project)?);
         }
         InboxCmd::Delete { id } => print_json(&store.delete_inbox_item(id)?),

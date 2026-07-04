@@ -57,7 +57,8 @@ pub fn default_db_path() -> PathBuf {
     dirs.data_dir().join("mesa.db")
 }
 
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE projects (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         name        TEXT NOT NULL,
@@ -169,7 +170,8 @@ const MIGRATIONS: &[&str] = &["
     ",
     "
     ALTER TABLE projects ADD COLUMN local_path TEXT;
-    "];
+    ",
+];
 
 /// Selects full task rows including the derived `blocked` flag.
 const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
@@ -223,7 +225,8 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
-const STORYBOARD_COLUMNS: &str = "id, project_id, title, description, author, created_at, updated_at";
+const STORYBOARD_COLUMNS: &str =
+    "id, project_id, title, description, author, created_at, updated_at";
 const FRAME_COLUMNS: &str =
     "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at";
 const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at";
@@ -249,7 +252,11 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 /// body verbatim, kept only when it carries more than the title (multi-line or
 /// truncated) so a one-line item doesn't duplicate itself.
 fn inbox_body_to_task(body: &str) -> (String, Option<String>) {
-    let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let first = body
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     let title: String = if first.chars().count() > 120 {
         first.chars().take(119).collect::<String>() + "…"
     } else {
@@ -579,9 +586,9 @@ impl Store {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {PROJECT_COLUMNS} FROM projects ORDER BY id"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY id"
+        ))?;
         let rows = stmt.query_map([], row_to_project)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -595,11 +602,39 @@ impl Store {
                 row_to_project,
             )
             .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!(
-                    "no project bound to root commit {root_commit}"
-                )),
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("no project bound to root commit {root_commit}"))
+                }
                 e => Error::Db(e),
             })
+    }
+
+    /// Resolves a project by its name (case-insensitive exact match). Project
+    /// names are not unique, so more than one match is `conflict` — the caller
+    /// must fall back to the numeric id.
+    pub fn find_project_by_name(&self, name: &str) -> Result<Project> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects WHERE name = ?1 COLLATE NOCASE ORDER BY id"
+        ))?;
+        let matches = stmt
+            .query_map([name], row_to_project)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match matches.len() {
+            0 => Err(Error::NotFound(format!(
+                "no project named {name:?}; pass a project id or an existing name \
+                 (see `mesa project list`)"
+            ))),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            _ => Err(Error::Conflict(format!(
+                "{} projects are named {name:?} (ids {}); use the id",
+                matches.len(),
+                matches
+                    .iter()
+                    .map(|p| p.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 
     /// Translates a `root_commit` unique-index violation into a clean
@@ -768,8 +803,14 @@ impl Store {
         match nearest {
             Ok((near_id, title)) => {
                 let short: String = title.chars().take(60).collect();
-                let ellipsis = if title.chars().count() > 60 { "…" } else { "" };
-                format!("task {id} not found; nearest existing task is {near_id} \"{short}{ellipsis}\"")
+                let ellipsis = if title.chars().count() > 60 {
+                    "…"
+                } else {
+                    ""
+                };
+                format!(
+                    "task {id} not found; nearest existing task is {near_id} \"{short}{ellipsis}\""
+                )
             }
             Err(_) => format!("task {id} not found; no tasks exist yet"),
         }
@@ -1387,15 +1428,16 @@ impl Store {
         let (action, summary) = if only_geometry {
             ("frame_moved", format!("moved frame '{}' (#{id})", f.title))
         } else {
-            ("frame_edited", format!("edited frame '{}' (#{id})", f.title))
+            (
+                "frame_edited",
+                format!("edited frame '{}' (#{id})", f.title),
+            )
         };
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE frames SET title = ?1, body = ?2, x = ?3, y = ?4, w = ?5, h = ?6, \
              color = ?7, task_id = ?8, updated_at = datetime('now') WHERE id = ?9",
-            rusqlite::params![
-                f.title, f.body, f.x, f.y, f.w, f.h, f.color, f.task_id, id,
-            ],
+            rusqlite::params![f.title, f.body, f.x, f.y, f.w, f.h, f.color, f.task_id, id,],
         )?;
         insert_storyboard_event(&tx, f.storyboard_id, actor, action, &summary)?;
         tx.commit()?;
@@ -1706,21 +1748,18 @@ impl Store {
                AND (?3 IS NULL OR p.author = ?3) \
              ORDER BY p.id DESC",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![project, tag, author],
-            |row| {
-                Ok(PostSummary {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    author: row.get(2)?,
-                    title: row.get(3)?,
-                    tag: row.get(4)?,
-                    reply_count: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(rusqlite::params![project, tag, author], |row| {
+            Ok(PostSummary {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                author: row.get(2)?,
+                title: row.get(3)?,
+                tag: row.get(4)?,
+                reply_count: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1895,11 +1934,10 @@ impl Store {
         )?;
         let task_id = tx.last_insert_rowid();
         // Creation event: NULL from_status -> the row's initial (default) status.
-        let initial_status: String = tx.query_row(
-            "SELECT status FROM tasks WHERE id = ?1",
-            [task_id],
-            |r| r.get(0),
-        )?;
+        let initial_status: String =
+            tx.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |r| {
+                r.get(0)
+            })?;
         tx.execute(
             "INSERT INTO task_events (task_id, from_status, to_status, at) \
              VALUES (?1, NULL, ?2, datetime('now'))",
@@ -2003,14 +2041,26 @@ mod tests {
 
     fn add_task(store: &mut Store, project_id: i64, title: &str) -> Task {
         store
-            .create_task(project_id, title, None, Priority::Medium, &[], None, None, None, None)
+            .create_task(
+                project_id,
+                title,
+                None,
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap()
     }
 
     #[test]
     fn project_crud_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("alpha", Some("first"), None, None).unwrap();
+        let p = store
+            .create_project("alpha", Some("first"), None, None)
+            .unwrap();
         assert_eq!(p.name, "alpha");
         assert_eq!(p.description.as_deref(), Some("first"));
 
@@ -2034,10 +2084,7 @@ mod tests {
         let (deleted, tasks) = store.delete_project(p.id).unwrap();
         assert_eq!(deleted, updated);
         assert!(tasks.is_empty());
-        assert!(matches!(
-            store.get_project(p.id),
-            Err(Error::NotFound(_))
-        ));
+        assert!(matches!(store.get_project(p.id), Err(Error::NotFound(_))));
     }
 
     #[test]
@@ -2077,6 +2124,26 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.local_path, None);
         assert_eq!(store.get_project(p.id).unwrap(), cleared);
+    }
+
+    #[test]
+    fn find_project_by_name_matches_case_insensitively_and_flags_ambiguity() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("Alpha", None, None, None).unwrap();
+        store.create_project("beta", None, None, None).unwrap();
+
+        assert_eq!(store.find_project_by_name("alpha").unwrap(), p);
+        assert!(matches!(
+            store.find_project_by_name("gamma"),
+            Err(Error::NotFound(_))
+        ));
+
+        // A duplicate name is ambiguous: the caller must use the id.
+        store.create_project("ALPHA", None, None, None).unwrap();
+        assert!(matches!(
+            store.find_project_by_name("alpha"),
+            Err(Error::Conflict(_))
+        ));
     }
 
     #[test]
@@ -2265,7 +2332,17 @@ mod tests {
     fn create_task_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let err = store
-            .create_task(999, "orphan", None, Priority::Medium, &[], None, None, None, None)
+            .create_task(
+                999,
+                "orphan",
+                None,
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
@@ -2298,7 +2375,17 @@ mod tests {
 
         // None preserves the schema default (todo).
         let d = store
-            .create_task(p.id, "later", None, Priority::Medium, &[], None, None, None, None)
+            .create_task(
+                p.id,
+                "later",
+                None,
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(d.status, Status::Todo);
     }
@@ -2313,7 +2400,17 @@ mod tests {
 
         // create: cross-project parent rejected
         let err = store
-            .create_task(p2.id, "sub", None, Priority::Medium, &[], Some(t1.id), None, None, None)
+            .create_task(
+                p2.id,
+                "sub",
+                None,
+                Priority::Medium,
+                &[],
+                Some(t1.id),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
@@ -2331,7 +2428,17 @@ mod tests {
 
         // same-project parent accepted, and can be detached again
         let sub = store
-            .create_task(p1.id, "sub", None, Priority::Medium, &[], Some(t1.id), None, None, None)
+            .create_task(
+                p1.id,
+                "sub",
+                None,
+                Priority::Medium,
+                &[],
+                Some(t1.id),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(sub.parent_id, Some(t1.id));
         let detached = store
@@ -2352,10 +2459,30 @@ mod tests {
         let p = store.create_project("p", None, None, None).unwrap();
         let root = add_task(&mut store, p.id, "root");
         let child = store
-            .create_task(p.id, "child", None, Priority::Medium, &[], Some(root.id), None, None, None)
+            .create_task(
+                p.id,
+                "child",
+                None,
+                Priority::Medium,
+                &[],
+                Some(root.id),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let grandchild = store
-            .create_task(p.id, "grandchild", None, Priority::Medium, &[], Some(child.id), None, None, None)
+            .create_task(
+                p.id,
+                "grandchild",
+                None,
+                Priority::Medium,
+                &[],
+                Some(child.id),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let bystander = add_task(&mut store, p.id, "bystander");
         // bystander is blocked by child; the edge must go when child goes
@@ -2380,11 +2507,23 @@ mod tests {
     #[test]
     fn delete_project_cascades_tasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("doomed", Some("desc"), None, None).unwrap();
+        let p = store
+            .create_project("doomed", Some("desc"), None, None)
+            .unwrap();
         let keep = store.create_project("keeper", None, None, None).unwrap();
         let t1 = add_task(&mut store, p.id, "one");
         let t2 = store
-            .create_task(p.id, "two", None, Priority::Medium, &[], Some(t1.id), None, None, None)
+            .create_task(
+                p.id,
+                "two",
+                None,
+                Priority::Medium,
+                &[],
+                Some(t1.id),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let survivor = add_task(&mut store, keep.id, "survivor");
 
@@ -2633,7 +2772,10 @@ mod tests {
         assert_eq!(all[0].task_id, a.id);
         assert_eq!(all[1].task_id, b.id);
         // events for an unknown task id is NotFound.
-        assert!(matches!(store.list_events(Some(999)), Err(Error::NotFound(_))));
+        assert!(matches!(
+            store.list_events(Some(999)),
+            Err(Error::NotFound(_))
+        ));
     }
 
     fn create_with_priority(
@@ -2643,7 +2785,17 @@ mod tests {
         priority: Priority,
     ) -> Task {
         store
-            .create_task(project_id, title, None, priority, &[], None, None, None, None)
+            .create_task(
+                project_id,
+                title,
+                None,
+                priority,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap()
     }
 
@@ -2927,7 +3079,10 @@ mod tests {
 
         assert_eq!(store.get_storyboard(sb.id).unwrap(), sb);
         assert_eq!(store.list_storyboards(None).unwrap(), vec![sb.clone()]);
-        assert_eq!(store.list_storyboards(Some(p.id)).unwrap(), vec![sb.clone()]);
+        assert_eq!(
+            store.list_storyboards(Some(p.id)).unwrap(),
+            vec![sb.clone()]
+        );
         assert!(store.list_storyboards(Some(p.id + 1)).unwrap().is_empty());
 
         // empty board view
@@ -3110,7 +3265,9 @@ mod tests {
         let foreign = store.create_frame(other.id, &frame_new("foreign")).unwrap();
 
         // self-edge rejected
-        let err = store.create_edge(sb.id, a.id, a.id, None, None).unwrap_err();
+        let err = store
+            .create_edge(sb.id, a.id, a.id, None, None)
+            .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
         // endpoint not on this board rejected
@@ -3329,9 +3486,7 @@ mod tests {
     fn no_op_update_changes_nothing_and_logs_nothing() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", Some("d"), None)
-            .unwrap();
+        let sb = store.create_storyboard(p.id, "b", Some("d"), None).unwrap();
         let f = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let g = store.create_frame(sb.id, &frame_new("g")).unwrap();
         let e = store
@@ -3470,7 +3625,10 @@ mod tests {
 
         // newest first
         let all = store.list_posts(Some(p.id), None, None).unwrap();
-        assert_eq!(all.iter().map(|s| s.id).collect::<Vec<_>>(), vec![b.id, a.id]);
+        assert_eq!(
+            all.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![b.id, a.id]
+        );
         // tag filter
         let news = store.list_posts(Some(p.id), Some("news"), None).unwrap();
         assert_eq!(news.iter().map(|s| s.id).collect::<Vec<_>>(), vec![a.id]);
@@ -3496,18 +3654,14 @@ mod tests {
 
         // unknown parent → validation (a reply is a creation referencing a
         // parent, like a task's --parent), not not_found.
-        let err = store
-            .reply_to_post(404, None, None, None, "r")
-            .unwrap_err();
+        let err = store.reply_to_post(404, None, None, None, "r").unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("404"));
 
         // a reply inherits its parent's project — confirm that rather than
         // rejecting a cross-project reply (which is now impossible to express).
         let p2 = store.create_project("p2", None, None, None).unwrap();
-        let other = store
-            .create_post(p2.id, None, None, None, "in p2")
-            .unwrap();
+        let other = store.create_post(p2.id, None, None, None, "in p2").unwrap();
         let reply = store
             .reply_to_post(other.id, None, None, None, "r")
             .unwrap();
@@ -3576,7 +3730,10 @@ mod tests {
         assert_eq!(task.status, Status::Todo);
         assert_eq!(task.priority, Priority::Medium);
         assert_eq!(task.title, "ship the auth fix");
-        assert_eq!(task.description.as_deref(), Some("ship the auth fix\nmore detail here"));
+        assert_eq!(
+            task.description.as_deref(),
+            Some("ship the auth fix\nmore detail here")
+        );
 
         // The item has moved out of the inbox entirely.
         assert!(matches!(
@@ -3598,7 +3755,10 @@ mod tests {
         let a = store.create_inbox_item(None, "one").unwrap();
         let b = store.create_inbox_item(None, "two").unwrap();
         let all = store.list_inbox_items(None).unwrap();
-        assert_eq!(all.iter().map(|i| i.id).collect::<Vec<_>>(), vec![b.id, a.id]);
+        assert_eq!(
+            all.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![b.id, a.id]
+        );
     }
 
     #[test]

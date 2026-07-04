@@ -418,9 +418,10 @@ fn parse_live_file(
             continue;
         }
 
-        let s = sessions
-            .entry(sid.clone())
-            .or_insert_with(|| LiveAcc { spark: vec![0; n_buckets], ..Default::default() });
+        let s = sessions.entry(sid.clone()).or_insert_with(|| LiveAcc {
+            spark: vec![0; n_buckets],
+            ..Default::default()
+        });
         if !s.has_ts || ts < s.start_ts {
             s.start_ts = ts;
             s.start_str = ts_str.clone();
@@ -970,8 +971,22 @@ mod tests {
         // Span is 01:00 → 01:10 = 10 minutes.
         assert!((d.overview.avg_session_minutes - 10.0).abs() < 1e-6);
         assert_eq!(d.models.len(), 2);
-        assert_eq!(d.skills.iter().find(|s| s.skill == "build").unwrap().messages, 1);
-        assert_eq!(d.agents.iter().find(|a| a.agent == "Explore").unwrap().messages, 1);
+        assert_eq!(
+            d.skills
+                .iter()
+                .find(|s| s.skill == "build")
+                .unwrap()
+                .messages,
+            1
+        );
+        assert_eq!(
+            d.agents
+                .iter()
+                .find(|a| a.agent == "Explore")
+                .unwrap()
+                .messages,
+            1
+        );
         let row = &d.sessions[0];
         assert_eq!(row.project.as_deref(), Some("widget"));
         assert!(row.used_subagent);
@@ -982,7 +997,13 @@ mod tests {
     fn iso_at(secs_ago: i64) -> String {
         let e = now_unix() - secs_ago;
         let tod = e.rem_euclid(86_400);
-        format!("{}T{:02}:{:02}:{:02}.000Z", fmt_date(e), tod / 3600, (tod % 3600) / 60, tod % 60)
+        format!(
+            "{}T{:02}:{:02}:{:02}.000Z",
+            fmt_date(e),
+            tod / 3600,
+            (tod % 3600) / 60,
+            tod % 60
+        )
     }
 
     #[test]

@@ -107,10 +107,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         .build()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind((host, port)).await?;
-        println!(
-            "{}",
-            json!({"listening": format!("http://{host}:{port}")})
-        );
+        println!("{}", json!({"listening": format!("http://{host}:{port}")}));
         // ConnectInfo carries the peer address so the agent endpoints and
         // local_path writes can be gated on loopback in default mode (see
         // `require_agent_access` / `require_local_path_write`).
@@ -129,7 +126,9 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/resolve", get(resolve_project))
         .route(
             "/api/projects/{id}",
-            get(show_project).patch(update_project).delete(delete_project),
+            get(show_project)
+                .patch(update_project)
+                .delete(delete_project),
         )
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route(
@@ -371,10 +370,7 @@ async fn resolve_project(
     Ok(Json(store.find_project_by_root_commit(&q.commit)?).into_response())
 }
 
-async fn show_project(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> ApiResult<Response> {
+async fn show_project(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
     Ok(Json(store.get_project(id)?).into_response())
 }
@@ -400,10 +396,7 @@ async fn update_project(
     Ok(Json(store.update_project(id, &patch)?).into_response())
 }
 
-async fn delete_project(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> ApiResult<Response> {
+async fn delete_project(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     let (project, tasks) = store.delete_project(id)?;
     Ok(Json(json!({"project": project, "tasks": tasks})).into_response())
@@ -1181,7 +1174,11 @@ fn require_lan_agent_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     // `localhost:<port>` without allocating a `format!` per request.
-    if host.strip_prefix("localhost:").and_then(|p| p.parse::<u16>().ok()) == Some(port) {
+    if host
+        .strip_prefix("localhost:")
+        .and_then(|p| p.parse::<u16>().ok())
+        == Some(port)
+    {
         return Ok(());
     }
     // SocketAddr's parser accepts exactly `<ipv4>:<port>` and `[<ipv6>]:<port>`.

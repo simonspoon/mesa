@@ -151,7 +151,10 @@ mod tests {
 
     #[test]
     fn command_in_missing_file_is_unconfigured() {
-        assert_eq!(command_in(Path::new("/nonexistent/hooks.json"), "x"), Ok(None));
+        assert_eq!(
+            command_in(Path::new("/nonexistent/hooks.json"), "x"),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -193,14 +196,7 @@ mod tests {
     fn run_honors_the_working_directory() {
         let dir = tempfile::tempdir().unwrap();
         let canon = dir.path().canonicalize().unwrap();
-        let out = run(
-            "test-hook",
-            "pwd",
-            Some(canon.to_str().unwrap()),
-            &[],
-            "",
-        )
-        .unwrap();
+        let out = run("test-hook", "pwd", Some(canon.to_str().unwrap()), &[], "").unwrap();
         assert_eq!(out.stdout.trim(), canon.to_str().unwrap());
     }
 

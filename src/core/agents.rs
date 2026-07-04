@@ -175,10 +175,7 @@ mod tests {
     #[test]
     fn list_under_runs_the_binary_and_parses() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = stub_claude(
-            dir.path(),
-            r#"[ "$1" = "agents" ] || exit 1; echo '[]'"#,
-        );
+        let bin = stub_claude(dir.path(), r#"[ "$1" = "agents" ] || exit 1; echo '[]'"#);
         assert_eq!(list_under_with(&bin, "/anywhere").unwrap(), vec![]);
     }
 

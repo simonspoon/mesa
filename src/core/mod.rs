@@ -13,6 +13,5 @@ pub use types::{
     AgentSession, AgentSpawned, CcAgentStat, CcDashboard, CcDayPoint, CcModelStat, CcOverview,
     CcProjectStat, CcSessionRow, CcSkillStat, CcTokens, CcUsage, CcUsageExtra, CcUsageWindow,
     Dependency, Frame, FrameEdge, HookRun, InboxItem, Post, PostSummary, PostThread, Priority,
-    Project,
-    ProjectAgents, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
+    Project, ProjectAgents, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
 };

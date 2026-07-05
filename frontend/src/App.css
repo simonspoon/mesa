@@ -1785,12 +1785,37 @@ main {
 }
 
 /* Diff text is untrusted plain text: <pre> keeps it verbatim (no wrapping —
-   the pane scrolls both ways). */
+   the pane scrolls both ways). Lines are wrapped in spans classified by
+   prefix for color only. `display: block` lets add/del rows carry a
+   full-width background tint. */
 .git-diff-text {
   margin: 0;
   font-family: var(--font-mono);
   font-size: 0.8rem;
   line-height: 1.4;
+}
+
+.git-diff-text span {
+  display: block;
+  min-width: fit-content;
+}
+
+.git-diff-text .diff-add {
+  color: var(--green);
+  background: rgba(43, 255, 156, 0.07);
+}
+
+.git-diff-text .diff-del {
+  color: var(--red);
+  background: rgba(255, 59, 92, 0.08);
+}
+
+.git-diff-text .diff-hunk {
+  color: var(--cyan);
+}
+
+.git-diff-text .diff-meta {
+  color: var(--muted);
 }
 
 .git-placeholder {

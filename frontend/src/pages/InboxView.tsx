@@ -68,7 +68,7 @@ export function InboxView() {
           rows={2}
           onChange={(e) => setBody(e.target.value)}
         />
-        <div className="post-create-meta">
+        <div className="inbox-create-meta">
           <input
             type="text"
             value={author}

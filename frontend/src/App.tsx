@@ -10,7 +10,6 @@ import { useFetch } from './useFetch'
 // Hash-based routing: #/ (placeholder), #/projects/:id,
 // #/projects/:id/tasks/:tid (task open in the side panel),
 // #/projects/:id/storyboards, #/projects/:id/storyboards/:sid,
-// #/projects/:id/posts, #/projects/:id/posts/:pid (bulletin board),
 // #/projects/:id/agents (live Claude Code sessions + embedded terminal),
 // #/projects/:id/git (working-tree status + per-file diffs).
 function useHashPath(): string {
@@ -53,8 +52,6 @@ function App() {
   const ccTab = ccMatch ? ((ccMatch[1] ?? 'overview') as CcTab) : null
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
-  const postMatch = /^\/projects\/(\d+)\/posts\/(\d+)$/.exec(path)
-  const postListMatch = /^\/projects\/(\d+)\/posts$/.exec(path)
   const agentsMatch = /^\/projects\/(\d+)\/agents$/.exec(path)
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
@@ -63,17 +60,13 @@ function App() {
     ? Number(storyboardMatch[1])
     : storyboardListMatch
       ? Number(storyboardListMatch[1])
-      : postMatch
-        ? Number(postMatch[1])
-        : postListMatch
-          ? Number(postListMatch[1])
-          : agentsMatch
-            ? Number(agentsMatch[1])
-            : gitMatch
-              ? Number(gitMatch[1])
-              : projectMatch
-                ? Number(projectMatch[1])
-                : null
+      : agentsMatch
+        ? Number(agentsMatch[1])
+        : gitMatch
+          ? Number(gitMatch[1])
+          : projectMatch
+            ? Number(projectMatch[1])
+            : null
 
   let page
   if (inboxMatch) {
@@ -92,8 +85,6 @@ function App() {
         taskId={null}
         storyboards
         storyboardId={Number(storyboardMatch[2])}
-        posts={false}
-        postId={null}
         agents={false}
         git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
@@ -107,38 +98,6 @@ function App() {
         taskId={null}
         storyboards
         storyboardId={null}
-        posts={false}
-        postId={null}
-        agents={false}
-        git={false}
-        onProjectsChanged={() => setNavVersion((v) => v + 1)}
-      />
-    )
-  } else if (postMatch) {
-    // Single bulletin thread, in place inside the project page frame.
-    page = (
-      <ProjectTasksPage
-        projectId={Number(postMatch[1])}
-        taskId={null}
-        storyboards={false}
-        storyboardId={null}
-        posts
-        postId={Number(postMatch[2])}
-        agents={false}
-        git={false}
-        onProjectsChanged={() => setNavVersion((v) => v + 1)}
-      />
-    )
-  } else if (postListMatch) {
-    // Bulletin board index, in place inside the project page frame.
-    page = (
-      <ProjectTasksPage
-        projectId={Number(postListMatch[1])}
-        taskId={null}
-        storyboards={false}
-        storyboardId={null}
-        posts
-        postId={null}
         agents={false}
         git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
@@ -152,8 +111,6 @@ function App() {
         taskId={null}
         storyboards={false}
         storyboardId={null}
-        posts={false}
-        postId={null}
         agents
         git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
@@ -167,8 +124,6 @@ function App() {
         taskId={null}
         storyboards={false}
         storyboardId={null}
-        posts={false}
-        postId={null}
         agents={false}
         git
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
@@ -181,8 +136,6 @@ function App() {
         taskId={projectMatch[2] ? Number(projectMatch[2]) : null}
         storyboards={false}
         storyboardId={null}
-        posts={false}
-        postId={null}
         agents={false}
         git={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}

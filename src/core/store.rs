@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::types::{
-    Frame, FrameEdge, InboxItem, Post, PostSummary, PostThread, Priority, Project, Status,
-    Storyboard, StoryboardEvent, StoryboardView, Task, TaskEvent,
+    Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard, StoryboardEvent,
+    StoryboardView, Task, TaskEvent,
 };
 
 #[derive(Debug)]
@@ -171,6 +171,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE projects ADD COLUMN local_path TEXT;
     ",
+    "
+    DROP TABLE posts;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -231,8 +234,6 @@ const FRAME_COLUMNS: &str =
     "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at";
 const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
-const POST_COLUMNS: &str =
-    "id, project_id, parent_id, author, title, tag, body, created_at, updated_at";
 const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at";
 
 fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
@@ -268,20 +269,6 @@ fn inbox_body_to_task(body: &str) -> (String, Option<String>) {
         Some(body.to_string())
     };
     (title, description)
-}
-
-fn row_to_post(row: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
-    Ok(Post {
-        id: row.get(0)?,
-        project_id: row.get(1)?,
-        parent_id: row.get(2)?,
-        author: row.get(3)?,
-        title: row.get(4)?,
-        tag: row.get(5)?,
-        body: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-    })
 }
 
 fn row_to_storyboard(row: &rusqlite::Row<'_>) -> rusqlite::Result<Storyboard> {
@@ -375,16 +362,6 @@ fn read_edges(conn: &Connection, storyboard_id: i64) -> Result<Vec<FrameEdge>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Reads a post's direct replies, oldest first. Operates on any `Connection`
-/// (including an open transaction) so a delete can echo an atomic snapshot.
-fn read_post_replies(conn: &Connection, post_id: i64) -> Result<Vec<Post>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {POST_COLUMNS} FROM posts WHERE parent_id = ?1 ORDER BY id"
-    ))?;
-    let rows = stmt.query_map([post_id], row_to_post)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// Fields to change on a project; `None` means leave unchanged.
 #[derive(Debug, Default, Clone)]
 pub struct ProjectPatch {
@@ -467,19 +444,6 @@ pub struct FramePatch {
 pub struct EdgePatch {
     /// `Some(None)` clears the label.
     pub label: Option<Option<String>>,
-}
-
-/// Fields to change on a post; `None` means leave unchanged. A post's project,
-/// `parent_id`, and `author` are immutable, so there are deliberately no fields
-/// for them — only the message content is editable.
-#[derive(Debug, Default, Clone)]
-pub struct PostPatch {
-    /// `Some(None)` clears the title.
-    pub title: Option<Option<String>>,
-    /// `Some(None)` clears the tag.
-    pub tag: Option<Option<String>>,
-    /// Replaces the body (which is required, so never cleared to null).
-    pub body: Option<String>,
 }
 
 /// Result of `next_task`: either the single actionable task, or — when none is
@@ -1652,202 +1616,6 @@ impl Store {
             )));
         }
         Ok(())
-    }
-
-    // ---- posts (bulletin board) ----
-
-    /// Creates a top-level bulletin-board post in an existing project. The
-    /// project is fixed at creation, mirroring tasks and storyboards. To post a
-    /// reply, use `reply_to_post` instead.
-    pub fn create_post(
-        &mut self,
-        project_id: i64,
-        author: Option<&str>,
-        title: Option<&str>,
-        tag: Option<&str>,
-        body: &str,
-    ) -> Result<Post> {
-        let project_exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-            [project_id],
-            |r| r.get(0),
-        )?;
-        if !project_exists {
-            return Err(Error::Validation(format!("project {project_id} not found")));
-        }
-        self.insert_post(project_id, None, author, title, tag, body)
-    }
-
-    /// Posts a reply to an existing post. The reply inherits the parent's
-    /// project (it cannot belong to any other), so an unknown parent — or one
-    /// that is itself a reply (replies are one level deep) — is a `validation`
-    /// error, consistent with creating a task under a bad `--parent`.
-    pub fn reply_to_post(
-        &mut self,
-        parent_id: i64,
-        author: Option<&str>,
-        title: Option<&str>,
-        tag: Option<&str>,
-        body: &str,
-    ) -> Result<Post> {
-        let project_id = self.check_post_parent(parent_id)?;
-        self.insert_post(project_id, Some(parent_id), author, title, tag, body)
-    }
-
-    /// Inserts a post row (top-level or reply) and returns it. The single write
-    /// path for posts; callers validate the project/parent first.
-    fn insert_post(
-        &mut self,
-        project_id: i64,
-        parent_id: Option<i64>,
-        author: Option<&str>,
-        title: Option<&str>,
-        tag: Option<&str>,
-        body: &str,
-    ) -> Result<Post> {
-        self.conn.execute(
-            "INSERT INTO posts (project_id, parent_id, author, title, tag, body, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
-            rusqlite::params![project_id, parent_id, author, title, tag, body],
-        )?;
-        self.get_post(self.conn.last_insert_rowid())
-    }
-
-    pub fn get_post(&self, id: i64) -> Result<Post> {
-        self.conn
-            .query_row(
-                &format!("SELECT {POST_COLUMNS} FROM posts WHERE id = ?1"),
-                [id],
-                row_to_post,
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Error::NotFound(format!("post {id} not found"))
-                }
-                e => Error::Db(e),
-            })
-    }
-
-    /// Lists top-level posts (newest first) as compact summaries with a derived
-    /// reply count. Replies are omitted here — fetch a thread with `get_post_thread`.
-    /// Optionally scoped by project, `tag`, and `author` (each an AND filter).
-    pub fn list_posts(
-        &self,
-        project: Option<i64>,
-        tag: Option<&str>,
-        author: Option<&str>,
-    ) -> Result<Vec<PostSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.project_id, p.author, p.title, p.tag, \
-                    (SELECT COUNT(*) FROM posts r WHERE r.parent_id = p.id), \
-                    p.created_at, p.updated_at \
-             FROM posts p \
-             WHERE p.parent_id IS NULL \
-               AND (?1 IS NULL OR p.project_id = ?1) \
-               AND (?2 IS NULL OR p.tag = ?2) \
-               AND (?3 IS NULL OR p.author = ?3) \
-             ORDER BY p.id DESC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![project, tag, author], |row| {
-            Ok(PostSummary {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                author: row.get(2)?,
-                title: row.get(3)?,
-                tag: row.get(4)?,
-                reply_count: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Returns a post with its direct replies (oldest first). `NotFound` if the
-    /// post is absent.
-    pub fn get_post_thread(&self, id: i64) -> Result<PostThread> {
-        let post = self.get_post(id)?;
-        let replies = read_post_replies(&self.conn, id)?;
-        Ok(PostThread { post, replies })
-    }
-
-    /// Edits a post's title/tag/body. Project, parent, and author are immutable.
-    pub fn update_post(&mut self, id: i64, patch: &PostPatch) -> Result<Post> {
-        let current = self.get_post(id)?;
-        let mut post = current.clone();
-        if let Some(title) = &patch.title {
-            post.title = title.clone();
-        }
-        if let Some(tag) = &patch.tag {
-            post.tag = tag.clone();
-        }
-        if let Some(body) = &patch.body {
-            post.body = body.clone();
-        }
-        // No-op patch: change nothing (and don't bump updated_at).
-        if post == current {
-            return Ok(current);
-        }
-        self.conn.execute(
-            "UPDATE posts SET title = ?1, tag = ?2, body = ?3, updated_at = datetime('now') \
-             WHERE id = ?4",
-            (&post.title, &post.tag, &post.body, id),
-        )?;
-        self.get_post(id)
-    }
-
-    /// Deletes a post and (cascading) its replies. Returns the full destroyed
-    /// thread so the transcript stays a recoverable record. The echo read and
-    /// the delete run in one transaction, so the echoed thread exactly matches
-    /// what was destroyed even under a concurrent writer.
-    pub fn delete_post(&mut self, id: i64) -> Result<PostThread> {
-        let tx = self.conn.transaction()?;
-        let post = tx
-            .query_row(
-                &format!("SELECT {POST_COLUMNS} FROM posts WHERE id = ?1"),
-                [id],
-                row_to_post,
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Error::NotFound(format!("post {id} not found"))
-                }
-                e => Error::Db(e),
-            })?;
-        let replies = read_post_replies(&tx, id)?;
-        tx.execute("DELETE FROM posts WHERE id = ?1", [id])?;
-        tx.commit()?;
-        Ok(PostThread { post, replies })
-    }
-
-    /// Validates a reply's target and returns the project the reply will belong
-    /// to (the parent's). `parent_id` must exist and be a top-level post
-    /// (replies are one level deep); either failure is a `validation` error.
-    fn check_post_parent(&self, parent_id: i64) -> Result<i64> {
-        let parent: Option<(i64, Option<i64>)> = self
-            .conn
-            .query_row(
-                "SELECT project_id, parent_id FROM posts WHERE id = ?1",
-                [parent_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(Error::Db(e)),
-            })?;
-        let Some((parent_project, parent_parent)) = parent else {
-            return Err(Error::Validation(format!(
-                "parent post {parent_id} not found"
-            )));
-        };
-        if parent_parent.is_some() {
-            return Err(Error::Validation(format!(
-                "post {parent_id} is itself a reply: replies are one level deep, so reply to \
-                 the top-level post instead"
-            )));
-        }
-        Ok(parent_project)
     }
 
     // ---- inbox (global update requests) ----
@@ -3545,147 +3313,6 @@ mod tests {
             store.list_storyboard_events(sb.id).unwrap().len(),
             before + 1
         );
-    }
-
-    // ---- posts (bulletin board) ----
-
-    #[test]
-    fn post_crud_round_trip_with_thread() {
-        let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
-
-        let post = store
-            .create_post(
-                p.id,
-                Some("agent-1"),
-                Some("Concurrency fix"),
-                Some("finding"),
-                "WAL mode fixed the SQLITE_BUSY errors",
-            )
-            .unwrap();
-        assert_eq!(post.project_id, p.id);
-        assert_eq!(post.parent_id, None);
-        assert_eq!(post.author.as_deref(), Some("agent-1"));
-        assert_eq!(post.tag.as_deref(), Some("finding"));
-        assert_eq!(post.body, "WAL mode fixed the SQLITE_BUSY errors");
-
-        // A reply joins the thread and inherits the project.
-        let reply = store
-            .reply_to_post(post.id, Some("agent-2"), None, None, "Nice, thanks")
-            .unwrap();
-        assert_eq!(reply.parent_id, Some(post.id));
-        assert_eq!(reply.project_id, p.id);
-
-        let thread = store.get_post_thread(post.id).unwrap();
-        assert_eq!(thread.post.id, post.id);
-        assert_eq!(thread.replies.len(), 1);
-        assert_eq!(thread.replies[0].id, reply.id);
-
-        // list shows only top-level posts, with a reply count.
-        let summaries = store.list_posts(Some(p.id), None, None).unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].id, post.id);
-        assert_eq!(summaries[0].reply_count, 1);
-
-        // Edit body + clear the tag.
-        let edited = store
-            .update_post(
-                post.id,
-                &PostPatch {
-                    body: Some("WAL + busy_timeout fixed it".into()),
-                    tag: Some(None),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(edited.body, "WAL + busy_timeout fixed it");
-        assert_eq!(edited.tag, None);
-        // author and title are untouched by this patch.
-        assert_eq!(edited.author.as_deref(), Some("agent-1"));
-        assert_eq!(edited.title.as_deref(), Some("Concurrency fix"));
-
-        // Deleting the post cascades its replies and echoes the full thread.
-        let destroyed = store.delete_post(post.id).unwrap();
-        assert_eq!(destroyed.post.id, post.id);
-        assert_eq!(destroyed.replies.len(), 1);
-        assert!(matches!(store.get_post(post.id), Err(Error::NotFound(_))));
-        assert!(matches!(store.get_post(reply.id), Err(Error::NotFound(_))));
-    }
-
-    #[test]
-    fn list_posts_filters_by_tag_and_author_newest_first() {
-        let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
-        let a = store
-            .create_post(p.id, Some("a"), None, Some("news"), "one")
-            .unwrap();
-        let b = store
-            .create_post(p.id, Some("b"), None, Some("question"), "two")
-            .unwrap();
-
-        // newest first
-        let all = store.list_posts(Some(p.id), None, None).unwrap();
-        assert_eq!(
-            all.iter().map(|s| s.id).collect::<Vec<_>>(),
-            vec![b.id, a.id]
-        );
-        // tag filter
-        let news = store.list_posts(Some(p.id), Some("news"), None).unwrap();
-        assert_eq!(news.iter().map(|s| s.id).collect::<Vec<_>>(), vec![a.id]);
-        // author filter
-        let by_b = store.list_posts(Some(p.id), None, Some("b")).unwrap();
-        assert_eq!(by_b.iter().map(|s| s.id).collect::<Vec<_>>(), vec![b.id]);
-    }
-
-    #[test]
-    fn create_post_unknown_project_is_validation_error() {
-        let (mut store, _dir) = temp_store();
-        let err = store
-            .create_post(999, None, None, None, "orphan")
-            .unwrap_err();
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("999"));
-    }
-
-    #[test]
-    fn reply_to_unknown_or_nested_parent_is_validation_error() {
-        let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-
-        // unknown parent → validation (a reply is a creation referencing a
-        // parent, like a task's --parent), not not_found.
-        let err = store.reply_to_post(404, None, None, None, "r").unwrap_err();
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("404"));
-
-        // a reply inherits its parent's project — confirm that rather than
-        // rejecting a cross-project reply (which is now impossible to express).
-        let p2 = store.create_project("p2", None, None, None).unwrap();
-        let other = store.create_post(p2.id, None, None, None, "in p2").unwrap();
-        let reply = store
-            .reply_to_post(other.id, None, None, None, "r")
-            .unwrap();
-        assert_eq!(reply.project_id, p2.id);
-
-        // reply to a reply (replies are one level deep)
-        let top = store.create_post(p1.id, None, None, None, "top").unwrap();
-        let first = store
-            .reply_to_post(top.id, None, None, None, "reply")
-            .unwrap();
-        let err = store
-            .reply_to_post(first.id, None, None, None, "nested")
-            .unwrap_err();
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("one level deep"));
-    }
-
-    #[test]
-    fn deleting_a_project_cascades_its_posts() {
-        let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
-        let post = store.create_post(p.id, None, None, None, "hi").unwrap();
-        store.delete_project(p.id).unwrap();
-        assert!(matches!(store.get_post(post.id), Err(Error::NotFound(_))));
     }
 
     // ---- inbox (global update requests) ----

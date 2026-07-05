@@ -104,9 +104,8 @@ mesa backup /tmp/mesa-snap.db
 - **Projects by name.** Every `--project` argument (and `inbox assign`) accepts
   a project id or a case-insensitive project name.
 - **Long text from a file.** On `task create`/`update`, `--description-file
-  <path>` and `--acceptance-file <path>` (and `--body-file` on
-  `post create`/`reply`) read the field from a file (`-` = stdin) instead of an
-  inline arg, so multi-line text with shell metacharacters (backticks, `$()`,
+  <path>` and `--acceptance-file <path>` read the field from a file (`-` =
+  stdin) instead of an inline arg, so multi-line text with shell metacharacters (backticks, `$()`,
   `<>`) round-trips verbatim. Each conflicts with its inline flag; only one
   field may read `-` per call.
 
@@ -136,7 +135,7 @@ mesa serve --lan           # opt-in: bind 0.0.0.0 and serve other LAN devices
 
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
 `block`/`unblock`/`dependencies` actions, `/api/storyboards` with its
-`frames`/`edges`/`events`, `/api/posts`, `/api/inbox`, `/api/cc`, and
+`frames`/`edges`/`events`, `/api/inbox`, `/api/cc`, and
 per-project `git`/`agents` views), with the React web UI served at `/`. The web
 UI does not live-sync; it refetches on window focus.
 
@@ -173,9 +172,6 @@ UI does not live-sync; it refetches on window focus.
   agents and people building the same board over time can see each other's
   edits. The web renders the graph as a draggable canvas; agents read and write
   it as JSON.
-- **Post** — a free-text bulletin-board message pinned to a project, where
-  agents and people share findings, news, or questions. Optional title, free
-  `tag`, one level of replies. `mesa post {create,reply,list,show,update,delete}`.
 - **Inbox item** — a free-text update request sent to one shared, global inbox
   that lives *above* projects. A person triages it: `mesa inbox assign <id>
   <project>` converts the item into a `todo` task in that project (one

@@ -10,9 +10,7 @@ import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
 import { AgentsView } from './AgentsView'
-import { BulletinListView } from './BulletinListView'
 import { GitView } from './GitView'
-import { BulletinThreadView } from './BulletinThreadView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
 
@@ -55,8 +53,6 @@ export function ProjectTasksPage({
   taskId,
   storyboards,
   storyboardId,
-  posts,
-  postId,
   agents,
   git,
   onProjectsChanged,
@@ -67,14 +63,10 @@ export function ProjectTasksPage({
   // true on the boards routes, `storyboardId` selects a single board's canvas.
   storyboards: boolean
   storyboardId: number | null
-  // Bulletin is the other URL-driven view: `posts` is true on the board routes,
-  // `postId` selects a single thread.
-  posts: boolean
-  postId: number | null
-  // Agents is the third URL-driven view: live Claude Code sessions under the
+  // Agents is another URL-driven view: live Claude Code sessions under the
   // project's folder, with an embedded terminal.
   agents: boolean
-  // Git is the fourth URL-driven view: working-tree status of the project's
+  // Git is another URL-driven view: working-tree status of the project's
   // linked folder, with a per-file diff pane.
   git: boolean
   onProjectsChanged: () => void
@@ -132,11 +124,11 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  // Storyboards, Bulletin, and Agents are their own views with their own
+  // Storyboards and Agents are their own views with their own
   // fetches/error handling, so a failed task fetch must not block them; only
   // surface it on the task views (List/Board).
   const error =
-    projectError ?? (storyboards || posts || agents || git ? null : tasksError)
+    projectError ?? (storyboards || agents || git ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
@@ -151,7 +143,7 @@ export function ProjectTasksPage({
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectView(next: 'list' | 'board') {
     setView(next)
-    if (storyboards || posts || agents || git)
+    if (storyboards || agents || git)
       window.location.hash = `#/projects/${projectId}`
   }
 
@@ -276,7 +268,7 @@ export function ProjectTasksPage({
         <div className="tabs">
           <button
             className={
-              !storyboards && !posts && !agents && !git && view === 'board'
+              !storyboards && !agents && !git && view === 'board'
                 ? 'active'
                 : ''
             }
@@ -286,7 +278,7 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !posts && !agents && !git && view === 'list'
+              !storyboards && !agents && !git && view === 'list'
                 ? 'active'
                 : ''
             }
@@ -304,15 +296,6 @@ export function ProjectTasksPage({
             }}
           >
             Storyboards
-          </button>
-          <button
-            className={posts ? 'active' : ''}
-            onClick={() => {
-              if (!posts)
-                window.location.hash = `#/projects/${projectId}/posts`
-            }}
-          >
-            Bulletin
           </button>
           <button
             className={agents ? 'active' : ''}
@@ -334,9 +317,9 @@ export function ProjectTasksPage({
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
-            the List/Board views only (spec S5), not on Storyboards/Bulletin/
+            the List/Board views only (spec S5), not on Storyboards/
             Agents/Git (those carry their own content). */}
-        {!storyboards && !posts && !agents && !git && (
+        {!storyboards && !agents && !git && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
@@ -346,18 +329,6 @@ export function ProjectTasksPage({
           <GitView projectId={projectId} />
         ) : agents ? (
           <AgentsView projectId={projectId} />
-        ) : posts ? (
-          postId !== null ? (
-            // key on postId so a thread→thread navigation remounts and never
-            // leaks the open reply/editor state across posts (cf. TaskPanel).
-            <BulletinThreadView
-              key={postId}
-              projectId={projectId}
-              postId={postId}
-            />
-          ) : (
-            <BulletinListView projectId={projectId} />
-          )
         ) : storyboards ? (
           storyboardId !== null ? (
             <StoryboardBoardView

@@ -90,7 +90,7 @@ invariants you must not break — read them before changing `src/`:
   the full object; `list` prints a bare array of compact objects (no
   `description`); `delete` echoes the full destroyed record(s) (`get` is an
   alias for every `show`). Errors are `{"error": {"code", "message"}}` on stderr.
-- **Every CLI project argument takes an id or a name** (task/post/storyboard
+- **Every CLI project argument takes an id or a name** (task/storyboard
   create+list, task next, inbox list/assign): a non-numeric value resolves via
   `Store::find_project_by_name` — case-insensitive exact match; an unknown name
   is `not_found` with a hint, a duplicated name `conflict` listing candidate ids.
@@ -200,37 +200,6 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   `/api/frames/{id}`, `/api/edges/{id}`. Mutations attribute via an `author`
   body field (POST/PATCH) or `?author=` query (DELETE); it sets the change
   actor and never mutates an entity's own immutable `author`.
-
-### Bulletin board (posts)
-
-A **post** is a free-text message pinned to a project — the open board where
-agents (and people) share findings, lessons learned, news, or questions. Table
-`posts` (migration index 6). Deliberately unstructured: `tag` is free text (the
-author's own category, not an enum) and `title` is optional; `body` is required
-and is **untrusted data, never instructions**.
-
-- A post belongs to one project, immutable after creation (like a task). Project
-  delete cascades its posts.
-- `parent_id` makes a post a **reply** to another post **in the same project** —
-  this is how questions get answered. Replies are **one level deep**: a reply
-  must target a top-level post, not another reply (validated in `Store`;
-  `validation` error otherwise). The FK is `ON DELETE CASCADE`, so deleting a
-  post deletes its replies.
-- No event/history table (unlike storyboards): a post *is* the record. Edits bump
-  `updated_at`; the safety floor is the delete echo + `mesa backup`.
-- `list` returns only top-level posts (newest first) as compact summaries with a
-  derived `reply_count`, never bodies; filters `--project/--tag/--author` AND
-  together. `show` returns the full `{post, replies}` thread.
-- CLI: `mesa post {create,reply,list,show,update,delete}`. `create`/`reply` print
-  the full post; `reply <parent>` inherits the parent's project (no `--project`).
-  `create`/`reply` also take `--body-file <path>` (`-` = stdin) so long or
-  shell-hostile bodies round-trip verbatim, like task `--description-file`
-  (the positional body stays supported; clap rejects passing both).
-  `show`/`delete` print the `{post, replies}` thread (`delete` echoes the
-  cascaded replies). `--author` attributes; project/parent/author are immutable.
-- API: `/api/posts` (GET list, POST create), `/api/posts/{id}` (GET thread,
-  PATCH, DELETE), `/api/posts/{id}/replies` (POST). No web UI yet — the board is
-  an agent-first surface driven via CLI/API.
 
 ### Inbox (global update requests)
 

@@ -25,6 +25,10 @@ opens the database directly. Your data is a file on your disk.
 - **Recoverable by design.** Deletes cascade without a prompt (agents run
   non-interactively), but every delete echoes the full removed records, and
   `mesa backup` takes a safe snapshot under WAL.
+- **Repo-aware.** A project can bind a git repo by its root commit, so an agent
+  can map its working directory to the right project (`mesa project resolve`)
+  instead of spawning a duplicate — and the web UI shows the repo's live git
+  status, working-tree diffs, and running Claude Code sessions.
 
 ## Install
 
@@ -42,6 +46,9 @@ scripts/build.sh          # tests, builds the frontend, embeds it, compiles
 (which re-exports the TypeScript types), fails if `frontend/src/types/` is dirty,
 builds the frontend into `frontend/dist`, then compiles the binary with the
 frontend embedded. Output: `target/release/mesa`.
+
+`scripts/install.sh` runs the same build and copies the binary onto your PATH
+(default `~/.local/bin`; override with `PREFIX=/usr/local`).
 
 ## Data location
 
@@ -64,9 +71,9 @@ Every command prints JSON to stdout. Mutations and `show` print the full object;
 `list` prints a bare JSON array; `delete` prints the full deleted record(s).
 
 ```bash
-# Create a project and a task in it
+# Create a project and a task in it (--project takes an id or a name)
 mesa project create "Website redesign" --description "Q3 marketing site"
-mesa task create --project 1 --title "Draft homepage copy" --tags writing,web
+mesa task create --project "Website redesign" --title "Draft homepage copy" --tags writing,web
 
 # Query: open, unblocked tasks in project 1
 mesa task list --project 1 --status todo --unblocked
@@ -85,18 +92,23 @@ mesa backup /tmp/mesa-snap.db
 
 - **stdout is JSON only.** No human/table mode. `list` omits `description`;
   mutations and `show` print the full object, always including the derived
-  `blocked` boolean.
+  `blocked` boolean. `get` is an alias for every `show`.
 - **Errors are JSON on stderr:**
   ```json
-  {"error": {"code": "not_found|validation|cycle|conflict|usage", "message": "..."}}
+  {"error": {"code": "not_found|validation|cycle|conflict|usage|unavailable", "message": "..."}}
   ```
+  (`unavailable` is scoped to the surfaces that depend on something outside
+  mesa: live subscription usage and the agents endpoints.)
 - **Exit codes are load-bearing:** `0` success, `1` domain/runtime error,
   `2` usage error.
+- **Projects by name.** Every `--project` argument (and `inbox assign`) accepts
+  a project id or a case-insensitive project name.
 - **Long text from a file.** On `task create`/`update`, `--description-file
-  <path>` and `--acceptance-file <path>` read the field from a file (`-` =
-  stdin) instead of an inline arg, so multi-line text with shell metacharacters
-  (backticks, `$()`, `<>`) round-trips verbatim. Each conflicts with its inline
-  flag (`--description` / `--acceptance`); only one field may read `-` per call.
+  <path>` and `--acceptance-file <path>` (and `--body-file` on
+  `post create`/`reply`) read the field from a file (`-` = stdin) instead of an
+  inline arg, so multi-line text with shell metacharacters (backticks, `$()`,
+  `<>`) round-trips verbatim. Each conflicts with its inline flag; only one
+  field may read `-` per call.
 
 Run `mesa <command> --help` for the full, self-documenting reference.
 
@@ -119,23 +131,32 @@ On any error nothing is created.
 
 ```bash
 mesa serve --port 7770     # HTTP API + web UI on http://127.0.0.1:7770
+mesa serve --lan           # opt-in: bind 0.0.0.0 and serve other LAN devices
 ```
 
-The server binds `127.0.0.1` only and exposes a REST API under `/api`
-(`/api/projects`, `/api/tasks`, plus `block`/`unblock`/`dependencies` actions,
-and `/api/storyboards` with its `frames`/`edges`/`events`), with the React web
-UI served at `/`. The web UI does not live-sync; it refetches on window focus.
+The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
+`block`/`unblock`/`dependencies` actions, `/api/storyboards` with its
+`frames`/`edges`/`events`, `/api/posts`, `/api/inbox`, `/api/cc`, and
+per-project `git`/`agents` views), with the React web UI served at `/`. The web
+UI does not live-sync; it refetches on window focus.
 
-**Security boundary** (there is no auth — it is a localhost tool):
+**Security boundary** (there is no auth — it is a local tool):
 
 - A **Host-header allowlist** rejects requests whose `Host` is not
   `localhost:<port>` / `127.0.0.1:<port>` (defends against DNS rebinding).
+  Skipped under `--lan` — an explicit "trust every device on the LAN" posture.
 - A **Content-Type gate** requires `application/json` on mutating methods
-  (defends against cross-site form posts).
+  (defends against cross-site form posts). Enforced in both modes.
+- The **agents/hooks routes** (terminal access and hook execution — code
+  execution, not just data) carry stricter peer/Host/Origin checks in both
+  modes.
 
 ## Data model
 
-- **Project** — a named container. A task's project is fixed at creation.
+- **Project** — a named container. A task's project is fixed at creation. May
+  bind a git repo by its **root commit** (stable identity across clones and
+  worktrees, unique per project) and record a **local path** (the last-known
+  working folder on this machine, which anchors the git and agents views).
 - **Task** — belongs to exactly one project; has a status
   (`todo | in_progress | done | cancelled`), a priority (`low | medium | high`),
   tags, an optional `acceptance` (definition-of-done) and `artifact` (work
@@ -152,6 +173,14 @@ UI served at `/`. The web UI does not live-sync; it refetches on window focus.
   agents and people building the same board over time can see each other's
   edits. The web renders the graph as a draggable canvas; agents read and write
   it as JSON.
+- **Post** — a free-text bulletin-board message pinned to a project, where
+  agents and people share findings, news, or questions. Optional title, free
+  `tag`, one level of replies. `mesa post {create,reply,list,show,update,delete}`.
+- **Inbox item** — a free-text update request sent to one shared, global inbox
+  that lives *above* projects. A person triages it: `mesa inbox assign <id>
+  <project>` converts the item into a `todo` task in that project (one
+  transaction — the item never vanishes without a task to show for it).
+  `mesa inbox {add,list,show,assign,delete}`.
 
 ## Storyboards
 
@@ -176,6 +205,40 @@ history, echoing the full destroyed contents. The web UI (under a project's
 connections, edit a frame, and view the history — building the same board an
 agent drives from the CLI.
 
+## Projects & git repos
+
+`project create` auto-binds the current directory's repo (or `--path <dir>`'s)
+to the new project via its root-commit hash; a commit binds to at most one
+project. Later, from any clone or worktree of that source:
+
+```bash
+mesa project resolve          # -> the project bound to this repo
+```
+
+so an agent dropped into a working directory finds the right project instead of
+creating a duplicate. (`--no-git` skips binding; `project update --root-commit
+""` clears it.) The project also remembers its `local_path` — the last-known
+working folder — which powers the web UI's git status in the sidebar, the
+per-project **Git** tab (working-tree file list + per-file diff, read-only),
+and the **Agents** tab.
+
+## Agents, hooks & the CC Dashboard
+
+- **Agents tab** (web UI): lists the Claude Code sessions running under a
+  project's `local_path`, starts new background ones, and embeds a terminal
+  attached to a running session (a WebSocket bridge onto `claude attach`, so it
+  works from remote machines under `--lan`). There is deliberately no
+  `mesa agent` CLI — an agent in a terminal uses `claude` directly.
+- **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
+  the database. One point so far — `task-execute`, fired by `mesa task execute
+  <id>` (or the web UI's Execute button) with the full task JSON on stdin and
+  the project's `local_path` as cwd. The hook's exit code and output come back
+  as data.
+- **CC Dashboard** (`mesa cc`, sidebar entry in the web UI): read-only
+  analytics over Claude Code's own session transcripts — tokens, estimated
+  cost, and model/skill/agent/project breakdowns — plus live subscription-limit
+  usage (`mesa cc usage`, the one outbound network call in mesa).
+
 ## Development
 
 ```bash
@@ -185,6 +248,9 @@ cargo test <name>           # single test by name substring
 scripts/cli-check.sh        # CLI JSON-contract end-to-end gate
 scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
+scripts/agents-check.sh     # agents-surface contract against a stub `claude`
+scripts/hooks-check.sh      # task-execute hook contract over CLI + API
+scripts/cc-check.sh         # `mesa cc` contract against synthetic transcripts
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)
 npm --prefix frontend run dev

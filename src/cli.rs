@@ -526,6 +526,14 @@ EXAMPLES
         #[arg(long, default_value = "30d")]
         window: String,
     },
+    /// Ingest new transcript lines into the mesa store and print a report
+    ///
+    /// Walks Claude Code's transcripts and incrementally ingests anything new
+    /// into the `cc_*` tables — the same ingest every dashboard read runs
+    /// first, exposed for cron/on-demand use. Output is one JSON object
+    /// (files scanned/ingested, sessions touched, rows actually added); a
+    /// second run with no new activity reports zero adds.
+    Sync,
     /// Print currently-running sessions (the live-sessions object)
     ///
     /// Sessions whose newest transcript event lands inside the last `--minutes`,
@@ -1351,17 +1359,20 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
     Ok(())
 }
 
-/// Dashboard reads (`summary`/`sessions`/`skills`) are served from the
-/// persisted `cc_*` tables, so they open the database like every other
-/// handler; `live`/`usage` read external state directly and stay store-less.
+/// Dashboard reads (`summary`/`sessions`/`skills`) auto-ingest new transcript
+/// lines first (`cc::sync`) and are then served from the persisted `cc_*`
+/// tables, so they open the database like every other handler; `live`/`usage`
+/// read external state directly and stay store-less (spec W3/W4).
 fn run_cc(cmd: CcCmd) -> Result<()> {
     match cmd {
         CcCmd::Summary { window } => {
-            let store = Store::open_default()?;
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store)?;
             print_json(&crate::core::cc::collect(&store, &window)?)
         }
         CcCmd::Sessions { window, limit } => {
-            let store = Store::open_default()?;
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store)?;
             let mut rows = crate::core::cc::collect(&store, &window)?.sessions;
             if let Some(n) = limit {
                 rows.truncate(n);
@@ -1369,8 +1380,13 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
             print_json(&rows);
         }
         CcCmd::Skills { window } => {
-            let store = Store::open_default()?;
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store)?;
             print_json(&crate::core::cc::collect(&store, &window)?.skills)
+        }
+        CcCmd::Sync => {
+            let mut store = Store::open_default()?;
+            print_json(&crate::core::cc::sync(&mut store)?)
         }
         CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
         CcCmd::Usage => match crate::core::usage::fetch() {

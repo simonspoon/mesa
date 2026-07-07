@@ -2089,6 +2089,21 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
+    /// Monotone stamp of persisted cc state: total rows across `cc_messages`,
+    /// `cc_tool_calls`, `cc_sessions`. cc rows are never deleted, so the stamp
+    /// only grows; the API uses it as the dashboard cache key (a change by any
+    /// process — CLI sync, cron — moves it, while transcript-file deletion,
+    /// which must not invalidate the history-inclusive view, does not).
+    pub fn cc_stamp(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM cc_messages)
+                  + (SELECT COUNT(*) FROM cc_tool_calls)
+                  + (SELECT COUNT(*) FROM cc_sessions)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     // ---- backup ----
 
     /// Snapshots the database to `path` via `VACUUM INTO` (safe under WAL).
@@ -3888,6 +3903,26 @@ mod tests {
         assert_eq!(cc_count(&store, "cc_messages"), 2);
         assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
         assert_eq!(cc_count(&store, "cc_files"), 1);
+    }
+
+    /// The API cache key: 0 on empty, moves when rows land, stays put on a
+    /// no-op re-ingest (so a warm cache keeps serving).
+    #[test]
+    fn cc_stamp_moves_only_when_rows_land() {
+        let (mut store, _dir) = temp_store();
+        assert_eq!(store.cc_stamp().unwrap(), 0);
+        let cursor = CcFileCursor {
+            mtime: 111,
+            size: 222,
+            byte_offset: 222,
+        };
+        let batch = cc_batch();
+        store.cc_ingest_file("/t/a.jsonl", &cursor, &batch).unwrap();
+        // 1 session + 2 messages + 1 tool call (agent runs/cursors excluded).
+        let stamp = store.cc_stamp().unwrap();
+        assert_eq!(stamp, 4);
+        store.cc_ingest_file("/t/a.jsonl", &cursor, &batch).unwrap();
+        assert_eq!(store.cc_stamp().unwrap(), stamp);
     }
 
     #[test]

@@ -363,22 +363,6 @@ pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
     Ok(agg.finish(window, cutoff, now))
 }
 
-/// Newest transcript mtime (Unix seconds), or 0 if none. The API uses this as a
-/// cheap cache key: re-parse only when new activity has landed.
-pub fn newest_mtime() -> i64 {
-    let mut newest = 0;
-    if let Some(root) = projects_dir() {
-        for f in collect_files(&root) {
-            if let Some(m) = file_mtime(&f)
-                && m > newest
-            {
-                newest = m;
-            }
-        }
-    }
-    newest
-}
-
 // ---- incremental ingest (transcripts → cc_* tables via Store) ----
 
 /// What one [`sync`] run did. Serialized for the CLI (`mesa cc sync`, story

@@ -53,11 +53,12 @@ struct AppState {
     store: Arc<Mutex<Store>>,
     port: u16,
     lan: bool,
-    /// CC Dashboard cache, keyed by window. Each entry pairs the newest
-    /// transcript mtime seen when it was built with the dashboard; a request
-    /// re-parses only when new activity has landed (parsing thousands of
-    /// transcript files per request is otherwise too slow). Read-only data —
-    /// not the mesa store, so no `Store` write path is involved.
+    /// CC Dashboard cache, keyed by window. Each entry pairs the db-derived
+    /// `cc_stamp` (persisted cc row counts) seen when it was built with the
+    /// dashboard; a request re-aggregates only when the stamp moved — i.e.
+    /// when any process's ingest added rows. File mtimes are deliberately not
+    /// the key: they can't see a cross-process ingest, and a deleted
+    /// transcript must keep serving the history-inclusive view.
     cc_cache: Arc<Mutex<HashMap<String, (i64, CcDashboard)>>>,
     /// Live subscription-usage cache: `(fetched_unix, data)`. The UI polls this,
     /// but each fetch hits Anthropic's usage endpoint, so a short TTL throttles
@@ -1654,18 +1655,26 @@ struct CcQuery {
     window: Option<String>,
 }
 
-/// Returns the CC telemetry dashboard for the requested window, served from an
-/// in-memory cache that is invalidated when a transcript file changes.
+/// Returns the CC telemetry dashboard for the requested window. Every request
+/// first ingests new transcript lines (`cc::sync`), then serves from an
+/// in-memory cache keyed by the db-derived `cc_stamp` — persisted row counts,
+/// not file mtimes — so an ingest by another process (CLI sync, cron)
+/// invalidates it, while deleting a transcript file (which must not drop
+/// history from the view) does not.
 async fn get_cc_dashboard(
     State(state): State<AppState>,
     Query(q): Query<CcQuery>,
 ) -> ApiResult<Response> {
     let window = q.window.unwrap_or_else(|| "30d".to_string());
-    let newest = crate::core::cc::newest_mtime();
+    let stamp = {
+        let mut store = state.store.lock().unwrap();
+        crate::core::cc::sync(&mut store)?;
+        store.cc_stamp()?
+    };
     {
         let cache = state.cc_cache.lock().unwrap();
-        if let Some((mtime, dash)) = cache.get(&window)
-            && *mtime == newest
+        if let Some((cached, dash)) = cache.get(&window)
+            && *cached == stamp
         {
             return Ok(Json(dash.clone()).into_response());
         }
@@ -1684,7 +1693,7 @@ async fn get_cc_dashboard(
         if cache.len() >= 16 {
             cache.clear();
         }
-        cache.insert(window, (newest, dash.clone()));
+        cache.insert(window, (stamp, dash.clone()));
     }
     Ok(Json(dash).into_response())
 }

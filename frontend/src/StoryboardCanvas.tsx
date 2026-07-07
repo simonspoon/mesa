@@ -120,24 +120,38 @@ function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
 }
 
 type Rect = { x: number; y: number; w: number; h: number }
+type Point = { x: number; y: number }
 const cx = (r: Rect) => r.x + r.w / 2
 const cy = (r: Rect) => r.y + r.h / 2
 
-/** Point where the line from `from`'s centre meets `to`'s rectangle border, so
- *  the arrowhead lands on the box edge instead of behind it. */
-function borderPoint(from: Rect, to: Rect): { x: number; y: number } {
-  const dx = cx(to) - cx(from)
-  const dy = cy(to) - cy(from)
-  if (dx === 0 && dy === 0) return { x: cx(to), y: cy(to) }
-  const sx = dx !== 0 ? to.w / 2 / Math.abs(dx) : Infinity
-  const sy = dy !== 0 ? to.h / 2 / Math.abs(dy) : Infinity
-  const s = Math.min(sx, sy)
-  return { x: cx(to) - dx * s, y: cy(to) - dy * s }
+/** The four connection-dot positions of a frame: the side midpoints, matching
+ *  the rendered HANDLES (top/right/bottom/left). */
+const anchorsOf = (r: Rect): Point[] => [
+  { x: cx(r), y: r.y },
+  { x: r.x + r.w, y: cy(r) },
+  { x: cx(r), y: r.y + r.h },
+  { x: r.x, y: cy(r) },
+]
+
+/** The anchor of `r` nearest to `toward`, so the edge endpoint sits exactly on
+ *  a connection dot and re-snaps as the frames move. */
+function nearestAnchor(r: Rect, toward: Point): Point {
+  let best = anchorsOf(r)[0]
+  let bestD = Infinity
+  for (const a of anchorsOf(r)) {
+    const d = (a.x - toward.x) ** 2 + (a.y - toward.y) ** 2
+    if (d < bestD) {
+      bestD = d
+      best = a
+    }
+  }
+  return best
 }
 
 /**
- * A "floating" edge: drawn border-to-border between the two frames' rendered
- * boxes (positions + sizes measured by React Flow), ignoring which handle the
+ * A "floating" edge drawn anchor-to-anchor: each endpoint snaps to whichever
+ * of the two frames' four side dots is nearest the other frame's centre
+ * (positions + sizes measured by React Flow), ignoring which handle the
  * connection was dragged from — the stored edge has no handle, only from/to
  * frames. The label (inline-editable, hover-revealed delete) sits on the
  * midpoint of the visible segment.
@@ -160,8 +174,8 @@ function FrameEdgeView({
   })
   const from = rect(sourceNode)
   const to = rect(targetNode)
-  const start = borderPoint(to, from)
-  const end = borderPoint(from, to)
+  const start = nearestAnchor(from, { x: cx(to), y: cy(to) })
+  const end = nearestAnchor(to, { x: cx(from), y: cy(from) })
   const [path] = getStraightPath({
     sourceX: start.x,
     sourceY: start.y,
@@ -206,7 +220,7 @@ const edgeTypes = { frame: FrameEdgeView }
 /**
  * The freeform storyboard canvas, rendered by React Flow: frames are custom
  * nodes dragged by their header (a PATCH on drop), edges are floating
- * border-to-border connectors created by dragging between the side handles,
+ * anchor-to-anchor connectors created by dragging between the side handles,
  * and a right-hand panel edits the selected frame. Nodes re-derive from the
  * server `view` after every mutation (`onChanged` refetches; the parent owns
  * the fetch), and every mutation is stamped with `author` for the change

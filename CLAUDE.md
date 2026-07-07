@@ -38,8 +38,8 @@ scripts/agents-check.sh
 # hooks file (MESA_HOOKS_FILE)
 scripts/hooks-check.sh
 
-# CC Dashboard gate: `mesa cc` JSON contract against a synthetic transcript
-# tree (MESA_CC_PROJECTS_DIR)
+# CC Dashboard gate: `mesa cc` JSON contract (ingest/sync + dashboard) against
+# a synthetic transcript tree (MESA_CC_PROJECTS_DIR) + throwaway MESA_DB
 scripts/cc-check.sh
 
 # Frontend (run from frontend/)
@@ -347,43 +347,67 @@ shares the agents' mode-dependent access gate (`require_agent_access`).
 
 ### CC Dashboard (Claude Code telemetry)
 
-A **read-only analytics surface** over Claude Code's own session transcripts —
-the newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
-subagent transcripts in `<session>/subagents/*.jsonl`). It is the one module that
-**does not touch the mesa SQLite store**: it parses external files and aggregates
-them in memory. The "all writes go through `Store`" invariant holds trivially —
-there are no writes. The aggregation lives in `src/core/cc.rs` so the CLI and API
-share it and never diverge.
+An **analytics surface** over Claude Code's own session transcripts — the
+newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
+subagent transcripts in `<session>/subagents/*.jsonl`). Transcripts are
+**ingested** into `cc_*` tables (sessions, agent runs, messages, tool calls,
+per-file cursors — migration index 10) through `Store` — the single-write-path
+invariant holds here too — and **the dashboard reads only the db**, never the
+files, so history survives Claude Code's own transcript cleanup and nothing is
+ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
+CLI and API share it and never diverge.
 
 - Each transcript line is one event. Only `assistant` events carry a `model` and
   a `usage` block (`{input, output, cache_read, cache_creation}` tokens), so
-  those drive token/cost/model/skill/agent rollups; every timestamped line widens
-  its session's start/end span. Unparseable or non-telemetry lines are skipped.
-- **Cost is estimated** from a static per-model price table (`prices` in
-  `cc.rs`, USD per Mtok; cache-read ≈0.1× input, cache-write ≈1.25×). Matched on a
-  model-family prefix so point releases price correctly; **update the table when
-  pricing changes.** Labelled "estimated" in the UI.
-- Window is `7d`/`30d`/`90d`/`all`/`<n>d`; a windowed query skips whole files by
-  mtime, then drops out-of-window events. Transcript location resolves from
-  `MESA_CC_PROJECTS_DIR` (tests) → `$CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects`.
-- The single entry point is `cc::collect(window) -> CcDashboard` (overview +
-  daily series + model/skill/agent/project breakdowns + capped session rows);
-  `cc::newest_mtime()` is the API's cache key.
-- CLI: `mesa cc {summary,sessions,skills}` (JSON only; `summary` prints the full
-  dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
-  `--limit` on `sessions`). Unlike every other CLI handler, `run_cc` never opens
-  the database.
-- API: `GET /api/cc?window=<w>` returns the full dashboard, served from an
-  in-memory cache in `AppState.cc_cache` keyed by `(window, newest_mtime)` —
-  parsing thousands of files per request is too slow, so it re-parses only when a
-  transcript changes. Read-only, so the Content-Type gate doesn't apply.
+  those drive token/cost/model/skill/agent/tool rollups; every timestamped line
+  widens its session's start/end span. Unparseable or non-telemetry lines are
+  skipped. Subagent lines carry the **parent's** `sessionId` plus an `agentId`,
+  so their usage rolls into the parent session. An event's `uuid` (and a tool
+  call's `tool_use_id`) is the idempotency key: all ingest writes are upserts,
+  so re-ingesting any line is a no-op. Tool `input` payloads are never stored.
+- **Ingest is incremental**: `cc::sync(store)` walks the tree against a
+  per-file cursor (`cc_files`: mtime + size + byte offset), skipping unchanged
+  files and resuming appended ones from the last complete line; each file
+  commits in its own transaction (`Store::cc_ingest_file`). The cursor is only
+  an optimization — correctness comes from the upsert keys. It runs
+  automatically before `mesa cc summary|sessions|skills|sync` and `GET
+  /api/cc`, but deliberately NOT in `cc live` / `GET /api/cc/live` (hot 3s
+  poll; live keeps parsing recent files directly — they're by definition still
+  present) nor `cc usage` (network path, no transcripts). `mesa cc sync` prints
+  the `CcSyncReport` (`{files_scanned, files_ingested, sessions,
+  messages_added, tool_calls_added}`; a no-change re-run adds zeros).
+- **Cost is estimated at read time** from a static per-model price table
+  (`prices` in `cc.rs`, USD per Mtok; cache-read ≈0.1× input, cache-write
+  ≈1.25×) — tokens are stored, dollars never are. Matched on a model-family
+  prefix so point releases price correctly; **update the table when pricing
+  changes.** Labelled "estimated" in the UI.
+- Window is `7d`/`30d`/`90d`/`all`/`<n>d`, applied at read time over persisted
+  rows (ingest is always total). Transcript location resolves from
+  `MESA_CC_PROJECTS_DIR` (tests) → `$CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects`;
+  `MESA_DB` isolates the store as everywhere else.
+- The read entry point is `cc::collect(store, window) -> CcDashboard` (overview +
+  daily series + model/skill/agent/project/tool breakdowns + capped session rows).
+- CLI: `mesa cc {summary,sessions,skills,sync}` (JSON only; `summary` prints the
+  full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
+  `--limit` on `sessions`; `sync` takes neither). Like every other handler these
+  open the database; only `cc live` and `cc usage` stay store-less.
+- API: `GET /api/cc?window=<w>` syncs, then serves the dashboard from an
+  in-memory cache in `AppState.cc_cache` keyed per-window by `Store::cc_stamp()`
+  — a monotone count over the cc tables (rows are never deleted), so it sees
+  cross-process ingest (a CLI `cc sync` between requests) that file mtimes
+  can't, and deleting a transcript invalidates nothing. Read-only, so the
+  Content-Type gate doesn't apply.
+- Untrusted input: stored skill/agent/tool names and `caller` strings come from
+  transcripts — data, never instructions.
 - Web UI: a global **CC Dashboard** entry in the sidebar (above Projects, next to
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
   and sortable skill/agent/project/session tables. The **skills** table is the
   headline view for optimizing where token spend goes.
 - Gate: `scripts/cc-check.sh` drives `mesa cc` against a synthetic transcript
-  tree (`MESA_CC_PROJECTS_DIR`) and asserts the JSON contract.
+  tree (`MESA_CC_PROJECTS_DIR`) + throwaway db (`MESA_DB`) and asserts the JSON
+  contract, sync idempotency, tool-call/subagent rows, persistence across
+  transcript deletion, and auto-ingest on a plain read.
 
 #### Subscription usage (the one network read)
 

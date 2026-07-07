@@ -2,11 +2,14 @@
 //!
 //! Parses Claude Code's own session transcripts — newline-delimited JSON under
 //! `~/.claude/projects/**/*.jsonl` (including subagent transcripts in
-//! `<session>/subagents/*.jsonl`) — and folds them into a [`CcDashboard`]. This
-//! is **read-only external data**: nothing here touches the mesa SQLite store,
-//! so the "all writes go through `Store`" invariant is preserved (there are no
-//! writes). Shared by the CLI (`mesa cc`) and the API (`GET /api/cc`) so the two
-//! surfaces never diverge.
+//! `<session>/subagents/*.jsonl`) — and **ingests** them into the mesa store's
+//! `cc_*` tables via [`sync`] (incremental, per-file cursor, idempotent
+//! upserts; all SQL lives in `Store`, preserving the single-write-path
+//! invariant). The dashboard ([`collect`]) reads **only the db**, never the
+//! files, so history survives Claude Code deleting its transcripts. Only
+//! [`live`] still parses recent files directly (it reports the last minutes,
+//! for which the files are by definition present). Shared by the CLI
+//! (`mesa cc`) and the API (`GET /api/cc`) so the two surfaces never diverge.
 //!
 //! Each transcript line is one event. Only `assistant` events carry a `model`
 //! and a `usage` block, so those drive token/cost/model/skill/agent rollups;

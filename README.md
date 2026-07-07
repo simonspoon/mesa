@@ -230,10 +230,13 @@ and the **Agents** tab.
   <id>` (or the web UI's Execute button) with the full task JSON on stdin and
   the project's `local_path` as cwd. The hook's exit code and output come back
   as data.
-- **CC Dashboard** (`mesa cc`, sidebar entry in the web UI): read-only
-  analytics over Claude Code's own session transcripts — tokens, estimated
-  cost, and model/skill/agent/project breakdowns — plus live subscription-limit
-  usage (`mesa cc usage`, the one outbound network call in mesa).
+- **CC Dashboard** (`mesa cc`, sidebar entry in the web UI): analytics over
+  Claude Code's own session transcripts — tokens, estimated cost, and
+  model/skill/agent/project/tool breakdowns — plus live subscription-limit
+  usage (`mesa cc usage`, the one outbound network call in mesa). Transcripts
+  are ingested into the mesa database (`mesa cc sync`, also run automatically
+  before every dashboard read), so your usage history survives Claude Code
+  cleaning up old transcripts.
 
 ## Development
 
@@ -246,7 +249,7 @@ scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
 scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
-scripts/cc-check.sh         # `mesa cc` contract against synthetic transcripts
+scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)
 npm --prefix frontend run dev

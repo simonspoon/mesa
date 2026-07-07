@@ -1,4 +1,29 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  Background,
+  BackgroundVariant,
+  BaseEdge,
+  ConnectionMode,
+  Controls,
+  EdgeLabelRenderer,
+  Handle,
+  MarkerType,
+  MiniMap,
+  Panel,
+  Position,
+  ReactFlow,
+  getStraightPath,
+  useConnection,
+  useInternalNode,
+  useNodesState,
+  type Connection,
+  type Edge,
+  type EdgeProps,
+  type Node,
+  type NodeProps,
+  type Viewport,
+} from '@xyflow/react'
+import '@xyflow/react/dist/style.css'
 import {
   createEdge,
   createFrame,
@@ -14,12 +39,93 @@ import { Markdown } from './components/Markdown'
 import type { Frame } from './types/Frame'
 import type { StoryboardView } from './types/StoryboardView'
 
-const cx = (f: Frame) => f.x + f.w / 2
-const cy = (f: Frame) => f.y + f.h / 2
+const MIN_ZOOM = 0.25
+const MAX_ZOOM = 3
+
+/** Node payload: the server frame plus whether the editor has it selected
+ *  (selection is owned by this component, not React Flow's click-select, so
+ *  the editor panel and the highlight can never disagree). */
+type FrameNodeType = Node<{ frame: Frame; selected: boolean }, 'frame'>
+
+/** Edge payload: the server label plus the mutation callbacks the label
+ *  controls need. Callbacks ride in `data` so the custom edge stays a plain
+ *  presentational component. */
+type FrameEdgeType = Edge<
+  {
+    label: string | null
+    onSaveLabel: (next: string) => Promise<void>
+    onDelete: () => void
+  },
+  'frame'
+>
+
+const HANDLES = [
+  { id: 'top', position: Position.Top },
+  { id: 'right', position: Position.Right },
+  { id: 'bottom', position: Position.Bottom },
+  { id: 'left', position: Position.Left },
+]
+
+/**
+ * One storyboard frame as a React Flow node. The header is the drag handle
+ * (`dragHandle` on the node targets it), so the body stays free for text
+ * selection and link clicks. Connections start from the four side dots; while
+ * a connection is being dragged from another node, an invisible full-size
+ * target handle covers the card so the drop can land anywhere on it.
+ */
+function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
+  const f = data.frame
+  const connection = useConnection()
+  const isConnectTarget = connection.inProgress && connection.fromNode.id !== id
+  // Handles are siblings of the card, not children: the card clips its
+  // content (overflow + corner clip-path), which would swallow the half-
+  // outside connection dots.
+  return (
+    <>
+      <div
+        className={'frame' + (data.selected ? ' selected' : '')}
+        style={{ width: f.w, minHeight: f.h, borderColor: f.color ?? undefined }}
+      >
+        <div className="frame-header">
+          <span className="frame-title">
+            <Markdown text={f.title} />
+          </span>
+          <span className="frame-id muted">#{f.id}</span>
+        </div>
+        {f.body && (
+          <div className="frame-body">
+            <Markdown text={f.body} />
+          </div>
+        )}
+        <div className="frame-foot muted">
+          {f.task_id !== null && (
+            <span className="badge">task #{f.task_id}</span>
+          )}
+          {f.author && <span>{f.author}</span>}
+        </div>
+      </div>
+      {HANDLES.map((h) => (
+        <Handle key={h.id} id={h.id} type="source" position={h.position} />
+      ))}
+      {isConnectTarget && (
+        <Handle
+          id="drop"
+          type="target"
+          position={Position.Top}
+          className="frame-drop-handle"
+        />
+      )}
+    </>
+  )
+}
+
+type Rect = { x: number; y: number; w: number; h: number }
+const cx = (r: Rect) => r.x + r.w / 2
+const cy = (r: Rect) => r.y + r.h / 2
 
 /** Point where the line from `from`'s centre meets `to`'s rectangle border, so
  *  the arrowhead lands on the box edge instead of behind it. */
-function borderPoint(from: Frame, to: Frame): { x: number; y: number } {
+function borderPoint(from: Rect, to: Rect): { x: number; y: number } {
   const dx = cx(to) - cx(from)
   const dy = cy(to) - cy(from)
   if (dx === 0 && dy === 0) return { x: cx(to), y: cy(to) }
@@ -29,53 +135,84 @@ function borderPoint(from: Frame, to: Frame): { x: number; y: number } {
   return { x: cx(to) - dx * s, y: cy(to) - dy * s }
 }
 
-type Drag = {
-  id: number
-  startX: number
-  startY: number
-  ox: number
-  oy: number
-  curX: number
-  curY: number
-  moved: boolean
+/**
+ * A "floating" edge: drawn border-to-border between the two frames' rendered
+ * boxes (positions + sizes measured by React Flow), ignoring which handle the
+ * connection was dragged from — the stored edge has no handle, only from/to
+ * frames. The label (inline-editable, hover-revealed delete) sits on the
+ * midpoint of the visible segment.
+ */
+function FrameEdgeView({
+  id,
+  source,
+  target,
+  data,
+  markerEnd,
+}: EdgeProps<FrameEdgeType>) {
+  const sourceNode = useInternalNode(source)
+  const targetNode = useInternalNode(target)
+  if (!sourceNode || !targetNode || !data) return null
+  const rect = (n: typeof sourceNode): Rect => ({
+    x: n.internals.positionAbsolute.x,
+    y: n.internals.positionAbsolute.y,
+    w: n.measured.width ?? 0,
+    h: n.measured.height ?? 0,
+  })
+  const from = rect(sourceNode)
+  const to = rect(targetNode)
+  const start = borderPoint(to, from)
+  const end = borderPoint(from, to)
+  const [path] = getStraightPath({
+    sourceX: start.x,
+    sourceY: start.y,
+    targetX: end.x,
+    targetY: end.y,
+  })
+  const isEmpty = !(data.label && data.label.trim())
+  return (
+    <>
+      <BaseEdge id={id} path={path} markerEnd={markerEnd} />
+      <EdgeLabelRenderer>
+        <div
+          className={'edge-label nodrag nopan' + (isEmpty ? ' empty' : '')}
+          style={{
+            transform: `translate(-50%, -50%) translate(${
+              (start.x + end.x) / 2
+            }px, ${(start.y + end.y) / 2}px)`,
+          }}
+        >
+          <InlineEdit
+            className="edge-label-text"
+            value={data.label ?? ''}
+            placeholder="label"
+            onSave={data.onSaveLabel}
+          />
+          <button
+            className="edge-del"
+            title="delete edge"
+            onClick={data.onDelete}
+          >
+            ✕
+          </button>
+        </div>
+      </EdgeLabelRenderer>
+    </>
+  )
 }
 
-/** Pan/zoom view transform applied to the content layer as
- *  `translate(tx, ty) scale(scale)` with transform-origin 0 0. This is a pure
- *  view layer over the saved frame x/y (never persisted on the board). Later
- *  stories read/persist this same shape, so it is kept as one structured value. */
-type ViewTransform = {
-  tx: number
-  ty: number
-  scale: number
-}
-
-const MIN_SCALE = 0.25
-const MAX_SCALE = 3
-const ZOOM_STEP = 0.0015 // per wheel deltaY unit
-const clampScale = (s: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s))
-
-const DEFAULT_TRANSFORM: ViewTransform = { tx: 0, ty: 0, scale: 1 }
-
-/** Pan gesture in progress: where the pointer went down and the transform at
- *  that moment. Pan moves the view by the raw client delta (screen-space). */
-type Pan = {
-  pointerId: number
-  startX: number
-  startY: number
-  tx: number
-  ty: number
-}
+const nodeTypes = { frame: FrameNode }
+const edgeTypes = { frame: FrameEdgeView }
 
 /**
- * The freeform storyboard canvas: frames are absolutely-positioned cards you
- * drag to reposition (a PATCH on drop), edges are SVG arrows that follow their
- * frames, and a right-hand panel edits the selected frame. "Connect" mode turns
- * clicks into edge creation. Frames render straight from the server `view`; the
- * only local state is a transient drag overlay, so there is no copy to keep in
- * sync. The board does not live-sync; `onChanged` refetches after every
- * mutation (the parent owns the fetch), and every mutation is stamped with
- * `author` for the change history.
+ * The freeform storyboard canvas, rendered by React Flow: frames are custom
+ * nodes dragged by their header (a PATCH on drop), edges are floating
+ * border-to-border connectors created by dragging between the side handles,
+ * and a right-hand panel edits the selected frame. Nodes re-derive from the
+ * server `view` after every mutation (`onChanged` refetches; the parent owns
+ * the fetch), and every mutation is stamped with `author` for the change
+ * history. The pan/zoom viewport is browser-local per board (boardView.ts);
+ * the parent keys this component by board id, so a board switch remounts onto
+ * that board's saved viewport.
  */
 export function StoryboardCanvas({
   view,
@@ -90,141 +227,81 @@ export function StoryboardCanvas({
 }) {
   const storyboardId = view.storyboard.id
   const [selectedId, setSelectedId] = useState<number | null>(null)
-  const [connectMode, setConnectMode] = useState(false)
-  const [connectFrom, setConnectFrom] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   // Expanded mode: the canvas takes over the whole window (CSS fixes the root to
   // the viewport). Purely a view-layer toggle, never persisted on the board.
   const [expanded, setExpanded] = useState(false)
-  // Live position of the frame currently being dragged; overlays the server
-  // position so the drag is smooth without copying the whole frame list.
-  const [dragPos, setDragPos] = useState<{ id: number; x: number; y: number } | null>(
-    null,
-  )
-  const dragRef = useRef<Drag | null>(null)
-  const justDragged = useRef(false)
 
-  // Real rendered frame heights. A frame's stored `h` is only a *floor*
-  // (`minHeight` below); markdown content makes the card grow taller, so the
-  // stored `h` understates a tall card. Connector geometry keys off the true
-  // box, else `cy`/`borderPoint` use a too-short box: the line meets an
-  // interior point and the (border-to-border) label drifts toward the source.
-  // offsetHeight is the pre-transform layout height (CSS scale doesn't change
-  // it), so it's already board-space. A ResizeObserver re-measures on growth.
-  const frameEls = useRef(new Map<number, HTMLDivElement>())
-  const roRef = useRef<ResizeObserver | null>(null)
-  const [heights, setHeights] = useState<Map<number, number>>(new Map())
-  const measure = useCallback(() => {
-    setHeights((prev) => {
-      const next = new Map(prev)
-      let changed = false
-      for (const [id, el] of frameEls.current) {
-        if (next.get(id) !== el.offsetHeight) {
-          next.set(id, el.offsetHeight)
-          changed = true
-        }
-      }
-      for (const id of [...next.keys()]) {
-        if (!frameEls.current.has(id)) {
-          next.delete(id)
-          changed = true
-        }
-      }
-      return changed ? next : prev
-    })
+  const showError = useCallback((e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e))
   }, [])
-  useEffect(() => {
-    const ro = new ResizeObserver(measure)
-    roRef.current = ro
-    for (const el of frameEls.current.values()) ro.observe(el)
-    measure()
-    return () => {
-      ro.disconnect()
-      roRef.current = null
-    }
-  }, [measure])
-  const registerFrame = useCallback(
-    (id: number) => (el: HTMLDivElement | null) => {
-      const map = frameEls.current
-      if (el) {
-        map.set(id, el)
-        roRef.current?.observe(el)
-      } else {
-        const prev = map.get(id)
-        if (prev) roRef.current?.unobserve(prev)
-        map.delete(id)
-      }
-    },
+
+  // Nodes live in React Flow state so drags are smooth (React Flow applies the
+  // position changes locally); the server view re-seeds them after every
+  // refetch. A drop PATCHes x/y, so the refetch lands on the same coordinates
+  // and nothing snaps back.
+  const toNodes = useCallback(
+    (frames: Frame[], selected: number | null): FrameNodeType[] =>
+      frames.map((f) => ({
+        id: String(f.id),
+        type: 'frame' as const,
+        position: { x: f.x, y: f.y },
+        data: { frame: f, selected: selected === f.id },
+        dragHandle: '.frame-header',
+      })),
     [],
   )
-  // Effective height for geometry: the measured render height when it exceeds
-  // the stored floor, else the floor.
-  const effH = (f: Frame) => Math.max(f.h, heights.get(f.id) ?? 0)
-
-  // Pan/zoom view transform (story 01). Browser-local view state (story 03):
-  // restored from localStorage on open and persisted on change, keyed by board.
-  // Held in React state so it survives the parent's refetch-on-mutation (the
-  // component is not remounted across `onChanged`); the lazy init seeds the
-  // first board, and the effect below re-seeds when the board id changes
-  // (boards switch in place, without a remount).
-  const [transform, setTransform] = useState<ViewTransform>(
-    () => loadBoardView(storyboardId) ?? DEFAULT_TRANSFORM,
+  const [nodes, setNodes, onNodesChange] = useNodesState<FrameNodeType>(
+    toNodes(view.frames, null),
   )
-  const [panning, setPanning] = useState(false)
-  const viewportRef = useRef<HTMLDivElement | null>(null)
-  const panRef = useRef<Pan | null>(null)
-
-  // Reseed the view when the board changes without a remount, then persist the
-  // current view per board on every change. `transformBoard` records which
-  // board the live `transform` value belongs to (advanced only by the persist
-  // effect, once `transform` has actually been replaced with the new board's
-  // view). On a board switch the reseed loads and applies the new board's saved
-  // view; the persist runs only when `transform` and `storyboardId` agree, so
-  // the outgoing board's transform is never written under the new board's key.
-  const transformBoard = useRef(storyboardId)
   useEffect(() => {
-    if (transformBoard.current !== storyboardId) {
-      setTransform(loadBoardView(storyboardId) ?? DEFAULT_TRANSFORM)
-    }
-  }, [storyboardId])
-  useEffect(() => {
-    if (transformBoard.current !== storyboardId) {
-      // First render after a board switch, before the reseed's setTransform has
-      // landed: `transform` still belongs to the previous board — don't write
-      // it under the new key. The reseed's state update re-runs this effect.
-      transformBoard.current = storyboardId
-      return
-    }
-    saveBoardView(storyboardId, transform)
-  }, [storyboardId, transform])
+    setNodes(toNodes(view.frames, selectedId))
+  }, [view.frames, selectedId, setNodes, toNodes])
 
-  function showError(e: unknown) {
-    setError(e instanceof Error ? e.message : String(e))
-  }
-
-  // Frames as placed on screen: server positions, with the dragged one overlaid.
-  const placed: Frame[] = view.frames.map((f) =>
-    dragPos && dragPos.id === f.id ? { ...f, x: dragPos.x, y: dragPos.y } : f,
+  const removeEdge = useCallback(
+    (id: number) => {
+      deleteEdge(id, author).then(() => {
+        setError(null)
+        onChanged()
+      }, showError)
+    },
+    [author, onChanged, showError],
   )
-  // Geometry frames carry the *effective* (rendered) height so connector ends
-  // land on the real card edges; rendering (below) still uses the stored `h` as
-  // a floor via `minHeight`.
-  const byId = new Map(placed.map((f) => [f.id, { ...f, h: effH(f) }]))
-  const selected = selectedId === null ? undefined : byId.get(selectedId)
 
-  // Board bounding box in board-space. Frames can be dragged to NEGATIVE x/y;
-  // the SVG connector layer must span that region too, else any line at x<0 /
-  // y<0 is clipped and only its (overflow-visible) label div shows — a label
-  // floating with no connector under it. minX/minY stay 0 for all-positive
-  // boards (no needless shift); they go negative only when a frame crosses the
-  // origin, and the SVG is offset + viewBox'd to match (see edge-layer below).
-  const PAD = 80
-  const minX = Math.min(0, ...placed.map((f) => f.x - PAD))
-  const minY = Math.min(0, ...placed.map((f) => f.y - PAD))
-  const maxX = Math.max(1200, ...placed.map((f) => f.x + f.w + PAD))
-  const maxY = Math.max(640, ...placed.map((f) => f.y + effH(f) + PAD))
-  const width = maxX - minX
-  const height = maxY - minY
+  /** Save an edited connector label. Empty string clears it (null). Returns the
+   *  promise so InlineEdit can surface a save error / stay open on failure. */
+  const editEdgeLabel = useCallback(
+    (id: number, next: string) =>
+      updateEdge(id, { label: next === '' ? null : next }, author).then(
+        () => {
+          setError(null)
+          onChanged()
+        },
+        (e) => {
+          showError(e)
+          throw e
+        },
+      ),
+    [author, onChanged, showError],
+  )
+
+  // Edges derive straight from the server view — no local edge state to sync.
+  const edges: FrameEdgeType[] = useMemo(
+    () =>
+      view.edges.map((e) => ({
+        id: String(e.id),
+        source: String(e.from_frame),
+        target: String(e.to_frame),
+        type: 'frame' as const,
+        data: {
+          label: e.label,
+          onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
+          onDelete: () => removeEdge(e.id),
+        },
+        markerEnd: { type: MarkerType.ArrowClosed, color: '#00e5ff' },
+      })),
+    [view.edges, editEdgeLabel, removeEdge],
+  )
 
   function addFrame() {
     const n = view.frames.length
@@ -240,144 +317,42 @@ export function StoryboardCanvas({
     }, showError)
   }
 
-  function toggleConnect() {
-    setConnectMode((on) => !on)
-    setConnectFrom(null)
-  }
-
-  function clickFrame(f: Frame) {
-    if (justDragged.current) {
-      justDragged.current = false
-      return
-    }
-    if (connectMode) {
-      if (connectFrom === null) {
-        setConnectFrom(f.id)
-      } else if (connectFrom === f.id) {
-        setConnectFrom(null)
-      } else {
-        createEdge(storyboardId, {
-          from_frame: connectFrom,
-          to_frame: f.id,
-          author,
-        }).then(() => {
-          setError(null)
-          setConnectFrom(null)
-          onChanged()
-        }, showError)
-      }
-      return
-    }
-    setSelectedId(f.id)
-  }
-
-  function onPointerDown(e: React.PointerEvent, f: Frame) {
-    // Clear any stale drag flag up front: the browser does not guarantee a
-    // click after every drag, so don't rely on clickFrame to reset it.
-    justDragged.current = false
-    if (e.button !== 0 || connectMode) return
-    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
-    dragRef.current = {
-      id: f.id,
-      startX: e.clientX,
-      startY: e.clientY,
-      ox: f.x,
-      oy: f.y,
-      curX: f.x,
-      curY: f.y,
-      moved: false,
-    }
-  }
-
-  function onPointerMove(e: React.PointerEvent, f: Frame) {
-    const d = dragRef.current
-    if (!d || d.id !== f.id) return
-    // Frames live inside the scaled content layer, so a board-space delta shows
-    // on screen as delta * scale. To keep the card under the cursor 1:1, convert
-    // the client (screen) delta back to board space by dividing by the current
-    // scale. The pan offset (tx/ty) is a constant translation that cancels out
-    // in a delta, so it never enters the saved x/y.
-    const nx = d.ox + (e.clientX - d.startX) / transform.scale
-    const ny = d.oy + (e.clientY - d.startY) / transform.scale
-    d.curX = nx
-    d.curY = ny
-    if (!d.moved && (Math.abs(nx - d.ox) > 3 || Math.abs(ny - d.oy) > 3)) {
-      d.moved = true
-    }
-    setDragPos({ id: f.id, x: nx, y: ny })
-  }
-
-  function onPointerUp(e: React.PointerEvent, f: Frame) {
-    const d = dragRef.current
-    if (!d || d.id !== f.id) return
-    dragRef.current = null
-    ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
-    if (!d.moved) {
-      setDragPos(null)
-      return
-    }
-    justDragged.current = true
-    updateFrame(f.id, { x: Math.round(d.curX), y: Math.round(d.curY) }, author).then(
-      () => {
-        // Keep the overlay at the dropped position until the refetch lands with
-        // the same coordinates, so the frame doesn't snap back for a frame.
-        setError(null)
-        onChanged()
-      },
-      (err) => {
-        // On failure, drop the overlay so the frame reverts to the server position.
-        setDragPos(null)
-        showError(err)
-      },
-    )
-  }
-
-  function removeEdge(id: number) {
-    deleteEdge(id, author).then(() => {
+  function onNodeDragStop(_e: unknown, node: FrameNodeType) {
+    const f = view.frames.find((fr) => String(fr.id) === node.id)
+    const x = Math.round(node.position.x)
+    const y = Math.round(node.position.y)
+    // A click on the drag handle also fires dragStop; only a real move PATCHes.
+    if (f && f.x === x && f.y === y) return
+    updateFrame(Number(node.id), { x, y }, author).then(() => {
       setError(null)
       onChanged()
     }, showError)
   }
 
-  /** Save an edited connector label. Empty string clears it (null). Returns the
-   *  promise so InlineEdit can surface a save error / stay open on failure. */
-  function editEdgeLabel(id: number, next: string) {
-    return updateEdge(id, { label: next === '' ? null : next }, author).then(
-      () => {
-        setError(null)
-        onChanged()
-      },
-      (e) => {
-        showError(e)
-        throw e
-      },
-    )
+  function onConnect(c: Connection) {
+    if (c.source === c.target) return // self-edges are rejected server-side
+    createEdge(storyboardId, {
+      from_frame: Number(c.source),
+      to_frame: Number(c.target),
+      author,
+    }).then(() => {
+      setError(null)
+      onChanged()
+    }, showError)
   }
 
-  // Wheel zoom centred on the cursor: keep the world point under the pointer
-  // fixed on screen while scale changes. world = (screen - t) / scale, so after
-  // scaling we solve t' = screen - world * scale'. Bound as a native non-passive
-  // listener so preventDefault() actually suppresses page scroll (React's
-  // synthetic onWheel is passive and cannot).
-  useEffect(() => {
-    const el = viewportRef.current
-    if (!el) return
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault()
-      const rect = el.getBoundingClientRect()
-      const px = e.clientX - rect.left
-      const py = e.clientY - rect.top
-      setTransform((t) => {
-        const next = clampScale(t.scale * Math.exp(-e.deltaY * ZOOM_STEP))
-        if (next === t.scale) return t
-        const wx = (px - t.tx) / t.scale
-        const wy = (py - t.ty) / t.scale
-        return { scale: next, tx: px - wx * next, ty: py - wy * next }
-      })
-    }
-    el.addEventListener('wheel', onWheel, { passive: false })
-    return () => el.removeEventListener('wheel', onWheel)
-  }, [])
+  // Pan/zoom is browser-local view state, keyed by board (boardView.ts): the
+  // saved {tx, ty, scale} maps 1:1 onto React Flow's {x, y, zoom}. Loaded once
+  // per mount (the parent remounts per board); saved on every move end.
+  const [defaultViewport] = useState<Viewport>(() => {
+    const saved = loadBoardView(storyboardId)
+    return saved
+      ? { x: saved.tx, y: saved.ty, zoom: saved.scale }
+      : { x: 0, y: 0, zoom: 1 }
+  })
+  function onMoveEnd(_e: unknown, vp: Viewport) {
+    saveBoardView(storyboardId, { tx: vp.x, ty: vp.y, scale: vp.zoom })
+  }
 
   // Escape leaves expanded (whole-window) mode — the usual way out of a takeover
   // view. Only bound while expanded so it never swallows Escape elsewhere.
@@ -390,83 +365,10 @@ export function StoryboardCanvas({
     return () => window.removeEventListener('keydown', onKey)
   }, [expanded])
 
-  // Pan starts only when the pointer goes down on empty canvas (not on a frame)
-  // and not in connect-mode; frame drags own their own pointer handlers. Pan
-  // translates the view by the raw client delta (screen-space, scale-free).
-  function onViewportPointerDown(e: React.PointerEvent) {
-    if (e.button !== 0 || connectMode) return
-    // Empty canvas only: not on a frame, edge label, or an in-canvas control.
-    if (
-      (e.target as HTMLElement).closest(
-        '.frame, .edge-label, .canvas-controls, .canvas-expand',
-      )
-    )
-      return
-    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
-    panRef.current = {
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      tx: transform.tx,
-      ty: transform.ty,
-    }
-    setPanning(true)
-  }
-
-  function onViewportPointerMove(e: React.PointerEvent) {
-    const p = panRef.current
-    if (!p || p.pointerId !== e.pointerId) return
-    setTransform((t) => ({
-      ...t,
-      tx: p.tx + (e.clientX - p.startX),
-      ty: p.ty + (e.clientY - p.startY),
-    }))
-  }
-
-  function onViewportPointerUp(e: React.PointerEvent) {
-    const p = panRef.current
-    if (!p || p.pointerId !== e.pointerId) return
-    panRef.current = null
-    ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
-    setPanning(false)
-  }
-
-  // Reset / fit: frame the whole board in one action. Computes the bounding box
-  // of the placed frames (board space) plus a margin, picks the largest scale
-  // that fits that box within the available viewport (so the content fills the
-  // space as fully as possible, clamped to the shared [MIN,MAX] range), and
-  // centres it. With no frames there is nothing to fit, so fall back to the
-  // default origin view. This goes through `setTransform`, so the persist effect
-  // (story 03) writes the reset view to localStorage — the reset is remembered.
-  // The viewport's getBoundingClientRect picks up its real size in both normal
-  // and expanded modes, so the same math fits to whatever space is available.
-  const FIT_MARGIN = 48 // board-space padding around the cards' bounding box
-  function resetView() {
-    const el = viewportRef.current
-    if (!el || placed.length === 0) {
-      setTransform(DEFAULT_TRANSFORM)
-      return
-    }
-    const minX = Math.min(...placed.map((f) => f.x))
-    const minY = Math.min(...placed.map((f) => f.y))
-    const maxX = Math.max(...placed.map((f) => f.x + f.w))
-    const maxY = Math.max(...placed.map((f) => f.y + effH(f)))
-    const bw = maxX - minX + FIT_MARGIN * 2
-    const bh = maxY - minY + FIT_MARGIN * 2
-    const rect = el.getBoundingClientRect()
-    // Largest scale that keeps the whole box on screen (limiting dimension
-    // wins). Clamped to [MIN,MAX]: a small board zooms in to fill, a huge one
-    // zooms out so nothing is clipped. No 100% cap — filling the space is the goal.
-    const scale = clampScale(Math.min(rect.width / bw, rect.height / bh))
-    // Centre the box: place its scaled centre at the viewport centre.
-    const cxBox = minX - FIT_MARGIN + bw / 2
-    const cyBox = minY - FIT_MARGIN + bh / 2
-    setTransform({
-      scale,
-      tx: rect.width / 2 - cxBox * scale,
-      ty: rect.height / 2 - cyBox * scale,
-    })
-  }
+  const selected =
+    selectedId === null
+      ? undefined
+      : view.frames.find((f) => f.id === selectedId)
 
   return (
     <div
@@ -474,200 +376,58 @@ export function StoryboardCanvas({
         expanded ? ' expanded' : ''
       }`}
     >
-      <div
-        ref={viewportRef}
-        className={`storyboard-viewport${panning ? ' panning' : ''}`}
-        onPointerDown={onViewportPointerDown}
-        onPointerMove={onViewportPointerMove}
-        onPointerUp={onViewportPointerUp}
-      >
-        {/* Infinite graph-paper grid filling the whole viewport. Lives on a
-            fixed full-size layer (behind the content) but its size/position
-            track the pan/zoom transform, so the lines stay aligned with the
-            frames at every zoom level. */}
-        <div
-          className="storyboard-grid"
-          style={{
-            backgroundSize: `${32 * transform.scale}px ${32 * transform.scale}px`,
-            backgroundPosition: `${transform.tx}px ${transform.ty}px`,
-          }}
-        />
-
-        {/* In-canvas controls, pinned top-left over the pan/zoom layer. */}
-        <div className="canvas-controls">
-          <button onClick={addFrame}>add frame</button>
-          <button
-            className={connectMode ? 'active' : ''}
-            onClick={toggleConnect}
-          >
-            {connectMode ? 'connecting…' : 'connect'}
-          </button>
-          <button
-            onClick={resetView}
-            title="Reset zoom and recentre on the cards"
-          >
-            reset view
-          </button>
-          <span className="canvas-hint muted">
-            {connectMode
-              ? connectFrom === null
-                ? 'click a frame to start an edge'
-                : 'click the target frame'
-              : 'drag a frame to move it · click to edit'}
-          </span>
-          {error && <span className="error">{error}</span>}
-        </div>
-
-        {/* Expand toggle, pinned top-right: take over the whole window. */}
-        <button
-          className={`canvas-expand${expanded ? ' active' : ''}`}
-          onClick={() => setExpanded((x) => !x)}
-          title={
-            expanded
-              ? 'Collapse the canvas (Esc)'
-              : 'Expand the canvas to fill the window'
-          }
+      <div className="storyboard-viewport">
+        <ReactFlow
+          colorMode="dark"
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          onNodesChange={onNodesChange}
+          onNodeDragStop={onNodeDragStop}
+          onNodeClick={(_e, node) => setSelectedId(Number(node.id))}
+          onPaneClick={() => setSelectedId(null)}
+          onConnect={onConnect}
+          connectionMode={ConnectionMode.Loose}
+          defaultViewport={defaultViewport}
+          onMoveEnd={onMoveEnd}
+          minZoom={MIN_ZOOM}
+          maxZoom={MAX_ZOOM}
+          // Deletion stays behind the explicit controls (editor panel / edge ✕),
+          // never a stray keypress — matching the rest of the app.
+          deleteKeyCode={null}
+          nodesFocusable={false}
+          edgesFocusable={false}
         >
-          {expanded ? 'collapse' : 'expand'}
-        </button>
-
-        <div
-          className="storyboard-content"
-          style={{
-            transform: `translate(${transform.tx}px, ${transform.ty}px) scale(${transform.scale})`,
-            transformOrigin: '0 0',
-          }}
-        >
-          <div className="storyboard-canvas" style={{ width, height }}>
-          <svg
-            className="edge-layer"
-            width={width}
-            height={height}
-            viewBox={`${minX} ${minY} ${width} ${height}`}
-            style={{ left: minX, top: minY }}
-          >
-            <defs>
-              <marker
-                id="arrow"
-                viewBox="0 0 10 10"
-                refX="9"
-                refY="5"
-                markerWidth="7"
-                markerHeight="7"
-                orient="auto-start-reverse"
-              >
-                <path d="M 0 0 L 10 5 L 0 10 z" />
-              </marker>
-            </defs>
-            {view.edges.map((e) => {
-              const from = byId.get(e.from_frame)
-              const to = byId.get(e.to_frame)
-              if (!from || !to) return null
-              // Both ends on the card borders (not the hidden centres): the
-              // arrowhead lands on the target edge and the tail starts at the
-              // source edge, so the visible segment is border-to-border and the
-              // label (same midpoint) sits dead-centre on it.
-              const start = borderPoint(to, from)
-              const end = borderPoint(from, to)
-              return (
-                <line
-                  key={`edge-line-${e.id}`}
-                  className="edge-line"
-                  x1={start.x}
-                  y1={start.y}
-                  x2={end.x}
-                  y2={end.y}
-                  markerEnd="url(#arrow)"
-                />
-              )
-            })}
-          </svg>
-
-          {view.edges.map((e) => {
-            const from = byId.get(e.from_frame)
-            const to = byId.get(e.to_frame)
-            if (!from || !to) return null
-            // Midpoint of the drawn line's VISIBLE segment, which runs
-            // border-to-border (source border point → target border point), so
-            // the label sits dead-centre on the line rather than skewed toward
-            // the source. The label lives in the scaled content layer, so this
-            // board-space point keeps it centred on the connector through every
-            // pan / zoom / frame move.
-            const sourceBorder = borderPoint(to, from)
-            const targetBorder = borderPoint(from, to)
-            const mx = (sourceBorder.x + targetBorder.x) / 2
-            const my = (sourceBorder.y + targetBorder.y) / 2
-            const isEmpty = !(e.label && e.label.trim())
-            return (
-              <div
-                key={`edge-${e.id}`}
-                className={'edge-label' + (isEmpty ? ' empty' : '')}
-                style={{ left: mx, top: my }}
-              >
-                <InlineEdit
-                  className="edge-label-text"
-                  value={e.label ?? ''}
-                  placeholder="label"
-                  onSave={(next) => editEdgeLabel(e.id, next)}
-                />
-                <button
-                  className="edge-del"
-                  title="delete edge"
-                  onClick={() => removeEdge(e.id)}
-                >
-                  ✕
-                </button>
-              </div>
-            )
-          })}
-
-          {placed.map((f) => (
-            <div
-              key={`frame-${f.id}`}
-              ref={registerFrame(f.id)}
-              className={
-                'frame' +
-                (selectedId === f.id ? ' selected' : '') +
-                (connectFrom === f.id ? ' connect-from' : '')
+          <Background
+            variant={BackgroundVariant.Lines}
+            gap={32}
+            color="rgba(0, 229, 255, 0.05)"
+          />
+          <Controls showInteractive={false} />
+          <MiniMap pannable zoomable />
+          <Panel position="top-left" className="canvas-controls">
+            <button onClick={addFrame}>add frame</button>
+            <span className="canvas-hint muted">
+              drag a header to move · drag a side dot to connect · click to
+              edit
+            </span>
+            {error && <span className="error">{error}</span>}
+          </Panel>
+          <Panel position="top-right">
+            <button
+              className={`canvas-expand${expanded ? ' active' : ''}`}
+              onClick={() => setExpanded((x) => !x)}
+              title={
+                expanded
+                  ? 'Collapse the canvas (Esc)'
+                  : 'Expand the canvas to fill the window'
               }
-              style={{
-                left: f.x,
-                top: f.y,
-                // Auto-size to fit content (#20): the frame's stored `w` caps the
-                // width (text wraps rather than growing unbounded) and `h` is a
-                // floor; the card grows taller as needed so nothing is clipped.
-                width: f.w,
-                minHeight: f.h,
-                borderColor: f.color ?? undefined,
-              }}
-              onClick={() => clickFrame(f)}
             >
-              <div
-                className="frame-header"
-                onPointerDown={(e) => onPointerDown(e, f)}
-                onPointerMove={(e) => onPointerMove(e, f)}
-                onPointerUp={(e) => onPointerUp(e, f)}
-              >
-                <span className="frame-title">
-                  <Markdown text={f.title} />
-                </span>
-                <span className="frame-id muted">#{f.id}</span>
-              </div>
-              {f.body && (
-                <div className="frame-body">
-                  <Markdown text={f.body} />
-                </div>
-              )}
-              <div className="frame-foot muted">
-                {f.task_id !== null && (
-                  <span className="badge">task #{f.task_id}</span>
-                )}
-                {f.author && <span>{f.author}</span>}
-              </div>
-            </div>
-          ))}
-          </div>
-        </div>
+              {expanded ? 'collapse' : 'expand'}
+            </button>
+          </Panel>
+        </ReactFlow>
       </div>
 
       {selected && (

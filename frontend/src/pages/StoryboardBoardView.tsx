@@ -146,7 +146,10 @@ export function StoryboardBoardView({
         </div>
       )}
 
+      {/* Keyed by board id: a board switch remounts the canvas so React Flow
+          re-reads that board's saved viewport (defaultViewport is mount-time). */}
       <StoryboardCanvas
+        key={storyboardId}
         view={view}
         projectId={projectId}
         author={actor}

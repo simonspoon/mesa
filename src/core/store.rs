@@ -174,6 +174,56 @@ const MIGRATIONS: &[&str] = &[
     "
     DROP TABLE posts;
     ",
+    "
+    CREATE TABLE cc_sessions (
+        session_id    TEXT PRIMARY KEY,
+        cwd           TEXT,
+        git_branch    TEXT,
+        entrypoint    TEXT,
+        used_subagent INTEGER NOT NULL DEFAULT 0,
+        start_ts      INTEGER,
+        end_ts        INTEGER
+    );
+    CREATE TABLE cc_agent_runs (
+        session_id  TEXT NOT NULL,
+        agent_id    TEXT NOT NULL,
+        agent       TEXT,
+        skill       TEXT,
+        PRIMARY KEY (session_id, agent_id)
+    );
+    CREATE TABLE cc_messages (
+        uuid          TEXT PRIMARY KEY,
+        session_id    TEXT NOT NULL,
+        agent_id      TEXT,
+        ts            INTEGER NOT NULL,
+        model         TEXT NOT NULL,
+        input_tokens          INTEGER NOT NULL,
+        output_tokens         INTEGER NOT NULL,
+        cache_read_tokens     INTEGER NOT NULL,
+        cache_creation_tokens INTEGER NOT NULL,
+        skill         TEXT,
+        agent         TEXT
+    );
+    CREATE INDEX idx_cc_messages_session ON cc_messages(session_id);
+    CREATE INDEX idx_cc_messages_ts      ON cc_messages(ts);
+    CREATE TABLE cc_tool_calls (
+        tool_use_id  TEXT PRIMARY KEY,
+        message_uuid TEXT NOT NULL,
+        session_id   TEXT NOT NULL,
+        agent_id     TEXT,
+        name         TEXT NOT NULL,
+        caller       TEXT,
+        ts           INTEGER NOT NULL
+    );
+    CREATE INDEX idx_cc_tool_calls_session ON cc_tool_calls(session_id);
+    CREATE INDEX idx_cc_tool_calls_ts      ON cc_tool_calls(ts);
+    CREATE TABLE cc_files (
+        path        TEXT PRIMARY KEY,
+        mtime       INTEGER NOT NULL,
+        size        INTEGER NOT NULL,
+        byte_offset INTEGER NOT NULL
+    );
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -484,6 +534,102 @@ pub struct ImportTask {
 pub struct ImportDoc {
     pub project: i64,
     pub tasks: Vec<ImportTask>,
+}
+
+// ---- CC telemetry ingest inputs (see `cc_ingest_file`) ----
+//
+// Plain structs the transcript parser (`core::cc`) folds a file into; `cc.rs`
+// never holds a raw connection — every cc SQL statement lives here.
+
+/// Per-file ingest cursor row (`cc_files`): how far a transcript has been
+/// ingested. Purely an optimization — correctness comes from the upsert keys,
+/// so a lost or stale cursor can only cost re-parsing, never duplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcFileCursor {
+    /// File mtime (unix seconds) as of last ingest.
+    pub mtime: i64,
+    /// File size in bytes as of last ingest.
+    pub size: i64,
+    /// Bytes fully ingested (end of the last complete line parsed).
+    pub byte_offset: i64,
+}
+
+/// One transcript file's parsed telemetry, ready to upsert in one transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CcFileBatch {
+    pub sessions: Vec<CcSessionUpsert>,
+    pub agent_runs: Vec<CcAgentRunUpsert>,
+    pub messages: Vec<CcMessageRow>,
+    pub tool_calls: Vec<CcToolCallRow>,
+}
+
+/// Session-level facts folded from a file's lines. Merge semantics on
+/// conflict: keep-first for `cwd`/`git_branch`/`entrypoint`, OR for
+/// `used_subagent`, min/max for the span — all idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcSessionUpsert {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub entrypoint: Option<String>,
+    pub used_subagent: bool,
+    /// Min over ALL timestamped lines seen (unix seconds).
+    pub start_ts: Option<i64>,
+    /// Max over ALL timestamped lines seen (unix seconds).
+    pub end_ts: Option<i64>,
+}
+
+/// One subagent run under a parent session. Keyed `(session_id, agent_id)`;
+/// `agent`/`skill` attribution is keep-first on conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcAgentRunUpsert {
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent: Option<String>,
+    pub skill: Option<String>,
+}
+
+/// One assistant usage event. Keyed by the event `uuid`; re-inserting is a
+/// no-op. Tokens only — cost is derived from the price table at read time,
+/// never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcMessageRow {
+    pub uuid: String,
+    pub session_id: String,
+    /// `None` = main thread; `Some` attributes the message to a subagent run.
+    pub agent_id: Option<String>,
+    pub ts: i64,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub skill: Option<String>,
+    pub agent: Option<String>,
+}
+
+/// One tool_use block. Keyed by `tool_use_id`; re-inserting is a no-op.
+/// `message_uuid` is a plain column (a tool_use can sit on an event that
+/// carries no usage, hence no `cc_messages` row). Input payloads are never
+/// stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcToolCallRow {
+    pub tool_use_id: String,
+    pub message_uuid: String,
+    pub session_id: String,
+    /// `None` = main thread.
+    pub agent_id: Option<String>,
+    pub name: String,
+    pub caller: Option<String>,
+    pub ts: i64,
+}
+
+/// Rows actually inserted by one `cc_ingest_file` call (conflict-no-ops
+/// excluded), from rusqlite `changes()` per statement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CcIngestCounts {
+    pub messages_added: i64,
+    pub tool_calls_added: i64,
 }
 
 pub struct Store {
@@ -1721,6 +1867,133 @@ impl Store {
         let item = self.get_inbox_item(id)?;
         self.conn.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
         Ok(item)
+    }
+
+    // ---- cc telemetry (the single write path for `cc_*` tables) ----
+
+    /// All per-file ingest cursors, keyed by absolute transcript path.
+    pub fn cc_cursors(&self) -> Result<HashMap<String, CcFileCursor>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime, size, byte_offset FROM cc_files")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                CcFileCursor {
+                    mtime: r.get(1)?,
+                    size: r.get(2)?,
+                    byte_offset: r.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Upserts one transcript file's parsed telemetry and its cursor row in
+    /// ONE transaction, so a crash mid-sync loses at most "this file not yet
+    /// ingested", never a half-advanced cursor. Idempotent by construction:
+    /// sessions merge (min/max span, OR `used_subagent`, keep-first text
+    /// fields), agent runs keep-first, messages and tool calls insert-or-
+    /// ignore on their stable keys — re-ingesting any line twice is a no-op.
+    pub fn cc_ingest_file(
+        &mut self,
+        path: &str,
+        cursor: &CcFileCursor,
+        batch: &CcFileBatch,
+    ) -> Result<CcIngestCounts> {
+        let tx = self.conn.transaction()?;
+        let mut counts = CcIngestCounts::default();
+        {
+            let mut sess = tx.prepare(
+                "INSERT INTO cc_sessions \
+                     (session_id, cwd, git_branch, entrypoint, used_subagent, start_ts, end_ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(session_id) DO UPDATE SET \
+                     cwd           = COALESCE(cc_sessions.cwd, excluded.cwd), \
+                     git_branch    = COALESCE(cc_sessions.git_branch, excluded.git_branch), \
+                     entrypoint    = COALESCE(cc_sessions.entrypoint, excluded.entrypoint), \
+                     used_subagent = MAX(cc_sessions.used_subagent, excluded.used_subagent), \
+                     start_ts      = MIN(COALESCE(cc_sessions.start_ts, excluded.start_ts), \
+                                         COALESCE(excluded.start_ts, cc_sessions.start_ts)), \
+                     end_ts        = MAX(COALESCE(cc_sessions.end_ts, excluded.end_ts), \
+                                         COALESCE(excluded.end_ts, cc_sessions.end_ts))",
+            )?;
+            for s in &batch.sessions {
+                sess.execute((
+                    &s.session_id,
+                    &s.cwd,
+                    &s.git_branch,
+                    &s.entrypoint,
+                    s.used_subagent,
+                    s.start_ts,
+                    s.end_ts,
+                ))?;
+            }
+
+            let mut run = tx.prepare(
+                "INSERT INTO cc_agent_runs (session_id, agent_id, agent, skill) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(session_id, agent_id) DO UPDATE SET \
+                     agent = COALESCE(cc_agent_runs.agent, excluded.agent), \
+                     skill = COALESCE(cc_agent_runs.skill, excluded.skill)",
+            )?;
+            for r in &batch.agent_runs {
+                run.execute((&r.session_id, &r.agent_id, &r.agent, &r.skill))?;
+            }
+
+            let mut msg = tx.prepare(
+                "INSERT INTO cc_messages \
+                     (uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
+                      cache_read_tokens, cache_creation_tokens, skill, agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(uuid) DO NOTHING",
+            )?;
+            for m in &batch.messages {
+                counts.messages_added += msg.execute((
+                    &m.uuid,
+                    &m.session_id,
+                    &m.agent_id,
+                    m.ts,
+                    &m.model,
+                    m.input_tokens,
+                    m.output_tokens,
+                    m.cache_read_tokens,
+                    m.cache_creation_tokens,
+                    &m.skill,
+                    &m.agent,
+                ))? as i64;
+            }
+
+            let mut call = tx.prepare(
+                "INSERT INTO cc_tool_calls \
+                     (tool_use_id, message_uuid, session_id, agent_id, name, caller, ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(tool_use_id) DO NOTHING",
+            )?;
+            for c in &batch.tool_calls {
+                counts.tool_calls_added += call.execute((
+                    &c.tool_use_id,
+                    &c.message_uuid,
+                    &c.session_id,
+                    &c.agent_id,
+                    &c.name,
+                    &c.caller,
+                    c.ts,
+                ))? as i64;
+            }
+
+            tx.execute(
+                "INSERT INTO cc_files (path, mtime, size, byte_offset) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(path) DO UPDATE SET \
+                     mtime = excluded.mtime, \
+                     size = excluded.size, \
+                     byte_offset = excluded.byte_offset",
+                (path, cursor.mtime, cursor.size, cursor.byte_offset),
+            )?;
+        }
+        tx.commit()?;
+        Ok(counts)
     }
 
     // ---- backup ----
@@ -3397,5 +3670,298 @@ mod tests {
         assert!(err.to_string().contains("999"));
         // The failed assignment left the item untouched in the inbox.
         assert!(store.get_inbox_item(item.id).is_ok());
+    }
+
+    // ---- cc telemetry ----
+
+    fn cc_count(store: &Store, table: &str) -> i64 {
+        store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn cc_batch() -> CcFileBatch {
+        CcFileBatch {
+            sessions: vec![CcSessionUpsert {
+                session_id: "sess-1".into(),
+                cwd: Some("/repo".into()),
+                git_branch: Some("main".into()),
+                entrypoint: Some("cli".into()),
+                used_subagent: false,
+                start_ts: Some(1000),
+                end_ts: Some(2000),
+            }],
+            agent_runs: vec![CcAgentRunUpsert {
+                session_id: "sess-1".into(),
+                agent_id: "agent-1".into(),
+                agent: Some("Explore".into()),
+                skill: None,
+            }],
+            messages: vec![
+                CcMessageRow {
+                    uuid: "uuid-1".into(),
+                    session_id: "sess-1".into(),
+                    agent_id: None,
+                    ts: 1500,
+                    model: "claude-fable-5".into(),
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_read_tokens: 30,
+                    cache_creation_tokens: 40,
+                    skill: Some("orchestrate".into()),
+                    agent: None,
+                },
+                CcMessageRow {
+                    uuid: "uuid-2".into(),
+                    session_id: "sess-1".into(),
+                    agent_id: Some("agent-1".into()),
+                    ts: 1600,
+                    model: "claude-fable-5".into(),
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: 3,
+                    cache_creation_tokens: 4,
+                    skill: None,
+                    agent: Some("Explore".into()),
+                },
+            ],
+            tool_calls: vec![CcToolCallRow {
+                tool_use_id: "toolu-1".into(),
+                message_uuid: "uuid-1".into(),
+                session_id: "sess-1".into(),
+                agent_id: None,
+                name: "Bash".into(),
+                caller: Some("main".into()),
+                ts: 1500,
+            }],
+        }
+    }
+
+    #[test]
+    fn cc_migration_applies_on_existing_pre_cc_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-cc.db");
+        // Build a db at the version just before the cc migration, with data.
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+                .unwrap();
+            conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.list_projects().unwrap()[0].name, "kept");
+        // All five cc tables exist and are empty.
+        for table in [
+            "cc_sessions",
+            "cc_agent_runs",
+            "cc_messages",
+            "cc_tool_calls",
+            "cc_files",
+        ] {
+            assert_eq!(cc_count(&store, table), 0, "{table} missing or non-empty");
+        }
+        assert!(store.cc_cursors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cc_ingest_file_is_idempotent() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 111,
+            size: 222,
+            byte_offset: 222,
+        };
+        let batch = cc_batch();
+
+        let first = store.cc_ingest_file("/t/a.jsonl", &cursor, &batch).unwrap();
+        assert_eq!(first.messages_added, 2);
+        assert_eq!(first.tool_calls_added, 1);
+        assert_eq!(cc_count(&store, "cc_sessions"), 1);
+        assert_eq!(cc_count(&store, "cc_agent_runs"), 1);
+        assert_eq!(cc_count(&store, "cc_messages"), 2);
+        assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
+        assert_eq!(cc_count(&store, "cc_files"), 1);
+
+        // Same batch again: a no-op — zero adds, row counts unchanged.
+        let second = store.cc_ingest_file("/t/a.jsonl", &cursor, &batch).unwrap();
+        assert_eq!(second, CcIngestCounts::default());
+        assert_eq!(cc_count(&store, "cc_sessions"), 1);
+        assert_eq!(cc_count(&store, "cc_agent_runs"), 1);
+        assert_eq!(cc_count(&store, "cc_messages"), 2);
+        assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
+        assert_eq!(cc_count(&store, "cc_files"), 1);
+    }
+
+    #[test]
+    fn cc_session_upsert_merges_span_or_and_keep_first() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 1,
+            size: 1,
+            byte_offset: 1,
+        };
+        // First sighting: sparse fields, narrow span.
+        let sparse = CcFileBatch {
+            sessions: vec![CcSessionUpsert {
+                session_id: "s".into(),
+                cwd: None,
+                git_branch: None,
+                entrypoint: Some("cli".into()),
+                used_subagent: false,
+                start_ts: Some(1500),
+                end_ts: Some(1600),
+            }],
+            ..Default::default()
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &sparse)
+            .unwrap();
+        // Second sighting: fills gaps, widens span, flips the subagent flag.
+        let fuller = CcFileBatch {
+            sessions: vec![CcSessionUpsert {
+                session_id: "s".into(),
+                cwd: Some("/repo".into()),
+                git_branch: Some("main".into()),
+                entrypoint: Some("sdk".into()), // must NOT overwrite (keep-first)
+                used_subagent: true,
+                start_ts: Some(1000),
+                end_ts: Some(2000),
+            }],
+            ..Default::default()
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &fuller)
+            .unwrap();
+
+        let (cwd, branch, entry): (Option<String>, Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT cwd, git_branch, entrypoint FROM cc_sessions WHERE session_id = 's'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("/repo"));
+        assert_eq!(branch.as_deref(), Some("main"));
+        assert_eq!(entry.as_deref(), Some("cli")); // keep-first held
+        let (used, start, end): (bool, Option<i64>, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT used_subagent, start_ts, end_ts FROM cc_sessions WHERE session_id = 's'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(used); // OR-merged
+        assert_eq!(start, Some(1000)); // min
+        assert_eq!(end, Some(2000)); // max
+        assert_eq!(cc_count(&store, "cc_sessions"), 1);
+
+        // A later narrower sighting must not shrink the span or unset the flag.
+        let narrow = CcFileBatch {
+            sessions: vec![CcSessionUpsert {
+                session_id: "s".into(),
+                cwd: None,
+                git_branch: None,
+                entrypoint: None,
+                used_subagent: false,
+                start_ts: Some(1200),
+                end_ts: Some(1300),
+            }],
+            ..Default::default()
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &narrow)
+            .unwrap();
+        let (used, start, end): (bool, Option<i64>, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT used_subagent, start_ts, end_ts FROM cc_sessions WHERE session_id = 's'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(used);
+        assert_eq!((start, end), (Some(1000), Some(2000)));
+    }
+
+    #[test]
+    fn cc_agent_run_upsert_keeps_first_attribution() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 1,
+            size: 1,
+            byte_offset: 1,
+        };
+        let first = CcFileBatch {
+            agent_runs: vec![CcAgentRunUpsert {
+                session_id: "s".into(),
+                agent_id: "a".into(),
+                agent: None,
+                skill: Some("khora".into()),
+            }],
+            ..Default::default()
+        };
+        store.cc_ingest_file("/t/a.jsonl", &cursor, &first).unwrap();
+        let second = CcFileBatch {
+            agent_runs: vec![CcAgentRunUpsert {
+                session_id: "s".into(),
+                agent_id: "a".into(),
+                agent: Some("Explore".into()),
+                skill: Some("other".into()), // must NOT overwrite
+            }],
+            ..Default::default()
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &second)
+            .unwrap();
+
+        let (agent, skill): (Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT agent, skill FROM cc_agent_runs WHERE session_id = 's' AND agent_id = 'a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(agent.as_deref(), Some("Explore")); // gap filled
+        assert_eq!(skill.as_deref(), Some("khora")); // keep-first held
+        assert_eq!(cc_count(&store, "cc_agent_runs"), 1);
+    }
+
+    #[test]
+    fn cc_cursors_round_trip_and_advance() {
+        let (mut store, _dir) = temp_store();
+        assert!(store.cc_cursors().unwrap().is_empty());
+
+        let c1 = CcFileCursor {
+            mtime: 10,
+            size: 100,
+            byte_offset: 100,
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &c1, &CcFileBatch::default())
+            .unwrap();
+        let cursors = store.cc_cursors().unwrap();
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors["/t/a.jsonl"], c1);
+
+        // Re-ingesting the same path advances its cursor in place.
+        let c2 = CcFileCursor {
+            mtime: 20,
+            size: 250,
+            byte_offset: 250,
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &c2, &CcFileBatch::default())
+            .unwrap();
+        let cursors = store.cc_cursors().unwrap();
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors["/t/a.jsonl"], c2);
     }
 }

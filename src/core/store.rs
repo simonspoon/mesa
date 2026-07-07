@@ -624,6 +624,20 @@ pub struct CcToolCallRow {
     pub ts: i64,
 }
 
+/// One `cc_sessions` row as read back for the dashboard (`cc_read_sessions`).
+/// Same fields as [`CcSessionUpsert`], but a distinct type so the read and
+/// write contracts can drift independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcSessionRecord {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub entrypoint: Option<String>,
+    pub used_subagent: bool,
+    pub start_ts: Option<i64>,
+    pub end_ts: Option<i64>,
+}
+
 /// Rows actually inserted by one `cc_ingest_file` call (conflict-no-ops
 /// excluded), from rusqlite `changes()` per statement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1994,6 +2008,85 @@ impl Store {
         }
         tx.commit()?;
         Ok(counts)
+    }
+
+    // ---- cc telemetry reads (the dashboard's source of truth — `cc.rs`
+    // aggregates these rows; it never opens a connection of its own) ----
+
+    /// Sessions in the window: `end_ts >= cutoff` (an in-window message always
+    /// implies this — a message's `ts` bounds the span — so no message join is
+    /// needed). `cutoff = None` returns everything.
+    pub fn cc_read_sessions(&self, cutoff: Option<i64>) -> Result<Vec<CcSessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, cwd, git_branch, entrypoint, used_subagent, start_ts, end_ts \
+             FROM cc_sessions WHERE ?1 IS NULL OR end_ts >= ?1",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| {
+            Ok(CcSessionRecord {
+                session_id: r.get(0)?,
+                cwd: r.get(1)?,
+                git_branch: r.get(2)?,
+                entrypoint: r.get(3)?,
+                used_subagent: r.get::<_, i64>(4)? != 0,
+                start_ts: r.get(5)?,
+                end_ts: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Message rows with `ts >= cutoff` (`None` = all).
+    pub fn cc_read_messages(&self, cutoff: Option<i64>) -> Result<Vec<CcMessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
+                    cache_read_tokens, cache_creation_tokens, skill, agent \
+             FROM cc_messages WHERE ?1 IS NULL OR ts >= ?1",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| {
+            Ok(CcMessageRow {
+                uuid: r.get(0)?,
+                session_id: r.get(1)?,
+                agent_id: r.get(2)?,
+                ts: r.get(3)?,
+                model: r.get(4)?,
+                input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
+                cache_read_tokens: r.get(7)?,
+                cache_creation_tokens: r.get(8)?,
+                skill: r.get(9)?,
+                agent: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Tool-call rows with `ts >= cutoff` (`None` = all).
+    pub fn cc_read_tool_calls(&self, cutoff: Option<i64>) -> Result<Vec<CcToolCallRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_use_id, message_uuid, session_id, agent_id, name, caller, ts \
+             FROM cc_tool_calls WHERE ?1 IS NULL OR ts >= ?1",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| {
+            Ok(CcToolCallRow {
+                tool_use_id: r.get(0)?,
+                message_uuid: r.get(1)?,
+                session_id: r.get(2)?,
+                agent_id: r.get(3)?,
+                name: r.get(4)?,
+                caller: r.get(5)?,
+                ts: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Subagent-run counts per session (all-time — runs carry no timestamp).
+    pub fn cc_agent_run_counts(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, COUNT(*) FROM cc_agent_runs GROUP BY session_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
     // ---- backup ----

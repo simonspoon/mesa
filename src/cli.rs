@@ -1351,19 +1351,27 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
     Ok(())
 }
 
-/// CC telemetry commands read transcripts directly (no Store), so unlike every
-/// other handler this one never opens the database.
+/// Dashboard reads (`summary`/`sessions`/`skills`) are served from the
+/// persisted `cc_*` tables, so they open the database like every other
+/// handler; `live`/`usage` read external state directly and stay store-less.
 fn run_cc(cmd: CcCmd) -> Result<()> {
     match cmd {
-        CcCmd::Summary { window } => print_json(&crate::core::cc::collect(&window)),
+        CcCmd::Summary { window } => {
+            let store = Store::open_default()?;
+            print_json(&crate::core::cc::collect(&store, &window)?)
+        }
         CcCmd::Sessions { window, limit } => {
-            let mut rows = crate::core::cc::collect(&window).sessions;
+            let store = Store::open_default()?;
+            let mut rows = crate::core::cc::collect(&store, &window)?.sessions;
             if let Some(n) = limit {
                 rows.truncate(n);
             }
             print_json(&rows);
         }
-        CcCmd::Skills { window } => print_json(&crate::core::cc::collect(&window).skills),
+        CcCmd::Skills { window } => {
+            let store = Store::open_default()?;
+            print_json(&crate::core::cc::collect(&store, &window)?.skills)
+        }
         CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
         CcCmd::Usage => match crate::core::usage::fetch() {
             Ok(usage) => print_json(&usage),

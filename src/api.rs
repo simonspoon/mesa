@@ -1670,7 +1670,10 @@ async fn get_cc_dashboard(
             return Ok(Json(dash.clone()).into_response());
         }
     }
-    let mut dash = crate::core::cc::collect(&window);
+    let mut dash = {
+        let store = state.store.lock().unwrap();
+        crate::core::cc::collect(&store, &window)?
+    };
     // `collect` returns every session; the web payload is bounded (the true
     // total stays in `overview.sessions`).
     dash.sessions.truncate(crate::core::cc::MAX_SESSION_ROWS);

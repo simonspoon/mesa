@@ -8,7 +8,16 @@ export type CcSessionRow = { session_id: string,
 /**
  * First/last event timestamps (ISO-8601 UTC, as recorded by Claude Code).
  */
-start: string, end: string, duration_minutes: number, models: Array<string>, messages: number, tokens: CcTokens, total_tokens: number, est_cost_usd: number, cwd: string | null, project: string | null, git_branch: string | null, entrypoint: string | null, 
+start: string, end: string, duration_minutes: number, models: Array<string>, messages: number, tokens: CcTokens, total_tokens: number, est_cost_usd: number, 
+/**
+ * Tool calls made in the window (main thread + subagents).
+ */
+tool_calls: number, 
+/**
+ * Subagent runs recorded under this session (not window-filtered — runs
+ * have no timestamp of their own).
+ */
+agent_runs: number, cwd: string | null, project: string | null, git_branch: string | null, entrypoint: string | null, 
 /**
  * True if any of the session's events came from a subagent (`isSidechain`).
  * Subagent transcripts reuse the parent's `sessionId`, so this is "the

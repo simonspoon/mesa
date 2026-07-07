@@ -561,6 +561,21 @@ pub struct CcProjectStat {
     pub est_cost_usd: f64,
 }
 
+/// Tool usage rolled up by `(name, caller)` over `tool_use` blocks.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcToolStat {
+    pub name: String,
+    /// The `tool_use.caller`, verbatim (e.g. `{"type":"direct"}`); null when
+    /// the block carried none.
+    pub caller: Option<String>,
+    #[ts(type = "number")]
+    pub calls: i64,
+    /// Distinct sessions that made at least one such call.
+    #[ts(type = "number")]
+    pub sessions: i64,
+}
+
 /// One session row for the sessions table.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -577,6 +592,13 @@ pub struct CcSessionRow {
     #[ts(type = "number")]
     pub total_tokens: i64,
     pub est_cost_usd: f64,
+    /// Tool calls made in the window (main thread + subagents).
+    #[ts(type = "number")]
+    pub tool_calls: i64,
+    /// Subagent runs recorded under this session (not window-filtered — runs
+    /// have no timestamp of their own).
+    #[ts(type = "number")]
+    pub agent_runs: i64,
     pub cwd: Option<String>,
     pub project: Option<String>,
     pub git_branch: Option<String>,
@@ -604,6 +626,8 @@ pub struct CcDashboard {
     pub skills: Vec<CcSkillStat>,
     pub agents: Vec<CcAgentStat>,
     pub projects: Vec<CcProjectStat>,
+    /// Tool-call breakdown by `(name, caller)`, most calls first.
+    pub tools: Vec<CcToolStat>,
     /// Sessions newest-first, capped (see `core::cc`); `overview.sessions` holds
     /// the true total.
     pub sessions: Vec<CcSessionRow>,

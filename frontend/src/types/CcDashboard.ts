@@ -6,6 +6,7 @@ import type { CcOverview } from "./CcOverview";
 import type { CcProjectStat } from "./CcProjectStat";
 import type { CcSessionRow } from "./CcSessionRow";
 import type { CcSkillStat } from "./CcSkillStat";
+import type { CcToolStat } from "./CcToolStat";
 
 /**
  * The full CC dashboard payload returned by `mesa cc summary` and `GET /api/cc`.
@@ -23,6 +24,10 @@ window: string,
  * Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
  */
 since: string | null, overview: CcOverview, daily: Array<CcDayPoint>, models: Array<CcModelStat>, skills: Array<CcSkillStat>, agents: Array<CcAgentStat>, projects: Array<CcProjectStat>, 
+/**
+ * Tool-call breakdown by `(name, caller)`, most calls first.
+ */
+tools: Array<CcToolStat>, 
 /**
  * Sessions newest-first, capped (see `core::cc`); `overview.sessions` holds
  * the true total.

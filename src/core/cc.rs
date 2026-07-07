@@ -30,7 +30,7 @@ use super::store::{
 };
 use super::types::{
     CcAgentStat, CcDashboard, CcDayPoint, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat,
-    CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens,
+    CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -217,6 +217,13 @@ struct ProjAcc {
     cost: f64,
 }
 
+/// Per-`(name, caller)` tool-call bucket.
+#[derive(Default)]
+struct ToolAcc {
+    calls: i64,
+    sessions: HashSet<String>,
+}
+
 #[derive(Default)]
 struct Agg {
     sessions: HashMap<String, SessionAcc>,
@@ -225,6 +232,11 @@ struct Agg {
     skills: HashMap<String, GroupAcc>,
     agents: HashMap<String, GroupAcc>,
     projects: HashMap<String, ProjAcc>,
+    tools: HashMap<(String, Option<String>), ToolAcc>,
+    /// In-window tool calls per session (for the session rows).
+    session_tool_calls: HashMap<String, i64>,
+    /// Subagent runs per session (all-time — runs carry no timestamp).
+    agent_runs: HashMap<String, i64>,
 }
 
 /// Cap the *web/API* dashboard applies to its session rows (newest first);
@@ -244,10 +256,13 @@ const ACTIVE_SECS: i64 = 90;
 /// Width of one `spark` bucket — one bar per minute.
 const LIVE_BUCKET_SECS: i64 = 60;
 
-/// Build the dashboard for `window` (`7d`/`30d`/`90d`/`all`/`<n>d`). Returns
-/// **all** session rows (newest first); callers that need a bounded payload cap
-/// `sessions` themselves (see [`MAX_SESSION_ROWS`]).
-pub fn collect(window: &str) -> CcDashboard {
+/// Build the dashboard for `window` (`7d`/`30d`/`90d`/`all`/`<n>d`) from the
+/// **persisted** `cc_*` rows — no transcript file is opened, so history
+/// survives Claude Code deleting its transcripts, and nothing can be counted
+/// twice against live files. Callers must run [`sync`] first to fold new
+/// transcript lines in. Returns **all** session rows (newest first); callers
+/// that need a bounded payload cap `sessions` themselves ([`MAX_SESSION_ROWS`]).
+pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
     let now = now_unix();
     // Floor the cutoff to UTC midnight so `since` (a date) is genuinely the
     // inclusive first day of the window — otherwise the boundary day would be
@@ -258,22 +273,94 @@ pub fn collect(window: &str) -> CcDashboard {
     });
 
     let mut agg = Agg::default();
-    if let Some(root) = projects_dir() {
-        for f in collect_files(&root) {
-            // Optimization: a windowed query skips whole files last modified
-            // before the cutoff, since an append-only transcript's mtime is >=
-            // its newest event. (A file restored from backup with an artificially
-            // old mtime could be skipped despite holding in-window events — an
-            // accepted trade for not parsing every file on each request.)
-            if let Some(c) = cutoff
-                && file_mtime(&f).is_some_and(|m| m < c)
-            {
-                continue;
-            }
-            parse_file(&f, cutoff, &mut agg);
+
+    // Sessions first: they carry the span and the metadata (cwd/branch/…)
+    // every other rollup keys off. A session is in-window iff its span reaches
+    // the cutoff (`end_ts >= cutoff` — an in-window message implies this).
+    for rec in store.cc_read_sessions(cutoff)? {
+        let s = agg.sessions.entry(rec.session_id).or_default();
+        s.cwd = rec.cwd;
+        s.git_branch = rec.git_branch;
+        s.entrypoint = rec.entrypoint;
+        s.sidechain = rec.used_subagent;
+        if let (Some(start), Some(end)) = (rec.start_ts, rec.end_ts) {
+            // Windowed duration = the stored span clamped to the window
+            // (`max(start, cutoff) .. end`); `all` = the full span.
+            let start = cutoff.map_or(start, |c| start.max(c));
+            let end = end.max(start);
+            s.has_ts = true;
+            s.start_ts = start;
+            s.end_ts = end;
+            s.start_str = fmt_ts(start);
+            s.end_str = fmt_ts(end);
         }
     }
-    agg.finish(window, cutoff, now)
+
+    for m in store.cc_read_messages(cutoff)? {
+        let usage = RawUsage {
+            input_tokens: m.input_tokens,
+            output_tokens: m.output_tokens,
+            cache_read_input_tokens: m.cache_read_tokens,
+            cache_creation_input_tokens: m.cache_creation_tokens,
+        };
+        let cost = estimate_cost(&m.model, &usage);
+        // The message's session is always present above (its ts bounds the
+        // session span), so this entry only fills in against a corrupt db.
+        // Projects group by the *session's* keep-first cwd.
+        let cwd = {
+            let s = agg.sessions.entry(m.session_id.clone()).or_default();
+            s.models.insert(m.model.clone());
+            s.messages += 1;
+            s.tokens.add(&usage);
+            s.cost += cost;
+            s.cwd.clone()
+        };
+
+        let d = agg.days.entry(fmt_date(m.ts)).or_default();
+        d.sessions.insert(m.session_id.clone());
+        d.messages += 1;
+        d.tokens.add(&usage);
+        d.cost += cost;
+
+        let g = agg.models.entry(m.model).or_default();
+        g.messages += 1;
+        g.sessions.insert(m.session_id.clone());
+        g.tokens.add(&usage);
+        g.cost += cost;
+
+        if let Some(skill) = m.skill {
+            let g = agg.skills.entry(skill).or_default();
+            g.messages += 1;
+            g.sessions.insert(m.session_id.clone());
+            g.tokens.add(&usage);
+            g.cost += cost;
+        }
+        if let Some(agent) = m.agent {
+            let g = agg.agents.entry(agent).or_default();
+            g.messages += 1;
+            g.sessions.insert(m.session_id.clone());
+            g.tokens.add(&usage);
+            g.cost += cost;
+        }
+        if let Some(cwd) = cwd {
+            let p = agg.projects.entry(cwd.clone()).or_default();
+            p.path = cwd;
+            p.sessions.insert(m.session_id.clone());
+            p.messages += 1;
+            p.tokens.add(&usage);
+            p.cost += cost;
+        }
+    }
+
+    for t in store.cc_read_tool_calls(cutoff)? {
+        let g = agg.tools.entry((t.name, t.caller)).or_default();
+        g.calls += 1;
+        g.sessions.insert(t.session_id.clone());
+        *agg.session_tool_calls.entry(t.session_id).or_default() += 1;
+    }
+    agg.agent_runs = store.cc_agent_run_counts()?;
+
+    Ok(agg.finish(window, cutoff, now))
 }
 
 /// Newest transcript mtime (Unix seconds), or 0 if none. The API uses this as a
@@ -720,107 +807,6 @@ fn parse_live_file(
     }
 }
 
-fn parse_file(path: &Path, cutoff: Option<i64>, agg: &mut Agg) {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let raw: RawLine = match serde_json::from_str(line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let (Some(sid), Some(ts_str)) = (raw.session_id.as_ref(), raw.timestamp.as_ref()) else {
-            continue;
-        };
-        let ts = match parse_ts(ts_str) {
-            Some(t) => t,
-            None => continue,
-        };
-        if cutoff.is_some_and(|c| ts < c) {
-            continue;
-        }
-
-        // Every timestamped line widens the session span and fills in metadata.
-        let s = agg.sessions.entry(sid.clone()).or_default();
-        if !s.has_ts || ts < s.start_ts {
-            s.start_ts = ts;
-            s.start_str = ts_str.clone();
-        }
-        if !s.has_ts || ts > s.end_ts {
-            s.end_ts = ts;
-            s.end_str = ts_str.clone();
-        }
-        s.has_ts = true;
-        if s.cwd.is_none() {
-            s.cwd = raw.cwd.clone();
-        }
-        if s.git_branch.is_none() {
-            s.git_branch = raw.git_branch.clone().filter(|g| !g.is_empty());
-        }
-        if s.entrypoint.is_none() {
-            s.entrypoint = raw.entrypoint.clone();
-        }
-        if raw.is_sidechain == Some(true) {
-            s.sidechain = true;
-        }
-
-        // Only assistant turns carry model + usage; everything else is span-only.
-        let Some(usage) = raw.message.as_ref().and_then(|m| m.usage.as_ref()) else {
-            continue;
-        };
-        let Some(model) = raw.message.as_ref().and_then(|m| m.model.clone()) else {
-            continue;
-        };
-        let cost = estimate_cost(&model, usage);
-
-        s.models.insert(model.clone());
-        s.messages += 1;
-        s.tokens.add(usage);
-        s.cost += cost;
-
-        let date = ts_str.get(0..10).unwrap_or("").to_string();
-        let d = agg.days.entry(date).or_default();
-        d.sessions.insert(sid.clone());
-        d.messages += 1;
-        d.tokens.add(usage);
-        d.cost += cost;
-
-        let m = agg.models.entry(model).or_default();
-        m.messages += 1;
-        m.sessions.insert(sid.clone());
-        m.tokens.add(usage);
-        m.cost += cost;
-
-        if let Some(skill) = raw.attribution_skill.clone() {
-            let g = agg.skills.entry(skill).or_default();
-            g.messages += 1;
-            g.sessions.insert(sid.clone());
-            g.tokens.add(usage);
-            g.cost += cost;
-        }
-        if let Some(agent) = raw.attribution_agent.clone() {
-            let g = agg.agents.entry(agent).or_default();
-            g.messages += 1;
-            g.sessions.insert(sid.clone());
-            g.tokens.add(usage);
-            g.cost += cost;
-        }
-        if let Some(cwd) = raw.cwd.clone() {
-            let p = agg.projects.entry(cwd.clone()).or_default();
-            p.path = cwd;
-            p.sessions.insert(sid.clone());
-            p.messages += 1;
-            p.tokens.add(usage);
-            p.cost += cost;
-        }
-    }
-}
-
 impl Agg {
     fn finish(self, window: &str, cutoff: Option<i64>, now: i64) -> CcDashboard {
         // ---- overview (over ALL sessions, before the row cap) ----
@@ -953,7 +939,26 @@ impl Agg {
             .collect();
         projects.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
 
+        // ---- tool calls (most calls first; name/caller tiebreak for stability) ----
+        let mut tools: Vec<CcToolStat> = self
+            .tools
+            .into_iter()
+            .map(|((name, caller), t)| CcToolStat {
+                name,
+                caller,
+                calls: t.calls,
+                sessions: t.sessions.len() as i64,
+            })
+            .collect();
+        tools.sort_by(|a, b| {
+            b.calls
+                .cmp(&a.calls)
+                .then_with(|| (&a.name, &a.caller).cmp(&(&b.name, &b.caller)))
+        });
+
         // ---- session rows (newest first; ISO strings sort chronologically) ----
+        let tool_counts = self.session_tool_calls;
+        let run_counts = self.agent_runs;
         let mut sessions: Vec<CcSessionRow> = self
             .sessions
             .into_iter()
@@ -964,13 +969,14 @@ impl Agg {
                     0.0
                 };
                 CcSessionRow {
-                    session_id,
                     duration_minutes: round2(dur),
                     models: s.models.into_iter().collect(),
                     messages: s.messages,
                     total_tokens: s.tokens.total(),
                     tokens: s.tokens.to_cc(),
                     est_cost_usd: round4(s.cost),
+                    tool_calls: tool_counts.get(&session_id).copied().unwrap_or(0),
+                    agent_runs: run_counts.get(&session_id).copied().unwrap_or(0),
                     project: s.cwd.as_deref().map(short_project),
                     cwd: s.cwd,
                     git_branch: s.git_branch,
@@ -978,6 +984,7 @@ impl Agg {
                     used_subagent: s.sidechain,
                     start: s.start_str,
                     end: s.end_str,
+                    session_id,
                 }
             })
             .collect();
@@ -993,6 +1000,7 @@ impl Agg {
             skills,
             agents,
             projects,
+            tools,
             sessions,
         }
     }
@@ -1133,6 +1141,20 @@ fn fmt_date(epoch: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Inverse of [`parse_ts`]: format Unix seconds as ISO-8601 UTC
+/// (`YYYY-MM-DDTHH:MM:SSZ`). Fractional seconds are not reconstructed — the
+/// stored integer is the truth, and the loss is cosmetic (see `.scratch/arch.md`).
+fn fmt_ts(epoch: i64) -> String {
+    let tod = epoch.rem_euclid(86_400);
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        fmt_date(epoch),
+        tod / 3_600,
+        (tod % 3_600) / 60,
+        tod % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,29 +1199,32 @@ mod tests {
     }
 
     #[test]
-    fn folds_transcripts_into_dashboard() {
+    fn folds_ingested_rows_into_dashboard() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("-some-project");
+        let proj = tmp.path().join("projects").join("-some-project");
         fs::create_dir_all(&proj).unwrap();
-        // Two assistant turns in one session, plus a non-telemetry user line.
+        // Two assistant turns in one session, plus a non-telemetry user line;
+        // one turn carries a tool_use block.
         write_jsonl(
             &proj,
             "sess.jsonl",
             &[
-                r#"{"type":"user","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/work/widget","gitBranch":"main","entrypoint":"cli","message":{"role":"user","content":"hi"}}"#,
-                r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#,
-                r#"{"type":"assistant","isSidechain":true,"sessionId":"s1","timestamp":"2026-06-15T01:10:00.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"user","uuid":"u0","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/work/widget","gitBranch":"main","entrypoint":"cli","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"},"caller":{"type":"direct"}}],"usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"assistant","uuid":"u2","isSidechain":true,"sessionId":"s1","timestamp":"2026-06-15T01:10:00.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
             ],
         );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
         // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
         unsafe {
-            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        let d = collect("all");
+        sync(&mut store).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
+        let d = collect(&store, "all").unwrap();
 
         assert_eq!(d.overview.sessions, 1);
         assert_eq!(d.overview.messages, 2);
@@ -1226,9 +1251,99 @@ mod tests {
                 .messages,
             1
         );
+        // Tool breakdown: one Bash call, caller verbatim.
+        assert_eq!(d.tools.len(), 1);
+        assert_eq!(d.tools[0].name, "Bash");
+        assert_eq!(d.tools[0].caller.as_deref(), Some(r#"{"type":"direct"}"#));
+        assert_eq!(d.tools[0].calls, 1);
+        assert_eq!(d.tools[0].sessions, 1);
         let row = &d.sessions[0];
         assert_eq!(row.project.as_deref(), Some("widget"));
         assert!(row.used_subagent);
+        assert_eq!(row.tool_calls, 1);
+        assert_eq!(row.agent_runs, 0); // no agentId lines in this transcript
+        assert_eq!(row.start, "2026-06-15T01:00:00Z");
+        assert_eq!(row.end, "2026-06-15T01:10:00Z");
+    }
+
+    #[test]
+    fn dashboard_survives_transcript_deletion() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-proj");
+        let subs = proj.join("s1").join("subagents");
+        fs::create_dir_all(&subs).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","caller":{"type":"direct"}}],"usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        // Subagent run under the same session: its usage and tool call must
+        // stay attributed to the parent session after the files are gone.
+        write_jsonl(
+            &subs,
+            "agent-aaa.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"u2","isSidechain":true,"sessionId":"s1","agentId":"agent-aaa","attributionAgent":"Explore","timestamp":"2026-06-15T01:10:00.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"tu2","name":"Read","caller":{"type":"direct"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#,
+            ],
+        );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", &root);
+        }
+        sync(&mut store).unwrap();
+        let before = collect(&store, "all").unwrap();
+
+        // Claude Code cleans up its transcripts: every file disappears.
+        fs::remove_dir_all(&root).unwrap();
+        let after = collect(&store, "all").unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        // Totals are identical before and after the deletion (only the
+        // generated-at stamp may differ).
+        let norm = |d: &CcDashboard| {
+            let mut v = serde_json::to_value(d).unwrap();
+            v["generated_at_unix"] = 0.into();
+            v
+        };
+        assert_eq!(norm(&before), norm(&after));
+
+        // The deleted session is still fully reported.
+        assert_eq!(after.overview.sessions, 1);
+        assert_eq!(after.overview.messages, 2);
+        let row = &after.sessions[0];
+        assert_eq!(row.session_id, "s1");
+        assert!(row.used_subagent);
+        // Subagent usage is attributed to the parent session…
+        assert_eq!(row.total_tokens, 100 + 200 + 50 + 10 + 20);
+        assert_eq!(row.agent_runs, 1);
+        // …tool-call data is present…
+        assert_eq!(row.tool_calls, 2);
+        assert_eq!(after.tools.iter().map(|t| t.calls).sum::<i64>(), 2);
+        // …and the agent/skill breakdowns survive.
+        assert_eq!(
+            after
+                .agents
+                .iter()
+                .find(|a| a.agent == "Explore")
+                .unwrap()
+                .messages,
+            1
+        );
+        assert_eq!(
+            after
+                .skills
+                .iter()
+                .find(|s| s.skill == "build")
+                .unwrap()
+                .messages,
+            1
+        );
     }
 
     // Build an ISO-8601 UTC timestamp `secs_ago` seconds before now, so a test
@@ -1512,27 +1627,63 @@ mod tests {
     }
 
     #[test]
-    fn window_filters_old_events() {
+    fn window_filters_persisted_rows() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("p")).unwrap();
+        let proj = tmp.path().join("projects").join("-p");
+        fs::create_dir_all(&proj).unwrap();
+        // One session entirely in the past; one spanning past → now.
         write_jsonl(
-            &tmp.path().join("p"),
+            &proj,
             "old.jsonl",
             &[
-                r#"{"type":"assistant","sessionId":"old","timestamp":"2000-01-01T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                r#"{"type":"assistant","uuid":"uo","sessionId":"old","timestamp":"2000-01-01T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"output_tokens":1}}}"#,
             ],
         );
+        let recent = format!(
+            r#"{{"type":"assistant","uuid":"m2","sessionId":"mix","timestamp":"{}","message":{{"model":"claude-opus-4-8","usage":{{"input_tokens":5,"output_tokens":6}}}}}}"#,
+            iso_at(60)
+        );
+        write_jsonl(
+            &proj,
+            "mix.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"m1","sessionId":"mix","timestamp":"2000-01-01T00:00:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":7,"output_tokens":0}}}"#,
+                recent.as_str(),
+            ],
+        );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
         unsafe {
-            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        // A 7-day window excludes a year-2000 event (file mtime is "now", so the
-        // file isn't skipped — the per-event cutoff is what drops it).
-        let d = collect("7d");
+        sync(&mut store).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
-        assert_eq!(d.overview.sessions, 0);
-        assert!(d.since.is_some());
+
+        // `all`: everything persisted is reported.
+        let all = collect(&store, "all").unwrap();
+        assert_eq!(all.overview.sessions, 2);
+        assert_eq!(all.overview.messages, 3);
+        assert!(all.since.is_none());
+
+        // `7d`: the year-2000 session drops out; the spanning session stays
+        // but only its in-window message counts, and its duration is clamped
+        // to the window rather than the 26-year stored span.
+        let d7 = collect(&store, "7d").unwrap();
+        assert_eq!(d7.window, "7d");
+        assert!(d7.since.is_some());
+        assert_eq!(d7.overview.sessions, 1);
+        assert_eq!(d7.overview.messages, 1);
+        assert_eq!(d7.overview.total_tokens, 11);
+        let row = &d7.sessions[0];
+        assert_eq!(row.session_id, "mix");
+        assert_eq!(row.messages, 1);
+        assert!(row.duration_minutes <= 8.0 * 24.0 * 60.0);
+
+        // `<n>d` free-form windows share the same path/shape.
+        let d2 = collect(&store, "2d").unwrap();
+        assert_eq!(d2.overview.sessions, 1);
+        assert_eq!(d2.overview.total_tokens, 11);
     }
 }

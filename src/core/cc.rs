@@ -22,8 +22,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use super::store::{
+    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcSessionUpsert, CcToolCallRow,
+    Result, Store,
+};
 use super::types::{
     CcAgentStat, CcDashboard, CcDayPoint, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat,
     CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens,
@@ -34,6 +38,9 @@ use super::types::{
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawLine {
+    /// Stable per-event id — the idempotency key for persisted message rows.
+    #[serde(default)]
+    uuid: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -63,6 +70,38 @@ struct RawMessage {
     model: Option<String>,
     #[serde(default)]
     usage: Option<RawUsage>,
+    /// Content blocks, parsed leniently: any JSON shape is accepted (user
+    /// messages carry a plain string here); only `tool_use` blocks in an array
+    /// are read, via [`RawMessage::tool_uses`]. Unused by `collect`/`live`.
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+}
+
+impl RawMessage {
+    /// The `tool_use` blocks of this message as `(id, name, caller)`. Blocks
+    /// missing a string `id`/`name`, and unknown block shapes, are skipped —
+    /// the same leniency as malformed lines. `caller` is kept verbatim: a JSON
+    /// string as-is, any other non-null value as its compact JSON text. Tool
+    /// `input` payloads are deliberately never read (untrusted + large).
+    fn tool_uses(&self) -> Vec<(String, String, Option<String>)> {
+        let Some(blocks) = self.content.as_ref().and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .filter_map(|b| {
+                let id = b.get("id")?.as_str()?;
+                let name = b.get("name")?.as_str()?;
+                let caller = b.get("caller").and_then(|c| match c {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                });
+                Some((id.to_string(), name.to_string(), caller))
+            })
+            .collect()
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -251,6 +290,202 @@ pub fn newest_mtime() -> i64 {
         }
     }
     newest
+}
+
+// ---- incremental ingest (transcripts → cc_* tables via Store) ----
+
+/// What one [`sync`] run did. Serialized for the CLI (`mesa cc sync`, story
+/// 250); never sent to the web UI, so deliberately not a ts-rs export.
+#[derive(Debug, Default, Serialize)]
+pub struct CcSyncReport {
+    /// `.jsonl` files seen under the transcript root.
+    pub files_scanned: i64,
+    /// Files actually parsed (cursor miss, growth, or rewrite).
+    pub files_ingested: i64,
+    /// Distinct sessions touched by the ingested files.
+    pub sessions: i64,
+    /// Message rows actually inserted (conflict no-ops excluded).
+    pub messages_added: i64,
+    /// Tool-call rows actually inserted (conflict no-ops excluded).
+    pub tool_calls_added: i64,
+}
+
+/// Incrementally ingest every transcript under [`projects_dir`] into the
+/// `cc_*` tables. Never window-limited — windowing is read-time only.
+///
+/// Per file, against its `cc_files` cursor: no cursor → parse from byte 0;
+/// mtime AND size both unchanged → skip without reading; size grew → resume
+/// from `byte_offset` (transcripts are append-only); size shrank (rewrite /
+/// rotation — abnormal) → re-parse from 0, safe because every row upserts on
+/// a stable key. The cursor is purely an optimization: correctness comes from
+/// the upsert keys, so a lost or stale cursor can only cost re-parsing, never
+/// duplicates. Each file commits in its own transaction (batch + cursor
+/// together), so a crash mid-sync loses at most "this file not yet ingested".
+pub fn sync(store: &mut Store) -> Result<CcSyncReport> {
+    let mut report = CcSyncReport::default();
+    let Some(root) = projects_dir() else {
+        return Ok(report);
+    };
+    let cursors = store.cc_cursors()?;
+    let mut sessions_touched: HashSet<String> = HashSet::new();
+    for f in collect_files(&root) {
+        report.files_scanned += 1;
+        let path = f.to_string_lossy().to_string();
+        let start = match (cursors.get(&path), file_mtime(&f), file_size(&f)) {
+            (_, None, _) | (_, _, None) => continue, // vanished mid-walk
+            (Some(c), Some(m), Some(s)) if c.mtime == m && c.size == s => continue, // unchanged
+            (Some(c), _, Some(s)) if s >= c.size => c.byte_offset.max(0) as usize, // grew: resume
+            _ => 0, // no cursor, or shrank: (re-)parse from the top
+        };
+        let Ok(bytes) = fs::read(&f) else { continue };
+        let start = start.min(bytes.len());
+        let (batch, consumed) = parse_batch(&bytes[start..]);
+        for s in &batch.sessions {
+            sessions_touched.insert(s.session_id.clone());
+        }
+        // Cursor = the bytes we actually parsed (not a re-stat, which could
+        // already include lines appended after our read).
+        let cursor = CcFileCursor {
+            mtime: file_mtime(&f).unwrap_or(0),
+            size: bytes.len() as i64,
+            byte_offset: (start + consumed) as i64,
+        };
+        let counts = store.cc_ingest_file(&path, &cursor, &batch)?;
+        report.files_ingested += 1;
+        report.messages_added += counts.messages_added;
+        report.tool_calls_added += counts.tool_calls_added;
+    }
+    report.sessions = sessions_touched.len() as i64;
+    Ok(report)
+}
+
+/// Fold the complete (`\n`-terminated) lines of `bytes` into a [`CcFileBatch`],
+/// returning it with the count of bytes consumed — the offset just past the
+/// last complete line. A trailing partial line (a writer mid-append) is left
+/// for the next sync.
+fn parse_batch(bytes: &[u8]) -> (CcFileBatch, usize) {
+    // BTreeMaps so the batch order is deterministic for a given input.
+    let mut sessions: BTreeMap<String, CcSessionUpsert> = BTreeMap::new();
+    let mut agent_runs: BTreeMap<(String, String), CcAgentRunUpsert> = BTreeMap::new();
+    let mut batch = CcFileBatch::default();
+    let mut pos = 0usize;
+    let mut consumed = 0usize;
+    while let Some(nl) = bytes[pos..].iter().position(|&b| b == b'\n') {
+        let line = &bytes[pos..pos + nl];
+        pos += nl + 1;
+        consumed = pos;
+        if let Ok(line) = std::str::from_utf8(line) {
+            fold_line(line, &mut sessions, &mut agent_runs, &mut batch);
+        }
+    }
+    batch.sessions = sessions.into_values().collect();
+    batch.agent_runs = agent_runs.into_values().collect();
+    (batch, consumed)
+}
+
+/// Fold one transcript line into the per-file accumulators. Mirrors
+/// `parse_file`'s rules: a line needs a session id + parseable timestamp to
+/// count at all; every such line widens the session span and fills metadata
+/// keep-first; only lines with an event `uuid` yield message/tool-call rows
+/// (pinned in `.scratch/arch.md` — no synthetic keys). Parent-session linkage
+/// is the line's own `sessionId` (subagent lines carry the parent's id), with
+/// `agentId` attributing the row to its subagent run.
+fn fold_line(
+    line: &str,
+    sessions: &mut BTreeMap<String, CcSessionUpsert>,
+    agent_runs: &mut BTreeMap<(String, String), CcAgentRunUpsert>,
+    batch: &mut CcFileBatch,
+) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let raw: RawLine = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let (Some(sid), Some(ts_str)) = (raw.session_id.as_ref(), raw.timestamp.as_ref()) else {
+        return;
+    };
+    let Some(ts) = parse_ts(ts_str) else {
+        return;
+    };
+
+    let s = sessions
+        .entry(sid.clone())
+        .or_insert_with(|| CcSessionUpsert {
+            session_id: sid.clone(),
+            cwd: None,
+            git_branch: None,
+            entrypoint: None,
+            used_subagent: false,
+            start_ts: None,
+            end_ts: None,
+        });
+    if s.cwd.is_none() {
+        s.cwd = raw.cwd.clone();
+    }
+    if s.git_branch.is_none() {
+        s.git_branch = raw.git_branch.clone().filter(|g| !g.is_empty());
+    }
+    if s.entrypoint.is_none() {
+        s.entrypoint = raw.entrypoint.clone();
+    }
+    if raw.is_sidechain == Some(true) {
+        s.used_subagent = true;
+    }
+    s.start_ts = Some(s.start_ts.map_or(ts, |t| t.min(ts)));
+    s.end_ts = Some(s.end_ts.map_or(ts, |t| t.max(ts)));
+
+    if let Some(aid) = raw.agent_id.as_ref() {
+        let r = agent_runs
+            .entry((sid.clone(), aid.clone()))
+            .or_insert_with(|| CcAgentRunUpsert {
+                session_id: sid.clone(),
+                agent_id: aid.clone(),
+                agent: None,
+                skill: None,
+            });
+        if r.agent.is_none() {
+            r.agent = raw.attribution_agent.clone();
+        }
+        if r.skill.is_none() {
+            r.skill = raw.attribution_skill.clone();
+        }
+    }
+
+    // Without an event uuid there is no stable row identity: the line stays
+    // span-only (no message row, and no tool-call rows — `message_uuid` is
+    // how a call links back to its event).
+    let (Some(uuid), Some(msg)) = (raw.uuid.as_ref(), raw.message.as_ref()) else {
+        return;
+    };
+    for (tool_use_id, name, caller) in msg.tool_uses() {
+        batch.tool_calls.push(CcToolCallRow {
+            tool_use_id,
+            message_uuid: uuid.clone(),
+            session_id: sid.clone(),
+            agent_id: raw.agent_id.clone(),
+            name,
+            caller,
+            ts,
+        });
+    }
+    if let (Some(model), Some(usage)) = (msg.model.as_ref(), msg.usage.as_ref()) {
+        batch.messages.push(CcMessageRow {
+            uuid: uuid.clone(),
+            session_id: sid.clone(),
+            agent_id: raw.agent_id.clone(),
+            ts,
+            model: model.clone(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            cache_creation_tokens: usage.cache_creation_input_tokens,
+            skill: raw.attribution_skill.clone(),
+            agent: raw.attribution_agent.clone(),
+        });
+    }
 }
 
 // ---- live sessions ----
@@ -818,6 +1053,10 @@ fn file_mtime(path: &Path) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
+fn file_size(path: &Path) -> Option<i64> {
+    fs::metadata(path).ok().map(|m| m.len() as i64)
+}
+
 /// Where Claude Code stores transcripts. `MESA_CC_PROJECTS_DIR` overrides it
 /// (used by tests); otherwise `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`.
 fn projects_dir() -> Option<PathBuf> {
@@ -1089,6 +1328,187 @@ mod tests {
         assert_eq!(sub.total_tokens, 30);
         assert_eq!(sub.messages, 1);
         assert!(sub.idle_seconds <= ACTIVE_SECS);
+    }
+
+    #[test]
+    fn tool_uses_parses_blocks_leniently() {
+        // Mixed content: a real tool_use (object caller), a text block, a
+        // malformed tool_use (no id), and a string-caller tool_use.
+        let m: RawMessage = serde_json::from_str(
+            r#"{"content":[
+                {"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"},"caller":{"type":"direct"}},
+                {"type":"text","text":"hi"},
+                {"type":"tool_use","name":"NoId"},
+                {"type":"tool_use","id":"tu2","name":"Skill","caller":"direct"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.tool_uses(),
+            vec![
+                (
+                    "tu1".to_string(),
+                    "Bash".to_string(),
+                    Some(r#"{"type":"direct"}"#.to_string())
+                ),
+                (
+                    "tu2".to_string(),
+                    "Skill".to_string(),
+                    Some("direct".to_string())
+                ),
+            ]
+        );
+        // A plain-string content (user turns) yields nothing and doesn't error.
+        let m: RawMessage = serde_json::from_str(r#"{"content":"just text"}"#).unwrap();
+        assert!(m.tool_uses().is_empty());
+    }
+
+    /// One-value SQL query against the ingest db (test-side read only; all
+    /// writes still go through `Store`).
+    fn q<T: rusqlite::types::FromSql>(db: &Path, sql: &str) -> T {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn sync_ingests_tool_calls_and_subagent_linkage() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        let subs = proj.join("s1").join("subagents");
+        fs::create_dir_all(&subs).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                r#"{"type":"user","uuid":"u0","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/work/widget","gitBranch":"main","entrypoint":"cli","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"},"caller":{"type":"direct"}}],"usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        // Subagent transcript: same sessionId as the parent (the linkage),
+        // plus an agentId attributing its rows to the run.
+        write_jsonl(
+            &subs,
+            "agent-aaa.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"u2","isSidechain":true,"sessionId":"s1","agentId":"agent-aaa","attributionAgent":"Explore","timestamp":"2026-06-15T01:10:00.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"tu2","name":"Read","caller":{"type":"direct"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        let rep = sync(&mut store).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        assert_eq!(rep.files_scanned, 2);
+        assert_eq!(rep.files_ingested, 2);
+        assert_eq!(rep.sessions, 1);
+        assert_eq!(rep.messages_added, 2);
+        assert_eq!(rep.tool_calls_added, 2);
+
+        // One session, span over ALL lines, subagent flag OR-merged in from
+        // the sidechain file, metadata keep-first.
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_sessions"), 1);
+        assert_eq!(
+            q::<String>(&db, "SELECT cwd FROM cc_sessions"),
+            "/home/me/work/widget"
+        );
+        assert_eq!(q::<i64>(&db, "SELECT used_subagent FROM cc_sessions"), 1);
+        assert_eq!(
+            q::<i64>(&db, "SELECT end_ts - start_ts FROM cc_sessions"),
+            600
+        );
+        // Messages keyed by event uuid; the subagent's row carries agent_id.
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 2);
+        assert_eq!(
+            q::<String>(&db, "SELECT agent_id FROM cc_messages WHERE uuid = 'u2'"),
+            "agent-aaa"
+        );
+        // Tool calls linked to session + message uuid; caller kept verbatim.
+        assert_eq!(
+            q::<String>(
+                &db,
+                "SELECT session_id || '/' || message_uuid || '/' || name || '/' || caller \
+                 FROM cc_tool_calls WHERE tool_use_id = 'tu1' AND agent_id IS NULL"
+            ),
+            r#"s1/u1/Bash/{"type":"direct"}"#
+        );
+        assert_eq!(
+            q::<String>(
+                &db,
+                "SELECT agent_id FROM cc_tool_calls WHERE tool_use_id = 'tu2'"
+            ),
+            "agent-aaa"
+        );
+        // The subagent run row links the run to its parent session.
+        assert_eq!(
+            q::<String>(
+                &db,
+                "SELECT session_id || '/' || agent FROM cc_agent_runs WHERE agent_id = 'agent-aaa'"
+            ),
+            "s1/Explore"
+        );
+    }
+
+    #[test]
+    fn sync_is_idempotent_and_resumes_incrementally() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        let l1 = r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","caller":{"type":"direct"}}],"usage":{"input_tokens":1,"output_tokens":2}}}"#;
+        let l2 = r#"{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":3,"output_tokens":4}}}"#;
+        let l3 = r#"{"type":"assistant","uuid":"u3","sessionId":"s1","timestamp":"2026-06-15T01:10:00.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu3","name":"Read","caller":{"type":"direct"}}],"usage":{"input_tokens":5,"output_tokens":6}}}"#;
+        write_jsonl(&proj, "s1.jsonl", &[l1, l2]);
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        let first = sync(&mut store).unwrap();
+        assert_eq!(first.files_ingested, 1);
+        assert_eq!(first.messages_added, 2);
+        assert_eq!(first.tool_calls_added, 1);
+
+        // Unchanged tree: the cursor (mtime + size) skips the file unread.
+        let second = sync(&mut store).unwrap();
+        assert_eq!(second.files_scanned, 1);
+        assert_eq!(second.files_ingested, 0);
+        assert_eq!(second.sessions, 0);
+        assert_eq!(second.messages_added, 0);
+        assert_eq!(second.tool_calls_added, 0);
+
+        // Append one event: only the new line ingests (cursor resume), no dupes.
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(proj.join("s1.jsonl"))
+                .unwrap();
+            writeln!(f, "{l3}").unwrap();
+        }
+        let third = sync(&mut store).unwrap();
+        assert_eq!(third.files_ingested, 1);
+        assert_eq!(third.messages_added, 1);
+        assert_eq!(third.tool_calls_added, 1);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 3);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_tool_calls"), 2);
+
+        // Shrunk file (rewrite/rotation — abnormal): full re-parse from 0,
+        // upsert keys keep it duplicate-free.
+        write_jsonl(&proj, "s1.jsonl", &[l1]);
+        let fourth = sync(&mut store).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        assert_eq!(fourth.files_ingested, 1);
+        assert_eq!(fourth.messages_added, 0);
+        assert_eq!(fourth.tool_calls_added, 0);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 3);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_tool_calls"), 2);
     }
 
     #[test]

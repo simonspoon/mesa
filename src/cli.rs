@@ -208,17 +208,23 @@ enum TaskCmd {
     /// (--parent) must be in the same project as its parent.
     #[command(after_help = "\
 EXAMPLES
-  mesa task create --project 1 --title \"Draft homepage copy\"
-  mesa task create --project 1 --title \"Review copy\" --priority high --tags writing,review
-  mesa task create --project 1 --title \"In flight\" --status in_progress  # straight into a column
-  mesa task create --project 1 --title \"Outline\" --parent 7   # subtask of task 7")]
+  mesa task create 1 \"Draft homepage copy\"
+  mesa task create mesa \"Review copy\" --priority high --tags writing,review
+  mesa task create 1 \"In flight\" --status in_progress  # straight into a column
+  mesa task create --project 1 --title \"Outline\" --parent 7   # flag form; subtask of task 7")]
     Create {
         /// Project the task belongs to, by id or name (immutable after creation)
-        #[arg(long)]
-        project: String,
+        #[arg(value_name = "PROJECT", required_unless_present = "project")]
+        project_pos: Option<String>,
         /// Task title
-        #[arg(long, allow_hyphen_values = true)]
-        title: String,
+        #[arg(value_name = "TITLE", required_unless_present = "title")]
+        title_pos: Option<String>,
+        /// Project, by id or name (flag form of PROJECT)
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Task title (flag form of TITLE)
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "title_pos")]
+        title: Option<String>,
         /// Optional free-text description
         #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
@@ -561,15 +567,21 @@ enum StoryboardCmd {
     /// with `storyboard frame create` and `storyboard edge create`.
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard create --project 1 --title \"Onboarding flow\"
-  mesa storyboard create --project 1 --title \"Checkout\" --author agent-7")]
+  mesa storyboard create 1 \"Onboarding flow\"
+  mesa storyboard create mesa \"Checkout\" --author agent-7")]
     Create {
         /// Project the storyboard belongs to, by id or name (immutable after creation)
-        #[arg(long)]
-        project: String,
+        #[arg(value_name = "PROJECT", required_unless_present = "project")]
+        project_pos: Option<String>,
         /// Storyboard title
-        #[arg(long, allow_hyphen_values = true)]
-        title: String,
+        #[arg(value_name = "TITLE", required_unless_present = "title")]
+        title_pos: Option<String>,
+        /// Project, by id or name (flag form of PROJECT)
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Storyboard title (flag form of TITLE)
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "title_pos")]
+        title: Option<String>,
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
@@ -644,15 +656,21 @@ enum FrameCmd {
     /// project (a soft reference, cleared if that task is later deleted).
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard frame create --storyboard 1 --title \"Land on home\" --x 40 --y 40
-  mesa storyboard frame create --storyboard 1 --title \"Sign up\" --task 7 --color '#ff2bd6'")]
+  mesa storyboard frame create 1 \"Land on home\" --x 40 --y 40
+  mesa storyboard frame create 1 \"Sign up\" --task 7 --color '#ff2bd6'")]
     Create {
         /// Storyboard the frame belongs to (immutable after creation)
-        #[arg(long)]
-        storyboard: i64,
+        #[arg(value_name = "STORYBOARD", required_unless_present = "storyboard")]
+        storyboard_pos: Option<i64>,
         /// Frame title
-        #[arg(long, allow_hyphen_values = true)]
-        title: String,
+        #[arg(value_name = "TITLE", required_unless_present = "title")]
+        title_pos: Option<String>,
+        /// Storyboard id (flag form of STORYBOARD)
+        #[arg(long, conflicts_with = "storyboard_pos")]
+        storyboard: Option<i64>,
+        /// Frame title (flag form of TITLE)
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "title_pos")]
+        title: Option<String>,
         /// Optional free-text body (markdown by convention)
         #[arg(long)]
         body: Option<String>,
@@ -744,17 +762,26 @@ enum EdgeCmd {
     /// diagram, not a dependency graph).
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard edge create --storyboard 1 --from 3 --to 4 --label \"then\"")]
+  mesa storyboard edge create 1 3 4 --label \"then\"")]
     Create {
         /// Storyboard both frames belong to
-        #[arg(long)]
-        storyboard: i64,
+        #[arg(value_name = "STORYBOARD", required_unless_present = "storyboard")]
+        storyboard_pos: Option<i64>,
         /// Source frame id
-        #[arg(long)]
-        from: i64,
+        #[arg(value_name = "FROM", required_unless_present = "from")]
+        from_pos: Option<i64>,
         /// Destination frame id
-        #[arg(long)]
-        to: i64,
+        #[arg(value_name = "TO", required_unless_present = "to")]
+        to_pos: Option<i64>,
+        /// Storyboard id (flag form of STORYBOARD)
+        #[arg(long, conflicts_with = "storyboard_pos")]
+        storyboard: Option<i64>,
+        /// Source frame id (flag form of FROM)
+        #[arg(long, conflicts_with = "from_pos")]
+        from: Option<i64>,
+        /// Destination frame id (flag form of TO)
+        #[arg(long, conflicts_with = "to_pos")]
+        to: Option<i64>,
         /// Optional edge label
         #[arg(long)]
         label: Option<String>,
@@ -1096,6 +1123,8 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
         TaskCmd::Create {
+            project_pos,
+            title_pos,
             project,
             title,
             description,
@@ -1108,6 +1137,9 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             acceptance_file,
             artifact,
         } => {
+            // clap guarantees exactly one of each positional/flag pair.
+            let project = project.or(project_pos).unwrap();
+            let title = title.or(title_pos).unwrap();
             let mut stdin_used = false;
             let description = resolve_field(description, description_file, &mut stdin_used)?;
             let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
@@ -1239,13 +1271,16 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
         StoryboardCmd::Create {
+            project_pos,
+            title_pos,
             project,
             title,
             description,
             author,
         } => print_json(&store.create_storyboard(
-            resolve_project(&store, &project)?,
-            &title,
+            // clap guarantees exactly one of each positional/flag pair.
+            resolve_project(&store, &project.or(project_pos).unwrap())?,
+            &title.or(title_pos).unwrap(),
             description.as_deref(),
             author.as_deref(),
         )?),
@@ -1276,6 +1311,8 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
 fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
     match cmd {
         FrameCmd::Create {
+            storyboard_pos,
+            title_pos,
             storyboard,
             title,
             body,
@@ -1287,8 +1324,10 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
             task,
             author,
         } => {
+            // clap guarantees exactly one of each positional/flag pair.
+            let storyboard = storyboard.or(storyboard_pos).unwrap();
             let new = FrameNew {
-                title,
+                title: title.or(title_pos).unwrap(),
                 body,
                 x,
                 y,
@@ -1336,15 +1375,19 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
 fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
     match cmd {
         EdgeCmd::Create {
+            storyboard_pos,
+            from_pos,
+            to_pos,
             storyboard,
             from,
             to,
             label,
             author,
         } => print_json(&store.create_edge(
-            storyboard,
-            from,
-            to,
+            // clap guarantees exactly one of each positional/flag pair.
+            storyboard.or(storyboard_pos).unwrap(),
+            from.or(from_pos).unwrap(),
+            to.or(to_pos).unwrap(),
             label.as_deref(),
             author.as_deref(),
         )?),

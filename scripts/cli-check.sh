@@ -63,6 +63,20 @@ run 0 "$MESA" task create --project "$P2" --title "Unrelated"
 T5=$(jqs .id)
 ok "task create: subtask and second project"
 
+# positional form: task create <PROJECT> <TITLE> ≡ --project/--title
+run 0 "$MESA" task create "$P" "Positional form" --priority low
+[ "$(jqs .title)" = "Positional form" ] || fail "task create positional: title"
+[ "$(jqs .project_id)" = "$P" ] || fail "task create positional: project_id"
+run 0 "$MESA" task delete "$(jqs .id)"
+run 0 "$MESA" task create "$P" --title "Mixed form"
+[ "$(jqs .title)" = "Mixed form" ] || fail "task create mixed: title"
+run 0 "$MESA" task delete "$(jqs .id)"
+run 2 "$MESA" task create "$P" "twice" --title "conflict"
+[ "$(jqe .error.code)" = "usage" ] || fail "positional+flag title: code=usage"
+run 2 "$MESA" task create "$P"
+[ "$(jqe .error.code)" = "usage" ] || fail "missing title: code=usage"
+ok "task create: positional/mixed forms; both-or-neither is usage"
+
 # validation: unknown project
 run 1 "$MESA" task create --project 9999 --title "orphan"
 [ "$(jqe .error.code)" = "validation" ] || fail "unknown project: error.code"

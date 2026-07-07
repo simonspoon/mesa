@@ -94,6 +94,11 @@ invariants you must not break — read them before changing `src/`:
   create+list, task next, inbox list/assign): a non-numeric value resolves via
   `Store::find_project_by_name` — case-insensitive exact match; an unknown name
   is `not_found` with a hint, a duplicated name `conflict` listing candidate ids.
+- **Create subcommands take their required args positionally or as flags**:
+  `task create <PROJECT> <TITLE>`, `storyboard create <PROJECT> <TITLE>`,
+  `frame create <STORYBOARD> <TITLE>`, `edge create <STORYBOARD> <FROM> <TO>` —
+  each positional has an equivalent `--flag` (clap enforces exactly one of the
+  pair; both or neither is `usage`, exit 2), matching `project create <NAME>`.
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Error codes: `not_found | validation | cycle | conflict | usage`, plus
   `unavailable` scoped to the surfaces that depend on something outside mesa:

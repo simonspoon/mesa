@@ -71,9 +71,9 @@ Every command prints JSON to stdout. Mutations and `show` print the full object;
 `list` prints a bare JSON array; `delete` prints the full deleted record(s).
 
 ```bash
-# Create a project and a task in it (--project takes an id or a name)
+# Create a project and a task in it (project by id or name; positional or --project/--title)
 mesa project create "Website redesign" --description "Q3 marketing site"
-mesa task create --project "Website redesign" --title "Draft homepage copy" --tags writing,web
+mesa task create "Website redesign" "Draft homepage copy" --tags writing,web
 
 # Query: open, unblocked tasks in project 1
 mesa task list --project 1 --status todo --unblocked
@@ -182,10 +182,10 @@ UI does not live-sync; it refetches on window focus.
 
 ```bash
 # Create a board, add two frames, connect them — all stamped with an author
-SB=$(mesa storyboard create --project 1 --title "Onboarding flow" --author agent-7 | jq .id)
-A=$(mesa storyboard frame create --storyboard "$SB" --title "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
-B=$(mesa storyboard frame create --storyboard "$SB" --title "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
-mesa storyboard edge create --storyboard "$SB" --from "$A" --to "$B" --label "then" --author agent-7
+SB=$(mesa storyboard create 1 "Onboarding flow" --author agent-7 | jq .id)
+A=$(mesa storyboard frame create "$SB" "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
+B=$(mesa storyboard frame create "$SB" "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
+mesa storyboard edge create "$SB" "$A" "$B" --label "then" --author agent-7
 
 # Read the whole board in one call: {storyboard, frames, edges}
 mesa storyboard show "$SB"

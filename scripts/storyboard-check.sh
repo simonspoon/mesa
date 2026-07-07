@@ -56,6 +56,23 @@ run 0 "$MESA" storyboard create --project "$P" --title "Onboarding" \
 SB=$(jqs .id)
 ok "storyboard create: full object with author + timestamps"
 
+# positional forms: create <PROJECT|STORYBOARD> <TITLE> ≡ flag forms
+run 0 "$MESA" storyboard create "$P" "Positional board"
+[ "$(jqs .title)" = "Positional board" ] || fail "storyboard create positional: title"
+SBP=$(jqs .id)
+run 0 "$MESA" storyboard frame create "$SBP" "Pos frame A"
+FP1=$(jqs .id)
+[ "$(jqs .title)" = "Pos frame A" ] || fail "frame create positional: title"
+run 0 "$MESA" storyboard frame create "$SBP" "Pos frame B"
+FP2=$(jqs .id)
+run 0 "$MESA" storyboard edge create "$SBP" "$FP1" "$FP2" --label then
+[ "$(jqs .from_frame)" = "$FP1" ] || fail "edge create positional: from"
+[ "$(jqs .to_frame)" = "$FP2" ] || fail "edge create positional: to"
+run 2 "$MESA" storyboard edge create "$SBP" "$FP1" "$FP2" --to "$FP2"
+[ "$(jqe .error.code)" = "usage" ] || fail "edge positional+flag: code=usage"
+run 0 "$MESA" storyboard delete "$SBP"
+ok "positional create forms: storyboard/frame/edge; both forms is usage"
+
 # unknown project is a validation error
 run 1 "$MESA" storyboard create --project 9999 --title "orphan"
 [ "$(jqe .error.code)" = "validation" ] || fail "unknown project: error.code"

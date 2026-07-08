@@ -14,7 +14,8 @@ pub use store::{
 pub use types::{
     AgentSession, AgentSpawned, Attachment, CcAgentStat, CcDashboard, CcDayPoint, CcModelStat,
     CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens, CcUsage, CcUsageExtra,
-    CcUsageWindow, Dependency, Frame, FrameEdge, GitFileDiff, GitRepoView, GitStatus, HookRun,
-    InboxItem, Priority, Project, ProjectAgents, ProjectGitStatus, ProjectGitView, Status,
-    Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
+    CcUsageWindow, Dependency, Frame, FrameEdge, GitCommit, GitCommitFile, GitFileDiff,
+    GitRepoView, GitStatus, HookRun, InboxItem, Priority, Project, ProjectAgents, ProjectGitLog,
+    ProjectGitStatus, ProjectGitView, Status, Storyboard, StoryboardEvent, StoryboardView, Task,
+    TaskSummary,
 };

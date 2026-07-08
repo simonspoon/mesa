@@ -200,7 +200,10 @@ pub struct ProjectGitView {
     pub repo: Option<GitRepoView>,
 }
 
-/// `GET /api/projects/{id}/git/diff` response.
+/// `GET /api/projects/{id}/git/diff` response. Also reused verbatim for
+/// `GET /api/projects/{id}/git/commits/{sha}/diff` (see
+/// `core::git::commit_file_diff_of`) — the fields mean exactly the same
+/// thing whether the diff is against the working tree or `git show <sha>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct GitFileDiff {
@@ -209,6 +212,54 @@ pub struct GitFileDiff {
     /// underlying git call failed — quiet, never an error). Binary files
     /// carry git's own "Binary files ... differ" line.
     pub diff: String,
+}
+
+/// One entry from `git log` (see `core::git::commit_log_of`). Author
+/// names/subjects originate from repo history — untrusted data, rendered
+/// verbatim, never interpreted as markup/instructions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitCommit {
+    /// Full sha (`%H`) — the identifier passed back into the commit-files
+    /// and commit-diff routes. Using the full hash (not the abbreviated
+    /// one) keeps commit ids unambiguous end to end.
+    pub hash: String,
+    /// Abbreviated sha (`%h`) — display only.
+    pub short_hash: String,
+    /// Author name (`%an`).
+    pub author: String,
+    /// Author date, ISO 8601 with offset (`%aI`).
+    pub date: String,
+    /// First line of the commit message (`%s`).
+    pub subject: String,
+}
+
+/// One changed path from a single commit (`git show --name-status`, see
+/// `core::git::commit_files_of`). Same {status, path, orig_path} shape as
+/// `GitFile` but a DISTINCT type: `status` here is a single name-status
+/// token (`A`/`M`/`D`/`T`/`U`/`X`, or `R100`/`C100` with a similarity
+/// score), not GitFile's two-column XY porcelain pair — a commit has no
+/// staged/unstaged distinction. Frontend reuses GitView.tsx's STATUS_WORDS
+/// letter→word map against `status.chars().next()`, not GitFile's
+/// two-column statusLabel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitCommitFile {
+    pub status: String,
+    pub path: String,
+    /// Rename/copy source path, else None (same convention as GitFile).
+    pub orig_path: Option<String>,
+}
+
+/// `GET /api/projects/{id}/git/log` response. Mirrors ProjectGitView's
+/// empty-state ladder, one level deeper: path null = no local_path; path
+/// set + commits null = folder gone / not a git repo; path set + commits
+/// = Some([]) = a real repo with zero commits (unborn HEAD). Never an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectGitLog {
+    pub path: Option<String>,
+    pub commits: Option<Vec<GitCommit>>,
 }
 
 /// Receipt for a newly started background session: the short job id usable

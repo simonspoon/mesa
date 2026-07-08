@@ -37,9 +37,9 @@ use serde_json::json;
 
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
-    GitFileDiff, GitRepoView, GitStatus, Priority, ProjectAgents, ProjectGitStatus, ProjectGitView,
-    ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary, agents, attachments, git,
-    hooks,
+    GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, Priority, ProjectAgents,
+    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch,
+    TaskPatch, TaskSummary, agents, attachments, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -93,6 +93,18 @@ struct AppState {
     /// handlers stay decoupled; same TTL/shape rationale. `None` is a cached
     /// miss (not a repo). Diffs are not cached — on-demand, one file, cheap.
     git_view_cache: Arc<Mutex<HashMap<String, (Instant, Option<GitRepoView>)>>>,
+    /// Recent commit log per project folder, keyed by `local_path`. Cached
+    /// (S3) so refetch-on-focus doesn't respawn `git log` every render; same
+    /// GIT_TTL/eviction-cap pattern as `git_view_cache`.
+    git_log_cache: Arc<Mutex<HashMap<String, (Instant, Vec<GitCommit>)>>>,
+    /// Per-commit changed-file list, keyed by (local_path, sha). Backs both
+    /// the files route and the per-commit diff route's path allowlist (M7),
+    /// so a commit selected then diffed doesn't re-run `git show
+    /// --name-status` twice in a row. Commit content is immutable once made,
+    /// so this cache never truly goes stale, but it reuses the same
+    /// GIT_TTL/eviction-cap machinery as every other cache here rather than
+    /// special-casing "cache forever" for one map.
+    git_commit_files_cache: Arc<Mutex<HashMap<(String, String), (Instant, Vec<GitCommitFile>)>>>,
     /// Bumped whenever a spawn invalidates the list cache. A concurrent list
     /// whose subprocess started before the spawn checks this before caching,
     /// so it can't reinsert a pre-spawn snapshot after the invalidation and
@@ -117,6 +129,8 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         agents_gen: Arc::new(AtomicU64::new(0)),
         git_cache: Arc::new(Mutex::new(HashMap::new())),
         git_view_cache: Arc::new(Mutex::new(HashMap::new())),
+        git_log_cache: Arc::new(Mutex::new(HashMap::new())),
+        git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -217,6 +231,18 @@ fn router(state: AppState) -> Router {
         // so the same standard guard only — no agent access gate.
         .route("/api/projects/{id}/git", get(get_project_git))
         .route("/api/projects/{id}/git/diff", get(get_project_git_diff))
+        // Commit history: recent log, one commit's changed files, and one
+        // commit-file's diff. Same read-only/standard-guard-only posture as
+        // the two routes above — these execute nothing but `git` shell-outs.
+        .route("/api/projects/{id}/git/log", get(get_project_git_log))
+        .route(
+            "/api/projects/{id}/git/commits/{sha}/files",
+            get(get_project_git_commit_files),
+        )
+        .route(
+            "/api/projects/{id}/git/commits/{sha}/diff",
+            get(get_project_git_commit_diff),
+        )
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -1254,6 +1280,146 @@ async fn get_project_git_diff(
         .await
         .unwrap_or(None)
         .unwrap_or_default();
+    Ok(Json(GitFileDiff { path: wanted, diff }).into_response())
+}
+
+/// Recent commit log for the project's `local_path` repo. Reuses
+/// `project_git_view` purely as the path/repo validity gate (it already runs
+/// `git status`, which is exactly "does `local_path` point at a live git
+/// repo") — ladder: `path == None` -> `{path: None, commits: None}`; `path`
+/// set + `repo == None` (folder gone / not a repo) -> `{path, commits:
+/// None}`; `repo == Some(_)` (valid repo, possibly unborn HEAD) -> fetch the
+/// log through `git_log_cache` -> `{path, commits: Some(vec)}` (`[]` on
+/// unborn HEAD). Never an error.
+async fn get_project_git_log(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let (path, repo) = project_git_view(&state, id).await?;
+    let commits = match (&path, &repo) {
+        (Some(dir), Some(_)) => {
+            let cached = {
+                let cache = state.git_log_cache.lock().unwrap();
+                cache
+                    .get(dir)
+                    .filter(|(at, _)| at.elapsed() < GIT_TTL)
+                    .map(|(_, c)| c.clone())
+            };
+            let commits = match cached {
+                Some(c) => c,
+                None => {
+                    let d = dir.clone();
+                    let c = tokio::task::spawn_blocking(move || git::commit_log_of(&d))
+                        .await
+                        .unwrap_or_default();
+                    let mut cache = state.git_log_cache.lock().unwrap();
+                    if cache.len() >= 64 {
+                        cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+                    }
+                    cache.insert(dir.clone(), (Instant::now(), c.clone()));
+                    c
+                }
+            };
+            Some(commits)
+        }
+        _ => None,
+    };
+    Ok(Json(ProjectGitLog { path, commits }).into_response())
+}
+
+/// Validates `sha`'s shape, resolves the project's repo dir via
+/// `project_git_view` (`repo == None` => `not_found`), then returns that
+/// commit's changed-file list — cached — or `not_found` if the shape is
+/// invalid or git couldn't resolve the commit. Bad-sha and no-repo collapse
+/// to the same `not_found`: from the caller's perspective both mean "can't
+/// show you that commit."
+async fn project_commit_files(
+    state: &AppState,
+    id: i64,
+    sha: &str,
+) -> ApiResult<(String, Vec<GitCommitFile>)> {
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("unknown commit: {sha}"),
+    };
+    let (path, repo) = project_git_view(state, id).await?;
+    let (Some(dir), Some(_)) = (path, repo) else {
+        return Err(not_found());
+    };
+    let key = (dir.clone(), sha.to_string());
+    let cached = {
+        let cache = state.git_commit_files_cache.lock().unwrap();
+        cache
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < GIT_TTL)
+            .map(|(_, f)| f.clone())
+    };
+    let files = match cached {
+        Some(f) => Some(f),
+        None => {
+            let d = dir.clone();
+            let sha_owned = sha.to_string();
+            let f = tokio::task::spawn_blocking(move || git::commit_files_of(&d, &sha_owned))
+                .await
+                .unwrap_or(None);
+            if let Some(f) = &f {
+                let mut cache = state.git_commit_files_cache.lock().unwrap();
+                if cache.len() >= 64 {
+                    cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+                }
+                cache.insert(key, (Instant::now(), f.clone()));
+            }
+            f
+        }
+    };
+    files.map(|f| (dir, f)).ok_or_else(not_found)
+}
+
+/// Files changed in one commit. Read-only external state behind the standard
+/// guard only, like the routes above.
+async fn get_project_git_commit_files(
+    State(state): State<AppState>,
+    Path((id, sha)): Path<(i64, String)>,
+) -> ApiResult<Response> {
+    let (_dir, files) = project_commit_files(&state, id, &sha).await?;
+    Ok(Json(files).into_response())
+}
+
+/// Unified diff of one file as introduced by one commit. `?path=` must be
+/// byte-equal to a member of THAT COMMIT's own changed-file list (`path` or
+/// rename `orig_path`) — mirrors `get_project_git_diff`'s allowlist, scoped
+/// per-commit (M7) rather than to the working-tree status list. Diff text
+/// itself is not cached (matches `get_project_git_diff`'s precedent); it
+/// runs fresh per request via `commit_file_diff_of`, capped at DIFF_CAP.
+async fn get_project_git_commit_diff(
+    State(state): State<AppState>,
+    Path((id, sha)): Path<(i64, String)>,
+    Query(q): Query<GitDiffQuery>,
+) -> ApiResult<Response> {
+    let wanted = q.path.ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let (dir, files) = project_commit_files(&state, id, &sha).await?;
+    let is_member = files
+        .iter()
+        .any(|f| f.path == wanted || f.orig_path.as_deref() == Some(wanted.as_str()));
+    if !is_member {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: format!("path not in commit {sha}: {wanted}"),
+        });
+    }
+    let sha_owned = sha.clone();
+    let target = wanted.clone();
+    let diff =
+        tokio::task::spawn_blocking(move || git::commit_file_diff_of(&dir, &sha_owned, &target))
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default();
     Ok(Json(GitFileDiff { path: wanted, diff }).into_response())
 }
 

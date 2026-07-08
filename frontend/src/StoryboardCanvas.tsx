@@ -12,7 +12,7 @@ import {
   Panel,
   Position,
   ReactFlow,
-  getStraightPath,
+  getBezierPath,
   useConnection,
   useInternalNode,
   useNodesState,
@@ -121,21 +121,23 @@ function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
 
 type Rect = { x: number; y: number; w: number; h: number }
 type Point = { x: number; y: number }
+type Anchor = Point & { position: Position }
 const cx = (r: Rect) => r.x + r.w / 2
 const cy = (r: Rect) => r.y + r.h / 2
 
 /** The four connection-dot positions of a frame: the side midpoints, matching
  *  the rendered HANDLES (top/right/bottom/left). */
-const anchorsOf = (r: Rect): Point[] => [
-  { x: cx(r), y: r.y },
-  { x: r.x + r.w, y: cy(r) },
-  { x: cx(r), y: r.y + r.h },
-  { x: r.x, y: cy(r) },
+const anchorsOf = (r: Rect): Anchor[] => [
+  { x: cx(r), y: r.y, position: Position.Top },
+  { x: r.x + r.w, y: cy(r), position: Position.Right },
+  { x: cx(r), y: r.y + r.h, position: Position.Bottom },
+  { x: r.x, y: cy(r), position: Position.Left },
 ]
 
 /** The anchor of `r` nearest to `toward`, so the edge endpoint sits exactly on
- *  a connection dot and re-snaps as the frames move. */
-function nearestAnchor(r: Rect, toward: Point): Point {
+ *  a connection dot and re-snaps as the frames move. Its `position` tells the
+ *  curved path which way to bow the control points. */
+function nearestAnchor(r: Rect, toward: Point): Anchor {
   let best = anchorsOf(r)[0]
   let bestD = Infinity
   for (const a of anchorsOf(r)) {
@@ -176,11 +178,13 @@ function FrameEdgeView({
   const to = rect(targetNode)
   const start = nearestAnchor(from, { x: cx(to), y: cy(to) })
   const end = nearestAnchor(to, { x: cx(from), y: cy(from) })
-  const [path] = getStraightPath({
+  const [path] = getBezierPath({
     sourceX: start.x,
     sourceY: start.y,
+    sourcePosition: start.position,
     targetX: end.x,
     targetY: end.y,
+    targetPosition: end.position,
   })
   const isEmpty = !(data.label && data.label.trim())
   return (

@@ -3,6 +3,7 @@
 // hand-write payload shapes here (spec Requirement 12).
 
 import type { AgentSpawned } from './types/AgentSpawned'
+import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
@@ -183,6 +184,41 @@ export function deleteTask(id: number): Promise<Task[]> {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+// ---- attachments (files attached to a task) ----
+
+/** A task's attachments (metadata only — never content bytes). */
+export function listAttachments(taskId: number): Promise<Attachment[]> {
+  return request(`/api/tasks/${taskId}/attachments`)
+}
+
+export interface AttachmentCreate {
+  filename: string
+  /** Base64-encoded file content (no `data:` prefix). Not FormData/multipart
+   * — the API only accepts base64-in-JSON, a deliberate CSRF-preserving
+   * decision (arch.md §4): the mutating-method Content-Type gate only allows
+   * `application/json`, which a plain HTML form cannot set. */
+  content_base64: string
+  author?: string
+}
+
+export function createAttachment(
+  taskId: number,
+  body: AttachmentCreate,
+): Promise<Attachment> {
+  return request(`/api/tasks/${taskId}/attachments`, jsonInit('POST', body))
+}
+
+/** Returns the destroyed attachment. */
+export function deleteAttachment(id: number): Promise<Attachment> {
+  return request(`/api/attachments/${id}`, jsonDelete())
+}
+
+/** Raw-bytes download/preview URL — used directly as `<a href>`/`<img src>`,
+ * no further encoding needed (arch.md §4). */
+export function attachmentDownloadUrl(id: number): string {
+  return `/api/attachments/${id}/download`
 }
 
 /** Git status of each project's local_path; projects without a repo omitted. */

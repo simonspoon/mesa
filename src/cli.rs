@@ -69,6 +69,9 @@ enum Command {
     /// Send and triage global inbox items (project-update requests)
     #[command(subcommand)]
     Inbox(InboxCmd),
+    /// Attach local files to tasks; list, inspect, fetch, and delete them
+    #[command(subcommand)]
+    Attachment(AttachmentCmd),
     /// Claude Code telemetry: sessions, tokens, models, skills, agents, cost
     #[command(subcommand)]
     Cc(CcCmd),
@@ -504,6 +507,69 @@ EXAMPLES
     /// Delete an inbox item (no confirmation); echoes the destroyed item
     Delete {
         /// Inbox item id
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttachmentCmd {
+    /// Attach a local file to a task; prints the full created attachment
+    ///
+    /// TASK is a bare task id (not name-resolved — only project arguments get
+    /// name resolution in this repo). The file at PATH is read off local disk
+    /// and a copy is stored under mesa's data directory. Missing/unreadable
+    /// PATH, or a task that does not exist, or a file over the 25 MiB per-file
+    /// cap are all errors.
+    #[command(after_help = "\
+EXAMPLES
+  mesa attachment add 3 ./screenshot.png
+  mesa attachment add --task 3 --path ./notes.pdf --author agent-7")]
+    Add {
+        /// Task to attach the file to
+        #[arg(value_name = "TASK", required_unless_present = "task")]
+        task_pos: Option<i64>,
+        /// Local file to read and attach
+        #[arg(value_name = "PATH", required_unless_present = "path")]
+        path_pos: Option<PathBuf>,
+        /// Task id (flag form of TASK)
+        #[arg(long, conflicts_with = "task_pos")]
+        task: Option<i64>,
+        /// Local file to read and attach (flag form of PATH)
+        #[arg(long, conflicts_with = "path_pos")]
+        path: Option<PathBuf>,
+        /// Free-text actor id of the uploader (an agent name or "user")
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List a task's attachments as a bare JSON array (no content bytes)
+    List {
+        /// Task id
+        task: i64,
+    },
+    /// Print one attachment's metadata as a full JSON object (never content)
+    #[command(visible_alias = "get")]
+    Show {
+        /// Attachment id
+        id: i64,
+    },
+    /// Write an attachment's bytes to a local path; prints the metadata JSON
+    ///
+    /// Creates or overwrites DEST with no confirmation. Content bytes never
+    /// ride stdout — only the attachment's metadata JSON does.
+    #[command(after_help = "\
+EXAMPLES
+  mesa attachment fetch 7 ./out/screenshot.png")]
+    Fetch {
+        /// Attachment id
+        id: i64,
+        /// Destination file to write (created/overwritten)
+        dest: PathBuf,
+    },
+    /// Delete an attachment (no confirmation); echoes the destroyed record
+    ///
+    /// Removes the DB row and unlinks the file on disk.
+    Delete {
+        /// Attachment id
         id: i64,
     },
 }
@@ -1020,6 +1086,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Task(cmd) => run_task(cmd),
         Command::Storyboard(cmd) => run_storyboard(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
+        Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
         Command::Serve { port, lan } => crate::api::serve(port, lan),
         Command::Backup { path } => {
@@ -1460,6 +1527,45 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
                 std::process::exit(1);
             }
         },
+    }
+    Ok(())
+}
+
+fn run_attachment(cmd: AttachmentCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        AttachmentCmd::Add {
+            task_pos,
+            path_pos,
+            task,
+            path,
+            author,
+        } => {
+            // clap guarantees exactly one of each positional/flag pair.
+            let task = task.or(task_pos).unwrap();
+            let path = path.or(path_pos).unwrap();
+            let filename = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    Error::Validation(format!(
+                        "cannot determine a filename from path {}",
+                        path.display()
+                    ))
+                })?;
+            let bytes = std::fs::read(&path)
+                .map_err(|e| Error::Validation(format!("cannot read {}: {e}", path.display())))?;
+            print_json(&store.create_attachment(task, &filename, &bytes, author.as_deref())?);
+        }
+        AttachmentCmd::List { task } => print_json(&store.list_attachments(task)?),
+        AttachmentCmd::Show { id } => print_json(&store.get_attachment(id)?),
+        AttachmentCmd::Fetch { id, dest } => {
+            let (attachment, bytes) = store.attachment_bytes(id)?;
+            std::fs::write(&dest, &bytes)
+                .map_err(|e| Error::Validation(format!("cannot write {}: {e}", dest.display())))?;
+            print_json(&attachment);
+        }
+        AttachmentCmd::Delete { id } => print_json(&store.delete_attachment(id)?),
     }
     Ok(())
 }

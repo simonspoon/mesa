@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use super::attachments;
 use super::types::{
-    Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard, StoryboardEvent,
-    StoryboardView, Task, TaskEvent,
+    Attachment, Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard,
+    StoryboardEvent, StoryboardView, Task, TaskEvent,
 };
 
 #[derive(Debug)]
@@ -228,6 +229,18 @@ const MIGRATIONS: &[&str] = &[
         byte_offset INTEGER NOT NULL
     );
     ",
+    "
+    CREATE TABLE attachments (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        filename     TEXT NOT NULL,
+        content_type TEXT,
+        size_bytes   INTEGER NOT NULL,
+        author       TEXT,
+        created_at   TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+    );
+    CREATE INDEX idx_attachments_task ON attachments(task_id);
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -298,6 +311,21 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         body: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+    })
+}
+
+const ATTACHMENT_COLUMNS: &str =
+    "id, task_id, filename, content_type, size_bytes, author, created_at";
+
+fn row_to_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
+    Ok(Attachment {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        filename: row.get(2)?,
+        content_type: row.get(3)?,
+        size_bytes: row.get(4)?,
+        author: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -1036,8 +1064,30 @@ impl Store {
             let rows = stmt.query_map([id], row_to_task)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // Attachment files for the task and all its subtasks, read before the
+        // delete commits (same "read paths before commit, unlink after
+        // commit" rule as `delete_attachment`, applied transitively). The
+        // `attachments.task_id` FK is `ON DELETE CASCADE`, so the DB rows drop
+        // automatically with the tasks; only the on-disk files need explicit
+        // cleanup here.
+        let attachment_files: Vec<(i64, i64, String)> = {
+            let mut stmt = tx.prepare(
+                "WITH RECURSIVE sub(sid) AS ( \
+                     SELECT id FROM tasks WHERE id = ?1 \
+                     UNION \
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.sid \
+                 ) \
+                 SELECT a.task_id, a.id, a.filename FROM attachments a JOIN sub ON a.task_id = sub.sid",
+            )?;
+            let rows = stmt.query_map([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         tx.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
         tx.commit()?;
+        for (task_id, attachment_id, filename) in attachment_files {
+            let path = attachments::attachment_path(task_id, attachment_id, &filename);
+            let _ = std::fs::remove_file(&path);
+        }
         Ok(tasks)
     }
 
@@ -1285,6 +1335,112 @@ impl Store {
     /// close a cycle. DFS over the full edge set.
     fn would_cycle(&self, task_id: i64, blocker_id: i64) -> Result<bool> {
         would_cycle(&self.conn, task_id, blocker_id)
+    }
+
+    // ---- attachments ----
+
+    /// Creates an attachment on `task_id`: validates the task exists and the
+    /// content fits the per-file cap, inserts the DB row, writes the bytes to
+    /// disk, and only then commits — a failed write rolls the transaction
+    /// back on drop, so a disk failure never leaves an orphan DB row (mirror
+    /// of `delete_attachment`'s commit-then-unlink ordering).
+    pub fn create_attachment(
+        &mut self,
+        task_id: i64,
+        filename: &str,
+        bytes: &[u8],
+        author: Option<&str>,
+    ) -> Result<Attachment> {
+        self.get_task(task_id)?;
+        if bytes.len() as u64 > attachments::MAX_ATTACHMENT_BYTES {
+            return Err(Error::Validation(format!(
+                "attachment {} bytes exceeds the {} byte limit",
+                bytes.len(),
+                attachments::MAX_ATTACHMENT_BYTES
+            )));
+        }
+        let content_type = attachments::guess_content_type(filename);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO attachments (task_id, filename, content_type, size_bytes, author, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            (task_id, filename, &content_type, bytes.len() as i64, author),
+        )?;
+        let id = tx.last_insert_rowid();
+        let path = attachments::attachment_path(task_id, id, filename);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, bytes)?;
+        tx.commit()?;
+        self.get_attachment(id)
+    }
+
+    pub fn get_attachment(&self, id: i64) -> Result<Attachment> {
+        self.conn
+            .query_row(
+                &format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE id = ?1"),
+                [id],
+                row_to_attachment,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("attachment {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Lists a task's attachments, oldest first. 404s if the task itself
+    /// doesn't exist (matches the repo's "the named parent must exist" posture
+    /// for scoped listings).
+    pub fn list_attachments(&self, task_id: i64) -> Result<Vec<Attachment>> {
+        self.get_task(task_id)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE task_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([task_id], row_to_attachment)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Reads an attachment's metadata plus its bytes off disk, for `fetch`/
+    /// `download`. A DB row with no file on disk (only possible via manual
+    /// tampering with the data directory) surfaces `NotFound` — the closest
+    /// existing error code, no new variant needed.
+    pub fn attachment_bytes(&self, id: i64) -> Result<(Attachment, Vec<u8>)> {
+        let attachment = self.get_attachment(id)?;
+        let path =
+            attachments::attachment_path(attachment.task_id, attachment.id, &attachment.filename);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound(format!(
+                    "attachment {id} file missing on disk at {}",
+                    path.display()
+                ))
+            } else {
+                Error::Io(e)
+            }
+        })?;
+        Ok((attachment, bytes))
+    }
+
+    /// Deletes one attachment: the DB delete commits first (the authoritative
+    /// step), then the on-disk file is unlinked best-effort — tolerating an
+    /// already-missing file and swallowing any other unlink error, since the
+    /// DB commit already succeeded and is the source of truth. Returns the
+    /// row as it was before deletion.
+    pub fn delete_attachment(&mut self, id: i64) -> Result<Attachment> {
+        let attachment = self.get_attachment(id)?;
+        let path =
+            attachments::attachment_path(attachment.task_id, attachment.id, &attachment.filename);
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM attachments WHERE id = ?1", [id])?;
+        tx.commit()?;
+        // Best-effort: the DB commit already succeeded and is the source of
+        // truth, so a missing file (already gone) or any other unlink error
+        // is swallowed rather than reported as a failed delete.
+        let _ = std::fs::remove_file(&path);
+        Ok(attachment)
     }
 
     // ---- storyboards ----
@@ -2670,6 +2826,151 @@ mod tests {
         ));
         // bystander survives and is no longer blocked (edge cascaded away)
         assert!(!store.get_task(bystander.id).unwrap().blocked);
+    }
+
+    /// Like `temp_store`, but also points `MESA_ATTACHMENTS_DIR` at a tempdir
+    /// sibling of the test db (so attachment tests never touch the real data
+    /// directory) and hands back `attachments::ENV_LOCK`'s guard — the caller
+    /// must keep it alive (`let (store, _dir, _lock) = ...`) for its whole
+    /// test body so no other test's env-var window overlaps (shared with
+    /// `attachments.rs`'s own env-var test, since both touch the same var).
+    fn attachment_test_store() -> (Store, tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = temp_store();
+        // SAFETY: the ENV_LOCK guard gives this test exclusive access to the
+        // env var for as long as it is held.
+        unsafe { std::env::set_var("MESA_ATTACHMENTS_DIR", dir.path().join("attachments")) };
+        (store, dir, guard)
+    }
+
+    #[test]
+    fn attachment_crud_round_trip() {
+        let (mut store, _dir, _lock) = attachment_test_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task with files");
+
+        let created = store
+            .create_attachment(t.id, "notes.md", b"hello world", Some("simon"))
+            .unwrap();
+        assert_eq!(created.task_id, t.id);
+        assert_eq!(created.filename, "notes.md");
+        assert_eq!(created.content_type.as_deref(), Some("text/markdown"));
+        assert_eq!(created.size_bytes, 11);
+        assert_eq!(created.author.as_deref(), Some("simon"));
+
+        assert_eq!(store.get_attachment(created.id).unwrap(), created);
+        assert_eq!(store.list_attachments(t.id).unwrap(), vec![created.clone()]);
+
+        let (meta, bytes) = store.attachment_bytes(created.id).unwrap();
+        assert_eq!(meta, created);
+        assert_eq!(bytes, b"hello world");
+
+        let deleted = store.delete_attachment(created.id).unwrap();
+        assert_eq!(deleted, created);
+        assert!(matches!(
+            store.get_attachment(created.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(store.list_attachments(t.id).unwrap().is_empty());
+
+        // the file is actually gone from disk
+        let path = attachments::attachment_path(t.id, created.id, &created.filename);
+        assert!(!path.exists());
+
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
+    }
+
+    #[test]
+    fn create_attachment_rejects_oversized_content() {
+        let (mut store, _dir, _lock) = attachment_test_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+
+        let oversized = vec![0u8; (attachments::MAX_ATTACHMENT_BYTES + 1) as usize];
+        let err = store
+            .create_attachment(t.id, "big.bin", &oversized, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(store.list_attachments(t.id).unwrap().is_empty());
+
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
+    }
+
+    #[test]
+    fn attachment_operations_on_missing_task_or_attachment_are_not_found() {
+        let (mut store, _dir, _lock) = attachment_test_store();
+
+        let err = store
+            .create_attachment(999_999, "f.txt", b"x", None)
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+
+        let err = store.list_attachments(999_999).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+
+        let err = store.get_attachment(999_999).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+
+        let err = store.attachment_bytes(999_999).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+
+        let err = store.delete_attachment(999_999).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
+    }
+
+    #[test]
+    fn delete_task_cascade_unlinks_attachment_files_for_task_and_subtasks() {
+        let (mut store, _dir, _lock) = attachment_test_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let root = add_task(&mut store, p.id, "root");
+        let child = store
+            .create_task(
+                p.id,
+                "child",
+                None,
+                Priority::Medium,
+                &[],
+                Some(root.id),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let on_root = store
+            .create_attachment(root.id, "root.txt", b"root bytes", None)
+            .unwrap();
+        let on_child = store
+            .create_attachment(child.id, "child.txt", b"child bytes", None)
+            .unwrap();
+
+        let root_path = attachments::attachment_path(root.id, on_root.id, &on_root.filename);
+        let child_path = attachments::attachment_path(child.id, on_child.id, &on_child.filename);
+        assert!(root_path.exists());
+        assert!(child_path.exists());
+
+        store.delete_task(root.id).unwrap();
+
+        assert!(!root_path.exists(), "root attachment file must be unlinked");
+        assert!(
+            !child_path.exists(),
+            "subtask attachment file must be unlinked"
+        );
+        // DB rows are gone too (cascaded via the FK + the recursive delete).
+        assert!(matches!(
+            store.get_attachment(on_root.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.get_attachment(on_child.id),
+            Err(Error::NotFound(_))
+        ));
+
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
     }
 
     #[test]

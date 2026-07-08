@@ -1,14 +1,19 @@
 import { useState } from 'react'
 import {
+  attachmentDownloadUrl,
+  createAttachment,
   createTask,
+  deleteAttachment,
   deleteTask,
   executeTask,
   getTask,
+  listAttachments,
   listDependencies,
   listTasks,
   updateTask,
 } from '../api'
 import { parseTags } from '../tags'
+import type { Attachment } from '../types/Attachment'
 import type { HookRun } from '../types/HookRun'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
@@ -74,6 +79,102 @@ function CreateSubtaskForm({
   )
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
+ * File picker that reads the selected file client-side and POSTs it as
+ * base64 JSON — never FormData/multipart (the API only accepts
+ * base64-in-JSON, see `api.ts`'s `AttachmentCreate`).
+ */
+function AttachmentUploadForm({
+  taskId,
+  onUploaded,
+}: {
+  taskId: number
+  onUploaded: () => void
+}) {
+  const [uploading, setUploading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    // Reset so selecting the same file again still fires onChange.
+    e.target.value = ''
+    if (!file) return
+    setUploading(true)
+    setError(null)
+    const reader = new FileReader()
+    reader.onload = () => {
+      // readAsDataURL yields "data:<mime>;base64,<content>" — strip the prefix.
+      const dataUrl = reader.result as string
+      const content_base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+      createAttachment(taskId, { filename: file.name, content_base64 }).then(
+        () => {
+          setUploading(false)
+          onUploaded()
+        },
+        (err: unknown) => {
+          setUploading(false)
+          setError(err instanceof Error ? err.message : String(err))
+        },
+      )
+    }
+    reader.onerror = () => {
+      setUploading(false)
+      setError('failed to read file')
+    }
+    reader.readAsDataURL(file)
+  }
+
+  return (
+    <p className="create-form">
+      <input type="file" onChange={handleFile} disabled={uploading} />
+      {uploading && <span className="muted"> uploading…</span>}
+      {error && <span className="error"> {error}</span>}
+    </p>
+  )
+}
+
+function AttachmentRow({
+  attachment,
+  onDeleted,
+}: {
+  attachment: Attachment
+  onDeleted: () => void
+}) {
+  const url = attachmentDownloadUrl(attachment.id)
+  return (
+    <li>
+      <span className="attachment-name">{attachment.filename}</span>{' '}
+      <span className="muted">
+        {formatBytes(attachment.size_bytes)}
+        {attachment.content_type && ` · ${attachment.content_type}`}
+      </span>
+      <div className="task-controls">
+        <a href={url} download={attachment.filename}>
+          download
+        </a>
+        <ConfirmDelete
+          label="delete"
+          message={`Delete "${attachment.filename}"?`}
+          onDelete={() => deleteAttachment(attachment.id).then(onDeleted)}
+        />
+      </div>
+      {attachment.content_type?.startsWith('image/') && (
+        <img
+          className="attachment-preview"
+          src={url}
+          alt={attachment.filename}
+        />
+      )}
+    </li>
+  )
+}
+
 /**
  * Task detail in the right-hand panel. Mutations call `onChanged` so the
  * project view's list/board refetches alongside the panel's own refetch.
@@ -93,13 +194,14 @@ export function TaskPanel({
   const [hookError, setHookError] = useState<string | null>(null)
   const { data, error, refetch } = useFetch(async () => {
     const task = await getTask(taskId)
-    const [siblings, blockers] = await Promise.all([
+    const [siblings, blockers, attachments] = await Promise.all([
       listTasks({ project: task.project_id }),
       listDependencies(taskId),
+      listAttachments(taskId),
     ])
     // One level of nesting only (spec Assumption 6).
     const subtasks = siblings.filter((t) => t.parent_id === taskId)
-    return { task, subtasks, blockers }
+    return { task, subtasks, blockers, attachments }
   }, `task-${taskId}`)
 
   const head = (
@@ -125,7 +227,7 @@ export function TaskPanel({
       </>
     )
 
-  const { task, subtasks, blockers } = data
+  const { task, subtasks, blockers, attachments } = data
 
   function changed() {
     refetch()
@@ -286,6 +388,18 @@ export function TaskPanel({
               </a>{' '}
               <span className={`badge status-${b.status}`}>{b.status}</span>
             </li>
+          ))}
+        </ul>
+      )}
+
+      <h2>Attachments</h2>
+      <AttachmentUploadForm taskId={taskId} onUploaded={changed} />
+      {attachments.length === 0 ? (
+        <p className="muted">None.</p>
+      ) : (
+        <ul className="card-list attachment-list">
+          {attachments.map((a) => (
+            <AttachmentRow key={a.id} attachment={a} onDeleted={changed} />
           ))}
         </ul>
       )}

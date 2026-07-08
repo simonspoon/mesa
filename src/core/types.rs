@@ -795,3 +795,25 @@ pub struct StoryboardEvent {
     /// When the change happened (SQLite `datetime` text, UTC).
     pub at: String,
 }
+
+/// A file attached to a task. Bytes live on disk (see `core::attachments`),
+/// derived from `(task_id, id, filename)` — never a path column to keep in
+/// sync. Content bytes never appear in this type (spec req. 21); fetch them
+/// via `Store::attachment_bytes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct Attachment {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub task_id: i64,
+    pub filename: String,
+    /// Best-effort extension-based guess; `None` when unrecognized.
+    pub content_type: Option<String>,
+    #[ts(type = "number")]
+    pub size_bytes: i64,
+    /// Free-text attribution of who attached the file.
+    pub author: Option<String>,
+    /// When the file was attached (SQLite `datetime` text, UTC).
+    pub created_at: String,
+}

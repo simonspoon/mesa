@@ -24,21 +24,22 @@ use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use base64::Engine;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
-    GitFileDiff, GitRepoView, GitStatus, Priority, ProjectAgents, ProjectGitStatus,
-    ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary, agents,
-    git, hooks,
+    GitFileDiff, GitRepoView, GitStatus, Priority, ProjectAgents, ProjectGitStatus, ProjectGitView,
+    ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary, agents, attachments, git,
+    hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -158,6 +159,27 @@ fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
+        // Attachments: file uploads/downloads scoped to a task. Upload is
+        // JSON body + base64 content (not multipart), per arch.md §4 — that
+        // keeps the route inside the existing Content-Type gate with no
+        // carve-out (a multipart/raw-body exception would reopen the
+        // form-CSRF hole the gate exists to close). The body-limit raise
+        // below is required so an at-cap upload is rejected by `Store`'s own
+        // size check (in the standard JSON error shape), not by axum's 2 MiB
+        // default limit (a bare non-JSON 413).
+        .route(
+            "/api/tasks/{id}/attachments",
+            get(list_task_attachments)
+                .post(create_attachment)
+                .layer(DefaultBodyLimit::max(ATTACHMENT_BODY_LIMIT)),
+        )
+        .route(
+            "/api/attachments/{id}",
+            get(show_attachment).delete(delete_attachment),
+        )
+        // GET, not mutating — the Content-Type gate doesn't apply (matches
+        // the git-diff/agents-list GET precedent below).
+        .route("/api/attachments/{id}/download", get(download_attachment))
         .route(
             "/api/storyboards",
             get(list_storyboards).post(create_storyboard),
@@ -610,6 +632,138 @@ async fn unblock_task(
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.remove_dependency(id, body.on)?).into_response())
+}
+
+// ---- attachments (files attached to a task) ----
+
+/// Upper bound on the raw HTTP request body for the create-attachment route.
+/// Comfortably exceeds `MAX_ATTACHMENT_BYTES * 4/3` (base64 expansion) plus
+/// JSON framing overhead (~1 MiB headroom), or axum's own 2 MiB
+/// `DefaultBodyLimit` would reject an at-cap upload with a bare non-JSON 413
+/// before `Store`'s own size check ever runs — breaking the "errors are
+/// always JSON" contract (arch.md §4). `Store::create_attachment` is what
+/// actually enforces the cap.
+const ATTACHMENT_BODY_LIMIT: usize =
+    (attachments::MAX_ATTACHMENT_BYTES as usize) * 4 / 3 + 1024 * 1024;
+
+#[derive(Deserialize)]
+struct AttachmentCreate {
+    filename: String,
+    content_base64: String,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+async fn list_task_attachments(
+    State(state): State<AppState>,
+    Path(task_id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_attachments(task_id)?).into_response())
+}
+
+/// Upload: JSON body with base64-encoded content, not multipart — see
+/// arch.md §4 for why (multipart/raw-body on a mutating route would reopen
+/// the form-CSRF hole the Content-Type gate exists to close). Unknown task
+/// -> 404 `not_found` (via `Store::create_attachment`); bad base64 -> 422
+/// `validation` here; oversized decoded content -> 422 `validation` from
+/// `Store`'s own size check.
+async fn create_attachment(
+    State(state): State<AppState>,
+    Path(task_id): Path<i64>,
+    body: Result<Json<AttachmentCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.content_base64.as_bytes())
+        .map_err(|e| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!("invalid base64 content: {e}"),
+        })?;
+    let mut store = state.store.lock().unwrap();
+    let attachment =
+        store.create_attachment(task_id, &body.filename, &bytes, body.author.as_deref())?;
+    Ok((StatusCode::CREATED, Json(attachment)).into_response())
+}
+
+async fn show_attachment(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_attachment(id)?).into_response())
+}
+
+/// Raw bytes, never JSON-wrapped. Not a mutating method, so the Content-Type
+/// gate doesn't apply (matches the git-diff/agents-list GET precedent) —
+/// reads exclusively through `Store::attachment_bytes`.
+async fn download_attachment(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let (attachment, bytes) = {
+        let store = state.store.lock().unwrap();
+        store.attachment_bytes(id)?
+    };
+    let content_type = attachment
+        .content_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (
+                header::CONTENT_DISPOSITION,
+                content_disposition(&attachment.filename),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Builds a `Content-Disposition: attachment; filename="..."` header value.
+/// Quotes/backslashes in the quoted-ASCII fallback are escaped; non-ASCII
+/// bytes in that fallback are replaced with `_` (never left un-escaped) and
+/// carried losslessly instead via the RFC 5987 `filename*=UTF-8''...`
+/// extended parameter, which RFC 6266-aware clients (and browsers) prefer
+/// over the plain `filename` when both are present.
+fn content_disposition(filename: &str) -> String {
+    let ascii_fallback: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let encoded = percent_encode_rfc5987(filename);
+    format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+/// Percent-encodes `s` per RFC 5987's `attr-char` set (used by the `filename*`
+/// extended parameter): ASCII alphanumerics plus `!#$&+-.^_`|~` pass through
+/// unescaped, everything else (including all non-ASCII UTF-8 bytes) is
+/// percent-encoded. Hand-rolled rather than pulling in a general-purpose
+/// percent-encoding dependency for one narrow, small use.
+fn percent_encode_rfc5987(s: &str) -> String {
+    const UNRESERVED: &[u8] = b"!#$&+-.^_`|~";
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || UNRESERVED.contains(b) {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+async fn delete_attachment(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.delete_attachment(id)?).into_response())
 }
 
 // ---- storyboards ----

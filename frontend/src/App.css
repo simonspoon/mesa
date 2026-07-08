@@ -1752,6 +1752,38 @@ main {
   overflow-wrap: anywhere;
 }
 
+/* Working tree | History toggle, same segmented-button shape as .cc-window. */
+.git-mode-toggle {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0 0 0.75rem;
+}
+
+.git-mode-toggle button.active {
+  color: var(--bg);
+  background: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan-dim);
+}
+
+/* History mode: "back to commits" affordance above a selected commit's
+   changed-file list. */
+.git-back {
+  display: block;
+  background: none;
+  border: none;
+  color: var(--cyan);
+  cursor: pointer;
+  padding: 0;
+  margin-bottom: 0.5rem;
+  font: inherit;
+}
+
+.git-commit-summary {
+  font-size: 0.85rem;
+  margin: 0 0 0.5rem;
+}
+
 /* Viewport-bound like the agents layout (shares --tab-viewport-*): the file
    list and diff pane scroll internally; the page itself never scrolls. */
 .git-layout {

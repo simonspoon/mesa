@@ -9,10 +9,12 @@ import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
+import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
 import type { ProjectAgents } from './types/ProjectAgents'
+import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
 import type { ProjectGitView } from './types/ProjectGitView'
 import type { Priority } from './types/Priority'
@@ -245,6 +247,37 @@ export function getProjectGitDiff(
 ): Promise<GitFileDiff> {
   return request(
     `/api/projects/${id}/git/diff?path=${encodeURIComponent(path)}`,
+  )
+}
+
+/** Recent commit log for the project's local_path repo. Empty states are
+ * data, never errors: path null = no local_path; path set + commits null =
+ * folder gone / not a repo; commits = [] = a real repo with no commits yet. */
+export function getProjectGitLog(id: number): Promise<ProjectGitLog> {
+  return request(`/api/projects/${id}/git/log`)
+}
+
+/** Files changed in one commit. 404s (surfaced as a thrown/rejected error
+ * by `request`, same as any other endpoint) on an unknown/invalid sha. */
+export function getProjectGitCommitFiles(
+  id: number,
+  sha: string,
+): Promise<GitCommitFile[]> {
+  return request(
+    `/api/projects/${id}/git/commits/${encodeURIComponent(sha)}/files`,
+  )
+}
+
+/** Unified diff of one file as of one commit. `path` must come from that
+ * SAME commit's own getProjectGitCommitFiles() result — passing a
+ * working-tree path that wasn't touched by this commit 404s. */
+export function getProjectGitCommitDiff(
+  id: number,
+  sha: string,
+  path: string,
+): Promise<GitFileDiff> {
+  return request(
+    `/api/projects/${id}/git/commits/${encodeURIComponent(sha)}/diff?path=${encodeURIComponent(path)}`,
   )
 }
 

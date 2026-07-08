@@ -47,10 +47,14 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// MESA_DB if set, else ~/Library/Application Support/mesa/mesa.db (macOS).
+/// MESA_DB if set and non-empty, else ~/Library/Application Support/mesa/mesa.db
+/// (macOS). An empty MESA_DB counts as unset: SQLite treats the path "" as a
+/// private anonymous temp db, so honoring it would silently answer from an
+/// empty database instead of the real one.
 pub fn default_db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("MESA_DB") {
-        return PathBuf::from(p);
+    match std::env::var("MESA_DB") {
+        Ok(p) if !p.is_empty() => return PathBuf::from(p),
+        _ => {}
     }
     let dirs = directories::ProjectDirs::from("", "", "mesa")
         .expect("could not determine application data directory");
@@ -2186,6 +2190,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("test.db")).unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn empty_mesa_db_env_counts_as_unset() {
+        // Set + assert + restore in one test: env vars are process-global and
+        // no other test reads MESA_DB.
+        unsafe { std::env::set_var("MESA_DB", "") };
+        let empty = default_db_path();
+        assert!(
+            empty.ends_with("mesa.db"),
+            "empty MESA_DB must fall back to the default path, got {empty:?}"
+        );
+        unsafe { std::env::set_var("MESA_DB", "/tmp/explicit.db") };
+        assert_eq!(default_db_path(), PathBuf::from("/tmp/explicit.db"));
+        unsafe { std::env::remove_var("MESA_DB") };
     }
 
     fn add_task(store: &mut Store, project_id: i64, title: &str) -> Task {

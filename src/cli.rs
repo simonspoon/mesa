@@ -260,11 +260,15 @@ EXAMPLES
     #[command(after_help = "\
 EXAMPLES
   mesa task list                                   # everything
+  mesa task list 1 --status todo --unblocked       # scoped to a project (id or name)
   mesa task list --project 1 --status todo --unblocked
   mesa task list --tag writing")]
     List {
         /// Only tasks in this project (id or name)
-        #[arg(long)]
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Only tasks in this project (id or name); flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
         /// Only tasks with this status: todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status)]
@@ -288,10 +292,14 @@ EXAMPLES
     #[command(after_help = "\
 EXAMPLES
   mesa task next                 # next actionable task across all projects
-  mesa task next --project 1     # next actionable task in project 1")]
+  mesa task next 1               # next actionable task in project 1 (id or name)
+  mesa task next --project 1     # flag form")]
     Next {
         /// Only consider tasks in this project (id or name)
-        #[arg(long)]
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Only consider tasks in this project (id or name); flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
     },
     /// Import a task graph from a JSON document on stdin (one transaction)
@@ -592,7 +600,10 @@ EXAMPLES
     /// List storyboards as a bare JSON array (no frames/edges; use `show`)
     List {
         /// Only storyboards in this project (id or name)
-        #[arg(long)]
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Only storyboards in this project (id or name); flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
     },
     /// Print a storyboard's full contents: {storyboard, frames, edges}
@@ -1158,11 +1169,13 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             )?);
         }
         TaskCmd::List {
+            project_pos,
             project,
             status,
             tag,
             unblocked,
         } => {
+            let project = project.or(project_pos);
             let project = resolve_project_opt(&store, project.as_deref())?;
             let tasks: Vec<_> = store
                 .list_tasks()?
@@ -1175,7 +1188,11 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 .collect();
             print_json(&tasks);
         }
-        TaskCmd::Next { project } => {
+        TaskCmd::Next {
+            project_pos,
+            project,
+        } => {
+            let project = project.or(project_pos);
             match store.next_task(resolve_project_opt(&store, project.as_deref())?)? {
                 NextResult::Task(task) => print_json(&task),
                 NextResult::None {
@@ -1284,7 +1301,11 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             description.as_deref(),
             author.as_deref(),
         )?),
-        StoryboardCmd::List { project } => {
+        StoryboardCmd::List {
+            project_pos,
+            project,
+        } => {
+            let project = project.or(project_pos);
             print_json(&store.list_storyboards(resolve_project_opt(&store, project.as_deref())?)?)
         }
         StoryboardCmd::Show { id } => print_json(&store.get_storyboard_view(id)?),

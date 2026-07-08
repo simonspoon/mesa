@@ -252,6 +252,17 @@ run 0 "$MESA" task next --project "$PI"
 [ "$(jqs .id)" = "$IA" ] || fail "next: expected high-priority unblocked task $IA"
 ok "task next --project: returns the deterministic actionable task"
 
+# positional project form: next/list <PROJECT> ≡ --project; both is usage
+run 0 "$MESA" task next "$PI"
+[ "$(jqs .id)" = "$IA" ] || fail "task next positional: expected task $IA"
+run 2 "$MESA" task next "$PI" --project "$PI"
+[ "$(jqe .error.code)" = "usage" ] || fail "task next positional+flag: code=usage"
+run 0 "$MESA" task list "$PI"
+[ "$(jqs 'length')" = "$("$MESA" task list --project "$PI" | jq length)" ] || fail "task list positional: same rows as --project"
+run 2 "$MESA" task list "$PI" --project "$PI"
+[ "$(jqe .error.code)" = "usage" ] || fail "task list positional+flag: code=usage"
+ok "task next/list: positional project ≡ --project; both is usage"
+
 # drive that project to completion; next then reports a counts object
 run 0 "$MESA" task update "$IA" --status done
 run 0 "$MESA" task update "$IB" --status done

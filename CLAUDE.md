@@ -99,6 +99,9 @@ invariants you must not break — read them before changing `src/`:
   `frame create <STORYBOARD> <TITLE>`, `edge create <STORYBOARD> <FROM> <TO>` —
   each positional has an equivalent `--flag` (clap enforces exactly one of the
   pair; both or neither is `usage`, exit 2), matching `project create <NAME>`.
+  The optional project filter on `task list`, `task next`, and
+  `storyboard list` takes the same shape: positional `[PROJECT]` or
+  `--project`, both is `usage`, neither means unscoped.
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Error codes: `not_found | validation | cycle | conflict | usage`, plus
   `unavailable` scoped to the surfaces that depend on something outside mesa:

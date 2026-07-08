@@ -87,6 +87,13 @@ run 0 "$MESA" storyboard list --project "$P"
 [ "$(jqs 'any(.[]; has("frames"))')" = "false" ] || fail "list: must omit frames"
 ok "storyboard list --project: bare array, frames omitted"
 
+# positional project form: list <PROJECT> ≡ --project; both is usage
+run 0 "$MESA" storyboard list "$P"
+[ "$(jqs length)" = "2" ] || fail "list positional: expected 2"
+run 2 "$MESA" storyboard list "$P" --project "$P"
+[ "$(jqe .error.code)" = "usage" ] || fail "list positional+flag: code=usage"
+ok "storyboard list: positional project ≡ --project; both is usage"
+
 # ---- frames ----
 run 0 "$MESA" storyboard frame create --storyboard "$SB" --title "Land on home" --author user
 F1=$(jqs .id)

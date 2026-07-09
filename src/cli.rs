@@ -265,7 +265,8 @@ EXAMPLES
   mesa task list                                   # everything
   mesa task list 1 --status todo --unblocked       # scoped to a project (id or name)
   mesa task list --project 1 --status todo --unblocked
-  mesa task list --tag writing")]
+  mesa task list --tag writing
+  mesa task list --parent 42                       # child stories of task 42")]
     List {
         /// Only tasks in this project (id or name)
         #[arg(value_name = "PROJECT")]
@@ -279,6 +280,9 @@ EXAMPLES
         /// Only tasks carrying this tag
         #[arg(long)]
         tag: Option<String>,
+        /// Only subtasks of this parent task id
+        #[arg(long)]
+        parent: Option<i64>,
         /// Only tasks that are not blocked
         #[arg(long)]
         unblocked: bool,
@@ -1240,6 +1244,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             project,
             status,
             tag,
+            parent,
             unblocked,
         } => {
             let project = project.or(project_pos);
@@ -1250,6 +1255,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 .filter(|t| project.is_none_or(|p| t.project_id == p))
                 .filter(|t| status.is_none_or(|s| t.status == s))
                 .filter(|t| tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
+                .filter(|t| parent.is_none_or(|p| t.parent_id == Some(p)))
                 .filter(|t| !unblocked || !t.blocked)
                 .map(compact)
                 .collect();

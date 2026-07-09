@@ -471,6 +471,20 @@ export function getCcDashboard(window: string): Promise<CcDashboard> {
   return request(`/api/cc?window=${encodeURIComponent(window)}`)
 }
 
+/**
+ * Claude Code telemetry scoped to one project's sessions (cwd == local_path).
+ * Same shape as getCcDashboard; never errors on an unmatched/unset local_path
+ * (empty/zero dashboard instead) — only an unknown project id 404s.
+ */
+export function getProjectCcDashboard(
+  projectId: number,
+  window: string,
+): Promise<CcDashboard> {
+  return request(
+    `/api/projects/${projectId}/cc?window=${encodeURIComponent(window)}`,
+  )
+}
+
 /** Currently-running Claude Code sessions over the last `minutes`. */
 export function getCcLive(minutes: number): Promise<CcLive> {
   return request(`/api/cc/live?minutes=${minutes}`)

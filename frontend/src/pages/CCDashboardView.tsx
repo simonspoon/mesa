@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { getCcDashboard, getCcLive, getCcUsage } from '../api'
+import { getCcDashboard, getCcLive, getCcUsage, getProjectCcDashboard } from '../api'
 import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
 import type { CcDashboard } from '../types/CcDashboard'
 import type { CcLiveSession } from '../types/CcLiveSession'
@@ -148,16 +148,33 @@ function Kpi({ label, value, sub }: { label: string; value: string; sub?: string
 // the route picks which body renders. The window selector stays on every page.
 export type CcTab = 'overview' | 'skills-agents' | 'projects' | 'sessions'
 
-export function CCDashboardView({ tab }: { tab: CcTab }) {
+/**
+ * `projectId` switches the view into project-scoped mode: it fetches from
+ * `GET /api/projects/{id}/cc` instead of the global `GET /api/cc` and hides
+ * widgets that are inherently account-wide rather than per-project — Live
+ * Sessions and Subscription Limits read separate, unscoped endpoints
+ * (`/api/cc/live`, `/api/cc/usage`) that have no project filter, so showing
+ * them under a single project's dashboard would silently display every
+ * project's data there, which is misleading rather than merely redundant.
+ * The Projects breakdown sub-table is dropped for the same reason the spec
+ * calls out explicitly (Must #6): once already scoped to one project, a
+ * table of per-project totals is noise. `tab` is still driven by the caller
+ * (story 275 wires the project page's tab list); this component defensively
+ * omits the Projects panel regardless of which tab is requested.
+ */
+export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: number }) {
   const [window, setWindow] = useState('30d')
-  const { data, error } = useFetch(() => getCcDashboard(window), `cc-${window}`, {
-    pollMs: 20000,
-  })
+  const scoped = projectId != null
+  const { data, error } = useFetch(
+    () => (scoped ? getProjectCcDashboard(projectId, window) : getCcDashboard(window)),
+    scoped ? `cc-project-${projectId}-${window}` : `cc-${window}`,
+    { pollMs: 20000 },
+  )
 
   return (
     <div className="cc-dashboard-page">
       <div className="cc-head">
-        <h1>CC Dashboard</h1>
+        <h1>{scoped ? 'Dashboard' : 'CC Dashboard'}</h1>
         <div className="cc-window">
           {WINDOWS.map((w) => (
             <button
@@ -173,14 +190,15 @@ export function CCDashboardView({ tab }: { tab: CcTab }) {
       </div>
       {tab === 'overview' && (
         <p className="muted">
-          Telemetry from Claude Code session transcripts. Costs are estimates
-          from a static price table.
+          Telemetry from Claude Code session transcripts
+          {scoped ? ' for this project' : ''}. Costs are estimates from a
+          static price table.
         </p>
       )}
 
       {error && <p className="error">{error}</p>}
 
-      {tab === 'overview' && (
+      {tab === 'overview' && !scoped && (
         <div className="cc-top">
           <LiveSessions />
           <SubscriptionCard />
@@ -190,7 +208,7 @@ export function CCDashboardView({ tab }: { tab: CcTab }) {
       {!data && !error && <p className="muted">Loading…</p>}
       {data && tab === 'overview' && <Overview data={data} />}
       {data && tab === 'skills-agents' && <SkillsAgents data={data} />}
-      {data && tab === 'projects' && <ProjectsPanel data={data} />}
+      {data && tab === 'projects' && !scoped && <ProjectsPanel data={data} />}
       {data && tab === 'sessions' && <SessionsPanel data={data} />}
     </div>
   )

@@ -10,6 +10,7 @@ import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
 import { AgentsView } from './AgentsView'
+import { CCDashboardView } from './CCDashboardView'
 import { GitView } from './GitView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
@@ -55,6 +56,7 @@ export function ProjectTasksPage({
   storyboardId,
   agents,
   git,
+  dashboard,
   onProjectsChanged,
 }: {
   projectId: number
@@ -69,6 +71,9 @@ export function ProjectTasksPage({
   // Git is another URL-driven view: working-tree status of the project's
   // linked folder, with a per-file diff pane.
   git: boolean
+  // Dashboard is another URL-driven view: this project's scoped CC telemetry
+  // (project-scoped CCDashboardView, overview only).
+  dashboard: boolean
   onProjectsChanged: () => void
 }) {
   // Status and tag are passed through to the API's query filters; priority
@@ -124,11 +129,12 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  // Storyboards and Agents are their own views with their own
+  // Storyboards, Agents, Git, and Dashboard are their own views with their own
   // fetches/error handling, so a failed task fetch must not block them; only
   // surface it on the task views (List/Board).
   const error =
-    projectError ?? (storyboards || agents || git ? null : tasksError)
+    projectError ??
+    (storyboards || agents || git || dashboard ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
@@ -143,7 +149,7 @@ export function ProjectTasksPage({
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectView(next: 'list' | 'board') {
     setView(next)
-    if (storyboards || agents || git)
+    if (storyboards || agents || git || dashboard)
       window.location.hash = `#/projects/${projectId}`
   }
 
@@ -266,9 +272,20 @@ export function ProjectTasksPage({
           </p>
         )}
         <div className="tabs">
+          {/* Dashboard is first, before Board (spec Must #4): a URL-driven
+              in-place view, like Storyboards/Agents/Git below. */}
+          <button
+            className={dashboard ? 'active' : ''}
+            onClick={() => {
+              if (!dashboard)
+                window.location.hash = `#/projects/${projectId}/dashboard`
+            }}
+          >
+            Dashboard
+          </button>
           <button
             className={
-              !storyboards && !agents && !git && view === 'board'
+              !storyboards && !agents && !git && !dashboard && view === 'board'
                 ? 'active'
                 : ''
             }
@@ -278,7 +295,7 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !agents && !git && view === 'list'
+              !storyboards && !agents && !git && !dashboard && view === 'list'
                 ? 'active'
                 : ''
             }
@@ -318,14 +335,16 @@ export function ProjectTasksPage({
 
         {/* Create action lives where the user is working: below the tabs, on
             the List/Board views only (spec S5), not on Storyboards/
-            Agents/Git (those carry their own content). */}
-        {!storyboards && !agents && !git && (
+            Agents/Git/Dashboard (those carry their own content). */}
+        {!storyboards && !agents && !git && !dashboard && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
         )}
 
-        {git ? (
+        {dashboard ? (
+          <CCDashboardView tab="overview" projectId={projectId} />
+        ) : git ? (
           <GitView projectId={projectId} />
         ) : agents ? (
           <AgentsView projectId={projectId} />

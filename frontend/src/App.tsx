@@ -11,7 +11,8 @@ import { useFetch } from './useFetch'
 // #/projects/:id/tasks/:tid (task open in the side panel),
 // #/projects/:id/storyboards, #/projects/:id/storyboards/:sid,
 // #/projects/:id/agents (live Claude Code sessions + embedded terminal),
-// #/projects/:id/git (working-tree status + per-file diffs).
+// #/projects/:id/git (working-tree status + per-file diffs),
+// #/projects/:id/dashboard (project-scoped CC telemetry).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -54,6 +55,7 @@ function App() {
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const agentsMatch = /^\/projects\/(\d+)\/agents$/.exec(path)
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
+  const dashboardMatch = /^\/projects\/(\d+)\/dashboard$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
   const activeProjectId = storyboardMatch
@@ -64,9 +66,11 @@ function App() {
         ? Number(agentsMatch[1])
         : gitMatch
           ? Number(gitMatch[1])
-          : projectMatch
-            ? Number(projectMatch[1])
-            : null
+          : dashboardMatch
+            ? Number(dashboardMatch[1])
+            : projectMatch
+              ? Number(projectMatch[1])
+              : null
 
   let page
   if (inboxMatch) {
@@ -87,6 +91,7 @@ function App() {
         storyboardId={Number(storyboardMatch[2])}
         agents={false}
         git={false}
+        dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -100,6 +105,7 @@ function App() {
         storyboardId={null}
         agents={false}
         git={false}
+        dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -113,6 +119,7 @@ function App() {
         storyboardId={null}
         agents
         git={false}
+        dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -126,6 +133,21 @@ function App() {
         storyboardId={null}
         agents={false}
         git
+        dashboard={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (dashboardMatch) {
+    // Project-scoped CC dashboard, in place inside the project page frame.
+    page = (
+      <ProjectTasksPage
+        projectId={Number(dashboardMatch[1])}
+        taskId={null}
+        storyboards={false}
+        storyboardId={null}
+        agents={false}
+        git={false}
+        dashboard
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -138,6 +160,7 @@ function App() {
         storyboardId={null}
         agents={false}
         git={false}
+        dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )

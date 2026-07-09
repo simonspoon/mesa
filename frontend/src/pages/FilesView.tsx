@@ -18,6 +18,7 @@ import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typesc
 import yaml from 'react-syntax-highlighter/dist/esm/languages/prism/yaml'
 import vscDarkPlus from 'react-syntax-highlighter/dist/esm/styles/prism/vsc-dark-plus'
 import { Markdown } from '../components/Markdown'
+import { splitFrontmatter } from '../frontmatter'
 import { getProjectFiles, getProjectFilesContent } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
 import { useFetch } from '../useFetch'
@@ -193,12 +194,30 @@ function ContentPane({
       {data.is_binary ? (
         <p className="muted">Binary file — cannot display.</p>
       ) : data.language === 'markdown' ? (
-        <div className="files-markdown-body">
-          <Markdown text={data.content} />
-        </div>
+        <MarkdownBody content={data.content} />
       ) : (
         <FileCode content={data.content} language={data.language} />
       )}
+    </div>
+  )
+}
+
+/** Markdown content, with a leading YAML frontmatter block (if any) split off
+ * and rendered as a highlighted YAML panel instead of being fed to
+ * react-markdown — untouched, it renders as two stray `<hr>`s around plain
+ * paragraph text (`---` is a thematic break, not a block react-markdown
+ * knows). */
+function MarkdownBody({ content }: { content: string }) {
+  const { frontmatter, body } = splitFrontmatter(content)
+  return (
+    <div className="files-markdown-body">
+      {frontmatter !== null && (
+        <div className="files-frontmatter">
+          <p className="files-frontmatter-label muted">Frontmatter</p>
+          <FileCode content={frontmatter} language="yaml" />
+        </div>
+      )}
+      <Markdown text={body} />
     </div>
   )
 }

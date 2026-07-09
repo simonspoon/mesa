@@ -160,7 +160,11 @@ export type CcTab = 'overview' | 'skills-agents' | 'projects' | 'sessions'
  * calls out explicitly (Must #6): once already scoped to one project, a
  * table of per-project totals is noise. `tab` is still driven by the caller
  * (story 275 wires the project page's tab list); this component defensively
- * omits the Projects panel regardless of which tab is requested.
+ * omits the Projects panel regardless of which tab is requested. Scoped mode
+ * has no tab picker of its own (the caller always passes `tab="overview"`),
+ * so the Sessions sub-view — the capped most-recent session rows, otherwise
+ * reached via its own `#/cc/sessions` route — renders inline underneath the
+ * KPIs/charts on that one page instead of behind a tab.
  */
 export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: number }) {
   const [window, setWindow] = useState('30d')
@@ -207,6 +211,7 @@ export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: nu
 
       {!data && !error && <p className="muted">Loading…</p>}
       {data && tab === 'overview' && <Overview data={data} />}
+      {data && tab === 'overview' && scoped && <SessionsPanel data={data} />}
       {data && tab === 'skills-agents' && <SkillsAgents data={data} />}
       {data && tab === 'projects' && !scoped && <ProjectsPanel data={data} />}
       {data && tab === 'sessions' && <SessionsPanel data={data} />}

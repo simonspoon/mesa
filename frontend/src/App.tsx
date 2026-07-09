@@ -12,6 +12,7 @@ import { useFetch } from './useFetch'
 // #/projects/:id/storyboards, #/projects/:id/storyboards/:sid,
 // #/projects/:id/agents (live Claude Code sessions + embedded terminal),
 // #/projects/:id/git (working-tree status + per-file diffs),
+// #/projects/:id/files (file tree + content viewer),
 // #/projects/:id/dashboard (project-scoped CC telemetry).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
@@ -55,6 +56,7 @@ function App() {
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const agentsMatch = /^\/projects\/(\d+)\/agents$/.exec(path)
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
+  const filesMatch = /^\/projects\/(\d+)\/files$/.exec(path)
   const dashboardMatch = /^\/projects\/(\d+)\/dashboard$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
@@ -66,11 +68,13 @@ function App() {
         ? Number(agentsMatch[1])
         : gitMatch
           ? Number(gitMatch[1])
-          : dashboardMatch
-            ? Number(dashboardMatch[1])
-            : projectMatch
-              ? Number(projectMatch[1])
-              : null
+          : filesMatch
+            ? Number(filesMatch[1])
+            : dashboardMatch
+              ? Number(dashboardMatch[1])
+              : projectMatch
+                ? Number(projectMatch[1])
+                : null
 
   let page
   if (inboxMatch) {
@@ -91,6 +95,7 @@ function App() {
         storyboardId={Number(storyboardMatch[2])}
         agents={false}
         git={false}
+        files={false}
         dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -105,6 +110,7 @@ function App() {
         storyboardId={null}
         agents={false}
         git={false}
+        files={false}
         dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -119,6 +125,7 @@ function App() {
         storyboardId={null}
         agents
         git={false}
+        files={false}
         dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -133,6 +140,22 @@ function App() {
         storyboardId={null}
         agents={false}
         git
+        files={false}
+        dashboard={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (filesMatch) {
+    // File tree + content viewer, in place inside the project page frame.
+    page = (
+      <ProjectTasksPage
+        projectId={Number(filesMatch[1])}
+        taskId={null}
+        storyboards={false}
+        storyboardId={null}
+        agents={false}
+        git={false}
+        files
         dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -147,6 +170,7 @@ function App() {
         storyboardId={null}
         agents={false}
         git={false}
+        files={false}
         dashboard
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -160,6 +184,7 @@ function App() {
         storyboardId={null}
         agents={false}
         git={false}
+        files={false}
         dashboard={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />

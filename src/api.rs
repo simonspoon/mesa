@@ -36,10 +36,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FrameNew, FramePatch,
-    GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, Priority, ProjectAgents,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch,
-    TaskPatch, TaskSummary, agents, attachments, git, hooks,
+    AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry, FrameNew,
+    FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, Priority,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
+    Status, Store, StoryboardPatch, TaskPatch, TaskSummary, agents, attachments, files, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -117,6 +117,13 @@ struct AppState {
     /// so it can't reinsert a pre-spawn snapshot after the invalidation and
     /// briefly hide the just-created session.
     agents_gen: Arc<AtomicU64>,
+    /// Files tab tree listing per project folder, keyed by `local_path` —
+    /// backs `GET /api/projects/{id}/files`. `core::files::tree_of` walks the
+    /// whole tree (bounded by `MAX_TREE_ENTRIES`/`MAX_TREE_DEPTH`, but still
+    /// not free for a large repo), so this reuses the same TTL/eviction-cap
+    /// pattern as `git_view_cache`. File content reads are not cached (mirrors
+    /// the git diff routes — on-demand, one file, cheap).
+    files_tree_cache: Arc<Mutex<HashMap<String, (Instant, (Vec<FileTreeEntry>, bool))>>>,
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -139,6 +146,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         git_view_cache: Arc::new(Mutex::new(HashMap::new())),
         git_log_cache: Arc::new(Mutex::new(HashMap::new())),
         git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
+        files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -251,6 +259,15 @@ fn router(state: AppState) -> Router {
             "/api/projects/{id}/git/commits/{sha}/diff",
             get(get_project_git_commit_diff),
         )
+        // Files tab: read-only tree listing + file-content reads rooted at
+        // the project's `local_path`, like the git tab. No code execution
+        // (unlike Agents), so the standard guard only; GET-only, so the
+        // Content-Type gate doesn't apply either.
+        .route("/api/projects/{id}/files", get(get_project_files))
+        .route(
+            "/api/projects/{id}/files/content",
+            get(get_project_files_content),
+        )
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -328,6 +345,7 @@ async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Respo
 
 // ---- errors ----
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -1437,6 +1455,113 @@ async fn get_project_git_commit_diff(
     Ok(Json(GitFileDiff { path: wanted, diff }).into_response())
 }
 
+/// Resolves a project's `local_path` and whether it is currently a live,
+/// readable directory — the shared root check for both Files routes below.
+/// `(None, false)` = no local_path; `(Some(path), false)` = path set but not a
+/// live directory; `(Some(path), true)` = live directory. Unlike
+/// `project_git_view` there's no subprocess here, so no third "call failed"
+/// state to fold in. Unknown project id surfaces as `not_found` via
+/// `get_project`.
+async fn project_files_root(state: &AppState, id: i64) -> ApiResult<(Option<String>, bool)> {
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let Some(path) = local_path else {
+        return Ok((None, false));
+    };
+    let is_dir = std::path::Path::new(&path).is_dir();
+    Ok((Some(path), is_dir))
+}
+
+/// Files tab tree listing. Empty-state ladder mirrors `ProjectGitView`: no
+/// `local_path` -> `{path: null, tree: null, truncated: false}`; dead/
+/// unreadable folder -> `{path, tree: null, truncated: false}`; live folder ->
+/// `{path, tree: Some(entries), truncated}` via `core::files::tree_of`, cached
+/// per folder in `files_tree_cache`. Never a 5xx for any of these three
+/// states.
+async fn get_project_files(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    if !is_dir {
+        return Ok(Json(ProjectFileTree {
+            path,
+            tree: None,
+            truncated: false,
+        })
+        .into_response());
+    }
+    let dir = path.clone().expect("is_dir true implies path is Some");
+    let cached = {
+        let cache = state.files_tree_cache.lock().unwrap();
+        cache
+            .get(&dir)
+            .filter(|(at, _)| at.elapsed() < GIT_TTL)
+            .map(|(_, v)| v.clone())
+    };
+    let (entries, truncated) = match cached {
+        Some(v) => v,
+        None => {
+            // Walking a large repo isn't free; keep it off the async workers,
+            // same rationale as the git subprocess calls above.
+            let d = dir.clone();
+            let v = tokio::task::spawn_blocking(move || files::tree_of(&d))
+                .await
+                .unwrap_or_else(|_| (Vec::new(), false));
+            let mut cache = state.files_tree_cache.lock().unwrap();
+            if cache.len() >= 64 {
+                cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+            }
+            cache.insert(dir.clone(), (Instant::now(), v.clone()));
+            v
+        }
+    };
+    Ok(Json(ProjectFileTree {
+        path,
+        tree: Some(entries),
+        truncated,
+    })
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct FilesContentQuery {
+    path: Option<String>,
+}
+
+/// Files tab content read for one file. Missing `?path=` is 422 `validation`
+/// (matches `GitDiffQuery`'s precedent). No `local_path` / dead folder
+/// collapses to 404 `not_found` (nothing under any root to serve). Otherwise
+/// delegates to `core::files::read_file`, whose `None` — traversal, absolute
+/// path, unlisted/nonexistent path, or a directory given for a file — is
+/// 279's single 404 `not_found` case, matching the git tab's "bad sha and no
+/// repo both mean not_found" precedent. Content reads are not cached (mirrors
+/// the git diff routes).
+async fn get_project_files_content(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FilesContentQuery>,
+) -> ApiResult<Response> {
+    let wanted = q.path.ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {wanted}"),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let rel = wanted.clone();
+    let view = tokio::task::spawn_blocking(move || files::read_file(&root, &rel))
+        .await
+        .unwrap_or(None);
+    view.map(|v| Json(v).into_response()).ok_or_else(not_found)
+}
+
 /// Terminal access is code execution on this machine — a strictly stronger
 /// capability than the task CRUD the rest of the API exposes. In default
 /// (loopback) mode the agent endpoints are never served to non-local peers.
@@ -2272,5 +2397,200 @@ mod tests {
         assert!(require_lan_page_access(&lan_peer(), &remote, 7770).is_ok());
         let dev = hdrs(Some("127.0.0.1:7770"), Some("http://localhost:5173"));
         assert!(require_lan_page_access(&loopback(), &dev, 7770).is_ok());
+    }
+
+    // --- Files tab: GET /files and /files/content (mesa task 279) ---------
+
+    /// A fresh AppState over a tempdir-backed store, isolated per test. The
+    /// backing `TempDir` is returned alongside so it stays alive (and the db
+    /// file with it) for the test's duration.
+    fn test_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let state = AppState {
+            store: Arc::new(Mutex::new(store)),
+            port: 0,
+            lan: false,
+            cc_cache: Arc::new(Mutex::new(HashMap::new())),
+            project_cc_cache: Arc::new(Mutex::new(HashMap::new())),
+            usage_cache: Arc::new(Mutex::new(None)),
+            usage_lock: Arc::new(tokio::sync::Mutex::new(())),
+            usage_refreshing: Arc::new(AtomicBool::new(false)),
+            agents_cache: Arc::new(Mutex::new(HashMap::new())),
+            agents_gen: Arc::new(AtomicU64::new(0)),
+            git_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_view_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_log_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
+            files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+        (dir, state)
+    }
+
+    fn new_project(state: &AppState, local_path: Option<&str>) -> i64 {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_project("proj", None, None, local_path)
+            .unwrap()
+            .id
+    }
+
+    async fn json_body(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn files_no_local_path_is_null_tree() {
+        let (_dir, state) = test_state();
+        let id = new_project(&state, None);
+        let resp = get_project_files(State(state), Path(id)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], serde_json::Value::Null);
+        assert_eq!(body["tree"], serde_json::Value::Null);
+        assert_eq!(body["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn files_dead_folder_has_path_but_null_tree() {
+        let (dir, state) = test_state();
+        let gone = dir.path().join("gone").to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&gone));
+        let resp = get_project_files(State(state), Path(id)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], serde_json::json!(gone));
+        assert_eq!(body["tree"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn files_live_folder_returns_tree() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "hi").unwrap();
+        std::fs::write(root.join("sub/b.rs"), "fn main() {}").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = get_project_files(State(state), Path(id)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], serde_json::json!(root_str));
+        assert_eq!(body["truncated"], false);
+        let tree = body["tree"].as_array().unwrap();
+        let names: Vec<&str> = tree.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"sub"));
+        assert!(names.contains(&"a.txt"));
+        let sub = tree.iter().find(|e| e["name"] == "sub").unwrap();
+        assert_eq!(sub["is_dir"], true);
+        let children = sub["children"].as_array().unwrap();
+        assert_eq!(children[0]["path"], "sub/b.rs");
+    }
+
+    #[tokio::test]
+    async fn files_content_reads_normal_file() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = get_project_files_content(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("main.rs".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], "main.rs");
+        assert_eq!(body["is_binary"], false);
+        assert_eq!(body["content"], "fn main() {}\n");
+        assert_eq!(body["language"], "rust");
+    }
+
+    #[tokio::test]
+    async fn files_content_missing_query_is_validation_error() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let err = get_project_files_content(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery { path: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "validation");
+    }
+
+    #[tokio::test]
+    async fn files_content_traversal_and_bad_paths_are_not_found() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for bad in [
+            "../secret.txt",
+            "/etc/passwd",
+            "nope.txt",
+            "sub", // a directory, not a file
+        ] {
+            let resp = get_project_files_content(
+                State(state.clone()),
+                Path(id),
+                Query(FilesContentQuery {
+                    path: Some(bad.to_string()),
+                }),
+            )
+            .await;
+            let err = resp.unwrap_err();
+            assert_eq!(err.status, StatusCode::NOT_FOUND, "path {bad:?}");
+            assert_eq!(err.code, "not_found", "path {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn files_content_no_local_path_or_dead_folder_is_not_found() {
+        let (dir, state) = test_state();
+        let no_path_project = new_project(&state, None);
+        let resp = get_project_files_content(
+            State(state.clone()),
+            Path(no_path_project),
+            Query(FilesContentQuery {
+                path: Some("a.txt".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+
+        let gone = dir.path().join("gone").to_str().unwrap().to_string();
+        let dead_project = new_project(&state, Some(&gone));
+        let resp = get_project_files_content(
+            State(state),
+            Path(dead_project),
+            Query(FilesContentQuery {
+                path: Some("a.txt".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
     }
 }

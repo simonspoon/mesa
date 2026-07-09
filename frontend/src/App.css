@@ -1878,6 +1878,132 @@ main {
   text-align: center;
 }
 
+/* Files tab: tree panel + content viewer, same viewport-bound two-pane shape
+   as .git-layout. */
+.files-truncated-note {
+  margin: 0 0 0.75rem;
+}
+
+.files-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: stretch;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
+}
+
+.files-tree {
+  flex: none;
+  width: 19rem;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.files-tree li {
+  padding: 0.25rem 0.5rem;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.files-tree li:hover {
+  background: var(--panel-raised);
+}
+
+.files-tree-dir {
+  color: var(--text-h);
+}
+
+.files-tree-toggle {
+  display: inline-block;
+  width: 1rem;
+  color: var(--muted);
+}
+
+.files-tree-file.selected {
+  background: var(--panel-raised);
+  box-shadow: inset 0 0 0 1px var(--cyan-dim);
+}
+
+.files-content-pane {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 0.5rem 0.75rem;
+}
+
+.files-content-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  margin: 0 0 0.5rem;
+}
+
+.files-content-path {
+  overflow-wrap: anywhere;
+}
+
+.badge.files-lang-badge {
+  color: inherit;
+  border-color: currentColor;
+  text-transform: none;
+}
+
+.badge.files-truncated-badge {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
+/* Untrusted file content: <pre> keeps it verbatim (no wrapping — the pane
+   scrolls both ways), same precedent as .git-diff-text. */
+.files-content-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.files-accent-cyan {
+  color: var(--cyan);
+}
+
+.files-accent-magenta {
+  color: var(--magenta);
+}
+
+.files-accent-amber {
+  color: var(--amber);
+}
+
+.files-accent-green {
+  color: var(--green);
+}
+
+.files-accent-red {
+  color: var(--red);
+}
+
+.files-accent-muted {
+  color: var(--muted);
+}
+
+.files-placeholder {
+  padding: 2rem;
+  border: 1px dashed var(--border);
+  text-align: center;
+}
+
 /* ---- narrow screens (task 191: mobile support) ----
    Kept at the end of the file so these override the desktop rules above at
    equal specificity. Two tiers: ≤860px (narrow/tablet) and ≤600px (phone). */
@@ -1945,6 +2071,24 @@ main {
   }
 
   .git-diff-pane {
+    height: var(--tab-viewport-height);
+    min-height: var(--tab-viewport-min);
+  }
+
+  /* Files tab: tree flows above, content pane keeps a viewport-bound box
+     below (same treatment as .git-layout). */
+  .files-layout {
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+
+  .files-tree {
+    width: auto;
+    overflow-y: visible;
+  }
+
+  .files-content-pane {
     height: var(--tab-viewport-height);
     min-height: var(--tab-viewport-min);
   }

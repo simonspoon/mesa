@@ -210,6 +210,70 @@ agent-style gate, it executes nothing.
   `git::is_valid_commit_id` (7–64 hex chars) **before** any `git` subprocess
   is spawned, so it can never be read as a flag or a path.
 
+### Files tab (read-only project file browser)
+
+The **Files** tab on a project page (web UI, `#/projects/:id/files`) browses
+the file tree of the project's `local_path` and reads individual file
+contents — same `local_path`-anchored, read-only posture as the Git tab
+(touches the store only to read `local_path`, no CLI).
+
+- `pub fn safe_path(root: &str, rel: &str) -> Option<PathBuf>`
+  (`src/core/files.rs`) is the sole traversal-defense chokepoint: canonicalizes
+  both `root` and `root.join(rel)` (resolving `.`/`..` **and** symlinks) and
+  requires the result to be `root` itself or a descendant — rejects
+  `../` traversal, absolute-path smuggling, symlink escapes, and nonexistent
+  paths in one check. Only `read_file` calls it.
+- `pub fn tree_of(root: &str) -> (Vec<FileTreeEntry>, bool)` walks `root`
+  (assumed already verified as a live directory by the caller), excluding
+  `EXCLUDED_DIRS` (`.git`, `node_modules`, `target`, `dist`, `build`, `.venv`,
+  `venv`, `__pycache__`, `.next`, `vendor`, `.cache`) at any depth, sorting
+  directories before files. Stops adding/descending at `MAX_TREE_ENTRIES`
+  (2,000 nodes) or `MAX_TREE_DEPTH` (12 levels), returning a `truncated` flag.
+  Symlinks are listed as file leaves and never followed (one rule covers both
+  escape and cycle risk).
+- `pub fn read_file(root: &str, rel: &str) -> Option<FileContentView>`
+  resolves `rel` via `safe_path`, rejects directories, detects binaries via an
+  extension allowlist or a NUL-byte sniff (`content: ""` for those), else
+  reads up to `FILE_CONTENT_CAP` (256 KiB, mirrors the Git tab's `DIFF_CAP`)
+  bytes with the same lossy-UTF8/char-boundary truncation as `git.rs::capped`.
+  `language` is an extension→tag lookup (e.g. `rs`→`rust`) set in both
+  branches — it describes the file, not the content.
+- `GET /api/projects/{id}/files` → `ProjectFileTree` via `files::tree_of`.
+  Same three-rung empty-state ladder as the Git tab: no `local_path` →
+  `{path: null, tree: null}`; dead/unreadable folder → `{path, tree: null}`;
+  live folder → `{path, tree: Some(entries), truncated}`. Never an error.
+  Cached 5s per folder (`AppState.files_tree_cache`) — walking a large repo
+  isn't free either.
+- `GET /api/projects/{id}/files/content?path=<relpath>` → `FileContentView`
+  via `files::read_file`. Missing `?path=` is 422 `validation` (matches the
+  Git tab's diff routes). No `local_path` / dead folder, or `read_file`
+  returning `None` (traversal, absolute path, unlisted/nonexistent path, or a
+  directory given for a file) all collapse to 404 `not_found` — one case,
+  matching the Git tab's "bad sha and no repo both mean not_found"
+  precedent. Content reads are not cached (on-demand, one file, cheap, like
+  the Git tab's diff routes).
+- Standard middleware guard only, like the Git tab — no agent-style
+  code-execution gate (this surface executes nothing) and no Content-Type
+  gate (both routes are GET-only reads).
+- Web UI: `FilesView` (`frontend/src/pages/FilesView.tsx`) under the project
+  tabs — a left-hand expandable file tree (`.files-tree`, directories
+  toggled open/closed in local component state, no deep-linking) and a
+  right-hand content pane, registered like the Git/Agents/Storyboards tabs (a
+  boolean `files` route prop threaded `App.tsx` → `ProjectTasksPage.tsx`'s tab
+  bar + content switch). Read-only: no edit/save/delete control anywhere in
+  the tab. Color coding is extension/language-derived, not a syntax
+  highlighter (per spec 277's design decision): tree rows derive their tint
+  client-side from `FileTreeEntry.name`'s extension via a local copy of
+  `files.rs`'s extension→language table (the tree endpoint carries no
+  `language` field, by design — see the API section above); the content pane
+  uses `FileContentView.language` verbatim for its header tint. Both map onto
+  the same five `--cyan`/`--magenta`/`--amber`/`--green`/`--red` accent
+  classes (`.files-accent-*`), grouped by rough language category since the
+  theme has far fewer hues than languages. A binary file renders "Binary file
+  — cannot display" instead of raw content; the no-`local_path` and
+  dead-folder empty-state rungs render the same quiet-placeholder pattern as
+  the Git tab, never a hard error.
+
 ### Storyboards (freeform visual canvas)
 
 A **storyboard** is a freeform spatial canvas of **frames** (cards at `x/y`) and

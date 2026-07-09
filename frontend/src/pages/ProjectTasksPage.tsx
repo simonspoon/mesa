@@ -11,6 +11,7 @@ import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
 import { AgentsView } from './AgentsView'
 import { CCDashboardView } from './CCDashboardView'
+import { FilesView } from './FilesView'
 import { GitView } from './GitView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
@@ -56,6 +57,7 @@ export function ProjectTasksPage({
   storyboardId,
   agents,
   git,
+  files,
   dashboard,
   onProjectsChanged,
 }: {
@@ -71,6 +73,9 @@ export function ProjectTasksPage({
   // Git is another URL-driven view: working-tree status of the project's
   // linked folder, with a per-file diff pane.
   git: boolean
+  // Files is another URL-driven view: the project's file tree (rooted at
+  // local_path) with a content viewer for the selected file.
+  files: boolean
   // Dashboard is another URL-driven view: this project's scoped CC telemetry
   // (project-scoped CCDashboardView, overview only).
   dashboard: boolean
@@ -129,12 +134,12 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  // Storyboards, Agents, Git, and Dashboard are their own views with their own
-  // fetches/error handling, so a failed task fetch must not block them; only
-  // surface it on the task views (List/Board).
+  // Storyboards, Agents, Git, Files, and Dashboard are their own views with
+  // their own fetches/error handling, so a failed task fetch must not block
+  // them; only surface it on the task views (List/Board).
   const error =
     projectError ??
-    (storyboards || agents || git || dashboard ? null : tasksError)
+    (storyboards || agents || git || files || dashboard ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
@@ -149,7 +154,7 @@ export function ProjectTasksPage({
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectView(next: 'list' | 'board') {
     setView(next)
-    if (storyboards || agents || git || dashboard)
+    if (storyboards || agents || git || files || dashboard)
       window.location.hash = `#/projects/${projectId}`
   }
 
@@ -285,7 +290,7 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !agents && !git && !dashboard && view === 'board'
+              !storyboards && !agents && !git && !files && !dashboard && view === 'board'
                 ? 'active'
                 : ''
             }
@@ -295,7 +300,7 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !agents && !git && !dashboard && view === 'list'
+              !storyboards && !agents && !git && !files && !dashboard && view === 'list'
                 ? 'active'
                 : ''
             }
@@ -331,12 +336,20 @@ export function ProjectTasksPage({
           >
             Git
           </button>
+          <button
+            className={files ? 'active' : ''}
+            onClick={() => {
+              if (!files) window.location.hash = `#/projects/${projectId}/files`
+            }}
+          >
+            Files
+          </button>
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
             the List/Board views only (spec S5), not on Storyboards/
-            Agents/Git/Dashboard (those carry their own content). */}
-        {!storyboards && !agents && !git && !dashboard && (
+            Agents/Git/Files/Dashboard (those carry their own content). */}
+        {!storyboards && !agents && !git && !files && !dashboard && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
@@ -346,6 +359,8 @@ export function ProjectTasksPage({
           <CCDashboardView tab="overview" projectId={projectId} />
         ) : git ? (
           <GitView projectId={projectId} />
+        ) : files ? (
+          <FilesView projectId={projectId} />
         ) : agents ? (
           <AgentsView projectId={projectId} />
         ) : storyboards ? (

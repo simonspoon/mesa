@@ -868,3 +868,49 @@ pub struct Attachment {
     /// When the file was attached (SQLite `datetime` text, UTC).
     pub created_at: String,
 }
+
+/// One node in a project's file tree, rooted at local_path (see
+/// `core::files::tree_of`). `children` is `Some(_)` for every directory
+/// (possibly `[]` — empty, excluded, or depth-capped) and `None` for every
+/// file — the discriminant IS `is_dir`, `children` is never used to infer it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FileTreeEntry {
+    /// Basename.
+    pub name: String,
+    /// Relative to local_path, "/"-separated.
+    pub path: String,
+    pub is_dir: bool,
+    pub children: Option<Vec<FileTreeEntry>>,
+}
+
+/// `GET /api/projects/{id}/files` response. Ladder mirrors `ProjectGitView`:
+/// path null = no local_path; path set + tree null = dead/unreadable folder;
+/// path set + tree = Some(_) = live folder (root itself always readable at
+/// that point, so this is never Some(vec![]) representing "unreadable" — an
+/// unreadable root collapses to the dead-folder rung, same as git's is_dir
+/// check). Never an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectFileTree {
+    pub path: Option<String>,
+    pub tree: Option<Vec<FileTreeEntry>>,
+    /// True iff MAX_TREE_ENTRIES or MAX_TREE_DEPTH was hit anywhere during
+    /// the walk (one global flag, not per-node — good enough to tell the UI
+    /// "this repo is bigger than what you're seeing").
+    pub truncated: bool,
+}
+
+/// `GET /api/projects/{id}/files/content` response (see `core::files::read_file`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FileContentView {
+    pub path: String,
+    pub is_binary: bool,
+    /// "" when is_binary is true — binary bytes are never put on the wire.
+    pub content: String,
+    pub truncated: bool,
+    /// Extension-derived language tag (e.g. "rs" -> "rust"), or None when
+    /// unrecognized. "" is never used in place of None here.
+    pub language: Option<String>,
+}

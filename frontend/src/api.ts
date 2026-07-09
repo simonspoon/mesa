@@ -7,6 +7,7 @@ import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
+import type { FileContentView } from './types/FileContentView'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
 import type { GitCommitFile } from './types/GitCommitFile'
@@ -14,6 +15,7 @@ import type { GitFileDiff } from './types/GitFileDiff'
 import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
 import type { ProjectAgents } from './types/ProjectAgents'
+import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
 import type { ProjectGitView } from './types/ProjectGitView'
@@ -278,6 +280,31 @@ export function getProjectGitCommitDiff(
 ): Promise<GitFileDiff> {
   return request(
     `/api/projects/${id}/git/commits/${encodeURIComponent(sha)}/diff?path=${encodeURIComponent(path)}`,
+  )
+}
+
+// ---- files (read-only file tree + content, local_path-anchored) ----
+
+/**
+ * File tree rooted at the project's local_path. Empty states are data,
+ * never errors: path null = no local_path; path set + tree null = folder
+ * gone / unreadable; tree = [] = a real, empty (or fully-excluded) folder.
+ */
+export function getProjectFiles(id: number): Promise<ProjectFileTree> {
+  return request(`/api/projects/${id}/files`)
+}
+
+/**
+ * One file's content (or a binary/truncation indicator) by its path from
+ * that SAME project's tree above. An unsafe/unlisted/nonexistent path, or a
+ * directory given where a file is expected, 404s.
+ */
+export function getProjectFilesContent(
+  id: number,
+  path: string,
+): Promise<FileContentView> {
+  return request(
+    `/api/projects/${id}/files/content?path=${encodeURIComponent(path)}`,
   )
 }
 

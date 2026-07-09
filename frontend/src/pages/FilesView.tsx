@@ -1,7 +1,68 @@
 import { useState } from 'react'
+import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter'
+import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash'
+import c from 'react-syntax-highlighter/dist/esm/languages/prism/c'
+import cpp from 'react-syntax-highlighter/dist/esm/languages/prism/cpp'
+import css from 'react-syntax-highlighter/dist/esm/languages/prism/css'
+import go from 'react-syntax-highlighter/dist/esm/languages/prism/go'
+import javascript from 'react-syntax-highlighter/dist/esm/languages/prism/javascript'
+import json from 'react-syntax-highlighter/dist/esm/languages/prism/json'
+import jsx from 'react-syntax-highlighter/dist/esm/languages/prism/jsx'
+import markup from 'react-syntax-highlighter/dist/esm/languages/prism/markup'
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python'
+import ruby from 'react-syntax-highlighter/dist/esm/languages/prism/ruby'
+import rust from 'react-syntax-highlighter/dist/esm/languages/prism/rust'
+import toml from 'react-syntax-highlighter/dist/esm/languages/prism/toml'
+import tsx from 'react-syntax-highlighter/dist/esm/languages/prism/tsx'
+import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typescript'
+import yaml from 'react-syntax-highlighter/dist/esm/languages/prism/yaml'
+import vscDarkPlus from 'react-syntax-highlighter/dist/esm/styles/prism/vsc-dark-plus'
+import { Markdown } from '../components/Markdown'
 import { getProjectFiles, getProjectFilesContent } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
 import { useFetch } from '../useFetch'
+
+// Registered once at module load. PrismLight (the sync "light" build) ships
+// no language grammar unless registered and has no fallback-fetch for
+// unregistered ones (unlike PrismAsyncLight, whose per-language dynamic
+// imports pull Prism's entire ~290-language catalog into the build output),
+// so the bundle only grows by the ~15 languages this file's own
+// EXTENSION_LANGUAGE table can actually produce.
+SyntaxHighlighter.registerLanguage('bash', bash)
+SyntaxHighlighter.registerLanguage('c', c)
+SyntaxHighlighter.registerLanguage('cpp', cpp)
+SyntaxHighlighter.registerLanguage('css', css)
+SyntaxHighlighter.registerLanguage('go', go)
+SyntaxHighlighter.registerLanguage('javascript', javascript)
+SyntaxHighlighter.registerLanguage('json', json)
+SyntaxHighlighter.registerLanguage('jsx', jsx)
+SyntaxHighlighter.registerLanguage('markup', markup)
+SyntaxHighlighter.registerLanguage('python', python)
+SyntaxHighlighter.registerLanguage('ruby', ruby)
+SyntaxHighlighter.registerLanguage('rust', rust)
+SyntaxHighlighter.registerLanguage('toml', toml)
+SyntaxHighlighter.registerLanguage('tsx', tsx)
+SyntaxHighlighter.registerLanguage('typescript', typescript)
+SyntaxHighlighter.registerLanguage('yaml', yaml)
+
+// Our EXTENSION_LANGUAGE tag -> the Prism grammar name it's registered under
+// above (mostly identical; a few Prism names differ from our tags).
+const PRISM_LANGUAGE: Record<string, string> = {
+  rust: 'rust',
+  typescript: 'typescript',
+  javascript: 'javascript',
+  python: 'python',
+  json: 'json',
+  yaml: 'yaml',
+  toml: 'toml',
+  shell: 'bash',
+  html: 'markup',
+  css: 'css',
+  go: 'go',
+  ruby: 'ruby',
+  c: 'c',
+  cpp: 'cpp',
+}
 
 // Extension -> language tag, a client-side copy of core::files::language_of's
 // table (arch.md §4 / src/core/files.rs). The TREE endpoint carries no
@@ -131,10 +192,44 @@ function ContentPane({
       </p>
       {data.is_binary ? (
         <p className="muted">Binary file — cannot display.</p>
+      ) : data.language === 'markdown' ? (
+        <div className="files-markdown-body">
+          <Markdown text={data.content} />
+        </div>
       ) : (
-        <pre className="files-content-text">{data.content}</pre>
+        <FileCode content={data.content} language={data.language} />
       )}
     </div>
+  )
+}
+
+/** Non-markdown file content: Prism-highlighted for a recognized language,
+ * plain monospace text otherwise (unknown extension or a language our
+ * highlighter build doesn't carry a grammar for). */
+function FileCode({
+  content,
+  language,
+}: {
+  content: string
+  language: string | null
+}) {
+  const prismLanguage = PRISM_LANGUAGE[language ?? '']
+  if (prismLanguage === undefined) {
+    return <pre className="files-content-text">{content}</pre>
+  }
+  return (
+    <SyntaxHighlighter
+      language={prismLanguage}
+      style={vscDarkPlus}
+      customStyle={{
+        margin: 0,
+        padding: 0,
+        background: 'transparent',
+      }}
+      codeTagProps={{ className: 'files-content-text' }}
+    >
+      {content}
+    </SyntaxHighlighter>
   )
 }
 

@@ -261,18 +261,31 @@ contents — same `local_path`-anchored, read-only posture as the Git tab
   right-hand content pane, registered like the Git/Agents/Storyboards tabs (a
   boolean `files` route prop threaded `App.tsx` → `ProjectTasksPage.tsx`'s tab
   bar + content switch). Read-only: no edit/save/delete control anywhere in
-  the tab. Color coding is extension/language-derived, not a syntax
-  highlighter (per spec 277's design decision): tree rows derive their tint
-  client-side from `FileTreeEntry.name`'s extension via a local copy of
-  `files.rs`'s extension→language table (the tree endpoint carries no
-  `language` field, by design — see the API section above); the content pane
-  uses `FileContentView.language` verbatim for its header tint. Both map onto
-  the same five `--cyan`/`--magenta`/`--amber`/`--green`/`--red` accent
-  classes (`.files-accent-*`), grouped by rough language category since the
-  theme has far fewer hues than languages. A binary file renders "Binary file
-  — cannot display" instead of raw content; the no-`local_path` and
-  dead-folder empty-state rungs render the same quiet-placeholder pattern as
-  the Git tab, never a hard error.
+  the tab. Tree-row and content-header tinting is still extension/language-derived:
+  tree rows derive their tint client-side from `FileTreeEntry.name`'s
+  extension via a local copy of `files.rs`'s extension→language table (the
+  tree endpoint carries no `language` field, by design — see the API section
+  above); the content pane uses `FileContentView.language` verbatim for its
+  header tint. Both map onto the same five
+  `--cyan`/`--magenta`/`--amber`/`--green`/`--red` accent classes
+  (`.files-accent-*`), grouped by rough language category since the theme has
+  far fewer hues than languages.
+  Spec 277 originally shipped this tab with dependency-free color-by-extension
+  only (no tokenizing highlighter); task 281 revisited that call and added
+  real syntax highlighting via `react-syntax-highlighter`'s `PrismLight`
+  build (`frontend/src/pages/FilesView.tsx`), registered for the same ~15
+  languages `EXTENSION_LANGUAGE` recognizes — the sync "light" Prism build was
+  chosen over the async build specifically because the async build's
+  per-language dynamic-import fallback pulls Prism's entire ~290-language
+  catalog into the bundle even when only a handful are ever registered; an
+  unrecognized language falls back to plain monospace `<pre>` text, matching
+  the pre-281 behavior. `.md` files render as formatted markdown via the
+  existing `Markdown` component (`frontend/src/components/Markdown.tsx`,
+  already used for storyboard frame cards) instead of raw/highlighted text —
+  safe against untrusted content the same way (no raw HTML passthrough). A
+  binary file still renders "Binary file — cannot display" instead of raw
+  content; the no-`local_path` and dead-folder empty-state rungs render the
+  same quiet-placeholder pattern as the Git tab, never a hard error.
 
 ### Storyboards (freeform visual canvas)
 

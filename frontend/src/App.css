@@ -1966,12 +1966,44 @@ main {
 }
 
 /* Untrusted file content: <pre> keeps it verbatim (no wrapping — the pane
-   scrolls both ways), same precedent as .git-diff-text. */
+   scrolls both ways), same precedent as .git-diff-text. Applied to a plain
+   <pre> for unhighlighted files and to PrismLight's <code> for highlighted
+   ones (task 281) — the global `code {}` inline-chip style (background/
+   border/padding, meant for short prose snippets) must be reset here or an
+   inline <code> spanning wrapped lines renders each line fragment boxed. */
 .files-content-text {
   margin: 0;
   font-family: var(--font-mono);
   font-size: 0.8rem;
   line-height: 1.4;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+/* Rendered markdown in the Files content pane (task 281) — same react-markdown
+   output as .frame-body, but normal prose measure/spacing instead of the
+   card's tight layout; code spans/blocks stay monospace. */
+.files-markdown-body {
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.files-markdown-body :where(h1, h2, h3, h4, h5, h6) {
+  margin: 1rem 0 0.4rem;
+}
+.files-markdown-body :where(p, ul, ol, blockquote) {
+  margin: 0.5rem 0;
+}
+.files-markdown-body :where(code) {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.files-markdown-body :where(pre) {
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+.files-markdown-body :where(a) {
+  color: var(--cyan);
 }
 
 .files-accent-cyan {

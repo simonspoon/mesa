@@ -61,6 +61,13 @@ struct AppState {
     /// the key: they can't see a cross-process ingest, and a deleted
     /// transcript must keep serving the history-inclusive view.
     cc_cache: Arc<Mutex<HashMap<String, (i64, CcDashboard)>>>,
+    /// Per-project CC Dashboard cache (its own map, not `cc_cache`), keyed by
+    /// `(project_id, window)` so it can never collide with or be invalidated
+    /// independently of the global dashboard's cache. Same stamp-gated
+    /// staleness check as `cc_cache` — `Store::cc_stamp()` is a global
+    /// counter, so any ingest anywhere conservatively invalidates every
+    /// project's cached entry too.
+    project_cc_cache: Arc<Mutex<HashMap<(i64, String), (i64, CcDashboard)>>>,
     /// Live subscription-usage cache: `(fetched_unix, data)`. The UI polls this,
     /// but each fetch hits Anthropic's usage endpoint, so a short TTL throttles
     /// outbound calls. Read-only live data — not the mesa store. Concurrent
@@ -122,6 +129,7 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         port,
         lan,
         cc_cache: Arc::new(Mutex::new(HashMap::new())),
+        project_cc_cache: Arc::new(Mutex::new(HashMap::new())),
         usage_cache: Arc::new(Mutex::new(None)),
         usage_lock: Arc::new(tokio::sync::Mutex::new(())),
         usage_refreshing: Arc::new(AtomicBool::new(false)),
@@ -248,6 +256,12 @@ fn router(state: AppState) -> Router {
         .route("/api/cc", get(get_cc_dashboard))
         // Live sessions: cheap, frequently-polled slice of the telemetry.
         .route("/api/cc/live", get(get_cc_live))
+        // Project-scoped CC Dashboard: same telemetry, filtered to sessions
+        // whose cwd matches this project's local_path. Reads the store only
+        // for the project's local_path (like the git tab), so the standard
+        // guard only — no agent access gate, Content-Type gate doesn't apply
+        // (read-only GET).
+        .route("/api/projects/{id}/cc", get(get_project_cc_dashboard))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -2014,6 +2028,58 @@ async fn get_cc_dashboard(
             cache.clear();
         }
         cache.insert(window, (stamp, dash.clone()));
+    }
+    Ok(Json(dash).into_response())
+}
+
+/// Project-scoped CC Dashboard: same `CcDashboard` shape as `get_cc_dashboard`,
+/// filtered to sessions whose `cwd` matches this project's `local_path`
+/// (`cc::collect_for_project`). Mirrors `project_git_view`'s precedent of
+/// resolving the project first, so an unknown id surfaces `not_found` before
+/// any sync/collect work — but only a 2-rung empty-state ladder is needed
+/// here (unlike the git tab's 3), since this never touches the filesystem:
+/// no `local_path`, or one that matches zero sessions, both fall out of
+/// `collect_for_project` as an ordinary zero-valued dashboard, never an
+/// error.
+async fn get_project_cc_dashboard(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<CcQuery>,
+) -> ApiResult<Response> {
+    let window = q.window.unwrap_or_else(|| "30d".to_string());
+    let local_path = {
+        let store = state.store.lock().unwrap();
+        store.get_project(id)?.local_path // unknown id -> not_found here
+    };
+    let stamp = {
+        let mut store = state.store.lock().unwrap();
+        crate::core::cc::sync(&mut store)?;
+        store.cc_stamp()?
+    };
+    let key = (id, window.clone());
+    {
+        let cache = state.project_cc_cache.lock().unwrap();
+        if let Some((cached, dash)) = cache.get(&key)
+            && *cached == stamp
+        {
+            return Ok(Json(dash.clone()).into_response());
+        }
+    }
+    let mut dash = {
+        let store = state.store.lock().unwrap();
+        crate::core::cc::collect_for_project(&store, &window, local_path.as_deref())?
+    };
+    dash.sessions.truncate(crate::core::cc::MAX_SESSION_ROWS);
+    {
+        let mut cache = state.project_cc_cache.lock().unwrap();
+        // `window` is arbitrary caller input and `id` ranges over every
+        // project; cap the distinct-key count (sized up from cc_cache's 16
+        // for the added project_id dimension) so the cache can't grow
+        // without bound.
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, (stamp, dash.clone()));
     }
     Ok(Json(dash).into_response())
 }

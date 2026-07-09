@@ -16,7 +16,7 @@ BIN=${BIN:-target/release/mesa}
 [ -x "$BIN" ] || { echo "FAIL: build mesa first (scripts/build.sh or cargo build)" >&2; exit 1; }
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
 
 # Synthetic tree: one session "a" whose main transcript carries a usage event
 # with a tool_use block, plus a subagent transcript (same sessionId, agentId)
@@ -170,5 +170,85 @@ assert len(s["spark"])==15, len(s["spark"])
 assert sum(s["spark"])==150, s["spark"]
 print("live (active) ok")
 ' || fail "live active shape"
+
+
+# ---- Project-scoped CC Dashboard: GET /api/projects/{id}/cc (mesa task 273) ----
+# A fresh project + real directory (local_path canonicalizes via
+# std::fs::canonicalize, so it must actually exist) with its own synthetic
+# session, added and checked only now, after every prior assertion above, so
+# it can't perturb the whole-dashboard counts already checked.
+
+SCOPED_DIR="$TMP/scoped-repo"
+mkdir -p "$SCOPED_DIR"
+SCOPED_PATH=$(cd "$SCOPED_DIR" && pwd -P)
+
+mkdir -p "$TMP/tree/-scoped-project"
+cat > "$TMP/tree/-scoped-project/scoped.jsonl" <<JSONL
+{"type":"assistant","uuid":"u4","sessionId":"scoped1","timestamp":"2026-06-17T01:00:00.000Z","cwd":"$SCOPED_PATH","message":{"model":"claude-opus-4-8","usage":{"input_tokens":500,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+JSONL
+
+SCOPED_ID=$("$BIN" project create "Scoped proj" --no-git | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+"$BIN" project update "$SCOPED_ID" --path "$SCOPED_PATH" >/dev/null
+
+NOLOC_ID=$("$BIN" project create "No local_path proj" --no-git | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+
+EMPTY_DIR="$TMP/empty-repo"; mkdir -p "$EMPTY_DIR"
+EMPTY_PATH=$(cd "$EMPTY_DIR" && pwd -P)
+MISMATCH_ID=$("$BIN" project create "Mismatched proj" --no-git | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+"$BIN" project update "$MISMATCH_ID" --path "$EMPTY_PATH" >/dev/null
+
+PORT=17773
+"$BIN" serve --port "$PORT" >/dev/null 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null || fail "server did not start"
+
+# a project whose local_path matches the synthetic session's cwd: scoped to
+# only that session, not the whole dashboard's other sessions.
+curl -sf "http://127.0.0.1:$PORT/api/projects/$SCOPED_ID/cc?window=all" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+o=d["overview"]
+assert o["sessions"]==1, o
+assert o["messages"]==1, o
+assert o["total_tokens"]==550, o
+assert len(d["sessions"])==1 and d["sessions"][0]["session_id"]=="scoped1", d["sessions"]
+print("project cc: scoped to matching session ok")
+' || fail "project cc dashboard was not scoped to the matching session"
+
+# no local_path at all: a defined zero-valued dashboard, not an error.
+curl -sf "http://127.0.0.1:$PORT/api/projects/$NOLOC_ID/cc?window=all" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+o=d["overview"]
+assert o["sessions"]==0 and o["messages"]==0 and o["total_tokens"]==0, o
+assert d["sessions"]==[] and d["models"]==[] and d["skills"]==[] and d["agents"]==[] and d["tools"]==[], d
+print("project cc: no local_path -> empty dashboard ok")
+' || fail "project cc dashboard without local_path was not an empty dashboard"
+
+# local_path set but matching zero sessions: same empty shape, still no error.
+curl -sf "http://127.0.0.1:$PORT/api/projects/$MISMATCH_ID/cc?window=all" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["overview"]["sessions"]==0, d["overview"]
+print("project cc: local_path with no matching sessions -> empty dashboard ok")
+' || fail "project cc dashboard with an unmatched local_path was not empty"
+
+# unknown project id: 404 not_found, never a crash/500.
+STATUS=$(curl -s -o "$TMP/cc-body" -w '%{http_code}' "http://127.0.0.1:$PORT/api/projects/999999999/cc")
+[ "$STATUS" = "404" ] || fail "project cc: unknown project id expected 404, got $STATUS ($(cat "$TMP/cc-body"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/cc-body"))
+assert d["error"]["code"]=="not_found", d
+' || fail "project cc: unknown project id did not return error.code=not_found"
+echo "project cc: unknown project id -> 404 not_found ok"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+unset SERVER_PID
 
 echo "ok: cc-check passed"

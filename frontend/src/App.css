@@ -2022,6 +2022,24 @@ main {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+/* Frontmatter reuses FileCode (.files-content-text), sized/wrapped for the
+   whole-file code view (task 281). Here it sits inside markdown prose, so
+   match .files-markdown-body's font-size and wrap long lines instead of
+   scrolling — a metadata panel, not a code block. PrismLight sets
+   white-space/overflow as an inline style on BOTH its <pre> and the nested
+   <code>, which beats any class-selector rule regardless of specificity, so
+   those need !important on both elements; font-size doesn't (no competing
+   inline style there). */
+.files-frontmatter .files-content-text {
+  font-size: 0.9rem;
+  white-space: pre-wrap !important;
+  word-break: break-word;
+}
+.files-frontmatter pre {
+  overflow: visible !important;
+  white-space: pre-wrap !important;
+  word-break: break-word;
+}
 
 .files-accent-cyan {
   color: var(--cyan);

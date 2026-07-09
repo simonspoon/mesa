@@ -266,6 +266,43 @@ const LIVE_BUCKET_SECS: i64 = 60;
 /// transcript lines in. Returns **all** session rows (newest first); callers
 /// that need a bounded payload cap `sessions` themselves ([`MAX_SESSION_ROWS`]).
 pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
+    collect_inner(store, window, None)
+}
+
+/// Project-scoped variant of [`collect`]: aggregation is restricted to
+/// sessions whose `cc_sessions.cwd` exactly equals `local_path` (no
+/// prefix/subdirectory matching — see `.scratch/arch.md`). `local_path: None`
+/// (the project has no `local_path` recorded) returns a zero-valued dashboard
+/// directly, without falling through to `collect_inner(store, window, None)`
+/// — that `None` means "unfiltered" there and would silently return the
+/// *global* dashboard instead.
+pub fn collect_for_project(
+    store: &Store,
+    window: &str,
+    local_path: Option<&str>,
+) -> Result<CcDashboard> {
+    let Some(local_path) = local_path else {
+        return Ok(empty_dashboard(window));
+    };
+    collect_inner(store, window, Some(local_path))
+}
+
+/// Zero-valued dashboard for `window`, built by running the same cutoff/now
+/// computation `collect` uses over an empty [`Agg`] — guarantees the
+/// zero-state has exactly the same shape (overview zeros, empty vecs, correct
+/// `window`/`since`/`generated_at_unix`) as a real dashboard that happens to
+/// match nothing, with no hand-maintained "empty CcDashboard" literal to
+/// drift out of sync.
+fn empty_dashboard(window: &str) -> CcDashboard {
+    let now = now_unix();
+    let cutoff = window_days(window).map(|d| (now - d * 86_400).div_euclid(86_400) * 86_400);
+    Agg::default().finish(window, cutoff, now)
+}
+
+/// Shared body of [`collect`] and [`collect_for_project`]. `cwd_filter: None`
+/// is unfiltered (the global dashboard); `Some(path)` restricts every
+/// aggregation loop to sessions whose `cwd` exactly equals `path`.
+fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Result<CcDashboard> {
     let now = now_unix();
     // Floor the cutoff to UTC midnight so `since` (a date) is genuinely the
     // inclusive first day of the window — otherwise the boundary day would be
@@ -280,7 +317,14 @@ pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
     // Sessions first: they carry the span and the metadata (cwd/branch/…)
     // every other rollup keys off. A session is in-window iff its span reaches
     // the cutoff (`end_ts >= cutoff` — an in-window message implies this).
+    // The filter guard here is also how the allow-list forms for the loops
+    // below: a filtered-out session's id is simply never inserted into
+    // `agg.sessions`, so the messages/tool_calls loops can key off its
+    // presence there instead of maintaining a separate set.
     for rec in store.cc_read_sessions(cutoff)? {
+        if cwd_filter.is_some_and(|f| rec.cwd.as_deref() != Some(f)) {
+            continue;
+        }
         let s = agg.sessions.entry(rec.session_id).or_default();
         s.cwd = rec.cwd;
         s.git_branch = rec.git_branch;
@@ -308,16 +352,21 @@ pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
         };
         let cost = estimate_cost(&m.model, &usage);
         // The message's session is always present above (its ts bounds the
-        // session span), so this entry only fills in against a corrupt db.
-        // Projects group by the *session's* keep-first cwd.
-        let cwd = {
-            let s = agg.sessions.entry(m.session_id.clone()).or_default();
-            s.models.insert(m.model.clone());
-            s.messages += 1;
-            s.tokens.add(&usage);
-            s.cost += cost;
-            s.cwd.clone()
+        // session span) unless the sessions loop filtered it out for cwd —
+        // so a missing session here means either a corrupt db (unfiltered
+        // path, not a real path today) or a filtered-out session
+        // (project-scoped path). Either way, drop the whole message rather
+        // than defaulting a blank session in, so a filtered-out session
+        // never re-enters aggregation via the messages loop. Projects group
+        // by the *session's* keep-first cwd.
+        let Some(s) = agg.sessions.get_mut(&m.session_id) else {
+            continue;
         };
+        s.models.insert(m.model.clone());
+        s.messages += 1;
+        s.tokens.add(&usage);
+        s.cost += cost;
+        let cwd = s.cwd.clone();
 
         let d = agg.days.entry(fmt_date(m.ts)).or_default();
         d.sessions.insert(m.session_id.clone());
@@ -356,6 +405,9 @@ pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
     }
 
     for t in store.cc_read_tool_calls(cutoff)? {
+        if cwd_filter.is_some() && !agg.sessions.contains_key(&t.session_id) {
+            continue;
+        }
         let g = agg.tools.entry((t.name, t.caller)).or_default();
         g.calls += 1;
         g.sessions.insert(t.session_id.clone());
@@ -1251,6 +1303,96 @@ mod tests {
         assert_eq!(row.agent_runs, 0); // no agentId lines in this transcript
         assert_eq!(row.start, "2026-06-15T01:00:00Z");
         assert_eq!(row.end, "2026-06-15T01:10:00Z");
+    }
+
+    #[test]
+    fn collect_for_project_filters_all_three_loops_by_cwd() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-some-project");
+        fs::create_dir_all(&proj).unwrap();
+        // Two sessions in one transcript file, distinguished only by cwd:
+        // s1 (the project we'll scope to) has a skill-attributed message and
+        // a Bash tool call; s2 (a different project's session) has an
+        // agent-attributed message and a Read tool call. If the filter leaks
+        // anywhere, s2's data will surface in the scoped dashboard.
+        write_jsonl(
+            &proj,
+            "sess.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/work/widget","gitBranch":"main","attributionSkill":"build","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","caller":{"type":"direct"}}],"usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"assistant","uuid":"u2","sessionId":"s2","timestamp":"2026-06-15T02:00:00.000Z","cwd":"/home/me/work/other","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"tu2","name":"Read","caller":{"type":"direct"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        // Sanity: the unscoped dashboard sees both sessions.
+        let global = collect(&store, "all").unwrap();
+        assert_eq!(global.overview.sessions, 2);
+        assert_eq!(global.overview.messages, 2);
+
+        // Scoped to s1's cwd: only s1 contributes, across every rollup.
+        let scoped = collect_for_project(&store, "all", Some("/home/me/work/widget")).unwrap();
+        assert_eq!(scoped.overview.sessions, 1);
+        assert_eq!(scoped.overview.messages, 1);
+        assert_eq!(scoped.overview.tokens.input, 100);
+        assert_eq!(scoped.overview.tokens.output, 200);
+        assert_eq!(scoped.sessions.len(), 1);
+        assert_eq!(scoped.sessions[0].session_id, "s1");
+        // models/skills/agents/tools breakdowns: only s1's data is present.
+        assert_eq!(scoped.models.len(), 1);
+        assert_eq!(scoped.models[0].model, "claude-opus-4-8");
+        assert_eq!(scoped.skills.len(), 1);
+        assert_eq!(scoped.skills[0].skill, "build");
+        assert!(scoped.agents.is_empty()); // s2's "Explore" must not leak in
+        assert_eq!(scoped.tools.len(), 1);
+        assert_eq!(scoped.tools[0].name, "Bash");
+        assert_eq!(scoped.tools[0].calls, 1);
+        // daily series: only s1's day/message counts into 2026-06-15.
+        assert_eq!(scoped.daily.len(), 1);
+        assert_eq!(scoped.daily[0].messages, 1);
+        // project breakdown: only s1's cwd appears.
+        assert_eq!(scoped.projects.len(), 1);
+        assert_eq!(scoped.projects[0].path, "/home/me/work/widget");
+
+        // Scoped to s2's cwd: symmetric check, only s2 contributes.
+        let scoped2 = collect_for_project(&store, "all", Some("/home/me/work/other")).unwrap();
+        assert_eq!(scoped2.overview.sessions, 1);
+        assert_eq!(scoped2.sessions[0].session_id, "s2");
+        assert_eq!(scoped2.tools.len(), 1);
+        assert_eq!(scoped2.tools[0].name, "Read");
+        assert!(scoped2.skills.is_empty());
+        assert_eq!(scoped2.agents.len(), 1);
+        assert_eq!(scoped2.agents[0].agent, "Explore");
+
+        // A project with no local_path (None) short-circuits to a zero-valued
+        // dashboard — not the global one — with the same shape a real
+        // dashboard would have for this window.
+        let unset = collect_for_project(&store, "all", None).unwrap();
+        assert_eq!(unset.overview.sessions, 0);
+        assert_eq!(unset.overview.messages, 0);
+        assert!(unset.sessions.is_empty());
+        assert!(unset.models.is_empty());
+        assert!(unset.skills.is_empty());
+        assert!(unset.agents.is_empty());
+        assert!(unset.tools.is_empty());
+        assert!(unset.daily.is_empty());
+        assert_eq!(unset.window, "all");
+        assert!(unset.since.is_none());
+
+        // A local_path that matches no session's cwd is likewise a
+        // zero-valued dashboard, not an error.
+        let no_match = collect_for_project(&store, "all", Some("/nope")).unwrap();
+        assert_eq!(no_match.overview.sessions, 0);
+        assert!(no_match.sessions.is_empty());
     }
 
     #[test]

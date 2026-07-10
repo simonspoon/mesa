@@ -39,6 +39,7 @@ import { Markdown } from './components/Markdown'
 import { layoutFrames, type LayoutDirection } from './layout'
 import type { Frame } from './types/Frame'
 import type { StoryboardView } from './types/StoryboardView'
+import type { Waypoint } from './types/Waypoint'
 
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 3
@@ -54,6 +55,7 @@ type FrameNodeType = Node<{ frame: Frame; selected: boolean }, 'frame'>
 type FrameEdgeType = Edge<
   {
     label: string | null
+    waypoints: Waypoint[]
     onSaveLabel: (next: string) => Promise<void>
     onDelete: () => void
   },
@@ -152,6 +154,49 @@ function nearestAnchor(r: Rect, toward: Point): Anchor {
 }
 
 /**
+ * Builds the drawn path for an edge, threading through 0..N stored waypoints
+ * in order (index 0 nearest `from`, the last nearest `to`). `anchors` is the
+ * full ordered point list actually used to draw the route — `[start,
+ * ...waypoints, end]` in absolute canvas coordinates — the seam the next
+ * story's drag handles / click-to-insert hit-testing builds on.
+ *
+ * Empty case: byte-identical to the original plain-bezier rendering — both
+ * endpoint anchors snap toward the *other* frame's centre and a single
+ * `getBezierPath` call draws the curve.
+ *
+ * Non-empty case: the start anchor snaps toward the first waypoint and the
+ * end anchor toward the last one, and the route is a poly-line through every
+ * anchor in order.
+ */
+function buildRoutedPath(
+  from: Rect,
+  to: Rect,
+  waypoints: Point[],
+): { path: string; anchors: Point[] } {
+  if (waypoints.length === 0) {
+    const start = nearestAnchor(from, { x: cx(to), y: cy(to) })
+    const end = nearestAnchor(to, { x: cx(from), y: cy(from) })
+    const [path] = getBezierPath({
+      sourceX: start.x,
+      sourceY: start.y,
+      sourcePosition: start.position,
+      targetX: end.x,
+      targetY: end.y,
+      targetPosition: end.position,
+    })
+    return { path, anchors: [start, end] }
+  }
+
+  const start = nearestAnchor(from, waypoints[0])
+  const end = nearestAnchor(to, waypoints[waypoints.length - 1])
+  const anchors: Point[] = [start, ...waypoints, end]
+  const path = anchors
+    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`)
+    .join(' ')
+  return { path, anchors }
+}
+
+/**
  * A "floating" edge drawn anchor-to-anchor: each endpoint snaps to whichever
  * of the two frames' four side dots is nearest the other frame's centre
  * (positions + sizes measured by React Flow), ignoring which handle the
@@ -177,16 +222,9 @@ function FrameEdgeView({
   })
   const from = rect(sourceNode)
   const to = rect(targetNode)
-  const start = nearestAnchor(from, { x: cx(to), y: cy(to) })
-  const end = nearestAnchor(to, { x: cx(from), y: cy(from) })
-  const [path] = getBezierPath({
-    sourceX: start.x,
-    sourceY: start.y,
-    sourcePosition: start.position,
-    targetX: end.x,
-    targetY: end.y,
-    targetPosition: end.position,
-  })
+  const { path, anchors } = buildRoutedPath(from, to, data.waypoints)
+  const start = anchors[0]
+  const end = anchors[anchors.length - 1]
   const isEmpty = !(data.label && data.label.trim())
   return (
     <>
@@ -318,6 +356,7 @@ export function StoryboardCanvas({
         type: 'frame' as const,
         data: {
           label: e.label,
+          waypoints: e.waypoints,
           onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
           onDelete: () => removeEdge(e.id),
         },

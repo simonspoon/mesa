@@ -16,6 +16,7 @@ import {
   useConnection,
   useInternalNode,
   useNodesState,
+  useReactFlow,
   type Connection,
   type Edge,
   type EdgeProps,
@@ -58,6 +59,7 @@ type FrameEdgeType = Edge<
     waypoints: Waypoint[]
     onSaveLabel: (next: string) => Promise<void>
     onDelete: () => void
+    onSaveWaypoints: (next: Waypoint[]) => Promise<void>
   },
   'frame'
 >
@@ -196,6 +198,21 @@ function buildRoutedPath(
   return { path, anchors }
 }
 
+/** Squared distance from `p` to the segment `a`-`b` — used to find which
+ *  segment of a routed connector a click landed nearest, to decide where in
+ *  the waypoint list a newly-inserted point belongs. Squared (no sqrt) since
+ *  only relative comparison is needed. */
+function distToSegmentSq(p: Point, a: Point, b: Point): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const lenSq = dx * dx + dy * dy
+  let t = lenSq === 0 ? 0 : ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq
+  t = Math.max(0, Math.min(1, t))
+  const cx2 = a.x + t * dx
+  const cy2 = a.y + t * dy
+  return (p.x - cx2) ** 2 + (p.y - cy2) ** 2
+}
+
 /**
  * A "floating" edge drawn anchor-to-anchor: each endpoint snaps to whichever
  * of the two frames' four side dots is nearest the other frame's centre
@@ -213,6 +230,27 @@ function FrameEdgeView({
 }: EdgeProps<FrameEdgeType>) {
   const sourceNode = useInternalNode(source)
   const targetNode = useInternalNode(target)
+  const { screenToFlowPosition } = useReactFlow()
+  // Local optimistic override of the waypoint list: live while dragging (so
+  // the connector follows the pointer before the PATCH round-trips) and also
+  // set immediately on insert/remove so the change is "visible immediately"
+  // (req. 3), mirroring nodes' own local drag state (`onNodeDragStop`'s
+  // pattern via `useNodesState`) — edges otherwise derive straight from the
+  // server view with no local state. Cleared once the server view's own
+  // `data.waypoints` changes (the reseed), by which point it already matches.
+  const [localWaypoints, setLocalWaypoints] = useState<Waypoint[] | null>(
+    null,
+  )
+  // Reset the override the moment the server view's own `data.waypoints`
+  // reference changes (the reseed) — a render-time adjustment (React's
+  // "adjusting state when a prop changes" pattern), not an effect, since by
+  // then the override and the fresh prop already agree on the value.
+  const [seenWaypoints, setSeenWaypoints] = useState(data?.waypoints)
+  if (data && data.waypoints !== seenWaypoints) {
+    setSeenWaypoints(data.waypoints)
+    setLocalWaypoints(null)
+  }
+
   if (!sourceNode || !targetNode || !data) return null
   const rect = (n: typeof sourceNode): Rect => ({
     x: n.internals.positionAbsolute.x,
@@ -222,13 +260,84 @@ function FrameEdgeView({
   })
   const from = rect(sourceNode)
   const to = rect(targetNode)
-  const { path, anchors } = buildRoutedPath(from, to, data.waypoints)
+  const waypoints = localWaypoints ?? data.waypoints
+  const { path, anchors } = buildRoutedPath(from, to, waypoints)
   const start = anchors[0]
   const end = anchors[anchors.length - 1]
   const isEmpty = !(data.label && data.label.trim())
+
+  const commit = (next: Waypoint[]) => {
+    setLocalWaypoints(next)
+    data.onSaveWaypoints(next).catch(() => setLocalWaypoints(null))
+  }
+
+  /** Double-click on the connector's path inserts a waypoint at the click
+   *  point, positioned in the ordered list by whichever existing segment (of
+   *  `anchors`, already computed above — never recomputed) the click landed
+   *  nearest. */
+  function insertWaypoint(e: React.MouseEvent) {
+    e.stopPropagation()
+    const p = screenToFlowPosition({ x: e.clientX, y: e.clientY })
+    const point = { x: Math.round(p.x), y: Math.round(p.y) }
+    let bestIndex = 0
+    let bestD = Infinity
+    for (let i = 0; i < anchors.length - 1; i++) {
+      const d = distToSegmentSq(point, anchors[i], anchors[i + 1])
+      if (d < bestD) {
+        bestD = d
+        bestIndex = i
+      }
+    }
+    const next = [...waypoints]
+    next.splice(bestIndex, 0, point)
+    commit(next)
+  }
+
+  /** Drags waypoint `index`: local state follows the pointer via window-level
+   *  listeners (the handle itself may leave the small hit target mid-drag),
+   *  then PATCHes the rounded final position on release — matching
+   *  `onNodeDragStop`'s local-drag-then-PATCH-then-reseed pattern. */
+  function startDrag(e: React.PointerEvent, index: number) {
+    e.stopPropagation()
+    e.preventDefault()
+    const onMove = (ev: PointerEvent) => {
+      const p = screenToFlowPosition({ x: ev.clientX, y: ev.clientY })
+      const next = waypoints.map((w, i) => (i === index ? p : w))
+      setLocalWaypoints(next)
+    }
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      const p = screenToFlowPosition({ x: ev.clientX, y: ev.clientY })
+      const rounded = { x: Math.round(p.x), y: Math.round(p.y) }
+      const next = waypoints.map((w, i) => (i === index ? rounded : w))
+      commit(next)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  /** Removes waypoint `index`, restoring the plain auto-routed bezier once
+   *  the array is empty again. */
+  function removeWaypoint(e: React.MouseEvent | React.PointerEvent, index: number) {
+    e.stopPropagation()
+    commit(waypoints.filter((_, i) => i !== index))
+  }
+
   return (
     <>
       <BaseEdge id={id} path={path} markerEnd={markerEnd} />
+      {/* Wider invisible hit target for click-to-insert — the visible path
+          (BaseEdge's `.react-flow__edge-path`) is only 2px wide, too thin to
+          reliably double-click. */}
+      <path
+        d={path}
+        fill="none"
+        stroke="transparent"
+        strokeWidth={16}
+        style={{ pointerEvents: 'stroke', cursor: 'copy' }}
+        onDoubleClick={insertWaypoint}
+      />
       <EdgeLabelRenderer>
         <div
           className={'edge-label nodrag nopan' + (isEmpty ? ' empty' : '')}
@@ -252,6 +361,18 @@ function FrameEdgeView({
             ✕
           </button>
         </div>
+        {anchors.slice(1, -1).map((w, i) => (
+          <div
+            key={i}
+            className="waypoint-handle nodrag nopan"
+            title="drag to move · double-click to remove"
+            style={{
+              transform: `translate(-50%, -50%) translate(${w.x}px, ${w.y}px)`,
+            }}
+            onPointerDown={(e) => startDrag(e, i)}
+            onDoubleClick={(e) => removeWaypoint(e, i)}
+          />
+        ))}
       </EdgeLabelRenderer>
     </>
   )
@@ -346,6 +467,24 @@ export function StoryboardCanvas({
     [author, onChanged, showError],
   )
 
+  /** Save a reordered/added/removed waypoint list. Mirrors `editEdgeLabel`
+   *  above. `FrameEdgeView` keeps its own local optimistic copy while
+   *  dragging/inserting/removing; this only persists it. */
+  const editEdgeWaypoints = useCallback(
+    (id: number, next: Waypoint[]) =>
+      updateEdge(id, { waypoints: next }, author).then(
+        () => {
+          setError(null)
+          onChanged()
+        },
+        (e) => {
+          showError(e)
+          throw e
+        },
+      ),
+    [author, onChanged, showError],
+  )
+
   // Edges derive straight from the server view — no local edge state to sync.
   const edges: FrameEdgeType[] = useMemo(
     () =>
@@ -359,10 +498,11 @@ export function StoryboardCanvas({
           waypoints: e.waypoints,
           onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
           onDelete: () => removeEdge(e.id),
+          onSaveWaypoints: (next: Waypoint[]) => editEdgeWaypoints(e.id, next),
         },
         markerEnd: { type: MarkerType.ArrowClosed, color: '#00e5ff' },
       })),
-    [view.edges, editEdgeLabel, removeEdge],
+    [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints],
   )
 
   function addFrame() {
@@ -470,6 +610,11 @@ export function StoryboardCanvas({
           onMoveEnd={onMoveEnd}
           minZoom={MIN_ZOOM}
           maxZoom={MAX_ZOOM}
+          // Double-click is now the waypoint-insert gesture on a connector
+          // path (and delete-waypoint on a handle) — React Flow's built-in
+          // double-click-to-zoom (d3-zoom, a native listener that fires ahead
+          // of React's synthetic handlers) would otherwise fight it.
+          zoomOnDoubleClick={false}
           // Deletion stays behind the explicit controls (editor panel / edge ✕),
           // never a stray keypress — matching the rest of the app.
           deleteKeyCode={null}

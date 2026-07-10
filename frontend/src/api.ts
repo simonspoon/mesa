@@ -27,6 +27,7 @@ import type { StoryboardEvent } from './types/StoryboardEvent'
 import type { StoryboardView } from './types/StoryboardView'
 import type { Task } from './types/Task'
 import type { TaskSummary } from './types/TaskSummary'
+import type { Waypoint } from './types/Waypoint'
 
 /** Error body shape shared by the API and CLI: {"error": {"code", "message"}}. */
 export class ApiError extends Error {
@@ -442,6 +443,7 @@ export function createEdge(
 
 export interface EdgePatch {
   label?: string | null
+  waypoints?: Waypoint[]
 }
 
 export function updateEdge(

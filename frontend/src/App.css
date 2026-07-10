@@ -852,6 +852,33 @@ main {
   opacity: 1;
 }
 
+/* Waypoint drag handle (#297/300): one per stored routing anchor, positioned
+   like the edge label via EdgeLabelRenderer's board-space transform. Always
+   faintly visible (unlike the label, it has no "empty" state to hide) so a
+   routed connector's handles are discoverable without hovering the exact
+   pixel of the thin connector line first. */
+.waypoint-handle {
+  position: absolute;
+  pointer-events: all;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--panel-raised);
+  border: 1px solid var(--cyan-dim);
+  cursor: grab;
+  opacity: 0.6;
+}
+
+.waypoint-handle:hover {
+  opacity: 1;
+  background: var(--cyan);
+  cursor: grab;
+}
+
+.waypoint-handle:active {
+  cursor: grabbing;
+}
+
 /* The card itself, inside a React Flow node wrapper (which owns absolute
    positioning); the connection handles are its siblings so the corner
    clip-path never swallows them. */

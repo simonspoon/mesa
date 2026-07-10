@@ -314,6 +314,34 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   `/api/frames/{id}`, `/api/edges/{id}`. Mutations attribute via an `author`
   body field (POST/PATCH) or `?author=` query (DELETE); it sets the change
   actor and never mutates an entity's own immutable `author`.
+- **Connector routing waypoints** (spec 297): `FrameEdge.waypoints` is an
+  ordered `Vec<Waypoint>` (`{x, y}`, absolute canvas coordinates — same space
+  as `Frame.x/y`, not relative to either endpoint frame), added via migration
+  index 13 on `frame_edges` (nullable `TEXT` column; NULL and `"[]"` both
+  deserialize to `vec![]`, never distinguished). Always a plain array in JSON
+  (never `null`), ordered from the `from_frame` end to the `to_frame` end.
+  `EdgePatch`/`EdgeUpdate` gain a matching `waypoints: Option<Vec<Waypoint>>`
+  field (`Store::update_edge`/API `update_edge` handler); a PATCH that changes
+  it logs a `"edge_rerouted"` storyboard event (mirrors `edge_relabeled`) in
+  the same transaction. No CLI flag for authoring waypoints — `show`/`delete`
+  round-trip the field automatically as a struct member. An edge with an empty
+  waypoint list renders byte-identical to before this feature (plain
+  `nearestAnchor`/`getBezierPath` bezier between the two frames); one or more
+  waypoints routes the path through them in order via
+  `buildRoutedPath(from, to, waypoints)` in `frontend/src/StoryboardCanvas.tsx`
+  (returns `{ path, anchors }`, `anchors` = `[start, ...waypoints, end]` in
+  absolute canvas coordinates — the seam the interactive layer builds on), with
+  the start/end anchors snapping toward the first/last waypoint instead of the
+  far frame's centre. On the canvas: double-clicking a connector's path
+  inserts a waypoint at the click point (ordered by nearest existing segment);
+  dragging a waypoint's handle (rendered at each `anchors.slice(1, -1)` point)
+  updates it live via local optimistic state and PATCHes the rounded position
+  on release, reseeding from the server view afterward — mirroring
+  `onNodeDragStop`'s local-drag-then-PATCH pattern; double-clicking a handle
+  removes it, restoring the plain bezier once the array is empty again.
+  `autoLayout()` never touches `waypoints` — it repositions frames only, so a
+  large relayout can leave a stored waypoint visually "stale" relative to its
+  frames until dragged/removed (an accepted tradeoff, not a bug).
 
 ### Inbox (global update requests)
 

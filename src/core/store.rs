@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use super::attachments;
 use super::types::{
     Attachment, Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard,
-    StoryboardEvent, StoryboardView, Task, TaskEvent,
+    StoryboardEvent, StoryboardView, Task, TaskEvent, Waypoint,
 };
 
 #[derive(Debug)]
@@ -241,6 +241,7 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_attachments_task ON attachments(task_id);
     ",
+    "ALTER TABLE frame_edges ADD COLUMN waypoints TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -299,7 +300,8 @@ const STORYBOARD_COLUMNS: &str =
     "id, project_id, title, description, author, created_at, updated_at";
 const FRAME_COLUMNS: &str =
     "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at";
-const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at";
+const EDGE_COLUMNS: &str =
+    "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
 const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at";
 
@@ -384,6 +386,12 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
 }
 
 fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
+    let waypoints_json: Option<String> = row.get(7)?;
+    let waypoints = waypoints_json
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<Vec<Waypoint>>(s).ok())
+        .unwrap_or_default();
     Ok(FrameEdge {
         id: row.get(0)?,
         storyboard_id: row.get(1)?,
@@ -392,6 +400,7 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
         label: row.get(4)?,
         author: row.get(5)?,
         created_at: row.get(6)?,
+        waypoints,
     })
 }
 
@@ -520,12 +529,16 @@ pub struct FramePatch {
     pub task_id: Option<Option<i64>>,
 }
 
-/// Fields to change on an edge; `None` means leave unchanged. Only the label is
-/// mutable — endpoints and author are fixed at creation.
+/// Fields to change on an edge; `None` means leave unchanged. Only the label
+/// and waypoints are mutable — endpoints and author are fixed at creation.
 #[derive(Debug, Default, Clone)]
 pub struct EdgePatch {
     /// `Some(None)` clears the label.
     pub label: Option<Option<String>>,
+    /// `Some(vec)` replaces the full ordered waypoint list (including
+    /// `Some(vec![])` to clear back to a straight auto-routed edge).
+    /// `None` leaves the stored waypoints untouched.
+    pub waypoints: Option<Vec<Waypoint>>,
 }
 
 /// Result of `next_task`: either the single actionable task, or — when none is
@@ -1863,25 +1876,43 @@ impl Store {
         if let Some(label) = &patch.label {
             edge.label = label.clone();
         }
+        if let Some(waypoints) = &patch.waypoints {
+            edge.waypoints = waypoints.clone();
+        }
         // No-op patch: change nothing and log nothing.
         if edge == current {
             return Ok(current);
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE frame_edges SET label = ?1 WHERE id = ?2",
-            (&edge.label, id),
-        )?;
-        insert_storyboard_event(
-            &tx,
-            edge.storyboard_id,
-            actor,
-            "edge_relabeled",
-            &format!(
-                "relabeled edge #{} \u{2192} #{}",
-                edge.from_frame, edge.to_frame
+            "UPDATE frame_edges SET label = ?1, waypoints = ?2 WHERE id = ?3",
+            (
+                &edge.label,
+                serde_json::to_string(&edge.waypoints).unwrap(),
+                id,
             ),
         )?;
+        let (action, summary) = if patch.waypoints.is_some() && edge.waypoints != current.waypoints
+        {
+            (
+                "edge_rerouted",
+                format!(
+                    "rerouted edge #{} \u{2192} #{} ({} waypoint(s))",
+                    edge.from_frame,
+                    edge.to_frame,
+                    edge.waypoints.len()
+                ),
+            )
+        } else {
+            (
+                "edge_relabeled",
+                format!(
+                    "relabeled edge #{} \u{2192} #{}",
+                    edge.from_frame, edge.to_frame
+                ),
+            )
+        };
+        insert_storyboard_event(&tx, edge.storyboard_id, actor, action, &summary)?;
         tx.commit()?;
         self.get_edge(id)
     }
@@ -3767,13 +3798,21 @@ mod tests {
                 e1.id,
                 &EdgePatch {
                     label: Some(Some("next".into())),
+                    waypoints: None,
                 },
                 Some("user"),
             )
             .unwrap();
         assert_eq!(relabelled.label.as_deref(), Some("next"));
         let cleared = store
-            .update_edge(e1.id, &EdgePatch { label: Some(None) }, None)
+            .update_edge(
+                e1.id,
+                &EdgePatch {
+                    label: Some(None),
+                    waypoints: None,
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(cleared.label, None);
 
@@ -3892,6 +3931,17 @@ mod tests {
                 e.id,
                 &EdgePatch {
                     label: Some(Some("next".into())),
+                    waypoints: None,
+                },
+                Some("user"),
+            )
+            .unwrap();
+        store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    label: None,
+                    waypoints: Some(vec![Waypoint { x: 10.0, y: 20.0 }]),
                 },
                 Some("user"),
             )
@@ -3910,6 +3960,7 @@ mod tests {
                 "frame_moved",
                 "frame_edited",
                 "edge_relabeled",
+                "edge_rerouted",
                 "edge_removed",
             ]
         );
@@ -3918,7 +3969,7 @@ mod tests {
         assert_eq!(events[1].actor.as_deref(), Some("user"));
         assert_eq!(events[2].actor, None); // frame b had no author
         assert_eq!(events[5].actor.as_deref(), Some("agent-2")); // the edit
-        assert_eq!(events[7].actor.as_deref(), Some("agent-2")); // the delete
+        assert_eq!(events[8].actor.as_deref(), Some("agent-2")); // the delete
         // summaries carry a human-readable line
         assert!(events[4].summary.contains("moved frame"));
         assert!(events[1].summary.contains("added frame 'a'"));
@@ -3992,6 +4043,7 @@ mod tests {
                 e.id,
                 &EdgePatch {
                     label: Some(Some("lbl".into())),
+                    waypoints: None,
                 },
                 Some("noop"),
             )

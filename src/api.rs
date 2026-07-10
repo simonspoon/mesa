@@ -39,7 +39,8 @@ use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry, FrameNew,
     FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, Priority,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    Status, Store, StoryboardPatch, TaskPatch, TaskSummary, agents, attachments, files, git, hooks,
+    Status, Store, StoryboardPatch, TaskPatch, TaskSummary, Waypoint, agents, attachments, files,
+    git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -954,6 +955,8 @@ struct EdgeCreate {
 struct EdgeUpdate {
     #[serde(default, deserialize_with = "double_option")]
     label: Option<Option<String>>,
+    #[serde(default)]
+    waypoints: Option<Vec<Waypoint>>,
     /// Recorded as the change author.
     #[serde(default)]
     author: Option<String>,
@@ -1097,7 +1100,10 @@ async fn update_edge(
     body: Result<Json<EdgeUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
-    let patch = EdgePatch { label: body.label };
+    let patch = EdgePatch {
+        label: body.label,
+        waypoints: body.waypoints,
+    };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_edge(id, &patch, body.author.as_deref())?).into_response())
 }

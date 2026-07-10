@@ -425,6 +425,15 @@ pub struct Frame {
     pub updated_at: String,
 }
 
+/// An absolute canvas-coordinate routing anchor on a `FrameEdge` — same
+/// coordinate space as `Frame.x/y`, not relative to either endpoint frame.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct Waypoint {
+    pub x: f64,
+    pub y: f64,
+}
+
 /// A directed connection from one frame to another on the same storyboard.
 /// Unlike task dependencies, storyboard edges may form cycles freely — a
 /// storyboard is a freeform diagram, not a dependency graph. Self-edges
@@ -444,6 +453,9 @@ pub struct FrameEdge {
     /// Free-text actor id that created the edge (an agent name or "user").
     pub author: Option<String>,
     pub created_at: String,
+    /// Ordered routing anchors from `from_frame`'s end to `to_frame`'s end.
+    /// Always a plain array — `[]` means "no waypoints", never `null`.
+    pub waypoints: Vec<Waypoint>,
 }
 
 /// The full contents of one storyboard: the board plus all of its frames and

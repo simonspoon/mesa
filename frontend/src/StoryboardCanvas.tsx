@@ -36,6 +36,7 @@ import { loadBoardView, saveBoardView } from './boardView'
 import { ConfirmDelete } from './components/ConfirmDelete'
 import { InlineEdit } from './components/InlineEdit'
 import { Markdown } from './components/Markdown'
+import { layoutFrames, type LayoutDirection } from './layout'
 import type { Frame } from './types/Frame'
 import type { StoryboardView } from './types/StoryboardView'
 
@@ -249,6 +250,10 @@ export function StoryboardCanvas({
   // Expanded mode: the canvas takes over the whole window (CSS fixes the root to
   // the viewport). Purely a view-layer toggle, never persisted on the board.
   const [expanded, setExpanded] = useState(false)
+  // Flow direction the "auto layout" button lays frames out in. A view-layer
+  // preference, not persisted — matches `expanded` above.
+  const [layoutDirection, setLayoutDirection] =
+    useState<LayoutDirection>('vertical')
 
   const showError = useCallback((e: unknown) => {
     setError(e instanceof Error ? e.message : String(e))
@@ -347,6 +352,21 @@ export function StoryboardCanvas({
     }, showError)
   }
 
+  /** Repositions every frame into ranked layers flowing in `layoutDirection`
+   *  (see layout.ts) and PATCHes each frame whose position actually moved. */
+  function autoLayout() {
+    const positions = layoutFrames(view.frames, view.edges, layoutDirection)
+    const moves = view.frames
+      .map((f) => ({ f, p: positions.get(f.id)! }))
+      .filter(({ f, p }) => f.x !== p.x || f.y !== p.y)
+    Promise.all(
+      moves.map(({ f, p }) => updateFrame(f.id, { x: p.x, y: p.y }, author)),
+    ).then(() => {
+      setError(null)
+      onChanged()
+    }, showError)
+  }
+
   function onConnect(c: Connection) {
     if (c.source === c.target) return // self-edges are rejected server-side
     createEdge(storyboardId, {
@@ -426,6 +446,19 @@ export function StoryboardCanvas({
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="canvas-controls">
             <button onClick={addFrame}>add frame</button>
+            <button onClick={autoLayout} title="Arrange frames by flow direction">
+              auto layout
+            </button>
+            <button
+              onClick={() =>
+                setLayoutDirection((d) =>
+                  d === 'vertical' ? 'horizontal' : 'vertical',
+                )
+              }
+              title="Flow direction for auto layout"
+            >
+              {layoutDirection === 'vertical' ? '↓ vertical' : '→ horizontal'}
+            </button>
             <span className="canvas-hint muted">
               drag a header to move · drag a side dot to connect · click to
               edit

@@ -24,7 +24,14 @@ header {
 .sidebar {
   flex: none;
   width: 220px;
-  min-height: calc(100vh - 3rem);
+  /* Sticky + its own scroll, decoupled from `main`'s height: with
+     align-items: stretch on .shell-body, a plain min-height let the
+     sidebar stretch to match a tall project board, pushing nav-footer's
+     "Restart server" button down past the bottom of the viewport (#295). */
+  position: sticky;
+  top: 0;
+  height: calc(100vh - 3rem);
+  overflow-y: auto;
   border-right: 1px solid var(--border);
   background: rgba(6, 10, 16, 0.6);
   padding: 1rem;

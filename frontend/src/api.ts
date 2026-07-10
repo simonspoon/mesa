@@ -521,3 +521,12 @@ export function getCcLive(minutes: number): Promise<CcLive> {
 export function getCcUsage(): Promise<CcUsage> {
   return request('/api/cc/usage')
 }
+
+/**
+ * Relaunches the server on the current mesa binary on disk. The old process
+ * exits shortly after responding, so the caller should poll for the server
+ * coming back up (see `waitForServer` in Sidebar.tsx) before reloading.
+ */
+export function restartServer(): Promise<{ restarting: boolean }> {
+  return request('/api/restart', jsonInit('POST', {}))
+}

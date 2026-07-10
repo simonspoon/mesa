@@ -233,6 +233,18 @@ header {
   min-width: 0;
 }
 
+/* Pins the restart control to the bottom of the sidebar regardless of how
+   much nav content is above it (the sidebar is a column flex container). */
+.nav-footer {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.nav-footer .confirm-delete {
+  flex-wrap: wrap;
+}
+
 main {
   flex: 1;
   min-width: 0;

@@ -1,8 +1,43 @@
 import { useEffect, useState } from 'react'
-import { createProject, getGitStatus, listInbox, listProjects, listTasks } from '../api'
+import {
+  createProject,
+  getGitStatus,
+  listInbox,
+  listProjects,
+  listTasks,
+  restartServer,
+} from '../api'
 import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
+import { ConfirmDelete } from './ConfirmDelete'
+
+/**
+ * Polls the server with a cheap existing GET until it responds, for use after
+ * `restartServer()` — the old process exits and a new one has to open the
+ * store and rebind the port before anything answers again.
+ */
+async function waitForServer(timeoutMs = 15000, intervalMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    try {
+      await listProjects()
+      return
+    } catch {
+      // Still shutting down or starting back up — keep polling.
+    }
+  }
+  throw new Error(
+    'server did not come back within 15s — check the terminal mesa is running in',
+  )
+}
+
+async function handleRestart(): Promise<void> {
+  await restartServer()
+  await waitForServer()
+  window.location.reload()
+}
 
 // CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
 // overview (charts + KPIs); these are the table views split out beneath it.
@@ -213,6 +248,13 @@ export function Sidebar({
           {createError && <p className="error">{createError}</p>}
         </>
       )}
+      <div className="nav-footer">
+        <ConfirmDelete
+          label="Restart server"
+          message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."
+          onDelete={handleRestart}
+        />
+      </div>
     </nav>
   )
 }

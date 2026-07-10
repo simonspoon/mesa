@@ -124,6 +124,15 @@ struct AppState {
     /// pattern as `git_view_cache`. File content reads are not cached (mirrors
     /// the git diff routes — on-demand, one file, cheap).
     files_tree_cache: Arc<Mutex<HashMap<String, (Instant, (Vec<FileTreeEntry>, bool))>>>,
+    /// Set by `restart_server` before it triggers graceful shutdown; `serve`
+    /// checks it right after `axum::serve` returns to decide whether to
+    /// relaunch the current binary.
+    restart_requested: Arc<AtomicBool>,
+    /// Taken (once) by `restart_server` to fire the graceful-shutdown signal
+    /// `serve` is awaiting. `None` after the first request, so a second
+    /// concurrent restart click reports "already restarting" instead of
+    /// panicking on a consumed oneshot.
+    shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -131,6 +140,8 @@ struct AppState {
 /// devices on the local network can reach it (no auth — see `serve --help`).
 pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
     let store = Store::open_default()?;
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         port,
@@ -147,6 +158,8 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         git_log_cache: Arc::new(Mutex::new(HashMap::new())),
         git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
         files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
+        restart_requested: restart_requested.clone(),
+        shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -162,9 +175,27 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
             listener,
             router(state).into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
         .await?;
-        Ok(())
-    })
+        Ok::<(), crate::core::Error>(())
+    })?;
+    // `axum::serve` only returns once the listener (and thus the port) is
+    // released — either on error (propagated above) or because
+    // `restart_server` fired the graceful-shutdown signal. Only the latter
+    // case relaunches: spawn the current binary with the same `serve` flags,
+    // then exit so the new process is free to bind the now-released port.
+    if restart_requested.load(Ordering::SeqCst) {
+        let exe = std::env::current_exe()?;
+        let mut args = vec!["serve".to_string(), "--port".to_string(), port.to_string()];
+        if lan {
+            args.push("--lan".to_string());
+        }
+        std::process::Command::new(exe).args(args).spawn()?;
+        std::process::exit(0);
+    }
+    Ok(())
 }
 
 fn router(state: AppState) -> Router {
@@ -279,6 +310,11 @@ fn router(state: AppState) -> Router {
         // guard only — no agent access gate, Content-Type gate doesn't apply
         // (read-only GET).
         .route("/api/projects/{id}/cc", get(get_project_cc_dashboard))
+        // Relaunches the server on the current `mesa` binary on disk (so a
+        // rebuilt/reinstalled binary takes effect without the user manually
+        // stopping and restarting `mesa serve`). Kills every in-flight
+        // connection on this process, so it shares the agents' access gate.
+        .route("/api/restart", post(restart_server))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -1806,6 +1842,30 @@ fn agents_unavailable(message: String) -> ApiError {
     }
 }
 
+/// Relaunches the server: gracefully shuts down `axum::serve` (so the port is
+/// released before anything rebinds it) and lets `serve` spawn a fresh
+/// process off `current_exe()` once that completes. Same access gate as the
+/// Agents endpoints — this is a strictly available-to-a-local-human action,
+/// not something a blind cross-site request should ever reach.
+///
+/// The response is written to this request's own connection before
+/// `with_graceful_shutdown` closes the listener, so the caller reliably sees
+/// `{"restarting": true}` even though the process that sent it exits shortly
+/// after. A second concurrent call (double-click) finds the oneshot already
+/// taken and just reports the same thing — restart is idempotent.
+async fn restart_server(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    state.restart_requested.store(true, Ordering::SeqCst);
+    if let Some(tx) = state.shutdown_tx.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+    Ok(Json(json!({"restarting": true})).into_response())
+}
+
 /// Lists the live Claude Code sessions running under this project's
 /// `local_path`. A project without one gets `{path: null, agents: []}` — the
 /// UI explains how to link a folder rather than erroring on every poll.
@@ -2423,6 +2483,8 @@ mod tests {
             git_log_cache: Arc::new(Mutex::new(HashMap::new())),
             git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
             files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
+            restart_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_tx: Arc::new(Mutex::new(None)),
         };
         (dir, state)
     }

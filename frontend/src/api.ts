@@ -129,6 +129,7 @@ export interface TaskCreate {
   project_id: number
   title: string
   description?: string
+  status?: Status
   priority?: Priority
   tags?: string[]
   parent_id?: number

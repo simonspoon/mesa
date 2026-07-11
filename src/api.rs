@@ -621,7 +621,7 @@ async fn create_task(
         body.parent_id,
         None,
         None,
-        body.status,
+        Some(body.status.unwrap_or(Status::Backlog)),
     )?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
 }

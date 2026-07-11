@@ -12,7 +12,7 @@ import { updateTaskStatus } from './api'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
-const COLUMNS: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
+const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
 
 function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } =

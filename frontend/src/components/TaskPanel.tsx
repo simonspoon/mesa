@@ -22,7 +22,7 @@ import { ConfirmDelete } from './ConfirmDelete'
 import { InlineEdit } from './InlineEdit'
 import { TaskRow } from './TaskRow'
 
-const STATUSES: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
+const STATUSES: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 
 function CreateSubtaskForm({
@@ -44,6 +44,9 @@ function CreateSubtaskForm({
       project_id: projectId,
       title,
       parent_id: parentId,
+      // Subtasks stay 'todo' by default — only the top-level Add Task button
+      // and INBOX triage default to 'backlog'.
+      status: 'todo',
       // Omit when empty, matching CreateTaskPanel.
       ...(description === '' ? {} : { description }),
     }).then(

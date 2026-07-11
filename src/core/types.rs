@@ -5,6 +5,7 @@ use ts_rs::TS;
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum Status {
+    Backlog,
     Todo,
     InProgress,
     Done,
@@ -14,6 +15,7 @@ pub enum Status {
 impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
+            Status::Backlog => "backlog",
             Status::Todo => "todo",
             Status::InProgress => "in_progress",
             Status::Done => "done",
@@ -23,6 +25,7 @@ impl Status {
 
     pub fn parse(s: &str) -> Option<Status> {
         match s {
+            "backlog" => Some(Status::Backlog),
             "todo" => Some(Status::Todo),
             "in_progress" => Some(Status::InProgress),
             "done" => Some(Status::Done),

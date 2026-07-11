@@ -18,7 +18,7 @@ import { StoryboardListView } from './StoryboardListView'
 
 import type { TaskSummary } from '../types/TaskSummary'
 
-const STATUSES: Status[] = ['todo', 'in_progress', 'done', 'cancelled']
+const STATUSES: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 
 // Order tasks so each subtask sits directly under its parent, indented one

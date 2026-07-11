@@ -45,7 +45,7 @@ export function InboxView() {
     )
   }
 
-  // Assigning converts the item into a todo task in the chosen project and
+  // Assigning converts the item into a backlog task in the chosen project and
   // removes it from the inbox, so we just refetch (the item drops off the list).
   function assign(id: number, value: string) {
     if (value === '') return
@@ -57,7 +57,7 @@ export function InboxView() {
       <h1>Inbox</h1>
       <p className="muted">
         Update requests agents send to the shared inbox. Assign each to a project
-        to turn it into a todo task there.
+        to turn it into a backlog task there.
       </p>
 
       <form className="create-form" onSubmit={submit}>

@@ -2010,9 +2010,9 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Routes an inbox item to a project by **converting it into a todo task**
-    /// in that project and then deleting the item — it "moves" out of the inbox
-    /// and becomes actionable work on the board. The task's title is the item's
+    /// Routes an inbox item to a project by **converting it into a backlog
+    /// task** in that project and then deleting the item — it "moves" out of
+    /// the inbox onto the board, pending triage. The task's title is the item's
     /// body (first line, truncated), its description the full body verbatim;
     /// priority defaults to medium. Returns the created `Task`. Assigning to an
     /// unknown project is a `validation` error, mirroring a task's `--project`.
@@ -2042,13 +2042,14 @@ impl Store {
         tx.execute(
             "INSERT INTO tasks \
              (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
-              created_at, updated_at) \
-             VALUES (?1, NULL, ?2, ?3, ?4, '[]', NULL, NULL, datetime('now'), datetime('now'))",
+              status, created_at, updated_at) \
+             VALUES (?1, NULL, ?2, ?3, ?4, '[]', NULL, NULL, ?5, datetime('now'), datetime('now'))",
             (
                 project_id,
                 &title,
                 description.as_deref(),
                 Priority::Medium.as_str(),
+                Status::Backlog.as_str(),
             ),
         )?;
         let task_id = tx.last_insert_rowid();
@@ -4096,7 +4097,7 @@ mod tests {
     }
 
     #[test]
-    fn assigning_an_inbox_item_converts_it_to_a_todo_task() {
+    fn assigning_an_inbox_item_converts_it_to_a_backlog_task() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
 
@@ -4107,7 +4108,7 @@ mod tests {
 
         let task = store.assign_inbox_item(item.id, p.id).unwrap();
         assert_eq!(task.project_id, p.id);
-        assert_eq!(task.status, Status::Todo);
+        assert_eq!(task.status, Status::Backlog);
         assert_eq!(task.priority, Priority::Medium);
         assert_eq!(task.title, "ship the auth fix");
         assert_eq!(

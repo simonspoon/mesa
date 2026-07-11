@@ -237,7 +237,7 @@ EXAMPLES
         /// Priority: low|medium|high
         #[arg(long, value_parser = parse_priority, default_value = "medium")]
         priority: Priority,
-        /// Initial status: todo|in_progress|done|cancelled (default todo)
+        /// Initial status: backlog|todo|in_progress|done|cancelled (default todo)
         #[arg(long, value_parser = parse_status, default_value = "todo")]
         status: Status,
         /// Comma-separated tags, e.g. --tags writing,web
@@ -274,7 +274,7 @@ EXAMPLES
         /// Only tasks in this project (id or name); flag form of [PROJECT]
         #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
-        /// Only tasks with this status: todo|in_progress|done|cancelled
+        /// Only tasks with this status: backlog|todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
         /// Only tasks carrying this tag
@@ -360,7 +360,7 @@ EXAMPLES
             conflicts_with = "description"
         )]
         description_file: Option<String>,
-        /// New status: todo|in_progress|done|cancelled
+        /// New status: backlog|todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status, group = "fields")]
         status: Option<Status>,
         /// New priority: low|medium|high
@@ -896,7 +896,8 @@ EXAMPLES
 }
 
 fn parse_status(s: &str) -> std::result::Result<Status, String> {
-    Status::parse(s).ok_or_else(|| format!("'{s}' is not one of todo|in_progress|done|cancelled"))
+    Status::parse(s)
+        .ok_or_else(|| format!("'{s}' is not one of backlog|todo|in_progress|done|cancelled"))
 }
 
 fn parse_priority(s: &str) -> std::result::Result<Priority, String> {

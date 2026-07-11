@@ -731,26 +731,40 @@ main {
 }
 
 /* Connection dots on the frame sides: hidden until the frame is hovered so
-   the canvas stays uncluttered; deliberately revealed mid-connection too. */
+   the canvas stays uncluttered; deliberately revealed mid-connection too.
+   The element itself is sized to a generous hit target (React Flow starts a
+   drag on pointerdown over this exact box) — the visible 9px dot is drawn as
+   a centered ::after so it doesn't look larger than before. */
 .storyboard .react-flow__handle {
-  width: 9px;
-  height: 9px;
-  background: var(--panel-raised);
-  border: 1px solid var(--border-bright);
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
   opacity: 0;
   transition: opacity 0.15s;
+}
+
+.storyboard .react-flow__handle::after {
+  content: '';
+  position: absolute;
+  inset: 6.5px;
+  border-radius: 50%;
+  background: var(--panel-raised);
+  border: 1px solid var(--border-bright);
 }
 
 .storyboard .react-flow__node:hover .react-flow__handle {
   opacity: 1;
 }
 
-.storyboard .react-flow__handle:hover {
+.storyboard .react-flow__handle:hover::after {
   background: var(--cyan);
 }
 
 /* Full-card drop target while a connection is in flight: invisible, but the
-   drop can land anywhere on the frame. */
+   drop can land anywhere on the frame. No dot to draw, so the ::after above
+   is switched off. */
 .storyboard .react-flow__handle.frame-drop-handle {
   inset: 0;
   transform: none;
@@ -760,6 +774,10 @@ main {
   border: none;
   background: transparent;
   opacity: 1;
+}
+
+.storyboard .react-flow__handle.frame-drop-handle::after {
+  content: none;
 }
 
 .storyboard .react-flow__controls {

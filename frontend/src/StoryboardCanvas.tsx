@@ -18,6 +18,7 @@ import {
   useNodesState,
   useReactFlow,
   type Connection,
+  type ConnectionLineComponentProps,
   type Edge,
   type EdgeProps,
   type Node,
@@ -378,6 +379,44 @@ function FrameEdgeView({
   )
 }
 
+/**
+ * Preview line while dragging a new connection from a side dot. React
+ * Flow's default picks the arrival side as a fixed opposite of whichever dot
+ * was grabbed (e.g. always "left" from a "right" handle), regardless of
+ * where the cursor actually is — dragging perpendicular to that axis makes
+ * the curve loop back on itself instead of bowing smoothly toward the
+ * cursor. This picks the arrival side from the cursor's dominant direction
+ * instead, matching how a real edge's floating anchor (`nearestAnchor`)
+ * would resolve once the drop lands on an actual frame.
+ */
+function FrameConnectionLine({
+  fromX,
+  fromY,
+  fromPosition,
+  toX,
+  toY,
+}: ConnectionLineComponentProps) {
+  const dx = toX - fromX
+  const dy = toY - fromY
+  const toPosition =
+    Math.abs(dx) >= Math.abs(dy)
+      ? dx >= 0
+        ? Position.Left
+        : Position.Right
+      : dy >= 0
+        ? Position.Top
+        : Position.Bottom
+  const [path] = getBezierPath({
+    sourceX: fromX,
+    sourceY: fromY,
+    sourcePosition: fromPosition,
+    targetX: toX,
+    targetY: toY,
+    targetPosition: toPosition,
+  })
+  return <path d={path} fill="none" className="react-flow__connection-path" />
+}
+
 const nodeTypes = { frame: FrameNode }
 const edgeTypes = { frame: FrameEdgeView }
 
@@ -606,6 +645,7 @@ export function StoryboardCanvas({
           onPaneClick={() => setSelectedId(null)}
           onConnect={onConnect}
           connectionMode={ConnectionMode.Loose}
+          connectionLineComponent={FrameConnectionLine}
           defaultViewport={defaultViewport}
           onMoveEnd={onMoveEnd}
           minZoom={MIN_ZOOM}

@@ -3392,6 +3392,66 @@ mod tests {
     }
 
     #[test]
+    fn next_task_excludes_backlog() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        store
+            .create_task(
+                p.id,
+                "shelved",
+                None,
+                Priority::High,
+                &[],
+                None,
+                None,
+                None,
+                Some(Status::Backlog),
+            )
+            .unwrap();
+        // A backlog task is never actionable, even ranked above everything by
+        // priority, and never counted in any of the None-result buckets.
+        match store.next_task(None).unwrap() {
+            NextResult::Task(_) => panic!("backlog task must not be picked as next"),
+            NextResult::None {
+                blocked,
+                in_progress,
+                todo,
+            } => {
+                assert_eq!(blocked, 0);
+                assert_eq!(in_progress, 0);
+                assert_eq!(todo, 0);
+            }
+        }
+
+        // A backlog blocker still counts as unresolved: it blocks a dependent
+        // exactly like any other non-done/cancelled status, so the dependent
+        // is skipped in favor of a plain unblocked todo.
+        let backlog_blocker = store
+            .create_task(
+                p.id,
+                "backlog_blocker",
+                None,
+                Priority::High,
+                &[],
+                None,
+                None,
+                None,
+                Some(Status::Backlog),
+            )
+            .unwrap();
+        let dependent =
+            create_with_priority(&mut store, p.id, "dependent", Priority::High);
+        store
+            .add_dependency(dependent.id, backlog_blocker.id)
+            .unwrap();
+        let plain_todo = add_task(&mut store, p.id, "plain_todo");
+        match store.next_task(None).unwrap() {
+            NextResult::Task(t) => assert_eq!(t.id, plain_todo.id),
+            NextResult::None { .. } => panic!("expected the plain todo task"),
+        }
+    }
+
+    #[test]
     fn next_task_respects_project_filter() {
         let (mut store, _dir) = temp_store();
         let p1 = store.create_project("p1", None, None, None).unwrap();

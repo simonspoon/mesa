@@ -1792,6 +1792,90 @@ main {
   overflow: hidden;
 }
 
+/* ---- Global agent sidebar: persists across every page (App.tsx), never
+   unmounted on collapse — only its width changes — so an attached terminal's
+   WebSocket survives a collapse/expand cycle with no reconnect. ---- */
+
+.agent-sidebar {
+  flex: none;
+  width: 28rem;
+  position: sticky;
+  top: 0;
+  height: calc(100vh - 3rem);
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: rgba(6, 10, 16, 0.6);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.15s;
+}
+
+.agent-sidebar.collapsed {
+  width: 2.5rem;
+}
+
+.agent-sidebar-toggle {
+  align-self: flex-start;
+  margin: 0.5rem 0.5rem 0;
+}
+
+.agent-sidebar.collapsed .agent-sidebar-toggle {
+  align-self: center;
+}
+
+/* Always in the DOM (never conditionally rendered on `collapsed`) — an
+   attached AgentTerminal keeps running underneath, unseen. `visibility`
+   (not `display`/unmount) hides it: the layout box — and the terminal's
+   fitted size inside it — stays put, so nothing needs to refit on expand,
+   and unlike relying on the parent's `overflow: hidden` alone, no sliver of
+   text can peek through the clipped edge. */
+.agent-sidebar.collapsed .agent-sidebar-body {
+  visibility: hidden;
+}
+
+.agent-sidebar-body {
+  flex: 1;
+  min-height: 0;
+  width: 28rem;
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 1rem 1rem;
+  overflow: hidden;
+}
+
+.agent-sidebar-list {
+  flex: none;
+  max-height: 45%;
+  overflow-y: auto;
+}
+
+.agent-sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.agent-sidebar-count {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--cyan);
+  border: 1px solid var(--cyan-dim);
+  padding: 0 0.4em;
+}
+
+.agent-sidebar-panel {
+  flex: 1;
+  min-height: 0;
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-bright);
+  background: var(--bg);
+  box-shadow: 0 0 12px rgba(0, 229, 255, 0.1);
+}
+
 /* ---- Git tab: changed-file list (left) + diff pane (right) ---- */
 
 .git-repo-header {
@@ -2318,6 +2402,26 @@ main {
     background: rgba(6, 10, 16, 0.97);
     border-right: 1px solid var(--border-bright);
     box-shadow: 4px 0 24px rgba(0, 0, 0, 0.6);
+  }
+
+  /* Same drawer treatment, mirrored to the right edge — it defaults to
+     collapsed (AgentSidebar.tsx), so the reopen handle stays in-flow here
+     too. */
+  .agent-sidebar:not(.collapsed) {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(24rem, 90vw);
+    height: auto;
+    z-index: 1200;
+    background: rgba(6, 10, 16, 0.97);
+    border-left: 1px solid var(--border-bright);
+    box-shadow: -4px 0 24px rgba(0, 0, 0, 0.6);
+  }
+
+  .agent-sidebar:not(.collapsed) .agent-sidebar-body {
+    width: 100%;
   }
 
   .kanban {

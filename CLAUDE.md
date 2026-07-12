@@ -413,7 +413,15 @@ and touches the mesa store only to read `local_path`. There is deliberately no
   the background session keeps running (claude's own attach/detach contract).
   Only background sessions (those with a short `id`) are attachable;
   interactive ones are listed as not-attachable.
-- **All three agent routes share one mode-dependent access gate**,
+- `GET /api/agents` → `Vec<AgentSession>` (bare array, no `path` wrapper) via
+  `claude agents --json` with **no `--cwd` filter** — every live session on
+  the machine, across every project's folder at once. Backs the global Agents
+  sidebar (below); the per-project route above is for the project-scoped
+  Agents tab. Shares `agents_cache` with the per-project route under a
+  sentinel key (`ALL_AGENTS_CACHE_KEY`, a NUL-prefixed string no real
+  `local_path` can equal) — same 2s TTL, same "collapse concurrent polls"
+  rationale, just keyed once instead of per-folder.
+- **All four agent routes share one mode-dependent access gate**,
   `require_agent_access`. Terminal access is code execution — a strictly
   stronger capability than the task CRUD the rest of the API exposes — so the
   browser-as-confused-deputy holes stay closed in BOTH modes; what differs is
@@ -460,6 +468,44 @@ and touches the mesa store only to read `local_path`. There is deliberately no
   under `--lan`. The vite dev proxy has `ws: true` for this socket.
 - Gate: `scripts/agents-check.sh` (stub `claude`, asserts the JSON contract and
   the local_path CLI plumbing). The WS bridge itself is verified by live QA.
+
+#### Global Agent sidebar
+
+A persistent, collapsible right-hand rail (`AgentSidebar`,
+`frontend/src/components/AgentSidebar.tsx`) shows every live session across
+every project — not scoped to one project's Agents tab — with room to attach
+a terminal alongside it. Rendered once in `App.tsx`, as a sibling of `<main>`
+outside the hash router, so it is never remounted by navigation; the same
+persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
+
+- Data: `listAllAgents()` (`GET /api/agents`, 3s poll) for the session list,
+  plus a plain `listProjects()` fetch (no poll) to label each session with the
+  project whose `local_path` is a prefix of its `cwd` (longest match wins for
+  nested folders) — the same relationship `claude agents --cwd` itself
+  matches on. A session under no known project's folder shows its raw `cwd`.
+- Layout: list on top (own scroll region, capped height) and an attached
+  terminal panel below (`AgentTerminal`, the same component the per-project
+  Agents tab uses) — two separate containers, so scrolling back up to the
+  list and picking a different session replaces the panel below without
+  losing the list's scroll position. The panel has a **close** button
+  (`agent-sidebar-panel`), which unmounts `AgentTerminal` and detaches (the
+  background session itself keeps running, unaffected — same contract as the
+  per-project tab's detach).
+- **Collapse never unmounts anything.** `collapsed` (default `true`) toggles
+  a CSS class on the `<aside>`; the list and any attached terminal stay
+  mounted underneath, hidden via `visibility: hidden` on the inner
+  `.agent-sidebar-body` (not `display: none` or a conditional
+  `{!collapsed && …}` render) — the layout box, xterm's fitted size, and the
+  attach WebSocket are all untouched by a collapse/expand cycle. This is the
+  feature's core guarantee: collapse the sidebar mid-session, expand it back
+  later, and the terminal is still attached with no reconnect, exactly as if
+  the tab had just been sitting in the background. `visibility` also avoids
+  the pixel-clipping trap `overflow: hidden` alone has: content narrower than
+  its own natural width but positioned inside the still-laid-out (just
+  invisible) body can't peek through the collapsed rail's clipped edge.
+- The list poll itself pauses while collapsed (`pollMs` only set when
+  expanded) — nobody can see the list, and each poll costs a `claude agents`
+  subprocess; reopening triggers an immediate one-off fetch.
 
 ### Hooks (user-configured shell commands on events)
 

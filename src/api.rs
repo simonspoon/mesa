@@ -263,13 +263,17 @@ fn router(state: AppState) -> Router {
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
         // Agents: live Claude Code sessions under a project's folder. All
-        // three routes share `require_agent_access` (terminal access = code
+        // four routes share `require_agent_access` (terminal access = code
         // execution): loopback-only in default mode, LAN-page-authenticated
         // under `--lan`.
         .route(
             "/api/projects/{id}/agents",
             get(list_project_agents).post(spawn_project_agent),
         )
+        // Global session list across every project folder — backs the
+        // persistent Agents sidebar (unlike the per-project route above,
+        // this has no `path`/empty-state wrapper: it is just the bare array).
+        .route("/api/agents", get(list_all_agents))
         .route("/api/agents/{id}/attach", get(attach_agent))
         // Sidebar decoration: working-tree git status of each project's
         // `local_path`. Read-only external state (shells `git status`).
@@ -1205,6 +1209,11 @@ struct AttachQuery {
 /// one subprocess, not to skip a lone tab's polls.
 const AGENTS_TTL: Duration = Duration::from_secs(2);
 
+/// Sentinel key the global agents list caches under in `agents_cache`
+/// (which is otherwise keyed by folder `local_path`). No real path can equal
+/// this — paths are canonicalized and never contain a NUL byte.
+const ALL_AGENTS_CACHE_KEY: &str = "\0all";
+
 /// How long one folder's git status is reused. The sidebar polls every 10s
 /// from possibly several tabs; `git status` walks the whole working tree, so
 /// unlike AGENTS_TTL this also skips a lone tab's back-to-back polls.
@@ -1939,6 +1948,39 @@ async fn list_project_agents(
         agents: sessions,
     })
     .into_response())
+}
+
+/// Lists every live Claude Code session on the machine (no folder filter) —
+/// backs the persistent Agents sidebar, which shows sessions across every
+/// project at once. Bare array response, unlike the per-project route: there
+/// is no single `local_path` to wrap it with an empty-state `path`.
+async fn list_all_agents(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    {
+        let cache = state.agents_cache.lock().unwrap();
+        if let Some((at, sessions)) = cache.get(ALL_AGENTS_CACHE_KEY)
+            && at.elapsed() < AGENTS_TTL
+        {
+            return Ok(Json(sessions.clone()).into_response());
+        }
+    }
+    let gen0 = state.agents_gen.load(Ordering::SeqCst);
+    let sessions = tokio::task::spawn_blocking(agents::list_all)
+        .await
+        .map_err(|e| agents_unavailable(format!("agents list panicked: {e}")))?
+        .map_err(agents_unavailable)?;
+    if state.agents_gen.load(Ordering::SeqCst) == gen0 {
+        let mut cache = state.agents_cache.lock().unwrap();
+        cache.insert(
+            ALL_AGENTS_CACHE_KEY.to_string(),
+            (Instant::now(), sessions.clone()),
+        );
+    }
+    Ok(Json(sessions).into_response())
 }
 
 /// Starts a new background session (`claude --bg`) in the project's folder

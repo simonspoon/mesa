@@ -98,8 +98,13 @@ cat > "$STUB_DIR/claude" <<EOF
 [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; exit 1; }
 case "\$1" in
   agents)
-    # invoked as: agents --json --cwd <dir>
-    printf '[{"pid":123,"id":"abc12345","cwd":"%s","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"}]\n' "\$4"
+    if [ "\$3" = "--cwd" ]; then
+      # invoked as: agents --json --cwd <dir>
+      printf '[{"pid":123,"id":"abc12345","cwd":"%s","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"}]\n' "\$4"
+    else
+      # invoked as: agents --json (no --cwd) — the global sidebar's call.
+      printf '[{"pid":123,"id":"abc12345","cwd":"/one/project","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"},{"pid":456,"id":"def67890","cwd":"/another/project","kind":"background","startedAt":1783000001000,"sessionId":"def67890-0000-0000-0000-000000000000","name":"other stub agent","status":"busy","state":"working"}]\n'
+    fi
     ;;
   --bg)
     echo "Starting background service…"
@@ -157,6 +162,14 @@ api 404 GET "/api/projects/99999/agents"
 [ "$(jqb .error.code)" = "not_found" ] || fail "GET agents unknown project: not_found"
 ok "GET agents on unknown project: 404 not_found"
 
+# ---- API: GET /api/agents — global list, no --cwd filter, bare array ----
+
+api 200 GET "/api/agents"
+[ "$(jqb 'length')" = "2" ] || fail "GET /api/agents: two stub sessions (no --cwd filter)"
+[ "$(jqb '.[0].cwd')" = "/one/project" ] || fail "GET /api/agents: first session cwd"
+[ "$(jqb '.[1].cwd')" = "/another/project" ] || fail "GET /api/agents: second session cwd"
+ok "GET /api/agents lists sessions across every folder (bare array, no --cwd)"
+
 # Cross-site defense: list/spawn reject a foreign browser Origin (like the
 # attach socket), while an Origin-less client (curl default) passes.
 origin_status() { # origin_status <method> <path> <origin> [body]
@@ -171,7 +184,9 @@ origin_status() { # origin_status <method> <path> <origin> [body]
   fail "POST agents foreign Origin: must be 403"
 [ "$(origin_status GET "/api/projects/$P/agents" 'http://localhost:7770')" = "200" ] ||
   fail "GET agents local Origin: must pass"
-ok "list/spawn reject foreign Origin (cross-site defense), allow local"
+[ "$(origin_status GET "/api/agents" 'https://evil.example')" = "403" ] ||
+  fail "GET /api/agents foreign Origin: must be 403"
+ok "list/spawn/global-list reject foreign Origin (cross-site defense), allow local"
 
 # A dead claude CLI is an upstream failure: 502 unavailable. Use a fresh
 # project/folder so the 2s in-memory list cache can't serve this request.

@@ -2,6 +2,7 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
+import type { AgentSession } from './types/AgentSession'
 import type { AgentSpawned } from './types/AgentSpawned'
 import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
@@ -315,6 +316,12 @@ export function getProjectFilesContent(
 /** The live Claude Code sessions under the project's folder. */
 export function getProjectAgents(id: number): Promise<ProjectAgents> {
   return request(`/api/projects/${id}/agents`)
+}
+
+/** Every live Claude Code session on the machine (no folder filter) — backs
+ * the persistent Agents sidebar. */
+export function listAllAgents(): Promise<AgentSession[]> {
+  return request('/api/agents')
 }
 
 /** Starts a background `claude --bg` session in the project's folder. */

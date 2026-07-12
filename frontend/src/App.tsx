@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 import { getTask } from './api'
+import { AgentSidebar } from './components/AgentSidebar'
 import { CommandPalette } from './components/CommandPalette'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
@@ -264,6 +265,7 @@ function App() {
           version={navVersion}
         />
         <main>{page}</main>
+        <AgentSidebar />
       </div>
       {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} />}
     </>

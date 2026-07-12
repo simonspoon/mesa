@@ -21,12 +21,23 @@ pub fn claude_bin() -> String {
 /// `claude agents --json --cwd <dir>` itself). Interactive sessions are
 /// included; only ones with a short `id` (background) are attachable.
 pub fn list_under(dir: &str) -> Result<Vec<AgentSession>, String> {
-    list_under_with(&claude_bin(), dir)
+    list_sessions(&claude_bin(), Some(dir))
 }
 
-fn list_under_with(bin: &str, dir: &str) -> Result<Vec<AgentSession>, String> {
-    let out = Command::new(bin)
-        .args(["agents", "--json", "--cwd", dir])
+/// Lists every live Claude Code session on the machine, with no folder
+/// filter — backs the global Agents sidebar, which shows sessions across
+/// every project at once instead of one project's folder.
+pub fn list_all() -> Result<Vec<AgentSession>, String> {
+    list_sessions(&claude_bin(), None)
+}
+
+fn list_sessions(bin: &str, dir: Option<&str>) -> Result<Vec<AgentSession>, String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(["agents", "--json"]);
+    if let Some(dir) = dir {
+        cmd.args(["--cwd", dir]);
+    }
+    let out = cmd
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("failed to run claude: {e}"))?;
@@ -176,7 +187,19 @@ mod tests {
     fn list_under_runs_the_binary_and_parses() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(dir.path(), r#"[ "$1" = "agents" ] || exit 1; echo '[]'"#);
-        assert_eq!(list_under_with(&bin, "/anywhere").unwrap(), vec![]);
+        assert_eq!(list_sessions(&bin, Some("/anywhere")).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn list_all_runs_without_a_cwd_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        // Asserts the argv is exactly `agents --json` — no --cwd anywhere.
+        let bin = stub_claude(
+            dir.path(),
+            r#"[ "$*" = "agents --json" ] || { echo "bad argv: $*" >&2; exit 1; }
+echo '[]'"#,
+        );
+        assert_eq!(list_sessions(&bin, None).unwrap(), vec![]);
     }
 
     #[test]
@@ -209,9 +232,9 @@ echo "prompt was: $3" >&2"#,
     fn failures_surface_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(dir.path(), r#"echo "kaboom" >&2; exit 3"#);
-        let err = list_under_with(&bin, "/anywhere").unwrap_err();
+        let err = list_sessions(&bin, Some("/anywhere")).unwrap_err();
         assert!(err.contains("kaboom"), "{err}");
-        let missing = list_under_with("/nonexistent/claude", "/anywhere").unwrap_err();
+        let missing = list_sessions("/nonexistent/claude", Some("/anywhere")).unwrap_err();
         assert!(missing.contains("failed to run claude"), "{missing}");
     }
 }

@@ -329,16 +329,23 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   `nearestAnchor`/`getBezierPath` bezier between the two frames); one or more
   waypoints routes the path through them in order via
   `buildRoutedPath(from, to, waypoints)` in `frontend/src/StoryboardCanvas.tsx`
-  (returns `{ path, anchors }`, `anchors` = `[start, ...waypoints, end]` in
-  absolute canvas coordinates — the seam the interactive layer builds on), with
-  the start/end anchors snapping toward the first/last waypoint instead of the
-  far frame's centre. On the canvas: double-clicking a connector's path
-  inserts a waypoint at the click point (ordered by nearest existing segment);
-  dragging a waypoint's handle (rendered at each `anchors.slice(1, -1)` point)
-  updates it live via local optimistic state and PATCHes the rounded position
-  on release, reseeding from the server view afterward — mirroring
-  `onNodeDragStop`'s local-drag-then-PATCH pattern; double-clicking a handle
-  removes it, restoring the plain bezier once the array is empty again.
+  (returns `{ path, anchors, mid }`, `anchors` = `[start, ...waypoints, end]`
+  in absolute canvas coordinates — the seam the interactive layer builds on),
+  with the start/end anchors snapping toward the first/last waypoint instead
+  of the far frame's centre. The routed `path` is a smooth Catmull-Rom spline
+  through `anchors` (`smoothPath`), not a straight poly-line, so a waypoint
+  bends the connector rather than kinking it at a sharp corner; `mid` is the
+  point at half the anchors' cumulative arc length (`midpointOfPolyline`),
+  used to place the edge label on the actual route instead of the straight
+  line between just the two endpoints, which drifts off to the side once a
+  waypoint bends the connector. On the canvas: double-clicking
+  a connector's path inserts a waypoint at the click point (ordered by nearest
+  existing segment); dragging a waypoint's handle (rendered at each
+  `anchors.slice(1, -1)` point) updates it live via local optimistic state and
+  PATCHes the rounded position on release, reseeding from the server view
+  afterward — mirroring `onNodeDragStop`'s local-drag-then-PATCH pattern;
+  double-clicking a handle removes it, restoring the plain bezier once the
+  array is empty again.
   `autoLayout()` never touches `waypoints` — it repositions frames only, so a
   large relayout can leave a stored waypoint visually "stale" relative to its
   frames until dragged/removed (an accepted tradeoff, not a bug).

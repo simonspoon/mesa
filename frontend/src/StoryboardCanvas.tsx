@@ -156,26 +156,81 @@ function nearestAnchor(r: Rect, toward: Point): Anchor {
   return best
 }
 
+/** Converts an ordered point list into a smooth SVG path via Catmull-Rom
+ *  splines (tension 1/6) turned into cubic beziers, so a routed connector
+ *  curves through each waypoint instead of meeting it at a sharp corner.
+ *  Falls back to a straight `L` segment when there aren't enough points to
+ *  fit a spline through. */
+function smoothPath(points: Point[]): string {
+  if (points.length < 3) {
+    return points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+  }
+  let d = `M ${points[0].x} ${points[0].y}`
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[i === 0 ? 0 : i - 1]
+    const p1 = points[i]
+    const p2 = points[i + 1]
+    const p3 = points[i + 2 < points.length ? i + 2 : points.length - 1]
+    const cp1x = p1.x + (p2.x - p0.x) / 6
+    const cp1y = p1.y + (p2.y - p0.y) / 6
+    const cp2x = p2.x - (p3.x - p1.x) / 6
+    const cp2y = p2.y - (p3.y - p1.y) / 6
+    d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`
+  }
+  return d
+}
+
+/** The point at half the total arc length along an ordered point list —
+ *  used to place an edge's label on the actual route (rather than the
+ *  straight-line midpoint of just its two endpoints, which drifts off a
+ *  bent/curved path). For a 2-point list this is exactly the segment
+ *  midpoint, matching the plain-bezier case's original behavior. */
+function midpointOfPolyline(points: Point[]): Point {
+  const segments: number[] = []
+  let total = 0
+  for (let i = 0; i < points.length - 1; i++) {
+    const dx = points[i + 1].x - points[i].x
+    const dy = points[i + 1].y - points[i].y
+    const d = Math.sqrt(dx * dx + dy * dy)
+    segments.push(d)
+    total += d
+  }
+  let remaining = total / 2
+  for (let i = 0; i < segments.length; i++) {
+    if (remaining <= segments[i] || i === segments.length - 1) {
+      const t = segments[i] === 0 ? 0 : remaining / segments[i]
+      return {
+        x: points[i].x + (points[i + 1].x - points[i].x) * t,
+        y: points[i].y + (points[i + 1].y - points[i].y) * t,
+      }
+    }
+    remaining -= segments[i]
+  }
+  return points[0]
+}
+
 /**
  * Builds the drawn path for an edge, threading through 0..N stored waypoints
  * in order (index 0 nearest `from`, the last nearest `to`). `anchors` is the
  * full ordered point list actually used to draw the route — `[start,
  * ...waypoints, end]` in absolute canvas coordinates — the seam the next
- * story's drag handles / click-to-insert hit-testing builds on.
+ * story's drag handles / click-to-insert hit-testing builds on. `mid` is
+ * where the edge label sits, always a point on (or, for the spline case,
+ * essentially on) the drawn path.
  *
  * Empty case: byte-identical to the original plain-bezier rendering — both
  * endpoint anchors snap toward the *other* frame's centre and a single
  * `getBezierPath` call draws the curve.
  *
  * Non-empty case: the start anchor snaps toward the first waypoint and the
- * end anchor toward the last one, and the route is a poly-line through every
- * anchor in order.
+ * end anchor toward the last one, and the route is a smooth spline through
+ * every anchor in order.
  */
 function buildRoutedPath(
   from: Rect,
   to: Rect,
   waypoints: Point[],
-): { path: string; anchors: Point[] } {
+): { path: string; anchors: Point[]; mid: Point } {
   if (waypoints.length === 0) {
     const start = nearestAnchor(from, { x: cx(to), y: cy(to) })
     const end = nearestAnchor(to, { x: cx(from), y: cy(from) })
@@ -187,16 +242,15 @@ function buildRoutedPath(
       targetY: end.y,
       targetPosition: end.position,
     })
-    return { path, anchors: [start, end] }
+    const anchors = [start, end]
+    return { path, anchors, mid: midpointOfPolyline(anchors) }
   }
 
   const start = nearestAnchor(from, waypoints[0])
   const end = nearestAnchor(to, waypoints[waypoints.length - 1])
   const anchors: Point[] = [start, ...waypoints, end]
-  const path = anchors
-    .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`)
-    .join(' ')
-  return { path, anchors }
+  const path = smoothPath(anchors)
+  return { path, anchors, mid: midpointOfPolyline(anchors) }
 }
 
 /** Squared distance from `p` to the segment `a`-`b` — used to find which
@@ -262,9 +316,7 @@ function FrameEdgeView({
   const from = rect(sourceNode)
   const to = rect(targetNode)
   const waypoints = localWaypoints ?? data.waypoints
-  const { path, anchors } = buildRoutedPath(from, to, waypoints)
-  const start = anchors[0]
-  const end = anchors[anchors.length - 1]
+  const { path, anchors, mid } = buildRoutedPath(from, to, waypoints)
   const isEmpty = !(data.label && data.label.trim())
 
   const commit = (next: Waypoint[]) => {
@@ -343,9 +395,7 @@ function FrameEdgeView({
         <div
           className={'edge-label nodrag nopan' + (isEmpty ? ' empty' : '')}
           style={{
-            transform: `translate(-50%, -50%) translate(${
-              (start.x + end.x) / 2
-            }px, ${(start.y + end.y) / 2}px)`,
+            transform: `translate(-50%, -50%) translate(${mid.x}px, ${mid.y}px)`,
           }}
         >
           <InlineEdit

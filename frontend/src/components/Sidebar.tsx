@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   createProject,
   getGitStatus,
+  listAllAgents,
   listInbox,
   listProjects,
   listTasks,
@@ -11,6 +12,7 @@ import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
 import { ConfirmDelete } from './ConfirmDelete'
+import { projectForCwd } from '../agentProject'
 
 /**
  * Polls the server with a cheap existing GET until it responds, for use after
@@ -120,6 +122,19 @@ export function Sidebar({
   for (const g of gitStatuses ?? []) {
     gitByProject.set(g.project_id, g.git)
   }
+  // Which projects have a live Claude Code agent session running under their
+  // local_path, for the pulsing nav dot below. Same cwd→project prefix match
+  // AgentSidebar uses to label sessions with their owning project.
+  const { data: agents } = useFetch(() => listAllAgents(), 'agents-nav', {
+    pollMs: 5000,
+  })
+  const activeAgentProjectIds = new Set<number>()
+  if (projects) {
+    for (const a of agents ?? []) {
+      const p = projectForCwd(a.cwd, projects)
+      if (p) activeAgentProjectIds.add(p.id)
+    }
+  }
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
@@ -224,6 +239,9 @@ export function Sidebar({
                     href={`#/projects/${p.id}`}
                   >
                     <span className="nav-project-name">{p.name}</span>
+                    {activeAgentProjectIds.has(p.id) && (
+                      <span className="live-dot on" title="agent running" />
+                    )}
                     {(todoCounts.get(p.id) ?? 0) > 0 && (
                       <span className="inbox-badge todo-badge">
                         {todoCounts.get(p.id)}

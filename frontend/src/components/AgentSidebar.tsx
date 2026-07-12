@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { listAllAgents, listProjects } from '../api'
+import { projectForCwd } from '../agentProject'
 import type { AgentSession } from '../types/AgentSession'
-import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
 import { AgentTerminal } from './AgentTerminal'
 
@@ -16,19 +16,6 @@ function startedAgo(ms: number): string {
   const hours = Math.floor(mins / 60)
   if (hours < 24) return `${hours}h ${mins % 60}m ago`
   return `${Math.floor(hours / 24)}d ago`
-}
-
-/** The project whose `local_path` is `cwd` or a parent of it — the same
- * prefix relationship `claude agents --cwd` itself matches on. Ties (nested
- * project folders) favor the longest/most-specific `local_path`. */
-function projectForCwd(cwd: string, projects: Project[]): Project | undefined {
-  return projects
-    .filter(
-      (p) =>
-        p.local_path !== null &&
-        (cwd === p.local_path || cwd.startsWith(p.local_path + '/')),
-    )
-    .sort((a, b) => b.local_path!.length - a.local_path!.length)[0]
 }
 
 /**

@@ -98,13 +98,11 @@ cat > "$STUB_DIR/claude" <<EOF
 [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; exit 1; }
 case "\$1" in
   agents)
-    if [ "\$3" = "--cwd" ]; then
-      # invoked as: agents --json --cwd <dir>
-      printf '[{"pid":123,"id":"abc12345","cwd":"%s","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"}]\n' "\$4"
-    else
-      # invoked as: agents --json (no --cwd) — the global sidebar's call.
-      printf '[{"pid":123,"id":"abc12345","cwd":"/one/project","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"},{"pid":456,"id":"def67890","cwd":"/another/project","kind":"background","startedAt":1783000001000,"sessionId":"def67890-0000-0000-0000-000000000000","name":"other stub agent","status":"busy","state":"working"}]\n'
-    fi
+    # mesa never passes --cwd (it fetches the unfiltered list and filters in
+    # Rust — agents::is_under, mesa task 313), so the stub always returns the
+    # same three sessions regardless of argv. One's cwd is this test repo's
+    # own toplevel, so the per-project route has something to filter down to.
+    printf '[{"pid":123,"id":"abc12345","cwd":"/one/project","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"},{"pid":456,"id":"def67890","cwd":"/another/project","kind":"background","startedAt":1783000001000,"sessionId":"def67890-0000-0000-0000-000000000000","name":"other stub agent","status":"busy","state":"working"},{"pid":789,"id":"toplvl001","cwd":"$TOPLEVEL","kind":"background","startedAt":1783000002000,"sessionId":"toplvl001-0000-0000-0000-000000000000","name":"toplevel stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"}]\n'
     ;;
   --bg)
     echo "Starting background service…"
@@ -137,9 +135,9 @@ jqb() { jq -r "$1" <<<"$BODY"; }
 
 api 200 GET "/api/projects/$P/agents"
 [ "$(jqb .path)" = "$TOPLEVEL" ] || fail "GET agents: path is the project folder"
-[ "$(jqb '.agents | length')" = "1" ] || fail "GET agents: one stub session"
-[ "$(jqb '.agents[0].id')" = "abc12345" ] || fail "GET agents: short id"
-[ "$(jqb '.agents[0].cwd')" = "$TOPLEVEL" ] || fail "GET agents: stub got --cwd $TOPLEVEL"
+[ "$(jqb '.agents | length')" = "1" ] || fail "GET agents: mesa filters the 3-session stub list down to 1"
+[ "$(jqb '.agents[0].id')" = "toplvl001" ] || fail "GET agents: short id"
+[ "$(jqb '.agents[0].cwd')" = "$TOPLEVEL" ] || fail "GET agents: filtered session's cwd is the project toplevel"
 [ "$(jqb '.agents[0].waitingFor')" = "permission prompt" ] || fail "GET agents: camelCase passthrough"
 ok "GET /api/projects/{id}/agents lists sessions under local_path"
 
@@ -165,9 +163,10 @@ ok "GET agents on unknown project: 404 not_found"
 # ---- API: GET /api/agents — global list, no --cwd filter, bare array ----
 
 api 200 GET "/api/agents"
-[ "$(jqb 'length')" = "2" ] || fail "GET /api/agents: two stub sessions (no --cwd filter)"
+[ "$(jqb 'length')" = "3" ] || fail "GET /api/agents: all three stub sessions (no --cwd filter)"
 [ "$(jqb '.[0].cwd')" = "/one/project" ] || fail "GET /api/agents: first session cwd"
 [ "$(jqb '.[1].cwd')" = "/another/project" ] || fail "GET /api/agents: second session cwd"
+[ "$(jqb '.[2].cwd')" = "$TOPLEVEL" ] || fail "GET /api/agents: third session cwd"
 ok "GET /api/agents lists sessions across every folder (bare array, no --cwd)"
 
 # Cross-site defense: list/spawn reject a foreign browser Origin (like the

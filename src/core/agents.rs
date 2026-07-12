@@ -17,27 +17,43 @@ pub fn claude_bin() -> String {
     std::env::var("MESA_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
-/// Lists live Claude Code sessions started under `dir` (prefix match done by
-/// `claude agents --json --cwd <dir>` itself). Interactive sessions are
-/// included; only ones with a short `id` (background) are attachable.
+/// Lists live Claude Code sessions started under `dir`. Filtered here in
+/// Rust against `list_all()`'s parsed `cwd` field, rather than trusting
+/// `claude agents --json --cwd <dir>`'s own matching: live QA on mesa task
+/// 310 found a real session whose cwd exactly equaled `dir` missing from the
+/// `--cwd`-filtered output while still present unfiltered (mesa task 313).
+/// A follow-up sweep (exact/prefix/trailing-slash/symlinked/worktree paths)
+/// couldn't reproduce the discrepancy against the installed CLI, so the
+/// exact trigger is uncharacterized — deterministic client-side filtering
+/// sidesteps trusting that black box at all, and is unit-testable without a
+/// claude binary. Interactive sessions are included; only ones with a short
+/// `id` (background) are attachable.
 pub fn list_under(dir: &str) -> Result<Vec<AgentSession>, String> {
-    list_sessions(&claude_bin(), Some(dir))
+    Ok(list_all()?
+        .into_iter()
+        .filter(|s| is_under(&s.cwd, dir))
+        .collect())
+}
+
+/// True if `cwd` is `dir` itself or a path strictly inside it — boundary-safe
+/// (`/tmp/mesa-31` must not match `/tmp/mesa-313`), unlike a plain
+/// `str::starts_with`.
+fn is_under(cwd: &str, dir: &str) -> bool {
+    let cwd = cwd.trim_end_matches('/');
+    let dir = dir.trim_end_matches('/');
+    cwd == dir || cwd.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Lists every live Claude Code session on the machine, with no folder
 /// filter — backs the global Agents sidebar, which shows sessions across
 /// every project at once instead of one project's folder.
 pub fn list_all() -> Result<Vec<AgentSession>, String> {
-    list_sessions(&claude_bin(), None)
+    list_sessions(&claude_bin())
 }
 
-fn list_sessions(bin: &str, dir: Option<&str>) -> Result<Vec<AgentSession>, String> {
-    let mut cmd = Command::new(bin);
-    cmd.args(["agents", "--json"]);
-    if let Some(dir) = dir {
-        cmd.args(["--cwd", dir]);
-    }
-    let out = cmd
+fn list_sessions(bin: &str) -> Result<Vec<AgentSession>, String> {
+    let out = Command::new(bin)
+        .args(["agents", "--json"])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("failed to run claude: {e}"))?;
@@ -172,6 +188,17 @@ mod tests {
     }
 
     #[test]
+    fn is_under_matches_exact_and_nested_boundary_safe() {
+        assert!(is_under("/repo", "/repo")); // exact cwd == dir
+        assert!(is_under("/repo/sub", "/repo")); // nested
+        assert!(is_under("/repo/", "/repo")); // trailing slash on cwd
+        assert!(is_under("/repo", "/repo/")); // trailing slash on dir
+        assert!(!is_under("/repo-other", "/repo")); // string-prefix, not path-prefix
+        assert!(!is_under("/repo", "/repo/sub")); // parent is not under its child
+        assert!(!is_under("/elsewhere", "/repo"));
+    }
+
+    #[test]
     fn parses_empty_list_and_rejects_garbage() {
         assert_eq!(parse_sessions(b"[]").unwrap(), vec![]);
         assert!(parse_sessions(b"not json").is_err());
@@ -218,22 +245,42 @@ mod tests {
     }
 
     #[test]
-    fn list_under_runs_the_binary_and_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = stub_claude(dir.path(), r#"[ "$1" = "agents" ] || exit 1; echo '[]'"#);
-        assert_eq!(list_sessions(&bin, Some("/anywhere")).unwrap(), vec![]);
-    }
-
-    #[test]
     fn list_all_runs_without_a_cwd_filter() {
         let dir = tempfile::tempdir().unwrap();
-        // Asserts the argv is exactly `agents --json` — no --cwd anywhere.
+        // Asserts the argv is exactly `agents --json` — no --cwd anywhere:
+        // list_under filters client-side instead of trusting claude's own
+        // --cwd matching (mesa task 313), so no code path ever passes it.
         let bin = stub_claude(
             dir.path(),
             r#"[ "$*" = "agents --json" ] || { echo "bad argv: $*" >&2; exit 1; }
 echo '[]'"#,
         );
-        assert_eq!(list_sessions(&bin, None).unwrap(), vec![]);
+        assert_eq!(list_sessions(&bin).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn list_under_filters_client_side_on_exact_and_prefix_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never passes --cwd; three sessions differing only in cwd, to prove
+        // exact match, nested-prefix match, and a boundary near-miss.
+        let bin = stub_claude(
+            dir.path(),
+            r#"[ "$*" = "agents --json" ] || { echo "bad argv: $*" >&2; exit 1; }
+cat <<'JSON'
+[
+  {"pid": 1, "id": "aaaaaaaa", "cwd": "/repo", "kind": "background", "startedAt": 1, "sessionId": "s1", "status": "idle"},
+  {"pid": 2, "id": "bbbbbbbb", "cwd": "/repo/sub", "kind": "background", "startedAt": 2, "sessionId": "s2", "status": "idle"},
+  {"pid": 3, "id": "cccccccc", "cwd": "/repo-other", "kind": "background", "startedAt": 3, "sessionId": "s3", "status": "idle"}
+]
+JSON"#,
+        );
+        let sessions = list_sessions(&bin).unwrap();
+        let filtered: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| is_under(&s.cwd, "/repo"))
+            .map(|s| s.id.unwrap())
+            .collect();
+        assert_eq!(filtered, vec!["aaaaaaaa", "bbbbbbbb"]);
     }
 
     #[test]
@@ -266,9 +313,9 @@ echo "prompt was: $3" >&2"#,
     fn failures_surface_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(dir.path(), r#"echo "kaboom" >&2; exit 3"#);
-        let err = list_sessions(&bin, Some("/anywhere")).unwrap_err();
+        let err = list_sessions(&bin).unwrap_err();
         assert!(err.contains("kaboom"), "{err}");
-        let missing = list_sessions("/nonexistent/claude", Some("/anywhere")).unwrap_err();
+        let missing = list_sessions("/nonexistent/claude").unwrap_err();
         assert!(missing.contains("failed to run claude"), "{missing}");
     }
 }

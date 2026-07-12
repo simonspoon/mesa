@@ -395,9 +395,14 @@ CLI (`src/core/agents.rs`; `MESA_CLAUDE_BIN` overrides the binary for tests) —
 and touches the mesa store only to read `local_path`. There is deliberately no
 `mesa agent` CLI: an agent in a terminal would just use `claude` directly.
 
-- `GET /api/projects/{id}/agents` → `{path, agents}` via
-  `claude agents --json --cwd <local_path>` (sessions started under that
-  folder, background and interactive). Cached 2s per folder in
+- `GET /api/projects/{id}/agents` → `{path, agents}` via `claude agents
+  --json` (sessions started under that folder, background and interactive),
+  filtered to `local_path` **in Rust** (`agents::is_under`) against each
+  session's own `cwd`, not via `claude`'s `--cwd` flag — live QA on mesa task
+  310 found a session whose cwd exactly equaled the filter dir missing from
+  `--cwd`-filtered output while present unfiltered (task 313); the exact
+  trigger was never characterized, so mesa filters deterministically instead
+  of trusting that black box. Cached 2s per folder in
   `AppState.agents_cache` (each list call costs ~0.5s of node startup; the UI
   polls every 3s). No `local_path` → `{path: null, agents: []}`, not an error.
 - `POST /api/projects/{id}/agents` (body `{prompt?}`) → runs `claude --bg` in
@@ -481,8 +486,9 @@ persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
 - Data: `listAllAgents()` (`GET /api/agents`, 3s poll) for the session list,
   plus a plain `listProjects()` fetch (no poll) to label each session with the
   project whose `local_path` is a prefix of its `cwd` (longest match wins for
-  nested folders) — the same relationship `claude agents --cwd` itself
-  matches on. A session under no known project's folder shows its raw `cwd`.
+  nested folders) — the same path-prefix relationship `agents::is_under`
+  matches on for the per-project route above. A session under no known
+  project's folder shows its raw `cwd`.
 - Layout: list on top (own scroll region, capped height) and an attached
   terminal panel below (`AgentTerminal`, the same component the per-project
   Agents tab uses) — two separate containers, so scrolling back up to the

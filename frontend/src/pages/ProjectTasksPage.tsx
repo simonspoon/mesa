@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { deleteProject, getProject, listTasks, updateProject } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
-import { CreateTaskPanel } from '../components/CreateTaskPanel'
+import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskPanel } from '../components/TaskPanel'
 import { TaskRow } from '../components/TaskRow'
@@ -192,24 +192,15 @@ export function ProjectTasksPage({
     if (taskId !== null) window.location.hash = `#/projects/${projectId}`
   }
 
-  const panel = creating ? (
-    <CreateTaskPanel
-      projectId={projectId}
-      onClose={closePanel}
-      onCreated={() => {
-        setCreating(false)
-        if (createTask) window.location.hash = `#/projects/${projectId}`
-        onTasksChanged()
-      }}
-    />
-  ) : taskId !== null ? (
-    <TaskPanel
-      key={taskId}
-      taskId={taskId}
-      onClose={closePanel}
-      onChanged={onTasksChanged}
-    />
-  ) : null
+  const panel =
+    taskId !== null ? (
+      <TaskPanel
+        key={taskId}
+        taskId={taskId}
+        onClose={closePanel}
+        onChanged={onTasksChanged}
+      />
+    ) : null
 
   const listView = (
     <>
@@ -268,6 +259,7 @@ export function ProjectTasksPage({
   )
 
   return (
+    <>
     <div className={panel ? 'project-split' : ''}>
       <div className="project-main">
         <h1>
@@ -422,5 +414,17 @@ export function ProjectTasksPage({
       </div>
       {panel && <aside className="side-panel">{panel}</aside>}
     </div>
+    {creating && (
+      <CreateTaskModal
+        projectId={projectId}
+        onClose={closePanel}
+        onCreated={() => {
+          setCreating(false)
+          if (createTask) window.location.hash = `#/projects/${projectId}`
+          onTasksChanged()
+        }}
+      />
+    )}
+    </>
   )
 }

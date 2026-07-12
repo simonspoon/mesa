@@ -2368,6 +2368,31 @@ main {
   padding: 0.4rem 0.6rem;
 }
 
+/* New-task creation, opened as a centered modal (replaces the old inline
+   side-panel entry point). Sits above the expanded-storyboard takeover
+   (1000) and phone sidebar drawer (1200), below the command palette (1300)
+   so Cmd/Ctrl+Shift+P still surfaces on top of it. */
+.create-task-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1250;
+  background: rgba(6, 10, 16, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.create-task-modal {
+  width: min(26rem, 90vw);
+  max-height: 85vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border-bright);
+  clip-path: var(--cut);
+  box-shadow: 0 0 32px rgba(0, 229, 255, 0.2);
+  padding: 0.75rem 1rem 1.5rem;
+}
+
 @media (max-width: 600px) {
   :root {
     /* Header + tabs + chrome are tighter on a phone; let viewport-bound panes

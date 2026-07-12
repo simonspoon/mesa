@@ -59,6 +59,7 @@ export function ProjectTasksPage({
   git,
   files,
   dashboard,
+  createTask,
   onProjectsChanged,
 }: {
   projectId: number
@@ -79,6 +80,12 @@ export function ProjectTasksPage({
   // Dashboard is another URL-driven view: this project's scoped CC telemetry
   // (project-scoped CCDashboardView, overview only).
   dashboard: boolean
+  // True while on the #/projects/:id/create-task route (the command
+  // palette's "Create task in <project>" entry): seeds the create-task
+  // panel open on arrival. `closePanel`/the panel's `onCreated` return the
+  // hash to the plain project route, so the create panel itself stays
+  // ephemeral local state (spec Assumption 2), not URL-persisted.
+  createTask: boolean
   onProjectsChanged: () => void
 }) {
   // Status and tag are passed through to the API's query filters; priority
@@ -92,8 +99,9 @@ export function ProjectTasksPage({
   const [view, setView] = useState<'list' | 'board'>('board')
   // Create-form panel state is ephemeral (spec Assumption 2); the task
   // panel is URL-driven via `taskId`. Latest action wins: opening a task
-  // closes the create form.
-  const [creating, setCreating] = useState(false)
+  // closes the create form. Seeded from `createTask` so a direct arrival
+  // via the create-task route opens straight into the form.
+  const [creating, setCreating] = useState(createTask)
   // Latest action wins: opening a task (taskId becomes non-null) closes the
   // create form. Adjust the state during render off the changed prop rather
   // than in an effect (avoids a cascading re-render).
@@ -101,6 +109,15 @@ export function ProjectTasksPage({
   if (taskId !== prevTaskId) {
     setPrevTaskId(taskId)
     if (taskId !== null) setCreating(false)
+  }
+  // The component isn't remounted between in-place project views, so a
+  // second palette-triggered arrival at the create-task route (component
+  // already mounted on this project) needs the same latest-action-wins
+  // treatment as `prevTaskId` above, not just the `useState` seed.
+  const [prevCreateTask, setPrevCreateTask] = useState(createTask)
+  if (createTask !== prevCreateTask) {
+    setPrevCreateTask(createTask)
+    if (createTask) setCreating(true)
   }
 
   const {
@@ -160,7 +177,12 @@ export function ProjectTasksPage({
 
   function closePanel() {
     setCreating(false)
-    if (taskId !== null) window.location.hash = `#/projects/${projectId}`
+    // `createTask` also needs the return-to-project-URL treatment: it
+    // arrived via the #/projects/:id/create-task route, so closing without
+    // saving must navigate away from that route too (spec Assumption 2:
+    // the panel is ephemeral, not a back-/refresh-stable URL).
+    if (taskId !== null || createTask)
+      window.location.hash = `#/projects/${projectId}`
   }
 
   function openCreate() {
@@ -176,6 +198,7 @@ export function ProjectTasksPage({
       onClose={closePanel}
       onCreated={() => {
         setCreating(false)
+        if (createTask) window.location.hash = `#/projects/${projectId}`
         onTasksChanged()
       }}
     />

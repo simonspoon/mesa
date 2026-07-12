@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 import { getTask } from './api'
+import { CommandPalette } from './components/CommandPalette'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
@@ -13,7 +14,10 @@ import { useFetch } from './useFetch'
 // #/projects/:id/agents (live Claude Code sessions + embedded terminal),
 // #/projects/:id/git (working-tree status + per-file diffs),
 // #/projects/:id/files (file tree + content viewer),
-// #/projects/:id/dashboard (project-scoped CC telemetry).
+// #/projects/:id/dashboard (project-scoped CC telemetry),
+// #/projects/:id/create-task (opens straight into the create-task form;
+// closing/saving it returns to the plain project URL — see
+// ProjectTasksPage's `createTask` prop).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -40,10 +44,29 @@ function LegacyTaskRedirect({ taskId }: { taskId: number }) {
   return <p className="muted">Loading…</p>
 }
 
+// Cmd+Shift+P (Mac) / Ctrl+Shift+P (elsewhere) opens the command palette,
+// wherever the app is mounted — checked via both metaKey and ctrlKey since
+// the modifier differs by platform. Always preventDefault so the browser's
+// own Ctrl/Cmd+Shift+P binding never fires underneath it.
+function useCommandPaletteShortcut(onOpen: () => void) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
+        e.preventDefault()
+        onOpen()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onOpen])
+}
+
 function App() {
   const path = useHashPath()
   // Bumped after project create/rename/delete so the sidebar refetches.
   const [navVersion, setNavVersion] = useState(0)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  useCommandPaletteShortcut(() => setPaletteOpen(true))
 
   const inboxMatch = /^\/inbox$/.exec(path)
   // CC Dashboard is the default landing view: the root path (#/ or empty) shows
@@ -58,6 +81,11 @@ function App() {
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
   const filesMatch = /^\/projects\/(\d+)\/files$/.exec(path)
   const dashboardMatch = /^\/projects\/(\d+)\/dashboard$/.exec(path)
+  // Route the command palette's "Create task in <project>" entry navigates
+  // to; ProjectTasksPage opens the create-task form on arrival and returns
+  // to the plain project route once the form is closed or saved (spec
+  // Assumption 2: the create panel itself stays ephemeral local state).
+  const createTaskMatch = /^\/projects\/(\d+)\/create-task$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
   const activeProjectId = storyboardMatch
@@ -72,9 +100,11 @@ function App() {
             ? Number(filesMatch[1])
             : dashboardMatch
               ? Number(dashboardMatch[1])
-              : projectMatch
-                ? Number(projectMatch[1])
-                : null
+              : createTaskMatch
+                ? Number(createTaskMatch[1])
+                : projectMatch
+                  ? Number(projectMatch[1])
+                  : null
 
   let page
   if (inboxMatch) {
@@ -97,6 +127,7 @@ function App() {
         git={false}
         files={false}
         dashboard={false}
+        createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -112,6 +143,7 @@ function App() {
         git={false}
         files={false}
         dashboard={false}
+        createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -127,6 +159,7 @@ function App() {
         git={false}
         files={false}
         dashboard={false}
+        createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -142,6 +175,7 @@ function App() {
         git
         files={false}
         dashboard={false}
+        createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -157,6 +191,7 @@ function App() {
         git={false}
         files
         dashboard={false}
+        createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -172,6 +207,24 @@ function App() {
         git={false}
         files={false}
         dashboard
+        createTask={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (createTaskMatch) {
+    // Opens straight into the create-task form, in place inside the project
+    // page frame (Board view underneath) — see the route comment above.
+    page = (
+      <ProjectTasksPage
+        projectId={Number(createTaskMatch[1])}
+        taskId={null}
+        storyboards={false}
+        storyboardId={null}
+        agents={false}
+        git={false}
+        files={false}
+        dashboard={false}
+        createTask
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -186,6 +239,7 @@ function App() {
         git={false}
         files={false}
         dashboard={false}
+        createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
@@ -211,6 +265,7 @@ function App() {
         />
         <main>{page}</main>
       </div>
+      {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} />}
     </>
   )
 }

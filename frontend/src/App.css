@@ -2225,6 +2225,65 @@ main {
   }
 }
 
+/* Command palette (Cmd/Ctrl+Shift+P): a centered modal above every other
+   overlay in the app — higher than the expanded-storyboard takeover (1000)
+   and the phone sidebar drawer (1200). */
+.command-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  background: rgba(6, 10, 16, 0.75);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+
+.command-palette {
+  width: min(32rem, 90vw);
+  max-height: 70vh;
+  background: var(--panel);
+  border: 1px solid var(--border-bright);
+  clip-path: var(--cut);
+  box-shadow: 0 0 32px rgba(0, 229, 255, 0.2);
+  display: flex;
+  flex-direction: column;
+}
+
+.command-palette-input {
+  border: none;
+  border-bottom: 1px solid var(--border);
+  font-size: 1rem;
+  padding: 0.75rem 1rem;
+}
+
+.command-palette-input:focus {
+  box-shadow: none;
+}
+
+.command-palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.4rem;
+  overflow-y: auto;
+}
+
+.command-palette-item {
+  padding: 0.4rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.command-palette-item.active {
+  background: rgba(0, 229, 255, 0.08);
+  color: var(--cyan);
+  text-shadow: 0 0 8px var(--cyan-dim);
+}
+
+.command-palette-empty {
+  padding: 0.4rem 0.6rem;
+}
+
 @media (max-width: 600px) {
   :root {
     /* Header + tabs + chrome are tighter on a phone; let viewport-bound panes

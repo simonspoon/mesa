@@ -88,9 +88,12 @@ fn spawn_bg_with(bin: &str, dir: &str, prompt: Option<&str>) -> Result<String, S
 
 /// Extracts the job id from `claude --bg` output. Observed forms:
 /// `backgrounded · e34b8ed9 (idle — send a prompt to start)` and
-/// `backgrounded · cf0c3945 · my-name`.
+/// `backgrounded · cf0c3945 · my-name`. The real `claude` CLI colorizes this
+/// line (unlike the plain-text test stub), so ANSI escapes are stripped
+/// first — otherwise the id token comes out wrapped in escape bytes.
 fn parse_spawn(stdout: &str) -> Result<String, String> {
-    stdout
+    let clean = strip_ansi(stdout);
+    clean
         .lines()
         .find_map(|line| {
             let rest = line.trim().strip_prefix("backgrounded · ")?;
@@ -98,6 +101,27 @@ fn parse_spawn(stdout: &str) -> Result<String, String> {
             (!id.is_empty()).then(|| id.to_string())
         })
         .ok_or_else(|| format!("no job id in claude --bg output: {stdout:?}"))
+}
+
+/// Strips ANSI CSI escape sequences (`ESC '[' <params> <final byte>`, e.g.
+/// SGR color codes like `\x1b[36m`). No crate dependency for one narrow use.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            while matches!(chars.peek(), Some(c2) if c2.is_ascii_digit() || matches!(c2, ';' | ':' | '?')) {
+                chars.next();
+            }
+            if matches!(chars.peek(), Some(c2) if ('@'..='~').contains(c2)) {
+                chars.next(); // consume the final byte
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -172,6 +196,16 @@ mod tests {
         let named = "backgrounded · cf0c3945 · test-bg\n";
         assert_eq!(parse_spawn(named).unwrap(), "cf0c3945");
         assert!(parse_spawn("no receipt here").is_err());
+    }
+
+    #[test]
+    fn parse_spawn_strips_ansi_color_codes() {
+        // The real claude CLI colorizes the receipt (the id token itself
+        // wrapped in an SGR color code); the plain-text stub above never
+        // exercises this. Root-caused via live QA in mesa task 310/312.
+        let colored = "\x1b[2mStarting background service…\x1b[0m\n\
+                       backgrounded · \x1b[36me34b8ed9\x1b[0m (idle — send a prompt to start)\n";
+        assert_eq!(parse_spawn(colored).unwrap(), "e34b8ed9");
     }
 
     /// Writes an executable stub `claude` into `dir` and returns its path.

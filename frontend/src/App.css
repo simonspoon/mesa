@@ -1796,9 +1796,16 @@ main {
    unmounted on collapse — only its width changes — so an attached terminal's
    WebSocket survives a collapse/expand cycle with no reconnect. ---- */
 
+/* Set on <body> for the duration of a resize drag so text elsewhere on the
+   page doesn't get selected as the pointer sweeps across it. */
+body.agent-sidebar-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+
 .agent-sidebar {
   flex: none;
-  width: 28rem;
+  width: var(--agent-sidebar-width, 28rem);
   position: sticky;
   top: 0;
   height: calc(100vh - 3rem);
@@ -1810,8 +1817,29 @@ main {
   transition: width 0.15s;
 }
 
+.agent-sidebar.resizing {
+  transition: none;
+}
+
 .agent-sidebar.collapsed {
   width: 2.5rem;
+}
+
+/* Drag handle on the left edge — straddles the border so it's grabbable
+   from either side without stealing space from the content. */
+.agent-sidebar-resize-handle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.agent-sidebar-resize-handle:hover,
+.agent-sidebar.resizing .agent-sidebar-resize-handle {
+  background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
 }
 
 .agent-sidebar-toggle {
@@ -1836,7 +1864,10 @@ main {
 .agent-sidebar-body {
   flex: 1;
   min-height: 0;
-  width: 28rem;
+  /* Stays at the last expanded width even while the aside itself clips to
+     2.5rem on collapse — an attached terminal's fitted size must not change
+     under a collapse/expand cycle (see the comment on AgentSidebar.tsx). */
+  width: var(--agent-sidebar-width, 28rem);
   display: flex;
   flex-direction: column;
   padding: 0.5rem 1rem 1rem;

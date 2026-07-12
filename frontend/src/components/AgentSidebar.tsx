@@ -1,9 +1,14 @@
 import { useEffect, useState } from 'react'
+import type { CSSProperties } from 'react'
 import { listAllAgents, listProjects } from '../api'
 import { projectForCwd } from '../agentProject'
 import type { AgentSession } from '../types/AgentSession'
 import { useFetch } from '../useFetch'
 import { AgentTerminal } from './AgentTerminal'
+
+const MIN_WIDTH = 280
+const MAX_WIDTH = 720
+const DEFAULT_WIDTH = 448 // 28rem, matches the CSS fallback
 
 function agentLabel(a: AgentSession): string {
   return a.name ?? a.id ?? a.sessionId.slice(0, 8)
@@ -30,6 +35,29 @@ function startedAgo(ms: number): string {
 export function AgentSidebar() {
   const [collapsed, setCollapsed] = useState(true)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [width, setWidth] = useState(DEFAULT_WIDTH)
+  const [resizing, setResizing] = useState(false)
+
+  // Drag-resize: the handle sits on the sidebar's left edge, so the new
+  // width is just the distance from the pointer to the right edge of the
+  // viewport. Listeners live on `document`, not the handle, so the drag
+  // keeps tracking even when the pointer outruns the handle mid-drag.
+  useEffect(() => {
+    if (!resizing) return
+    const onMove = (e: MouseEvent) => {
+      const next = window.innerWidth - e.clientX
+      setWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, next)))
+    }
+    const onUp = () => setResizing(false)
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.classList.add('agent-sidebar-resizing')
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('agent-sidebar-resizing')
+    }
+  }, [resizing])
 
   // Only poll while expanded — collapsed, nobody can see the list, and each
   // poll costs a `claude agents` subprocess. The one-off fetch on expand (via
@@ -54,7 +82,19 @@ export function AgentSidebar() {
   const selected = agents.find((a) => a.id !== null && a.id === selectedId)
 
   return (
-    <aside className={`agent-sidebar${collapsed ? ' collapsed' : ''}`}>
+    <aside
+      className={`agent-sidebar${collapsed ? ' collapsed' : ''}${resizing ? ' resizing' : ''}`}
+      style={{ '--agent-sidebar-width': `${width}px` } as CSSProperties}
+    >
+      {!collapsed && (
+        <div
+          className="agent-sidebar-resize-handle"
+          onMouseDown={(e) => {
+            e.preventDefault()
+            setResizing(true)
+          }}
+        />
+      )}
       <button
         type="button"
         className="sidebar-toggle agent-sidebar-toggle"

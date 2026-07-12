@@ -37,10 +37,10 @@ use serde_json::json;
 
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry, FrameNew,
-    FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, Priority,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    Status, Store, StoryboardPatch, TaskPatch, TaskSummary, Waypoint, agents, attachments, files,
-    git, hooks,
+    FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, NextResult,
+    Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary, Waypoint, agents,
+    attachments, files, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -136,10 +136,121 @@ struct AppState {
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
+/// How often the todo-watcher (`watch_todo`) checks every project for
+/// dispatchable work. Not user-configurable — a fixed background cadence,
+/// not a request-driven poll like the UI's. `MESA_WATCH_TODO_TICK_MS`
+/// overrides it for tests (mirrors `MESA_CLAUDE_BIN`'s test-seam precedent),
+/// so a gate script isn't stuck waiting a full 60s per check.
+const WATCH_TODO_TICK: Duration = Duration::from_secs(60);
+
+fn watch_todo_tick() -> Duration {
+    std::env::var("MESA_WATCH_TODO_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_TODO_TICK)
+}
+
+/// One todo-watcher pass: for every project with a live `local_path` and no
+/// `in_progress` task, pick the next actionable task (`Store::next_task`) and
+/// dispatch a background `claude` agent on it. Marks the task `in_progress`
+/// itself *before* spawning — closing the race window between dispatch and
+/// the agent's own `/execute-mesa-task` pickup step, so a second tick can't
+/// double-dispatch the same task while the agent is still starting up. A
+/// spawn failure reverts the task back to `todo` so the project isn't
+/// wedged; a dispatched agent that later crashes without finishing is not
+/// detected here (task-status, not live-session, is the "in process" signal)
+/// and leaves that project quiet until someone intervenes — an accepted v1
+/// tradeoff over polling `claude agents` for every project every tick.
+///
+/// Two-phase, like `spawn_project_agent`: the store lock is held only long
+/// enough to decide and claim (phase 1), then dropped before the blocking
+/// `claude --bg` shell-outs (phase 2) — holding it across a spawn would
+/// freeze every other API request (each needs the same lock) for as long as
+/// `claude --bg` takes to start (node startup, ~0.5s+, per the Agents-tab
+/// comments) times however many projects this tick dispatches.
+fn todo_watcher_tick(state: &AppState) {
+    let claimed: Vec<(i64, String)> = {
+        let mut store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        let projects = match store.list_projects() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("todo-watcher: list_projects failed: {e}");
+                return;
+            }
+        };
+        let tasks = match store.list_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("todo-watcher: list_tasks failed: {e}");
+                return;
+            }
+        };
+        let busy_projects: std::collections::HashSet<i64> = tasks
+            .iter()
+            .filter(|t| t.status == Status::InProgress)
+            .map(|t| t.project_id)
+            .collect();
+        let mut claimed = Vec::new();
+        for project in projects {
+            let Some(local_path) = project.local_path.as_deref() else {
+                continue;
+            };
+            if !std::path::Path::new(local_path).is_dir() {
+                continue;
+            }
+            if busy_projects.contains(&project.id) {
+                continue;
+            }
+            let task = match store.next_task(Some(project.id)) {
+                Ok(NextResult::Task(task)) => task,
+                Ok(NextResult::None { .. }) => continue,
+                Err(e) => {
+                    eprintln!(
+                        "todo-watcher: next_task failed for project {}: {e}",
+                        project.id
+                    );
+                    continue;
+                }
+            };
+            let in_progress = TaskPatch {
+                status: Some(Status::InProgress),
+                ..Default::default()
+            };
+            if let Err(e) = store.update_task(task.id, &in_progress) {
+                eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
+                continue;
+            }
+            claimed.push((task.id, local_path.to_string()));
+        }
+        claimed
+    };
+    for (task_id, local_path) in claimed {
+        let prompt = format!("/execute-mesa-task {task_id}");
+        if let Err(e) = agents::spawn_bg(&local_path, Some(&prompt)) {
+            eprintln!("todo-watcher: spawn failed for task {task_id}: {e}");
+            let mut store = match state.store.lock() {
+                Ok(s) => s,
+                Err(e) => e.into_inner(),
+            };
+            let revert = TaskPatch {
+                status: Some(Status::Todo),
+                ..Default::default()
+            };
+            let _ = store.update_task(task_id, &revert);
+        }
+    }
+}
+
 /// Opens the default store and serves the API, blocking until the process is
 /// killed. Binds 127.0.0.1 by default; with `lan`, binds 0.0.0.0 so other
 /// devices on the local network can reach it (no auth — see `serve --help`).
-pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
+/// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`]);
+/// off by default, propagated across the web UI's Restart Server action.
+pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> {
     let store = Store::open_default()?;
     let restart_requested = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -167,6 +278,17 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async {
+        if watch_todo {
+            let watch_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(watch_todo_tick());
+                loop {
+                    ticker.tick().await;
+                    let state = watch_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || todo_watcher_tick(&state)).await;
+                }
+            });
+        }
         let listener = tokio::net::TcpListener::bind((host, port)).await?;
         println!("{}", json!({"listening": format!("http://{host}:{port}")}));
         // ConnectInfo carries the peer address so the agent endpoints and
@@ -192,6 +314,9 @@ pub fn serve(port: u16, lan: bool) -> crate::core::Result<()> {
         let mut args = vec!["serve".to_string(), "--port".to_string(), port.to_string()];
         if lan {
             args.push("--lan".to_string());
+        }
+        if watch_todo {
+            args.push("--watch-todo".to_string());
         }
         std::process::Command::new(exe).args(args).spawn()?;
         std::process::exit(0);

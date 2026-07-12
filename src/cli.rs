@@ -98,6 +98,14 @@ enum Command {
         /// can run code via the Agents terminal.
         #[arg(long, default_value_t = false)]
         lan: bool,
+        /// Periodically check every project for an actionable todo task when
+        /// nothing is in_progress, and auto-start a background `claude` agent
+        /// on it (prompt: `/execute-mesa-task <task-id>`). Off by default:
+        /// this spawns real agents (API cost, code execution) with no user
+        /// request behind it. Preserved across the web UI's Restart Server
+        /// action.
+        #[arg(long, default_value_t = false)]
+        watch_todo: bool,
     },
     /// Snapshot the database to a file (safe while the server runs)
     ///
@@ -1093,7 +1101,11 @@ fn execute(command: Command) -> Result<()> {
         Command::Inbox(cmd) => run_inbox(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
-        Command::Serve { port, lan } => crate::api::serve(port, lan),
+        Command::Serve {
+            port,
+            lan,
+            watch_todo,
+        } => crate::api::serve(port, lan, watch_todo),
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;

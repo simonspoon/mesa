@@ -12,7 +12,7 @@ import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
 import { ConfirmDelete } from './ConfirmDelete'
-import { projectForCwd } from '../agentProject'
+import { isRunningAgent, projectForCwd } from '../agentProject'
 
 /**
  * Polls the server with a cheap existing GET until it responds, for use after
@@ -131,6 +131,7 @@ export function Sidebar({
   const activeAgentProjectIds = new Set<number>()
   if (projects) {
     for (const a of agents ?? []) {
+      if (!isRunningAgent(a)) continue
       const p = projectForCwd(a.cwd, projects)
       if (p) activeAgentProjectIds.add(p.id)
     }

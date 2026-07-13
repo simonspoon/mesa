@@ -711,8 +711,11 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // busy_timeout first: a concurrent journal_mode=WAL conversion on a
+        // brand-new db needs a brief exclusive lock, and must be able to wait
+        // on it rather than fail outright.
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         migrate(&conn)?;
         Ok(Store { conn })
@@ -2380,11 +2383,29 @@ fn would_cycle(conn: &Connection, task_id: i64, blocker_id: i64) -> Result<bool>
     Ok(false)
 }
 
+/// `BEGIN IMMEDIATE` serializes concurrent first-opens of a brand-new db: two
+/// processes racing here would otherwise both read `user_version = 0` and
+/// both try to `CREATE TABLE`, crashing the loser with "table already
+/// exists". The losing process's `BEGIN IMMEDIATE` blocks (up to
+/// `busy_timeout`, already set by `Store::open` before this runs) until the
+/// winner commits, then re-reads the now-current `user_version` and finds
+/// nothing left to apply.
 fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-        conn.execute_batch(sql)?;
-        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let run = || -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
+            conn.execute_batch(sql)?;
+            conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            conn.execute_batch("ROLLBACK").ok();
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -3627,6 +3648,28 @@ mod tests {
         }
         // reopening an already-migrated db must not fail
         let store = Store::open(&path).unwrap();
+        assert!(store.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_first_open_of_a_new_db_does_not_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("racy.db");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).map(|_| ()))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
         assert!(store.list_projects().unwrap().is_empty());
     }
 

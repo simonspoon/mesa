@@ -2,24 +2,27 @@ import { useState } from 'react'
 import {
   DndContext,
   PointerSensor,
-  useDraggable,
   useDroppable,
   useSensor,
   useSensors,
   type DragEndEvent,
 } from '@dnd-kit/core'
-import { updateTaskStatus } from './api'
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
+import { updateTaskPosition } from './api'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
 const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
 
 function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } =
-    useDraggable({ id: task.id })
-  const style = transform
-    ? { transform: `translate(${transform.x}px, ${transform.y}px)` }
-    : undefined
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: task.id,
+  })
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  }
   return (
     <li
       ref={setNodeRef}
@@ -44,7 +47,10 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
 
 // Order a column's tasks so each subtask sits directly under its parent,
 // indented one level (spec S6). A subtask whose parent is in another column
-// (different status) stays at the top level so it is never dropped.
+// (different status) stays at the top level so it is never dropped. This is
+// also the visual order dragging reorders against (spec 328) — the id list
+// this returns doubles as both render order and the SortableContext's item
+// list, so drop position always matches what's on screen.
 function nestColumn(
   tasks: TaskSummary[],
 ): { task: TaskSummary; depth: number }[] {
@@ -70,24 +76,32 @@ function nestColumn(
 
 function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
   const { setNodeRef, isOver } = useDroppable({ id: status })
+  const ordered = nestColumn(tasks)
   return (
     <div ref={setNodeRef} className={`kanban-column${isOver ? ' over' : ''}`}>
       <h2>
         {status} <span className="muted">{tasks.length}</span>
       </h2>
-      <ul>
-        {nestColumn(tasks).map(({ task, depth }) => (
-          <Card key={task.id} task={task} depth={depth} />
-        ))}
-      </ul>
+      <SortableContext
+        items={ordered.map(({ task }) => task.id)}
+        strategy={verticalListSortingStrategy}
+      >
+        <ul>
+          {ordered.map(({ task, depth }) => (
+            <Card key={task.id} task={task} depth={depth} />
+          ))}
+        </ul>
+      </SortableContext>
     </div>
   )
 }
 
 /**
- * Per-project kanban board: one droppable column per status, draggable
- * task cards. A drop fires PATCH /api/tasks/:id with the new status
- * (spec Requirement 10), then `onMoved` so the caller refetches.
+ * Per-project kanban board: one droppable column per status, sortable task
+ * cards. A drop fires PATCH /api/tasks/:id with the new status when the
+ * column changed (spec Requirement 10) and/or a new `sort_order` reflecting
+ * the drop position within the destination column (spec 328), then
+ * `onMoved` so the caller refetches.
  */
 export function KanbanBoard({
   tasks,
@@ -105,12 +119,35 @@ export function KanbanBoard({
 
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event
-    if (!over) return
+    if (!over || active.id === over.id) return
     const id = Number(active.id)
-    const status = over.id as Status
     const task = tasks.find((t) => t.id === id)
-    if (!task || task.status === status) return
-    updateTaskStatus(id, status).then(
+    if (!task) return
+
+    // `over` is either a column's own droppable id (dropped on empty
+    // column space) or another card's id (dropped near a card) — resolve
+    // both to a target status and the destination column's rendered order.
+    const overTask = tasks.find((t) => t.id === Number(over.id))
+    const status = overTask ? overTask.status : (over.id as Status)
+    const destOrdered = nestColumn(
+      tasks.filter((t) => t.status === status && t.id !== id),
+    ).map(({ task: t }) => t)
+    const overIndex = overTask ? destOrdered.findIndex((t) => t.id === overTask.id) : -1
+    const insertAt = overIndex === -1 ? destOrdered.length : overIndex
+
+    const prev = insertAt > 0 ? destOrdered[insertAt - 1].sort_order : null
+    const next = insertAt < destOrdered.length ? destOrdered[insertAt].sort_order : null
+    const sortOrder =
+      prev === null && next === null
+        ? 1
+        : prev === null
+          ? next! - 1
+          : next === null
+            ? prev + 1
+            : (prev + next) / 2
+
+    if (status === task.status && sortOrder === task.sort_order) return
+    updateTaskPosition(id, status === task.status ? undefined : status, sortOrder).then(
       () => {
         setError(null)
         onMoved()

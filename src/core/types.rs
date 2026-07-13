@@ -313,6 +313,10 @@ pub struct Task {
     pub created_at: String,
     /// When the task row was last updated (SQLite `datetime` text, UTC).
     pub updated_at: String,
+    /// Manual board order (spec 328): compared across the whole table (not
+    /// per-status), so a task keeps its relative position when its status
+    /// changes. Not a dense rank — a sortable value; ties break on `id`.
+    pub sort_order: f64,
     /// Derived: true if any dependency is not done/cancelled. Always present.
     pub blocked: bool,
 }
@@ -358,6 +362,8 @@ pub struct TaskSummary {
     pub tags: Vec<String>,
     /// Definition-of-done, surfaced in `list` so agents see it without `show`.
     pub acceptance: Option<String>,
+    /// Manual board order (spec 328); see `Task::sort_order`.
+    pub sort_order: f64,
     pub blocked: bool,
 }
 
@@ -372,6 +378,7 @@ impl From<&Task> for TaskSummary {
             priority: t.priority,
             tags: t.tags.clone(),
             acceptance: t.acceptance.clone(),
+            sort_order: t.sort_order,
             blocked: t.blocked,
         }
     }

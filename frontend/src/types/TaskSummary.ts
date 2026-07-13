@@ -10,4 +10,8 @@ export type TaskSummary = { id: number, project_id: number, parent_id: number | 
 /**
  * Definition-of-done, surfaced in `list` so agents see it without `show`.
  */
-acceptance: string | null, blocked: boolean, };
+acceptance: string | null, 
+/**
+ * Manual board order (spec 328); see `Task::sort_order`.
+ */
+sort_order: number, blocked: boolean, };

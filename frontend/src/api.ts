@@ -110,6 +110,22 @@ export function updateTaskStatus(id: number, status: Status): Promise<Task> {
   })
 }
 
+/**
+ * Board drag-and-drop (spec 328): sets the dropped card's manual order,
+ * and its status too when the drop also changed columns.
+ */
+export function updateTaskPosition(
+  id: number,
+  status: Status | undefined,
+  sortOrder: number,
+): Promise<Task> {
+  return request(`/api/tasks/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, sort_order: sortOrder }),
+  })
+}
+
 /** The full task objects `id` is directly blocked by. */
 export function listDependencies(id: number): Promise<Task[]> {
   return request(`/api/tasks/${id}/dependencies`)
@@ -142,6 +158,7 @@ export interface TaskPatch {
   status?: Status
   priority?: Priority
   tags?: string[]
+  sort_order?: number
 }
 
 export function createProject(

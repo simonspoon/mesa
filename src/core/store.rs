@@ -242,12 +242,16 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_attachments_task ON attachments(task_id);
     ",
     "ALTER TABLE frame_edges ADD COLUMN waypoints TEXT;",
+    "
+    ALTER TABLE tasks ADD COLUMN sort_order REAL NOT NULL DEFAULT 0;
+    UPDATE tasks SET sort_order = id;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
 const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
      t.status, t.priority, t.tags, \
-     t.acceptance, t.artifact, t.created_at, t.updated_at, \
+     t.acceptance, t.artifact, t.created_at, t.updated_at, t.sort_order, \
      EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON b.id = d.blocked_by \
             WHERE d.task_id = t.id AND b.status NOT IN ('done', 'cancelled'))";
 
@@ -268,7 +272,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         artifact: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
-        blocked: row.get(12)?,
+        sort_order: row.get(12)?,
+        blocked: row.get(13)?,
     })
 }
 
@@ -484,6 +489,9 @@ pub struct TaskPatch {
     pub acceptance: Option<Option<String>>,
     /// `Some(None)` clears the artifact (work-receipt) field.
     pub artifact: Option<Option<String>>,
+    /// Manual board order (spec 328); caller (the API) computes the
+    /// fractional value from the drop position, `Store` just persists it.
+    pub sort_order: Option<f64>,
 }
 
 /// Fields to change on a storyboard; `None` means leave unchanged. A
@@ -916,11 +924,17 @@ impl Store {
         }
         let tags_json = serde_json::to_string(tags).expect("tags serialize");
         let tx = self.conn.transaction()?;
+        // New tasks append to the end of the board's manual order (spec 328),
+        // regardless of how far prior reordering has spread sort_order values.
+        let next_sort_order: f64 =
+            tx.query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tasks", [], |r| {
+                r.get(0)
+            })?;
         tx.execute(
             "INSERT INTO tasks \
              (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
-              status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
+              status, sort_order, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
             (
                 project_id,
                 parent_id,
@@ -931,6 +945,7 @@ impl Store {
                 acceptance,
                 artifact,
                 status.unwrap_or(Status::Todo).as_str(),
+                next_sort_order,
             ),
         )?;
         let id = tx.last_insert_rowid();
@@ -986,9 +1001,9 @@ impl Store {
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks t ORDER BY t.id"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks t ORDER BY t.sort_order, t.id"
+        ))?;
         let rows = stmt.query_map([], row_to_task)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1028,13 +1043,16 @@ impl Store {
         if let Some(artifact) = &patch.artifact {
             task.artifact = artifact.clone();
         }
+        if let Some(sort_order) = patch.sort_order {
+            task.sort_order = sort_order;
+        }
         let tags_json = serde_json::to_string(&task.tags).expect("tags serialize");
         let status_changed = task.status != old_status;
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE tasks SET title = ?1, description = ?2, status = ?3, priority = ?4, \
-             tags = ?5, parent_id = ?6, acceptance = ?7, artifact = ?8, \
-             updated_at = datetime('now') WHERE id = ?9",
+             tags = ?5, parent_id = ?6, acceptance = ?7, artifact = ?8, sort_order = ?9, \
+             updated_at = datetime('now') WHERE id = ?10",
             (
                 &task.title,
                 &task.description,
@@ -1044,6 +1062,7 @@ impl Store {
                 task.parent_id,
                 &task.acceptance,
                 &task.artifact,
+                task.sort_order,
                 id,
             ),
         )?;
@@ -2633,6 +2652,7 @@ mod tests {
                     parent_id: None,
                     acceptance: None,
                     artifact: None,
+                    sort_order: None,
                 },
             )
             .unwrap();

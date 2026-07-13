@@ -20,6 +20,12 @@ created_at: string,
  */
 updated_at: string, 
 /**
+ * Manual board order (spec 328): compared across the whole table (not
+ * per-status), so a task keeps its relative position when its status
+ * changes. Not a dense rank — a sortable value; ties break on `id`.
+ */
+sort_order: number, 
+/**
  * Derived: true if any dependency is not done/cancelled. Always present.
  */
 blocked: boolean, };

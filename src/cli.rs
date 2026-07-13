@@ -1338,6 +1338,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 },
                 acceptance: acceptance.map(clear_if_empty),
                 artifact: artifact.map(clear_if_empty),
+                sort_order: None,
             };
             print_json(&store.update_task(id, &patch)?);
         }

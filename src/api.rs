@@ -701,6 +701,8 @@ struct TaskUpdate {
     tags: Option<Vec<String>>,
     #[serde(default, deserialize_with = "double_option")]
     parent_id: Option<Option<i64>>,
+    #[serde(default)]
+    sort_order: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -778,6 +780,7 @@ async fn update_task(
         parent_id: body.parent_id,
         acceptance: None,
         artifact: None,
+        sort_order: body.sort_order,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_task(id, &patch)?).into_response())

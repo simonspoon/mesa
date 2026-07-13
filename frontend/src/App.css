@@ -676,9 +676,8 @@ main {
   box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
 }
 
-/* Expanded mode: the storyboard takes over the whole window. The root pins to
-   the viewport and the canvas viewport fills the remaining space; the editor
-   panel (if open) overlays the right edge. */
+/* Expanded mode: the storyboard takes over the whole window, the root
+   pinning to the viewport and the canvas viewport filling it. */
 .storyboard.expanded {
   position: fixed;
   inset: 0;
@@ -693,12 +692,6 @@ main {
 .storyboard.expanded .storyboard-viewport {
   flex: 1 1 auto;
   height: 100%;
-}
-
-.storyboard.expanded .side-panel {
-  position: static;
-  height: 100%;
-  overflow: auto;
 }
 
 /* Viewport: fixed-size window React Flow fills (it needs an explicitly-sized
@@ -1004,6 +997,46 @@ main {
 
 .task-input {
   width: 6rem;
+}
+
+/* Inline edit mode (double-click a card): a comfortable minimum width for the
+   form fields (the node's own `width: f.w` inline style is suppressed while
+   editing — see FrameNode — so a narrow card can grow instead of clipping
+   its inputs), plus the same highlight as `.selected` since editing implies
+   selected. */
+.frame.editing {
+  min-width: 16rem;
+  border-color: var(--cyan);
+  box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+.frame-title-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-display);
+  font-size: 0.78rem;
+  padding: 0.1rem 0.3rem;
+}
+
+.frame-done {
+  padding: 0.1rem 0.4rem;
+  font-size: 0.7rem;
+}
+
+.frame-body-input {
+  flex: 1;
+  margin: 0.4rem 0.5rem;
+  width: calc(100% - 1rem);
+  font-size: 0.8rem;
+  resize: vertical;
+}
+
+.frame-edit-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem 0.5rem;
+  border-top: 1px solid var(--border);
 }
 
 .author-field input {
@@ -2259,12 +2292,10 @@ body.agent-sidebar-resizing {
     grid-template-columns: repeat(2, 1fr);
   }
 
-  /* The right-hand editor column (task panel, frame editor) is wider than the
-     screen here; present it as a bottom sheet over the content instead. Both
-     panels already carry a close control. Also overrides the static panel of
-     the expanded storyboard (z-index 1000). */
-  .side-panel,
-  .storyboard.expanded .side-panel {
+  /* The right-hand editor column (task panel) is wider than the screen here;
+     present it as a bottom sheet over the content instead. It already
+     carries a close control. */
+  .side-panel {
     position: fixed;
     top: auto;
     left: 0;
@@ -2488,8 +2519,7 @@ body.agent-sidebar-resizing {
     min-height: 4rem;
   }
 
-  .side-panel,
-  .storyboard.expanded .side-panel {
+  .side-panel {
     max-height: 80vh;
   }
 

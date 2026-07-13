@@ -35,6 +35,7 @@ import {
   deleteFrame,
   updateEdge,
   updateFrame,
+  type FramePatch,
 } from './api'
 import { loadBoardView, saveBoardView } from './boardView'
 import { ConfirmDelete } from './components/ConfirmDelete'
@@ -48,10 +49,26 @@ import type { Waypoint } from './types/Waypoint'
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 3
 
-/** Node payload: the server frame plus whether the editor has it selected
- *  (selection is owned by this component, not React Flow's click-select, so
- *  the editor panel and the highlight can never disagree). */
-type FrameNodeType = Node<{ frame: Frame; selected: boolean }, 'frame'>
+/** Node payload: the server frame, its selected/editing state (owned by this
+ *  component, not React Flow's own click-select, so they can never disagree
+ *  with the rendered highlight), plus the mutation callbacks the inline
+ *  edit form needs. Callbacks ride in `data` so the node stays a plain
+ *  presentational component, matching `FrameEdgeType` below. */
+type FrameNodeType = Node<
+  {
+    frame: Frame
+    selected: boolean
+    editing: boolean
+    projectId: number
+    onSaveTitle: (next: string) => Promise<void>
+    onSaveBody: (next: string) => Promise<void>
+    onSaveColor: (next: string | null) => Promise<void>
+    onSaveTask: (next: number | null) => Promise<void>
+    onDelete: () => Promise<void>
+    onDone: () => void
+  },
+  'frame'
+>
 
 /** Edge payload: the server label plus the mutation callbacks the label
  *  controls need. Callbacks ride in `data` so the custom edge stays a plain
@@ -80,37 +97,184 @@ const HANDLES = [
  * selection and link clicks. Connections start from the four side dots; while
  * a connection is being dragged from another node, an invisible full-size
  * target handle covers the card so the drop can land anywhere on it.
+ *
+ * Double-clicking the card (handled by the parent's `onNodeDoubleClick`, which
+ * flips `data.editing`) swaps the static title/body for inputs and reveals a
+ * colour/task/delete row directly on the card — there is no separate editor
+ * panel. Field drafts reset from the server frame each time `editing` turns
+ * true (the "adjust state during render on a prop change" pattern, matching
+ * `FrameEdgeView`'s `seenWaypoints`), so a previous unsaved edit never leaks
+ * into the next edit session.
  */
 function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
   const f = data.frame
+  const editing = data.editing
   const connection = useConnection()
   const isConnectTarget = connection.inProgress && connection.fromNode.id !== id
+
+  const [titleDraft, setTitleDraft] = useState(f.title)
+  const [bodyDraft, setBodyDraft] = useState(f.body ?? '')
+  const [taskDraft, setTaskDraft] = useState(
+    f.task_id !== null ? String(f.task_id) : '',
+  )
+  const [taskError, setTaskError] = useState<string | null>(null)
+  const [wasEditing, setWasEditing] = useState(editing)
+  if (editing !== wasEditing) {
+    setWasEditing(editing)
+    if (editing) {
+      setTitleDraft(f.title)
+      setBodyDraft(f.body ?? '')
+      setTaskDraft(f.task_id !== null ? String(f.task_id) : '')
+      setTaskError(null)
+    }
+  }
+
+  // Save failures surface on the shared canvas error banner (`saveFrame` in
+  // the parent already calls `showError`); these `.catch(() => {})`s only
+  // swallow the resulting promise rejection so it doesn't also log as an
+  // unhandled rejection. `saveTask` is the one exception — it shows the
+  // error inline next to the field, matching the old panel's behavior for a
+  // validation error the user needs to fix (e.g. an unknown task id).
+  function saveTitle() {
+    const next = titleDraft.trim()
+    if (next === '' || next === f.title) {
+      setTitleDraft(f.title)
+      return
+    }
+    data.onSaveTitle(next).catch(() => {})
+  }
+
+  function saveBody() {
+    if (bodyDraft !== (f.body ?? '')) data.onSaveBody(bodyDraft).catch(() => {})
+  }
+
+  function saveTask() {
+    const trimmed = taskDraft.trim()
+    if (trimmed === '') {
+      setTaskError(null)
+      if (f.task_id !== null) data.onSaveTask(null).catch(() => {})
+      return
+    }
+    const taskId = Number(trimmed)
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      setTaskError('task id must be a positive number')
+      return
+    }
+    setTaskError(null)
+    data.onSaveTask(taskId).catch((e: unknown) => {
+      setTaskError(e instanceof Error ? e.message : String(e))
+    })
+  }
+
   // Handles are siblings of the card, not children: the card clips its
   // content (overflow + corner clip-path), which would swallow the half-
   // outside connection dots.
   return (
     <>
       <div
-        className={'frame' + (data.selected ? ' selected' : '')}
-        style={{ width: f.w, minHeight: f.h, borderColor: f.color ?? undefined }}
+        className={
+          'frame' +
+          (data.selected ? ' selected' : '') +
+          (editing ? ' editing' : '')
+        }
+        style={{
+          width: editing ? undefined : f.w,
+          minHeight: f.h,
+          borderColor: f.color ?? undefined,
+        }}
       >
         <div className="frame-header">
-          <span className="frame-title">
-            <Markdown text={f.title} />
-          </span>
+          {editing ? (
+            <input
+              className="frame-title-input nodrag"
+              autoFocus
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={saveTitle}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                if (e.key === 'Escape') setTitleDraft(f.title)
+              }}
+            />
+          ) : (
+            <span className="frame-title">
+              <Markdown text={f.title} />
+            </span>
+          )}
           <span className="frame-id muted">#{f.id}</span>
+          {editing && (
+            <button
+              className="frame-done nodrag"
+              title="done editing"
+              onClick={data.onDone}
+            >
+              done
+            </button>
+          )}
         </div>
-        {f.body && (
-          <div className="frame-body">
-            <Markdown text={f.body} />
+        {editing ? (
+          <textarea
+            className="frame-body-input"
+            rows={4}
+            value={bodyDraft}
+            placeholder="no body — type to add"
+            onChange={(e) => setBodyDraft(e.target.value)}
+            onBlur={saveBody}
+          />
+        ) : (
+          f.body && (
+            <div className="frame-body">
+              <Markdown text={f.body} />
+            </div>
+          )
+        )}
+        {editing ? (
+          <div className="frame-edit-fields">
+            <p className="frame-field">
+              colour{' '}
+              <input
+                type="color"
+                value={f.color ?? '#0e1722'}
+                onChange={(e) => data.onSaveColor(e.target.value).catch(() => {})}
+              />
+              <button onClick={() => data.onSaveColor(null).catch(() => {})}>
+                clear
+              </button>
+            </p>
+            <p className="frame-field">
+              task{' '}
+              <input
+                type="text"
+                className="task-input"
+                value={taskDraft}
+                placeholder="task id"
+                onChange={(e) => setTaskDraft(e.target.value)}
+                onBlur={saveTask}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                }}
+              />
+              {f.task_id !== null && (
+                <a href={`#/projects/${data.projectId}/tasks/${f.task_id}`}>
+                  open #{f.task_id}
+                </a>
+              )}
+              {taskError && <span className="error">{taskError}</span>}
+            </p>
+            <ConfirmDelete
+              label="delete frame"
+              message="Deletes this frame and the edges touching it."
+              onDelete={data.onDelete}
+            />
+          </div>
+        ) : (
+          <div className="frame-foot muted">
+            {f.task_id !== null && (
+              <span className="badge">task #{f.task_id}</span>
+            )}
+            {f.author && <span>{f.author}</span>}
           </div>
         )}
-        <div className="frame-foot muted">
-          {f.task_id !== null && (
-            <span className="badge">task #{f.task_id}</span>
-          )}
-          {f.author && <span>{f.author}</span>}
-        </div>
       </div>
       {HANDLES.map((h) => (
         <Handle key={h.id} id={h.id} type="source" position={h.position} />
@@ -476,12 +640,13 @@ const edgeTypes = { frame: FrameEdgeView }
  * The freeform storyboard canvas, rendered by React Flow: frames are custom
  * nodes dragged by their header (a PATCH on drop), edges are floating
  * anchor-to-anchor connectors created by dragging between the side handles,
- * and a right-hand panel edits the selected frame. Nodes re-derive from the
- * server `view` after every mutation (`onChanged` refetches; the parent owns
- * the fetch), and every mutation is stamped with `author` for the change
- * history. The pan/zoom viewport is browser-local per board (boardView.ts);
- * the parent keys this component by board id, so a board switch remounts onto
- * that board's saved viewport.
+ * and double-clicking a frame edits it in place on the card (title/body/
+ * colour/task) — no side panel. Nodes re-derive from the server `view` after
+ * every mutation (`onChanged` refetches; the parent owns the fetch), and
+ * every mutation is stamped with `author` for the change history. The
+ * pan/zoom viewport is browser-local per board (boardView.ts); the parent
+ * keys this component by board id, so a board switch remounts onto that
+ * board's saved viewport.
  */
 export function StoryboardCanvas({
   view,
@@ -496,6 +661,11 @@ export function StoryboardCanvas({
 }) {
   const storyboardId = view.storyboard.id
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  // The frame currently in on-card inline edit mode (entered by double-click),
+  // distinct from `selectedId` (highlight + Cmd+D target) — a card can be
+  // selected without being edited, never edited without being selected (set
+  // together on double-click).
+  const [editingId, setEditingId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   // Expanded mode: the canvas takes over the whole window (CSS fixes the root to
   // the viewport). Purely a view-layer toggle, never persisted on the board.
@@ -509,27 +679,75 @@ export function StoryboardCanvas({
     setError(e instanceof Error ? e.message : String(e))
   }, [])
 
+  /** Save one edited field on a frame. Mirrors `editEdgeLabel` below: resolves
+   *  to refetch, surfaces a rejection on the shared error banner. Used by the
+   *  inline edit form on the card — there is no separate save step, each
+   *  field commits on blur/change. */
+  const saveFrame = useCallback(
+    (id: number, patch: FramePatch) =>
+      updateFrame(id, patch, author).then(
+        () => {
+          setError(null)
+          onChanged()
+        },
+        (e) => {
+          showError(e)
+          throw e
+        },
+      ),
+    [author, onChanged, showError],
+  )
+
+  const removeFrame = useCallback(
+    (id: number) =>
+      deleteFrame(id, author).then(
+        () => {
+          setError(null)
+          setEditingId(null)
+          setSelectedId(null)
+          onChanged()
+        },
+        (e) => {
+          showError(e)
+          throw e
+        },
+      ),
+    [author, onChanged, showError],
+  )
+
   // Nodes live in React Flow state so drags are smooth (React Flow applies the
   // position changes locally); the server view re-seeds them after every
   // refetch. A drop PATCHes x/y, so the refetch lands on the same coordinates
   // and nothing snaps back.
   const toNodes = useCallback(
-    (frames: Frame[], selected: number | null): FrameNodeType[] =>
+    (frames: Frame[], selected: number | null, editing: number | null): FrameNodeType[] =>
       frames.map((f) => ({
         id: String(f.id),
         type: 'frame' as const,
         position: { x: f.x, y: f.y },
-        data: { frame: f, selected: selected === f.id },
+        data: {
+          frame: f,
+          selected: selected === f.id,
+          editing: editing === f.id,
+          projectId,
+          onSaveTitle: (next: string) => saveFrame(f.id, { title: next }),
+          onSaveBody: (next: string) =>
+            saveFrame(f.id, { body: next === '' ? null : next }),
+          onSaveColor: (next: string | null) => saveFrame(f.id, { color: next }),
+          onSaveTask: (next: number | null) => saveFrame(f.id, { task_id: next }),
+          onDelete: () => removeFrame(f.id),
+          onDone: () => setEditingId(null),
+        },
         dragHandle: '.frame-header',
       })),
-    [],
+    [projectId, saveFrame, removeFrame],
   )
   const [nodes, setNodes, onNodesChange] = useNodesState<FrameNodeType>(
-    toNodes(view.frames, null),
+    toNodes(view.frames, null, null),
   )
   useEffect(() => {
-    setNodes(toNodes(view.frames, selectedId))
-  }, [view.frames, selectedId, setNodes, toNodes])
+    setNodes(toNodes(view.frames, selectedId, editingId))
+  }, [view.frames, selectedId, editingId, setNodes, toNodes])
 
   const removeEdge = useCallback(
     (id: number) => {
@@ -743,6 +961,18 @@ export function StoryboardCanvas({
     return () => window.removeEventListener('keydown', onKey)
   }, [expanded])
 
+  // Escape also leaves a card's inline edit mode — the same "usual way out"
+  // as expanded mode above. Only bound while editing so it never swallows
+  // Escape elsewhere (e.g. a waypoint drag).
+  useEffect(() => {
+    if (editingId === null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setEditingId(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [editingId])
+
   // Cmd+D (Ctrl+D off-mac) duplicates the selected frame. Skipped while focus
   // is in a text field (title/body/task-id inputs) so it doesn't fire
   // mid-edit; preventDefault suppresses the browser's own bookmark shortcut.
@@ -760,17 +990,8 @@ export function StoryboardCanvas({
     return () => window.removeEventListener('keydown', onKey)
   }, [selectedId, view.frames, duplicateFrame])
 
-  const selected =
-    selectedId === null
-      ? undefined
-      : view.frames.find((f) => f.id === selectedId)
-
   return (
-    <div
-      className={`storyboard${selected ? ' has-panel' : ''}${
-        expanded ? ' expanded' : ''
-      }`}
-    >
+    <div className={`storyboard${expanded ? ' expanded' : ''}`}>
       <div className="storyboard-viewport">
         <ReactFlow
           colorMode="dark"
@@ -783,8 +1004,20 @@ export function StoryboardCanvas({
           }}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
-          onNodeClick={(_e, node) => setSelectedId(Number(node.id))}
-          onPaneClick={() => setSelectedId(null)}
+          onNodeClick={(_e, node) => {
+            const id = Number(node.id)
+            setSelectedId(id)
+            if (editingId !== null && editingId !== id) setEditingId(null)
+          }}
+          onNodeDoubleClick={(_e, node) => {
+            const id = Number(node.id)
+            setSelectedId(id)
+            setEditingId(id)
+          }}
+          onPaneClick={() => {
+            setSelectedId(null)
+            setEditingId(null)
+          }}
           onDoubleClick={onPaneDoubleClick}
           onConnect={onConnect}
           onConnectEnd={onConnectEnd}
@@ -828,8 +1061,8 @@ export function StoryboardCanvas({
               {layoutDirection === 'vertical' ? '↓ vertical' : '→ horizontal'}
             </button>
             <span className="canvas-hint muted">
-              drag a header to move · drag a side dot to connect · click to
-              edit
+              drag a header to move · drag a side dot to connect ·
+              double-click a card to edit
             </span>
             {error && <span className="error">{error}</span>}
           </Panel>
@@ -848,151 +1081,6 @@ export function StoryboardCanvas({
           </Panel>
         </ReactFlow>
       </div>
-
-      {selected && (
-        <aside className="side-panel frame-editor">
-          <FrameEditor
-            key={selected.id}
-            frame={selected}
-            projectId={projectId}
-            author={author}
-            onChanged={onChanged}
-            onClose={() => setSelectedId(null)}
-            onDeleted={() => {
-              setSelectedId(null)
-              onChanged()
-            }}
-            onError={showError}
-          />
-        </aside>
-      )}
     </div>
-  )
-}
-
-/** Edits the selected frame. Keyed by frame id in the parent, so its draft
- *  state resets cleanly when the selection changes. */
-function FrameEditor({
-  frame,
-  projectId,
-  author,
-  onChanged,
-  onClose,
-  onDeleted,
-  onError,
-}: {
-  frame: Frame
-  projectId: number
-  author: string
-  onChanged: () => void
-  onClose: () => void
-  onDeleted: () => void
-  onError: (e: unknown) => void
-}) {
-  const [taskDraft, setTaskDraft] = useState(
-    frame.task_id !== null ? String(frame.task_id) : '',
-  )
-  const [taskError, setTaskError] = useState<string | null>(null)
-
-  function saveTask() {
-    const trimmed = taskDraft.trim()
-    if (trimmed === '') {
-      setTaskError(null)
-      updateFrame(frame.id, { task_id: null }, author).then(onChanged, onError)
-      return
-    }
-    const id = Number(trimmed)
-    if (!Number.isInteger(id) || id <= 0) {
-      setTaskError('task id must be a positive number')
-      return
-    }
-    setTaskError(null)
-    updateFrame(frame.id, { task_id: id }, author).then(onChanged, (e) => {
-      setTaskError(e instanceof Error ? e.message : String(e))
-    })
-  }
-
-  return (
-    <>
-      <p className="panel-head">
-        <button className="panel-close" onClick={onClose}>
-          ✕
-        </button>
-      </p>
-      <h1>
-        <InlineEdit
-          value={frame.title}
-          onSave={(title) =>
-            updateFrame(frame.id, { title }, author).then(onChanged)
-          }
-        />
-      </h1>
-
-      <p className="description">
-        <InlineEdit
-          value={frame.body ?? ''}
-          multiline
-          placeholder="no body — click to add"
-          onSave={(d) =>
-            updateFrame(frame.id, { body: d === '' ? null : d }, author).then(
-              onChanged,
-            )
-          }
-        />
-      </p>
-
-      <p className="frame-field">
-        Colour{' '}
-        <input
-          type="color"
-          value={frame.color ?? '#0e1722'}
-          onChange={(e) =>
-            updateFrame(frame.id, { color: e.target.value }, author).then(
-              onChanged,
-              onError,
-            )
-          }
-        />
-        <button
-          onClick={() =>
-            updateFrame(frame.id, { color: null }, author).then(
-              onChanged,
-              onError,
-            )
-          }
-        >
-          clear
-        </button>
-      </p>
-
-      <p className="frame-field">
-        Task{' '}
-        <input
-          type="text"
-          className="task-input"
-          value={taskDraft}
-          placeholder="task id"
-          onChange={(e) => setTaskDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') saveTask()
-          }}
-        />
-        <button onClick={saveTask}>link</button>
-        {frame.task_id !== null && (
-          <a href={`#/projects/${projectId}/tasks/${frame.task_id}`}>
-            open #{frame.task_id}
-          </a>
-        )}
-        {taskError && <span className="error">{taskError}</span>}
-      </p>
-
-      <p>
-        <ConfirmDelete
-          label="delete frame"
-          message="Deletes this frame and the edges touching it."
-          onDelete={() => deleteFrame(frame.id, author).then(onDeleted)}
-        />
-      </p>
-    </>
   )
 }

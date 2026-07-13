@@ -311,6 +311,24 @@ export function getProjectFilesContent(
   )
 }
 
+/**
+ * Saves a file's full content, overwriting it on disk. Path and content ride
+ * the JSON body (matches the request wrapper's Content-Type header, keeping
+ * this mutating call inside the API's CSRF gate). A binary/truncated target,
+ * or oversized new content, 422s; an unsafe/unlisted/nonexistent path 404s.
+ * Returns the freshly re-read `FileContentView`.
+ */
+export function updateProjectFilesContent(
+  id: number,
+  path: string,
+  content: string,
+): Promise<FileContentView> {
+  return request(
+    `/api/projects/${id}/files/content`,
+    jsonInit('PATCH', { path, content }),
+  )
+}
+
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----
 
 /** The live Claude Code sessions under the project's folder. */

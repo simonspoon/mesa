@@ -19,7 +19,12 @@ import yaml from 'react-syntax-highlighter/dist/esm/languages/prism/yaml'
 import vscDarkPlus from 'react-syntax-highlighter/dist/esm/styles/prism/vsc-dark-plus'
 import { Markdown } from '../components/Markdown'
 import { splitFrontmatter } from '../frontmatter'
-import { getProjectFiles, getProjectFilesContent } from '../api'
+import {
+  ApiError,
+  getProjectFiles,
+  getProjectFilesContent,
+  updateProjectFilesContent,
+} from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
 import { useFetch } from '../useFetch'
 
@@ -165,7 +170,10 @@ function DeadFolderPlaceholder({ path }: { path: string }) {
 }
 
 /** The selected file's content: monospace, with a language-tinted header,
- * and binary/truncation indicators in place of raw/garbled bytes (M5/M6). */
+ * binary/truncation indicators in place of raw/garbled bytes (M5/M6), and an
+ * Edit affordance (task 327) for anything neither binary nor truncated — a
+ * truncated file's displayed bytes aren't its full content, so saving them
+ * back would corrupt it; the same reason the API itself refuses that write. */
 function ContentPane({
   projectId,
   path,
@@ -173,12 +181,50 @@ function ContentPane({
   projectId: number
   path: string
 }) {
-  const { data, error } = useFetch(
+  const { data, error, refetch } = useFetch(
     () => getProjectFilesContent(projectId, path),
     `files-content-${projectId}-${path}`,
   )
+  // Not path-keyed off `data` (which reloads under the same component
+  // instance as `path` changes) — the parent remounts this component on
+  // every path change via a `key={path}` prop, so this state naturally
+  // starts fresh per file; switching files mid-edit discards the draft,
+  // matching this app's no-confirmation posture on other destructive UI
+  // actions (deletes, etc.).
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
+
+  const editable = !data.is_binary && !data.truncated
+
+  function startEdit() {
+    setDraft(data!.content)
+    setSaveError(null)
+    setEditing(true)
+  }
+
+  function cancelEdit() {
+    setEditing(false)
+    setSaveError(null)
+  }
+
+  async function save() {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await updateProjectFilesContent(projectId, path, draft)
+      setEditing(false)
+      refetch()
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : 'Failed to save file.')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <div className="files-content">
@@ -190,8 +236,36 @@ function ContentPane({
         {data.truncated && (
           <span className="badge files-truncated-badge">truncated</span>
         )}
+        {editable && !editing && (
+          <button className="files-edit-btn" onClick={startEdit}>
+            Edit
+          </button>
+        )}
+        {editing && (
+          <span className="files-edit-actions">
+            <button onClick={save} disabled={saving}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={cancelEdit} disabled={saving}>
+              Cancel
+            </button>
+          </span>
+        )}
       </p>
-      {data.is_binary ? (
+      {saveError && <p className="error">{saveError}</p>}
+      {editing ? (
+        <textarea
+          autoFocus
+          className="files-content-editor"
+          value={draft}
+          spellCheck={false}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') cancelEdit()
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') save()
+          }}
+        />
+      ) : data.is_binary ? (
         <p className="muted">Binary file — cannot display.</p>
       ) : data.language === 'markdown' ? (
         <MarkdownBody content={data.content} />
@@ -316,11 +390,13 @@ function TreeNode({
 
 /**
  * The Files tab: the project's file tree (rooted at local_path) on the left,
- * expandable per directory, with the selected file's content on the right —
- * read-only, no edit/save/delete affordance anywhere (M11). Rendered in
- * place inside ProjectTasksPage's frame, like GitView/AgentsView. Empty
- * states are quiet placeholders, matching the Git/Agents tabs' ladder, never
- * a hard error (M10).
+ * expandable per directory, with the selected file's content on the right.
+ * A non-binary, non-truncated file can be edited and saved back to disk
+ * (task 327, `ContentPane`'s Edit affordance); everything else — browsing,
+ * the tree, no create/delete/rename — stays read-only. Rendered in place
+ * inside ProjectTasksPage's frame, like GitView/AgentsView. Empty states are
+ * quiet placeholders, matching the Git/Agents tabs' ladder, never a hard
+ * error (M10).
  */
 export function FilesView({ projectId }: { projectId: number }) {
   const { data, error } = useFetch(
@@ -388,7 +464,15 @@ export function FilesView({ projectId }: { projectId: number }) {
           </ul>
           <div className="files-content-pane">
             {selectedPath !== null ? (
-              <ContentPane projectId={projectId} path={selectedPath} />
+              // `key={selectedPath}` remounts on every file switch, which is
+              // what discards any in-progress edit's local state (draft,
+              // editing) when the user picks a different file — simpler than
+              // threading a reset effect through ContentPane.
+              <ContentPane
+                key={selectedPath}
+                projectId={projectId}
+                path={selectedPath}
+              />
             ) : (
               <p className="muted">Select a file to see its content.</p>
             )}

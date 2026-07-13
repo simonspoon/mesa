@@ -420,14 +420,17 @@ fn router(state: AppState) -> Router {
             "/api/projects/{id}/git/commits/{sha}/diff",
             get(get_project_git_commit_diff),
         )
-        // Files tab: read-only tree listing + file-content reads rooted at
-        // the project's `local_path`, like the git tab. No code execution
-        // (unlike Agents), so the standard guard only; GET-only, so the
-        // Content-Type gate doesn't apply either.
+        // Files tab: tree listing + file-content reads rooted at the
+        // project's `local_path`, like the git tab. The tree route stays a
+        // plain read (standard guard only, GET so the Content-Type gate
+        // doesn't apply). The content route's GET is the same; its PATCH
+        // (task 327, edit-and-save) shares the agents/hooks `require_agent_
+        // access` gate instead — writing into local_path is code-execution-
+        // adjacent, the same capability class those routes already guard.
         .route("/api/projects/{id}/files", get(get_project_files))
         .route(
             "/api/projects/{id}/files/content",
-            get(get_project_files_content),
+            get(get_project_files_content).patch(update_project_files_content),
         )
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
@@ -1738,6 +1741,70 @@ async fn get_project_files_content(
     view.map(|v| Json(v).into_response()).ok_or_else(not_found)
 }
 
+#[derive(Deserialize)]
+struct FilesContentUpdate {
+    path: String,
+    content: String,
+}
+
+/// Files tab edit-and-save (task 327). Path and new content ride the JSON
+/// body — not a query string — for the same reason attachments' upload does:
+/// it keeps this mutating route inside the Content-Type CSRF gate. Gated by
+/// [`require_agent_access`], not the plain `guard` the read routes above use:
+/// writing into a project's `local_path` is code-execution-adjacent (the
+/// written bytes can be a hook script, a git hook, or anything else that
+/// later executes), the same capability class as the agents/hooks routes —
+/// under `--lan` a peer who can already spawn an agent or run a hook in this
+/// folder gains nothing new here, so reusing that gate (rather than the
+/// stricter loopback-only `require_local_path_write`) is the coherent choice,
+/// not a looser one. On success, re-reads and returns the fresh
+/// `FileContentView` (matches every other mutation in this API echoing the
+/// full updated object). `core::files::write_file`'s `NotFound` collapses
+/// path-traversal/nonexistent/directory/write-failure into 404 `not_found`;
+/// `Validation` (binary target, truncated target, oversized new content) is
+/// 422 `validation` — mirrors the read route's own collapse-many-causes
+/// precedent.
+async fn update_project_files_content(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<FilesContentUpdate>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {}", body.path),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let rel = body.path.clone();
+    let content = body.content;
+    let write_root = root.clone();
+    let write_rel = rel.clone();
+    let write_result =
+        tokio::task::spawn_blocking(move || files::write_file(&write_root, &write_rel, &content))
+            .await
+            .unwrap_or(Err(files::WriteFileError::NotFound));
+    if let Err(err) = write_result {
+        return match err {
+            files::WriteFileError::NotFound => Err(not_found()),
+            files::WriteFileError::Validation(message) => Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: message.into(),
+            }),
+        };
+    }
+    let view = tokio::task::spawn_blocking(move || files::read_file(&root, &rel))
+        .await
+        .unwrap_or(None);
+    view.map(|v| Json(v).into_response()).ok_or_else(not_found)
+}
+
 /// Terminal access is code execution on this machine — a strictly stronger
 /// capability than the task CRUD the rest of the API exposes. In default
 /// (loopback) mode the agent endpoints are never served to non-local peers.
@@ -2823,6 +2890,126 @@ mod tests {
             Path(dead_project),
             Query(FilesContentQuery {
                 path: Some("a.txt".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Files tab: PATCH /files/content (mesa task 327) -------------------
+
+    /// Default-mode `require_agent_access` headers a real loopback browser
+    /// request would send: Host matches `test_state()`'s port 0, no Origin
+    /// (same-origin GETs/PATCHes from the embedded UI carry none).
+    fn loopback_agent_headers() -> HeaderMap {
+        hdrs(Some("localhost:0"), None)
+    }
+
+    #[tokio::test]
+    async fn update_files_content_edits_and_returns_fresh_view() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = update_project_files_content(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentUpdate {
+                path: "main.rs".to_string(),
+                content: "fn main() { edited(); }\n".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["content"], "fn main() { edited(); }\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            "fn main() { edited(); }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_files_content_rejects_non_loopback_peer_in_default_mode() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hi").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = update_project_files_content(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentUpdate {
+                path: "a.txt".to_string(),
+                content: "pwned".to_string(),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "hi",
+            "rejected write must never touch disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_files_content_traversal_binary_and_missing_are_rejected() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(root.join("img.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for (bad_path, expect_status) in [
+            ("../secret.txt", StatusCode::NOT_FOUND),
+            ("nope.txt", StatusCode::NOT_FOUND),
+            ("img.png", StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let resp = update_project_files_content(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(id),
+                Json(FilesContentUpdate {
+                    path: bad_path.to_string(),
+                    content: "x".to_string(),
+                }),
+            )
+            .await;
+            let err = resp.unwrap_err();
+            assert_eq!(err.status, expect_status, "path {bad_path:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("secret.txt")).unwrap(),
+            "top secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_files_content_no_local_path_is_not_found() {
+        let (_dir, state) = test_state();
+        let id = new_project(&state, None);
+        let resp = update_project_files_content(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentUpdate {
+                path: "a.txt".to_string(),
+                content: "x".to_string(),
             }),
         )
         .await;

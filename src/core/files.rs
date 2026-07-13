@@ -1,9 +1,11 @@
-//! Read-only file-tree listing + file-content reads rooted at a project's
+//! File-tree listing + file-content reads/writes rooted at a project's
 //! `local_path` (see `.scratch/arch.md` under mesa task 277/278 for the
-//! cross-area contract). Like `core::git`/`core::agents`, this module reads
+//! cross-area contract). Like `core::git`/`core::agents`, this module touches
 //! EXTERNAL filesystem state only — `std::fs`, no `Store` dependency beyond
 //! whatever `local_path` string its caller (279's API layer) already
-//! resolved — and never writes.
+//! resolved. `write_file` (task 327) is the one write in the module — it
+//! overwrites an existing text file's content in place; it never creates,
+//! deletes, or renames anything.
 
 use std::fs;
 use std::io::Read;
@@ -244,6 +246,51 @@ pub fn read_file(root: &str, rel: &str) -> Option<FileContentView> {
         truncated,
         language: language.map(str::to_string),
     })
+}
+
+/// Why [`write_file`] rejected the request. Both variants collapse many
+/// distinct causes into one, mirroring `read_file`'s own "one `None` for
+/// traversal/absolute/unlisted/directory" precedent:
+///   - `NotFound`: `safe_path` rejected `rel` (traversal, absolute-path
+///     smuggling, symlink escape, nonexistent path), the target is a
+///     directory, or the actual `fs::write` failed (permissions, disk full,
+///     the path vanished between the check and the write).
+///   - `Validation(reason)`: the target resolves to a real file but can't be
+///     safely edited from the capped, possibly-lossy view the editor showed
+///     — binary content, a truncated read (the true file is bigger than
+///     [`FILE_CONTENT_CAP`], so what was displayed wasn't the whole file),
+///     or new content that itself exceeds the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFileError {
+    NotFound,
+    Validation(&'static str),
+}
+
+/// Overwrites the file at `rel` (resolved the same way [`read_file`] resolves
+/// it — reused directly, not re-implemented) with `content`, replacing its
+/// entire byte content. Only ever writes to a path that already resolves to
+/// an existing, non-directory, non-binary, non-truncated file — this is an
+/// edit of a file the caller was shown, never a create, delete, or rename.
+pub fn write_file(root: &str, rel: &str, content: &str) -> Result<(), WriteFileError> {
+    let view = read_file(root, rel).ok_or(WriteFileError::NotFound)?;
+    if view.is_binary {
+        return Err(WriteFileError::Validation("cannot edit a binary file"));
+    }
+    if view.truncated {
+        return Err(WriteFileError::Validation(
+            "file is larger than mesa can safely edit",
+        ));
+    }
+    if content.len() > FILE_CONTENT_CAP {
+        return Err(WriteFileError::Validation(
+            "content is larger than mesa can safely write",
+        ));
+    }
+    // Re-resolve rather than reuse a path out of `view` (which carries none)
+    // — `safe_path` is the module's sole request-path-to-fs-path chokepoint,
+    // used identically by every reader/writer.
+    let path = safe_path(root, rel).ok_or(WriteFileError::NotFound)?;
+    fs::write(&path, content).map_err(|_| WriteFileError::NotFound)
 }
 
 /// NUL-byte sniff over the first 8 KiB — the standard cheap binary-file
@@ -518,5 +565,101 @@ mod tests {
         fs::write(dir.path().join("notes.xyz"), "plain text").unwrap();
         let v = read_file(root, "notes.xyz").unwrap();
         assert_eq!(v.language, None);
+    }
+
+    // --- write_file ---------------------------------------------------------
+
+    #[test]
+    fn write_file_overwrites_existing_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        assert_eq!(write_file(root, "main.rs", "fn main() { edited(); }\n"), Ok(()));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "fn main() { edited(); }\n"
+        );
+    }
+
+    #[test]
+    fn write_file_none_for_traversal_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+
+        assert_eq!(
+            write_file(root.to_str().unwrap(), "../secret.txt", "pwned"),
+            Err(WriteFileError::NotFound)
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("secret.txt")).unwrap(),
+            "top secret"
+        );
+    }
+
+    #[test]
+    fn write_file_not_found_for_nonexistent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert_eq!(
+            write_file(root, "nope.txt", "hi"),
+            Err(WriteFileError::NotFound)
+        );
+    }
+
+    #[test]
+    fn write_file_not_found_for_directory_given_as_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert_eq!(
+            write_file(root, "sub", "hi"),
+            Err(WriteFileError::NotFound)
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_binary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("img.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+
+        assert_eq!(
+            write_file(root, "img.png", "not a real png"),
+            Err(WriteFileError::Validation("cannot edit a binary file"))
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_truncated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let big = "a".repeat(FILE_CONTENT_CAP + 1000);
+        fs::write(dir.path().join("big.txt"), &big).unwrap();
+
+        let err = write_file(root, "big.txt", "short replacement").unwrap_err();
+        assert_eq!(
+            err,
+            WriteFileError::Validation("file is larger than mesa can safely edit")
+        );
+        // The write must never have happened — the file is untouched.
+        assert_eq!(fs::read_to_string(dir.path().join("big.txt")).unwrap(), big);
+    }
+
+    #[test]
+    fn write_file_rejects_oversized_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("small.txt"), "hi").unwrap();
+        let big_content = "a".repeat(FILE_CONTENT_CAP + 1);
+
+        let err = write_file(root, "small.txt", &big_content).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFileError::Validation("content is larger than mesa can safely write")
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("small.txt")).unwrap(), "hi");
     }
 }

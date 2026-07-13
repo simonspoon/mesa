@@ -2166,6 +2166,45 @@ body.agent-sidebar-resizing {
   overflow-wrap: anywhere;
 }
 
+/* Edit affordance (task 327) — pinned to the header's right edge, same
+   0.8rem button sizing as .inline-edit-actions for visual consistency with
+   the rest of the app's inline edit controls. */
+.files-content-header .files-edit-btn,
+.files-content-header .files-edit-actions {
+  margin-left: auto;
+}
+
+.files-edit-btn {
+  font-size: 0.8rem;
+}
+
+.files-edit-actions {
+  display: inline-flex;
+  gap: 0.5rem;
+}
+
+.files-edit-actions button {
+  font-size: 0.8rem;
+}
+
+/* Full-size editable twin of .files-content-text — same monospace sizing,
+   but a real form control filling the content pane instead of a <pre>. */
+.files-content-editor {
+  display: block;
+  width: 100%;
+  min-height: 60vh;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  resize: vertical;
+  background: none;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
 .badge.files-lang-badge {
   color: inherit;
   border-color: currentColor;

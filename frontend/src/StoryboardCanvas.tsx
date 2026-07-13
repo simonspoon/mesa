@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Background,
   BackgroundVariant,
@@ -23,6 +23,7 @@ import {
   type EdgeProps,
   type Node,
   type NodeProps,
+  type ReactFlowInstance,
   type Viewport,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
@@ -594,18 +595,31 @@ export function StoryboardCanvas({
     [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints],
   )
 
-  function addFrame() {
+  function addFrame(pos?: { x: number; y: number }) {
     const n = view.frames.length
     createFrame(storyboardId, {
       title: 'New frame',
-      x: 48 + (n % 6) * 28,
-      y: 48 + (n % 6) * 28,
+      x: pos ? Math.round(pos.x) : 48 + (n % 6) * 28,
+      y: pos ? Math.round(pos.y) : 48 + (n % 6) * 28,
       author,
     }).then((f) => {
       setError(null)
       onChanged()
       setSelectedId(f.id)
     }, showError)
+  }
+
+  // React Flow has no onPaneDoubleClick — capture the instance via onInit and
+  // gate on the event target so this only fires on the empty pane background,
+  // never bubbling up from a node/edge double-click (waypoint insert/remove).
+  const rfInstance = useRef<ReactFlowInstance<FrameNodeType, FrameEdgeType> | null>(
+    null,
+  )
+  function onPaneDoubleClick(e: React.MouseEvent) {
+    if (!(e.target as HTMLElement).classList.contains('react-flow__pane')) return
+    const inst = rfInstance.current
+    if (!inst) return
+    addFrame(inst.screenToFlowPosition({ x: e.clientX, y: e.clientY }))
   }
 
   function onNodeDragStop(_e: unknown, node: FrameNodeType) {
@@ -689,10 +703,14 @@ export function StoryboardCanvas({
           edges={edges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
+          onInit={(inst) => {
+            rfInstance.current = inst
+          }}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onNodeClick={(_e, node) => setSelectedId(Number(node.id))}
           onPaneClick={() => setSelectedId(null)}
+          onDoubleClick={onPaneDoubleClick}
           onConnect={onConnect}
           connectionMode={ConnectionMode.Loose}
           connectionLineComponent={FrameConnectionLine}
@@ -719,7 +737,7 @@ export function StoryboardCanvas({
           <Controls showInteractive={false} />
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="canvas-controls">
-            <button onClick={addFrame}>add frame</button>
+            <button onClick={() => addFrame()}>add frame</button>
             <button onClick={autoLayout} title="Arrange frames by flow direction">
               auto layout
             </button>

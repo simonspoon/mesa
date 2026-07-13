@@ -16,6 +16,15 @@
 //! every line with a timestamp contributes to a session's start/end span. Lines
 //! that don't parse, or aren't telemetry, are skipped.
 //!
+//! A call to the built-in `advisor` tool doesn't get its own transcript line
+//! or file the way a Task-tool subagent does — it's a `server_tool_use` block
+//! on an ordinary event, and the advisor model's own (often large) usage is
+//! nested inside that event's `usage.iterations[]` rather than the event's
+//! own top-level `usage` (which stays small — wrapper overhead only). Both
+//! are unfolded in [`fold_line`]/[`RawMessage::tool_uses`] so advisor calls
+//! and their real token/cost show up under their own model, tagged agent
+//! `"advisor"`.
+//!
 //! Cost is **estimated** from a static per-model price table (USD per million
 //! tokens). It is labelled as an estimate in the UI and will drift as pricing
 //! changes — update [`prices`] when it does.
@@ -86,13 +95,21 @@ impl RawMessage {
     /// the same leniency as malformed lines. `caller` is kept verbatim: a JSON
     /// string as-is, any other non-null value as its compact JSON text. Tool
     /// `input` payloads are deliberately never read (untrusted + large).
+    /// `server_tool_use` blocks (e.g. the built-in `advisor` tool) carry the
+    /// same `id`/`name`/`caller` shape as `tool_use` under a distinct `type`
+    /// tag, so they're read the same way.
     fn tool_uses(&self) -> Vec<(String, String, Option<String>)> {
         let Some(blocks) = self.content.as_ref().and_then(|c| c.as_array()) else {
             return Vec::new();
         };
         blocks
             .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .filter(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("tool_use") | Some("server_tool_use")
+                )
+            })
             .filter_map(|b| {
                 let id = b.get("id")?.as_str()?;
                 let name = b.get("name")?.as_str()?;
@@ -109,6 +126,29 @@ impl RawMessage {
 
 #[derive(Deserialize, Default)]
 struct RawUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    cache_read_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_input_tokens: i64,
+    /// A `server_tool_use` call to a tool that itself runs its own model turn
+    /// (currently only `advisor`) records that turn's real usage here rather
+    /// than in the top-level fields above, which stay small (wrapper
+    /// overhead only). Each entry's own `type` tags what kind of turn it was
+    /// (`"advisor_message"` for advisor); only those are read.
+    #[serde(default)]
+    iterations: Vec<RawIteration>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawIteration {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     input_tokens: i64,
     #[serde(default)]
@@ -349,6 +389,7 @@ fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Resul
             output_tokens: m.output_tokens,
             cache_read_input_tokens: m.cache_read_tokens,
             cache_creation_input_tokens: m.cache_creation_tokens,
+            ..Default::default()
         };
         let cost = estimate_cost(&m.model, &usage);
         // The message's session is always present above (its ts bounds the
@@ -513,9 +554,14 @@ fn parse_batch(bytes: &[u8]) -> (CcFileBatch, usize) {
 /// `parse_file`'s rules: a line needs a session id + parseable timestamp to
 /// count at all; every such line widens the session span and fills metadata
 /// keep-first; only lines with an event `uuid` yield message/tool-call rows
-/// (pinned in `.scratch/arch.md` — no synthetic keys). Parent-session linkage
-/// is the line's own `sessionId` (subagent lines carry the parent's id), with
-/// `agentId` attributing the row to its subagent run.
+/// (pinned in `.scratch/arch.md` — no synthetic keys for a *line* lacking its
+/// own uuid). Parent-session linkage is the line's own `sessionId` (subagent
+/// lines carry the parent's id), with `agentId` attributing the row to its
+/// subagent run. One exception to "no synthetic keys": an advisor call's
+/// nested `usage.iterations` turn has no uuid of its own (it isn't a
+/// separate line), so its message row is keyed off the *real* parent uuid
+/// plus a deterministic suffix — still idempotent, since re-ingesting the
+/// same line always derives the same key.
 fn fold_line(
     line: &str,
     sessions: &mut BTreeMap<String, CcSessionUpsert>,
@@ -611,6 +657,36 @@ fn fold_line(
             skill: raw.attribution_skill.clone(),
             agent: raw.attribution_agent.clone(),
         });
+        // An advisor call's own model turn is nested inside this event's
+        // usage.iterations rather than being its own transcript line (unlike
+        // a Task-tool subagent, which gets a separate subagents/*.jsonl
+        // file). Surface it as its own message row — keyed off this event's
+        // uuid since it has none of its own — so its real tokens/cost land
+        // under its own model and it shows up as agent "advisor", not folded
+        // invisibly into the caller's tiny wrapper usage above.
+        for (i, it) in usage
+            .iterations
+            .iter()
+            .filter(|it| it.kind.as_deref() == Some("advisor_message"))
+            .enumerate()
+        {
+            let Some(advisor_model) = it.model.as_ref() else {
+                continue;
+            };
+            batch.messages.push(CcMessageRow {
+                uuid: format!("{uuid}:advisor:{i}"),
+                session_id: sid.clone(),
+                agent_id: None,
+                ts,
+                model: advisor_model.clone(),
+                input_tokens: it.input_tokens,
+                output_tokens: it.output_tokens,
+                cache_read_tokens: it.cache_read_input_tokens,
+                cache_creation_tokens: it.cache_creation_input_tokens,
+                skill: raw.attribution_skill.clone(),
+                agent: Some("advisor".to_string()),
+            });
+        }
     }
 }
 
@@ -1230,6 +1306,7 @@ mod tests {
             output_tokens: 1_000_000,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            ..Default::default()
         };
         // Opus: $5 in + $25 out per Mtok = $30.
         assert!((estimate_cost("claude-opus-4-8", &u) - 30.0).abs() < 1e-9);
@@ -1695,6 +1772,80 @@ mod tests {
                 "SELECT session_id || '/' || agent FROM cc_agent_runs WHERE agent_id = 'agent-aaa'"
             ),
             "s1/Explore"
+        );
+    }
+
+    #[test]
+    fn sync_ingests_advisor_calls() {
+        // task 340: an advisor call is one `assistant` event with a
+        // `server_tool_use` block naming "advisor" and its own (large) model
+        // usage nested in `usage.iterations`, NOT a separate transcript line
+        // the way a Task-tool subagent gets one. Both the tool call and the
+        // advisor model's real usage must still be ingested.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-sonnet-5","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}}],"usage":{"input_tokens":4,"output_tokens":683,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":[{"type":"message","input_tokens":2,"output_tokens":85},{"type":"advisor_message","model":"claude-opus-4-8","input_tokens":91627,"output_tokens":18716,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},{"type":"message","input_tokens":2,"output_tokens":598}]}}}"#],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        let rep = sync(&mut store).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        assert_eq!(rep.files_ingested, 1);
+        // The caller's wrapper turn AND the advisor's own turn each yield a
+        // message row.
+        assert_eq!(rep.messages_added, 2);
+        assert_eq!(rep.tool_calls_added, 1);
+
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 2);
+        assert_eq!(
+            q::<String>(&db, "SELECT model FROM cc_messages WHERE uuid = 'u1'"),
+            "claude-sonnet-5"
+        );
+        // The advisor row is keyed off the parent event's uuid (no uuid of
+        // its own), carries the advisor's real model + tokens, and is
+        // tagged agent "advisor" so it surfaces distinctly from its caller.
+        let advisor_uuid = q::<String>(
+            &db,
+            "SELECT uuid FROM cc_messages WHERE uuid != 'u1'",
+        );
+        assert_eq!(advisor_uuid, "u1:advisor:0");
+        assert_eq!(
+            q::<String>(
+                &db,
+                "SELECT model || '/' || agent || '/' || skill || '/' \
+                 || input_tokens || '/' || output_tokens \
+                 || '/' || cache_read_tokens || '/' || cache_creation_tokens \
+                 FROM cc_messages WHERE uuid = 'u1:advisor:0'"
+            ),
+            "claude-opus-4-8/advisor/build/91627/18716/100/50"
+        );
+        assert_eq!(
+            q::<i64>(
+                &db,
+                "SELECT COUNT(*) FROM cc_messages \
+                 WHERE uuid = 'u1:advisor:0' AND agent_id IS NULL"
+            ),
+            1
+        );
+        // The advisor tool call itself is linked back to the parent event.
+        assert_eq!(
+            q::<String>(
+                &db,
+                "SELECT session_id || '/' || message_uuid || '/' || name \
+                 FROM cc_tool_calls WHERE tool_use_id = 'srv1'"
+            ),
+            "s1/u1/advisor"
         );
     }
 

@@ -729,6 +729,20 @@ CLI and API share it and never diverge.
   so their usage rolls into the parent session. An event's `uuid` (and a tool
   call's `tool_use_id`) is the idempotency key: all ingest writes are upserts,
   so re-ingesting any line is a no-op. Tool `input` payloads are never stored.
+- A call to the built-in **`advisor`** tool doesn't get its own transcript
+  line/file the way a Task-tool subagent does (no `subagents/*.jsonl`, no
+  `isSidechain`): it's a `server_tool_use` content block (read like
+  `tool_use`, so it still yields a `cc_tool_calls` row) on an ordinary event,
+  and the advisor model's own — often large — usage is nested inside that
+  same event's `usage.iterations[]` array (entries tagged
+  `"type":"advisor_message"`, each carrying its own `model`) rather than the
+  event's small top-level `usage` (wrapper overhead only). `fold_line` reads
+  those entries and emits a **second** `cc_messages` row for them, keyed off
+  the parent event's real `uuid` plus a deterministic suffix (the one
+  exception to "no synthetic keys" — still idempotent, since re-ingesting the
+  same line always derives the same key) and tagged agent `"advisor"`, so an
+  advisor call's real tokens/cost/model show up distinctly instead of being
+  folded invisibly into the caller's tiny wrapper usage.
 - **Ingest is incremental**: `cc::sync(store)` walks the tree against a
   per-file cursor (`cc_files`: mtime + size + byte offset), skipping unchanged
   files and resuming appended ones from the last complete line; each file

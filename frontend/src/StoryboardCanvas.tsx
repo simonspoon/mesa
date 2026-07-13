@@ -548,12 +548,12 @@ function FrameEdgeView({
       <BaseEdge id={id} path={path} markerEnd={markerEnd} />
       {/* Wider invisible hit target for click-to-insert — the visible path
           (BaseEdge's `.react-flow__edge-path`) is only 2px wide, too thin to
-          reliably double-click. */}
+          reliably double-click (mesa task 334: 16px was still too thin). */}
       <path
         d={path}
         fill="none"
         stroke="transparent"
-        strokeWidth={16}
+        strokeWidth={28}
         style={{ pointerEvents: 'stroke', cursor: 'copy' }}
         onDoubleClick={insertWaypoint}
       />

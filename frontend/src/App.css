@@ -551,9 +551,16 @@ main {
   box-shadow: 0 0 10px rgba(0, 229, 255, 0.15);
 }
 
+/* The source card stays in its list slot as a dimmed placeholder while
+   `.drag-overlay` below (dnd-kit's DragOverlay, portaled to document.body)
+   renders the crisp card that actually follows the pointer — see
+   KanbanBoard.tsx for why the moving card can't be this element itself. */
 .kanban-card.dragging {
-  position: relative;
-  z-index: 1;
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+.kanban-card.drag-overlay {
   cursor: grabbing;
   border-color: var(--cyan);
   box-shadow: 0 0 16px var(--cyan-dim);

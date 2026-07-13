@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import {
   DndContext,
+  DragOverlay,
   PointerSensor,
   useDroppable,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from '@dnd-kit/core'
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
@@ -14,6 +16,21 @@ import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
 const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
+
+function CardBody({ task }: { task: TaskSummary }) {
+  return (
+    <>
+      <span className="card-id muted">#{task.id}</span>
+      <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
+        {task.title}
+      </a>
+      <div>
+        <span className={`badge priority-${task.priority}`}>{task.priority}</span>
+        {task.blocked && <span className="badge blocked">blocked</span>}
+      </div>
+    </>
+  )
+}
 
 function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -33,14 +50,7 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
       {...listeners}
       {...attributes}
     >
-      <span className="card-id muted">#{task.id}</span>
-      <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
-        {task.title}
-      </a>
-      <div>
-        <span className={`badge priority-${task.priority}`}>{task.priority}</span>
-        {task.blocked && <span className="badge blocked">blocked</span>}
-      </div>
+      <CardBody task={task} />
     </li>
   )
 }
@@ -111,13 +121,19 @@ export function KanbanBoard({
   onMoved: () => void
 }) {
   const [error, setError] = useState<string | null>(null)
+  const [activeId, setActiveId] = useState<number | null>(null)
   // distance: 5 lets plain clicks reach the card's link without starting
   // a drag.
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   )
 
+  function handleDragStart(event: DragStartEvent) {
+    setActiveId(Number(event.active.id))
+  }
+
   function handleDragEnd(event: DragEndEvent) {
+    setActiveId(null)
     const { active, over } = event
     if (!over || active.id === over.id) return
     const id = Number(active.id)
@@ -158,10 +174,17 @@ export function KanbanBoard({
     )
   }
 
+  const activeTask = activeId === null ? null : tasks.find((t) => t.id === activeId)
+
   return (
     <>
       {error && <p className="error">{error}</p>}
-      <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+      <DndContext
+        sensors={sensors}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        onDragCancel={() => setActiveId(null)}
+      >
         <div className="kanban">
           {COLUMNS.map((status) => (
             <Column
@@ -171,6 +194,23 @@ export function KanbanBoard({
             />
           ))}
         </div>
+        {/* Portals the dragged card to document.body (dnd-kit's DragOverlay)
+            so it escapes the stacking context each `.kanban-column` forms via
+            its `clip-path` — without this, a card dragged over a
+            later-DOM-order sibling column rendered underneath that column's
+            own painted contents (bug 329), no z-index on the card itself
+            could fix it. */}
+        <DragOverlay>
+          {activeTask ? (
+            <div
+              className={`kanban-card drag-overlay${
+                activeTask.parent_id !== null ? ' subtask-card' : ''
+              }`}
+            >
+              <CardBody task={activeTask} />
+            </div>
+          ) : null}
+        </DragOverlay>
       </DndContext>
     </>
   )

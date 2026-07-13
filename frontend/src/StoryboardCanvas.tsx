@@ -609,6 +609,30 @@ export function StoryboardCanvas({
     }, showError)
   }
 
+  /** Cmd+D/Ctrl+D target: creates a copy of `frame` offset down-right so it
+   *  doesn't sit exactly on top of the original. Does not carry over the
+   *  linked task — a duplicate shouldn't silently point two frames at the
+   *  same task without the user choosing to. */
+  const duplicateFrame = useCallback(
+    (frame: Frame) => {
+      createFrame(storyboardId, {
+        title: frame.title,
+        body: frame.body ?? undefined,
+        x: frame.x + 32,
+        y: frame.y + 32,
+        w: frame.w,
+        h: frame.h,
+        color: frame.color ?? undefined,
+        author,
+      }).then((f) => {
+        setError(null)
+        onChanged()
+        setSelectedId(f.id)
+      }, showError)
+    },
+    [storyboardId, author, onChanged, showError],
+  )
+
   // React Flow has no onPaneDoubleClick — capture the instance via onInit and
   // gate on the event target so this only fires on the empty pane background,
   // never bubbling up from a node/edge double-click (waypoint insert/remove).
@@ -684,6 +708,23 @@ export function StoryboardCanvas({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [expanded])
+
+  // Cmd+D (Ctrl+D off-mac) duplicates the selected frame. Skipped while focus
+  // is in a text field (title/body/task-id inputs) so it doesn't fire
+  // mid-edit; preventDefault suppresses the browser's own bookmark shortcut.
+  useEffect(() => {
+    if (selectedId === null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== 'd' || !(e.metaKey || e.ctrlKey)) return
+      const target = e.target as HTMLElement
+      if (target.closest('input, textarea, [contenteditable="true"]')) return
+      e.preventDefault()
+      const frame = view.frames.find((f) => f.id === selectedId)
+      if (frame) duplicateFrame(frame)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selectedId, view.frames, duplicateFrame])
 
   const selected =
     selectedId === null

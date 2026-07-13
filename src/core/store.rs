@@ -703,6 +703,21 @@ pub struct Store {
     conn: Connection,
 }
 
+// Serializes the open sequence across threads *in this process*. Two
+// connections racing on `PRAGMA journal_mode=WAL`'s SHARED->EXCLUSIVE lock
+// promotion hit `SQLITE_BUSY` *immediately* — that failure bypasses the busy
+// handler entirely, so raising `busy_timeout` (confirmed up to 60s) never
+// helps (task 336; task 332's "busy_timeout before the WAL pragma" reduced
+// the window but can't close it, since the WAL pragma runs outside
+// `migrate`'s own `BEGIN IMMEDIATE`). A same-process mutex removes that
+// contention deterministically for the intra-process case (e.g. many
+// threads in one `cargo test` run opening the same fresh db, as this test
+// does). It does nothing for genuinely concurrent *processes* — that stays
+// on `migrate`'s `BEGIN IMMEDIATE`, which still only covers schema creation,
+// not this WAL conversion; a first-open race between two separate processes
+// remains a narrow, unhandled edge (task-332 territory, not fixed here).
+static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(parent) = path.parent()
@@ -711,6 +726,7 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        let _guard = OPEN_LOCK.lock().unwrap();
         // busy_timeout first: a concurrent journal_mode=WAL conversion on a
         // brand-new db needs a brief exclusive lock, and must be able to wait
         // on it rather than fail outright.

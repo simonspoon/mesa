@@ -23,6 +23,20 @@ function startedAgo(ms: number): string {
   return `${Math.floor(hours / 24)}d ago`
 }
 
+type Bucket = 'BLOCKED' | 'ACTIVE' | 'DONE'
+
+// `AgentSession` carries no completion timestamp (only `startedAt`, the
+// session's start time) — `claude agents --json` doesn't report one. DONE is
+// sorted by `startedAt` desc as the closest available proxy for "most
+// recently completed"; the bucketing itself is exact, driven by `state`.
+function bucketOf(a: AgentSession): Bucket {
+  if (a.state === 'blocked') return 'BLOCKED'
+  if (a.state === 'done' || a.state === 'failed' || a.state === 'stopped') return 'DONE'
+  return 'ACTIVE' // 'working', or no state at all (interactive sessions)
+}
+
+const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE', 'DONE']
+
 /**
  * Global, persistent right-hand sidebar: every live Claude Code session
  * across every project, with an embedded terminal for the selected one.
@@ -35,6 +49,13 @@ function startedAgo(ms: number): string {
 export function AgentSidebar() {
   const [collapsed, setCollapsed] = useState(true)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  // DONE starts collapsed (stale sessions aren't the thing you want to see
+  // first); BLOCKED/ACTIVE start open since those need attention.
+  const [collapsedSections, setCollapsedSections] = useState<Record<Bucket, boolean>>({
+    BLOCKED: false,
+    ACTIVE: false,
+    DONE: true,
+  })
   const [width, setWidth] = useState(DEFAULT_WIDTH)
   const [resizing, setResizing] = useState(false)
   // Maximized: the panel grows to fill the whole main content area (in place
@@ -159,40 +180,65 @@ export function AgentSidebar() {
           ) : agents.length === 0 ? (
             <p className="muted">No agents running.</p>
           ) : (
-            <ul className="card-list agent-list">
-              {agents.map((a) => {
-                const proj = projectForCwd(a.cwd, projects ?? [])
-                return (
-                  <li
-                    key={a.sessionId}
-                    className={
-                      (a.id !== null ? 'attachable' : '') +
-                      (a.id !== null && a.id === selectedId ? ' selected' : '')
+            BUCKETS.map((bucket) => {
+              const bucketAgents = agents.filter((a) => bucketOf(a) === bucket)
+              if (bucketAgents.length === 0) return null
+              const sectionCollapsed = collapsedSections[bucket]
+              return (
+                <div key={bucket} className="agent-sidebar-section">
+                  <button
+                    type="button"
+                    className="agent-sidebar-section-head"
+                    aria-expanded={!sectionCollapsed}
+                    onClick={() =>
+                      setCollapsedSections((s) => ({ ...s, [bucket]: !s[bucket] }))
                     }
-                    onClick={() => {
-                      if (a.id !== null) {
-                        setSelectedId(a.id)
-                        refetch()
-                      }
-                    }}
                   >
-                    <span className="agent-name">{agentLabel(a)}</span>
-                    <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
-                    {a.status && (
-                      <span className={`badge agent-status-${a.status}`}>{a.status}</span>
-                    )}
-                    {a.state && a.state !== a.status && (
-                      <span className={`badge agent-state-${a.state}`}>{a.state}</span>
-                    )}
-                    {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
-                    <div className="muted agent-meta">
-                      {proj ? proj.name : a.cwd} · started {startedAgo(a.startedAt)}
-                      {a.id === null && ' · external terminal — not attachable'}
-                    </div>
-                  </li>
-                )
-              })}
-            </ul>
+                    <span className="agent-sidebar-section-caret">
+                      {sectionCollapsed ? '▸' : '▾'}
+                    </span>
+                    {bucket}
+                    <span className="agent-sidebar-count">{bucketAgents.length}</span>
+                  </button>
+                  {!sectionCollapsed && (
+                    <ul className="card-list agent-list">
+                      {bucketAgents.map((a) => {
+                        const proj = projectForCwd(a.cwd, projects ?? [])
+                        return (
+                          <li
+                            key={a.sessionId}
+                            className={
+                              (a.id !== null ? 'attachable' : '') +
+                              (a.id !== null && a.id === selectedId ? ' selected' : '')
+                            }
+                            onClick={() => {
+                              if (a.id !== null) {
+                                setSelectedId(a.id)
+                                refetch()
+                              }
+                            }}
+                          >
+                            <span className="agent-name">{agentLabel(a)}</span>
+                            <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
+                            {a.status && (
+                              <span className={`badge agent-status-${a.status}`}>{a.status}</span>
+                            )}
+                            {a.state && a.state !== a.status && (
+                              <span className={`badge agent-state-${a.state}`}>{a.state}</span>
+                            )}
+                            {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
+                            <div className="muted agent-meta">
+                              {proj ? proj.name : a.cwd} · started {startedAgo(a.startedAt)}
+                              {a.id === null && ' · external terminal — not attachable'}
+                            </div>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  )}
+                </div>
+              )
+            })
           )}
         </div>
 

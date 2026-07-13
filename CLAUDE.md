@@ -606,6 +606,16 @@ persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
   nested folders) — the same path-prefix relationship `agents::is_under`
   matches on for the per-project route above. A session under no known
   project's folder shows its raw `cwd`.
+- The session list is grouped into three collapsible sections — BLOCKED
+  (`state === "blocked"`), ACTIVE (`state === "working"` or no `state` at all,
+  which covers interactive sessions — those never get a `state`), and DONE
+  (`state` is `done`/`failed`/`stopped`, i.e. the process has exited) — each a
+  `<button>` header toggling its own `collapsedSections[bucket]` entry; DONE
+  starts collapsed, BLOCKED/ACTIVE start open. `AgentSession` carries no
+  completion timestamp (`claude agents --json` doesn't report one, only
+  `startedAt`), so DONE is ordered by `startedAt` desc as the closest
+  available proxy rather than a true completion time. An empty bucket renders
+  no header at all (not an empty section).
 - Layout: list on top (own scroll region, capped height) and an attached
   terminal panel below (`AgentTerminal`, the same component the per-project
   Agents tab uses) — two separate containers, so scrolling back up to the

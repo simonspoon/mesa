@@ -1044,6 +1044,7 @@ fn compact(t: &Task) -> serde_json::Value {
         "priority": t.priority,
         "tags": t.tags,
         "acceptance": t.acceptance,
+        "sort_order": t.sort_order,
         "blocked": t.blocked,
     })
 }

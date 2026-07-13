@@ -37,6 +37,23 @@ export function AgentSidebar() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [width, setWidth] = useState(DEFAULT_WIDTH)
   const [resizing, setResizing] = useState(false)
+  // Maximized: the panel grows to fill the whole main content area (in place
+  // of the fixed drag-resized width), matching the storyboard canvas's own
+  // takeover-view expand toggle. Distinct from `collapsed` — maximized only
+  // has an effect while the panel isn't collapsed.
+  const [maximized, setMaximized] = useState(false)
+
+  // Escape leaves maximized mode — the usual way out of a takeover view,
+  // same convention as the storyboard canvas. Only bound while maximized so
+  // it never swallows Escape elsewhere.
+  useEffect(() => {
+    if (!maximized) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMaximized(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [maximized])
 
   // Drag-resize: the handle sits on the sidebar's left edge, so the new
   // width is just the distance from the pointer to the right edge of the
@@ -83,10 +100,10 @@ export function AgentSidebar() {
 
   return (
     <aside
-      className={`agent-sidebar${collapsed ? ' collapsed' : ''}${resizing ? ' resizing' : ''}`}
+      className={`agent-sidebar${collapsed ? ' collapsed' : ''}${resizing ? ' resizing' : ''}${maximized ? ' maximized' : ''}`}
       style={{ '--agent-sidebar-width': `${width}px` } as CSSProperties}
     >
-      {!collapsed && (
+      {!collapsed && !maximized && (
         <div
           className="agent-sidebar-resize-handle"
           onMouseDown={(e) => {
@@ -95,15 +112,39 @@ export function AgentSidebar() {
           }}
         />
       )}
-      <button
-        type="button"
-        className="sidebar-toggle agent-sidebar-toggle"
-        aria-label={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
-        title={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
-        onClick={() => setCollapsed((c) => !c)}
-      >
-        {collapsed ? '«' : '»'}
-      </button>
+      <div className="agent-sidebar-header-actions">
+        <button
+          type="button"
+          className="sidebar-toggle agent-sidebar-toggle"
+          aria-label={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
+          title={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
+          onClick={() => {
+            setCollapsed((c) => !c)
+            setMaximized(false)
+          }}
+        >
+          {collapsed ? '«' : '»'}
+        </button>
+        {!collapsed && (
+          <button
+            type="button"
+            className={`agent-sidebar-maximize${maximized ? ' active' : ''}`}
+            aria-label={
+              maximized
+                ? 'Restore agents sidebar width'
+                : 'Expand agents sidebar to fill the main content area'
+            }
+            title={
+              maximized
+                ? 'Restore panel width (Esc)'
+                : 'Expand panel to fill the main content area'
+            }
+            onClick={() => setMaximized((m) => !m)}
+          >
+            {maximized ? 'restore' : 'maximize'}
+          </button>
+        )}
+      </div>
 
       <div className="agent-sidebar-body">
         <div className="agent-sidebar-list">

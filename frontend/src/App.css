@@ -1865,6 +1865,35 @@ body.agent-sidebar-resizing {
   width: 2.5rem;
 }
 
+/* Maximized: the panel grows to fill the whole main content area instead of
+   its fixed drag-resized width — `:has()` reaches back to hide `main`
+   (it precedes `.agent-sidebar` in the DOM, so no forward sibling selector
+   can target it) since flexbox then has only the aside left to fill. */
+.agent-sidebar.maximized {
+  flex: 1 1 auto;
+  width: auto;
+}
+
+.agent-sidebar.maximized .agent-sidebar-body {
+  width: 100%;
+}
+
+.shell-body:has(.agent-sidebar.maximized) main {
+  display: none;
+}
+
+.agent-sidebar-maximize {
+  background: rgba(6, 10, 16, 0.85);
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+}
+
+.agent-sidebar-maximize.active {
+  color: var(--magenta);
+  border-color: var(--magenta);
+  box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
+}
+
 /* Drag handle on the left edge — straddles the border so it's grabbable
    from either side without stealing space from the content. */
 .agent-sidebar-resize-handle {
@@ -1882,13 +1911,20 @@ body.agent-sidebar-resizing {
   background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
 }
 
-.agent-sidebar-toggle {
+.agent-sidebar-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
   align-self: flex-start;
   margin: 0.5rem 0.5rem 0;
 }
 
-.agent-sidebar.collapsed .agent-sidebar-toggle {
+.agent-sidebar.collapsed .agent-sidebar-header-actions {
   align-self: center;
+}
+
+.agent-sidebar-toggle {
+  margin: 0;
 }
 
 /* Always in the DOM (never conditionally rendered on `collapsed`) — an

@@ -21,6 +21,7 @@ import {
   type ConnectionLineComponentProps,
   type Edge,
   type EdgeProps,
+  type FinalConnectionState,
   type Node,
   type NodeProps,
   type ReactFlowInstance,
@@ -685,6 +686,39 @@ export function StoryboardCanvas({
     }, showError)
   }
 
+  /** Dragging a connection from a frame's side dot and releasing over empty
+   *  canvas (not onto another frame's drop target) creates a new frame at
+   *  the release point and wires an edge from the source frame to it — the
+   *  standard React Flow "add node on connection drop" affordance. Dropping
+   *  on a frame still takes the `onConnect` path above and only makes an
+   *  edge; `connectionState.isValid` is truthy exactly when the drag ended
+   *  on a valid target handle, so this only fires on the empty-space case. */
+  function onConnectEnd(
+    event: MouseEvent | TouchEvent,
+    connectionState: FinalConnectionState,
+  ) {
+    const inst = rfInstance.current
+    if (connectionState.isValid || !connectionState.fromNode || !inst) return
+    const point = 'changedTouches' in event ? event.changedTouches[0] : event
+    const pos = inst.screenToFlowPosition({ x: point.clientX, y: point.clientY })
+    const fromId = connectionState.fromNode.id
+    createFrame(storyboardId, {
+      title: 'New frame',
+      x: Math.round(pos.x),
+      y: Math.round(pos.y),
+      author,
+    }).then((f) => {
+      setError(null)
+      onChanged()
+      setSelectedId(f.id)
+      createEdge(storyboardId, {
+        from_frame: Number(fromId),
+        to_frame: f.id,
+        author,
+      }).then(() => onChanged(), showError)
+    }, showError)
+  }
+
   // Pan/zoom is browser-local view state, keyed by board (boardView.ts): the
   // saved {tx, ty, scale} maps 1:1 onto React Flow's {x, y, zoom}. Loaded once
   // per mount (the parent remounts per board); saved on every move end.
@@ -753,6 +787,7 @@ export function StoryboardCanvas({
           onPaneClick={() => setSelectedId(null)}
           onDoubleClick={onPaneDoubleClick}
           onConnect={onConnect}
+          onConnectEnd={onConnectEnd}
           connectionMode={ConnectionMode.Loose}
           connectionLineComponent={FrameConnectionLine}
           defaultViewport={defaultViewport}

@@ -625,7 +625,18 @@ EXAMPLES
     /// first, exposed for cron/on-demand use. Output is one JSON object
     /// (files scanned/ingested, sessions touched, rows actually added); a
     /// second run with no new activity reports zero adds.
-    Sync,
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc sync             # incremental: only new/changed transcript bytes
+  mesa cc sync --rebuild   # clear cursors, re-walk everything from scratch")]
+    Sync {
+        /// Clear all cc_files cursors first, forcing every transcript to be
+        /// re-parsed from byte 0. Use after a cc.rs parsing fix, so it
+        /// retroactively applies to already-ingested history. Existing rows
+        /// are corrected in place (upsert on a stable key), never truncated.
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Print currently-running sessions (the live-sessions object)
     ///
     /// Sessions whose newest transcript event lands inside the last `--minutes`,
@@ -1520,12 +1531,12 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
     match cmd {
         CcCmd::Summary { window } => {
             let mut store = Store::open_default()?;
-            crate::core::cc::sync(&mut store)?;
+            crate::core::cc::sync(&mut store, false)?;
             print_json(&crate::core::cc::collect(&store, &window)?)
         }
         CcCmd::Sessions { window, limit } => {
             let mut store = Store::open_default()?;
-            crate::core::cc::sync(&mut store)?;
+            crate::core::cc::sync(&mut store, false)?;
             let mut rows = crate::core::cc::collect(&store, &window)?.sessions;
             if let Some(n) = limit {
                 rows.truncate(n);
@@ -1534,12 +1545,12 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
         }
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;
-            crate::core::cc::sync(&mut store)?;
+            crate::core::cc::sync(&mut store, false)?;
             print_json(&crate::core::cc::collect(&store, &window)?.skills)
         }
-        CcCmd::Sync => {
+        CcCmd::Sync { rebuild } => {
             let mut store = Store::open_default()?;
-            print_json(&crate::core::cc::sync(&mut store)?)
+            print_json(&crate::core::cc::sync(&mut store, rebuild)?)
         }
         CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
         CcCmd::Usage => match crate::core::usage::fetch() {

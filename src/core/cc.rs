@@ -488,11 +488,25 @@ pub struct CcSyncReport {
 /// the upsert keys, so a lost or stale cursor can only cost re-parsing, never
 /// duplicates. Each file commits in its own transaction (batch + cursor
 /// together), so a crash mid-sync loses at most "this file not yet ingested".
-pub fn sync(store: &mut Store) -> Result<CcSyncReport> {
+///
+/// `rebuild` clears every `cc_files` cursor first (`Store::cc_clear_cursors`),
+/// so this walk re-parses every transcript from byte 0 regardless of its
+/// mtime/size. Safe to call any time — never truncates `cc_*` data — but it
+/// is additive, not corrective: `cc_messages`/`cc_tool_calls` rows insert on
+/// `DO NOTHING`, so a row that already exists keeps its stored values. A
+/// `cc.rs` fix retroactively applies via rebuild only when it makes the
+/// parser emit a row (a new stable key) it previously missed entirely — the
+/// motivating case, mesa task 340's advisor-accounting fix. A fix that needs
+/// to *change* an already-ingested row's values still needs that row deleted
+/// by hand first.
+pub fn sync(store: &mut Store, rebuild: bool) -> Result<CcSyncReport> {
     let mut report = CcSyncReport::default();
     let Some(root) = projects_dir() else {
         return Ok(report);
     };
+    if rebuild {
+        store.cc_clear_cursors()?;
+    }
     let cursors = store.cc_cursors()?;
     let mut sessions_touched: HashSet<String> = HashSet::new();
     for f in collect_files(&root) {
@@ -1336,7 +1350,7 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        sync(&mut store).unwrap();
+        sync(&mut store, false).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
@@ -1406,7 +1420,7 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        sync(&mut store).unwrap();
+        sync(&mut store, false).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
@@ -1500,7 +1514,7 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", &root);
         }
-        sync(&mut store).unwrap();
+        sync(&mut store, false).unwrap();
         let before = collect(&store, "all").unwrap();
 
         // Claude Code cleans up its transcripts: every file disappears.
@@ -1720,7 +1734,7 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        let rep = sync(&mut store).unwrap();
+        let rep = sync(&mut store, false).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
@@ -1796,7 +1810,7 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        let rep = sync(&mut store).unwrap();
+        let rep = sync(&mut store, false).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
@@ -1864,13 +1878,13 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        let first = sync(&mut store).unwrap();
+        let first = sync(&mut store, false).unwrap();
         assert_eq!(first.files_ingested, 1);
         assert_eq!(first.messages_added, 2);
         assert_eq!(first.tool_calls_added, 1);
 
         // Unchanged tree: the cursor (mtime + size) skips the file unread.
-        let second = sync(&mut store).unwrap();
+        let second = sync(&mut store, false).unwrap();
         assert_eq!(second.files_scanned, 1);
         assert_eq!(second.files_ingested, 0);
         assert_eq!(second.sessions, 0);
@@ -1885,7 +1899,7 @@ mod tests {
                 .unwrap();
             writeln!(f, "{l3}").unwrap();
         }
-        let third = sync(&mut store).unwrap();
+        let third = sync(&mut store, false).unwrap();
         assert_eq!(third.files_ingested, 1);
         assert_eq!(third.messages_added, 1);
         assert_eq!(third.tool_calls_added, 1);
@@ -1895,7 +1909,7 @@ mod tests {
         // Shrunk file (rewrite/rotation — abnormal): full re-parse from 0,
         // upsert keys keep it duplicate-free.
         write_jsonl(&proj, "s1.jsonl", &[l1]);
-        let fourth = sync(&mut store).unwrap();
+        let fourth = sync(&mut store, false).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
@@ -1904,6 +1918,75 @@ mod tests {
         assert_eq!(fourth.tool_calls_added, 0);
         assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 3);
         assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_tool_calls"), 2);
+    }
+
+    #[test]
+    fn rebuild_reparses_unchanged_files_without_duplicating_rows() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        let l1 = r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","caller":{"type":"direct"}}],"usage":{"input_tokens":1,"output_tokens":2}}}"#;
+        write_jsonl(&proj, "s1.jsonl", &[l1]);
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        let first = sync(&mut store, false).unwrap();
+        assert_eq!(first.files_ingested, 1);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_files"), 1);
+
+        // Unchanged tree, no rebuild: cursor skips the file unread.
+        let plain = sync(&mut store, false).unwrap();
+        assert_eq!(plain.files_ingested, 0);
+
+        // Simulate the mesa-task-340 scenario: a row later versions of the
+        // parser would emit is missing from an older ingest (here, deleted
+        // directly to stand in for "never ingested by the old parser").
+        // A rebuild re-walks the same bytes and backfills it — the actual
+        // value-add over a plain sync, which the cursor would have skipped.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM cc_tool_calls WHERE tool_use_id = 'tu1'", [])
+                .unwrap();
+        }
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_tool_calls"), 0);
+
+        // Also stand in for the *unsupported* case: a fix that would change
+        // an already-present row's stored values. `cc_messages` inserts on
+        // `DO NOTHING`, so this corrupted value must NOT be corrected by a
+        // rebuild — proving rebuild is additive-only, never corrective.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE cc_messages SET input_tokens = 999 WHERE uuid = 'u1'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Unchanged tree, rebuild: the cursor is cleared first, so the file
+        // is re-walked from byte 0 regardless of mtime/size.
+        let rebuilt = sync(&mut store, true).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        assert_eq!(rebuilt.files_scanned, 1);
+        assert_eq!(rebuilt.files_ingested, 1);
+        // The missing tool-call row is backfilled...
+        assert_eq!(rebuilt.tool_calls_added, 1);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_tool_calls"), 1);
+        // ...no duplicate cc_files cursor or cc_messages row is created...
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_files"), 1);
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 1);
+        assert_eq!(rebuilt.messages_added, 0);
+        // ...and the already-present (corrupted) message row is left as-is —
+        // rebuild backfills missing rows, it does not correct existing ones.
+        assert_eq!(
+            q::<i64>(&db, "SELECT input_tokens FROM cc_messages WHERE uuid = 'u1'"),
+            999
+        );
     }
 
     #[test]
@@ -1936,7 +2019,7 @@ mod tests {
         unsafe {
             std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
         }
-        sync(&mut store).unwrap();
+        sync(&mut store, false).unwrap();
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }

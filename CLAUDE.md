@@ -743,15 +743,28 @@ CLI and API share it and never diverge.
   same line always derives the same key) and tagged agent `"advisor"`, so an
   advisor call's real tokens/cost/model show up distinctly instead of being
   folded invisibly into the caller's tiny wrapper usage.
-- **Ingest is incremental**: `cc::sync(store)` walks the tree against a
+- **Ingest is incremental**: `cc::sync(store, rebuild)` walks the tree against a
   per-file cursor (`cc_files`: mtime + size + byte offset), skipping unchanged
   files and resuming appended ones from the last complete line; each file
   commits in its own transaction (`Store::cc_ingest_file`). The cursor is only
   an optimization — correctness comes from the upsert keys. It runs
-  automatically before `mesa cc summary|sessions|skills|sync` and `GET
-  /api/cc`, but deliberately NOT in `cc live` / `GET /api/cc/live` (hot 3s
-  poll; live keeps parsing recent files directly — they're by definition still
-  present) nor `cc usage` (network path, no transcripts). `mesa cc sync` prints
+  automatically (`rebuild = false`) before `mesa cc summary|sessions|skills|sync`
+  and `GET /api/cc`, but deliberately NOT in `cc live` / `GET /api/cc/live` (hot
+  3s poll; live keeps parsing recent files directly — they're by definition
+  still present) nor `cc usage` (network path, no transcripts). `mesa cc sync
+  --rebuild` (`rebuild = true`) clears every `cc_files` cursor first
+  (`Store::cc_clear_cursors`) so the walk re-parses every transcript from byte
+  0 regardless of mtime/size — safe any time, never truncates `cc_*` data, but
+  it is **additive, not corrective**: `cc_messages`/`cc_tool_calls` insert on
+  `DO NOTHING`, so a row that already exists keeps its stored values. A
+  `cc.rs` parsing fix retroactively applies via rebuild only when it makes the
+  parser emit a row (a new stable key) it previously missed entirely — the
+  motivating case, mesa task 340's advisor-accounting fix, which added a
+  second `cc_messages` row under a key that never existed before. A fix that
+  needs to *change* an already-ingested row's values still needs that row
+  deleted by hand before a rebuild backfills it. Only exposed via the CLI,
+  not the API — an operator/one-off action, not something a dashboard read
+  should ever trigger. `mesa cc sync` prints
   the `CcSyncReport` (`{files_scanned, files_ingested, sessions,
   messages_added, tool_calls_added}`; a no-change re-run adds zeros).
 - **Cost is estimated at read time** from a static per-model price table
@@ -767,8 +780,8 @@ CLI and API share it and never diverge.
   daily series + model/skill/agent/project/tool breakdowns + capped session rows).
 - CLI: `mesa cc {summary,sessions,skills,sync}` (JSON only; `summary` prints the
   full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
-  `--limit` on `sessions`; `sync` takes neither). Like every other handler these
-  open the database; only `cc live` and `cc usage` stay store-less.
+  `--limit` on `sessions` and `--rebuild` on `sync`). Like every other handler
+  these open the database; only `cc live` and `cc usage` stay store-less.
 - API: `GET /api/cc?window=<w>` syncs, then serves the dashboard from an
   in-memory cache in `AppState.cc_cache` keyed per-window by `Store::cc_stamp()`
   — a monotone count over the cc tables (rows are never deleted), so it sees

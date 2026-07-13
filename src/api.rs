@@ -2430,7 +2430,7 @@ async fn get_cc_dashboard(
     let window = q.window.unwrap_or_else(|| "30d".to_string());
     let stamp = {
         let mut store = state.store.lock().unwrap();
-        crate::core::cc::sync(&mut store)?;
+        crate::core::cc::sync(&mut store, false)?;
         store.cc_stamp()?
     };
     {
@@ -2481,7 +2481,7 @@ async fn get_project_cc_dashboard(
     };
     let stamp = {
         let mut store = state.store.lock().unwrap();
-        crate::core::cc::sync(&mut store)?;
+        crate::core::cc::sync(&mut store, false)?;
         store.cc_stamp()?
     };
     let key = (id, window.clone());

@@ -3,10 +3,10 @@
 # the mesa store (cc_* tables) and serves the dashboard from the db, so this
 # drives it against a tiny synthetic transcript tree (MESA_CC_PROJECTS_DIR) and a
 # throwaway db (MESA_DB), asserting: the summary/sessions/skills JSON shapes, the
-# `cc sync` report + its idempotency (second sync = no-op), tool-call and
-# subagent rows, persistence across transcript deletion, and auto-ingest on a
-# plain dashboard read. `cc live` stays a direct file parse (no db) and is
-# checked last.
+# `cc sync` report + its idempotency (second sync = no-op), `cc sync --rebuild`
+# re-walking without duplicating rows, tool-call and subagent rows, persistence
+# across transcript deletion, and auto-ingest on a plain dashboard read.
+# `cc live` stays a direct file parse (no db) and is checked last.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -60,6 +60,19 @@ assert r["messages_added"]==0, r
 assert r["tool_calls_added"]==0, r
 print("sync idempotent ok")
 ' || fail "second sync not a no-op"
+
+# sync --rebuild: clears cursors, re-walks both files, re-adds nothing (same
+# stable-key upserts as a plain sync) — proves a rebuild is safe to run any
+# time, not just a way to force re-parsing.
+"$BIN" cc sync --rebuild | python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+assert r["files_scanned"]==2, r
+assert r["files_ingested"]==2, r
+assert r["messages_added"]==0, r
+assert r["tool_calls_added"]==0, r
+print("sync --rebuild ok")
+' || fail "sync --rebuild did not re-walk without duplicating rows"
 
 # summary: full dashboard object with the expected top-level keys + counts,
 # including the tools breakdown and the subagent-attributed agents breakdown.

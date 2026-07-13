@@ -2133,6 +2133,21 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
+    /// Deletes every `cc_files` cursor row, forcing the next [`crate::core::cc::sync`]
+    /// to re-walk every transcript from byte 0. Only the cursors are cleared —
+    /// the already-ingested `cc_*` rows are never truncated. Re-ingest is
+    /// additive, not corrective: `cc_messages`/`cc_tool_calls` insert on
+    /// `DO NOTHING`, so a row that already exists keeps its stored values
+    /// untouched — a parsing fix retroactively applies only in the sense
+    /// that it can now emit a row (a new stable key) it previously missed,
+    /// e.g. mesa task 340's advisor-accounting fix. A fix that needs to
+    /// *change* an already-ingested row's values still needs a manual
+    /// `DELETE` of that row (or table) before a rebuild backfills it.
+    pub fn cc_clear_cursors(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM cc_files", [])?;
+        Ok(())
+    }
+
     /// Upserts one transcript file's parsed telemetry and its cursor row in
     /// ONE transaction, so a crash mid-sync loses at most "this file not yet
     /// ingested", never a half-advanced cursor. Idempotent by construction:

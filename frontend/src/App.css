@@ -311,6 +311,10 @@ main {
   align-self: flex-start;
 }
 
+.panel-form .inline-edit-actions {
+  align-self: flex-start;
+}
+
 .project-actions {
   display: flex;
   gap: 0.75rem;

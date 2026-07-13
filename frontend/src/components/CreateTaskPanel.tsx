@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { createAttachment, createTask } from '../api'
 import { parseTags } from '../tags'
 import type { Priority } from '../types/Priority'
+import type { Status } from '../types/Status'
 
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 
@@ -29,6 +30,10 @@ function readFileAsBase64(file: File): Promise<string> {
  * "stage before create" endpoint). If some uploads fail, the task itself
  * still exists: the form stays open with only the failed files staged so
  * submitting again retries just those, instead of creating a duplicate task.
+ *
+ * The primary submit button omits `status`, so the API defaults new tasks to
+ * `backlog` (spec 302). The secondary "create + move to todo" button passes
+ * `status: 'todo'` explicitly, a fast path around that triage step.
  */
 export function CreateTaskPanel({
   projectId,
@@ -58,8 +63,7 @@ export function CreateTaskPanel({
     setPendingFiles((prev) => prev.filter((_, i) => i !== index))
   }
 
-  async function submit(e: React.FormEvent) {
-    e.preventDefault()
+  async function submit(status?: Status) {
     setSubmitting(true)
     setError(null)
     try {
@@ -71,6 +75,7 @@ export function CreateTaskPanel({
           description: description === '' ? undefined : description,
           priority,
           tags: parseTags(tags),
+          ...(status ? { status } : {}),
         })
         taskId = task.id
         setCreatedTaskId(taskId)
@@ -118,7 +123,13 @@ export function CreateTaskPanel({
         </button>
       </p>
       <h2>New task</h2>
-      <form className="panel-form" onSubmit={submit}>
+      <form
+        className="panel-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          submit()
+        }}
+      >
         <input
           type="text"
           value={title}
@@ -170,13 +181,24 @@ export function CreateTaskPanel({
             ))}
           </ul>
         )}
-        <button type="submit" disabled={submitting}>
-          {createdTaskId === null
-            ? 'create'
-            : pendingFiles.length > 0
-              ? `retry ${pendingFiles.length} attachment(s)`
-              : 'done'}
-        </button>
+        <div className="inline-edit-actions">
+          <button type="submit" disabled={submitting}>
+            {createdTaskId === null
+              ? 'create'
+              : pendingFiles.length > 0
+                ? `retry ${pendingFiles.length} attachment(s)`
+                : 'done'}
+          </button>
+          {createdTaskId === null && (
+            <button
+              type="button"
+              disabled={submitting || title.trim() === ''}
+              onClick={() => submit('todo')}
+            >
+              create + move to todo
+            </button>
+          )}
+        </div>
         {error && <span className="error">{error}</span>}
       </form>
     </>

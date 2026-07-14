@@ -37,10 +37,10 @@ use serde_json::json;
 
 use crate::core::{
     AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry, FrameNew,
-    FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, NextResult,
-    Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
-    ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, files, git, hooks,
+    FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
+    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary,
+    Waypoint, agents, attachments, files, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -101,6 +101,13 @@ struct AppState {
     /// handlers stay decoupled; same TTL/shape rationale. `None` is a cached
     /// miss (not a repo). Diffs are not cached — on-demand, one file, cheap.
     git_view_cache: Arc<Mutex<HashMap<String, (Instant, Option<GitRepoView>)>>>,
+    /// Every worktree of the repo behind a project folder, keyed by
+    /// `local_path` (`git worktree list` always reports the full set
+    /// regardless of which worktree it's run from, so `local_path` alone is
+    /// the right cache key — not `(local_path, selected worktree)`). Backs
+    /// the git tab's worktree selector and the `?worktree=` allowlist on the
+    /// view/diff routes below. Same TTL/shape rationale as `git_view_cache`.
+    git_worktrees_cache: Arc<Mutex<HashMap<String, (Instant, Option<Vec<GitWorktree>>)>>>,
     /// Recent commit log per project folder, keyed by `local_path`. Cached
     /// (S3) so refetch-on-focus doesn't respawn `git log` every render; same
     /// GIT_TTL/eviction-cap pattern as `git_view_cache`.
@@ -268,6 +275,7 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> 
         agents_gen: Arc::new(AtomicU64::new(0)),
         git_cache: Arc::new(Mutex::new(HashMap::new())),
         git_view_cache: Arc::new(Mutex::new(HashMap::new())),
+        git_worktrees_cache: Arc::new(Mutex::new(HashMap::new())),
         git_log_cache: Arc::new(Mutex::new(HashMap::new())),
         git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
         files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1404,7 +1412,9 @@ async fn get_git_status(State(state): State<AppState>) -> ApiResult<Response> {
 /// through `git_view_cache`: `(None, None)` when no folder is linked,
 /// `(Some(path), None)` when the folder is gone or not a git repo — quiet
 /// empty shapes, never an error (agents-endpoint posture). Unknown project
-/// id still surfaces as `not_found` via `get_project`.
+/// id still surfaces as `not_found` via `get_project`. Always reads
+/// `local_path` itself — the History routes below never take a `?worktree=`
+/// override (commit history is shared across worktrees of one repo).
 async fn project_git_view(
     state: &AppState,
     id: i64,
@@ -1416,20 +1426,29 @@ async fn project_git_view(
     if !std::path::Path::new(&path).is_dir() {
         return Ok((Some(path), None));
     }
+    let view = git_view_at(state, &path).await;
+    Ok((Some(path), view))
+}
+
+/// The working-tree view (branch + changed-file list) of one directory,
+/// through `git_view_cache` keyed by that directory — generalized out of
+/// `project_git_view` so the git-tab routes can point it at either a
+/// project's `local_path` or one of its worktrees (`resolve_git_dir`).
+async fn git_view_at(state: &AppState, dir: &str) -> Option<GitRepoView> {
     let cached = {
         let cache = state.git_view_cache.lock().unwrap();
         cache
-            .get(&path)
+            .get(dir)
             .filter(|(at, _)| at.elapsed() < GIT_TTL)
             .map(|(_, v)| v.clone())
     };
-    let view = match cached {
+    match cached {
         Some(v) => v,
         None => {
             // Blocking subprocess (like the sidebar status) — keep it off the
             // async workers. A panic just means "no view this request".
-            let dir = path.clone();
-            let v = tokio::task::spawn_blocking(move || git::view_of(&dir))
+            let d = dir.to_string();
+            let v = tokio::task::spawn_blocking(move || git::view_of(&d))
                 .await
                 .unwrap_or(None);
             let mut cache = state.git_view_cache.lock().unwrap();
@@ -1437,35 +1456,132 @@ async fn project_git_view(
             if cache.len() >= 64 {
                 cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
             }
-            cache.insert(path.clone(), (Instant::now(), v.clone()));
+            cache.insert(dir.to_string(), (Instant::now(), v.clone()));
             v
         }
+    }
+}
+
+/// Every worktree of the repo behind `local_path`, through
+/// `git_worktrees_cache` keyed by `local_path` (the list is the same
+/// regardless of which worktree it's queried from, so `local_path` alone is
+/// the right key). `None` when `local_path` is not a repo.
+async fn git_worktrees_at(state: &AppState, local_path: &str) -> Option<Vec<GitWorktree>> {
+    let cached = {
+        let cache = state.git_worktrees_cache.lock().unwrap();
+        cache
+            .get(local_path)
+            .filter(|(at, _)| at.elapsed() < GIT_TTL)
+            .map(|(_, v)| v.clone())
     };
-    Ok((Some(path), view))
+    match cached {
+        Some(v) => v,
+        None => {
+            let d = local_path.to_string();
+            let v = tokio::task::spawn_blocking(move || git::worktrees_of(&d))
+                .await
+                .unwrap_or(None);
+            let mut cache = state.git_worktrees_cache.lock().unwrap();
+            if cache.len() >= 64 {
+                cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+            }
+            cache.insert(local_path.to_string(), (Instant::now(), v.clone()));
+            v
+        }
+    }
+}
+
+/// Resolves which directory a git-view/diff request should actually read:
+/// `local_path` by default, or a caller-selected worktree of it when
+/// `worktree` is `Some`. `worktree` must be byte-equal to one of
+/// `git_worktrees_at(local_path)`'s `path` entries — that list is the
+/// allowlist, the same membership-based defense as `?path=` on the diff
+/// route (an unlisted/absolute/unrelated folder 404s rather than ever
+/// reaching a `git -C <dir>` call). Also returns the worktree list itself so
+/// callers that need it (the view route) don't re-fetch it.
+async fn resolve_git_dir(
+    state: &AppState,
+    local_path: &str,
+    worktree: Option<&str>,
+) -> ApiResult<(String, Option<Vec<GitWorktree>>)> {
+    let worktrees = git_worktrees_at(state, local_path).await;
+    match worktree {
+        None => Ok((local_path.to_string(), worktrees)),
+        Some(w) => {
+            let listed = worktrees
+                .as_ref()
+                .is_some_and(|wt| wt.iter().any(|e| e.path == w));
+            if !listed {
+                return Err(ApiError {
+                    status: StatusCode::NOT_FOUND,
+                    code: "not_found",
+                    message: format!("worktree not found: {w}"),
+                });
+            }
+            Ok((w.to_string(), worktrees))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GitViewQuery {
+    /// Selects which worktree's status/files `repo` reflects; must be a
+    /// path from this same response's `worktrees` list (see
+    /// `resolve_git_dir`). Omitted → the project's own `local_path`.
+    worktree: Option<String>,
 }
 
 /// Working-tree view (branch + changed-file list) of this project's
-/// `local_path` for the git tab. Read-only external state behind the
-/// standard guard only, like `/api/git-status`.
+/// `local_path`, or of one of its worktrees when `?worktree=` selects one,
+/// for the git tab. Read-only external state behind the standard guard
+/// only, like `/api/git-status`.
 async fn get_project_git(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(q): Query<GitViewQuery>,
 ) -> ApiResult<Response> {
-    let (path, repo) = project_git_view(&state, id).await?;
-    Ok(Json(ProjectGitView { path, repo }).into_response())
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let Some(local_path) = local_path else {
+        return Ok(Json(ProjectGitView {
+            path: None,
+            repo: None,
+            worktrees: None,
+        })
+        .into_response());
+    };
+    if !std::path::Path::new(&local_path).is_dir() {
+        return Ok(Json(ProjectGitView {
+            path: Some(local_path),
+            repo: None,
+            worktrees: None,
+        })
+        .into_response());
+    }
+    let (dir, worktrees) = resolve_git_dir(&state, &local_path, q.worktree.as_deref()).await?;
+    let repo = git_view_at(&state, &dir).await;
+    Ok(Json(ProjectGitView {
+        path: Some(local_path),
+        repo,
+        worktrees,
+    })
+    .into_response())
 }
 
 #[derive(Deserialize)]
 struct GitDiffQuery {
     path: Option<String>,
+    /// Same worktree selector as `GitViewQuery` — the diff is read from the
+    /// selected worktree's directory, and `path` is checked against *that*
+    /// worktree's own file-status list, not the project's default one.
+    worktree: Option<String>,
 }
 
-/// Unified diff for one file from the project's git status list. `?path=`
-/// must be byte-equal to a listed file's `path` (or rename `orig_path`) —
-/// git's own status output is the allowlist, so this can never read a file
-/// git didn't report (`../…`, absolute paths, and clean files are all
-/// non-members → `not_found`). A failed/empty underlying diff is `diff: ""`,
-/// never an error.
+/// Unified diff for one file from the selected worktree's (default: the
+/// project's `local_path`) git status list. `?path=` must be byte-equal to a
+/// listed file's `path` (or rename `orig_path`) — git's own status output is
+/// the allowlist, so this can never read a file git didn't report (`../…`,
+/// absolute paths, and clean files are all non-members → `not_found`). A
+/// failed/empty underlying diff is `diff: ""`, never an error.
 async fn get_project_git_diff(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1476,18 +1592,27 @@ async fn get_project_git_diff(
         code: "validation",
         message: "path query parameter is required".into(),
     })?;
-    let (path, repo) = project_git_view(&state, id).await?;
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("path not in git status: {wanted}"),
+    };
+    let Some(local_path) = local_path else {
+        return Err(not_found());
+    };
+    if !std::path::Path::new(&local_path).is_dir() {
+        return Err(not_found());
+    }
+    let (dir, _worktrees) = resolve_git_dir(&state, &local_path, q.worktree.as_deref()).await?;
+    let repo = git_view_at(&state, &dir).await;
     let file = repo.as_ref().and_then(|r| {
         r.files
             .iter()
             .find(|f| f.path == wanted || f.orig_path.as_deref() == Some(wanted.as_str()))
     });
-    let (Some(dir), Some(file)) = (path, file) else {
-        return Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            code: "not_found",
-            message: format!("path not in git status: {wanted}"),
-        });
+    let Some(file) = file else {
+        return Err(not_found());
     };
     let untracked = file.status == "??";
     let target = wanted.clone();
@@ -2725,6 +2850,7 @@ mod tests {
             agents_gen: Arc::new(AtomicU64::new(0)),
             git_cache: Arc::new(Mutex::new(HashMap::new())),
             git_view_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_worktrees_cache: Arc::new(Mutex::new(HashMap::new())),
             git_log_cache: Arc::new(Mutex::new(HashMap::new())),
             git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
             files_tree_cache: Arc::new(Mutex::new(HashMap::new())),

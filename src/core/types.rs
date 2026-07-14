@@ -193,6 +193,22 @@ pub struct GitRepoView {
     pub files: Vec<GitFile>,
 }
 
+/// One entry from `git worktree list --porcelain` (see
+/// `core::git::worktrees_of`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GitWorktree {
+    /// Absolute path of this worktree's checkout.
+    pub path: String,
+    /// Checked-out branch name; None when detached.
+    pub branch: Option<String>,
+    /// HEAD commit, full sha.
+    pub head: String,
+    /// True for the worktree at the project's own `local_path` — the one
+    /// mesa is anchored to, highlighted in the UI as "current".
+    pub is_current: bool,
+}
+
 /// `GET /api/projects/{id}/git` response. Mirrors ProjectAgents' empty-state
 /// pattern: path null = no local_path; path set + repo null = folder gone
 /// or not a git repo. Never an error.
@@ -201,6 +217,10 @@ pub struct GitRepoView {
 pub struct ProjectGitView {
     pub path: Option<String>,
     pub repo: Option<GitRepoView>,
+    /// All worktrees of this repo (from `local_path`, regardless of which
+    /// one `repo` currently reflects — see `?worktree=` on this route).
+    /// None alongside `repo: None` (no repo to list worktrees of).
+    pub worktrees: Option<Vec<GitWorktree>>,
 }
 
 /// `GET /api/projects/{id}/git/diff` response. Also reused verbatim for

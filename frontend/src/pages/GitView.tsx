@@ -9,6 +9,7 @@ import {
 import type { GitCommit } from '../types/GitCommit'
 import type { GitCommitFile } from '../types/GitCommitFile'
 import type { GitFile } from '../types/GitFile'
+import type { GitWorktree } from '../types/GitWorktree'
 import { useFetch } from '../useFetch'
 
 // Human word for one porcelain-v2 status char. X = staged column,
@@ -97,11 +98,21 @@ function DiffText({ diff }: { diff: string }) {
   )
 }
 
-/** The selected working-tree file's unified diff vs HEAD. */
-function DiffPane({ projectId, path }: { projectId: number; path: string }) {
+/** The selected working-tree file's unified diff vs HEAD, scoped to
+ * `worktree` when a non-default one is selected (same selector GitView's
+ * own file list/diff already resolved `path` against). */
+function DiffPane({
+  projectId,
+  path,
+  worktree,
+}: {
+  projectId: number
+  path: string
+  worktree: string | null
+}) {
   const { data, error } = useFetch(
-    () => getProjectGitDiff(projectId, path),
-    `git-diff-${projectId}-${path}`,
+    () => getProjectGitDiff(projectId, path, worktree ?? undefined),
+    `git-diff-${projectId}-${worktree ?? ''}-${path}`,
   )
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
@@ -303,20 +314,78 @@ function HistoryPane({ projectId }: { projectId: number }) {
   )
 }
 
+/** Short label for one worktree row: branch name, or the first 8 chars of
+ * its HEAD sha when detached (same "short id stands in for a branch name"
+ * convention as `parse_status`'s detached-HEAD branch field). */
+function worktreeLabel(w: GitWorktree): string {
+  return w.branch ?? w.head.slice(0, 8)
+}
+
+/**
+ * Worktree selector: one row of chips, one per `git worktree list` entry,
+ * highlighting whichever is active — the explicitly `selected` one, or (no
+ * explicit selection yet) the repo's own `is_current` entry, i.e. the
+ * worktree at the project's `local_path`. Hidden entirely when the repo has
+ * only one worktree (the common case) — nothing to select between (S2-style
+ * quiet default, mirrors the History toggle only mattering once there's
+ * history to browse).
+ */
+function WorktreeList({
+  worktrees,
+  selected,
+  onSelect,
+}: {
+  worktrees: GitWorktree[]
+  selected: string | null
+  onSelect: (path: string) => void
+}) {
+  if (worktrees.length <= 1) return null
+  return (
+    <div className="git-worktree-list">
+      {worktrees.map((w) => {
+        const active = selected === null ? w.is_current : w.path === selected
+        return (
+          <button
+            key={w.path}
+            type="button"
+            className={active ? 'active' : ''}
+            title={w.path}
+            onClick={() => onSelect(w.path)}
+          >
+            {worktreeLabel(w)}
+            {w.is_current && <span className="muted"> (current)</span>}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 /**
  * The GIT tab: working-tree status of the project's linked folder — branch +
  * ahead/behind header, changed/untracked file list on the left, the selected
  * file's diff on the right — plus a History sub-view (commit list → changed
- * files → diff) reachable via a toggle, without leaving the tab (M1/S2).
- * Rendered in place inside ProjectTasksPage's frame, like AgentsView.
- * Read-only; refetches on window focus (no poll — git state changes from
- * terminal work outside the app, and the server caches the status call for
- * 5s anyway).
+ * files → diff) reachable via a toggle, without leaving the tab (M1/S2). A
+ * worktree selector (`WorktreeList`) sits above both: picking a worktree
+ * re-points the branch header, file list, and diff pane at that worktree's
+ * directory instead of the project's own `local_path` (server-validated —
+ * `getProjectGit`/`getProjectGitDiff`'s `worktree` param only ever accepts a
+ * path from this same repo's own worktree list). History stays scoped to
+ * the project's `local_path` regardless of the selected worktree — all
+ * worktrees of one repo share the same commit history. Rendered in place
+ * inside ProjectTasksPage's frame, like AgentsView. Read-only; refetches on
+ * window focus (no poll — git state changes from terminal work outside the
+ * app, and the server caches the status call for 5s anyway).
  */
 export function GitView({ projectId }: { projectId: number }) {
+  // null = no explicit pick yet, i.e. "whichever worktree is_current" (the
+  // server's own default when `?worktree=` is omitted).
+  const [selectedWorktree, setSelectedWorktree] = useState<string | null>(
+    null,
+  )
   const { data, error } = useFetch(
-    () => getProjectGit(projectId),
-    `git-${projectId}`,
+    () => getProjectGit(projectId, selectedWorktree ?? undefined),
+    `git-${projectId}-${selectedWorktree ?? ''}`,
   )
   // Selected path is component state, not URL (no deep-linking a file).
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
@@ -332,6 +401,7 @@ export function GitView({ projectId }: { projectId: number }) {
   if (projectId !== prevProject) {
     setPrevProject(projectId)
     setSelectedPath(null)
+    setSelectedWorktree(null)
   }
 
   if (error && !data) return <p className="error">{error}</p>
@@ -353,6 +423,9 @@ export function GitView({ projectId }: { projectId: number }) {
     selectedPath !== null
       ? (files.find((f) => f.path === selectedPath) ?? null)
       : null
+  // Header shows the directory `repo` actually reflects: the selected
+  // worktree once one's picked, else the project's own local_path.
+  const repoPath = selectedWorktree ?? data.path
 
   return (
     <div className="git-view">
@@ -362,8 +435,19 @@ export function GitView({ projectId }: { projectId: number }) {
         {status.behind > 0 && (
           <span className="git-behind">↓{status.behind}</span>
         )}
-        <span className="muted git-repo-path">{data.path}</span>
+        <span className="muted git-repo-path">{repoPath}</span>
       </p>
+
+      {data.worktrees !== null && (
+        <WorktreeList
+          worktrees={data.worktrees}
+          selected={selectedWorktree}
+          onSelect={(path) => {
+            setSelectedWorktree(path)
+            setSelectedPath(null)
+          }}
+        />
+      )}
 
       <div className="git-mode-toggle">
         <button
@@ -403,7 +487,11 @@ export function GitView({ projectId }: { projectId: number }) {
           </ul>
           <div className="git-diff-pane">
             {selected !== null ? (
-              <DiffPane projectId={projectId} path={selected.path} />
+              <DiffPane
+                projectId={projectId}
+                path={selected.path}
+                worktree={selectedWorktree}
+              />
             ) : (
               <p className="muted">Select a file to see its diff.</p>
             )}

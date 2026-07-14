@@ -2064,6 +2064,23 @@ body.agent-sidebar-resizing {
   overflow-wrap: anywhere;
 }
 
+/* Worktree selector: one chip per `git worktree list` entry. Wraps instead
+   of scrolling — a repo with many worktrees is the rare case, and wrapping
+   keeps every chip reachable without a horizontal scrollbar. */
+.git-worktree-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0 0 0.75rem;
+}
+
+.git-worktree-list button.active {
+  color: var(--bg);
+  background: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan-dim);
+}
+
 /* Working tree | History toggle, same segmented-button shape as .cc-window. */
 .git-mode-toggle {
   display: flex;

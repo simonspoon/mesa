@@ -252,23 +252,34 @@ export function getGitStatus(): Promise<ProjectGitStatus[]> {
 
 /**
  * Working-tree view of the project's local_path repo: branch summary plus the
- * changed/untracked file list. Empty states are data, never errors:
- * path null = no local_path; path set + repo null = folder gone / not a repo.
+ * changed/untracked file list, plus every worktree of that repo. Empty states
+ * are data, never errors: path null = no local_path; path set + repo null =
+ * folder gone / not a repo. `worktree` selects which worktree `repo`
+ * reflects (must be one of the response's own `worktrees[].path`); omitted =
+ * the project's `local_path`.
  */
-export function getProjectGit(id: number): Promise<ProjectGitView> {
-  return request(`/api/projects/${id}/git`)
+export function getProjectGit(
+  id: number,
+  worktree?: string,
+): Promise<ProjectGitView> {
+  const q = worktree ? `?worktree=${encodeURIComponent(worktree)}` : ''
+  return request(`/api/projects/${id}/git${q}`)
 }
 
 /**
  * Unified diff (vs HEAD; untracked files as all-added) for one path from the
  * status list. Non-listed paths are 404 — the UI only asks for listed files.
+ * `worktree` scopes both the status list and the diff read to that worktree
+ * (same selector as getProjectGit).
  */
 export function getProjectGitDiff(
   id: number,
   path: string,
+  worktree?: string,
 ): Promise<GitFileDiff> {
+  const wt = worktree ? `&worktree=${encodeURIComponent(worktree)}` : ''
   return request(
-    `/api/projects/${id}/git/diff?path=${encodeURIComponent(path)}`,
+    `/api/projects/${id}/git/diff?path=${encodeURIComponent(path)}${wt}`,
   )
 }
 

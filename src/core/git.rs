@@ -6,7 +6,7 @@
 
 use std::process::{Command, Stdio};
 
-use crate::core::types::{GitCommit, GitCommitFile, GitFile, GitRepoView, GitStatus};
+use crate::core::types::{GitCommit, GitCommitFile, GitFile, GitRepoView, GitStatus, GitWorktree};
 
 /// Diff text is capped so one huge file can't balloon the JSON response
 /// (hooks' 64 KiB output cap precedent, scaled for diffs).
@@ -140,6 +140,74 @@ fn parse_view(porcelain: &str) -> GitRepoView {
         status: parse_status(porcelain),
         files,
     }
+}
+
+/// Every worktree of the repo at `dir` (the main checkout plus any linked
+/// `git worktree add` folders), or `None` when `dir` is not a git repo / git
+/// is unavailable. Runs from any worktree, `git worktree list` always
+/// reports the full set for the repo — so the git tab's worktree selector
+/// stays complete regardless of which worktree `dir` happens to be.
+pub fn worktrees_of(dir: &str) -> Option<Vec<GitWorktree>> {
+    let out = Command::new("git")
+        .args(["-C", dir, "worktree", "list", "--porcelain"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_worktrees(&String::from_utf8_lossy(&out.stdout), dir))
+}
+
+/// Kept pure (text in, list out) so the porcelain contract is unit-testable
+/// without spawning git, like `parse_status`/`parse_view`. Blocks are
+/// separated by a blank line; `is_current` is decided by comparing each
+/// worktree's path against `dir` (canonicalized on both sides so a
+/// non-canonical `local_path` still matches — falls back to a raw string
+/// compare if either side fails to canonicalize, e.g. a folder that no
+/// longer exists).
+fn parse_worktrees(porcelain: &str, dir: &str) -> Vec<GitWorktree> {
+    let dir_canon = std::fs::canonicalize(dir).ok();
+    let mut worktrees = Vec::new();
+    let mut path: Option<String> = None;
+    let mut head = String::new();
+    let mut branch: Option<String> = None;
+
+    let mut flush = |path: &mut Option<String>, head: &mut String, branch: &mut Option<String>| {
+        if let Some(p) = path.take() {
+            let is_current = match (&dir_canon, std::fs::canonicalize(&p).ok()) {
+                (Some(a), Some(b)) => *a == b,
+                _ => p == dir,
+            };
+            worktrees.push(GitWorktree {
+                path: p,
+                branch: branch.take(),
+                head: std::mem::take(head),
+                is_current,
+            });
+        }
+    };
+
+    for line in porcelain.lines() {
+        if line.is_empty() {
+            flush(&mut path, &mut head, &mut branch);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut head, &mut branch);
+            path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            head = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            branch = Some(
+                rest.strip_prefix("refs/heads/")
+                    .unwrap_or(rest)
+                    .to_string(),
+            );
+        }
+    }
+    flush(&mut path, &mut head, &mut branch);
+    worktrees
 }
 
 /// Unified diff for one path from the status list — staged + unstaged as one
@@ -409,6 +477,81 @@ mod tests {
         );
         assert_eq!(v.status.branch, "feature/x");
         assert!(v.files.is_empty());
+    }
+
+    #[test]
+    fn parse_worktrees_reads_branch_detached_and_bare_blocks() {
+        let wts = parse_worktrees(
+            "worktree /repo/main\n\
+             HEAD 1111111111111111111111111111111111111111\n\
+             branch refs/heads/main\n\
+             \n\
+             worktree /repo/linked\n\
+             HEAD 2222222222222222222222222222222222222222\n\
+             branch refs/heads/feature\n\
+             \n\
+             worktree /repo/detached\n\
+             HEAD 3333333333333333333333333333333333333333\n\
+             detached\n",
+            "/repo/linked",
+        );
+        assert_eq!(wts.len(), 3);
+        assert_eq!(wts[0].path, "/repo/main");
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert!(!wts[0].is_current);
+        assert_eq!(wts[1].path, "/repo/linked");
+        assert_eq!(wts[1].branch.as_deref(), Some("feature"));
+        // Neither side canonicalizes (folders don't exist) — falls back to
+        // the raw string compare, which matches the `dir` passed in.
+        assert!(wts[1].is_current);
+        assert_eq!(wts[2].path, "/repo/detached");
+        assert_eq!(wts[2].branch, None);
+        assert_eq!(wts[2].head, "3333333333333333333333333333333333333333");
+    }
+
+    #[test]
+    fn worktrees_of_real_repo_lists_linked_worktree_and_marks_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(worktrees_of(path), None);
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-C", path, "-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-b", "trunk"]);
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-m", "seed"]);
+
+        let linked_dir = tempfile::tempdir().unwrap();
+        let linked_path = linked_dir.path().join("linked");
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            linked_path.to_str().unwrap(),
+        ]);
+
+        let from_main = worktrees_of(path).unwrap();
+        assert_eq!(from_main.len(), 2);
+        let main_entry = from_main.iter().find(|w| w.branch.as_deref() == Some("trunk")).unwrap();
+        assert!(main_entry.is_current);
+        let linked_entry = from_main.iter().find(|w| w.branch.as_deref() == Some("feature")).unwrap();
+        assert!(!linked_entry.is_current);
+
+        // Same full list, but querying from the linked worktree flips which
+        // entry is "current".
+        let from_linked = worktrees_of(linked_path.to_str().unwrap()).unwrap();
+        assert_eq!(from_linked.len(), 2);
+        assert!(!from_linked.iter().find(|w| w.branch.as_deref() == Some("trunk")).unwrap().is_current);
+        assert!(from_linked.iter().find(|w| w.branch.as_deref() == Some("feature")).unwrap().is_current);
     }
 
     #[test]

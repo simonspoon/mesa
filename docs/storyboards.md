@@ -17,10 +17,12 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   record. `delete_storyboard` cascades frames/edges/events and writes no event
   (the history dies with the board; the delete echo is the recoverable record).
 - CLI: `mesa storyboard {create,list,show,update,delete,events}` plus nested
-  `frame {create,update,delete}` and `edge {create,update,delete}`. `show`/
-  `delete` print the full `{storyboard, frames, edges}` view; `frame delete`
-  echoes `{frame, edges}`; `events` prints the change log. Mutating commands
-  take `--author` for attribution.
+  `mesa storyboard frame {create,update,delete}` and `mesa storyboard edge
+  {create,update,delete}` — frame/edge subcommands live under `storyboard`,
+  not as top-level `mesa frame`/`mesa edge` commands. `show`/`delete` print
+  the full `{storyboard, frames, edges}` view; `frame delete` echoes `{frame,
+  edges}`; `events` prints the change log. Mutating commands take `--author`
+  for attribution.
 - API: `/api/storyboards` CRUD, `/api/storyboards/{id}/{frames,edges,events}`,
   `/api/frames/{id}` (PATCH/DELETE), `/api/edges/{id}` (GET/PATCH/DELETE).
   Mutations attribute via an `author` body field (POST/PATCH) or `?author=`

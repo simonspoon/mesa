@@ -170,7 +170,7 @@ fn watch_todo_tick() -> Duration {
 /// `claude --bg` takes to start (node startup, ~0.5s+, per the Agents-tab
 /// comments) times however many projects this tick dispatches.
 fn todo_watcher_tick(state: &AppState) {
-    let claimed: Vec<(i64, String)> = {
+    let claimed: Vec<(i64, String, String)> = {
         let mut store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => e.into_inner(),
@@ -224,13 +224,14 @@ fn todo_watcher_tick(state: &AppState) {
                 eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
                 continue;
             }
-            claimed.push((task.id, local_path.to_string()));
+            let session_name = format!("{}: {}", project.name, task.title);
+            claimed.push((task.id, local_path.to_string(), session_name));
         }
         claimed
     };
-    for (task_id, local_path) in claimed {
+    for (task_id, local_path, session_name) in claimed {
         let prompt = format!("/execute-mesa-task {task_id}");
-        if let Err(e) = agents::spawn_bg(&local_path, Some(&prompt)) {
+        if let Err(e) = agents::spawn_bg(&local_path, Some(&prompt), Some(&session_name)) {
             eprintln!("todo-watcher: spawn failed for task {task_id}: {e}");
             let mut store = match state.store.lock() {
                 Ok(s) => s,
@@ -2208,7 +2209,8 @@ async fn spawn_project_agent(
         });
     }
     let dir = path.clone();
-    let job = tokio::task::spawn_blocking(move || agents::spawn_bg(&dir, body.prompt.as_deref()))
+    let job =
+        tokio::task::spawn_blocking(move || agents::spawn_bg(&dir, body.prompt.as_deref(), None))
         .await
         .map_err(|e| agents_unavailable(format!("agent spawn panicked: {e}")))?
         .map_err(agents_unavailable)?;

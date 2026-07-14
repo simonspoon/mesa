@@ -31,7 +31,7 @@ run() {
 }
 jqs() { jq -r "$1" <<<"$STDOUT"; }
 
-# ---- stub claude: logs every --bg invocation's (cwd, prompt) to BG_LOG ----
+# ---- stub claude: logs every --bg invocation's (cwd, name, prompt) to BG_LOG ----
 
 STUB_DIR="$TMP/stub"
 mkdir -p "$STUB_DIR"
@@ -42,9 +42,11 @@ cat > "$STUB_DIR/claude" <<EOF
 if [ "\$1" = "--bg" ]; then
   shift
   [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; exit 1; }
+  NAME=""
+  if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
   PROMPT=""
   if [ "\$1" = "--" ]; then shift; PROMPT="\$1"; fi
-  echo "\$(pwd)|\$PROMPT" >> "$BG_LOG"
+  echo "\$(pwd)|\$NAME|\$PROMPT" >> "$BG_LOG"
   echo "backgrounded · deadbeef (idle — send a prompt to start)"
   exit 0
 fi
@@ -120,10 +122,10 @@ wait_for_server "$PORT"
 
 wait_bg_lines 1
 LINE=$(head -1 "$BG_LOG")
-[ "$LINE" = "$DIR_A|/execute-mesa-task $TASK_A" ] ||
-  fail "expected '$DIR_A|/execute-mesa-task $TASK_A', got '$LINE'"
+[ "$LINE" = "$DIR_A|A: task a|/execute-mesa-task $TASK_A" ] ||
+  fail "expected '$DIR_A|A: task a|/execute-mesa-task $TASK_A', got '$LINE'"
 [ "$(task_status "$TASK_A")" = "in_progress" ] || fail "dispatched task must be claimed in_progress"
-ok "watch_todo on: dispatches next actionable task, prompt is /execute-mesa-task <id>, claims in_progress"
+ok "watch_todo on: dispatches next actionable task, prompt is /execute-mesa-task <id>, session named '<project>: <title>', claims in_progress"
 
 # ---- project already busy (in_progress task present): a second todo task
 # in the SAME project must NOT be dispatched while the first is in flight ----

@@ -74,16 +74,27 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
 
 /// Starts a detached background session (`claude --bg`) in `dir` and returns
 /// its short job id. `prompt` is optional — without one the session starts
-/// idle, ready for the first message over an attach. `claude --bg` prints a
-/// human receipt, not JSON; the id is parsed from its "backgrounded · <id>"
-/// line.
-pub fn spawn_bg(dir: &str, prompt: Option<&str>) -> Result<String, String> {
-    spawn_bg_with(&claude_bin(), dir, prompt)
+/// idle, ready for the first message over an attach. `name`, if given, is
+/// passed as `claude`'s `-n/--name` (shown in the prompt box, `/resume`
+/// picker, and terminal title) — the todo-watcher uses this so an
+/// auto-dispatched session is identifiable at a glance instead of showing up
+/// generically. `claude --bg` prints a human receipt, not JSON; the id is
+/// parsed from its "backgrounded · <id>" line.
+pub fn spawn_bg(dir: &str, prompt: Option<&str>, name: Option<&str>) -> Result<String, String> {
+    spawn_bg_with(&claude_bin(), dir, prompt, name)
 }
 
-fn spawn_bg_with(bin: &str, dir: &str, prompt: Option<&str>) -> Result<String, String> {
+fn spawn_bg_with(
+    bin: &str,
+    dir: &str,
+    prompt: Option<&str>,
+    name: Option<&str>,
+) -> Result<String, String> {
     let mut cmd = Command::new(bin);
     cmd.arg("--bg").current_dir(dir).stdin(Stdio::null());
+    if let Some(name) = name {
+        cmd.arg("--name").arg(name);
+    }
     if let Some(prompt) = prompt {
         // `--` ends option parsing so a prompt beginning with `-` (a markdown
         // bullet, or a token like `--resume`) is taken as prompt text, not
@@ -290,7 +301,7 @@ JSON"#,
             dir.path(),
             r#"[ "$1" = "--bg" ] || exit 1; echo "backgrounded · deadbeef (idle — send a prompt to start)""#,
         );
-        let id = spawn_bg_with(&bin, dir.path().to_str().unwrap(), None).unwrap();
+        let id = spawn_bg_with(&bin, dir.path().to_str().unwrap(), None, None).unwrap();
         assert_eq!(id, "deadbeef");
     }
 
@@ -305,8 +316,27 @@ JSON"#,
 echo "backgrounded · abc00000"
 echo "prompt was: $3" >&2"#,
         );
-        let id = spawn_bg_with(&bin, dir.path().to_str().unwrap(), Some("--resume")).unwrap();
+        let id = spawn_bg_with(&bin, dir.path().to_str().unwrap(), Some("--resume"), None).unwrap();
         assert_eq!(id, "abc00000");
+    }
+
+    #[test]
+    fn spawn_bg_passes_name_flag_before_prompt_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_claude(
+            dir.path(),
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--name" ] && [ "$3" = "proj: do the thing" ] && [ "$4" = "--" ] ||
+              { echo "bad argv: $*" >&2; exit 1; }
+echo "backgrounded · cf0c3945 · proj: do the thing""#,
+        );
+        let id = spawn_bg_with(
+            &bin,
+            dir.path().to_str().unwrap(),
+            Some("/execute-mesa-task 1"),
+            Some("proj: do the thing"),
+        )
+        .unwrap();
+        assert_eq!(id, "cf0c3945");
     }
 
     #[test]

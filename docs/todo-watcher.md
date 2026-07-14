@@ -13,7 +13,10 @@ because someone ran `mesa serve`.
   `in_progress` task, it calls `Store::next_task` for that project and, on an
   actionable task, immediately flips that task to `in_progress` itself —
   *before* spawning — then calls `agents::spawn_bg(local_path,
-  "/execute-mesa-task <task-id>")`. Claiming the task before the spawn closes
+  "/execute-mesa-task <task-id>", Some("<project name>: <task title>"))`. The
+  name reaches `claude --bg` as `-n/--name`, so the auto-dispatched session
+  shows up identifiably (prompt box, `/resume` picker, terminal title, Agents
+  sidebar) instead of generically. Claiming the task before the spawn closes
   the race window between dispatch and the agent's own `/execute-mesa-task`
   pickup step, so a later tick can't double-dispatch the same task while the
   agent is still starting up. A project with no `local_path`, or a stale one

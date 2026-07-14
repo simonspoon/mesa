@@ -906,6 +906,47 @@ main {
   cursor: grabbing;
 }
 
+/* Anchor-lock dots (mesa task 353): 4 per endpoint (8 total), revealed only
+   while the edge is hovered (`FrameEdgeView`'s local `hovered` state) — quiet
+   by default, matching the waypoint handles' restraint on a plain edge.
+   Positioned a few px outside the frame's own always-on `.react-flow__handle`
+   connection dot (`ANCHOR_LOCK_OFFSET` in the component) so a click lands on
+   this dot, not the connection Handle underneath it. A distinct class (not
+   `.react-flow__handle`) keeps the two visually and functionally separate. */
+.anchor-lock-dot {
+  position: absolute;
+  pointer-events: all;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1px solid var(--cyan-dim);
+  cursor: pointer;
+}
+
+.anchor-lock-dot:hover {
+  border-color: var(--cyan);
+}
+
+/* Filled = the endpoint's current locked side; the other 3 (or all 4, if
+   that endpoint is unlocked) stay outline-only. */
+.anchor-lock-dot.locked {
+  background: var(--cyan);
+  border-color: var(--cyan);
+}
+
+/* Invisible hover "halo" ring around a hovered edge's connected frames (mesa
+   task 353): four bars tiling the margin just outside each frame's border,
+   never over the frame body, so the pointer can travel continuously from any
+   anchor-lock dot to any other on that frame (including the far side, across
+   what would otherwise be bare canvas) without hover dropping mid-transit.
+   Purely a hit target — always fully transparent. */
+.anchor-lock-halo {
+  position: absolute;
+  pointer-events: all;
+  background: transparent;
+}
+
 /* The card itself, inside a React Flow node wrapper (which owns absolute
    positioning); the connection handles are its siblings so the corner
    clip-path never swallows them. */

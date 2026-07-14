@@ -467,6 +467,41 @@ pub struct Waypoint {
     pub y: f64,
 }
 
+/// Which side of a frame a `FrameEdge` endpoint is locked to, when locked at
+/// all. Shares its four lowercase string values with React Flow's own
+/// `Position` enum, so a value read off `FrameEdge.from_anchor`/`to_anchor`
+/// casts directly into a `Position` prop with no translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum AnchorSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl AnchorSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnchorSide::Top => "top",
+            AnchorSide::Right => "right",
+            AnchorSide::Bottom => "bottom",
+            AnchorSide::Left => "left",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AnchorSide> {
+        match s {
+            "top" => Some(AnchorSide::Top),
+            "right" => Some(AnchorSide::Right),
+            "bottom" => Some(AnchorSide::Bottom),
+            "left" => Some(AnchorSide::Left),
+            _ => None,
+        }
+    }
+}
+
 /// A directed connection from one frame to another on the same storyboard.
 /// Unlike task dependencies, storyboard edges may form cycles freely — a
 /// storyboard is a freeform diagram, not a dependency graph. Self-edges
@@ -489,6 +524,13 @@ pub struct FrameEdge {
     /// Ordered routing anchors from `from_frame`'s end to `to_frame`'s end.
     /// Always a plain array — `[]` means "no waypoints", never `null`.
     pub waypoints: Vec<Waypoint>,
+    /// Side of `from_frame` this edge is locked to, if any. `None` means
+    /// floating — routing picks the nearest side live, exactly today's
+    /// behavior.
+    pub from_anchor: Option<AnchorSide>,
+    /// Side of `to_frame` this edge is locked to, if any. Same contract as
+    /// `from_anchor`, independent per endpoint.
+    pub to_anchor: Option<AnchorSide>,
 }
 
 /// The full contents of one storyboard: the board plus all of its frames and

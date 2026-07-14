@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use super::attachments;
 use super::types::{
-    Attachment, Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard,
+    AnchorSide, Attachment, Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard,
     StoryboardEvent, StoryboardView, Task, TaskEvent, Waypoint,
 };
 
@@ -247,6 +247,10 @@ const MIGRATIONS: &[&str] = &[
     UPDATE tasks SET sort_order = id;
     ",
     "ALTER TABLE tasks ADD COLUMN result TEXT;",
+    "
+    ALTER TABLE frame_edges ADD COLUMN from_anchor TEXT;
+    ALTER TABLE frame_edges ADD COLUMN to_anchor TEXT;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -308,7 +312,7 @@ const STORYBOARD_COLUMNS: &str =
 const FRAME_COLUMNS: &str =
     "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at";
 const EDGE_COLUMNS: &str =
-    "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints";
+    "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
 const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at";
 
@@ -399,6 +403,8 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str::<Vec<Waypoint>>(s).ok())
         .unwrap_or_default();
+    let from_anchor: Option<String> = row.get(8)?;
+    let to_anchor: Option<String> = row.get(9)?;
     Ok(FrameEdge {
         id: row.get(0)?,
         storyboard_id: row.get(1)?,
@@ -408,6 +414,12 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
         author: row.get(5)?,
         created_at: row.get(6)?,
         waypoints,
+        from_anchor: from_anchor
+            .as_deref()
+            .map(|s| AnchorSide::parse(s).expect("invalid anchor in db")),
+        to_anchor: to_anchor
+            .as_deref()
+            .map(|s| AnchorSide::parse(s).expect("invalid anchor in db")),
     })
 }
 
@@ -438,6 +450,44 @@ fn insert_storyboard_event(
         (storyboard_id, actor, action, summary),
     )?;
     Ok(())
+}
+
+/// Describes an anchor-lock change to `edge` relative to `current` for the
+/// `edge_anchor_changed` storyboard event. Only called once at least one of
+/// `from_anchor`/`to_anchor` differs between the two.
+fn anchor_summary(edge: &FrameEdge, current: &FrameEdge) -> String {
+    let from_changed = edge.from_anchor != current.from_anchor;
+    let to_changed = edge.to_anchor != current.to_anchor;
+    let arrow = format!("edge #{} \u{2192} #{}", edge.from_frame, edge.to_frame);
+    if from_changed && to_changed {
+        return format!(
+            "changed anchors of {arrow} (from: {}, to: {})",
+            anchor_state_str(edge.from_anchor),
+            anchor_state_str(edge.to_anchor)
+        );
+    }
+    let (end, old, new) = if from_changed {
+        ("from", current.from_anchor, edge.from_anchor)
+    } else {
+        ("to", current.to_anchor, edge.to_anchor)
+    };
+    match (old, new) {
+        (None, Some(side)) => format!("locked {end}-anchor of {arrow} to {}", side.as_str()),
+        (Some(_), None) => format!("unlocked {end}-anchor of {arrow}"),
+        (Some(old_side), Some(new_side)) => format!(
+            "changed {end}-anchor of {arrow} from {} to {}",
+            old_side.as_str(),
+            new_side.as_str()
+        ),
+        (None, None) => unreachable!("anchor_summary called with no change"),
+    }
+}
+
+fn anchor_state_str(side: Option<AnchorSide>) -> &'static str {
+    match side {
+        Some(s) => s.as_str(),
+        None => "unlocked",
+    }
 }
 
 /// Reads a storyboard's frames, ordered by id. Operates on any `Connection`
@@ -541,8 +591,9 @@ pub struct FramePatch {
     pub task_id: Option<Option<i64>>,
 }
 
-/// Fields to change on an edge; `None` means leave unchanged. Only the label
-/// and waypoints are mutable — endpoints and author are fixed at creation.
+/// Fields to change on an edge; `None` means leave unchanged. Only the label,
+/// waypoints, and anchor locks are mutable — endpoints and author are fixed
+/// at creation.
 #[derive(Debug, Default, Clone)]
 pub struct EdgePatch {
     /// `Some(None)` clears the label.
@@ -551,6 +602,11 @@ pub struct EdgePatch {
     /// `Some(vec![])` to clear back to a straight auto-routed edge).
     /// `None` leaves the stored waypoints untouched.
     pub waypoints: Option<Vec<Waypoint>>,
+    /// `Some(None)` unlocks (returns to floating); `Some(Some(side))` locks
+    /// to that side; `None` leaves the current lock state untouched.
+    pub from_anchor: Option<Option<AnchorSide>>,
+    /// Same three-state contract as `from_anchor`, independent per endpoint.
+    pub to_anchor: Option<Option<AnchorSide>>,
 }
 
 /// Result of `next_task`: either the single actionable task, or — when none is
@@ -1925,21 +1981,33 @@ impl Store {
         if let Some(waypoints) = &patch.waypoints {
             edge.waypoints = waypoints.clone();
         }
+        if let Some(from_anchor) = &patch.from_anchor {
+            edge.from_anchor = *from_anchor;
+        }
+        if let Some(to_anchor) = &patch.to_anchor {
+            edge.to_anchor = *to_anchor;
+        }
         // No-op patch: change nothing and log nothing.
         if edge == current {
             return Ok(current);
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE frame_edges SET label = ?1, waypoints = ?2 WHERE id = ?3",
+            "UPDATE frame_edges SET label = ?1, waypoints = ?2, from_anchor = ?3, to_anchor = ?4 \
+             WHERE id = ?5",
             (
                 &edge.label,
                 serde_json::to_string(&edge.waypoints).unwrap(),
+                edge.from_anchor.map(|a| a.as_str()),
+                edge.to_anchor.map(|a| a.as_str()),
                 id,
             ),
         )?;
-        let (action, summary) = if patch.waypoints.is_some() && edge.waypoints != current.waypoints
-        {
+        let anchor_changed =
+            edge.from_anchor != current.from_anchor || edge.to_anchor != current.to_anchor;
+        let (action, summary) = if anchor_changed {
+            ("edge_anchor_changed", anchor_summary(&edge, &current))
+        } else if patch.waypoints.is_some() && edge.waypoints != current.waypoints {
             (
                 "edge_rerouted",
                 format!(
@@ -3994,7 +4062,7 @@ mod tests {
                 e1.id,
                 &EdgePatch {
                     label: Some(Some("next".into())),
-                    waypoints: None,
+                    ..Default::default()
                 },
                 Some("user"),
             )
@@ -4005,7 +4073,7 @@ mod tests {
                 e1.id,
                 &EdgePatch {
                     label: Some(None),
-                    waypoints: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -4127,7 +4195,7 @@ mod tests {
                 e.id,
                 &EdgePatch {
                     label: Some(Some("next".into())),
-                    waypoints: None,
+                    ..Default::default()
                 },
                 Some("user"),
             )
@@ -4136,8 +4204,8 @@ mod tests {
             .update_edge(
                 e.id,
                 &EdgePatch {
-                    label: None,
                     waypoints: Some(vec![Waypoint { x: 10.0, y: 20.0 }]),
+                    ..Default::default()
                 },
                 Some("user"),
             )
@@ -4239,7 +4307,7 @@ mod tests {
                 e.id,
                 &EdgePatch {
                     label: Some(Some("lbl".into())),
-                    waypoints: None,
+                    ..Default::default()
                 },
                 Some("noop"),
             )
@@ -4262,6 +4330,124 @@ mod tests {
             store.list_storyboard_events(sb.id).unwrap().len(),
             before + 1
         );
+    }
+
+    #[test]
+    fn edge_anchor_patch_is_three_state_preserved_and_logged() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        let e = store
+            .create_edge(sb.id, a.id, b.id, Some("lbl"), None)
+            .unwrap();
+        assert_eq!(e.from_anchor, None);
+        assert_eq!(e.to_anchor, None);
+
+        // Lock the "from" end.
+        let locked = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    from_anchor: Some(Some(AnchorSide::Right)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(locked.from_anchor, Some(AnchorSide::Right));
+        assert_eq!(locked.to_anchor, None);
+
+        // (1) A label-only PATCH leaves the existing anchor lock untouched.
+        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let relabeled = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    label: Some(Some("lbl2".into())),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(relabeled.from_anchor, Some(AnchorSide::Right));
+        assert_eq!(relabeled.to_anchor, None);
+        let events = store.list_storyboard_events(sb.id).unwrap();
+        assert_eq!(events.len(), before + 1);
+        assert_eq!(events.last().unwrap().action, "edge_relabeled");
+
+        // (2) Locking the other end logs exactly one edge_anchor_changed event.
+        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let changed = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    to_anchor: Some(Some(AnchorSide::Bottom)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(changed.to_anchor, Some(AnchorSide::Bottom));
+        assert_eq!(changed.from_anchor, Some(AnchorSide::Right)); // independent endpoints
+        let events = store.list_storyboard_events(sb.id).unwrap();
+        assert_eq!(events.len(), before + 1);
+        assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
+        assert!(events.last().unwrap().summary.contains("locked to-anchor"));
+
+        // (3) Re-PATCHing an endpoint to the side it's already locked to is a
+        // no-op: no change, no event.
+        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let noop = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    to_anchor: Some(Some(AnchorSide::Bottom)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(noop.to_anchor, Some(AnchorSide::Bottom));
+        assert_eq!(store.list_storyboard_events(sb.id).unwrap().len(), before);
+
+        // Unlocking logs its own event with the "unlocked" summary shape.
+        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let unlocked = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    from_anchor: Some(None),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(unlocked.from_anchor, None);
+        assert_eq!(unlocked.to_anchor, Some(AnchorSide::Bottom)); // untouched
+        let events = store.list_storyboard_events(sb.id).unwrap();
+        assert_eq!(events.len(), before + 1);
+        assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
+        assert!(events.last().unwrap().summary.contains("unlocked from-anchor"));
+
+        // Priority: when a single PATCH changes both an anchor and the label,
+        // the anchor change wins the one-event-per-call slot.
+        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    label: Some(Some("lbl3".into())),
+                    from_anchor: Some(Some(AnchorSide::Top)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        let events = store.list_storyboard_events(sb.id).unwrap();
+        assert_eq!(events.len(), before + 1);
+        assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
     }
 
     // ---- inbox (global update requests) ----

@@ -36,11 +36,11 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    AgentSession, AgentSpawned, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry, FrameNew,
-    FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
-    ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch, TaskSummary,
-    Waypoint, agents, attachments, files, git, hooks,
+    AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry,
+    FrameNew, FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus,
+    GitWorktree, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch,
+    TaskSummary, Waypoint, agents, attachments, files, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -1102,6 +1102,10 @@ struct EdgeUpdate {
     label: Option<Option<String>>,
     #[serde(default)]
     waypoints: Option<Vec<Waypoint>>,
+    #[serde(default, deserialize_with = "double_option")]
+    from_anchor: Option<Option<AnchorSide>>,
+    #[serde(default, deserialize_with = "double_option")]
+    to_anchor: Option<Option<AnchorSide>>,
     /// Recorded as the change author.
     #[serde(default)]
     author: Option<String>,
@@ -1248,6 +1252,8 @@ async fn update_edge(
     let patch = EdgePatch {
         label: body.label,
         waypoints: body.waypoints,
+        from_anchor: body.from_anchor,
+        to_anchor: body.to_anchor,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_edge(id, &patch, body.author.as_deref())?).into_response())
@@ -3146,5 +3152,23 @@ mod tests {
         )
         .await;
         assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Locked edge anchors: three-state PATCH validation (mesa task 350) ---
+
+    /// An invalid `AnchorSide` literal fails to deserialize `EdgeUpdate` at
+    /// the serde boundary — the same mechanism that already maps an invalid
+    /// `status`/`priority` literal to a 422 `validation` error via
+    /// `impl From<JsonRejection> for ApiError` (see module docs). Once a
+    /// value reaches `Store::update_edge`, it is already a valid `AnchorSide`;
+    /// there is nothing left for a dedicated Store-level check to reject.
+    #[test]
+    fn edge_update_rejects_invalid_anchor_literal() {
+        assert!(serde_json::from_str::<EdgeUpdate>(r#"{"from_anchor":"diagonal"}"#).is_err());
+        assert!(serde_json::from_str::<EdgeUpdate>(r#"{"to_anchor":"diagonal"}"#).is_err());
+        // Valid literals, null (unlock), and omission all still parse.
+        assert!(serde_json::from_str::<EdgeUpdate>(r#"{"from_anchor":"top"}"#).is_ok());
+        assert!(serde_json::from_str::<EdgeUpdate>(r#"{"to_anchor":null}"#).is_ok());
+        assert!(serde_json::from_str::<EdgeUpdate>(r#"{}"#).is_ok());
     }
 }

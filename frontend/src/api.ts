@@ -4,6 +4,7 @@
 
 import type { AgentSession } from './types/AgentSession'
 import type { AgentSpawned } from './types/AgentSpawned'
+import type { AnchorSide } from './types/AnchorSide'
 import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
@@ -498,6 +499,8 @@ export function createEdge(
 export interface EdgePatch {
   label?: string | null
   waypoints?: Waypoint[]
+  from_anchor?: AnchorSide | null
+  to_anchor?: AnchorSide | null
 }
 
 export function updateEdge(

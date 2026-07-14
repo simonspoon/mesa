@@ -42,6 +42,7 @@ import { ConfirmDelete } from './components/ConfirmDelete'
 import { InlineEdit } from './components/InlineEdit'
 import { Markdown } from './components/Markdown'
 import { layoutFrames, type LayoutDirection } from './layout'
+import type { AnchorSide } from './types/AnchorSide'
 import type { Frame } from './types/Frame'
 import type { StoryboardView } from './types/StoryboardView'
 import type { Waypoint } from './types/Waypoint'
@@ -77,9 +78,12 @@ type FrameEdgeType = Edge<
   {
     label: string | null
     waypoints: Waypoint[]
+    fromAnchor: AnchorSide | null
+    toAnchor: AnchorSide | null
     onSaveLabel: (next: string) => Promise<void>
     onDelete: () => void
     onSaveWaypoints: (next: Waypoint[]) => Promise<void>
+    onSaveAnchor: (end: 'from' | 'to', side: AnchorSide | null) => Promise<void>
   },
   'frame'
 >
@@ -322,6 +326,65 @@ function nearestAnchor(r: Rect, toward: Point): Anchor {
   return best
 }
 
+/** The anchor of `r` at a specific locked side — used instead of
+ *  `nearestAnchor` once an endpoint is locked, so it holds that side
+ *  regardless of the other frame's (or a waypoint's) position. */
+function lockedAnchor(r: Rect, side: Position): Anchor {
+  return anchorsOf(r).find((a) => a.position === side)!
+}
+
+/** Outward unit normal for each side, used to push an anchor-lock dot a few
+ *  px past the frame border — see `ANCHOR_LOCK_OFFSET`. */
+const OUTWARD_NORMAL: Record<Position, Point> = {
+  [Position.Top]: { x: 0, y: -1 },
+  [Position.Right]: { x: 1, y: 0 },
+  [Position.Bottom]: { x: 0, y: 1 },
+  [Position.Left]: { x: -1, y: 0 },
+}
+
+/** How far an anchor-lock dot sits past the exact `anchorsOf` point (which is
+ *  also where `FrameNode`'s always-on `HANDLES` connection dots render) —
+ *  enough that a click lands unambiguously on the lock dot, not the
+ *  connection `Handle` underneath it (ADR #7). Checked concretely (mesa task
+ *  353): the connection `Handle`'s hit box is 22px square centered on the
+ *  anchor point (11px radius) and this dot is 10px (5px radius), so the
+ *  offset must clear 11 + 5 = 16px to leave zero overlap — 14px still left a
+ *  2px band where the `Handle` (not this dot) won the hit-test. */
+const ANCHOR_LOCK_OFFSET = 18
+
+/** An anchor position offset outward along its own side's normal, for
+ *  rendering (never for path routing — routing always uses the exact
+ *  `anchorsOf` point). */
+function offsetOutward(a: Anchor, dist: number): Point {
+  const n = OUTWARD_NORMAL[a.position]
+  return { x: a.x + n.x * dist, y: a.y + n.y * dist }
+}
+
+/** Margin of the invisible hover "halo" around a frame, in flow units — wide
+ *  enough to fully contain the anchor-lock dots (which sit `ANCHOR_LOCK_OFFSET`
+ *  outside the frame border) with a few px to spare. */
+const ANCHOR_HALO_MARGIN = ANCHOR_LOCK_OFFSET + 8
+
+/** Four non-overlapping bars tiling the padding ring just outside a frame's
+ *  bounds — never over the frame body itself, so the frame's own drag/click
+ *  behavior is untouched. Checked empirically (mesa task 353): a single fixed
+ *  hide-delay on the path/dot handlers alone isn't enough — a stepped
+ *  mouse-move toward a dot on the frame's *far* side (opposite the edge's
+ *  live anchor) crossed bare canvas for 100+ px and dropped hover before
+ *  arriving, so that dot was unreachable. This halo gives the pointer one
+ *  continuous hoverable surface all the way around the frame, so it can
+ *  travel from any anchor-lock dot to any other on the same frame (or from
+ *  the edge path, which always lands exactly on this ring's inner edge)
+ *  without crossing open canvas. */
+function haloBars(r: Rect, margin: number): { x: number; y: number; w: number; h: number }[] {
+  return [
+    { x: r.x - margin, y: r.y - margin, w: r.w + 2 * margin, h: margin }, // top
+    { x: r.x - margin, y: r.y + r.h, w: r.w + 2 * margin, h: margin }, // bottom
+    { x: r.x - margin, y: r.y, w: margin, h: r.h }, // left
+    { x: r.x + r.w, y: r.y, w: margin, h: r.h }, // right
+  ]
+}
+
 /** Converts an ordered point list into a smooth SVG path via Catmull-Rom
  *  splines (tension 1/6) turned into cubic beziers, so a routed connector
  *  curves through each waypoint instead of meeting it at a sharp corner.
@@ -396,10 +459,16 @@ function buildRoutedPath(
   from: Rect,
   to: Rect,
   waypoints: Point[],
+  fromAnchor: AnchorSide | null,
+  toAnchor: AnchorSide | null,
 ): { path: string; anchors: Point[]; mid: Point } {
   if (waypoints.length === 0) {
-    const start = nearestAnchor(from, { x: cx(to), y: cy(to) })
-    const end = nearestAnchor(to, { x: cx(from), y: cy(from) })
+    const start = fromAnchor
+      ? lockedAnchor(from, fromAnchor as Position)
+      : nearestAnchor(from, { x: cx(to), y: cy(to) })
+    const end = toAnchor
+      ? lockedAnchor(to, toAnchor as Position)
+      : nearestAnchor(to, { x: cx(from), y: cy(from) })
     const [path] = getBezierPath({
       sourceX: start.x,
       sourceY: start.y,
@@ -412,8 +481,12 @@ function buildRoutedPath(
     return { path, anchors, mid: midpointOfPolyline(anchors) }
   }
 
-  const start = nearestAnchor(from, waypoints[0])
-  const end = nearestAnchor(to, waypoints[waypoints.length - 1])
+  const start = fromAnchor
+    ? lockedAnchor(from, fromAnchor as Position)
+    : nearestAnchor(from, waypoints[0])
+  const end = toAnchor
+    ? lockedAnchor(to, toAnchor as Position)
+    : nearestAnchor(to, waypoints[waypoints.length - 1])
   const anchors: Point[] = [start, ...waypoints, end]
   const path = smoothPath(anchors)
   return { path, anchors, mid: midpointOfPolyline(anchors) }
@@ -471,6 +544,39 @@ function FrameEdgeView({
     setSeenWaypoints(data.waypoints)
     setLocalWaypoints(null)
   }
+  // Anchor-lock dots (8, 4 per endpoint) are quiet by default and revealed on
+  // hover only — local state, not `EdgeProps.selected` (this canvas has no
+  // `onEdgesChange`/`useEdgesState`, so an edge's `selected` never round-trips;
+  // see arch.md §6). Set from both the wide hit-target path and each dot
+  // itself (below), so hover survives the path-to-dot handoff.
+  const [hovered, setHovered] = useState(false)
+  // A same-side dot sits right next to the path (inside its 28px hit band),
+  // so path->dot is a seamless handoff there — but the *other* 3 sides per
+  // endpoint can be 100+px away across empty canvas, well outside that band.
+  // Hiding on the bare `onMouseLeave` would unmount those far dots mid-travel,
+  // before the pointer ever reaches them, making the opposite side
+  // unreachable (checked empirically: a stepped mouse-move toward a far dot
+  // dropped to 0 dots one step off the path and never recovered). A short
+  // hide delay — cleared by any enter, on path or dot — bridges that gap
+  // (standard hover-intent debounce), without new cross-component wiring.
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (hideTimer.current) clearTimeout(hideTimer.current)
+  }, [])
+  function showAnchorDots() {
+    if (hideTimer.current) {
+      clearTimeout(hideTimer.current)
+      hideTimer.current = null
+    }
+    setHovered(true)
+  }
+  function scheduleHideAnchorDots() {
+    if (hideTimer.current) clearTimeout(hideTimer.current)
+    hideTimer.current = setTimeout(() => {
+      hideTimer.current = null
+      setHovered(false)
+    }, 250)
+  }
 
   if (!sourceNode || !targetNode || !data) return null
   const rect = (n: typeof sourceNode): Rect => ({
@@ -482,7 +588,13 @@ function FrameEdgeView({
   const from = rect(sourceNode)
   const to = rect(targetNode)
   const waypoints = localWaypoints ?? data.waypoints
-  const { path, anchors, mid } = buildRoutedPath(from, to, waypoints)
+  const { path, anchors, mid } = buildRoutedPath(
+    from,
+    to,
+    waypoints,
+    data.fromAnchor,
+    data.toAnchor,
+  )
   const isEmpty = !(data.label && data.label.trim())
 
   const commit = (next: Waypoint[]) => {
@@ -543,6 +655,17 @@ function FrameEdgeView({
     commit(waypoints.filter((_, i) => i !== index))
   }
 
+  /** Click on an anchor-lock dot: clicking the already-locked (filled) side
+   *  unlocks that endpoint (back to floating/`nearestAnchor`); clicking any
+   *  other (outline) side locks — or directly re-locks, no separate unlock
+   *  step — to that side. The two endpoints are fully independent. */
+  const clickAnchorDot = (e: React.MouseEvent, end: 'from' | 'to', side: Position) => {
+    e.stopPropagation()
+    const current = end === 'from' ? data.fromAnchor : data.toAnchor
+    const isLocked = current !== null && current === (side as unknown as AnchorSide)
+    data.onSaveAnchor(end, isLocked ? null : (side as unknown as AnchorSide)).catch(() => {})
+  }
+
   return (
     <>
       <BaseEdge id={id} path={path} markerEnd={markerEnd} />
@@ -556,6 +679,8 @@ function FrameEdgeView({
         strokeWidth={28}
         style={{ pointerEvents: 'stroke', cursor: 'copy' }}
         onDoubleClick={insertWaypoint}
+        onMouseEnter={showAnchorDots}
+        onMouseLeave={scheduleHideAnchorDots}
       />
       <EdgeLabelRenderer>
         <div
@@ -590,6 +715,47 @@ function FrameEdgeView({
             onDoubleClick={(e) => removeWaypoint(e, i)}
           />
         ))}
+        {hovered &&
+          (
+            [
+              ['from', from, data.fromAnchor] as const,
+              ['to', to, data.toAnchor] as const,
+            ] as const
+          ).flatMap(([end, rect, lockedSide]) => [
+            ...haloBars(rect, ANCHOR_HALO_MARGIN).map((bar, i) => (
+              <div
+                key={`${end}-halo-${i}`}
+                className="anchor-lock-halo nodrag nopan"
+                style={{
+                  transform: `translate(${bar.x}px, ${bar.y}px)`,
+                  width: bar.w,
+                  height: bar.h,
+                }}
+                onMouseEnter={showAnchorDots}
+                onMouseLeave={scheduleHideAnchorDots}
+              />
+            )),
+            ...anchorsOf(rect).map((a) => {
+              const locked =
+                lockedSide !== null && lockedSide === (a.position as unknown as AnchorSide)
+              const p = offsetOutward(a, ANCHOR_LOCK_OFFSET)
+              return (
+                <div
+                  key={`${end}-${a.position}`}
+                  className={
+                    'anchor-lock-dot nodrag nopan' + (locked ? ' locked' : '')
+                  }
+                  title={`lock ${end} endpoint to ${a.position}`}
+                  style={{
+                    transform: `translate(-50%, -50%) translate(${p.x}px, ${p.y}px)`,
+                  }}
+                  onMouseEnter={showAnchorDots}
+                  onMouseLeave={scheduleHideAnchorDots}
+                  onClick={(e) => clickAnchorDot(e, end, a.position)}
+                />
+              )
+            }),
+          ])}
       </EdgeLabelRenderer>
     </>
   )
@@ -794,6 +960,28 @@ export function StoryboardCanvas({
     [author, onChanged, showError],
   )
 
+  /** Lock/unlock one edge endpoint to a fixed side. Mirrors `editEdgeLabel`
+   *  above. A lock click is a single discrete action (no in-progress drag
+   *  phase like waypoints), so there's no local optimistic copy to keep. */
+  const editEdgeAnchor = useCallback(
+    (id: number, end: 'from' | 'to', side: AnchorSide | null) =>
+      updateEdge(
+        id,
+        end === 'from' ? { from_anchor: side } : { to_anchor: side },
+        author,
+      ).then(
+        () => {
+          setError(null)
+          onChanged()
+        },
+        (e) => {
+          showError(e)
+          throw e
+        },
+      ),
+    [author, onChanged, showError],
+  )
+
   // Edges derive straight from the server view — no local edge state to sync.
   const edges: FrameEdgeType[] = useMemo(
     () =>
@@ -805,13 +993,17 @@ export function StoryboardCanvas({
         data: {
           label: e.label,
           waypoints: e.waypoints,
+          fromAnchor: e.from_anchor,
+          toAnchor: e.to_anchor,
           onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
           onDelete: () => removeEdge(e.id),
           onSaveWaypoints: (next: Waypoint[]) => editEdgeWaypoints(e.id, next),
+          onSaveAnchor: (end: 'from' | 'to', side: AnchorSide | null) =>
+            editEdgeAnchor(e.id, end, side),
         },
         markerEnd: { type: MarkerType.ArrowClosed, color: '#00e5ff' },
       })),
-    [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints],
+    [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints, editEdgeAnchor],
   )
 
   function addFrame(pos?: { x: number; y: number }) {

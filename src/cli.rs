@@ -1526,6 +1526,8 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
             let patch = EdgePatch {
                 label: label.map(clear_if_empty),
                 waypoints: None,
+                from_anchor: None,
+                to_anchor: None,
             };
             print_json(&store.update_edge(id, &patch, author.as_deref())?);
         }

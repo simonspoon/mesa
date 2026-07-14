@@ -60,3 +60,49 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   `autoLayout()` never touches `waypoints` — it repositions frames only, so a
   large relayout can leave a stored waypoint visually "stale" relative to its
   frames until dragged/removed (an accepted tradeoff, not a bug).
+- **Locked connector anchors** (spec 348): each edge endpoint may be locked to
+  a specific side of its frame instead of floating to whichever side
+  `nearestAnchor` currently computes. `FrameEdge.from_anchor`/`to_anchor` are
+  `Option<AnchorSide>`, added via migration index 16 on `frame_edges`
+  (nullable `TEXT` columns, appended right after the `result` column entry at
+  index 15). `AnchorSide` (`Top`/`Right`/`Bottom`/`Left`) is stored as a
+  **bare lowercase string** (`"top"`, `"right"`, ...) via `as_str()`/`parse()`
+  — the same convention as `Status`/`Priority`, and deliberately **not**
+  JSON-encoded like `waypoints` (a single typed enum in one column is a
+  closer fit to `Status`/`Priority` than to a JSON-serialized `Vec<Waypoint>`
+  collection). The four string values are byte-identical to React Flow's own
+  `Position` enum, so no translation table is needed on the frontend — though
+  a value read off `FrameEdge.from_anchor`/`to_anchor` still needs a type-level
+  `as Position` cast, since ts-rs generates `AnchorSide` as its own
+  string-literal union, not the same TS type as `Position`.
+  `EdgePatch`/`EdgeUpdate` gain `from_anchor`/`to_anchor: Option<Option<AnchorSide>>`
+  via the existing `double_option` pattern (also used for `label`,
+  `description`, `parent_id`, ...) — **a three-state contract per endpoint**:
+  omitted leaves the current lock untouched, explicit `null` unlocks (back to
+  floating), a valid side string locks (or directly re-locks to a different
+  side, no separate unlock step needed). This is stricter than `waypoints`'
+  own two-state contract (`None` = untouched, `Some(vec)` = replace, including
+  `Some(vec![])` to clear) — do not assume the same shape reading from one to
+  the other. An invalid side literal fails to deserialize `EdgeUpdate` at the
+  serde boundary, mapped to a 422 `validation` error the same way an invalid
+  `status`/`priority` literal is today; there is no separate `Store`-level
+  check. A PATCH that actually changes either anchor logs a single
+  `"edge_anchor_changed"` storyboard event (checked first in
+  `Store::update_edge`'s one-event-per-call priority, ahead of
+  `edge_rerouted`/`edge_relabeled`) naming which end(s) changed and to/from
+  which side; a patch that re-asserts the already-locked side (or otherwise
+  changes nothing) logs nothing, same as `label`/`waypoints`. On the canvas,
+  `buildRoutedPath` substitutes a locked side for `nearestAnchor(...)` in
+  **both** branches — the plain-bezier (no-waypoints) branch and the
+  waypoint-routed branch — so a locked endpoint holds its side even once
+  waypoints exist; an edge with both ends unlocked takes neither branch's
+  locked path and renders byte-identical to before this feature. Hovering an
+  edge reveals 8 small anchor-lock dots (4 per endpoint, positioned just
+  outside each frame's own connection handles); a filled dot marks that
+  endpoint's current locked side, the other three (all four, if unlocked)
+  render outline-only. Clicking an outline dot locks (or re-locks) that
+  endpoint to that side; clicking the filled dot unlocks it back to floating.
+  The two endpoints are fully independent, so mixed lock state (one end
+  locked, the other floating, or each locked to a different side) is valid.
+  No CLI flag for authoring anchors — same "round-trips automatically as a
+  struct member, no setter" treatment as `waypoints`.

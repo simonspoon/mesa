@@ -1,4 +1,10 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
+
+function autosize(el: HTMLTextAreaElement | null) {
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
 
 /**
  * Click-to-edit text field: renders the value (or a muted placeholder),
@@ -25,6 +31,13 @@ export function InlineEdit({
   const [draft, setDraft] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  // Existing descriptions can already span many lines, so size once on
+  // entering edit mode, not just as the user types.
+  useLayoutEffect(() => {
+    if (editing && multiline) autosize(textareaRef.current)
+  }, [editing, multiline])
 
   function start() {
     setDraft(value)
@@ -66,10 +79,14 @@ export function InlineEdit({
 
   const field = multiline ? (
     <textarea
+      ref={textareaRef}
       autoFocus
       value={draft}
       rows={4}
-      onChange={(e) => setDraft(e.target.value)}
+      onChange={(e) => {
+        setDraft(e.target.value)
+        autosize(e.target)
+      }}
       onKeyDown={(e) => {
         if (e.key === 'Escape') cancel()
       }}

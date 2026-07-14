@@ -615,6 +615,11 @@ main {
   flex: 1 1 12rem;
 }
 
+.inline-edit.editing textarea {
+  resize: none;
+  overflow: hidden;
+}
+
 .inline-edit-actions {
   display: inline-flex;
   gap: 0.5rem;

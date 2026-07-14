@@ -260,4 +260,45 @@ run 2 "$MESA" storyboard create "no project flag"
 [ "$(jqe .error.code)" = "usage" ] || fail "missing --project: error.code"
 ok "storyboard create without --project: exit 2, code=usage"
 
+# ---- diagram_type + shape (mesa task 357) ----
+# $P was deleted above (project delete cascade check); use a fresh project.
+run 0 "$MESA" project create "Diagram types project" --no-git
+DP=$(jqs .id)
+
+run 0 "$MESA" storyboard create --project "$DP" --title "Untyped board"
+[ "$(jqs .diagram_type)" = "storyboard" ] || fail "storyboard create: default diagram_type"
+ok "storyboard create: diagram_type defaults to storyboard"
+
+run 0 "$MESA" storyboard create --project "$DP" --title "Flow" --type flowchart
+FLOW=$(jqs .id)
+[ "$(jqs .diagram_type)" = "flowchart" ] || fail "storyboard create --type: diagram_type"
+ok "storyboard create --type flowchart: diagram_type echoed"
+
+run 2 "$MESA" storyboard create --project "$DP" --title "Bad type" --type bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "invalid --type: error.code"
+ok "storyboard create --type bogus: exit 2, code=usage"
+
+run 0 "$MESA" storyboard frame create --storyboard "$FLOW" --title "Decide" --shape decision
+DECIDE=$(jqs .id)
+[ "$(jqs .shape)" = "decision" ] || fail "frame create --shape: shape echoed"
+ok "frame create --shape decision: shape echoed"
+
+run 1 "$MESA" storyboard frame create --storyboard "$FLOW" --title "Bad shape" --shape entity
+[ "$(jqe .error.code)" = "validation" ] || fail "shape wrong for board type: error.code"
+ok "frame create --shape entity on a flowchart board: exit 1, code=validation"
+
+run 2 "$MESA" storyboard frame create --storyboard "$FLOW" --title "Bad value" --shape bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "invalid --shape: error.code"
+ok "frame create --shape bogus: exit 2, code=usage"
+
+# diagram_type/shape are creation-only: no --type/--shape flag exists on the
+# update subcommands, so passing one is a clap usage error, not validation.
+run 2 "$MESA" storyboard update "$FLOW" --type storyboard
+[ "$(jqe .error.code)" = "usage" ] || fail "--type on storyboard update: error.code"
+ok "storyboard update --type: exit 2, code=usage (no such flag; immutable)"
+
+run 2 "$MESA" storyboard frame update "$DECIDE" --shape process
+[ "$(jqe .error.code)" = "usage" ] || fail "--shape on frame update: error.code"
+ok "frame update --shape: exit 2, code=usage (no such flag; immutable)"
+
 echo "all $CHECKS checks passed"

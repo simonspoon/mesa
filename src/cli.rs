@@ -16,8 +16,8 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, Priority,
-    ProjectPatch, Result, Status, Store, StoryboardPatch, Task, TaskPatch,
+    DiagramType, EdgePatch, Error, FrameNew, FramePatch, FrameShape, ImportDoc, NextResult,
+    Priority, ProjectPatch, Result, Status, Store, StoryboardPatch, Task, TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -689,6 +689,10 @@ EXAMPLES
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
+        /// Diagram type: storyboard|flowchart|erd (default storyboard);
+        /// immutable after creation — no --type on `storyboard update`
+        #[arg(long = "type", value_parser = parse_diagram_type)]
+        diagram_type: Option<DiagramType>,
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
@@ -799,6 +803,11 @@ EXAMPLES
         /// Optional task id to link (must be in the storyboard's project)
         #[arg(long)]
         task: Option<i64>,
+        /// Node shape: process|decision|start_end|entity, valid only for the
+        /// board's diagram type (must be omitted on a storyboard board);
+        /// immutable after creation — no --shape on `storyboard frame update`
+        #[arg(long, value_parser = parse_frame_shape)]
+        shape: Option<FrameShape>,
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
@@ -928,6 +937,15 @@ fn parse_status(s: &str) -> std::result::Result<Status, String> {
 
 fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
     Priority::parse(s).ok_or_else(|| format!("'{s}' is not one of low|medium|high"))
+}
+
+fn parse_diagram_type(s: &str) -> std::result::Result<DiagramType, String> {
+    DiagramType::parse(s).ok_or_else(|| format!("'{s}' is not one of storyboard|flowchart|erd"))
+}
+
+fn parse_frame_shape(s: &str) -> std::result::Result<FrameShape, String> {
+    FrameShape::parse(s)
+        .ok_or_else(|| format!("'{s}' is not one of process|decision|start_end|entity"))
 }
 
 /// Comma-separated tags; empty string yields the empty set (clears tags).
@@ -1403,6 +1421,7 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             project,
             title,
             description,
+            diagram_type,
             author,
         } => print_json(&store.create_storyboard(
             // clap guarantees exactly one of each positional/flag pair.
@@ -1410,6 +1429,7 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             &title.or(title_pos).unwrap(),
             description.as_deref(),
             author.as_deref(),
+            diagram_type,
         )?),
         StoryboardCmd::List {
             project_pos,
@@ -1453,6 +1473,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
             h,
             color,
             task,
+            shape,
             author,
         } => {
             // clap guarantees exactly one of each positional/flag pair.
@@ -1467,6 +1488,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
                 color,
                 task_id: task,
                 author,
+                shape,
             };
             print_json(&store.create_frame(storyboard, &new)?);
         }

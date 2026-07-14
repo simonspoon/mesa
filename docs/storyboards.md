@@ -106,3 +106,126 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   locked, the other floating, or each locked to a different side) is valid.
   No CLI flag for authoring anchors — same "round-trips automatically as a
   struct member, no setter" treatment as `waypoints`.
+- **Diagram types + per-frame shapes** (spec 355): a storyboard carries a
+  `diagram_type` (`Storyboard.diagram_type: DiagramType`) — `storyboard`
+  (default), `flowchart`, or `erd` — stored as a **bare lowercase string**
+  (`as_str()`/`parse()`, same convention as `AnchorSide`/`Status`/`Priority`),
+  added via migration index 17 alongside `frames.shape` (`ALTER TABLE
+  storyboards ADD COLUMN diagram_type TEXT NOT NULL DEFAULT 'storyboard'` /
+  `ALTER TABLE frames ADD COLUMN shape TEXT`, one migration entry, no new
+  table). Every pre-feature storyboard backfills to `diagram_type:
+  "storyboard"` for free via the column default; every pre-feature frame's
+  `shape` reads back `null`.
+  - **`diagram_type` is immutable after creation** — the same structural
+    posture as `project_id`/`author`: there is no field for it on
+    `StoryboardPatch`/the API's `StoryboardUpdate`, so there is no runtime
+    guard to bypass. `storyboard update --type ...` doesn't exist as a flag;
+    passing one is a clap **usage error (exit 2)**, not a domain `validation`
+    error, because the patch type has no path to carry the value.
+  - Each frame carries its own **`shape: Option<FrameShape>`** —
+    `process`/`decision`/`start_end`/`entity`, or `None` for the generic
+    card — because Must #5 requires a flowchart board to hold a *mix* of
+    shapes simultaneously, so shape can't be inferred from the board's
+    `diagram_type` alone; it's a per-frame property set at
+    `FrameNew.shape`. `Store::create_frame` validates the given shape against
+    the parent board's `diagram_type` via `validate_frame_shape`
+    (`src/core/store.rs`), reading `diagram_type` off the same
+    `get_storyboard` call `create_frame` already makes (no extra query):
+    a `storyboard` board's frames must have `shape: None`; a `flowchart`
+    board's frames must be one of `process`/`decision`/`start_end` (not
+    `entity`); an `erd` board's frames must be `entity` (not any flowchart
+    shape). A mismatch is `Error::Validation` (`"shape '<shape>' is not valid
+    for a <diagram_type> board"`).
+  - **`shape` is likewise immutable after creation** — no field on
+    `FramePatch`/the API's `FrameUpdate`, mirroring `diagram_type`'s
+    reasoning: a frame should never carry a shape from the "wrong" type
+    system, and no story needs to re-shape a frame in place. `storyboard
+    frame update --shape ...` doesn't exist as a flag; same clap usage-error
+    posture as `storyboard update --type`.
+  - CLI: `storyboard create <PROJECT> <TITLE> [--type
+    storyboard|flowchart|erd]` (absent → `storyboard`, the column default;
+    an unrecognized value is a clap usage error, exit 2, same posture as
+    `--priority`). `storyboard frame create <STORYBOARD> <TITLE> [--shape
+    process|decision|start_end|entity]` (absent → `None`; an unrecognized
+    value is a clap usage error, exit 2; a syntactically valid value that's
+    wrong for the board's `diagram_type` is the `Store` `validation` error
+    above, exit 1 — the CLI does not auto-correct or default a shape for a
+    non-`storyboard` board, it just passes what it's given through to
+    `Store`). Neither `storyboard update` nor `storyboard frame update` gets
+    a corresponding flag (immutability, above). `storyboard show`/`list`/
+    `delete` and `frame` reads need no CLI change — they already print the
+    full `Storyboard`/`Frame`/`StoryboardView` object, so `diagram_type`/
+    `shape` ride for free once the struct fields exist.
+  - API: `POST /api/storyboards` accepts `#[serde(default)] diagram_type:
+    Option<DiagramType>` in the request body (missing/`null` → `storyboard`);
+    `POST /api/storyboards/{id}/frames` accepts `#[serde(default)] shape:
+    Option<FrameShape>` (missing/`null` → `None`). Neither `StoryboardUpdate`
+    nor `FrameUpdate` gains a field. A syntactically-invalid string for
+    either (e.g. `"diagram_type": "bogus"`) fails to deserialize at the serde
+    boundary → the existing `JsonRejection` 422 `validation` path, same as an
+    invalid `AnchorSide` literal on `EdgeUpdate` today. A syntactically-valid but
+    wrong-for-board-type shape is the same `Store` `validation` error as the
+    CLI path. Every `Storyboard`/`Frame`/`StoryboardView` response (create,
+    show, list, embedded in the board view) carries `diagram_type`/`shape`
+    automatically — it's the same struct, not a projection.
+  - Frontend node types (`frontend/src/StoryboardCanvas.tsx`): React Flow's
+    per-node `type` is keyed off `Frame.shape`, not `diagram_type` —
+    `diagram_type` only selects which shape *set* the creation UX offers.
+    `toNodes` sets `type: (f.shape ?? 'frame') as FrameNodeKind`; `nodeTypes`
+    maps `{ frame: FrameNode, process: ProcessNode, decision: DecisionNode,
+    start_end: StartEndNode, entity: EntityNode }`. All five components
+    share one implementation, `FrameCardNode` — identical content, editing,
+    and connection-handle behavior — distinguished only by an optional
+    `shapeClass` (an extra CSS class on the card) and, for `EntityNode` only,
+    a `renderBody` override (below). A `storyboard`-type board's frames all
+    have `shape: null`, so they resolve to `type: 'frame'` / plain
+    `FrameNode`, byte-identical to pre-feature rendering (the Must #6
+    non-regression guard).
+    - **Flowchart shapes** (`.frame-process`/`.frame-decision`/
+      `.frame-start-end` in `frontend/src/App.css`): `process` is a plain
+      rounded rectangle (`clip-path: none`); `start_end` is a pill/stadium
+      shape (`border-radius: 999px`, green border) with extra header padding
+      so the title/id clear the curve; `decision` is **not** a `clip-path`
+      diamond on the card itself (an earlier attempt clipped the title's
+      leading letter and the `#id` badge at the diamond's narrow point) —
+      instead the card stays a plain unclipped rectangle
+      (`background/border: transparent`) and an oversized amber-bordered
+      `::before` pseudo-element behind it (`z-index: -1`, `clip-path:
+      polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)`) renders the diamond as a
+      decorative backdrop/halo, so content is never clipped. Directed
+      arrowheads on edges (`MarkerType.ArrowClosed`) already render
+      unconditionally for every board type, pre-dating this feature — Must
+      #7 needed no new edge-direction work.
+    - **ERD shape** (`.frame-entity`): a plain rectangle tinted magenta,
+      distinguished from `process` mainly by the attribute list, not the
+      silhouette. `EntityNode` passes `FrameCardNode` a `renderBody` that
+      renders `Frame.body` as `attributeLines(body)` — split on `\n`, trim,
+      drop empty lines — mapped into a `<ul className="frame-attr-list">
+      <li>` per line, instead of running `body` through the `Markdown`
+      component every other shape uses. This is presentation-only: `Frame.
+      body` is still a plain string (no new column, no JSON-in-`body`
+      convention, no per-attribute typed structure) — "one attribute per
+      non-empty line" is a rendering convention in `EntityNode` alone, not a
+      parsed/validated format enforced anywhere else. A two-line body like
+      `"id: int PK\nname: string"` therefore reads as two distinct list
+      items on an `entity` frame, versus one collapsed line through
+      `Markdown`'s soft-break handling on a generic card — the concrete
+      difference the Should #13 "not an opaque markdown blob" requirement is
+      checking for.
+  - Frontend creation UX: `StoryboardListView.tsx`'s new-storyboard form adds
+    a `diagram_type` `<select>` (options `storyboard`/`flowchart`/`erd`,
+    default `storyboard`) next to title/author, passed straight through to
+    `createStoryboard(...)`. `StoryboardCanvas.tsx`'s add-frame toolbar reads
+    `SHAPES_FOR_TYPE[view.storyboard.diagram_type]` (`storyboard: []`,
+    `flowchart: ['process','decision','start_end']`, `erd: ['entity']` — kept
+    in lockstep with `Store::validate_frame_shape`) to decide what to render:
+    a `storyboard`-type board (empty shape set) keeps the original single
+    "add frame" button, byte-identical markup to before this feature; a
+    `flowchart`/`erd` board renders one button per valid shape instead (e.g.
+    "+ process" / "+ decision" / "+ start/end"), each calling `createFrame`
+    with that shape. The first shape in a board's set doubles as the
+    `defaultShape` used by the canvas's other frame-creating gestures (pane
+    double-click, dragging a connection to empty canvas, Cmd+D duplicate) so
+    those keep working on flowchart/erd boards instead of hitting the
+    `Store` validation error a bare `shape: null` create would now draw on a
+    non-`storyboard` board.

@@ -6,8 +6,8 @@ use rusqlite::Connection;
 
 use super::attachments;
 use super::types::{
-    AnchorSide, Attachment, Frame, FrameEdge, InboxItem, Priority, Project, Status, Storyboard,
-    StoryboardEvent, StoryboardView, Task, TaskEvent, Waypoint,
+    AnchorSide, Attachment, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Priority,
+    Project, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskEvent, Waypoint,
 };
 
 #[derive(Debug)]
@@ -251,6 +251,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE frame_edges ADD COLUMN from_anchor TEXT;
     ALTER TABLE frame_edges ADD COLUMN to_anchor TEXT;
     ",
+    "
+    ALTER TABLE storyboards ADD COLUMN diagram_type TEXT NOT NULL DEFAULT 'storyboard';
+    ALTER TABLE frames ADD COLUMN shape TEXT;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -308,9 +312,9 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 const STORYBOARD_COLUMNS: &str =
-    "id, project_id, title, description, author, created_at, updated_at";
-const FRAME_COLUMNS: &str =
-    "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at";
+    "id, project_id, title, description, author, diagram_type, created_at, updated_at";
+const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, \
+     shape, created_at, updated_at";
 const EDGE_COLUMNS: &str =
     "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
@@ -367,18 +371,21 @@ fn inbox_body_to_task(body: &str) -> (String, Option<String>) {
 }
 
 fn row_to_storyboard(row: &rusqlite::Row<'_>) -> rusqlite::Result<Storyboard> {
+    let diagram_type: String = row.get(5)?;
     Ok(Storyboard {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
         author: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        diagram_type: DiagramType::parse(&diagram_type).expect("invalid diagram_type in db"),
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
 fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
+    let shape: Option<String> = row.get(11)?;
     Ok(Frame {
         id: row.get(0)?,
         storyboard_id: row.get(1)?,
@@ -391,9 +398,36 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
         color: row.get(8)?,
         task_id: row.get(9)?,
         author: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        shape: shape
+            .as_deref()
+            .map(|s| FrameShape::parse(s).expect("invalid shape in db")),
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
+}
+
+/// Validates a frame's `shape` against its board's `diagram_type` shape set:
+/// `storyboard` boards take no shape, `flowchart` boards take
+/// `process`/`decision`/`start_end`, `erd` boards take only `entity`.
+fn validate_frame_shape(diagram_type: DiagramType, shape: Option<FrameShape>) -> Result<()> {
+    let ok = matches!(
+        (diagram_type, shape),
+        (DiagramType::Storyboard, None)
+            | (
+                DiagramType::Flowchart,
+                Some(FrameShape::Process | FrameShape::Decision | FrameShape::StartEnd),
+            )
+            | (DiagramType::Erd, Some(FrameShape::Entity))
+    );
+    if ok {
+        Ok(())
+    } else {
+        let shape_str = shape.map(FrameShape::as_str).unwrap_or("none");
+        Err(Error::Validation(format!(
+            "shape '{shape_str}' is not valid for a {} board",
+            diagram_type.as_str()
+        )))
+    }
 }
 
 fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
@@ -560,7 +594,10 @@ pub struct StoryboardPatch {
 
 /// A new frame to add to a storyboard. Coordinates and size are caller-supplied
 /// (the CLI/API apply sensible defaults); `task_id`, if given, must reference a
-/// task in the storyboard's project.
+/// task in the storyboard's project. `shape`, if given, must be a member of
+/// the storyboard's `diagram_type` shape set (validated by
+/// `Store::create_frame`) — settable only at creation, no field on
+/// `FramePatch`.
 #[derive(Debug, Clone)]
 pub struct FrameNew {
     pub title: String,
@@ -572,6 +609,7 @@ pub struct FrameNew {
     pub color: Option<String>,
     pub task_id: Option<i64>,
     pub author: Option<String>,
+    pub shape: Option<FrameShape>,
 }
 
 /// Fields to change on a frame; `None` means leave unchanged. A frame's
@@ -1561,13 +1599,17 @@ impl Store {
     // ---- storyboards ----
 
     /// Creates a storyboard in an existing project. The project is fixed at
-    /// creation (immutable thereafter), mirroring tasks.
+    /// creation (immutable thereafter), mirroring tasks. `diagram_type`
+    /// defaults to `DiagramType::Storyboard` when omitted, matching the
+    /// column default — immutable after creation (no field on
+    /// `StoryboardPatch`).
     pub fn create_storyboard(
         &mut self,
         project_id: i64,
         title: &str,
         description: Option<&str>,
         author: Option<&str>,
+        diagram_type: Option<DiagramType>,
     ) -> Result<Storyboard> {
         let project_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
@@ -1577,12 +1619,13 @@ impl Store {
         if !project_exists {
             return Err(Error::Validation(format!("project {project_id} not found")));
         }
+        let diagram_type = diagram_type.unwrap_or(DiagramType::Storyboard);
         let id = {
             let tx = self.conn.transaction()?;
             tx.execute(
-                "INSERT INTO storyboards (project_id, title, description, author, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'))",
-                (project_id, title, description, author),
+                "INSERT INTO storyboards (project_id, title, description, author, diagram_type, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))",
+                (project_id, title, description, author, diagram_type.as_str()),
             )?;
             let id = tx.last_insert_rowid();
             insert_storyboard_event(
@@ -1716,9 +1759,13 @@ impl Store {
     /// Adds a frame to an existing storyboard. An unknown storyboard is a
     /// validation error (the id is a request parameter, like a task's project).
     /// A `task_id`, if given, must reference a task in the board's project.
+    /// `new.shape`, if given, must be a member of the board's `diagram_type`
+    /// shape set — a `storyboard` board takes no shape, a `flowchart` board
+    /// takes `process`/`decision`/`start_end`, an `erd` board takes only
+    /// `entity`; a mismatch is a validation error.
     pub fn create_frame(&mut self, storyboard_id: i64, new: &FrameNew) -> Result<Frame> {
-        let project_id = match self.get_storyboard(storyboard_id) {
-            Ok(sb) => sb.project_id,
+        let sb = match self.get_storyboard(storyboard_id) {
+            Ok(sb) => sb,
             Err(Error::NotFound(_)) => {
                 return Err(Error::Validation(format!(
                     "storyboard {storyboard_id} not found"
@@ -1726,15 +1773,17 @@ impl Store {
             }
             Err(e) => return Err(e),
         };
+        let project_id = sb.project_id;
         if let Some(task_id) = new.task_id {
             self.check_frame_task(task_id, project_id)?;
         }
+        validate_frame_shape(sb.diagram_type, new.shape)?;
         let id = {
             let tx = self.conn.transaction()?;
             tx.execute(
                 "INSERT INTO frames \
-                 (storyboard_id, title, body, x, y, w, h, color, task_id, author, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
+                 (storyboard_id, title, body, x, y, w, h, color, task_id, author, shape, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))",
                 rusqlite::params![
                     storyboard_id,
                     new.title,
@@ -1746,6 +1795,7 @@ impl Store {
                     new.color,
                     new.task_id,
                     new.author,
+                    new.shape.map(FrameShape::as_str),
                 ],
             )?;
             let id = tx.last_insert_rowid();
@@ -3620,8 +3670,7 @@ mod tests {
                 Some(Status::Backlog),
             )
             .unwrap();
-        let dependent =
-            create_with_priority(&mut store, p.id, "dependent", Priority::High);
+        let dependent = create_with_priority(&mut store, p.id, "dependent", Priority::High);
         store
             .add_dependency(dependent.id, backlog_blocker.id)
             .unwrap();
@@ -3826,6 +3875,7 @@ mod tests {
             color: None,
             task_id: None,
             author: None,
+            shape: None,
         }
     }
 
@@ -3834,7 +3884,7 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
         let sb = store
-            .create_storyboard(p.id, "flow", Some("the happy path"), Some("agent-1"))
+            .create_storyboard(p.id, "flow", Some("the happy path"), Some("agent-1"), None)
             .unwrap();
         assert_eq!(sb.title, "flow");
         assert_eq!(sb.description.as_deref(), Some("the happy path"));
@@ -3883,17 +3933,57 @@ mod tests {
     fn create_storyboard_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let err = store
-            .create_storyboard(999, "orphan", None, None)
+            .create_storyboard(999, "orphan", None, None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
     }
 
     #[test]
+    fn migration_backfills_diagram_type_and_leaves_shape_null_on_pre_357_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-357.db");
+        // Build a db at the version just before the diagram_type/shape
+        // migration, with a pre-feature storyboard and frame (spec 355 Must
+        // #1/#6: existing rows must read back as diagram_type=storyboard,
+        // shape=null, with no explicit backfill statement).
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+                .unwrap();
+            conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO storyboards (project_id, title, author, created_at, updated_at) \
+                 VALUES (1, 'pre-feature board', NULL, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames \
+                 (storyboard_id, title, x, y, w, h, author, created_at, updated_at) \
+                 VALUES (1, 'pre-feature frame', 0, 0, 240, 140, NULL, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let boards = store.list_storyboards(None).unwrap();
+        assert_eq!(boards.len(), 1);
+        assert_eq!(boards[0].diagram_type, DiagramType::Storyboard);
+        let view = store.get_storyboard_view(boards[0].id).unwrap();
+        assert_eq!(view.frames.len(), 1);
+        assert_eq!(view.frames[0].shape, None);
+    }
+
+    #[test]
     fn frame_crud_and_view_ordering() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
 
         let f1 = store
             .create_frame(
@@ -3960,7 +4050,7 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let p1 = store.create_project("p1", None, None, None).unwrap();
         let p2 = store.create_project("p2", None, None, None).unwrap();
-        let sb = store.create_storyboard(p1.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p1.id, "b", None, None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
 
@@ -4022,8 +4112,8 @@ mod tests {
     fn edge_crud_rejects_self_and_foreign_frames_and_allows_cycles() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
-        let other = store.create_storyboard(p.id, "other", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let other = store.create_storyboard(p.id, "other", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let foreign = store.create_frame(other.id, &frame_new("foreign")).unwrap();
@@ -4090,7 +4180,7 @@ mod tests {
     fn delete_frame_cascades_edges_and_echoes_them() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let c = store.create_frame(sb.id, &frame_new("c")).unwrap();
@@ -4114,7 +4204,7 @@ mod tests {
     fn delete_storyboard_cascades_and_echoes_full_view() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
@@ -4134,7 +4224,7 @@ mod tests {
     fn delete_project_cascades_storyboards() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("doomed", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
@@ -4152,9 +4242,7 @@ mod tests {
     fn storyboard_change_history_records_actor_and_actions() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "flow", None, Some("agent-1"))
-            .unwrap();
+        let sb = store.create_storyboard(p.id, "flow", None, Some("agent-1"), None).unwrap();
         let a = store
             .create_frame(
                 sb.id,
@@ -4255,12 +4343,12 @@ mod tests {
     fn delete_storyboard_cascades_its_change_history() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
         store.create_frame(sb.id, &frame_new("a")).unwrap();
         assert!(!store.list_storyboard_events(sb.id).unwrap().is_empty());
         store.delete_storyboard(sb.id).unwrap();
         // a fresh board reuses no rows; the orphaned events are gone
-        let sb2 = store.create_storyboard(p.id, "b2", None, None).unwrap();
+        let sb2 = store.create_storyboard(p.id, "b2", None, None, None).unwrap();
         let events = store.list_storyboard_events(sb2.id).unwrap();
         assert_eq!(events.len(), 1); // only its own creation
         assert_eq!(events[0].action, "storyboard_created");
@@ -4270,7 +4358,7 @@ mod tests {
     fn no_op_update_changes_nothing_and_logs_nothing() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", Some("d"), None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", Some("d"), None, None).unwrap();
         let f = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let g = store.create_frame(sb.id, &frame_new("g")).unwrap();
         let e = store
@@ -4336,7 +4424,7 @@ mod tests {
     fn edge_anchor_patch_is_three_state_preserved_and_logged() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None).unwrap();
+        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let e = store

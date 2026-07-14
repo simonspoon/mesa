@@ -43,12 +43,42 @@ import { InlineEdit } from './components/InlineEdit'
 import { Markdown } from './components/Markdown'
 import { layoutFrames, type LayoutDirection } from './layout'
 import type { AnchorSide } from './types/AnchorSide'
+import type { DiagramType } from './types/DiagramType'
 import type { Frame } from './types/Frame'
+import type { FrameShape } from './types/FrameShape'
 import type { StoryboardView } from './types/StoryboardView'
 import type { Waypoint } from './types/Waypoint'
 
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 3
+
+/** Every React Flow node `type` string this canvas can produce: the generic
+ *  `'frame'` card (a `storyboard`-type board, or any frame with `shape ===
+ *  null`) plus every `FrameShape` value. */
+type FrameNodeKind = FrameShape | 'frame'
+
+/** The valid `Frame.shape` set for each `Storyboard.diagram_type`, per
+ *  `Store::validate_frame_shape` (src/core/store.rs) — a `storyboard` board
+ *  takes no shape (the generic card, `shape: null`), a `flowchart` board
+ *  takes exactly one of process/decision/start_end, an `erd` board takes
+ *  only entity. Drives both the add-frame picker's offered options (story
+ *  360) and the default shape handed to the other frame-creating gestures
+ *  below (pane double-click, drag-to-empty-canvas, duplicate) so those keep
+ *  working on flowchart/erd boards instead of hitting the `Store` validation
+ *  error a `shape: null` create would now draw on those board types. */
+const SHAPES_FOR_TYPE: Record<DiagramType, FrameShape[]> = {
+  storyboard: [],
+  flowchart: ['process', 'decision', 'start_end'],
+  erd: ['entity'],
+}
+
+/** Display label for each shape's add-frame picker button. */
+const SHAPE_LABELS: Record<FrameShape, string> = {
+  process: 'process',
+  decision: 'decision',
+  start_end: 'start/end',
+  entity: 'entity',
+}
 
 /** Node payload: the server frame, its selected/editing state (owned by this
  *  component, not React Flow's own click-select, so they can never disagree
@@ -68,7 +98,7 @@ type FrameNodeType = Node<
     onDelete: () => Promise<void>
     onDone: () => void
   },
-  'frame'
+  FrameNodeKind
 >
 
 /** Edge payload: the server label plus the mutation callbacks the label
@@ -109,8 +139,26 @@ const HANDLES = [
  * true (the "adjust state during render on a prop change" pattern, matching
  * `FrameEdgeView`'s `seenWaypoints`), so a previous unsaved edit never leaks
  * into the next edit session.
+ *
+ * Shared by every flowchart/ERD shape (`FrameNode`/`ProcessNode`/
+ * `DecisionNode`/`StartEndNode`/`EntityNode` below): identical content,
+ * editing, and connection behavior — the only differences are `shapeClass`,
+ * an extra class name that gives the card its silhouette (rectangle/diamond/
+ * oval/entity box) in CSS, and the optional `renderBody` override (used only
+ * by `EntityNode` to render `Frame.body` as a distinct attribute list
+ * instead of markdown — see arch.md §5). A single implementation keeps the
+ * mutation wiring (`data.onSave*`) in one place rather than duplicated per
+ * shape.
  */
-function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
+function FrameCardNode({
+  id,
+  data,
+  shapeClass,
+  renderBody,
+}: NodeProps<FrameNodeType> & {
+  shapeClass?: string
+  renderBody?: (body: string) => React.ReactNode
+}) {
   const f = data.frame
   const editing = data.editing
   const connection = useConnection()
@@ -178,6 +226,7 @@ function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
       <div
         className={
           'frame' +
+          (shapeClass ? ' ' + shapeClass : '') +
           (data.selected ? ' selected' : '') +
           (editing ? ' editing' : '')
         }
@@ -228,7 +277,7 @@ function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
         ) : (
           f.body && (
             <div className="frame-body">
-              <Markdown text={f.body} />
+              {renderBody ? renderBody(f.body) : <Markdown text={f.body} />}
             </div>
           )
         )}
@@ -292,6 +341,62 @@ function FrameNode({ id, data }: NodeProps<FrameNodeType>) {
         />
       )}
     </>
+  )
+}
+
+/** The generic card — a `storyboard`-type board, or any frame with
+ *  `shape === null` (Must #6 regression guard: byte-identical to the
+ *  pre-flowchart rendering, since `shapeClass` is unset). */
+function FrameNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} />
+}
+
+/** Flowchart "process" step: a plain rectangle (sharper corners than the
+ *  generic card's cut-corner styling). */
+function ProcessNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-process" />
+}
+
+/** Flowchart "decision" branch: a diamond. */
+function DecisionNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-decision" />
+}
+
+/** Flowchart "start/end" terminator: a rounded oval/pill. */
+function StartEndNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-start-end" />
+}
+
+/** Splits `Frame.body` into its attribute lines: one attribute per non-empty
+ *  line, per arch.md §5's line-based convention (no new field, no JSON-in-
+ *  `body` structure — `body` stays a plain string round-tripping through the
+ *  same `Frame`/`FrameNew`/`FramePatch` shape every other frame uses). */
+function attributeLines(body: string): string[] {
+  return body
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+}
+
+/** ERD "entity" shape: same card/editing/connection behavior as every other
+ *  shape, but the body renders as a distinct attribute list — one `<li>` per
+ *  non-empty line of `Frame.body` — instead of through the `Markdown`
+ *  component every other shape uses for its body. Should #13 only asks for a
+ *  readable list, not typed/structured attributes, so this is presentation
+ *  only: storage is untouched plain text. */
+function EntityNode(props: NodeProps<FrameNodeType>) {
+  return (
+    <FrameCardNode
+      {...props}
+      shapeClass="frame-entity"
+      renderBody={(body) => (
+        <ul className="frame-attr-list">
+          {attributeLines(body).map((line, i) => (
+            <li key={i}>{line}</li>
+          ))}
+        </ul>
+      )}
+    />
   )
 }
 
@@ -799,7 +904,13 @@ function FrameConnectionLine({
   return <path d={path} fill="none" className="react-flow__connection-path" />
 }
 
-const nodeTypes = { frame: FrameNode }
+const nodeTypes = {
+  frame: FrameNode,
+  process: ProcessNode,
+  decision: DecisionNode,
+  start_end: StartEndNode,
+  entity: EntityNode,
+}
 const edgeTypes = { frame: FrameEdgeView }
 
 /**
@@ -889,7 +1000,11 @@ export function StoryboardCanvas({
     (frames: Frame[], selected: number | null, editing: number | null): FrameNodeType[] =>
       frames.map((f) => ({
         id: String(f.id),
-        type: 'frame' as const,
+        // Storyboard-type boards (and any pre-357 frame): `shape` is always
+        // null, so this always resolves to `'frame'` — byte-identical to the
+        // pre-flowchart behavior (Must #6 regression guard). A flowchart
+        // board's frames key off their own persisted shape instead.
+        type: (f.shape ?? 'frame') as FrameNodeKind,
         position: { x: f.x, y: f.y },
         data: {
           frame: f,
@@ -1006,13 +1121,24 @@ export function StoryboardCanvas({
     [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints, editEdgeAnchor],
   )
 
-  function addFrame(pos?: { x: number; y: number }) {
+  // The shape set this board's diagram_type allows, and — for the gestures
+  // that don't offer an explicit shape choice (pane double-click,
+  // drag-a-connection-to-empty-canvas) — the shape to default to so those
+  // still work on flowchart/erd boards instead of drawing the `Store`
+  // validation error a `shape: null` create now hits there. `[0]` is
+  // `undefined` for a `storyboard`-type board (empty array), matching
+  // pre-360 behavior exactly.
+  const boardShapes = SHAPES_FOR_TYPE[view.storyboard.diagram_type]
+  const defaultShape = boardShapes[0]
+
+  function addFrame(shape?: FrameShape, pos?: { x: number; y: number }) {
     const n = view.frames.length
     createFrame(storyboardId, {
       title: 'New frame',
       x: pos ? Math.round(pos.x) : 48 + (n % 6) * 28,
       y: pos ? Math.round(pos.y) : 48 + (n % 6) * 28,
       author,
+      shape,
     }).then((f) => {
       setError(null)
       onChanged()
@@ -1023,7 +1149,10 @@ export function StoryboardCanvas({
   /** Cmd+D/Ctrl+D target: creates a copy of `frame` offset down-right so it
    *  doesn't sit exactly on top of the original. Does not carry over the
    *  linked task — a duplicate shouldn't silently point two frames at the
-   *  same task without the user choosing to. */
+   *  same task without the user choosing to. Carries over the source
+   *  frame's own shape (rather than `defaultShape`) so duplicating e.g. a
+   *  decision node yields another decision node, not always the board's
+   *  first shape. */
   const duplicateFrame = useCallback(
     (frame: Frame) => {
       createFrame(storyboardId, {
@@ -1035,6 +1164,7 @@ export function StoryboardCanvas({
         h: frame.h,
         color: frame.color ?? undefined,
         author,
+        shape: frame.shape ?? undefined,
       }).then((f) => {
         setError(null)
         onChanged()
@@ -1054,7 +1184,7 @@ export function StoryboardCanvas({
     if (!(e.target as HTMLElement).classList.contains('react-flow__pane')) return
     const inst = rfInstance.current
     if (!inst) return
-    addFrame(inst.screenToFlowPosition({ x: e.clientX, y: e.clientY }))
+    addFrame(defaultShape, inst.screenToFlowPosition({ x: e.clientX, y: e.clientY }))
   }
 
   function onNodeDragStop(_e: unknown, node: FrameNodeType) {
@@ -1117,6 +1247,7 @@ export function StoryboardCanvas({
       x: Math.round(pos.x),
       y: Math.round(pos.y),
       author,
+      shape: defaultShape,
     }).then((f) => {
       setError(null)
       onChanged()
@@ -1238,7 +1369,25 @@ export function StoryboardCanvas({
           <Controls showInteractive={false} />
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="canvas-controls">
-            <button onClick={() => addFrame()}>add frame</button>
+            {boardShapes.length === 0 ? (
+              // storyboard-type board: exactly today's single button, shape
+              // implicitly null — zero UI regression (Must #6).
+              <button onClick={() => addFrame()}>add frame</button>
+            ) : (
+              // flowchart/erd board: a picker offering only the shape set
+              // valid for this board's diagram_type (SHAPES_FOR_TYPE above).
+              <span className="add-frame-picker">
+                {boardShapes.map((shape) => (
+                  <button
+                    key={shape}
+                    onClick={() => addFrame(shape)}
+                    title={`add a ${SHAPE_LABELS[shape]} frame`}
+                  >
+                    + {SHAPE_LABELS[shape]}
+                  </button>
+                ))}
+              </span>
+            )}
             <button onClick={autoLayout} title="Arrange frames by flow direction">
               auto layout
             </button>

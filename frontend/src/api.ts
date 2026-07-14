@@ -9,9 +9,11 @@ import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
+import type { DiagramType } from './types/DiagramType'
 import type { FileContentView } from './types/FileContentView'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
+import type { FrameShape } from './types/FrameShape'
 import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { HookRun } from './types/HookRun'
@@ -412,6 +414,7 @@ export interface StoryboardCreate {
   title: string
   description?: string
   author?: string
+  diagram_type?: DiagramType
 }
 
 export function createStoryboard(body: StoryboardCreate): Promise<Storyboard> {
@@ -446,6 +449,7 @@ export interface FrameCreate {
   color?: string
   task_id?: number
   author?: string
+  shape?: FrameShape
 }
 
 export function createFrame(

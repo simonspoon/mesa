@@ -1,7 +1,14 @@
 import { useState } from 'react'
 import { createStoryboard, listStoryboards } from '../api'
 import { getAuthor, setAuthor } from '../author'
+import type { DiagramType } from '../types/DiagramType'
 import { useFetch } from '../useFetch'
+
+/** The three board styles a new storyboard can be created as (Must #1/#9) —
+ *  offered as a plain `<select>` alongside title/author, defaulting to the
+ *  original generic board so existing creation behavior is unchanged unless
+ *  the user picks otherwise. */
+const DIAGRAM_TYPES: DiagramType[] = ['storyboard', 'flowchart', 'erd']
 
 /**
  * Lists a project's storyboards and creates new ones. A board is a freeform
@@ -16,12 +23,18 @@ export function StoryboardListView({ projectId }: { projectId: number }) {
   )
   const [title, setTitle] = useState('')
   const [author, setAuthorState] = useState(getAuthor())
+  const [diagramType, setDiagramType] = useState<DiagramType>('storyboard')
   const [createError, setCreateError] = useState<string | null>(null)
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
     setAuthor(author)
-    createStoryboard({ project_id: projectId, title, author }).then(
+    createStoryboard({
+      project_id: projectId,
+      title,
+      author,
+      diagram_type: diagramType,
+    }).then(
       (sb) => {
         setTitle('')
         setCreateError(null)
@@ -50,6 +63,17 @@ export function StoryboardListView({ projectId }: { projectId: number }) {
           title="your name — stamped on what you create"
           onChange={(e) => setAuthorState(e.target.value)}
         />
+        <select
+          value={diagramType}
+          title="diagram type — fixed once created"
+          onChange={(e) => setDiagramType(e.target.value as DiagramType)}
+        >
+          {DIAGRAM_TYPES.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
         <button type="submit">create</button>
         {createError && <span className="error">{createError}</span>}
       </form>

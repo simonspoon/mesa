@@ -676,6 +676,19 @@ main {
   background: rgba(6, 10, 16, 0.85);
 }
 
+/* Add-frame shape picker (flowchart/erd boards only — story 360): one button
+   per valid shape, stacked like the rest of .canvas-controls's children. */
+.add-frame-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.add-frame-picker button {
+  width: 100%;
+  background: rgba(6, 10, 16, 0.85);
+}
+
 .canvas-hint {
   font-size: 0.72rem;
   line-height: 1.3;
@@ -966,6 +979,76 @@ main {
   box-shadow: 0 0 16px var(--cyan-dim);
 }
 
+/* Flowchart node shapes (mesa task 358) — same card, distinguished only by
+   silhouette + border tint so process/decision/start-end read as distinct
+   flowchart primitives at a glance. A `storyboard`-type board's frames never
+   carry these classes (`shape` is always null there), so its cards are
+   untouched. */
+.frame.frame-process {
+  clip-path: none;
+  border-radius: 6px;
+}
+
+/* A true `clip-path` diamond on the whole card clips the header (title +
+   `#id`) — it sits right at the top, where the diamond taper is narrowest,
+   so no amount of inner padding keeps it inside the silhouette without
+   also shrinking the diamond far below the card's actual w/h (checked
+   empirically with mesa task 358's khora pass: the leading letter of the
+   title and the id badge were both cut off). Instead the diamond is a
+   decorative backdrop (`::before`), larger than and behind the card, which
+   stays a normal unclipped rectangle — content is never touched, only the
+   silhouette around it reads as a diamond. `overflow: visible` lets that
+   backdrop extend past the card's own box; `position: relative` + the
+   backdrop's `z-index: -1` keeps it behind (not covering) the content. */
+.frame.frame-decision {
+  position: relative;
+  clip-path: none;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+.frame.frame-decision::before {
+  content: '';
+  position: absolute;
+  inset: -35% -20%;
+  z-index: -1;
+  background: var(--panel-raised);
+  border: 1px solid var(--amber);
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+.frame.frame-decision.selected::before,
+.frame.frame-decision.editing::before {
+  border-color: var(--cyan);
+  box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+.frame.frame-start-end {
+  clip-path: none;
+  border-radius: 999px;
+  border-color: var(--green);
+}
+.frame.frame-start-end .frame-header {
+  border-radius: 999px 999px 0 0;
+  /* The rounded ends only eat into the corners (a "stadium" shape, not a
+     true ellipse, whenever w > h — the common case here), but nudge the
+     title/id row's own padding out a bit further so it clears the curve
+     even on a squarer start/end card. */
+  padding-left: 0.85rem;
+  padding-right: 0.85rem;
+}
+
+/* ERD "entity" shape (mesa task 359) — a plain rectangle, like `frame-
+   process`, but tinted magenta so it reads as its own primitive next to the
+   flowchart shapes. Its distinguishing feature is the attribute list below
+   (`.frame-attr-list`), not the silhouette. */
+.frame.frame-entity {
+  clip-path: none;
+  border-radius: 2px;
+  border-color: var(--magenta);
+}
+
 .frame-header {
   display: flex;
   justify-content: space-between;
@@ -1034,6 +1117,23 @@ main {
 .frame-body :where(a),
 .frame-title :where(a) {
   color: var(--cyan);
+}
+
+/* Entity attribute list (mesa task 359) — one line of `Frame.body` per row,
+   rendered as a plain list (not through `Markdown`) so it reads as a
+   distinct, tabular field list rather than an opaque prose blob. */
+.frame-attr-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  list-style: disc;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.76rem;
+}
+.frame-attr-list li {
+  overflow-wrap: anywhere;
+}
+.frame-attr-list li + li {
+  margin-top: 0.2rem;
 }
 
 .frame-foot {

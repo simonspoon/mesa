@@ -407,6 +407,77 @@ impl From<&Task> for TaskSummary {
     }
 }
 
+/// A storyboard's diagram style, chosen at creation and immutable thereafter
+/// (no field on `StoryboardPatch` — the same structural-immutability posture
+/// as `project_id`/`author`). Picks the shape set offered for its frames: a
+/// `storyboard` board takes the generic frame card, a `flowchart` board takes
+/// `process`/`decision`/`start_end` node shapes, an `erd` board takes only the
+/// `entity` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum DiagramType {
+    Storyboard,
+    Flowchart,
+    Erd,
+}
+
+impl DiagramType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagramType::Storyboard => "storyboard",
+            DiagramType::Flowchart => "flowchart",
+            DiagramType::Erd => "erd",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<DiagramType> {
+        match s {
+            "storyboard" => Some(DiagramType::Storyboard),
+            "flowchart" => Some(DiagramType::Flowchart),
+            "erd" => Some(DiagramType::Erd),
+            _ => None,
+        }
+    }
+}
+
+/// A frame's node shape, chosen at creation and immutable thereafter (no
+/// field on `FramePatch` — mirrors `DiagramType`'s posture, for the same
+/// reason: a board should never hold a shape from the "wrong" type system).
+/// `None` on `Frame.shape` means the generic card, valid only on a
+/// `storyboard`-type board; `Store::create_frame` validates a given shape
+/// against the parent board's `DiagramType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum FrameShape {
+    Process,
+    Decision,
+    StartEnd,
+    Entity,
+}
+
+impl FrameShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameShape::Process => "process",
+            FrameShape::Decision => "decision",
+            FrameShape::StartEnd => "start_end",
+            FrameShape::Entity => "entity",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<FrameShape> {
+        match s {
+            "process" => Some(FrameShape::Process),
+            "decision" => Some(FrameShape::Decision),
+            "start_end" => Some(FrameShape::StartEnd),
+            "entity" => Some(FrameShape::Entity),
+            _ => None,
+        }
+    }
+}
+
 /// A visual storyboard: a freeform spatial canvas of frames (cards) and the
 /// directed edges between them. Belongs to a project, fixed at creation (like a
 /// task). `author` is a free-text actor id — an agent name or "user" — naming
@@ -424,6 +495,8 @@ pub struct Storyboard {
     pub description: Option<String>,
     /// Free-text actor id that created the board (an agent name or "user").
     pub author: Option<String>,
+    /// The board's diagram style, fixed at creation (see `DiagramType`).
+    pub diagram_type: DiagramType,
     /// When the board was created (SQLite `datetime` text, UTC).
     pub created_at: String,
     /// When the board was last changed (SQLite `datetime` text, UTC).
@@ -454,6 +527,9 @@ pub struct Frame {
     pub task_id: Option<i64>,
     /// Free-text actor id that created the frame (an agent name or "user").
     pub author: Option<String>,
+    /// The frame's node shape, fixed at creation, validated against the
+    /// board's `diagram_type` (see `FrameShape`). `None` is the generic card.
+    pub shape: Option<FrameShape>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1000,4 +1076,64 @@ pub struct FileContentView {
     /// Extension-derived language tag (e.g. "rs" -> "rust"), or None when
     /// unrecognized. "" is never used in place of None here.
     pub language: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagram_type_serializes_to_bare_lowercase_strings() {
+        assert_eq!(
+            serde_json::to_string(&DiagramType::Storyboard).unwrap(),
+            "\"storyboard\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiagramType::Flowchart).unwrap(),
+            "\"flowchart\""
+        );
+        // The acronym-casing case the arch doc flagged to confirm, not assume.
+        assert_eq!(serde_json::to_string(&DiagramType::Erd).unwrap(), "\"erd\"");
+    }
+
+    #[test]
+    fn frame_shape_serializes_to_bare_lowercase_strings() {
+        assert_eq!(
+            serde_json::to_string(&FrameShape::Process).unwrap(),
+            "\"process\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FrameShape::Decision).unwrap(),
+            "\"decision\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FrameShape::StartEnd).unwrap(),
+            "\"start_end\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FrameShape::Entity).unwrap(),
+            "\"entity\""
+        );
+    }
+
+    #[test]
+    fn diagram_type_and_frame_shape_round_trip_through_parse() {
+        for dt in [
+            DiagramType::Storyboard,
+            DiagramType::Flowchart,
+            DiagramType::Erd,
+        ] {
+            assert_eq!(DiagramType::parse(dt.as_str()), Some(dt));
+        }
+        for shape in [
+            FrameShape::Process,
+            FrameShape::Decision,
+            FrameShape::StartEnd,
+            FrameShape::Entity,
+        ] {
+            assert_eq!(FrameShape::parse(shape.as_str()), Some(shape));
+        }
+        assert_eq!(DiagramType::parse("bogus"), None);
+        assert_eq!(FrameShape::parse("bogus"), None);
+    }
 }

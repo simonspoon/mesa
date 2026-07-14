@@ -36,11 +36,11 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::core::{
-    AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, EdgePatch, Error, FileTreeEntry,
-    FrameNew, FramePatch, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus,
-    GitWorktree, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
-    ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch, TaskPatch,
-    TaskSummary, Waypoint, agents, attachments, files, git, hooks,
+    AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
+    FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
+    GitRepoView, GitStatus, GitWorktree, NextResult, Priority, ProjectAgents, ProjectFileTree,
+    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch,
+    TaskPatch, TaskSummary, Waypoint, agents, attachments, files, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -1022,6 +1022,10 @@ struct StoryboardCreate {
     description: Option<String>,
     #[serde(default)]
     author: Option<String>,
+    /// Missing/null defaults to `DiagramType::Storyboard`. Immutable after
+    /// creation — no field on `StoryboardUpdate`.
+    #[serde(default)]
+    diagram_type: Option<DiagramType>,
 }
 
 /// Optional `?author=` for the change history on body-less mutations (DELETE).
@@ -1059,6 +1063,11 @@ struct FrameCreate {
     color: Option<String>,
     #[serde(default)]
     task_id: Option<i64>,
+    /// Must be a member of the board's `diagram_type` shape set; validated
+    /// by `Store::create_frame`. Immutable after creation — no field on
+    /// `FrameUpdate`.
+    #[serde(default)]
+    shape: Option<FrameShape>,
     #[serde(default)]
     author: Option<String>,
 }
@@ -1130,6 +1139,7 @@ async fn create_storyboard(
         &body.title,
         body.description.as_deref(),
         body.author.as_deref(),
+        body.diagram_type,
     )?;
     Ok((StatusCode::CREATED, Json(storyboard)).into_response())
 }
@@ -1190,6 +1200,7 @@ async fn create_frame(
         color: payload.color,
         task_id: payload.task_id,
         author: payload.author,
+        shape: payload.shape,
     };
     let mut store = state.store.lock().unwrap();
     let frame = store.create_frame(storyboard_id, &new)?;

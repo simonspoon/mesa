@@ -167,7 +167,7 @@ export function AgentSidebar() {
         )}
       </div>
 
-      <div className="agent-sidebar-body">
+      <div className={`agent-sidebar-body${selectedId !== null ? ' session-open' : ''}`}>
         <div className="agent-sidebar-list">
           <h2 className="agent-sidebar-head">
             Agents

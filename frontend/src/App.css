@@ -1965,6 +1965,18 @@ body.agent-sidebar-resizing {
   overflow-y: auto;
 }
 
+/* A selected session takes over the whole body: the list is dropped from
+   flow via `display: none` (not `visibility`, unlike the collapse case)
+   so the panel below reclaims its space — the point is layout, not keeping
+   anything alive underneath (no attached terminal lives in the list). */
+.agent-sidebar-body.session-open .agent-sidebar-list {
+  display: none;
+}
+
+.agent-sidebar-body.session-open .agent-sidebar-panel {
+  margin-top: 0;
+}
+
 .agent-sidebar-head {
   display: flex;
   align-items: center;

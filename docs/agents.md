@@ -112,14 +112,17 @@ persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
   `startedAt`), so DONE is ordered by `startedAt` desc as the closest
   available proxy rather than a true completion time. An empty bucket renders
   no header at all (not an empty section).
-- Layout: list on top (own scroll region, capped height) and an attached
-  terminal panel below (`AgentTerminal`, the same component the per-project
-  Agents tab uses) — two separate containers, so scrolling back up to the
-  list and picking a different session replaces the panel below without
-  losing the list's scroll position. The panel has a **close** button
-  (`agent-sidebar-panel`), which unmounts `AgentTerminal` and detaches (the
-  background session itself keeps running, unaffected — same contract as the
-  per-project tab's detach).
+- Layout: selecting a session (`selectedId`) is a takeover, not a split view —
+  the attached terminal panel (`AgentTerminal`, the same component the
+  per-project Agents tab uses) fills the **whole** `.agent-sidebar-body`, and
+  the list is dropped from flow (`display: none` via the `session-open`
+  modifier class on `.agent-sidebar-body`) so the panel reclaims its layout
+  space. The list stays mounted (not conditionally rendered), just out of
+  flow. The panel has a **close** button (`agent-sidebar-panel`), which
+  unmounts `AgentTerminal`, detaches (the background session itself keeps
+  running, unaffected — same contract as the per-project tab's detach), and
+  is the only way back to the list — switching to a different session means
+  close, then reselect, since only one session's panel is shown at a time.
 - **Collapse never unmounts anything.** `collapsed` (default `true`) toggles
   a CSS class on the `<aside>`; the list and any attached terminal stay
   mounted underneath, hidden via `visibility: hidden` on the inner

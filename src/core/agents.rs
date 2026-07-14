@@ -41,7 +41,10 @@ pub fn list_under(dir: &str) -> Result<Vec<AgentSession>, String> {
 fn is_under(cwd: &str, dir: &str) -> bool {
     let cwd = cwd.trim_end_matches('/');
     let dir = dir.trim_end_matches('/');
-    cwd == dir || cwd.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
+    cwd == dir
+        || cwd
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Lists every live Claude Code session on the machine, with no folder
@@ -138,7 +141,8 @@ fn strip_ansi(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next(); // consume '['
-            while matches!(chars.peek(), Some(c2) if c2.is_ascii_digit() || matches!(c2, ';' | ':' | '?')) {
+            while matches!(chars.peek(), Some(c2) if c2.is_ascii_digit() || matches!(c2, ';' | ':' | '?'))
+            {
                 chars.next();
             }
             if matches!(chars.peek(), Some(c2) if ('@'..='~').contains(c2)) {

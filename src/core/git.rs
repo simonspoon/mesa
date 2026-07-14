@@ -199,11 +199,7 @@ fn parse_worktrees(porcelain: &str, dir: &str) -> Vec<GitWorktree> {
         } else if let Some(rest) = line.strip_prefix("HEAD ") {
             head = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("branch ") {
-            branch = Some(
-                rest.strip_prefix("refs/heads/")
-                    .unwrap_or(rest)
-                    .to_string(),
-            );
+            branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
         }
     }
     flush(&mut path, &mut head, &mut branch);
@@ -541,17 +537,35 @@ mod tests {
 
         let from_main = worktrees_of(path).unwrap();
         assert_eq!(from_main.len(), 2);
-        let main_entry = from_main.iter().find(|w| w.branch.as_deref() == Some("trunk")).unwrap();
+        let main_entry = from_main
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("trunk"))
+            .unwrap();
         assert!(main_entry.is_current);
-        let linked_entry = from_main.iter().find(|w| w.branch.as_deref() == Some("feature")).unwrap();
+        let linked_entry = from_main
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("feature"))
+            .unwrap();
         assert!(!linked_entry.is_current);
 
         // Same full list, but querying from the linked worktree flips which
         // entry is "current".
         let from_linked = worktrees_of(linked_path.to_str().unwrap()).unwrap();
         assert_eq!(from_linked.len(), 2);
-        assert!(!from_linked.iter().find(|w| w.branch.as_deref() == Some("trunk")).unwrap().is_current);
-        assert!(from_linked.iter().find(|w| w.branch.as_deref() == Some("feature")).unwrap().is_current);
+        assert!(
+            !from_linked
+                .iter()
+                .find(|w| w.branch.as_deref() == Some("trunk"))
+                .unwrap()
+                .is_current
+        );
+        assert!(
+            from_linked
+                .iter()
+                .find(|w| w.branch.as_deref() == Some("feature"))
+                .unwrap()
+                .is_current
+        );
     }
 
     #[test]

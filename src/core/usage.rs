@@ -152,16 +152,16 @@ fn parse(bytes: &[u8]) -> Result<CcUsage, String> {
 /// macOS Keychain → `~/.claude/.credentials.json`. Returns `None` if none is
 /// available. The env-var forms are bare token strings (not the credentials JSON).
 fn token() -> Option<String> {
-    if let Ok(t) = std::env::var("MESA_CC_TOKEN") {
-        if !t.is_empty() {
-            return Some(t);
-        }
+    if let Ok(t) = std::env::var("MESA_CC_TOKEN")
+        && !t.is_empty()
+    {
+        return Some(t);
     }
     // Long-lived OAuth token (`claude setup-token`); same env var Claude Code reads.
-    if let Ok(t) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
-        if !t.is_empty() {
-            return Some(t);
-        }
+    if let Ok(t) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        && !t.is_empty()
+    {
+        return Some(t);
     }
     // macOS Keychain — where Claude Code stores the token on darwin.
     if let Ok(out) = Command::new("security")
@@ -172,12 +172,10 @@ fn token() -> Option<String> {
             "-w",
         ])
         .output()
+        && out.status.success()
+        && let Some(t) = token_from_json(&out.stdout)
     {
-        if out.status.success() {
-            if let Some(t) = token_from_json(&out.stdout) {
-                return Some(t);
-            }
-        }
+        return Some(t);
     }
     // File fallback (Linux, or installs that don't use the keychain).
     token_from_json(&std::fs::read(claude_dir()?.join(".credentials.json")).ok()?)

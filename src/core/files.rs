@@ -575,7 +575,10 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
 
-        assert_eq!(write_file(root, "main.rs", "fn main() { edited(); }\n"), Ok(()));
+        assert_eq!(
+            write_file(root, "main.rs", "fn main() { edited(); }\n"),
+            Ok(())
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("main.rs")).unwrap(),
             "fn main() { edited(); }\n"
@@ -614,10 +617,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         fs::create_dir_all(dir.path().join("sub")).unwrap();
-        assert_eq!(
-            write_file(root, "sub", "hi"),
-            Err(WriteFileError::NotFound)
-        );
+        assert_eq!(write_file(root, "sub", "hi"), Err(WriteFileError::NotFound));
     }
 
     #[test]
@@ -660,6 +660,9 @@ mod tests {
             err,
             WriteFileError::Validation("content is larger than mesa can safely write")
         );
-        assert_eq!(fs::read_to_string(dir.path().join("small.txt")).unwrap(), "hi");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("small.txt")).unwrap(),
+            "hi"
+        );
     }
 }

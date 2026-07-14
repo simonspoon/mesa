@@ -1024,7 +1024,7 @@ impl Agg {
                 est_cost_usd: round4(g.cost),
             })
             .collect();
-        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        models.sort_by_key(|b| std::cmp::Reverse(b.total_tokens));
 
         let mut skills: Vec<CcSkillStat> = self
             .skills
@@ -1038,7 +1038,7 @@ impl Agg {
                 est_cost_usd: round4(g.cost),
             })
             .collect();
-        skills.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        skills.sort_by_key(|b| std::cmp::Reverse(b.total_tokens));
 
         let mut agents: Vec<CcAgentStat> = self
             .agents
@@ -1052,12 +1052,12 @@ impl Agg {
                 est_cost_usd: round4(g.cost),
             })
             .collect();
-        agents.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        agents.sort_by_key(|b| std::cmp::Reverse(b.total_tokens));
 
         let mut projects: Vec<CcProjectStat> = self
             .projects
-            .into_iter()
-            .map(|(_, p)| CcProjectStat {
+            .into_values()
+            .map(|p| CcProjectStat {
                 project: short_project(&p.path),
                 path: p.path,
                 sessions: p.sessions.len() as i64,
@@ -1066,7 +1066,7 @@ impl Agg {
                 est_cost_usd: round4(p.cost),
             })
             .collect();
-        projects.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        projects.sort_by_key(|b| std::cmp::Reverse(b.total_tokens));
 
         // ---- tool calls (most calls first; name/caller tiebreak for stability) ----
         let mut tools: Vec<CcToolStat> = self
@@ -1803,7 +1803,9 @@ mod tests {
         write_jsonl(
             &proj,
             "s1.jsonl",
-            &[r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-sonnet-5","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}}],"usage":{"input_tokens":4,"output_tokens":683,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":[{"type":"message","input_tokens":2,"output_tokens":85},{"type":"advisor_message","model":"claude-opus-4-8","input_tokens":91627,"output_tokens":18716,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},{"type":"message","input_tokens":2,"output_tokens":598}]}}}"#],
+            &[
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-sonnet-5","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}}],"usage":{"input_tokens":4,"output_tokens":683,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":[{"type":"message","input_tokens":2,"output_tokens":85},{"type":"advisor_message","model":"claude-opus-4-8","input_tokens":91627,"output_tokens":18716,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},{"type":"message","input_tokens":2,"output_tokens":598}]}}}"#,
+            ],
         );
         let db = tmp.path().join("mesa.db");
         let mut store = Store::open(&db).unwrap();
@@ -1829,10 +1831,7 @@ mod tests {
         // The advisor row is keyed off the parent event's uuid (no uuid of
         // its own), carries the advisor's real model + tokens, and is
         // tagged agent "advisor" so it surfaces distinctly from its caller.
-        let advisor_uuid = q::<String>(
-            &db,
-            "SELECT uuid FROM cc_messages WHERE uuid != 'u1'",
-        );
+        let advisor_uuid = q::<String>(&db, "SELECT uuid FROM cc_messages WHERE uuid != 'u1'");
         assert_eq!(advisor_uuid, "u1:advisor:0");
         assert_eq!(
             q::<String>(
@@ -1984,7 +1983,10 @@ mod tests {
         // ...and the already-present (corrupted) message row is left as-is —
         // rebuild backfills missing rows, it does not correct existing ones.
         assert_eq!(
-            q::<i64>(&db, "SELECT input_tokens FROM cc_messages WHERE uuid = 'u1'"),
+            q::<i64>(
+                &db,
+                "SELECT input_tokens FROM cc_messages WHERE uuid = 'u1'"
+            ),
             999
         );
     }

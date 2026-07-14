@@ -315,8 +315,7 @@ const STORYBOARD_COLUMNS: &str =
     "id, project_id, title, description, author, diagram_type, created_at, updated_at";
 const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, \
      shape, created_at, updated_at";
-const EDGE_COLUMNS: &str =
-    "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
+const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
 const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at";
 
@@ -937,12 +936,12 @@ impl Store {
     /// binds the same hash between our check and our write, so the loser still
     /// gets `conflict` instead of a raw DB error (HTTP 500).
     fn map_commit_conflict(e: rusqlite::Error, hash: &str) -> Error {
-        if let rusqlite::Error::SqliteFailure(f, _) = &e {
-            if f.code == rusqlite::ErrorCode::ConstraintViolation {
-                return Error::Conflict(format!(
-                    "root commit {hash} is already bound to another project"
-                ));
-            }
+        if let rusqlite::Error::SqliteFailure(f, _) = &e
+            && f.code == rusqlite::ErrorCode::ConstraintViolation
+        {
+            return Error::Conflict(format!(
+                "root commit {hash} is already bound to another project"
+            ));
         }
         Error::Db(e)
     }
@@ -1043,10 +1042,11 @@ impl Store {
         let tx = self.conn.transaction()?;
         // New tasks append to the end of the board's manual order (spec 328),
         // regardless of how far prior reordering has spread sort_order values.
-        let next_sort_order: f64 =
-            tx.query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tasks", [], |r| {
-                r.get(0)
-            })?;
+        let next_sort_order: f64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tasks",
+            [],
+            |r| r.get(0),
+        )?;
         tx.execute(
             "INSERT INTO tasks \
              (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
@@ -3983,7 +3983,9 @@ mod tests {
     fn frame_crud_and_view_ordering() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
 
         let f1 = store
             .create_frame(
@@ -4050,7 +4052,9 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let p1 = store.create_project("p1", None, None, None).unwrap();
         let p2 = store.create_project("p2", None, None, None).unwrap();
-        let sb = store.create_storyboard(p1.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p1.id, "b", None, None, None)
+            .unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
 
@@ -4112,8 +4116,12 @@ mod tests {
     fn edge_crud_rejects_self_and_foreign_frames_and_allows_cycles() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
-        let other = store.create_storyboard(p.id, "other", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
+        let other = store
+            .create_storyboard(p.id, "other", None, None, None)
+            .unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let foreign = store.create_frame(other.id, &frame_new("foreign")).unwrap();
@@ -4180,7 +4188,9 @@ mod tests {
     fn delete_frame_cascades_edges_and_echoes_them() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let c = store.create_frame(sb.id, &frame_new("c")).unwrap();
@@ -4204,7 +4214,9 @@ mod tests {
     fn delete_storyboard_cascades_and_echoes_full_view() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
@@ -4224,7 +4236,9 @@ mod tests {
     fn delete_project_cascades_storyboards() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("doomed", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
@@ -4242,7 +4256,9 @@ mod tests {
     fn storyboard_change_history_records_actor_and_actions() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "flow", None, Some("agent-1"), None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "flow", None, Some("agent-1"), None)
+            .unwrap();
         let a = store
             .create_frame(
                 sb.id,
@@ -4343,12 +4359,16 @@ mod tests {
     fn delete_storyboard_cascades_its_change_history() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
         store.create_frame(sb.id, &frame_new("a")).unwrap();
         assert!(!store.list_storyboard_events(sb.id).unwrap().is_empty());
         store.delete_storyboard(sb.id).unwrap();
         // a fresh board reuses no rows; the orphaned events are gone
-        let sb2 = store.create_storyboard(p.id, "b2", None, None, None).unwrap();
+        let sb2 = store
+            .create_storyboard(p.id, "b2", None, None, None)
+            .unwrap();
         let events = store.list_storyboard_events(sb2.id).unwrap();
         assert_eq!(events.len(), 1); // only its own creation
         assert_eq!(events[0].action, "storyboard_created");
@@ -4358,7 +4378,9 @@ mod tests {
     fn no_op_update_changes_nothing_and_logs_nothing() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", Some("d"), None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", Some("d"), None, None)
+            .unwrap();
         let f = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let g = store.create_frame(sb.id, &frame_new("g")).unwrap();
         let e = store
@@ -4424,7 +4446,9 @@ mod tests {
     fn edge_anchor_patch_is_three_state_preserved_and_logged() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
-        let sb = store.create_storyboard(p.id, "b", None, None, None).unwrap();
+        let sb = store
+            .create_storyboard(p.id, "b", None, None, None)
+            .unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let e = store
@@ -4517,7 +4541,13 @@ mod tests {
         let events = store.list_storyboard_events(sb.id).unwrap();
         assert_eq!(events.len(), before + 1);
         assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
-        assert!(events.last().unwrap().summary.contains("unlocked from-anchor"));
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .summary
+                .contains("unlocked from-anchor")
+        );
 
         // Priority: when a single PATCH changes both an anchor and the label,
         // the anchor change wins the one-event-per-call slot.

@@ -50,6 +50,10 @@ use crate::core::{
 #[folder = "frontend/dist"]
 struct Assets;
 
+// The nested cache maps below (each `Arc<Mutex<HashMap<K, (Instant, V)>>>` or
+// similar) are deliberate and documented per-field; factoring them into named
+// type aliases would not make the caching contracts any clearer.
+#[allow(clippy::type_complexity)]
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
@@ -2088,10 +2092,10 @@ fn require_lan_agent_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError
         return Ok(());
     }
     // SocketAddr's parser accepts exactly `<ipv4>:<port>` and `[<ipv6>]:<port>`.
-    if let Ok(sock) = host.parse::<SocketAddr>() {
-        if sock.port() == port {
-            return Ok(());
-        }
+    if let Ok(sock) = host.parse::<SocketAddr>()
+        && sock.port() == port
+    {
+        return Ok(());
     }
     // Browsers omit `:80` from Host on the default HTTP port, so serving on 80
     // yields portless forms: `localhost`, `192.168.1.50`, `[::1]`.
@@ -2354,9 +2358,9 @@ async fn spawn_project_agent(
     let dir = path.clone();
     let job =
         tokio::task::spawn_blocking(move || agents::spawn_bg(&dir, body.prompt.as_deref(), None))
-        .await
-        .map_err(|e| agents_unavailable(format!("agent spawn panicked: {e}")))?
-        .map_err(agents_unavailable)?;
+            .await
+            .map_err(|e| agents_unavailable(format!("agent spawn panicked: {e}")))?
+            .map_err(agents_unavailable)?;
     // Drop the cached list so the next poll shows the new session immediately,
     // and bump the generation so a list request in flight since before this
     // spawn won't reinsert its pre-spawn snapshot over the invalidation.

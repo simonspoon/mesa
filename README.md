@@ -32,11 +32,17 @@ opens the database directly. Your data is a file on your disk.
 
 ## Install
 
+```bash
+brew install simonspoon/tap/mesa
+```
+
+### Build from source
+
 mesa is a Rust binary with an embedded frontend. Building a release binary
 requires Rust (edition 2024), Node.js, and npm.
 
 ```bash
-git clone <repo-url> mesa
+git clone https://github.com/simonspoon/mesa.git
 cd mesa
 scripts/build.sh          # tests, builds the frontend, embeds it, compiles
 ./target/release/mesa --help

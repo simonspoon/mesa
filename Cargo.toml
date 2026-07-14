@@ -2,6 +2,11 @@
 name = "mesa"
 version = "0.1.0"
 edition = "2024"
+description = "Local-first project & task management for humans and agents"
+license = "MIT"
+repository = "https://github.com/simonspoon/mesa"
+keywords = ["task-management", "cli", "agent", "sqlite"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }

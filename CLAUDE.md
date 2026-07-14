@@ -24,6 +24,8 @@ scripts/install.sh
 # Rust tests (store-level logic lives in src/core/store.rs)
 cargo test
 cargo test <name>            # single test by name substring
+cargo clippy --all-targets -- -D warnings   # CI-gated (.github/workflows/ci.yml); keep clean
+cargo fmt --check                           # CI-gated; run `cargo fmt` before committing
 
 # CLI JSON-contract end-to-end gate (create→list→block→cycle→delete→backup)
 scripts/cli-check.sh

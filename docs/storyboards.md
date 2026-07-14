@@ -22,9 +22,10 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   echoes `{frame, edges}`; `events` prints the change log. Mutating commands
   take `--author` for attribution.
 - API: `/api/storyboards` CRUD, `/api/storyboards/{id}/{frames,edges,events}`,
-  `/api/frames/{id}`, `/api/edges/{id}`. Mutations attribute via an `author`
-  body field (POST/PATCH) or `?author=` query (DELETE); it sets the change
-  actor and never mutates an entity's own immutable `author`.
+  `/api/frames/{id}` (PATCH/DELETE), `/api/edges/{id}` (GET/PATCH/DELETE).
+  Mutations attribute via an `author` body field (POST/PATCH) or `?author=`
+  query (DELETE); it sets the change actor and never mutates an entity's own
+  immutable `author`.
 - **Connector routing waypoints** (spec 297): `FrameEdge.waypoints` is an
   ordered `Vec<Waypoint>` (`{x, y}`, absolute canvas coordinates — same space
   as `Frame.x/y`, not relative to either endpoint frame), added via migration

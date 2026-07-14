@@ -394,7 +394,10 @@ fn router(state: AppState) -> Router {
         .route("/api/storyboards/{id}/edges", post(create_edge))
         .route("/api/storyboards/{id}/events", get(list_storyboard_events))
         .route("/api/frames/{id}", patch(update_frame).delete(delete_frame))
-        .route("/api/edges/{id}", patch(update_edge).delete(delete_edge))
+        .route(
+            "/api/edges/{id}",
+            get(show_edge).patch(update_edge).delete(delete_edge),
+        )
         .route("/api/inbox", get(list_inbox).post(create_inbox))
         .route(
             "/api/inbox/{id}",
@@ -1256,6 +1259,11 @@ async fn create_edge(
         body.author.as_deref(),
     )?;
     Ok((StatusCode::CREATED, Json(edge)).into_response())
+}
+
+async fn show_edge(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_edge(id)?).into_response())
 }
 
 async fn update_edge(

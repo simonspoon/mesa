@@ -1837,8 +1837,16 @@ main {
 .agent-terminal-screen {
   flex: 1;
   min-height: 0;
-  padding: 0.4rem;
   overflow: hidden;
+}
+
+/* Padding lives on .xterm itself, not .agent-terminal-screen: FitAddon reads
+   the container's border-box height but only subtracts padding declared on
+   terminal.element (this .xterm div). Padding on the parent instead made
+   FitAddon overestimate available rows by the padding amount, clipping the
+   bottom line under overflow:hidden. */
+.agent-terminal-screen .xterm {
+  padding: 0.4rem;
 }
 
 /* ---- Global agent sidebar: persists across every page (App.tsx), never

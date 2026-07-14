@@ -210,6 +210,20 @@ run 0 "$MESA" task update "$TA" --acceptance ""
 [ "$(jqs .acceptance)" = "null" ] || fail "update --acceptance \"\": must clear"
 ok "task update --acceptance \"\": clears the field"
 
+# ---- result field (update-only: written when the agent finishes a task) ----
+run 0 "$MESA" task update "$TA" --status done --result "shipped in abc123"
+[ "$(jqs .result)" = "shipped in abc123" ] || fail "update --result: not stored"
+ok "task update --status done --result: stored"
+
+run 0 "$MESA" task list --project "$P3"
+[ "$(jqs 'any(.[]; has("result"))')" = "false" ] ||
+  fail "list: result must NOT appear in compact objects"
+ok "task list: result absent (compact shape)"
+
+run 0 "$MESA" task update "$TA" --result ""
+[ "$(jqs .result)" = "null" ] || fail "update --result \"\": must clear"
+ok "task update --result \"\": clears the field"
+
 # ---- import (atomic task graph) ----
 # Dedicated project so the next/events flow below sees only the imported graph.
 run 0 "$MESA" project create "Import graph" --no-git

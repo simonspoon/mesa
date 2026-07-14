@@ -329,6 +329,9 @@ pub struct Task {
     pub acceptance: Option<String>,
     /// Free-text receipt of completed work (commit SHA / PR URL / path).
     pub artifact: Option<String>,
+    /// Free-text final summary the agent writes when the task is done;
+    /// unlike `artifact` (a pointer), this holds the narrative itself.
+    pub result: Option<String>,
     /// When the task row was inserted (SQLite `datetime` text, UTC).
     pub created_at: String,
     /// When the task row was last updated (SQLite `datetime` text, UTC).

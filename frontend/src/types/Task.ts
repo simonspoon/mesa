@@ -12,6 +12,11 @@ acceptance: string | null,
  */
 artifact: string | null, 
 /**
+ * Free-text final summary the agent writes when the task is done;
+ * unlike `artifact` (a pointer), this holds the narrative itself.
+ */
+result: string | null, 
+/**
  * When the task row was inserted (SQLite `datetime` text, UTC).
  */
 created_at: string, 

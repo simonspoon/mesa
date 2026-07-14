@@ -246,12 +246,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tasks ADD COLUMN sort_order REAL NOT NULL DEFAULT 0;
     UPDATE tasks SET sort_order = id;
     ",
+    "ALTER TABLE tasks ADD COLUMN result TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
 const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
      t.status, t.priority, t.tags, \
-     t.acceptance, t.artifact, t.created_at, t.updated_at, t.sort_order, \
+     t.acceptance, t.artifact, t.result, t.created_at, t.updated_at, t.sort_order, \
      EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON b.id = d.blocked_by \
             WHERE d.task_id = t.id AND b.status NOT IN ('done', 'cancelled'))";
 
@@ -270,10 +271,11 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         tags: serde_json::from_str(&tags).expect("invalid tags json in db"),
         acceptance: row.get(8)?,
         artifact: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        sort_order: row.get(12)?,
-        blocked: row.get(13)?,
+        result: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        sort_order: row.get(13)?,
+        blocked: row.get(14)?,
     })
 }
 
@@ -489,6 +491,8 @@ pub struct TaskPatch {
     pub acceptance: Option<Option<String>>,
     /// `Some(None)` clears the artifact (work-receipt) field.
     pub artifact: Option<Option<String>>,
+    /// `Some(None)` clears the result (final-summary) field.
+    pub result: Option<Option<String>>,
     /// Manual board order (spec 328); caller (the API) computes the
     /// fractional value from the drop position, `Store` just persists it.
     pub sort_order: Option<f64>,
@@ -1062,6 +1066,9 @@ impl Store {
         if let Some(artifact) = &patch.artifact {
             task.artifact = artifact.clone();
         }
+        if let Some(result) = &patch.result {
+            task.result = result.clone();
+        }
         if let Some(sort_order) = patch.sort_order {
             task.sort_order = sort_order;
         }
@@ -1070,8 +1077,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE tasks SET title = ?1, description = ?2, status = ?3, priority = ?4, \
-             tags = ?5, parent_id = ?6, acceptance = ?7, artifact = ?8, sort_order = ?9, \
-             updated_at = datetime('now') WHERE id = ?10",
+             tags = ?5, parent_id = ?6, acceptance = ?7, artifact = ?8, result = ?9, \
+             sort_order = ?10, updated_at = datetime('now') WHERE id = ?11",
             (
                 &task.title,
                 &task.description,
@@ -1081,6 +1088,7 @@ impl Store {
                 task.parent_id,
                 &task.acceptance,
                 &task.artifact,
+                &task.result,
                 task.sort_order,
                 id,
             ),
@@ -2704,6 +2712,7 @@ mod tests {
                     parent_id: None,
                     acceptance: None,
                     artifact: None,
+                    result: None,
                     sort_order: None,
                 },
             )
@@ -2718,6 +2727,38 @@ mod tests {
         let deleted = store.delete_task(t.id).unwrap();
         assert_eq!(deleted, vec![updated]);
         assert!(matches!(store.get_task(t.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn update_task_sets_and_clears_result() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "ship it");
+        assert_eq!(t.result, None);
+
+        let done = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    status: Some(Status::Done),
+                    result: Some(Some("shipped in commit abc123".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(done.result.as_deref(), Some("shipped in commit abc123"));
+        assert_eq!(store.get_task(t.id).unwrap().result, done.result);
+
+        let cleared = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    result: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.result, None);
     }
 
     #[test]

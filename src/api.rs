@@ -789,6 +789,7 @@ async fn update_task(
         parent_id: body.parent_id,
         acceptance: None,
         artifact: None,
+        result: None,
         sort_order: body.sort_order,
     };
     let mut store = state.store.lock().unwrap();

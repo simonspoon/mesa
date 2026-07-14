@@ -349,7 +349,8 @@ EXAMPLES
   mesa task update 3 --status in_progress
   mesa task update 3 --tags writing,urgent    # replaces all tags
   mesa task update 3 --description \"\"         # clears the description
-  mesa task update 3 --no-parent              # detach from its parent")]
+  mesa task update 3 --no-parent              # detach from its parent
+  mesa task update 3 --status done --result \"shipped in a3985c1\"")]
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
         /// Task id
@@ -397,6 +398,12 @@ EXAMPLES
         /// New work receipt; pass "" to clear it
         #[arg(long, group = "fields")]
         artifact: Option<String>,
+        /// New final-summary result; pass "" to clear it
+        #[arg(long, group = "fields", allow_hyphen_values = true)]
+        result: Option<String>,
+        /// Read the new result from a file (`-` = stdin); conflicts with --result
+        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "result")]
+        result_file: Option<String>,
     },
     /// Delete a task AND all its subtasks (no confirmation)
     ///
@@ -1333,10 +1340,13 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             acceptance,
             acceptance_file,
             artifact,
+            result,
+            result_file,
         } => {
             let mut stdin_used = false;
             let description = resolve_field(description, description_file, &mut stdin_used)?;
             let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
+            let result = resolve_field(result, result_file, &mut stdin_used)?;
             let patch = TaskPatch {
                 title,
                 description: description.map(clear_if_empty),
@@ -1350,6 +1360,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 },
                 acceptance: acceptance.map(clear_if_empty),
                 artifact: artifact.map(clear_if_empty),
+                result: result.map(clear_if_empty),
                 sort_order: None,
             };
             print_json(&store.update_task(id, &patch)?);

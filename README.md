@@ -104,7 +104,8 @@ mesa backup /tmp/mesa-snap.db
 - **Projects by name.** Every `--project` argument (and `inbox assign`) accepts
   a project id or a case-insensitive project name.
 - **Long text from a file.** On `task create`/`update`, `--description-file
-  <path>` and `--acceptance-file <path>` read the field from a file (`-` =
+  <path>` and `--acceptance-file <path>` (and, `update`-only, `--result-file
+  <path>`) read the field from a file (`-` =
   stdin) instead of an inline arg, so multi-line text with shell metacharacters (backticks, `$()`,
   `<>`) round-trips verbatim. Each conflicts with its inline flag; only one
   field may read `-` per call.
@@ -158,8 +159,9 @@ UI does not live-sync; it refetches on window focus.
   working folder on this machine, which anchors the git and agents views).
 - **Task** — belongs to exactly one project; has a status
   (`todo | in_progress | done | cancelled`), a priority (`low | medium | high`),
-  tags, an optional `acceptance` (definition-of-done) and `artifact` (work
-  receipt), and may be a subtask of another task in the same project.
+  tags, an optional `acceptance` (definition-of-done), `artifact` (work
+  receipt), and `result` (free-text final summary, set via `task update` when
+  the work is done), and may be a subtask of another task in the same project.
 - **Dependency** — a "blocked-by" edge between tasks. Self-edges and cycles are
   rejected. `blocked` is true while any blocker is not `done`/`cancelled`, and is
   derived on every read.

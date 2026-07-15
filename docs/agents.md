@@ -93,7 +93,9 @@ A persistent, collapsible right-hand rail (`AgentSidebar`,
 `frontend/src/components/AgentSidebar.tsx`) shows every live session across
 every project — not scoped to one project's Agents tab — with room to attach
 several at once, arranged as a tree of resizable/rearrangeable,
-mixed-orientation panes. Rendered once in
+mixed-orientation panes. The session list itself is one of those panes (task
+368) — resizable and rearrangeable exactly like an attached agent's pane,
+just permanent rather than closable. Rendered once in
 `App.tsx`, as a sibling of `<main>` outside the hash router, so it is never
 remounted by navigation; the same persistent-shell pattern the left `Sidebar`
 and `CommandPalette` already use.
@@ -113,27 +115,42 @@ and `CommandPalette` already use.
   completion timestamp (`claude agents --json` doesn't report one, only
   `startedAt`), so DONE is ordered by `startedAt` desc as the closest
   available proxy rather than a true completion time. An empty bucket renders
-  no header at all (not an empty section).
+  no header at all (not an empty section). This bucketed list is itself the
+  body of the session-list **pane** (below) — `AgentListPane` — not a
+  separate fixed element above the pane tree.
 - Layout: panes live in a **split-tree** (`SplitNode`/`LeafNode` in
   `AgentSidebar.tsx`), not a flat list. Each node is either a leaf (one
-  attached **pane** — `Pane`, wrapping the same `AgentTerminal` the
-  per-project Agents tab uses) or a split: an ordered list of children, each
+  **pane** — `PaneShell`, wrapping either an attached `AgentTerminal` via
+  `AgentPane`, or the session list itself via `AgentListPane`, per the
+  leaf's own `contentKind`) or a split: an ordered list of children, each
   carrying its own `ratio` (that slot's flex-grow share within the split)
   and oriented `row` (side-by-side) or `column` (stacked). The root is
-  always a split node, never a bare leaf; with no orientation ever toggled
-  it stays one column of leaves — today's plain top-to-bottom stack is just
-  the tree's simplest, degenerate shape. Clicking a session toggles its pane
-  in or out of the tree (`insertLeaf`/`removeLeaf`); a new pane always
-  appends to the **root** split's own children, regardless of how deep or
-  mixed the tree has become elsewhere — there's no "insert into the
-  currently-focused split" concept. A pane's **close** button unmounts its
+  always a split node, never a bare leaf; it is seeded on mount with one
+  permanent leaf — the session list, `contentKind: 'list'`, id
+  `LIST_LEAF_ID` — via `ensureListLeaf`, so the tree is never truly empty.
+  The session list is a pane like any other (task 368): resizable via its
+  own dividers and rearrangeable by dragging its header grip, just not
+  closable — `PaneShell`'s `onClose` is omitted for it, since closing the
+  one entry point back into opening agent panes would strand the sidebar.
+  With no orientation ever toggled and no agent pane open, the tree stays
+  one column holding just that leaf — today's plain top-to-bottom stack
+  (list, then whatever agent panes are open) is just the tree's simplest,
+  non-degenerate shape. Clicking a session toggles its **agent** pane in or
+  out of the tree (`insertLeaf`/`removeLeaf`); a new pane always appends to
+  the **root** split's own children, regardless of how deep or mixed the
+  tree has become elsewhere — there's no "insert into the currently-focused
+  split" concept. An agent pane's **close** button unmounts its
   `AgentTerminal` and detaches (the background session itself keeps running,
   unaffected — same contract as the per-project tab's detach) without
   touching any other open pane. `SplitNodeView`, the component that
   recursively renders one split's own direct children, is declared at module
   scope (not nested inside `AgentSidebar`) so its identity never changes
   across a re-render — nesting a per-split component inside `AgentSidebar`'s
-  body would remount every `AgentTerminal` beneath it on every poll tick.
+  body would remount every `AgentTerminal` beneath it on every poll tick. The
+  session-list data/handlers (`agents`, `collapsedSections`, `onTogglePane`,
+  ...) reach `AgentListPane` the same way — bundled into one `ListPaneProps`
+  object threaded down through `SplitNodeView`'s props, never a closure over
+  `AgentSidebar`'s own state, for the same remount-avoidance reason.
   - **Mixed orientation via a per-divider toggle**: every divider carries a
     small button (`.agent-sidebar-divider-toggle`, centered on the strip)
     showing the orientation clicking it would *produce* — `⬌` on a column

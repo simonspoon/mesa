@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
-import type { CSSProperties } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import {
   DndContext,
   PointerSensor,
@@ -18,6 +18,7 @@ import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects } from '../api'
 import { projectForCwd } from '../agentProject'
 import type { AgentSession } from '../types/AgentSession'
+import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
 import { AgentTerminal } from './AgentTerminal'
 
@@ -34,6 +35,12 @@ const MIN_MAIN_WIDTH = 320
 const MIN_PANE_PX = 80 // floor on a pane's own height during divider drag
 const DEFAULT_RATIO = 1
 
+// Stable id for the one leaf whose content is the session list rather than
+// an attached terminal — an `agentId` from `claude agents --json` is always
+// a short opaque id with no fixed shape, so a `__`-wrapped sentinel can't
+// collide with a real one.
+const LIST_LEAF_ID = '__agent-list__'
+
 // --- Split tree -------------------------------------------------------
 //
 // Replaces the old flat `openIds: string[]` + `ratios: Record<string,
@@ -42,14 +49,22 @@ const DEFAULT_RATIO = 1
 // Mixed row/column nesting is what stories 372/373 build on top of this;
 // today only the degenerate single-column tree (today's flat stack) is
 // ever produced, since nothing yet creates a nested split.
-type LeafNode = { kind: 'leaf'; agentId: string }
+//
+// A leaf's content is either an attached agent terminal or the session
+// list itself (task 368) — `contentKind` discriminates the two, `id` is
+// the leaf's identity either way (an `agentId`, or `LIST_LEAF_ID` for the
+// list) so every id-keyed helper below (`findPathToLeaf`, dnd-kit's own
+// sortable id, ...) stays a single code path regardless of content.
+type LeafNode =
+  | { kind: 'leaf'; contentKind: 'agent'; id: string }
+  | { kind: 'leaf'; contentKind: 'list'; id: typeof LIST_LEAF_ID }
 
 type SplitNode = {
   kind: 'split'
   // Stable id for nested-split React keys — a leaf already has a natural
-  // key (its own agentId); a split has none, so mint one at creation and
-  // carry it through every rebuild/canonicalize instead of regenerating it
-  // on render (which would break React's reconciliation on every toggle).
+  // key (its own id); a split has none, so mint one at creation and carry
+  // it through every rebuild/canonicalize instead of regenerating it on
+  // render (which would break React's reconciliation on every toggle).
   id: string
   orientation: 'row' | 'column' // row = side-by-side, column = stacked
   children: SplitChild[]
@@ -138,13 +153,13 @@ function replaceAtPath(root: SplitNode, path: number[], fn: (n: SplitNode) => Sp
   return canonicalize(rebuild(root, path)) as SplitNode
 }
 
-function findPathToLeaf(root: SplitNode, agentId: string): number[] | null {
+function findPathToLeaf(root: SplitNode, id: string): number[] | null {
   for (let i = 0; i < root.children.length; i++) {
     const child = root.children[i].node
     if (child.kind === 'leaf') {
-      if (child.agentId === agentId) return [i]
+      if (child.id === id) return [i]
     } else {
-      const sub = findPathToLeaf(child, agentId)
+      const sub = findPathToLeaf(child, id)
       if (sub) return [i, ...sub]
     }
   }
@@ -152,12 +167,12 @@ function findPathToLeaf(root: SplitNode, agentId: string): number[] | null {
 }
 
 function collectLeafIds(node: PaneNode): string[] {
-  if (node.kind === 'leaf') return [node.agentId]
+  if (node.kind === 'leaf') return [node.id]
   return node.children.flatMap((c) => collectLeafIds(c.node))
 }
 
 function childKey(node: PaneNode): string {
-  return node.kind === 'leaf' ? node.agentId : node.id
+  return node.id
 }
 
 // Always appended to root's own children, regardless of how deep/mixed the
@@ -165,7 +180,26 @@ function childKey(node: PaneNode): string {
 function insertLeaf(root: SplitNode, agentId: string): SplitNode {
   return replaceAtPath(root, [], (n) => ({
     ...n,
-    children: [...n.children, { ratio: DEFAULT_RATIO, node: { kind: 'leaf', agentId } }],
+    children: [
+      ...n.children,
+      { ratio: DEFAULT_RATIO, node: { kind: 'leaf', contentKind: 'agent', id: agentId } },
+    ],
+  }))
+}
+
+// Seeds the one permanent session-list leaf if the tree doesn't already
+// have one — called once at init and is otherwise a no-op, since nothing
+// in the UI ever closes the list leaf (task 368: it's a pane like any
+// other agent pane, just not a closable one — closing it would strand the
+// sidebar with no way left to open an agent pane).
+function ensureListLeaf(root: SplitNode): SplitNode {
+  if (findPathToLeaf(root, LIST_LEAF_ID)) return root
+  return replaceAtPath(root, [], (n) => ({
+    ...n,
+    children: [
+      { ratio: DEFAULT_RATIO, node: { kind: 'leaf', contentKind: 'list', id: LIST_LEAF_ID } },
+      ...n.children,
+    ],
   }))
 }
 
@@ -292,25 +326,34 @@ function bucketOf(a: AgentSession): Bucket {
 const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE', 'DONE']
 
 /**
- * One open agent's pane inside the split view: a header (drag handle + label
- * + close) over its own independent `AgentTerminal`. `ratio` is this pane's
- * share of the stack's flex space (see `AgentSidebar`'s divider-drag comment)
- * — sortable via dnd-kit, so panes are also rearrangeable by dragging the
- * header's grip.
+ * One pane's chrome inside the split view: a header (drag handle + label +
+ * optional extra badge + optional close) over arbitrary content. `ratio` is
+ * this pane's share of the stack's flex space (see `AgentSidebar`'s
+ * divider-drag comment) — sortable via dnd-kit via `dragId`, so every pane
+ * (an attached agent terminal or the session list) is rearrangeable by
+ * dragging the header's grip the same way.
+ *
+ * `onClose` is optional: the session-list pane has none (task 368 — it's a
+ * permanent leaf, since closing it would strand the sidebar with no way
+ * left to open an agent pane), every agent pane has one.
  */
-function Pane({
-  agentId,
+function PaneShell({
+  dragId,
   label,
+  headerExtra,
   ratio,
   onClose,
+  children,
 }: {
-  agentId: string
+  dragId: string
   label: string
+  headerExtra?: ReactNode
   ratio: number
-  onClose: () => void
+  onClose?: () => void
+  children: ReactNode
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: agentId,
+    id: dragId,
   })
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -336,12 +379,123 @@ function Pane({
             ⠿
           </span>
           <span>{label}</span>
+          {headerExtra}
         </span>
-        <button onClick={onClose}>close</button>
+        {onClose && <button onClick={onClose}>close</button>}
       </div>
+      {children}
+    </div>
+  )
+}
+
+/** One open agent's pane: `PaneShell` over its own independent `AgentTerminal`. */
+function AgentPane({
+  agentId,
+  label,
+  ratio,
+  onClose,
+}: {
+  agentId: string
+  label: string
+  ratio: number
+  onClose: () => void
+}) {
+  return (
+    <PaneShell dragId={agentId} label={label} ratio={ratio} onClose={onClose}>
       {/* key remounts terminal + socket only if agentId itself changes */}
       <AgentTerminal key={agentId} agentId={agentId} />
-    </div>
+    </PaneShell>
+  )
+}
+
+/** Props the session-list pane needs from `AgentSidebar`'s own state/data —
+ * bundled into one object so `SplitNodeView` (module-scope, see its own
+ * comment) can thread it down without widening its per-callback prop list. */
+type ListPaneProps = {
+  agents: AgentSession[]
+  sessionsLoaded: boolean
+  error: string | null
+  projects: Project[] | null | undefined
+  openIds: string[]
+  collapsedSections: Record<Bucket, boolean>
+  onToggleSection: (bucket: Bucket) => void
+  onTogglePane: (agentId: string) => void
+}
+
+/** The session list itself, as a pane (task 368) — same `PaneShell` chrome
+ * as an agent pane, just not closable and with the bucketed session list as
+ * its body instead of a terminal. */
+function AgentListPane({ ratio, list }: { ratio: number; list: ListPaneProps }) {
+  const { agents, sessionsLoaded, error, projects, openIds, collapsedSections, onToggleSection, onTogglePane } =
+    list
+  return (
+    <PaneShell
+      dragId={LIST_LEAF_ID}
+      label="Agents"
+      headerExtra={agents.length > 0 ? <span className="agent-sidebar-count">{agents.length}</span> : null}
+      ratio={ratio}
+    >
+      <div className="agent-sidebar-list">
+        {error && !sessionsLoaded ? (
+          <p className="error">{error}</p>
+        ) : !sessionsLoaded ? (
+          <p className="muted">Loading…</p>
+        ) : agents.length === 0 ? (
+          <p className="muted">No agents running.</p>
+        ) : (
+          BUCKETS.map((bucket) => {
+            const bucketAgents = agents.filter((a) => bucketOf(a) === bucket)
+            if (bucketAgents.length === 0) return null
+            const sectionCollapsed = collapsedSections[bucket]
+            return (
+              <div key={bucket} className="agent-sidebar-section">
+                <button
+                  type="button"
+                  className="agent-sidebar-section-head"
+                  aria-expanded={!sectionCollapsed}
+                  onClick={() => onToggleSection(bucket)}
+                >
+                  <span className="agent-sidebar-section-caret">{sectionCollapsed ? '▸' : '▾'}</span>
+                  {bucket}
+                  <span className="agent-sidebar-count">{bucketAgents.length}</span>
+                </button>
+                {!sectionCollapsed && (
+                  <ul className="card-list agent-list">
+                    {bucketAgents.map((a) => {
+                      const proj = projectForCwd(a.cwd, projects ?? [])
+                      return (
+                        <li
+                          key={a.sessionId}
+                          className={
+                            (a.id !== null ? 'attachable' : '') +
+                            (a.id !== null && openIds.includes(a.id) ? ' selected' : '')
+                          }
+                          onClick={() => {
+                            if (a.id !== null) onTogglePane(a.id)
+                          }}
+                        >
+                          <span className="agent-name">{agentLabel(a)}</span>
+                          <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
+                          {a.status && <span className={`badge agent-status-${a.status}`}>{a.status}</span>}
+                          {a.state && a.state !== a.status && (
+                            <span className={`badge agent-state-${a.state}`}>{a.state}</span>
+                          )}
+                          {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
+                          <div className="muted agent-meta">
+                            {proj ? proj.name : a.cwd} · started {startedAgo(a.startedAt)}
+                            {a.id === null && ' · external terminal — not attachable'}
+                          </div>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+              </div>
+            )
+          })
+        )}
+      </div>
+    </PaneShell>
   )
 }
 
@@ -364,6 +518,7 @@ function SplitNodeView({
   node,
   path,
   agents,
+  listProps,
   onClose,
   onDividerMouseDown,
   onDividerToggle,
@@ -371,6 +526,7 @@ function SplitNodeView({
   node: SplitNode
   path: number[]
   agents: AgentSession[]
+  listProps: ListPaneProps
   onClose: (agentId: string) => void
   onDividerMouseDown: (
     path: number[],
@@ -382,9 +538,7 @@ function SplitNodeView({
   onDividerToggle: (path: number[], i: number) => void
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const leafIds = node.children
-    .filter((c) => c.node.kind === 'leaf')
-    .map((c) => (c.node as LeafNode).agentId)
+  const leafIds = node.children.filter((c) => c.node.kind === 'leaf').map((c) => (c.node as LeafNode).id)
   const strategy = node.orientation === 'row' ? horizontalListSortingStrategy : verticalListSortingStrategy
 
   return (
@@ -393,20 +547,25 @@ function SplitNodeView({
         {node.children.map((child, i) => (
           <Fragment key={childKey(child.node)}>
             {child.node.kind === 'leaf' ? (
-              <Pane
-                agentId={child.node.agentId}
-                label={(() => {
-                  // Reassigned to a local so the arrow functions below
-                  // (separate closures) keep the 'leaf' narrowing — TS
-                  // doesn't carry a discriminant check across a closure
-                  // boundary on a value read from the outer scope.
-                  const leaf = child.node as LeafNode
-                  const session = agents.find((a) => a.id === leaf.agentId)
-                  return session ? agentLabel(session) : leaf.agentId
-                })()}
-                ratio={child.ratio}
-                onClose={() => onClose((child.node as LeafNode).agentId)}
-              />
+              child.node.contentKind === 'list' ? (
+                <AgentListPane ratio={child.ratio} list={listProps} />
+              ) : (
+                <AgentPane
+                  agentId={child.node.id}
+                  label={(() => {
+                    // Reassigned to a local (with the narrower type spelled
+                    // out) so the arrow function below — a separate closure
+                    // — keeps the 'agent' narrowing: TS doesn't carry a
+                    // discriminant check across a closure boundary on a
+                    // value read from the outer scope.
+                    const leaf = child.node as Extract<LeafNode, { contentKind: 'agent' }>
+                    const session = agents.find((a) => a.id === leaf.id)
+                    return session ? agentLabel(session) : leaf.id
+                  })()}
+                  ratio={child.ratio}
+                  onClose={() => onClose(child.node.id)}
+                />
+              )
             ) : (
               <div
                 className="agent-sidebar-split-wrapper"
@@ -416,6 +575,7 @@ function SplitNodeView({
                   node={child.node}
                   path={[...path, i]}
                   agents={agents}
+                  listProps={listProps}
                   onClose={onClose}
                   onDividerMouseDown={onDividerMouseDown}
                   onDividerToggle={onDividerToggle}
@@ -480,13 +640,15 @@ function SplitNodeView({
 export function AgentSidebar() {
   const [collapsed, setCollapsed] = useState(true)
   // Split tree holding every open pane + how each split's children share its
-  // flex space. Root is always a SplitNode, never a bare leaf/null; with no
-  // toggle ever used it stays the degenerate single-column tree — one flex
-  // container, column direction, exactly today's flat stack. A session
-  // toggles a leaf in/out of the tree by clicking it in the session list
-  // below; dragging a pane's grip reorders it among its split siblings
-  // (dnd-kit sortable).
-  const [root, setRoot] = useState<SplitNode>(emptyRoot)
+  // flex space. Root is always a SplitNode, never a bare leaf/null; the
+  // session-list leaf is seeded in once up front (task 368 — it's a pane
+  // like any other, just permanent) so with no other toggle or divider
+  // ever used it stays a single-child column: one flex container, column
+  // direction, the list pane alone. A session toggles its own leaf in/out
+  // of the tree by clicking it inside the list pane; dragging a pane's
+  // grip (including the list pane's own) reorders it among its split
+  // siblings (dnd-kit sortable).
+  const [root, setRoot] = useState<SplitNode>(() => ensureListLeaf(emptyRoot()))
   // DONE starts collapsed (stale sessions aren't the thing you want to see
   // first); BLOCKED/ACTIVE start open. `state` from the API is a live status
   // (working/blocked/done/…), not the `collapsed` UI concept below.
@@ -620,8 +782,20 @@ export function AgentSidebar() {
   const agents = [...(sessions ?? [])].sort((a, b) => b.startedAt - a.startedAt)
   const openIds = collectLeafIds(root)
 
+  const listProps: ListPaneProps = {
+    agents,
+    sessionsLoaded: sessions !== null,
+    error,
+    projects,
+    openIds,
+    collapsedSections,
+    onToggleSection: (bucket) => setCollapsedSections((s) => ({ ...s, [bucket]: !s[bucket] })),
+    onTogglePane: togglePane,
+  }
+
   function togglePane(id: string) {
     setRoot((r) => (findPathToLeaf(r, id) ? removeLeaf(r, id) : insertLeaf(r, id)))
+    refetch()
   }
 
   function closePane(id: string) {
@@ -737,92 +911,17 @@ export function AgentSidebar() {
       </div>
 
       <div className="agent-sidebar-body">
-        <div className="agent-sidebar-list">
-          <h2 className="agent-sidebar-head">
-            Agents
-            {agents.length > 0 && <span className="agent-sidebar-count">{agents.length}</span>}
-          </h2>
-          {error && !sessions ? (
-            <p className="error">{error}</p>
-          ) : !sessions ? (
-            <p className="muted">Loading…</p>
-          ) : agents.length === 0 ? (
-            <p className="muted">No agents running.</p>
-          ) : (
-            BUCKETS.map((bucket) => {
-              const bucketAgents = agents.filter((a) => bucketOf(a) === bucket)
-              if (bucketAgents.length === 0) return null
-              const sectionCollapsed = collapsedSections[bucket]
-              return (
-                <div key={bucket} className="agent-sidebar-section">
-                  <button
-                    type="button"
-                    className="agent-sidebar-section-head"
-                    aria-expanded={!sectionCollapsed}
-                    onClick={() =>
-                      setCollapsedSections((s) => ({ ...s, [bucket]: !s[bucket] }))
-                    }
-                  >
-                    <span className="agent-sidebar-section-caret">
-                      {sectionCollapsed ? '▸' : '▾'}
-                    </span>
-                    {bucket}
-                    <span className="agent-sidebar-count">{bucketAgents.length}</span>
-                  </button>
-                  {!sectionCollapsed && (
-                    <ul className="card-list agent-list">
-                      {bucketAgents.map((a) => {
-                        const proj = projectForCwd(a.cwd, projects ?? [])
-                        return (
-                          <li
-                            key={a.sessionId}
-                            className={
-                              (a.id !== null ? 'attachable' : '') +
-                              (a.id !== null && openIds.includes(a.id) ? ' selected' : '')
-                            }
-                            onClick={() => {
-                              if (a.id !== null) {
-                                togglePane(a.id)
-                                refetch()
-                              }
-                            }}
-                          >
-                            <span className="agent-name">{agentLabel(a)}</span>
-                            <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
-                            {a.status && (
-                              <span className={`badge agent-status-${a.status}`}>{a.status}</span>
-                            )}
-                            {a.state && a.state !== a.status && (
-                              <span className={`badge agent-state-${a.state}`}>{a.state}</span>
-                            )}
-                            {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
-                            <div className="muted agent-meta">
-                              {proj ? proj.name : a.cwd} · started {startedAgo(a.startedAt)}
-                              {a.id === null && ' · external terminal — not attachable'}
-                            </div>
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  )}
-                </div>
-              )
-            })
-          )}
-        </div>
-
-        {root.children.length > 0 && (
-          <DndContext sensors={sensors} onDragEnd={handlePaneDragEnd}>
-            <SplitNodeView
-              node={root}
-              path={[]}
-              agents={agents}
-              onClose={closePane}
-              onDividerMouseDown={startDivider}
-              onDividerToggle={toggleDividerAt}
-            />
-          </DndContext>
-        )}
+        <DndContext sensors={sensors} onDragEnd={handlePaneDragEnd}>
+          <SplitNodeView
+            node={root}
+            path={[]}
+            agents={agents}
+            listProps={listProps}
+            onClose={closePane}
+            onDividerMouseDown={startDivider}
+            onDividerToggle={toggleDividerAt}
+          />
+        </DndContext>
       </div>
     </aside>
   )

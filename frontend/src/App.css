@@ -2108,18 +2108,16 @@ body.agent-sidebar-resizing {
   overflow: hidden;
 }
 
+/* Body of the session-list pane (task 368: the list itself is now a pane
+   like any other, via `AgentListPane`/`PaneShell` in AgentSidebar.tsx) —
+   fills the remaining flex space below the shared `.agent-terminal-header`
+   and scrolls internally, the same sizing contract `.agent-terminal` uses
+   for an attached terminal's own pane body. */
 .agent-sidebar-list {
-  flex: none;
-  max-height: 45%;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
-}
-
-.agent-sidebar-head {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.95rem;
-  margin: 0.25rem 0 0.5rem;
+  padding: 0.5rem 0.6rem;
 }
 
 .agent-sidebar-count {
@@ -2169,7 +2167,6 @@ body.agent-sidebar-resizing {
 .agent-sidebar-panes {
   flex: 1;
   min-height: 0;
-  margin-top: 0.75rem;
   overflow: hidden;
 }
 

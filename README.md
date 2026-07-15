@@ -1,3 +1,5 @@
+<img src="frontend/public/favicon.svg" width="72" height="72" alt="mesa logo" />
+
 # mesa
 
 **Local-first project & task management for humans and agents.**

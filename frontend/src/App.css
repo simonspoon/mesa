@@ -6,6 +6,9 @@ header {
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-family: var(--font-display);
   font-weight: 700;
   font-size: 1.1rem;
@@ -13,6 +16,12 @@ header {
   letter-spacing: 0.35em;
   color: var(--text-h);
   text-shadow: 0 0 10px var(--cyan);
+}
+
+.brand-mark {
+  width: 1.3rem;
+  height: 1.3rem;
+  flex: none;
 }
 
 /* App shell: header on top, then sidebar + full-width main. */

@@ -254,6 +254,11 @@ function App() {
     <>
       <header>
         <a className="brand" href="#/">
+          <svg className="brand-mark" viewBox="0 0 100 100" role="img" aria-hidden="true">
+            <polygon points="8,84 8,68 16,68 16,52 26,52 26,34 74,34 74,52 84,52 84,68 92,68 92,84" fill="#0a4d59" />
+            <polygon points="16,68 16,52 26,52 26,34 74,34 74,52 84,52 84,68" fill="#00a8c2" />
+            <polygon points="26,52 26,34 74,34 74,52" fill="#00e5ff" />
+          </svg>
           mesa
         </a>
       </header>

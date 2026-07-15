@@ -18,7 +18,6 @@ import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
-import type { ProjectAgents } from './types/ProjectAgents'
 import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
@@ -361,11 +360,6 @@ export function updateProjectFilesContent(
 }
 
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----
-
-/** The live Claude Code sessions under the project's folder. */
-export function getProjectAgents(id: number): Promise<ProjectAgents> {
-  return request(`/api/projects/${id}/agents`)
-}
 
 /** Every live Claude Code session on the machine (no folder filter) — backs
  * the persistent Agents sidebar. */

@@ -1831,60 +1831,6 @@ main {
   background: rgba(0, 229, 255, 0.05);
 }
 
-/* ---- Agents tab: embedded terminal (main) + session sub nav (right) ---- */
-
-/* Viewport-bound like the storyboard canvas (shares --tab-viewport-*): the
-   terminal fills this box and scrolls internally (xterm scrollback); the page
-   itself never scrolls. */
-.agents-layout {
-  display: flex;
-  gap: 1rem;
-  align-items: stretch;
-  height: var(--tab-viewport-height);
-  min-height: var(--tab-viewport-min);
-}
-
-.agents-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.agents-subnav {
-  flex: none;
-  width: 19rem;
-  overflow-y: auto;
-  padding-left: 1rem;
-  border-left: 1px solid var(--border);
-  /* Error banners and paths carry unbroken tokens (fs paths, claude stderr);
-     wrap them instead of growing a horizontal scrollbar in the column. */
-  overflow-wrap: anywhere;
-}
-
-.agents-start {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-
-.agents-placeholder {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  padding: 2rem;
-  border: 1px dashed var(--border);
-}
-
-.agents-path {
-  font-size: 0.8rem;
-  font-family: var(--font-mono);
-  overflow-wrap: anywhere;
-}
-
 .agent-list li.attachable {
   cursor: pointer;
 }
@@ -1981,14 +1927,8 @@ main {
   color: var(--amber);
 }
 
-.agents-poll-error {
-  font-size: 0.8rem;
-  margin: 0.25rem 0;
-}
-
-/* xterm needs an explicitly sized box to fit into: this one flex-fills the
-   panel (which fills .agents-main), so the terminal is exactly the viewport
-   space left over — never taller. */
+/* xterm needs an explicitly sized box to fit into: this one flex-fills its
+   pane, so the terminal is exactly the available space — never taller. */
 .agent-terminal-screen {
   flex: 1;
   min-height: 0;
@@ -2739,29 +2679,6 @@ body.agent-sidebar-resizing {
     border: none;
     border-top: 1px solid var(--border-bright);
     box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
-  }
-
-  /* Agents tab: terminal keeps the viewport-bound box, session list flows
-     beneath it instead of squeezing it from the right. */
-  .agents-layout {
-    flex-direction: column;
-    height: auto;
-    min-height: 0;
-  }
-
-  .agents-main {
-    flex: none;
-    height: var(--tab-viewport-height);
-    min-height: var(--tab-viewport-min);
-  }
-
-  .agents-subnav {
-    width: auto;
-    overflow-y: visible;
-    padding-left: 0;
-    border-left: none;
-    padding-top: 0.75rem;
-    border-top: 1px solid var(--border);
   }
 
   /* Git tab: file list flows above, diff keeps a viewport-bound box below. */

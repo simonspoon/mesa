@@ -695,7 +695,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
   // only applies its result if this still matches the id it captured, so
   // canceling (or reopening the form for a different project) before a spawn
   // resolves can't have the stale response clobber whatever the form shows
-  // by the time it lands. Mirrors `AgentsView`'s own `projectIdRef` guard
+  // by the time it lands. The project-id ref below guards
   // against the analogous stale-async-write problem.
   const addRequestId = useRef(0)
 
@@ -806,7 +806,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
 
   // Relative "started Xm ago" labels are derived from the clock at render
   // time, but useFetch drops byte-identical polls, so an idle list would
-  // never re-render and the labels would freeze (mirrors AgentsView).
+  // never re-render and the labels would freeze.
   const [, setTick] = useState(0)
   useEffect(() => {
     const t = setInterval(() => setTick((x) => x + 1), 30000)

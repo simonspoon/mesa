@@ -145,7 +145,7 @@ mesa serve --lan           # opt-in: bind 0.0.0.0 and serve other LAN devices
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
 `block`/`unblock`/`dependencies` actions, `/api/storyboards` with its
 `frames`/`edges`/`events`, `/api/inbox`, `/api/cc`, and
-per-project `git`/`agents` views), with the React web UI served at `/`. The web
+per-project `git`/`agents` endpoints), with the React web UI served at `/`. The web
 UI does not live-sync; it refetches on window focus.
 
 **Security boundary** (there is no auth — it is a local tool):
@@ -224,17 +224,18 @@ mesa project resolve          # -> the project bound to this repo
 so an agent dropped into a working directory finds the right project instead of
 creating a duplicate. (`--no-git` skips binding; `project update --root-commit
 ""` clears it.) The project also remembers its `local_path` — the last-known
-working folder — which powers the web UI's git status in the sidebar, the
-per-project **Git** tab (working-tree file list + per-file diff, read-only),
-and the **Agents** tab.
+working folder — which powers the web UI's git status, the per-project **Git**
+tab (working-tree file list + per-file diff, read-only), and project labels and
+start locations in the global Agents sidebar.
 
 ## Agents, hooks & the CC Dashboard
 
-- **Agents tab** (web UI): lists the Claude Code sessions running under a
-  project's `local_path`, starts new background ones, and embeds a terminal
-  attached to a running session (a WebSocket bridge onto `claude attach`, so it
-  works from remote machines under `--lan`). There is deliberately no
-  `mesa agent` CLI — an agent in a terminal uses `claude` directly.
+- **Agents sidebar** (web UI): lists Claude Code sessions across projects,
+  starts new background ones in a selected project's `local_path`, and embeds
+  terminals attached to running sessions (a WebSocket bridge onto `claude
+  attach`, so it works from remote machines under `--lan`). There is
+  deliberately no `mesa agent` CLI — an agent in a terminal uses `claude`
+  directly.
 - **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
   the database. One point so far — `task-execute`, fired by `mesa task execute
   <id>` (or the web UI's Execute button) with the full task JSON on stdin and

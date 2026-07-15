@@ -373,7 +373,7 @@ function WorktreeList({
  * path from this same repo's own worktree list). History stays scoped to
  * the project's `local_path` regardless of the selected worktree — all
  * worktrees of one repo share the same commit history. Rendered in place
- * inside ProjectTasksPage's frame, like AgentsView. Read-only; refetches on
+ * inside ProjectTasksPage's frame. Read-only; refetches on
  * window focus (no poll — git state changes from terminal work outside the
  * app, and the server caches the status call for 5s anyway).
  */
@@ -396,7 +396,7 @@ export function GitView({ projectId }: { projectId: number }) {
   // This component is not remounted when the route moves between projects
   // (App renders ProjectTasksPage at a stable position), so a stale selection
   // would carry project A's file into project B. Reset it when the project
-  // changes — during render, off the changed prop (AgentsView pattern).
+  // changes — during render, off the changed prop.
   const [prevProject, setPrevProject] = useState(projectId)
   if (projectId !== prevProject) {
     setPrevProject(projectId)

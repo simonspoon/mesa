@@ -19,7 +19,7 @@ function navigate(hash: string) {
 
 /**
  * Fixed top-level destinations plus, per project: "Go to <name>" (the
- * board), the agents/git/files/dashboard/storyboards sub-views, and
+ * board), the git/files/dashboard/storyboards sub-views, and
  * "Create task in <name>" (which lands on the create-task route —
  * ProjectTasksPage opens the form with its title input focused).
  */
@@ -35,12 +35,6 @@ function buildCommands(projects: Project[]): Command[] {
       label: `Go to ${p.name}`,
       search: `${name} board`,
       run: () => navigate(`#/projects/${p.id}`),
-    })
-    commands.push({
-      id: `agents-${p.id}`,
-      label: `${p.name} — Agents`,
-      search: `${name} agents`,
-      run: () => navigate(`#/projects/${p.id}/agents`),
     })
     commands.push({
       id: `git-${p.id}`,
@@ -77,9 +71,7 @@ function buildCommands(projects: Project[]): Command[] {
 }
 
 // Word-AND: every whitespace-separated token in the query must appear
-// somewhere in the command's search string. Satisfies both flows the query
-// is built for — "agents" alone surfaces every project's Agents view,
-// "acme agents" narrows to just Acme's.
+// somewhere in the command's search string.
 function matches(command: Command, query: string): boolean {
   const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
   return tokens.every((t) => command.search.includes(t))

@@ -6,7 +6,6 @@ import { InlineEdit } from '../components/InlineEdit'
 import { TaskPanel } from '../components/TaskPanel'
 import { KanbanBoard } from '../KanbanBoard'
 import { useFetch } from '../useFetch'
-import { AgentsView } from './AgentsView'
 import { CCDashboardView } from './CCDashboardView'
 import { FilesView } from './FilesView'
 import { GitView } from './GitView'
@@ -18,7 +17,6 @@ export function ProjectTasksPage({
   taskId,
   storyboards,
   storyboardId,
-  agents,
   git,
   files,
   dashboard,
@@ -31,9 +29,6 @@ export function ProjectTasksPage({
   // true on the boards routes, `storyboardId` selects a single board's canvas.
   storyboards: boolean
   storyboardId: number | null
-  // Agents is another URL-driven view: live Claude Code sessions under the
-  // project's folder, with an embedded terminal.
-  agents: boolean
   // Git is another URL-driven view: working-tree status of the project's
   // linked folder, with a per-file diff pane.
   git: boolean
@@ -95,12 +90,12 @@ export function ProjectTasksPage({
     `count-${projectId}`,
   )
 
-  // Storyboards, Agents, Git, Files, and Dashboard are their own views with
+  // Storyboards, Git, Files, and Dashboard are their own views with
   // their own fetches/error handling, so a failed task fetch must not block
   // them; only surface it on the Board view.
   const error =
     projectError ??
-    (storyboards || agents || git || files || dashboard ? null : tasksError)
+    (storyboards || git || files || dashboard ? null : tasksError)
   if (error) return <p className="error">{error}</p>
 
   function onTasksChanged() {
@@ -112,7 +107,7 @@ export function ProjectTasksPage({
   // returns the hash to the project URL so the switch happens in place,
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectBoard() {
-    if (storyboards || agents || git || files || dashboard)
+    if (storyboards || git || files || dashboard)
       window.location.hash = `#/projects/${projectId}`
   }
 
@@ -178,7 +173,7 @@ export function ProjectTasksPage({
         )}
         <div className="tabs">
           {/* Dashboard is first, before Board (spec Must #4): a URL-driven
-              in-place view, like Storyboards/Agents/Git below. */}
+              in-place view, like Storyboards/Git below. */}
           <button
             className={dashboard ? 'active' : ''}
             onClick={() => {
@@ -190,7 +185,7 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !agents && !git && !files && !dashboard
+              !storyboards && !git && !files && !dashboard
                 ? 'active'
                 : ''
             }
@@ -208,15 +203,6 @@ export function ProjectTasksPage({
             }}
           >
             Storyboards
-          </button>
-          <button
-            className={agents ? 'active' : ''}
-            onClick={() => {
-              if (!agents)
-                window.location.hash = `#/projects/${projectId}/agents`
-            }}
-          >
-            Agents
           </button>
           <button
             className={git ? 'active' : ''}
@@ -238,8 +224,8 @@ export function ProjectTasksPage({
 
         {/* Create action lives where the user is working: below the tabs, on
             the Board view only (spec S5), not on Storyboards/
-            Agents/Git/Files/Dashboard (those carry their own content). */}
-        {!storyboards && !agents && !git && !files && !dashboard && (
+            Git/Files/Dashboard (those carry their own content). */}
+        {!storyboards && !git && !files && !dashboard && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
@@ -251,8 +237,6 @@ export function ProjectTasksPage({
           <GitView projectId={projectId} />
         ) : files ? (
           <FilesView projectId={projectId} />
-        ) : agents ? (
-          <AgentsView projectId={projectId} />
         ) : storyboards ? (
           storyboardId !== null ? (
             <StoryboardBoardView

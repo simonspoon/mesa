@@ -1,11 +1,11 @@
-# Agents (live Claude Code sessions per project)
+# Agents (live Claude Code sessions)
 
-The **Agents** tab on a project page (web UI, `#/projects/:id/agents`) lists
-the Claude Code sessions running under the project's `local_path`, starts new
-background ones, and embeds a terminal attached to a running one. Like the CC
-Dashboard it reads **external** state — here by shelling out to the `claude`
-CLI (`src/core/agents.rs`; `MESA_CLAUDE_BIN` overrides the binary for tests) —
-and touches the mesa store only to read `local_path`. There is deliberately no
+The persistent **Agents sidebar** lists Claude Code sessions across projects,
+starts new background ones in a selected project's `local_path`, and embeds
+terminals attached to running sessions. Like the CC Dashboard it reads
+**external** state — here by shelling out to the `claude` CLI
+(`src/core/agents.rs`; `MESA_CLAUDE_BIN` overrides the binary for tests) — and
+touches the mesa store only to read `local_path`. There is deliberately no
 `mesa agent` CLI: an agent in a terminal would just use `claude` directly.
 
 - `GET /api/projects/{id}/agents` → `{path, agents}` via `claude agents
@@ -34,8 +34,7 @@ and touches the mesa store only to read `local_path`. There is deliberately no
 - `GET /api/agents` → `Vec<AgentSession>` (bare array, no `path` wrapper) via
   `claude agents --json` with **no `--cwd` filter** — every live session on
   the machine, across every project's folder at once. Backs the global Agents
-  sidebar (below); the per-project route above is for the project-scoped
-  Agents tab. Shares `agents_cache` with the per-project route under a
+  sidebar (below) and shares `agents_cache` with the per-project route under a
   sentinel key (`ALL_AGENTS_CACHE_KEY`, a NUL-prefixed string no real
   `local_path` can equal) — same 2s TTL, same "collapse concurrent polls"
   rationale, just keyed once instead of per-folder.
@@ -78,12 +77,6 @@ and touches the mesa store only to read `local_path`. There is deliberately no
   DNS-rebinding page on the server's own machine arrives with a loopback peer),
   so the agent routes' Host/Origin checks stack on top. Every other project
   field stays writable under `--lan`.
-- Web UI: `AgentsView` under the project tabs — the attached terminal
-  (`AgentTerminal`, xterm.js + fit addon over the attach socket) fills the main
-  area, viewport-bound (the terminal scrolls, the page doesn't), with the
-  session list + start form in a sub nav on the right (3s poll). All terminal
-  I/O rides the server-side WebSocket bridge, so it works from remote machines
-  under `--lan`. The vite dev proxy has `ws: true` for this socket.
 - Gate: `scripts/agents-check.sh` (stub `claude`, asserts the JSON contract and
   the local_path CLI plumbing). The WS bridge itself is verified by live QA.
 
@@ -91,7 +84,7 @@ and touches the mesa store only to read `local_path`. There is deliberately no
 
 A persistent, collapsible right-hand rail (`AgentSidebar`,
 `frontend/src/components/AgentSidebar.tsx`) shows every live session across
-every project — not scoped to one project's Agents tab — with room to attach
+every project, with room to attach
 several at once, arranged as a tree of resizable/rearrangeable,
 mixed-orientation panes. The session list itself is one of those panes (task
 368) — resizable and rearrangeable exactly like an attached agent's pane,
@@ -245,6 +238,6 @@ and `CommandPalette` already use.
   the left `Sidebar` highlights) if that project is startable, else the
   first startable project, else empty. Submitting calls
   `spawnProjectAgent` and inserts the returned id straight into the pane
-  tree via `insertLeaf` (mirroring `AgentsView`'s own start form), so the new
+  tree via `insertLeaf`, so the new
   session opens attached immediately instead of waiting for the next list
   poll.

@@ -20,7 +20,7 @@ because someone ran `mesa serve`.
   the race window between dispatch and the agent's own `/execute-mesa-task`
   pickup step, so a later tick can't double-dispatch the same task while the
   agent is still starting up. A project with no `local_path`, or a stale one
-  (the folder no longer exists), is skipped, same posture as the Agents tab.
+  (the folder no longer exists), is skipped, matching the agents endpoint.
 - If `spawn_bg` fails (the `claude` CLI missing or erroring), the claimed
   task is reverted back to `todo` so the project isn't wedged — an
   unrecoverable spawn must not silently stop that project from ever being
@@ -42,4 +42,4 @@ because someone ran `mesa serve`.
 - Gate: `scripts/todo-watcher-check.sh` (flag on/off, dispatch + claim,
   busy-project skip, path-less/stale-path skip, spawn-failure revert)
   against a stub `claude` binary — no CLI surface of its own beyond the
-  `serve` flag, matching the Agents tab's "no `mesa agent` CLI" precedent.
+  `serve` flag, matching the agents surface's "no `mesa agent` CLI" precedent.

@@ -394,8 +394,8 @@ function TreeNode({
  * A non-binary, non-truncated file can be edited and saved back to disk
  * (task 327, `ContentPane`'s Edit affordance); everything else — browsing,
  * the tree, no create/delete/rename — stays read-only. Rendered in place
- * inside ProjectTasksPage's frame, like GitView/AgentsView. Empty states are
- * quiet placeholders, matching the Git/Agents tabs' ladder, never a hard
+ * inside ProjectTasksPage's frame, like GitView. Empty states are quiet
+ * placeholders, matching the Git tab's ladder, never a hard
  * error (M10).
  */
 export function FilesView({ projectId }: { projectId: number }) {

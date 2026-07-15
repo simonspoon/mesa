@@ -2057,6 +2057,34 @@ body.agent-sidebar-resizing {
   box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
 }
 
+.agent-sidebar-add {
+  background: rgba(6, 10, 16, 0.85);
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  margin-left: auto;
+}
+
+.agent-sidebar-add.active {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan-dim);
+}
+
+.agent-sidebar-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0.4rem 0.5rem 0;
+  padding: 0.6rem;
+  border: 1px solid var(--border);
+  background: rgba(6, 10, 16, 0.85);
+}
+
+.agent-sidebar-add-form-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
 /* Drag handle on the left edge — straddles the border so it's grabbable
    from either side without stealing space from the content. */
 .agent-sidebar-resize-handle {

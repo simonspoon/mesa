@@ -233,3 +233,18 @@ and `CommandPalette` already use.
   (`agent-sidebar-maximize`) grows the panel to fill the whole main content
   area instead (`main` display:none via `:has()`), matching the storyboard
   canvas's own takeover-view expand toggle; `Escape` restores.
+- **Starting a new agent**: a `+ agent` button (`agent-sidebar-add`) sits in
+  the header actions next to maximize, visible only while expanded. It opens
+  a small form (`agent-sidebar-add-form`) above the pane tree — a project
+  `<select>`, an optional first-prompt text input, and start/cancel — rather
+  than being part of the split tree itself (it starts a session; it isn't
+  one). The project picker only lists projects with a linked folder
+  (`local_path` set), since that's where `POST /api/projects/{id}/agents`
+  runs `claude --bg` and a folderless project would just 400; it defaults to
+  the project currently in focus (App's `activeProjectId`, the same value
+  the left `Sidebar` highlights) if that project is startable, else the
+  first startable project, else empty. Submitting calls
+  `spawnProjectAgent` and inserts the returned id straight into the pane
+  tree via `insertLeaf` (mirroring `AgentsView`'s own start form), so the new
+  session opens attached immediately instead of waiting for the next list
+  poll.

@@ -265,7 +265,7 @@ function App() {
           version={navVersion}
         />
         <main>{page}</main>
-        <AgentSidebar />
+        <AgentSidebar activeProjectId={activeProjectId} />
       </div>
       {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} />}
     </>

@@ -503,7 +503,7 @@ main {
 
 .kanban {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 0.75rem;
 }
 
@@ -513,6 +513,10 @@ main {
   clip-path: var(--cut);
   padding: 0.5rem;
   min-height: 8rem;
+  /* Grid items default to min-width: auto, which lets a long unbroken
+     title (or id) grow the track past its 1fr share instead of wrapping —
+     that's what actually breaks equal column widths (task 378). */
+  min-width: 0;
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 
@@ -542,6 +546,7 @@ main {
   cursor: grab;
   touch-action: none;
   transition: box-shadow 0.15s;
+  overflow-wrap: anywhere;
 }
 
 /* Small id label, top-left of a Board card; subordinate to the title. */

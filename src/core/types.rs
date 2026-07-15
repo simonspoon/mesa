@@ -387,6 +387,10 @@ pub struct TaskSummary {
     pub acceptance: Option<String>,
     /// Manual board order (spec 328); see `Task::sort_order`.
     pub sort_order: f64,
+    /// When the task row was last updated (SQLite `datetime` text, UTC); the
+    /// Done board column sorts on this as a completion-time proxy (spec 366)
+    /// since a done task is not normally edited again.
+    pub updated_at: String,
     pub blocked: bool,
 }
 
@@ -402,6 +406,7 @@ impl From<&Task> for TaskSummary {
             tags: t.tags.clone(),
             acceptance: t.acceptance.clone(),
             sort_order: t.sort_order,
+            updated_at: t.updated_at.clone(),
             blocked: t.blocked,
         }
     }

@@ -14,4 +14,10 @@ acceptance: string | null,
 /**
  * Manual board order (spec 328); see `Task::sort_order`.
  */
-sort_order: number, blocked: boolean, };
+sort_order: number, 
+/**
+ * When the task row was last updated (SQLite `datetime` text, UTC); the
+ * Done board column sorts on this as a completion-time proxy (spec 366)
+ * since a done task is not normally edited again.
+ */
+updated_at: string, blocked: boolean, };

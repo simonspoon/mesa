@@ -55,6 +55,16 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
   )
 }
 
+// The Done column reads as a completion log (spec 366): most recently
+// completed first, by `updated_at` (a done task is not normally edited
+// again, so it stands in for a completion timestamp). Every other column
+// keeps the manual `sort_order` order already baked into the array from
+// GET /api/tasks.
+function orderColumn(status: Status, tasks: TaskSummary[]): TaskSummary[] {
+  if (status !== 'done') return tasks
+  return [...tasks].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+}
+
 // Order a column's tasks so each subtask sits directly under its parent,
 // indented one level (spec S6). A subtask whose parent is in another column
 // (different status) stays at the top level so it is never dropped. This is
@@ -86,7 +96,7 @@ function nestColumn(
 
 function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
   const { setNodeRef, isOver } = useDroppable({ id: status })
-  const ordered = nestColumn(tasks)
+  const ordered = nestColumn(orderColumn(status, tasks))
   return (
     <div ref={setNodeRef} className={`kanban-column${isOver ? ' over' : ''}`}>
       <h2>
@@ -146,7 +156,7 @@ export function KanbanBoard({
     const overTask = tasks.find((t) => t.id === Number(over.id))
     const status = overTask ? overTask.status : (over.id as Status)
     const destOrdered = nestColumn(
-      tasks.filter((t) => t.status === status && t.id !== id),
+      orderColumn(status, tasks.filter((t) => t.status === status && t.id !== id)),
     ).map(({ task: t }) => t)
     const overIndex = overTask ? destOrdered.findIndex((t) => t.id === overTask.id) : -1
     const insertAt = overIndex === -1 ? destOrdered.length : overIndex

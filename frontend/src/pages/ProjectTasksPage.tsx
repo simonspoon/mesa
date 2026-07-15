@@ -4,10 +4,7 @@ import { ConfirmDelete } from '../components/ConfirmDelete'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskPanel } from '../components/TaskPanel'
-import { TaskRow } from '../components/TaskRow'
 import { KanbanBoard } from '../KanbanBoard'
-import type { Priority } from '../types/Priority'
-import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
 import { AgentsView } from './AgentsView'
 import { CCDashboardView } from './CCDashboardView'
@@ -15,40 +12,6 @@ import { FilesView } from './FilesView'
 import { GitView } from './GitView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
-
-import type { TaskSummary } from '../types/TaskSummary'
-
-const STATUSES: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
-const PRIORITIES: Priority[] = ['low', 'medium', 'high']
-
-// Order tasks so each subtask sits directly under its parent, indented one
-// level (spec S6, one level only). Parents keep the incoming order; a subtask
-// whose parent is absent from the list (filtered out) stays in place at the
-// top level so it is never dropped.
-function nestSubtasks(
-  tasks: TaskSummary[],
-): { task: TaskSummary; depth: number }[] {
-  const byParent = new Map<number, TaskSummary[]>()
-  for (const t of tasks) {
-    if (t.parent_id !== null) {
-      const group = byParent.get(t.parent_id) ?? []
-      group.push(t)
-      byParent.set(t.parent_id, group)
-    }
-  }
-  const present = new Set(tasks.map((t) => t.id))
-  const out: { task: TaskSummary; depth: number }[] = []
-  for (const t of tasks) {
-    // Skip subtasks whose parent is also in the list; they are emitted under
-    // the parent below. Orphaned subtasks fall through at depth 0.
-    if (t.parent_id !== null && present.has(t.parent_id)) continue
-    out.push({ task: t, depth: 0 })
-    for (const child of byParent.get(t.id) ?? []) {
-      out.push({ task: child, depth: 1 })
-    }
-  }
-  return out
-}
 
 export function ProjectTasksPage({
   projectId,
@@ -88,15 +51,6 @@ export function ProjectTasksPage({
   createTask: boolean
   onProjectsChanged: () => void
 }) {
-  // Status and tag are passed through to the API's query filters; priority
-  // is filtered client-side (the API has no priority filter).
-  const [status, setStatus] = useState<Status | ''>('')
-  const [priority, setPriority] = useState<Priority | ''>('')
-  const [tag, setTag] = useState('')
-  // List/Board is an in-place toggle held in local state; Storyboards is
-  // URL-driven (the `storyboards` prop). `view` only distinguishes list vs
-  // board — when Storyboards is active it governs neither tab's content.
-  const [view, setView] = useState<'list' | 'board'>('board')
   // Create-form panel state is ephemeral (spec Assumption 2); the task
   // panel is URL-driven via `taskId`. Latest action wins: opening a task
   // closes the create form. Seeded from `createTask` so a direct arrival
@@ -125,27 +79,17 @@ export function ProjectTasksPage({
     error: projectError,
     refetch: refetchProject,
   } = useFetch(() => getProject(projectId), `project-${projectId}`)
-  // The board always shows every status column, so it fetches unfiltered;
-  // the list filters apply only to the list view.
+  // The board always shows every status column, so it fetches unfiltered.
   const { data: tasks, error: tasksError, refetch } = useFetch(
-    () =>
-      view === 'board'
-        ? listTasks({ project: projectId })
-        : listTasks({
-            project: projectId,
-            status: status === '' ? undefined : status,
-            tag: tag === '' ? undefined : tag,
-          }),
-    view === 'board'
-      ? `board-${projectId}`
-      : `tasks-${projectId}-${status}-${tag}`,
-    // Live-sync the List/Board: agents mutate the DB underneath the UI, so
-    // poll for changes instead of waiting for a window refocus. No-op polls
-    // are dropped in useFetch, so an unchanged view never re-renders.
+    () => listTasks({ project: projectId }),
+    `board-${projectId}`,
+    // Live-sync the board: agents mutate the DB underneath the UI, so poll
+    // for changes instead of waiting for a window refocus. No-op polls are
+    // dropped in useFetch, so an unchanged view never re-renders.
     { pollMs: 3000 },
   )
-  // Unfiltered count for the delete confirmation: the list fetch above may
-  // be filtered, but the cascade destroys every task in the project.
+  // Unfiltered count for the delete confirmation: the cascade destroys
+  // every task in the project.
   const { data: allTasks, refetch: refetchCount } = useFetch(
     () => listTasks({ project: projectId }),
     `count-${projectId}`,
@@ -153,24 +97,21 @@ export function ProjectTasksPage({
 
   // Storyboards, Agents, Git, Files, and Dashboard are their own views with
   // their own fetches/error handling, so a failed task fetch must not block
-  // them; only surface it on the task views (List/Board).
+  // them; only surface it on the Board view.
   const error =
     projectError ??
     (storyboards || agents || git || files || dashboard ? null : tasksError)
   if (error) return <p className="error">{error}</p>
-
-  const visible = tasks?.filter((t) => priority === '' || t.priority === priority)
 
   function onTasksChanged() {
     refetch()
     refetchCount()
   }
 
-  // Switch to a task view (List/Board). When a storyboards route is open this
-  // also returns the hash to the project URL so the switch happens in place,
+  // Return to the Board view. When a storyboards route is open this also
+  // returns the hash to the project URL so the switch happens in place,
   // matching how the tabs toggle among any views (M5 symmetric return).
-  function selectView(next: 'list' | 'board') {
-    setView(next)
+  function selectBoard() {
     if (storyboards || agents || git || files || dashboard)
       window.location.hash = `#/projects/${projectId}`
   }
@@ -201,62 +142,6 @@ export function ProjectTasksPage({
         onChanged={onTasksChanged}
       />
     ) : null
-
-  const listView = (
-    <>
-      <div className="filters">
-        <label>
-          Status{' '}
-          <select
-            value={status}
-            onChange={(e) => setStatus(e.target.value as Status | '')}
-          >
-            <option value="">all</option>
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Priority{' '}
-          <select
-            value={priority}
-            onChange={(e) => setPriority(e.target.value as Priority | '')}
-          >
-            <option value="">all</option>
-            {PRIORITIES.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Tag{' '}
-          <input
-            type="text"
-            value={tag}
-            placeholder="filter by tag"
-            onChange={(e) => setTag(e.target.value)}
-          />
-        </label>
-      </div>
-
-      {!visible ? (
-        <p className="muted">Loading…</p>
-      ) : visible.length === 0 ? (
-        <p className="muted">No tasks match.</p>
-      ) : (
-        <ul className="card-list">
-          {nestSubtasks(visible).map(({ task, depth }) => (
-            <TaskRow key={task.id} task={task} depth={depth} />
-          ))}
-        </ul>
-      )}
-    </>
-  )
 
   return (
     <>
@@ -305,26 +190,16 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !agents && !git && !files && !dashboard && view === 'board'
+              !storyboards && !agents && !git && !files && !dashboard
                 ? 'active'
                 : ''
             }
-            onClick={() => selectView('board')}
+            onClick={selectBoard}
           >
             Board
           </button>
-          <button
-            className={
-              !storyboards && !agents && !git && !files && !dashboard && view === 'list'
-                ? 'active'
-                : ''
-            }
-            onClick={() => selectView('list')}
-          >
-            List
-          </button>
           {/* URL-driven in-place views (refresh-/back-stable) that keep this
-              frame around their content, like List/Board above. */}
+              frame around their content, like Board above. */}
           <button
             className={storyboards ? 'active' : ''}
             onClick={() => {
@@ -362,7 +237,7 @@ export function ProjectTasksPage({
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
-            the List/Board views only (spec S5), not on Storyboards/
+            the Board view only (spec S5), not on Storyboards/
             Agents/Git/Files/Dashboard (those carry their own content). */}
         {!storyboards && !agents && !git && !files && !dashboard && (
           <p className="task-actions">
@@ -387,14 +262,10 @@ export function ProjectTasksPage({
           ) : (
             <StoryboardListView projectId={projectId} />
           )
-        ) : view === 'board' ? (
-          !tasks ? (
-            <p className="muted">Loading…</p>
-          ) : (
-            <KanbanBoard tasks={tasks} onMoved={onTasksChanged} />
-          )
+        ) : !tasks ? (
+          <p className="muted">Loading…</p>
         ) : (
-          listView
+          <KanbanBoard tasks={tasks} onMoved={onTasksChanged} />
         )}
 
         {/* Destructive action tucked away, de-emphasized (spec S8): rarely

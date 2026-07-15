@@ -92,9 +92,10 @@ and touches the mesa store only to read `local_path`. There is deliberately no
 A persistent, collapsible right-hand rail (`AgentSidebar`,
 `frontend/src/components/AgentSidebar.tsx`) shows every live session across
 every project — not scoped to one project's Agents tab — with room to attach
-a terminal alongside it. Rendered once in `App.tsx`, as a sibling of `<main>`
-outside the hash router, so it is never remounted by navigation; the same
-persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
+several at once, as resizable/rearrangeable stacked panes. Rendered once in
+`App.tsx`, as a sibling of `<main>` outside the hash router, so it is never
+remounted by navigation; the same persistent-shell pattern the left `Sidebar`
+and `CommandPalette` already use.
 
 - Data: `listAllAgents()` (`GET /api/agents`, 3s poll) for the session list,
   plus a plain `listProjects()` fetch (no poll) to label each session with the
@@ -112,17 +113,29 @@ persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
   `startedAt`), so DONE is ordered by `startedAt` desc as the closest
   available proxy rather than a true completion time. An empty bucket renders
   no header at all (not an empty section).
-- Layout: selecting a session (`selectedId`) is a takeover, not a split view —
-  the attached terminal panel (`AgentTerminal`, the same component the
-  per-project Agents tab uses) fills the **whole** `.agent-sidebar-body`, and
-  the list is dropped from flow (`display: none` via the `session-open`
-  modifier class on `.agent-sidebar-body`) so the panel reclaims its layout
-  space. The list stays mounted (not conditionally rendered), just out of
-  flow. The panel has a **close** button (`agent-sidebar-panel`), which
-  unmounts `AgentTerminal`, detaches (the background session itself keeps
-  running, unaffected — same contract as the per-project tab's detach), and
-  is the only way back to the list — switching to a different session means
-  close, then reselect, since only one session's panel is shown at a time.
+- Layout: clicking a session toggles it into `openIds` (an ordered array, not
+  a single `selectedId`) — any number of sessions can be attached at once,
+  each its own **pane** (`Pane` in `AgentSidebar.tsx`, wrapping the same
+  `AgentTerminal` the per-project Agents tab uses) stacked below the
+  (always-visible) session list in `.agent-sidebar-panes`. Panes and their
+  dividers are flat flex siblings, not nested per-pane wrappers — a pane's
+  `flex-grow` (its share of the stack, in `ratios`) only competes correctly
+  against its true siblings that way. A pane's **close** button unmounts its
+  `AgentTerminal` and detaches (the background session itself keeps running,
+  unaffected — same contract as the per-project tab's detach) without
+  touching any other open pane.
+  - **Resizable**: a divider between two adjacent panes (`.agent-sidebar-pane-divider`)
+    is drag-resizable — hand-rolled `mousedown`/`document`-level
+    `mousemove`/`mouseup`, the same pattern as the sidebar's own width handle
+    below, converting a pixel delta into a ratio delta relative to the two
+    panes' combined `flex-grow` so the same drag distance feels consistent
+    regardless of pane count or current split. Floored at `MIN_PANE_PX` so a
+    drag can't collapse a pane to zero.
+  - **Rearrangeable**: each pane's header has a drag grip (`⠿`,
+    `.agent-sidebar-pane-grip`) wired to `@dnd-kit/sortable`
+    (`useSortable`/`SortableContext`/`verticalListSortingStrategy`) — the same
+    library and pattern `KanbanBoard.tsx` uses for column drag-and-drop.
+    Dragging a grip reorders `openIds` via `arrayMove`.
 - **Collapse never unmounts anything.** `collapsed` (default `true`) toggles
   a CSS class on the `<aside>`; the list and any attached terminal stay
   mounted underneath, hidden via `visibility: hidden` on the inner
@@ -138,3 +151,16 @@ persistent-shell pattern the left `Sidebar` and `CommandPalette` already use.
 - The list poll itself pauses while collapsed (`pollMs` only set when
   expanded) — nobody can see the list, and each poll costs a `claude agents`
   subprocess; reopening triggers an immediate one-off fetch.
+- **Width**: the whole rail is drag-resizable from its left-edge handle
+  (`agent-sidebar-resize-handle`), floored at `MIN_WIDTH` but with **no fixed
+  upper cap** — it can be dragged arbitrarily wide. The only ceiling is a
+  floor on `main`'s own width (`MIN_MAIN_WIDTH`), measured live off `main`'s
+  `getBoundingClientRect()` on every drag move (so it tracks the left nav
+  sidebar's actual current width, collapsed or expanded, rather than assuming
+  one) — past that point `main`'s content (e.g. the CC Dashboard's cards)
+  doesn't overflow the page so much as wrap into illegible slivers, which is
+  the thing being floored against, not an arbitrary product limit like the
+  sidebar's own old 720px cap. A separate **maximize** toggle
+  (`agent-sidebar-maximize`) grows the panel to fill the whole main content
+  area instead (`main` display:none via `:has()`), matching the storyboard
+  canvas's own takeover-view expand toggle; `Escape` restores.

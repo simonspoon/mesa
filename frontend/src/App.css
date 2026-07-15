@@ -2114,18 +2114,6 @@ body.agent-sidebar-resizing {
   overflow-y: auto;
 }
 
-/* A selected session takes over the whole body: the list is dropped from
-   flow via `display: none` (not `visibility`, unlike the collapse case)
-   so the panel below reclaims its space — the point is layout, not keeping
-   anything alive underneath (no attached terminal lives in the list). */
-.agent-sidebar-body.session-open .agent-sidebar-list {
-  display: none;
-}
-
-.agent-sidebar-body.session-open .agent-sidebar-panel {
-  margin-top: 0;
-}
-
 .agent-sidebar-head {
   display: flex;
   align-items: center;
@@ -2170,15 +2158,64 @@ body.agent-sidebar-resizing {
   width: 1em;
 }
 
-.agent-sidebar-panel {
+/* Stack of open agent panes below the session list. Panes and dividers are
+   flat flex siblings (not nested per-pane wrappers) so each pane's
+   `flex-grow: <ratio>` (set inline per pane, see AgentSidebar.tsx) competes
+   against every other pane's ratio directly, not just its own subtree. */
+.agent-sidebar-panes {
   flex: 1;
   min-height: 0;
   margin-top: 0.75rem;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+}
+
+.agent-sidebar-pane {
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border-bright);
   background: var(--bg);
   box-shadow: 0 0 12px rgba(0, 229, 255, 0.1);
+}
+
+.agent-sidebar-pane.dragging {
+  opacity: 0.5;
+}
+
+.agent-sidebar-pane-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-sidebar-pane-grip {
+  cursor: grab;
+  color: var(--muted);
+  padding: 0 0.25rem;
+}
+
+.agent-sidebar-pane-grip:active {
+  cursor: grabbing;
+}
+
+/* Horizontal divider between two stacked panes — drag to resize their
+   relative heights. Same straddle-the-border trick as the sidebar's own
+   width handle, just rotated 90°. */
+.agent-sidebar-pane-divider {
+  flex: none;
+  height: 6px;
+  margin: -3px 0;
+  cursor: row-resize;
+  z-index: 1;
+}
+
+.agent-sidebar-pane-divider:hover {
+  background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
 }
 
 /* ---- Git tab: changed-file list (left) + diff pane (right) ---- */

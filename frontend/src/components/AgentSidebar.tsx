@@ -7,7 +7,13 @@ import {
   useSensors,
   type DragEndEvent,
 } from '@dnd-kit/core'
-import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects } from '../api'
 import { projectForCwd } from '../agentProject'
@@ -27,6 +33,236 @@ const MIN_MAIN_WIDTH = 320
 
 const MIN_PANE_PX = 80 // floor on a pane's own height during divider drag
 const DEFAULT_RATIO = 1
+
+// --- Split tree -------------------------------------------------------
+//
+// Replaces the old flat `openIds: string[]` + `ratios: Record<string,
+// number>` pair. A single tree, rooted at a `SplitNode`, holds every open
+// pane plus how the panes sharing a container split their flex space.
+// Mixed row/column nesting is what stories 372/373 build on top of this;
+// today only the degenerate single-column tree (today's flat stack) is
+// ever produced, since nothing yet creates a nested split.
+type LeafNode = { kind: 'leaf'; agentId: string }
+
+type SplitNode = {
+  kind: 'split'
+  // Stable id for nested-split React keys — a leaf already has a natural
+  // key (its own agentId); a split has none, so mint one at creation and
+  // carry it through every rebuild/canonicalize instead of regenerating it
+  // on render (which would break React's reconciliation on every toggle).
+  id: string
+  orientation: 'row' | 'column' // row = side-by-side, column = stacked
+  children: SplitChild[]
+}
+
+type SplitChild = {
+  ratio: number // this slot's flex-grow share within its parent split
+  node: PaneNode
+}
+
+type PaneNode = LeafNode | SplitNode
+
+function emptyRoot(): SplitNode {
+  return { kind: 'split', id: crypto.randomUUID(), orientation: 'column', children: [] }
+}
+
+/**
+ * Collapses a tree bottom-up until none of its 3 rules apply anywhere:
+ *  (a) drop an empty split child entirely,
+ *  (b) inline a singleton split child (its one grandchild takes over the
+ *      wrapper's own ratio slot),
+ *  (c) splice a same-orientation split child's children directly into this
+ *      level, rescaled to fit inside the child's ratio budget — flex-grow
+ *      only competes among true siblings, so a same-orientation wrapper is
+ *      pure nesting with no visual effect.
+ * Rule (c) is what makes toggling a divider and toggling it back a true
+ * round trip instead of an ever-growing nest. Called by `replaceAtPath` on
+ * every mutation, so callers never have to remember to call it themselves.
+ */
+function canonicalize(node: PaneNode): PaneNode {
+  if (node.kind === 'leaf') return node
+  let children: SplitChild[] = node.children.map((c) => ({ ratio: c.ratio, node: canonicalize(c.node) }))
+  let changed = true
+  while (changed) {
+    changed = false
+    const next: SplitChild[] = []
+    for (const c of children) {
+      if (c.node.kind === 'split' && c.node.children.length === 0) {
+        changed = true
+        continue
+      }
+      if (c.node.kind === 'split' && c.node.children.length === 1) {
+        next.push({ ratio: c.ratio, node: c.node.children[0].node })
+        changed = true
+        continue
+      }
+      if (c.node.kind === 'split' && c.node.orientation === node.orientation) {
+        const sum = c.node.children.reduce((s, cc) => s + cc.ratio, 0) || 1
+        for (const cc of c.node.children) next.push({ ratio: (cc.ratio / sum) * c.ratio, node: cc.node })
+        changed = true
+        continue
+      }
+      next.push(c)
+    }
+    children = next
+  }
+  return { kind: 'split', id: node.id, orientation: node.orientation, children }
+}
+
+/** `[]` is root itself; `[2]` is `root.children[2].node`; `[2, 0]` is that node's own `children[0].node`, etc. */
+function getNodeAtPath(root: SplitNode, path: number[]): PaneNode {
+  let node: PaneNode = root
+  for (const i of path) {
+    if (node.kind !== 'split') throw new Error('getNodeAtPath: path runs through a leaf')
+    node = node.children[i].node
+  }
+  return node
+}
+
+/**
+ * Rebuilds only the spine from `root` down to the split node at `path`,
+ * applying `fn` there, and canonicalizes the whole result before returning
+ * — the single choke point every tree mutation goes through.
+ */
+function replaceAtPath(root: SplitNode, path: number[], fn: (n: SplitNode) => SplitNode): SplitNode {
+  function rebuild(node: SplitNode, rest: number[]): SplitNode {
+    if (rest.length === 0) return fn(node)
+    const [i, ...tail] = rest
+    const childNode = node.children[i].node
+    if (childNode.kind !== 'split') throw new Error('replaceAtPath: path runs through a leaf')
+    const children = node.children.map((c, idx) =>
+      idx === i ? { ratio: c.ratio, node: rebuild(childNode, tail) } : c,
+    )
+    return { ...node, children }
+  }
+  return canonicalize(rebuild(root, path)) as SplitNode
+}
+
+function findPathToLeaf(root: SplitNode, agentId: string): number[] | null {
+  for (let i = 0; i < root.children.length; i++) {
+    const child = root.children[i].node
+    if (child.kind === 'leaf') {
+      if (child.agentId === agentId) return [i]
+    } else {
+      const sub = findPathToLeaf(child, agentId)
+      if (sub) return [i, ...sub]
+    }
+  }
+  return null
+}
+
+function collectLeafIds(node: PaneNode): string[] {
+  if (node.kind === 'leaf') return [node.agentId]
+  return node.children.flatMap((c) => collectLeafIds(c.node))
+}
+
+function childKey(node: PaneNode): string {
+  return node.kind === 'leaf' ? node.agentId : node.id
+}
+
+// Always appended to root's own children, regardless of how deep/mixed the
+// tree is elsewhere — the spec's stated default insertion point.
+function insertLeaf(root: SplitNode, agentId: string): SplitNode {
+  return replaceAtPath(root, [], (n) => ({
+    ...n,
+    children: [...n.children, { ratio: DEFAULT_RATIO, node: { kind: 'leaf', agentId } }],
+  }))
+}
+
+function removeLeaf(root: SplitNode, agentId: string): SplitNode {
+  const path = findPathToLeaf(root, agentId)
+  if (!path) return root
+  const parentPath = path.slice(0, -1)
+  const i = path[path.length - 1]
+  return replaceAtPath(root, parentPath, (n) => ({
+    ...n,
+    children: n.children.filter((_, idx) => idx !== i),
+  }))
+}
+
+/**
+ * Toggles the orientation of the divider between `children[i]`/`children[i+1]`
+ * of the split node at `path`: extracts that pair, wraps it in a NEW split
+ * node with the OPPOSITE orientation (ratio = the pair's combined ratio), and
+ * splices that single node back into the same slot. The familiar "flip a
+ * 2-child split in place" case is not a separate code path — it's what
+ * `canonicalize`'s singleton-inline rule (via `replaceAtPath`) collapses this
+ * same general operation down to automatically when `n.children.length === 2`.
+ */
+function toggleDivider(root: SplitNode, path: number[], i: number): SplitNode {
+  return replaceAtPath(root, path, (n) => {
+    const a = n.children[i]
+    const b = n.children[i + 1]
+    const wrapper: SplitNode = {
+      kind: 'split',
+      id: crypto.randomUUID(),
+      orientation: n.orientation === 'row' ? 'column' : 'row',
+      children: [a, b],
+    }
+    const children = [
+      ...n.children.slice(0, i),
+      { ratio: a.ratio + b.ratio, node: wrapper },
+      ...n.children.slice(i + 2),
+    ]
+    return { ...n, children }
+  })
+}
+
+/**
+ * Moves the leaf at `fromPath` out of its current split and inserts it at
+ * `toIndex` in the DIFFERENT split at `toPath`, then canonicalizes once.
+ * The moved leaf's own ratio is dropped — the destination slot always gets
+ * `DEFAULT_RATIO`, matching how a reopened pane gets no special ratio
+ * treatment (arch.md §3).
+ *
+ * Deliberately a single top-down rebuild over the ORIGINAL tree's indices,
+ * not two sequential `replaceAtPath` calls (each of which canonicalizes).
+ * Canonicalizing right after the removal alone could prune/inline the
+ * source's now-empty-or-singleton parent split, shifting a LATER sibling's
+ * index — which would silently invalidate a `toPath`/`toIndex` computed
+ * against the pre-removal tree if that sibling happens to sit on (or past)
+ * the destination's branch. Applying both the removal and the insertion in
+ * one pass, each still keyed off the untouched original indices, then
+ * canonicalizing exactly once at the end avoids that class of bug entirely.
+ */
+function moveLeaf(root: SplitNode, fromPath: number[], toPath: number[], toIndex: number): SplitNode {
+  const leaf = getNodeAtPath(root, fromPath)
+  if (leaf.kind !== 'leaf') return root
+  const fromParentPath = fromPath.slice(0, -1)
+  const fromIndex = fromPath[fromPath.length - 1]
+
+  function rebuild(node: SplitNode, path: number[]): SplitNode {
+    const atFromParent =
+      path.length === fromParentPath.length && path.every((v, k) => v === fromParentPath[k])
+    const atToParent = path.length === toPath.length && path.every((v, k) => v === toPath[k])
+
+    let children = node.children.map((c, i) => {
+      const onFromBranch = fromParentPath.length > path.length && fromParentPath[path.length] === i
+      const onToBranch = toPath.length > path.length && toPath[path.length] === i
+      if ((onFromBranch || onToBranch) && c.node.kind === 'split') {
+        return { ratio: c.ratio, node: rebuild(c.node, [...path, i]) }
+      }
+      return c
+    })
+
+    if (atFromParent) children = children.filter((_, idx) => idx !== fromIndex)
+    if (atToParent) {
+      children = [...children]
+      children.splice(toIndex, 0, { ratio: DEFAULT_RATIO, node: leaf })
+    }
+    return { ...node, children }
+  }
+
+  return canonicalize(rebuild(root, [])) as SplitNode
+}
+
+// One function every hardcoded `e.clientY`/`e.clientX` read goes through:
+// a row split's divider drags along X, a column split's along Y. Typed
+// structurally (not `MouseEvent`) so it accepts both a React synthetic
+// mousedown event and a native `document`-level mousemove event.
+function axisPos(e: { clientX: number; clientY: number }, orientation: 'row' | 'column'): number {
+  return orientation === 'row' ? e.clientX : e.clientY
+}
 
 function agentLabel(a: AgentSession): string {
   return a.name ?? a.id ?? a.sessionId.slice(0, 8)
@@ -81,6 +317,11 @@ function Pane({
     transition,
     flexGrow: ratio,
     flexBasis: 0,
+    // Whichever axis flexbox distributes (main axis) is the one that needs
+    // flooring to 0, and that axis flips with the parent split's
+    // orientation (row vs column) — zeroing both defensively is cheaper
+    // than branching on orientation and has no downside.
+    minWidth: 0,
     minHeight: 0,
   }
   return (
@@ -105,6 +346,128 @@ function Pane({
 }
 
 /**
+ * Recursively renders one split node's own direct children as a flex
+ * container (row or column per `node.orientation`) — nesting happens
+ * *across* `SplitNodeView` instances (a nested split renders inside a
+ * ratio-bearing wrapper div that is itself one flex item of the parent),
+ * never within one instance's children, because flex-grow ratios only
+ * compete among true flex siblings.
+ *
+ * Declared at module scope (not inside `AgentSidebar`) deliberately: an
+ * open pane's `AgentTerminal` owns a live WebSocket that must survive
+ * every re-render (poll tick, resize drag, collapse/expand) with no
+ * reconnect. A component nested inside `AgentSidebar`'s body would get a
+ * new identity — and remount every `AgentTerminal` beneath it — on every
+ * one of those re-renders.
+ */
+function SplitNodeView({
+  node,
+  path,
+  agents,
+  onClose,
+  onDividerMouseDown,
+  onDividerToggle,
+}: {
+  node: SplitNode
+  path: number[]
+  agents: AgentSession[]
+  onClose: (agentId: string) => void
+  onDividerMouseDown: (
+    path: number[],
+    i: number,
+    orientation: 'row' | 'column',
+    startPos: number,
+    container: HTMLDivElement,
+  ) => void
+  onDividerToggle: (path: number[], i: number) => void
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const leafIds = node.children
+    .filter((c) => c.node.kind === 'leaf')
+    .map((c) => (c.node as LeafNode).agentId)
+  const strategy = node.orientation === 'row' ? horizontalListSortingStrategy : verticalListSortingStrategy
+
+  return (
+    <SortableContext items={leafIds} strategy={strategy}>
+      <div ref={containerRef} className={`agent-sidebar-panes agent-sidebar-panes-${node.orientation}`}>
+        {node.children.map((child, i) => (
+          <Fragment key={childKey(child.node)}>
+            {child.node.kind === 'leaf' ? (
+              <Pane
+                agentId={child.node.agentId}
+                label={(() => {
+                  // Reassigned to a local so the arrow functions below
+                  // (separate closures) keep the 'leaf' narrowing — TS
+                  // doesn't carry a discriminant check across a closure
+                  // boundary on a value read from the outer scope.
+                  const leaf = child.node as LeafNode
+                  const session = agents.find((a) => a.id === leaf.agentId)
+                  return session ? agentLabel(session) : leaf.agentId
+                })()}
+                ratio={child.ratio}
+                onClose={() => onClose((child.node as LeafNode).agentId)}
+              />
+            ) : (
+              <div
+                className="agent-sidebar-split-wrapper"
+                style={{ display: 'flex', flexGrow: child.ratio, flexBasis: 0, minWidth: 0, minHeight: 0 }}
+              >
+                <SplitNodeView
+                  node={child.node}
+                  path={[...path, i]}
+                  agents={agents}
+                  onClose={onClose}
+                  onDividerMouseDown={onDividerMouseDown}
+                  onDividerToggle={onDividerToggle}
+                />
+              </div>
+            )}
+            {i < node.children.length - 1 && (
+              <div
+                className={`agent-sidebar-pane-divider agent-sidebar-pane-divider-${node.orientation}`}
+                onMouseDown={(e) => {
+                  // Belt-and-suspenders with the toggle button's own
+                  // stopPropagation: mousedown fires before click, so if the
+                  // toggle button is the target, don't also start a resize
+                  // drag on the same gesture.
+                  if ((e.target as HTMLElement).closest('.agent-sidebar-divider-toggle')) return
+                  e.preventDefault()
+                  const container = containerRef.current
+                  if (!container) return
+                  onDividerMouseDown(path, i, node.orientation, axisPos(e, node.orientation), container)
+                }}
+              >
+                <button
+                  type="button"
+                  className="agent-sidebar-divider-toggle"
+                  aria-label={
+                    node.orientation === 'row' ? 'Split panes stacked' : 'Split panes side-by-side'
+                  }
+                  title={
+                    node.orientation === 'row' ? 'Split panes stacked' : 'Split panes side-by-side'
+                  }
+                  onClick={(e) => {
+                    // Stop this click from also reaching anything that
+                    // treats the divider as a resize-drag surface — the
+                    // toggle and the resize-drag share the same element by
+                    // design (arch doc §6), so this is the one thing that
+                    // keeps them from double-firing on the same gesture.
+                    e.stopPropagation()
+                    onDividerToggle(path, i)
+                  }}
+                >
+                  {node.orientation === 'row' ? '⬍' : '⬌'}
+                </button>
+              </div>
+            )}
+          </Fragment>
+        ))}
+      </div>
+    </SortableContext>
+  )
+}
+
+/**
  * Global, persistent right-hand sidebar: every live Claude Code session
  * across every project, with room to attach one pane per selected session.
  * Rendered once in `App.tsx`, outside the router — it never unmounts on
@@ -116,14 +479,14 @@ function Pane({
  */
 export function AgentSidebar() {
   const [collapsed, setCollapsed] = useState(true)
-  // Order = pane order, top to bottom. A session toggles in/out of this list
-  // by clicking it in the session list below; dragging a pane's grip
-  // reorders it (dnd-kit sortable).
-  const [openIds, setOpenIds] = useState<string[]>([])
-  // Each open pane's share of the stack's flex space (flex-grow). Missing
-  // entries default to DEFAULT_RATIO — opening a new pane needs no
-  // renormalization since flexbox distributes by ratio automatically.
-  const [ratios, setRatios] = useState<Record<string, number>>({})
+  // Split tree holding every open pane + how each split's children share its
+  // flex space. Root is always a SplitNode, never a bare leaf/null; with no
+  // toggle ever used it stays the degenerate single-column tree — one flex
+  // container, column direction, exactly today's flat stack. A session
+  // toggles a leaf in/out of the tree by clicking it in the session list
+  // below; dragging a pane's grip reorders it among its split siblings
+  // (dnd-kit sortable).
+  const [root, setRoot] = useState<SplitNode>(emptyRoot)
   // DONE starts collapsed (stale sessions aren't the thing you want to see
   // first); BLOCKED/ACTIVE start open. `state` from the API is a live status
   // (working/blocked/done/…), not the `collapsed` UI concept below.
@@ -140,17 +503,22 @@ export function AgentSidebar() {
   // has an effect while the panel isn't collapsed.
   const [maximized, setMaximized] = useState(false)
 
-  const panesRef = useRef<HTMLDivElement>(null)
-  // Set while dragging a divider between two adjacent panes; `i` is the
-  // index of the upper pane (the divider sits between openIds[i] and
-  // openIds[i+1]). Captured once at mousedown so the drag reads as a delta
-  // from a stable baseline rather than accumulating rounding error.
+  // Set while dragging a divider between two adjacent children of the split
+  // node at `path`; `i` is the index of the upper/left one (the divider sits
+  // between `children[i]` and `children[i+1]`). Captured once at mousedown
+  // so the drag reads as a delta from a stable baseline rather than
+  // accumulating rounding error. `startPos`/`containerSize` are axis-generic
+  // (clientX/width for a row split, clientY/height for a column split) —
+  // `axisPos` and `startDivider` below read/measure whichever axis
+  // `orientation` says to, at any depth in the tree.
   const [paneDrag, setPaneDrag] = useState<null | {
+    path: number[]
     i: number
-    startY: number
+    orientation: 'row' | 'column'
+    startPos: number
     startA: number
     startB: number
-    containerH: number
+    containerSize: number
   }>(null)
 
   const sensors = useSensors(
@@ -195,19 +563,29 @@ export function AgentSidebar() {
   }, [resizing])
 
   // Divider drag: converts a pixel delta into a ratio delta relative to the
-  // two adjacent panes' combined ratio, so the same drag distance feels
-  // consistent regardless of how many panes are open or their current split.
+  // two adjacent children's combined ratio, so the same drag distance feels
+  // consistent regardless of how many siblings that split has or their
+  // current split. Scoped to the split node at `paneDrag.path` — resizing
+  // one split's divider never touches any other split's ratios.
   useEffect(() => {
     if (!paneDrag) return
     const onMove = (e: MouseEvent) => {
-      const idA = openIds[paneDrag.i]
-      const idB = openIds[paneDrag.i + 1]
-      if (!idA || !idB || paneDrag.containerH <= 0) return
+      if (paneDrag.containerSize <= 0) return
+      const pos = axisPos(e, paneDrag.orientation)
       const sum = paneDrag.startA + paneDrag.startB
-      const deltaRatio = ((e.clientY - paneDrag.startY) / paneDrag.containerH) * sum
-      const minRatio = (MIN_PANE_PX / paneDrag.containerH) * sum
+      const deltaRatio = ((pos - paneDrag.startPos) / paneDrag.containerSize) * sum
+      const minRatio = (MIN_PANE_PX / paneDrag.containerSize) * sum
       const nextA = Math.min(sum - minRatio, Math.max(minRatio, paneDrag.startA + deltaRatio))
-      setRatios((r) => ({ ...r, [idA]: nextA, [idB]: sum - nextA }))
+      setRoot((r) =>
+        replaceAtPath(r, paneDrag.path, (n) => ({
+          ...n,
+          children: n.children.map((c, idx) => {
+            if (idx === paneDrag.i) return { ...c, ratio: nextA }
+            if (idx === paneDrag.i + 1) return { ...c, ratio: sum - nextA }
+            return c
+          }),
+        })),
+      )
     }
     const onUp = () => setPaneDrag(null)
     document.addEventListener('mousemove', onMove)
@@ -218,9 +596,6 @@ export function AgentSidebar() {
       document.removeEventListener('mouseup', onUp)
       document.body.classList.remove('agent-sidebar-resizing')
     }
-    // openIds intentionally omitted: paneDrag.i indexes the order as it was
-    // at drag start, and a reorder mid-drag is not a case worth handling.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paneDrag])
 
   // Only poll while expanded — collapsed, nobody can see the list, and each
@@ -243,31 +618,73 @@ export function AgentSidebar() {
   }, [])
 
   const agents = [...(sessions ?? [])].sort((a, b) => b.startedAt - a.startedAt)
+  const openIds = collectLeafIds(root)
 
   function togglePane(id: string) {
-    setOpenIds((ids) =>
-      ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id],
-    )
+    setRoot((r) => (findPathToLeaf(r, id) ? removeLeaf(r, id) : insertLeaf(r, id)))
   }
 
   function closePane(id: string) {
-    setOpenIds((ids) => ids.filter((x) => x !== id))
-    setRatios((r) => {
-      if (!(id in r)) return r
-      const next = { ...r }
-      delete next[id]
-      return next
-    })
+    setRoot((r) => removeLeaf(r, id))
   }
 
+  // If the dragged pane and its drop target share the same parent split,
+  // it's a plain reorder among siblings. Otherwise it's a cross-split move
+  // (story 375): the drop target is another leaf's position within a
+  // DIFFERENT split — reusing 374's existing per-leaf sortable drop targets
+  // (arch.md §7's option (a): simplest shape, no new `useDroppable`
+  // container surface needed) — so `over` is always another leaf's id, in
+  // whichever split it lives in, and `moveLeaf` slots the dragged leaf in at
+  // that leaf's own index.
   function handlePaneDragEnd(event: DragEndEvent) {
     const { active, over } = event
     if (!over || active.id === over.id) return
-    setOpenIds((ids) => {
-      const from = ids.indexOf(String(active.id))
-      const to = ids.indexOf(String(over.id))
-      if (from === -1 || to === -1) return ids
-      return arrayMove(ids, from, to)
+    setRoot((r) => {
+      const fromPath = findPathToLeaf(r, String(active.id))
+      const toPath = findPathToLeaf(r, String(over.id))
+      if (!fromPath || !toPath) return r
+      const fromParent = fromPath.slice(0, -1)
+      const toParent = toPath.slice(0, -1)
+      const samePath =
+        fromParent.length === toParent.length && fromParent.every((v, k) => v === toParent[k])
+      const from = fromPath[fromPath.length - 1]
+      const to = toPath[toPath.length - 1]
+      if (samePath) {
+        return replaceAtPath(r, fromParent, (n) => ({ ...n, children: arrayMove(n.children, from, to) }))
+      }
+      return moveLeaf(r, fromPath, toParent, to)
+    })
+  }
+
+  function toggleDividerAt(path: number[], i: number) {
+    setRoot((r) => toggleDivider(r, path, i))
+  }
+
+  // Divider mousedown → resize-start. `containerSize` is measured off THAT
+  // divider's own split node's container — not a single sidebar-wide ref —
+  // because a nested split's drag math must be relative to its own box.
+  // Width for a row split (dragging moves along X), height for a column
+  // split (dragging moves along Y); MIN_PANE_PX floors against this same
+  // per-node size in the drag effect above, so the floor is naturally
+  // scoped to just this split's own two adjacent children at any depth.
+  function startDivider(
+    path: number[],
+    i: number,
+    orientation: 'row' | 'column',
+    startPos: number,
+    container: HTMLDivElement,
+  ) {
+    const node = getNodeAtPath(root, path)
+    if (node.kind !== 'split') return
+    const rect = container.getBoundingClientRect()
+    setPaneDrag({
+      path,
+      i,
+      orientation,
+      startPos,
+      startA: node.children[i]?.ratio ?? DEFAULT_RATIO,
+      startB: node.children[i + 1]?.ratio ?? DEFAULT_RATIO,
+      containerSize: orientation === 'row' ? rect.width : rect.height,
     })
   }
 
@@ -394,46 +811,16 @@ export function AgentSidebar() {
           )}
         </div>
 
-        {openIds.length > 0 && (
+        {root.children.length > 0 && (
           <DndContext sensors={sensors} onDragEnd={handlePaneDragEnd}>
-            <SortableContext items={openIds} strategy={verticalListSortingStrategy}>
-              <div className="agent-sidebar-panes" ref={panesRef}>
-                {openIds.map((id, i) => {
-                  const session = agents.find((a) => a.id === id)
-                  return (
-                    // Pane and divider are flat siblings of every other pane
-                    // — flex-grow ratios only compete against true siblings,
-                    // so a wrapping element per pane would isolate each
-                    // pane's growth to its own subtree instead of the stack.
-                    <Fragment key={id}>
-                      <Pane
-                        agentId={id}
-                        label={session ? agentLabel(session) : id}
-                        ratio={ratios[id] ?? DEFAULT_RATIO}
-                        onClose={() => closePane(id)}
-                      />
-                      {i < openIds.length - 1 && (
-                        <div
-                          className="agent-sidebar-pane-divider"
-                          onMouseDown={(e) => {
-                            e.preventDefault()
-                            const container = panesRef.current
-                            if (!container) return
-                            setPaneDrag({
-                              i,
-                              startY: e.clientY,
-                              startA: ratios[id] ?? DEFAULT_RATIO,
-                              startB: ratios[openIds[i + 1]] ?? DEFAULT_RATIO,
-                              containerH: container.getBoundingClientRect().height,
-                            })
-                          }}
-                        />
-                      )}
-                    </Fragment>
-                  )
-                })}
-              </div>
-            </SortableContext>
+            <SplitNodeView
+              node={root}
+              path={[]}
+              agents={agents}
+              onClose={closePane}
+              onDividerMouseDown={startDivider}
+              onDividerToggle={toggleDividerAt}
+            />
           </DndContext>
         )}
       </div>

@@ -2158,17 +2158,29 @@ body.agent-sidebar-resizing {
   width: 1em;
 }
 
-/* Stack of open agent panes below the session list. Panes and dividers are
-   flat flex siblings (not nested per-pane wrappers) so each pane's
-   `flex-grow: <ratio>` (set inline per pane, see AgentSidebar.tsx) competes
-   against every other pane's ratio directly, not just its own subtree. */
+/* One split node's own direct children, rendered as a flex container —
+   flat flex siblings within this one `SplitNodeView` instance (not nested
+   per-child wrappers for leaves) so each pane's `flex-grow: <ratio>` (set
+   inline per pane/wrapper, see AgentSidebar.tsx) competes against its true
+   siblings directly. Nesting happens *across* instances: a nested split
+   renders inside its own ratio-bearing wrapper div, itself one flex item
+   here. Orientation (row = side-by-side, column = stacked) is carried by
+   the modifier class alongside this one, not a variant of it. */
 .agent-sidebar-panes {
   flex: 1;
   min-height: 0;
   margin-top: 0.75rem;
+  overflow: hidden;
+}
+
+.agent-sidebar-panes-column {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+}
+
+.agent-sidebar-panes-row {
+  display: flex;
+  flex-direction: row;
 }
 
 .agent-sidebar-pane {
@@ -2203,19 +2215,63 @@ body.agent-sidebar-resizing {
   cursor: grabbing;
 }
 
-/* Horizontal divider between two stacked panes — drag to resize their
-   relative heights. Same straddle-the-border trick as the sidebar's own
-   width handle, just rotated 90°. */
+/* Divider between two adjacent children of one split node — drag to resize
+   their relative share. Same straddle-the-border trick as the sidebar's
+   own width handle. Shape/cursor is orientation-specific (below): a column
+   split's divider is a horizontal strip you drag vertically (row-resize);
+   a row split's is a vertical strip dragged horizontally (col-resize). */
 .agent-sidebar-pane-divider {
   flex: none;
-  height: 6px;
-  margin: -3px 0;
-  cursor: row-resize;
   z-index: 1;
+  position: relative;
 }
 
 .agent-sidebar-pane-divider:hover {
   background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
+}
+
+.agent-sidebar-pane-divider-column {
+  height: 6px;
+  margin: -3px 0;
+  cursor: row-resize;
+}
+
+.agent-sidebar-pane-divider-row {
+  width: 6px;
+  margin: 0 -3px;
+  cursor: col-resize;
+}
+
+/* Toggle affordance centered on the divider strip: click flips that
+   divider's owning split's orientation (`toggleDivider`). Its icon shows
+   the orientation the click WOULD PRODUCE, not the current one. Shares the
+   divider element with the resize-drag handler by design (arch doc §6) —
+   `stopPropagation` on click + a mousedown target check keep the two from
+   double-firing on the same gesture. */
+.agent-sidebar-divider-toggle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 0.65rem;
+  line-height: 1;
+  border: 1px solid var(--border-bright);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  z-index: 2;
+}
+
+.agent-sidebar-divider-toggle:hover {
+  color: var(--cyan);
+  border-color: var(--cyan);
 }
 
 /* ---- Git tab: changed-file list (left) + diff pane (right) ---- */

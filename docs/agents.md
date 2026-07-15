@@ -92,7 +92,8 @@ and touches the mesa store only to read `local_path`. There is deliberately no
 A persistent, collapsible right-hand rail (`AgentSidebar`,
 `frontend/src/components/AgentSidebar.tsx`) shows every live session across
 every project — not scoped to one project's Agents tab — with room to attach
-several at once, as resizable/rearrangeable stacked panes. Rendered once in
+several at once, arranged as a tree of resizable/rearrangeable,
+mixed-orientation panes. Rendered once in
 `App.tsx`, as a sibling of `<main>` outside the hash router, so it is never
 remounted by navigation; the same persistent-shell pattern the left `Sidebar`
 and `CommandPalette` already use.
@@ -113,29 +114,80 @@ and `CommandPalette` already use.
   `startedAt`), so DONE is ordered by `startedAt` desc as the closest
   available proxy rather than a true completion time. An empty bucket renders
   no header at all (not an empty section).
-- Layout: clicking a session toggles it into `openIds` (an ordered array, not
-  a single `selectedId`) — any number of sessions can be attached at once,
-  each its own **pane** (`Pane` in `AgentSidebar.tsx`, wrapping the same
-  `AgentTerminal` the per-project Agents tab uses) stacked below the
-  (always-visible) session list in `.agent-sidebar-panes`. Panes and their
-  dividers are flat flex siblings, not nested per-pane wrappers — a pane's
-  `flex-grow` (its share of the stack, in `ratios`) only competes correctly
-  against its true siblings that way. A pane's **close** button unmounts its
+- Layout: panes live in a **split-tree** (`SplitNode`/`LeafNode` in
+  `AgentSidebar.tsx`), not a flat list. Each node is either a leaf (one
+  attached **pane** — `Pane`, wrapping the same `AgentTerminal` the
+  per-project Agents tab uses) or a split: an ordered list of children, each
+  carrying its own `ratio` (that slot's flex-grow share within the split)
+  and oriented `row` (side-by-side) or `column` (stacked). The root is
+  always a split node, never a bare leaf; with no orientation ever toggled
+  it stays one column of leaves — today's plain top-to-bottom stack is just
+  the tree's simplest, degenerate shape. Clicking a session toggles its pane
+  in or out of the tree (`insertLeaf`/`removeLeaf`); a new pane always
+  appends to the **root** split's own children, regardless of how deep or
+  mixed the tree has become elsewhere — there's no "insert into the
+  currently-focused split" concept. A pane's **close** button unmounts its
   `AgentTerminal` and detaches (the background session itself keeps running,
   unaffected — same contract as the per-project tab's detach) without
-  touching any other open pane.
-  - **Resizable**: a divider between two adjacent panes (`.agent-sidebar-pane-divider`)
-    is drag-resizable — hand-rolled `mousedown`/`document`-level
-    `mousemove`/`mouseup`, the same pattern as the sidebar's own width handle
-    below, converting a pixel delta into a ratio delta relative to the two
-    panes' combined `flex-grow` so the same drag distance feels consistent
-    regardless of pane count or current split. Floored at `MIN_PANE_PX` so a
-    drag can't collapse a pane to zero.
-  - **Rearrangeable**: each pane's header has a drag grip (`⠿`,
+  touching any other open pane. `SplitNodeView`, the component that
+  recursively renders one split's own direct children, is declared at module
+  scope (not nested inside `AgentSidebar`) so its identity never changes
+  across a re-render — nesting a per-split component inside `AgentSidebar`'s
+  body would remount every `AgentTerminal` beneath it on every poll tick.
+  - **Mixed orientation via a per-divider toggle**: every divider carries a
+    small button (`.agent-sidebar-divider-toggle`, centered on the strip)
+    showing the orientation clicking it would *produce* — `⬌` on a column
+    divider (splits its two adjacent panes side-by-side), `⬍` on a row
+    divider (stacks them back). Clicking it extracts that divider's two
+    adjacent children, wraps them in a new split node of the opposite
+    orientation, and splices that node back into the same slot — this is
+    the one mechanism for going from a flat stack to a mixed, arbitrarily
+    nested layout, and back. There's no global toggle, context menu, or
+    per-pane toolbar; the interaction stays scoped to the exact divider the
+    tree operation affects. The toggle button's `onClick` stops propagation
+    so the divider's own resize-drag `onMouseDown` never also fires on the
+    same gesture, and the drag handler separately ignores the button as a
+    mousedown target (belt-and-suspenders, since `mousedown` precedes
+    `click`).
+  - **Pruning via canonicalization**: every tree mutation (toggle, close,
+    reopen) is followed by canonicalizing the whole tree against three
+    rules — drop a split left with zero children, inline a split left with
+    exactly one child (its lone child takes over the wrapper's own ratio
+    slot), and merge a split into its parent when both share the same
+    orientation (the child's own children splice in directly, ratios
+    rescaled to fit the slot's budget). The merge rule is what makes
+    toggling a divider and toggling it back a true round trip — without it,
+    nesting would only grow and a second toggle would stop restoring the
+    original layout. Together the three rules guarantee a close (or a
+    toggle that leaves a split empty or singleton) never renders a dangling
+    empty or zero-size region, and reopening a previously-closed agent from
+    the session list appends a fresh pane at the root without disturbing the
+    rest of the layout.
+  - **Resizable**: a divider between two adjacent children
+    (`.agent-sidebar-pane-divider`) is drag-resizable — hand-rolled
+    `mousedown`/`document`-level `mousemove`/`mouseup`, the same pattern as
+    the sidebar's own width handle below. The drag is axis-aware per the
+    divider's own split: it reads `clientX` and resizes width for a `row`
+    divider, `clientY` and resizes height for a `column` divider, measured
+    against that split node's own container (not the whole sidebar), so a
+    divider several levels deep resizes only its own two adjacent children
+    regardless of how the rest of the tree is shaped. Floored at
+    `MIN_PANE_PX` so a drag can't collapse a pane to zero.
+  - **Rearrangeable**: each pane's header still has a drag grip (`⠿`,
     `.agent-sidebar-pane-grip`) wired to `@dnd-kit/sortable`
-    (`useSortable`/`SortableContext`/`verticalListSortingStrategy`) — the same
-    library and pattern `KanbanBoard.tsx` uses for column drag-and-drop.
-    Dragging a grip reorders `openIds` via `arrayMove`.
+    (`useSortable`/`SortableContext`) — the same library and pattern
+    `KanbanBoard.tsx` uses for column drag-and-drop, but scoped per split
+    node instead of one flat list: one `SortableContext` per `SplitNodeView`
+    instance (all nested under the sidebar's single top-level `DndContext`,
+    dnd-kit's standard multi-container pattern), listing only that split's
+    own **leaf** children — a nested split occupying a sibling slot has no
+    grip and isn't itself draggable. `strategy` follows the split's own
+    orientation: `horizontalListSortingStrategy` for `row`,
+    `verticalListSortingStrategy` for `column`. Dragging a grip reorders
+    that one split's children via `arrayMove`; dropping onto a pane that
+    lives in a *different* split is currently a no-op — reordering is
+    scoped to siblings within one split, and moving a pane across split
+    boundaries isn't wired up yet.
 - **Collapse never unmounts anything.** `collapsed` (default `true`) toggles
   a CSS class on the `<aside>`; the list and any attached terminal stay
   mounted underneath, hidden via `visibility: hidden` on the inner

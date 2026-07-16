@@ -193,11 +193,36 @@ and `CommandPalette` already use.
     own **leaf** children — a nested split occupying a sibling slot has no
     grip and isn't itself draggable. `strategy` follows the split's own
     orientation: `horizontalListSortingStrategy` for `row`,
-    `verticalListSortingStrategy` for `column`. Dragging a grip reorders
-    that one split's children via `arrayMove`; dropping onto a pane that
-    lives in a *different* split is currently a no-op — reordering is
-    scoped to siblings within one split, and moving a pane across split
-    boundaries isn't wired up yet.
+    `verticalListSortingStrategy` for `column`. `collisionDetection` is
+    `pointerWithin`, not dnd-kit's default — every pane can span the whole
+    sidebar, so resolving the drop target off the *dragged pane's own*
+    (translated) box would let a wide/tall pane's box overlap several
+    candidates the cursor isn't even over; `pointerWithin` picks whichever
+    pane the raw pointer position is actually inside.
+  - **Drop position on the target pane picks between two gestures** — a
+    center 40%×40% box vs. the outer edges, quartered into left/right/
+    top/bottom by whichever axis the pointer deviates from center more
+    (`computeDropEdge`, the standard tiling-WM/VS-Code docking read; a
+    cyan `.agent-sidebar-pane-drop-indicator` previews the live zone,
+    updated continuously via `onDragMove`):
+    - **Center → reorder/move.** Same parent split: a plain sibling
+      reorder (`arrayMove`). Different parent split: a cross-split move
+      (`moveLeaf`) — the dragged leaf slots into the target's own index in
+      *its* split, taking on `DEFAULT_RATIO` there.
+    - **Edge → split.** `splitLeafAt` wraps the target and the dragged leaf
+      in a brand-new split node — row for a left/right edge, column for
+      top/bottom, ordered so left/top puts the dragged leaf first — and
+      replaces the target's own slot with that wrapper (which inherits the
+      target's ratio there; target and the newly split-in leaf share
+      `DEFAULT_RATIO` between themselves). If the new wrapper's
+      orientation matches its own parent split's, `canonicalize` splices
+      its two children straight back out flat on the next render — which
+      is the intended outcome, not a bug to special-case around: dropping
+      on the left/right edge of a pane that's already in a row split just
+      means "insert as its row-sibling here."
+    Either gesture reuses the same per-leaf sortable drop targets — `over`
+    is always another leaf's id, in whichever split it lives in, no
+    separate `useDroppable` surface for the edge case.
 - **Collapse never unmounts anything.** `collapsed` (default `true`) toggles
   a CSS class on the `<aside>`; the list and any attached terminal stay
   mounted underneath, hidden via `visibility: hidden` on the inner

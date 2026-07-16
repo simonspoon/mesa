@@ -3,9 +3,13 @@ import type { CSSProperties, ReactNode } from 'react'
 import {
   DndContext,
   PointerSensor,
+  pointerWithin,
   useSensor,
   useSensors,
+  type ClientRect,
   type DragEndEvent,
+  type DragMoveEvent,
+  type DragStartEvent,
 } from '@dnd-kit/core'
 import {
   SortableContext,
@@ -290,6 +294,118 @@ function moveLeaf(root: SplitNode, fromPath: number[], toPath: number[], toIndex
   return canonicalize(rebuild(root, [])) as SplitNode
 }
 
+type DropEdge = 'left' | 'right' | 'top' | 'bottom'
+
+/**
+ * Wraps the leaf at `toPath` together with the leaf dragged from `fromPath`
+ * into a NEW split node — orientation from `edge` (row for left/right,
+ * column for top/bottom), order from `edge` (left/top puts the dragged
+ * leaf first) — replacing the target's own slot with that wrapper. This is
+ * the drag-TO-SPLIT gesture (edge zones, story 387); `moveLeaf` above is
+ * drag-to-REORDER (center zone, story 375) — the caller picks between them
+ * per drop position (`computeDropEdge`), not this function.
+ *
+ * The wrapper inherits the target's own ratio in ITS parent, so sibling
+ * sizing elsewhere is untouched; inside the wrapper the target and the
+ * newly split-in leaf share `DEFAULT_RATIO` evenly, matching how a
+ * freshly moved/reopened pane always gets an unspecial-cased ratio
+ * (`moveLeaf`'s own comment). If the wrapper's orientation happens to
+ * match its own parent's, `canonicalize` immediately splices its two
+ * children back out flat — which is exactly the right outcome, not a
+ * bug: dropping on the left/right edge of a pane that already lives in a
+ * row split just means "insert as that pane's row-sibling here," same
+ * open question `toggleDivider` already answers for the adjacent-pair
+ * case. No orientation-vs-parent special-casing is needed here because
+ * of that.
+ *
+ * Same single-pass, both-paths-keyed-to-the-ORIGINAL-tree rebuild as
+ * `moveLeaf`, for the same reason given there — but the removal and the
+ * replacement are both decided in ONE `map` over each split's original
+ * `children` (index-only, no early filtering) precisely because `fromPath`
+ * and `toPath` can share a parent here (dragging one sibling onto another
+ * within the same split, e.g. building a nested split out of two flat
+ * row/column siblings) — a case `moveLeaf` never has to handle since
+ * `handlePaneDragEnd` only calls it when the two parents differ. Filtering
+ * out `fromIndex` before locating `toIndex` would shift indices out from
+ * under `atToParent`'s lookup whenever `fromIndex < toIndex`; deciding
+ * both against the same original array read sidesteps that entirely.
+ */
+function splitLeafAt(root: SplitNode, fromPath: number[], toPath: number[], edge: DropEdge): SplitNode {
+  const leaf = getNodeAtPath(root, fromPath)
+  const target = getNodeAtPath(root, toPath)
+  if (leaf.kind !== 'leaf' || target.kind !== 'leaf' || leaf.id === target.id) return root
+  const fromParentPath = fromPath.slice(0, -1)
+  const fromIndex = fromPath[fromPath.length - 1]
+  const toParentPath = toPath.slice(0, -1)
+  const toIndex = toPath[toPath.length - 1]
+  const orientation: 'row' | 'column' = edge === 'left' || edge === 'right' ? 'row' : 'column'
+  const draggedFirst = edge === 'left' || edge === 'top'
+
+  function rebuild(node: SplitNode, path: number[]): SplitNode {
+    const atFromParent = path.length === fromParentPath.length && path.every((v, k) => v === fromParentPath[k])
+    const atToParent = path.length === toParentPath.length && path.every((v, k) => v === toParentPath[k])
+
+    const recursed = node.children.map((c, i) => {
+      const onFromBranch = fromParentPath.length > path.length && fromParentPath[path.length] === i
+      const onToBranch = toParentPath.length > path.length && toParentPath[path.length] === i
+      if ((onFromBranch || onToBranch) && c.node.kind === 'split') {
+        return { ratio: c.ratio, node: rebuild(c.node, [...path, i]) }
+      }
+      return c
+    })
+
+    const children = recursed
+      .map((c, idx) => {
+        if (atFromParent && idx === fromIndex) return null
+        if (atToParent && idx === toIndex) {
+          const wrapper: SplitNode = {
+            kind: 'split',
+            id: crypto.randomUUID(),
+            orientation,
+            children: draggedFirst
+              ? [{ ratio: DEFAULT_RATIO, node: leaf }, { ratio: DEFAULT_RATIO, node: target }]
+              : [{ ratio: DEFAULT_RATIO, node: target }, { ratio: DEFAULT_RATIO, node: leaf }],
+          }
+          return { ratio: c.ratio, node: wrapper }
+        }
+        return c
+      })
+      .filter((c): c is SplitChild => c !== null)
+
+    return { ...node, children }
+  }
+
+  return canonicalize(rebuild(root, [])) as SplitNode
+}
+
+// Center 40%x40% of the target pane (|dx|,|dy| both under this) is the
+// "reorder" zone — `moveLeaf`/`arrayMove`, no new split, no indicator. The
+// outer 60% is quartered into left/right/top/bottom triangles by whichever
+// axis deviates from center more, the standard tiling-WM/VS-Code docking
+// read on a drop point (arch note for story 387).
+//
+// Takes the raw POINTER position, not the dragged pane's own (translated)
+// bounding box — deliberately: every pane here spans the sidebar's full
+// width/height at some point (there's no independent left/right column
+// until a row split already exists), so a pane's own box can be far wider
+// or taller than the target it's hovering. Zoning off the dragged box's
+// CENTER would tie the detected edge to that box's size and grab-point
+// offset instead of to where the user is actually pointing — dragging a
+// full-width pane by a grip near its own left edge could never reach a
+// target's "left" zone at all, since the box's center would have to
+// travel the same huge distance the pointer does, not just the pointer's
+// own delta. The pointer itself has no such size-dependence, so it's the
+// one thing that reads the same regardless of what's being dragged.
+const CENTER_ZONE_HALF = 0.2
+
+function computeDropEdge(pointer: { x: number; y: number }, overRect: ClientRect): DropEdge | null {
+  if (overRect.width <= 0 || overRect.height <= 0) return null
+  const dx = (pointer.x - overRect.left) / overRect.width - 0.5
+  const dy = (pointer.y - overRect.top) / overRect.height - 0.5
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < CENTER_ZONE_HALF) return null
+  return Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : dy < 0 ? 'top' : 'bottom'
+}
+
 // One function every hardcoded `e.clientY`/`e.clientX` read goes through:
 // a row split's divider drags along X, a column split's along Y. Typed
 // structurally (not `MouseEvent`) so it accepts both a React synthetic
@@ -359,6 +475,7 @@ function PaneShell({
   headerExtra,
   ratio,
   onClose,
+  dropEdge,
   children,
 }: {
   dragId: string
@@ -366,6 +483,11 @@ function PaneShell({
   headerExtra?: ReactNode
   ratio: number
   onClose?: () => void
+  // Set only while a drag is hovering an edge zone of THIS pane — renders
+  // the split-preview overlay below. `null`/absent covers both "no drag in
+  // progress" and "hovering this pane's own center zone" (reorder, no new
+  // split, nothing to preview).
+  dropEdge?: DropEdge | null
   children: ReactNode
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -400,6 +522,7 @@ function PaneShell({
         {onClose && <button onClick={onClose}>close</button>}
       </div>
       {children}
+      {dropEdge && <div className={`agent-sidebar-pane-drop-indicator agent-sidebar-pane-drop-indicator-${dropEdge}`} />}
     </div>
   )
 }
@@ -410,14 +533,16 @@ function AgentPane({
   label,
   ratio,
   onClose,
+  dropEdge,
 }: {
   agentId: string
   label: string
   ratio: number
   onClose: () => void
+  dropEdge?: DropEdge | null
 }) {
   return (
-    <PaneShell dragId={agentId} label={label} ratio={ratio} onClose={onClose}>
+    <PaneShell dragId={agentId} label={label} ratio={ratio} onClose={onClose} dropEdge={dropEdge}>
       {/* key remounts terminal + socket only if agentId itself changes */}
       <AgentTerminal key={agentId} agentId={agentId} />
     </PaneShell>
@@ -441,7 +566,7 @@ type ListPaneProps = {
 /** The session list itself, as a pane (task 368) — same `PaneShell` chrome
  * as an agent pane, just not closable and with the bucketed session list as
  * its body instead of a terminal. */
-function AgentListPane({ ratio, list }: { ratio: number; list: ListPaneProps }) {
+function AgentListPane({ ratio, list, dropEdge }: { ratio: number; list: ListPaneProps; dropEdge?: DropEdge | null }) {
   const { agents, sessionsLoaded, error, projects, openIds, collapsedSections, onToggleSection, onTogglePane } =
     list
   return (
@@ -450,6 +575,7 @@ function AgentListPane({ ratio, list }: { ratio: number; list: ListPaneProps }) 
       label="Agents"
       headerExtra={agents.length > 0 ? <span className="agent-sidebar-count">{agents.length}</span> : null}
       ratio={ratio}
+      dropEdge={dropEdge}
     >
       <div className="agent-sidebar-list">
         {error && !sessionsLoaded ? (
@@ -538,6 +664,7 @@ function SplitNodeView({
   onClose,
   onDividerMouseDown,
   onDividerToggle,
+  dropZone,
 }: {
   node: SplitNode
   path: number[]
@@ -552,6 +679,11 @@ function SplitNodeView({
     container: HTMLDivElement,
   ) => void
   onDividerToggle: (path: number[], i: number) => void
+  // Which pane (if any) is currently a drag's edge-zone drop target, and
+  // which edge — threaded down so the ONE leaf it names renders the
+  // split-preview overlay (`PaneShell`'s `dropEdge`) without every other
+  // pane needing to know a drag is even happening.
+  dropZone: { id: string; edge: DropEdge } | null
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const leafIds = node.children.filter((c) => c.node.kind === 'leaf').map((c) => (c.node as LeafNode).id)
@@ -564,7 +696,11 @@ function SplitNodeView({
           <Fragment key={childKey(child.node)}>
             {child.node.kind === 'leaf' ? (
               child.node.contentKind === 'list' ? (
-                <AgentListPane ratio={child.ratio} list={listProps} />
+                <AgentListPane
+                  ratio={child.ratio}
+                  list={listProps}
+                  dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
+                />
               ) : (
                 <AgentPane
                   agentId={child.node.id}
@@ -580,6 +716,7 @@ function SplitNodeView({
                   })()}
                   ratio={child.ratio}
                   onClose={() => onClose(child.node.id)}
+                  dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
                 />
               )
             ) : (
@@ -595,6 +732,7 @@ function SplitNodeView({
                   onClose={onClose}
                   onDividerMouseDown={onDividerMouseDown}
                   onDividerToggle={onDividerToggle}
+                  dropZone={dropZone}
                 />
               </div>
             )}
@@ -716,6 +854,22 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
     startB: number
     containerSize: number
   }>(null)
+
+  // Which pane a pane-drag (dnd-kit, not the divider drag above) is
+  // currently hovering an edge zone of, and which edge — drives the
+  // split-preview overlay only; the actual split-vs-reorder decision is
+  // recomputed independently at drop time (`handlePaneDragEnd`) straight
+  // off that event's own pointer position, so this state can never go
+  // stale relative to the decision it's only previewing.
+  const [dropZone, setDropZone] = useState<null | { id: string; edge: DropEdge }>(null)
+
+  // The pointer's own viewport position at drag start (`activatorEvent`,
+  // only available there — `DragMoveEvent`/`DragEndEvent` carry `delta`
+  // relative to it but not an absolute position of their own). A ref, not
+  // state: written once per drag in `onDragStart` and only ever read
+  // inside the same drag's later move/end handlers, so it never needs to
+  // drive a render itself.
+  const dragOriginRef = useRef<{ x: number; y: number } | null>(null)
 
   const sensors = useSensors(
     // distance: 4 lets plain clicks on the grip still register as clicks,
@@ -900,21 +1054,70 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
     )
   }
 
-  // If the dragged pane and its drop target share the same parent split,
-  // it's a plain reorder among siblings. Otherwise it's a cross-split move
-  // (story 375): the drop target is another leaf's position within a
-  // DIFFERENT split — reusing 374's existing per-leaf sortable drop targets
-  // (arch.md §7's option (a): simplest shape, no new `useDroppable`
-  // container surface needed) — so `over` is always another leaf's id, in
-  // whichever split it lives in, and `moveLeaf` slots the dragged leaf in at
-  // that leaf's own index.
+  // `activatorEvent` is the native pointerdown/mousedown that started this
+  // drag — the one place dnd-kit hands over an absolute pointer position;
+  // every later event on the same drag gives only `delta` relative to it.
+  function handlePaneDragStart(event: DragStartEvent) {
+    const ae = event.activatorEvent as MouseEvent
+    dragOriginRef.current = { x: ae.clientX, y: ae.clientY }
+  }
+
+  // Live pointer position for this drag: the absolute position captured at
+  // start plus the cumulative delta dnd-kit reports on every later event —
+  // same reconstruction `handlePaneDragEnd` below does, so the preview
+  // (continuous, via onDragMove) and the drop decision (once, via
+  // onDragEnd) always agree on where the pointer actually is.
+  function livePointer(event: DragMoveEvent): { x: number; y: number } | null {
+    const origin = dragOriginRef.current
+    if (!origin) return null
+    return { x: origin.x + event.delta.x, y: origin.y + event.delta.y }
+  }
+
+  // Live preview only — recomputed continuously while a pane drag is in
+  // progress. `over` briefly lags a fast pointer between frames; that's
+  // fine for a preview, and `handlePaneDragEnd` never reads this state, so
+  // a stale frame here can't produce a wrong drop.
+  function handlePaneDragMove(event: DragMoveEvent) {
+    const { over } = event
+    const pointer = livePointer(event)
+    if (!over || !pointer) {
+      setDropZone(null)
+      return
+    }
+    const edge = computeDropEdge(pointer, over.rect)
+    setDropZone(edge ? { id: String(over.id), edge } : null)
+  }
+
+  function handlePaneDragCancel() {
+    setDropZone(null)
+    dragOriginRef.current = null
+  }
+
+  // Edge zone of the drop target (`computeDropEdge`, recomputed fresh here
+  // rather than trusting `dropZone` state) picks between two gestures:
+  //  - center zone → today's move/reorder (story 375): same parent split
+  //    is a plain sibling reorder (`arrayMove`); a different parent is a
+  //    cross-split move, `over`'s own index in its split (`moveLeaf`).
+  //  - edge zone → drag-TO-SPLIT (story 387): wrap the drop target and the
+  //    dragged leaf in a NEW split oriented/ordered by the edge
+  //    (`splitLeafAt`) — see its own comment for why a same-orientation
+  //    result collapses back to a plain sibling insert via `canonicalize`,
+  //    which is the desired outcome, not a bug to work around.
+  // Either way `over` is always another leaf's id (374's per-leaf sortable
+  // drop targets, no separate `useDroppable` surface needed for the edge
+  // case either — the target pane's own already-measured rect is enough).
   function handlePaneDragEnd(event: DragEndEvent) {
     const { active, over } = event
+    const pointer = livePointer(event)
+    setDropZone(null)
+    dragOriginRef.current = null
     if (!over || active.id === over.id) return
+    const edge = pointer ? computeDropEdge(pointer, over.rect) : null
     setRoot((r) => {
       const fromPath = findPathToLeaf(r, String(active.id))
       const toPath = findPathToLeaf(r, String(over.id))
       if (!fromPath || !toPath) return r
+      if (edge) return splitLeafAt(r, fromPath, toPath, edge)
       const fromParent = fromPath.slice(0, -1)
       const toParent = toPath.slice(0, -1)
       const samePath =
@@ -1068,7 +1271,24 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
       )}
 
       <div className="agent-sidebar-body">
-        <DndContext sensors={sensors} onDragEnd={handlePaneDragEnd}>
+        <DndContext
+          sensors={sensors}
+          // dnd-kit's own default collision detection picks `over` off the
+          // DRAGGED pane's translated bounding box, not the pointer — fine
+          // when everything being dragged is small relative to its
+          // droppables, but every pane here starts out (and often stays)
+          // as wide/tall as the whole sidebar, so that box can overlap
+          // several candidates at once and pick one the cursor isn't even
+          // over. `pointerWithin` resolves `over` from the actual pointer
+          // position instead, matching `computeDropEdge`'s own pointer-based
+          // read below — both now agree on the one thing that has no
+          // dragged-pane-size dependence.
+          collisionDetection={pointerWithin}
+          onDragStart={handlePaneDragStart}
+          onDragMove={handlePaneDragMove}
+          onDragEnd={handlePaneDragEnd}
+          onDragCancel={handlePaneDragCancel}
+        >
           <SplitNodeView
             node={root}
             path={[]}
@@ -1077,6 +1297,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
             onClose={closePane}
             onDividerMouseDown={startDivider}
             onDividerToggle={toggleDividerAt}
+            dropZone={dropZone}
           />
         </DndContext>
       </div>

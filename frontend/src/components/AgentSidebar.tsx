@@ -45,6 +45,22 @@ const DEFAULT_RATIO = 1
 // collide with a real one.
 const LIST_LEAF_ID = '__agent-list__'
 
+// `crypto.randomUUID` is a secure-context-only API — accessing mesa over
+// LAN (`mesa serve --lan`) is plain HTTP, so WebKit/Safari on a real iOS
+// device treats the origin as insecure and leaves it undefined, crashing
+// the whole sidebar. These ids are just split-tree React keys, not
+// security-sensitive, so a Math.random fallback is fine.
+function newSplitId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
 // --- Split tree -------------------------------------------------------
 //
 // Replaces the old flat `openIds: string[]` + `ratios: Record<string,
@@ -82,7 +98,7 @@ type SplitChild = {
 type PaneNode = LeafNode | SplitNode
 
 function emptyRoot(): SplitNode {
-  return { kind: 'split', id: crypto.randomUUID(), orientation: 'column', children: [] }
+  return { kind: 'split', id: newSplitId(), orientation: 'column', children: [] }
 }
 
 /**
@@ -233,7 +249,7 @@ function toggleDivider(root: SplitNode, path: number[], i: number): SplitNode {
     const b = n.children[i + 1]
     const wrapper: SplitNode = {
       kind: 'split',
-      id: crypto.randomUUID(),
+      id: newSplitId(),
       orientation: n.orientation === 'row' ? 'column' : 'row',
       children: [a, b],
     }
@@ -360,7 +376,7 @@ function splitLeafAt(root: SplitNode, fromPath: number[], toPath: number[], edge
         if (atToParent && idx === toIndex) {
           const wrapper: SplitNode = {
             kind: 'split',
-            id: crypto.randomUUID(),
+            id: newSplitId(),
             orientation,
             children: draggedFirst
               ? [{ ratio: DEFAULT_RATIO, node: leaf }, { ratio: DEFAULT_RATIO, node: target }]

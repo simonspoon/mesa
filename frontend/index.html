@@ -8,6 +8,44 @@
   </head>
   <body>
     <div id="root"></div>
+    <!--
+      Deliberately plain, untranspiled ES5-ish JS: if the bundled module
+      below fails to parse on an older/unusual browser (real devices vary
+      far more than the dev simulator), this script must still run to turn
+      a silent blank screen into a visible, actionable message. See #root's
+      CSS background — it renders from a separate <link> regardless of
+      whether the module script ever executes, which is what makes a JS
+      parse failure look identical to "nothing happened."
+    -->
+    <script>
+      (function () {
+        function showFallback(message) {
+          var root = document.getElementById('root')
+          if (!root || root.childNodes.length > 0) return
+          root.innerHTML =
+            '<div style="font-family: monospace; padding: 24px; white-space: pre-wrap; color: #f66;">' +
+            'mesa failed to load in this browser.\n\n' +
+            message +
+            '\n\nOpen this page’s browser console for details, or try a different browser/device.' +
+            '</div>'
+        }
+        window.addEventListener('error', function (e) {
+          showFallback((e && e.message) || 'Unknown script error.')
+        })
+        window.addEventListener('unhandledrejection', function (e) {
+          var reason = e && e.reason
+          showFallback(
+            'Unhandled promise rejection: ' +
+              (reason && reason.message ? reason.message : reason),
+          )
+        })
+        setTimeout(function () {
+          showFallback(
+            'The app did not start and no error was reported. This usually means the browser could not run the bundled JavaScript.',
+          )
+        }, 5000)
+      })()
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

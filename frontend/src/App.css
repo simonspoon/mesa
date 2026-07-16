@@ -24,10 +24,15 @@ header {
   flex: none;
 }
 
-/* App shell: header on top, then sidebar + full-width main. */
+/* App shell: header on top, then sidebar + full-width main. Fills the
+   viewport-locked `#root` (index.css) and never scrolls itself — `main`
+   scrolls internally instead, so the two sticky sidebars are height-bounded
+   and can't chain their wheel into a document scroll (#382). */
 .shell-body {
   display: flex;
   align-items: stretch;
+  flex: 1;
+  min-height: 0;
 }
 
 .sidebar {
@@ -39,8 +44,11 @@ header {
      "Restart server" button down past the bottom of the viewport (#295). */
   position: sticky;
   top: 0;
-  height: calc(100vh - 3rem);
+  /* Fills the shell-body's definite height (no longer the old `100vh - 3rem`
+     guess at the header height) — the shell is viewport-locked now. */
+  height: 100%;
   overflow-y: auto;
+  overscroll-behavior: contain;
   border-right: 1px solid var(--border);
   background: rgba(6, 10, 16, 0.6);
   padding: 1rem;
@@ -264,6 +272,10 @@ header {
 main {
   flex: 1;
   min-width: 0;
+  /* The single document-independent scroll container: page content scrolls
+     here, not on `body`, so wheeling over the sidebars never moves the page. */
+  min-height: 0;
+  overflow-y: auto;
   padding: 1rem 1.5rem 3rem;
 }
 
@@ -1960,7 +1972,8 @@ body.agent-sidebar-resizing {
   width: var(--agent-sidebar-width, 28rem);
   position: sticky;
   top: 0;
-  height: calc(100vh - 3rem);
+  /* Fills the shell-body's definite height — see `.sidebar`. */
+  height: 100%;
   overflow: hidden;
   border-left: 1px solid var(--border);
   background: rgba(6, 10, 16, 0.6);
@@ -2099,6 +2112,10 @@ body.agent-sidebar-resizing {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* Don't chain scroll past this pane's own edge into whatever is behind it —
+     matters on the mobile drawer (a `position: fixed` overlay with the page
+     still scrollable underneath) and when the list itself overflows (#382). */
+  overscroll-behavior: contain;
   padding: 0.5rem 0.6rem;
 }
 

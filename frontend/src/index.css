@@ -54,6 +54,20 @@ body {
   line-height: 1.5;
 }
 
+/* Viewport-locked app shell: header (fixed) over a shell-body that fills the
+   rest, with `main` (not the document) as the scroll container. Without this
+   `main` grew with its content and the whole page scrolled — so a wheel over
+   the sticky agent sidebar, whose own list either fit or sat at its boundary,
+   fell through to the document and scrolled the entire site (#382). Locking
+   the shell to the viewport removes that document scroll entirely, so there is
+   nothing left for the sidebar to chain into. */
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 h1,
 h2 {
   font-family: var(--font-display);

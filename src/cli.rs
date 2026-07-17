@@ -29,8 +29,10 @@ OUTPUT
   done/cancelled).
 
   Errors are JSON on stderr:
-    {\"error\": {\"code\": \"not_found|cycle|validation|conflict|usage\", \"message\": \"...\"}}
-  Exit codes: 0 success, 1 domain/runtime error, 2 usage error.
+    {\"error\": {\"code\": \"not_found|cycle|validation|conflict|usage|unavailable\", \"message\": \"...\"}}
+  Exit codes: 0 success, 1 domain/runtime error, 2 usage error. `unavailable`
+  is scoped to `cc usage` (missing token or unreachable upstream); see
+  `mesa cc usage --help`.
 
 DATABASE
   Defaults to ~/Library/Application Support/mesa/mesa.db;
@@ -86,8 +88,9 @@ enum Command {
     /// reach the web UI, and the Host-header check is skipped. WARNING: LAN
     /// mode has NO authentication — every device on your network has full read
     /// and write access to all your data AND can open a terminal into any
-    /// project's folder (the Agents tab runs `claude` there), i.e. run code on
-    /// this machine. Only use it on networks you trust.
+    /// project's folder (the Agents tab runs `claude` there) or a raw shell at
+    /// $HOME (the Terminal tab), i.e. run code on this machine. Only use it on
+    /// networks you trust.
     Serve {
         /// Port to bind
         #[arg(long, default_value_t = 7770)]
@@ -95,7 +98,7 @@ enum Command {
         /// Make the server reachable from other devices on your local network
         /// (binds 0.0.0.0 and skips the Host-header check). No authentication:
         /// anyone on the network gets full read/write access to your data and
-        /// can run code via the Agents terminal.
+        /// can run code via the Agents or Terminal tabs.
         #[arg(long, default_value_t = false)]
         lan: bool,
         /// Periodically check every project for an actionable todo task when

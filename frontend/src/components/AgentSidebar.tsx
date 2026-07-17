@@ -6,14 +6,12 @@ import {
   pointerWithin,
   useSensor,
   useSensors,
-  type ClientRect,
   type DragEndEvent,
   type DragMoveEvent,
   type DragStartEvent,
 } from '@dnd-kit/core'
 import {
   SortableContext,
-  arrayMove,
   horizontalListSortingStrategy,
   useSortable,
   verticalListSortingStrategy,
@@ -21,10 +19,29 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
 import { projectForCwd } from '../agentProject'
+import * as ptyPool from '../lib/ptyPool'
+import {
+  axisPos,
+  collectLeafIds,
+  computeDropEdge,
+  DEFAULT_RATIO,
+  emptyRoot,
+  findPathToLeaf,
+  getNodeAtPath,
+  MIN_PANE_PX,
+  removeLeaf,
+  replaceAtPath,
+  resolveDrop,
+  toggleDivider,
+  type DropEdge,
+  type LeafNode as PTLeafNode,
+  type SplitNode as PTSplitNode,
+} from '../lib/paneTree'
 import type { AgentSession } from '../types/AgentSession'
 import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
-import { AgentTerminal } from './AgentTerminal'
+import { agentTerminalDescriptor } from './AgentTerminal'
+import { PtySlot } from './PtySlot'
 
 const MIN_WIDTH = 280
 const DEFAULT_WIDTH = 448 // 28rem, matches the CSS fallback
@@ -36,164 +53,21 @@ const DEFAULT_WIDTH = 448 // 28rem, matches the CSS fallback
 // nav sidebar's actual width (collapsed or expanded) instead of assuming one.
 const MIN_MAIN_WIDTH = 320
 
-const MIN_PANE_PX = 80 // floor on a pane's own height during divider drag
-const DEFAULT_RATIO = 1
-
 // Stable id for the one leaf whose content is the session list rather than
 // an attached terminal — an `agentId` from `claude agents --json` is always
 // a short opaque id with no fixed shape, so a `__`-wrapped sentinel can't
 // collide with a real one.
 const LIST_LEAF_ID = '__agent-list__'
 
-// `crypto.randomUUID` is a secure-context-only API — accessing mesa over
-// LAN (`mesa serve --lan`) is plain HTTP, so WebKit/Safari on a real iOS
-// device treats the origin as insecure and leaves it undefined, crashing
-// the whole sidebar. These ids are just split-tree React keys, not
-// security-sensitive, so a Math.random fallback is fine.
-function newSplitId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0
-    const v = c === 'x' ? r : (r & 0x3) | 0x8
-    return v.toString(16)
-  })
-}
-
-// --- Split tree -------------------------------------------------------
-//
-// Replaces the old flat `openIds: string[]` + `ratios: Record<string,
-// number>` pair. A single tree, rooted at a `SplitNode`, holds every open
-// pane plus how the panes sharing a container split their flex space.
-// Mixed row/column nesting is what stories 372/373 build on top of this;
-// today only the degenerate single-column tree (today's flat stack) is
-// ever produced, since nothing yet creates a nested split.
-//
-// A leaf's content is either an attached agent terminal or the session
-// list itself (task 368) — `contentKind` discriminates the two, `id` is
-// the leaf's identity either way (an `agentId`, or `LIST_LEAF_ID` for the
-// list) so every id-keyed helper below (`findPathToLeaf`, dnd-kit's own
-// sortable id, ...) stays a single code path regardless of content.
-type LeafNode =
-  | { kind: 'leaf'; contentKind: 'agent'; id: string }
-  | { kind: 'leaf'; contentKind: 'list'; id: typeof LIST_LEAF_ID }
-
-type SplitNode = {
-  kind: 'split'
-  // Stable id for nested-split React keys — a leaf already has a natural
-  // key (its own id); a split has none, so mint one at creation and carry
-  // it through every rebuild/canonicalize instead of regenerating it on
-  // render (which would break React's reconciliation on every toggle).
-  id: string
-  orientation: 'row' | 'column' // row = side-by-side, column = stacked
-  children: SplitChild[]
-}
-
-type SplitChild = {
-  ratio: number // this slot's flex-grow share within its parent split
-  node: PaneNode
-}
-
-type PaneNode = LeafNode | SplitNode
-
-function emptyRoot(): SplitNode {
-  return { kind: 'split', id: newSplitId(), orientation: 'column', children: [] }
-}
-
-/**
- * Collapses a tree bottom-up until none of its 3 rules apply anywhere:
- *  (a) drop an empty split child entirely,
- *  (b) inline a singleton split child (its one grandchild takes over the
- *      wrapper's own ratio slot),
- *  (c) splice a same-orientation split child's children directly into this
- *      level, rescaled to fit inside the child's ratio budget — flex-grow
- *      only competes among true siblings, so a same-orientation wrapper is
- *      pure nesting with no visual effect.
- * Rule (c) is what makes toggling a divider and toggling it back a true
- * round trip instead of an ever-growing nest. Called by `replaceAtPath` on
- * every mutation, so callers never have to remember to call it themselves.
- */
-function canonicalize(node: PaneNode): PaneNode {
-  if (node.kind === 'leaf') return node
-  let children: SplitChild[] = node.children.map((c) => ({ ratio: c.ratio, node: canonicalize(c.node) }))
-  let changed = true
-  while (changed) {
-    changed = false
-    const next: SplitChild[] = []
-    for (const c of children) {
-      if (c.node.kind === 'split' && c.node.children.length === 0) {
-        changed = true
-        continue
-      }
-      if (c.node.kind === 'split' && c.node.children.length === 1) {
-        next.push({ ratio: c.ratio, node: c.node.children[0].node })
-        changed = true
-        continue
-      }
-      if (c.node.kind === 'split' && c.node.orientation === node.orientation) {
-        const sum = c.node.children.reduce((s, cc) => s + cc.ratio, 0) || 1
-        for (const cc of c.node.children) next.push({ ratio: (cc.ratio / sum) * c.ratio, node: cc.node })
-        changed = true
-        continue
-      }
-      next.push(c)
-    }
-    children = next
-  }
-  return { kind: 'split', id: node.id, orientation: node.orientation, children }
-}
-
-/** `[]` is root itself; `[2]` is `root.children[2].node`; `[2, 0]` is that node's own `children[0].node`, etc. */
-function getNodeAtPath(root: SplitNode, path: number[]): PaneNode {
-  let node: PaneNode = root
-  for (const i of path) {
-    if (node.kind !== 'split') throw new Error('getNodeAtPath: path runs through a leaf')
-    node = node.children[i].node
-  }
-  return node
-}
-
-/**
- * Rebuilds only the spine from `root` down to the split node at `path`,
- * applying `fn` there, and canonicalizes the whole result before returning
- * — the single choke point every tree mutation goes through.
- */
-function replaceAtPath(root: SplitNode, path: number[], fn: (n: SplitNode) => SplitNode): SplitNode {
-  function rebuild(node: SplitNode, rest: number[]): SplitNode {
-    if (rest.length === 0) return fn(node)
-    const [i, ...tail] = rest
-    const childNode = node.children[i].node
-    if (childNode.kind !== 'split') throw new Error('replaceAtPath: path runs through a leaf')
-    const children = node.children.map((c, idx) =>
-      idx === i ? { ratio: c.ratio, node: rebuild(childNode, tail) } : c,
-    )
-    return { ...node, children }
-  }
-  return canonicalize(rebuild(root, path)) as SplitNode
-}
-
-function findPathToLeaf(root: SplitNode, id: string): number[] | null {
-  for (let i = 0; i < root.children.length; i++) {
-    const child = root.children[i].node
-    if (child.kind === 'leaf') {
-      if (child.id === id) return [i]
-    } else {
-      const sub = findPathToLeaf(child, id)
-      if (sub) return [i, ...sub]
-    }
-  }
-  return null
-}
-
-function collectLeafIds(node: PaneNode): string[] {
-  if (node.kind === 'leaf') return [node.id]
-  return node.children.flatMap((c) => collectLeafIds(c.node))
-}
-
-function childKey(node: PaneNode): string {
-  return node.id
-}
+// This sidebar's own `contentKind` union, narrowing the shared generic
+// pane-tree types (`frontend/src/lib/paneTree.ts`, extracted in mesa task
+// 395) to what's specific here — an attached agent terminal, or the
+// permanent session-list pane. A local type alias, not a re-export, so
+// every existing bare `LeafNode`/`SplitNode` reference below keeps working
+// unchanged.
+type AgentLeafKind = 'agent' | 'list'
+type LeafNode = PTLeafNode<AgentLeafKind>
+type SplitNode = PTSplitNode<AgentLeafKind>
 
 // Always appended to root's own children, regardless of how deep/mixed the
 // tree is elsewhere — the spec's stated default insertion point.
@@ -221,213 +95,6 @@ function ensureListLeaf(root: SplitNode): SplitNode {
       ...n.children,
     ],
   }))
-}
-
-function removeLeaf(root: SplitNode, agentId: string): SplitNode {
-  const path = findPathToLeaf(root, agentId)
-  if (!path) return root
-  const parentPath = path.slice(0, -1)
-  const i = path[path.length - 1]
-  return replaceAtPath(root, parentPath, (n) => ({
-    ...n,
-    children: n.children.filter((_, idx) => idx !== i),
-  }))
-}
-
-/**
- * Toggles the orientation of the divider between `children[i]`/`children[i+1]`
- * of the split node at `path`: extracts that pair, wraps it in a NEW split
- * node with the OPPOSITE orientation (ratio = the pair's combined ratio), and
- * splices that single node back into the same slot. The familiar "flip a
- * 2-child split in place" case is not a separate code path — it's what
- * `canonicalize`'s singleton-inline rule (via `replaceAtPath`) collapses this
- * same general operation down to automatically when `n.children.length === 2`.
- */
-function toggleDivider(root: SplitNode, path: number[], i: number): SplitNode {
-  return replaceAtPath(root, path, (n) => {
-    const a = n.children[i]
-    const b = n.children[i + 1]
-    const wrapper: SplitNode = {
-      kind: 'split',
-      id: newSplitId(),
-      orientation: n.orientation === 'row' ? 'column' : 'row',
-      children: [a, b],
-    }
-    const children = [
-      ...n.children.slice(0, i),
-      { ratio: a.ratio + b.ratio, node: wrapper },
-      ...n.children.slice(i + 2),
-    ]
-    return { ...n, children }
-  })
-}
-
-/**
- * Moves the leaf at `fromPath` out of its current split and inserts it at
- * `toIndex` in the DIFFERENT split at `toPath`, then canonicalizes once.
- * The moved leaf's own ratio is dropped — the destination slot always gets
- * `DEFAULT_RATIO`, matching how a reopened pane gets no special ratio
- * treatment (arch.md §3).
- *
- * Deliberately a single top-down rebuild over the ORIGINAL tree's indices,
- * not two sequential `replaceAtPath` calls (each of which canonicalizes).
- * Canonicalizing right after the removal alone could prune/inline the
- * source's now-empty-or-singleton parent split, shifting a LATER sibling's
- * index — which would silently invalidate a `toPath`/`toIndex` computed
- * against the pre-removal tree if that sibling happens to sit on (or past)
- * the destination's branch. Applying both the removal and the insertion in
- * one pass, each still keyed off the untouched original indices, then
- * canonicalizing exactly once at the end avoids that class of bug entirely.
- */
-function moveLeaf(root: SplitNode, fromPath: number[], toPath: number[], toIndex: number): SplitNode {
-  const leaf = getNodeAtPath(root, fromPath)
-  if (leaf.kind !== 'leaf') return root
-  const fromParentPath = fromPath.slice(0, -1)
-  const fromIndex = fromPath[fromPath.length - 1]
-
-  function rebuild(node: SplitNode, path: number[]): SplitNode {
-    const atFromParent =
-      path.length === fromParentPath.length && path.every((v, k) => v === fromParentPath[k])
-    const atToParent = path.length === toPath.length && path.every((v, k) => v === toPath[k])
-
-    let children = node.children.map((c, i) => {
-      const onFromBranch = fromParentPath.length > path.length && fromParentPath[path.length] === i
-      const onToBranch = toPath.length > path.length && toPath[path.length] === i
-      if ((onFromBranch || onToBranch) && c.node.kind === 'split') {
-        return { ratio: c.ratio, node: rebuild(c.node, [...path, i]) }
-      }
-      return c
-    })
-
-    if (atFromParent) children = children.filter((_, idx) => idx !== fromIndex)
-    if (atToParent) {
-      children = [...children]
-      children.splice(toIndex, 0, { ratio: DEFAULT_RATIO, node: leaf })
-    }
-    return { ...node, children }
-  }
-
-  return canonicalize(rebuild(root, [])) as SplitNode
-}
-
-type DropEdge = 'left' | 'right' | 'top' | 'bottom'
-
-/**
- * Wraps the leaf at `toPath` together with the leaf dragged from `fromPath`
- * into a NEW split node — orientation from `edge` (row for left/right,
- * column for top/bottom), order from `edge` (left/top puts the dragged
- * leaf first) — replacing the target's own slot with that wrapper. This is
- * the drag-TO-SPLIT gesture (edge zones, story 387); `moveLeaf` above is
- * drag-to-REORDER (center zone, story 375) — the caller picks between them
- * per drop position (`computeDropEdge`), not this function.
- *
- * The wrapper inherits the target's own ratio in ITS parent, so sibling
- * sizing elsewhere is untouched; inside the wrapper the target and the
- * newly split-in leaf share `DEFAULT_RATIO` evenly, matching how a
- * freshly moved/reopened pane always gets an unspecial-cased ratio
- * (`moveLeaf`'s own comment). If the wrapper's orientation happens to
- * match its own parent's, `canonicalize` immediately splices its two
- * children back out flat — which is exactly the right outcome, not a
- * bug: dropping on the left/right edge of a pane that already lives in a
- * row split just means "insert as that pane's row-sibling here," same
- * open question `toggleDivider` already answers for the adjacent-pair
- * case. No orientation-vs-parent special-casing is needed here because
- * of that.
- *
- * Same single-pass, both-paths-keyed-to-the-ORIGINAL-tree rebuild as
- * `moveLeaf`, for the same reason given there — but the removal and the
- * replacement are both decided in ONE `map` over each split's original
- * `children` (index-only, no early filtering) precisely because `fromPath`
- * and `toPath` can share a parent here (dragging one sibling onto another
- * within the same split, e.g. building a nested split out of two flat
- * row/column siblings) — a case `moveLeaf` never has to handle since
- * `handlePaneDragEnd` only calls it when the two parents differ. Filtering
- * out `fromIndex` before locating `toIndex` would shift indices out from
- * under `atToParent`'s lookup whenever `fromIndex < toIndex`; deciding
- * both against the same original array read sidesteps that entirely.
- */
-function splitLeafAt(root: SplitNode, fromPath: number[], toPath: number[], edge: DropEdge): SplitNode {
-  const leaf = getNodeAtPath(root, fromPath)
-  const target = getNodeAtPath(root, toPath)
-  if (leaf.kind !== 'leaf' || target.kind !== 'leaf' || leaf.id === target.id) return root
-  const fromParentPath = fromPath.slice(0, -1)
-  const fromIndex = fromPath[fromPath.length - 1]
-  const toParentPath = toPath.slice(0, -1)
-  const toIndex = toPath[toPath.length - 1]
-  const orientation: 'row' | 'column' = edge === 'left' || edge === 'right' ? 'row' : 'column'
-  const draggedFirst = edge === 'left' || edge === 'top'
-
-  function rebuild(node: SplitNode, path: number[]): SplitNode {
-    const atFromParent = path.length === fromParentPath.length && path.every((v, k) => v === fromParentPath[k])
-    const atToParent = path.length === toParentPath.length && path.every((v, k) => v === toParentPath[k])
-
-    const recursed = node.children.map((c, i) => {
-      const onFromBranch = fromParentPath.length > path.length && fromParentPath[path.length] === i
-      const onToBranch = toParentPath.length > path.length && toParentPath[path.length] === i
-      if ((onFromBranch || onToBranch) && c.node.kind === 'split') {
-        return { ratio: c.ratio, node: rebuild(c.node, [...path, i]) }
-      }
-      return c
-    })
-
-    const children = recursed
-      .map((c, idx) => {
-        if (atFromParent && idx === fromIndex) return null
-        if (atToParent && idx === toIndex) {
-          const wrapper: SplitNode = {
-            kind: 'split',
-            id: newSplitId(),
-            orientation,
-            children: draggedFirst
-              ? [{ ratio: DEFAULT_RATIO, node: leaf }, { ratio: DEFAULT_RATIO, node: target }]
-              : [{ ratio: DEFAULT_RATIO, node: target }, { ratio: DEFAULT_RATIO, node: leaf }],
-          }
-          return { ratio: c.ratio, node: wrapper }
-        }
-        return c
-      })
-      .filter((c): c is SplitChild => c !== null)
-
-    return { ...node, children }
-  }
-
-  return canonicalize(rebuild(root, [])) as SplitNode
-}
-
-// Center 40%x40% of the target pane (|dx|,|dy| both under this) is the
-// "reorder" zone — `moveLeaf`/`arrayMove`, no new split, no indicator. The
-// outer 60% is quartered into left/right/top/bottom triangles by whichever
-// axis deviates from center more, the standard tiling-WM/VS-Code docking
-// read on a drop point (arch note for story 387).
-//
-// Takes the raw POINTER position, not the dragged pane's own (translated)
-// bounding box — deliberately: every pane here spans the sidebar's full
-// width/height at some point (there's no independent left/right column
-// until a row split already exists), so a pane's own box can be far wider
-// or taller than the target it's hovering. Zoning off the dragged box's
-// CENTER would tie the detected edge to that box's size and grab-point
-// offset instead of to where the user is actually pointing — dragging a
-// full-width pane by a grip near its own left edge could never reach a
-// target's "left" zone at all, since the box's center would have to
-// travel the same huge distance the pointer does, not just the pointer's
-// own delta. The pointer itself has no such size-dependence, so it's the
-// one thing that reads the same regardless of what's being dragged.
-const CENTER_ZONE_HALF = 0.2
-
-function computeDropEdge(pointer: { x: number; y: number }, overRect: ClientRect): DropEdge | null {
-  if (overRect.width <= 0 || overRect.height <= 0) return null
-  const dx = (pointer.x - overRect.left) / overRect.width - 0.5
-  const dy = (pointer.y - overRect.top) / overRect.height - 0.5
-  if (Math.max(Math.abs(dx), Math.abs(dy)) < CENTER_ZONE_HALF) return null
-  return Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : dy < 0 ? 'top' : 'bottom'
-}
-
-// One function every hardcoded `e.clientY`/`e.clientX` read goes through:
-// a row split's divider drags along X, a column split's along Y. Typed
-// structurally (not `MouseEvent`) so it accepts both a React synthetic
-// mousedown event and a native `document`-level mousemove event.
-function axisPos(e: { clientX: number; clientY: number }, orientation: 'row' | 'column'): number {
-  return orientation === 'row' ? e.clientX : e.clientY
 }
 
 function agentLabel(a: AgentSession): string {
@@ -543,7 +210,13 @@ function PaneShell({
   )
 }
 
-/** One open agent's pane: `PaneShell` over its own independent `AgentTerminal`. */
+/**
+ * One open agent's pane: `PaneShell` over its own `PtySlot` (mesa task 399
+ * / .scratch/arch.md §6.2) — the actual `PtyTerminal` lives in the
+ * always-mounted `PtyPool`, keyed by `agentId`; this just relocates its
+ * stable container to this tree position, so a split/move reparent never
+ * remounts (or reconnects) it.
+ */
 function AgentPane({
   agentId,
   label,
@@ -557,10 +230,10 @@ function AgentPane({
   onClose: () => void
   dropEdge?: DropEdge | null
 }) {
+  const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
   return (
     <PaneShell dragId={agentId} label={label} ratio={ratio} onClose={onClose} dropEdge={dropEdge}>
-      {/* key remounts terminal + socket only if agentId itself changes */}
-      <AgentTerminal key={agentId} agentId={agentId} />
+      <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
     </PaneShell>
   )
 }
@@ -666,11 +339,14 @@ function AgentListPane({ ratio, list, dropEdge }: { ratio: number; list: ListPan
  * compete among true flex siblings.
  *
  * Declared at module scope (not inside `AgentSidebar`) deliberately: an
- * open pane's `AgentTerminal` owns a live WebSocket that must survive
- * every re-render (poll tick, resize drag, collapse/expand) with no
- * reconnect. A component nested inside `AgentSidebar`'s body would get a
- * new identity — and remount every `AgentTerminal` beneath it — on every
- * one of those re-renders.
+ * open pane's `PtySlot` (and the `PtyTerminal` it relocates into this tree
+ * position, mesa task 399) must survive every re-render (poll tick, resize
+ * drag, collapse/expand) with no reconnect. A component nested inside
+ * `AgentSidebar`'s body would get a new identity — and remount every
+ * `PtySlot` beneath it — on every one of those re-renders. (A *reparent*,
+ * as opposed to a same-identity re-render, is the separate case
+ * `ptyPool.ts`/`PtySlot.tsx` handle: the pool container survives that too,
+ * but via relocation, not via this component staying module-scope.)
  */
 function SplitNodeView({
   node,
@@ -709,7 +385,7 @@ function SplitNodeView({
     <SortableContext items={leafIds} strategy={strategy}>
       <div ref={containerRef} className={`agent-sidebar-panes agent-sidebar-panes-${node.orientation}`}>
         {node.children.map((child, i) => (
-          <Fragment key={childKey(child.node)}>
+          <Fragment key={child.node.id}>
             {child.node.kind === 'leaf' ? (
               child.node.contentKind === 'list' ? (
                 <AgentListPane
@@ -721,14 +397,13 @@ function SplitNodeView({
                 <AgentPane
                   agentId={child.node.id}
                   label={(() => {
-                    // Reassigned to a local (with the narrower type spelled
-                    // out) so the arrow function below — a separate closure
-                    // — keeps the 'agent' narrowing: TS doesn't carry a
-                    // discriminant check across a closure boundary on a
-                    // value read from the outer scope.
-                    const leaf = child.node as Extract<LeafNode, { contentKind: 'agent' }>
-                    const session = agents.find((a) => a.id === leaf.id)
-                    return session ? agentLabel(session) : leaf.id
+                    // `contentKind` is a plain union-typed field on a single
+                    // object shape here (paneTree.ts's `LeafNode<K>` isn't a
+                    // discriminated union across shapes), so there's no
+                    // per-variant `id` type to narrow to — just read
+                    // `child.node.id` directly, valid for either contentKind.
+                    const session = agents.find((a) => a.id === child.node.id)
+                    return session ? agentLabel(session) : child.node.id
                   })()}
                   ratio={child.ratio}
                   onClose={() => onClose(child.node.id)}
@@ -802,10 +477,10 @@ function SplitNodeView({
  * across every project, with room to attach one pane per selected session.
  * Rendered once in `App.tsx`, outside the router — it never unmounts on
  * navigation, so collapsing it only changes CSS (width), never the React
- * tree. That is load-bearing: each open pane's `AgentTerminal` owns a
- * WebSocket, and it must survive a collapse/expand cycle with no reconnect,
- * exactly like leaving the tab and coming back — now true for every open
- * pane, not just one.
+ * tree. That is load-bearing: each open pane's `PtyTerminal` (relocated
+ * here via `PtySlot`, mesa task 399) owns a WebSocket, and it must survive
+ * a collapse/expand cycle with no reconnect, exactly like leaving the tab
+ * and coming back — now true for every open pane, not just one.
  */
 export function AgentSidebar({ activeProjectId }: { activeProjectId: number | null }) {
   const [collapsed, setCollapsed] = useState(true)
@@ -1012,11 +687,19 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
   }
 
   function togglePane(id: string) {
+    // Decided against the current `root`, not inside the `setRoot` updater:
+    // `ptyPool.remove` is a real side effect (kills the pool entry, so the
+    // shell can be reaped), and an updater function can run more than once
+    // (React StrictMode) — reading `root` here, once, keeps that side
+    // effect tied to exactly one real close, matching arch.md §6.2's
+    // "explicit, colocated with the actual close call site" rule.
+    if (findPathToLeaf(root, id)) ptyPool.remove(id)
     setRoot((r) => (findPathToLeaf(r, id) ? removeLeaf(r, id) : insertLeaf(r, id)))
     refetch()
   }
 
   function closePane(id: string) {
+    ptyPool.remove(id)
     setRoot((r) => removeLeaf(r, id))
   }
 
@@ -1109,42 +792,16 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
     dragOriginRef.current = null
   }
 
-  // Edge zone of the drop target (`computeDropEdge`, recomputed fresh here
-  // rather than trusting `dropZone` state) picks between two gestures:
-  //  - center zone → today's move/reorder (story 375): same parent split
-  //    is a plain sibling reorder (`arrayMove`); a different parent is a
-  //    cross-split move, `over`'s own index in its split (`moveLeaf`).
-  //  - edge zone → drag-TO-SPLIT (story 387): wrap the drop target and the
-  //    dragged leaf in a NEW split oriented/ordered by the edge
-  //    (`splitLeafAt`) — see its own comment for why a same-orientation
-  //    result collapses back to a plain sibling insert via `canonicalize`,
-  //    which is the desired outcome, not a bug to work around.
-  // Either way `over` is always another leaf's id (374's per-leaf sortable
-  // drop targets, no separate `useDroppable` surface needed for the edge
-  // case either — the target pane's own already-measured rect is enough).
+  // The reorder-vs-move-vs-split decision itself is shared, pure logic
+  // (`resolveDrop`, `frontend/src/lib/paneTree.ts`) — this handler just
+  // reconstructs the live pointer position and hands off.
   function handlePaneDragEnd(event: DragEndEvent) {
     const { active, over } = event
     const pointer = livePointer(event)
     setDropZone(null)
     dragOriginRef.current = null
-    if (!over || active.id === over.id) return
-    const edge = pointer ? computeDropEdge(pointer, over.rect) : null
-    setRoot((r) => {
-      const fromPath = findPathToLeaf(r, String(active.id))
-      const toPath = findPathToLeaf(r, String(over.id))
-      if (!fromPath || !toPath) return r
-      if (edge) return splitLeafAt(r, fromPath, toPath, edge)
-      const fromParent = fromPath.slice(0, -1)
-      const toParent = toPath.slice(0, -1)
-      const samePath =
-        fromParent.length === toParent.length && fromParent.every((v, k) => v === toParent[k])
-      const from = fromPath[fromPath.length - 1]
-      const to = toPath[toPath.length - 1]
-      if (samePath) {
-        return replaceAtPath(r, fromParent, (n) => ({ ...n, children: arrayMove(n.children, from, to) }))
-      }
-      return moveLeaf(r, fromPath, toParent, to)
-    })
+    if (!over) return
+    setRoot((r) => resolveDrop(r, String(active.id), String(over.id), pointer, over.rect) ?? r)
   }
 
   function toggleDividerAt(path: number[], i: number) {

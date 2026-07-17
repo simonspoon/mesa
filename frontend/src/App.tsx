@@ -3,10 +3,12 @@ import './App.css'
 import { getTask } from './api'
 import { AgentSidebar } from './components/AgentSidebar'
 import { CommandPalette } from './components/CommandPalette'
+import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
+import { TerminalPage } from './pages/TerminalPage'
 import { useFetch } from './useFetch'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
@@ -17,7 +19,9 @@ import { useFetch } from './useFetch'
 // #/projects/:id/dashboard (project-scoped CC telemetry),
 // #/projects/:id/create-task (opens straight into the create-task form;
 // closing/saving it returns to the plain project URL — see
-// ProjectTasksPage's `createTask` prop).
+// ProjectTasksPage's `createTask` prop), #/terminal (global shell pane-tree;
+// TerminalPage is a permanent sibling mount, not resolved into `page` — see
+// the render below).
 function useHashPath(): string {
   const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
   useEffect(() => {
@@ -69,6 +73,13 @@ function App() {
   useCommandPaletteShortcut(() => setPaletteOpen(true))
 
   const inboxMatch = /^\/inbox$/.exec(path)
+  // Terminal is not resolved into `page` (see below) — it's a permanent
+  // sibling mount alongside `main`/`AgentSidebar` (mesa task 396,
+  // .scratch/arch.md §4.3), toggled via `visibility` so panes and their
+  // websockets survive navigating away and back. This match only drives
+  // that visibility toggle and the nav's active-link highlight.
+  const terminalMatch = /^\/terminal$/.exec(path)
+  const terminalActive = terminalMatch !== null
   // CC Dashboard is the default landing view: the root path (#/ or empty) shows
   // the overview, and the brand link points back here. The three sub-pages
   // (#/cc/skills-agents, #/cc/projects, #/cc/sessions) carry the table views;
@@ -239,11 +250,31 @@ function App() {
         <Sidebar
           activeProjectId={activeProjectId}
           inboxActive={inboxMatch !== null}
+          terminalActive={terminalActive}
           ccTab={ccTab}
           version={navVersion}
         />
-        <main>{page}</main>
+        <div className="main-slot">
+          {/* Both panes are permanent siblings, never conditionally rendered —
+              same invariant AgentSidebar's own collapse relies on. `main`'s
+              content (`page`) keeps its existing per-route mount/unmount
+              behavior; only the pane wrapper's visibility toggles alongside
+              Terminal's, so navigating to/from Terminal never touches
+              TerminalPage's own mounted state (arch.md §4.3). */}
+          <div className="main-slot-pane" style={{ visibility: terminalActive ? 'hidden' : 'visible' }}>
+            <main>{page}</main>
+          </div>
+          <div className="main-slot-pane" style={{ visibility: terminalActive ? 'visible' : 'hidden' }}>
+            <TerminalPage />
+          </div>
+        </div>
         <AgentSidebar activeProjectId={activeProjectId} />
+        {/* Single always-mounted owner of every open leaf's PtyTerminal
+            (mesa task 399, .scratch/arch.md §6.2), across BOTH AgentSidebar
+            and TerminalPage — a permanent sibling, never inside `page` or
+            conditionally rendered, same never-unmount invariant AgentSidebar
+            itself already relies on. */}
+        <PtyPool />
       </div>
       {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} />}
     </>

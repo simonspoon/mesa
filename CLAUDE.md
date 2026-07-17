@@ -187,6 +187,10 @@ invariants you must not break — read them before changing `src/`:
   interdependent Host/Origin check stack under `--lan`); `local_path` writes
   are loopback-only in both modes. Includes the global Agent sidebar.
   `docs/agents.md`.
+- **Terminal** — global `$HOME` shell panes (`portable-pty`, not `claude
+  attach`), gated by the same `require_agent_access` stack as the Agents
+  attach endpoint; persists across nav via the same visibility-toggle
+  pattern as the Agent sidebar. `docs/terminal.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
 - **Hooks** — user-configured shell commands fired on events (`task-execute`

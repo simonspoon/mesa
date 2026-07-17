@@ -416,6 +416,10 @@ fn router(state: AppState) -> Router {
         // this has no `path`/empty-state wrapper: it is just the bare array).
         .route("/api/agents", get(list_all_agents))
         .route("/api/agents/{id}/attach", get(attach_agent))
+        // Terminal page: a raw `$SHELL` PTY per connection, no session
+        // registry (unlike the agent routes above). Shares
+        // `require_agent_access` unchanged — see that fn's doc.
+        .route("/api/terminal/attach", get(terminal_attach))
         // Sidebar decoration: working-tree git status of each project's
         // `local_path`. Read-only external state (shells `git status`).
         .route("/api/git-status", get(get_git_status))
@@ -2419,6 +2423,41 @@ async fn attach_agent(
     }))
 }
 
+/// Upgrades to a WebSocket bridged onto a real interactive shell in a PTY —
+/// the Terminal page. Distinct from [`attach_agent`]: this spawns `$SHELL`
+/// (falling back to `/bin/sh`) at `$HOME` directly, never `claude attach`,
+/// and has no session id — every connection is its own shell with no
+/// server-side registry (see `.scratch/arch.md` §0). Gated by the exact same
+/// [`require_agent_access`] used by the agent routes above (terminal access
+/// = code execution either way); see that function's doc for the gate's
+/// mode-branched behavior.
+async fn terminal_attach(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(q): Query<AttachQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let size = PtySize {
+        rows: q.rows.unwrap_or(40),
+        cols: q.cols.unwrap_or(120),
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    Ok(ws.on_upgrade(move |socket| async move {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.env("TERM", "xterm-256color");
+        if let Some(dirs) = directories::BaseDirs::new() {
+            cmd.cwd(dirs.home_dir());
+        }
+        if let Err(err) = pump_pty(socket, cmd, size).await {
+            eprintln!("terminal attach: {err}");
+        }
+    }))
+}
+
 /// Client→server text frames carry JSON control; today that is only
 /// `{"resize": {"cols": N, "rows": N}}`. Binary frames are keystrokes.
 #[derive(Deserialize)]
@@ -2439,9 +2478,7 @@ struct AttachResize {
 /// [`AttachControl`]). Returns when either side closes; the attach child is
 /// killed on the way out (the background session survives — verified claude
 /// behavior: "The session keeps running either way").
-async fn bridge_attach(mut socket: WebSocket, id: String, size: PtySize) -> Result<(), String> {
-    let pty = native_pty_system();
-    let pair = pty.openpty(size).map_err(|e| format!("openpty: {e}"))?;
+async fn bridge_attach(socket: WebSocket, id: String, size: PtySize) -> Result<(), String> {
     let mut cmd = CommandBuilder::new(agents::claude_bin());
     cmd.args(["attach", &id]);
     cmd.env("TERM", "xterm-256color");
@@ -2450,10 +2487,24 @@ async fn bridge_attach(mut socket: WebSocket, id: String, size: PtySize) -> Resu
     if let Some(dirs) = directories::BaseDirs::new() {
         cmd.cwd(dirs.home_dir());
     }
+    pump_pty(socket, cmd, size).await
+}
+
+/// Spawns `cmd` inside a PTY of `size` and pumps bytes between it and the
+/// WebSocket: server→client binary frames are raw terminal output;
+/// client→server binary frames are keystrokes, text frames are control (see
+/// [`AttachControl`]). Returns when either side closes; the child is killed
+/// on the way out. Shared by [`bridge_attach`] (`claude attach <id>`) and the
+/// Terminal page's raw-shell endpoint (`terminal_attach`) — both need
+/// identical wire protocol, keepalive, resize, and kill-on-close semantics,
+/// differing only in which command they spawn.
+async fn pump_pty(mut socket: WebSocket, cmd: CommandBuilder, size: PtySize) -> Result<(), String> {
+    let pty = native_pty_system();
+    let pair = pty.openpty(size).map_err(|e| format!("openpty: {e}"))?;
     let mut child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|e| format!("spawn claude attach: {e}"))?;
+        .map_err(|e| format!("spawn pty command: {e}"))?;
     drop(pair.slave);
     let master = pair.master;
     // Once the child is spawned, every error path must reap it — dropping the

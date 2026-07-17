@@ -55,15 +55,17 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
 ]
 
 /**
- * Persistent left nav: three top-level entries sharing one `.nav-item` style —
- * the CC Dashboard, the global Inbox, and Projects. The CC Dashboard owns a
- * fixed subnav of its sub-pages; Projects owns a subnav (the project list +
- * create form), so its row is a disclosure header that collapses its subnav.
- * `ccTab` is the active CC sub-page (or null when off the dashboard) and drives
- * which CC link is highlighted. `version` is bumped by pages after project
- * rename/delete so the list refetches (it is part of the useFetch key). The
- * inbox count live-polls so the badge of items needing triage stays current as
- * agents send.
+ * Persistent left nav: four top-level entries sharing one `.nav-item` style —
+ * the CC Dashboard, the global Inbox, Terminal, and Projects. The CC Dashboard
+ * owns a fixed subnav of its sub-pages; Projects owns a subnav (the project
+ * list + create form), so its row is a disclosure header that collapses its
+ * subnav. `ccTab` is the active CC sub-page (or null when off the dashboard)
+ * and drives which CC link is highlighted. `terminalActive` highlights the
+ * Terminal link the same way `inboxActive` does — the page itself is a
+ * permanent sibling mount in `App.tsx` (mesa task 396), not rendered here.
+ * `version` is bumped by pages after project rename/delete so the list
+ * refetches (it is part of the useFetch key). The inbox count live-polls so
+ * the badge of items needing triage stays current as agents send.
  */
 /**
  * One-line git summary under a project name: branch, a dirty marker with the
@@ -85,11 +87,13 @@ function GitLine({ git }: { git: GitStatus | undefined }) {
 export function Sidebar({
   activeProjectId,
   inboxActive,
+  terminalActive,
   ccTab,
   version,
 }: {
   activeProjectId: number | null
   inboxActive: boolean
+  terminalActive: boolean
   ccTab: CcTab | null
   version: number
 }) {
@@ -213,6 +217,9 @@ export function Sidebar({
       <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
         <span className="nav-item-label">Inbox</span>
         {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+      </a>
+      <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
+        <span className="nav-item-label">Terminal</span>
       </a>
       <button
         type="button"

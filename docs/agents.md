@@ -113,9 +113,10 @@ and `CommandPalette` already use.
   separate fixed element above the pane tree.
 - Layout: panes live in a **split-tree** (`SplitNode`/`LeafNode` in
   `AgentSidebar.tsx`), not a flat list. Each node is either a leaf (one
-  **pane** — `PaneShell`, wrapping either an attached `AgentTerminal` via
-  `AgentPane`, or the session list itself via `AgentListPane`, per the
-  leaf's own `contentKind`) or a split: an ordered list of children, each
+  **pane** — `PaneShell`, wrapping either an attached agent terminal (via
+  `AgentPane`, rendered through the shared pty pool — see below) or the
+  session list itself via `AgentListPane`, per the leaf's own `contentKind`)
+  or a split: an ordered list of children, each
   carrying its own `ratio` (that slot's flex-grow share within the split)
   and oriented `row` (side-by-side) or `column` (stacked). The root is
   always a split node, never a bare leaf; it is seeded on mount with one
@@ -132,14 +133,15 @@ and `CommandPalette` already use.
   out of the tree (`insertLeaf`/`removeLeaf`); a new pane always appends to
   the **root** split's own children, regardless of how deep or mixed the
   tree has become elsewhere — there's no "insert into the currently-focused
-  split" concept. An agent pane's **close** button unmounts its
-  `AgentTerminal` and detaches (the background session itself keeps running,
-  unaffected — same contract as the per-project tab's detach) without
-  touching any other open pane. `SplitNodeView`, the component that
+  split" concept. An agent pane's **close** button removes it from the
+  shared pty pool (below) and detaches (the background session itself keeps
+  running, unaffected — same contract as the per-project tab's detach)
+  without touching any other open pane. `SplitNodeView`, the component that
   recursively renders one split's own direct children, is declared at module
   scope (not nested inside `AgentSidebar`) so its identity never changes
   across a re-render — nesting a per-split component inside `AgentSidebar`'s
-  body would remount every `AgentTerminal` beneath it on every poll tick. The
+  body would remount every open pane's `PtySlot` beneath it on every poll
+  tick. The
   session-list data/handlers (`agents`, `collapsedSections`, `onTogglePane`,
   ...) reach `AgentListPane` the same way — bundled into one `ListPaneProps`
   object threaded down through `SplitNodeView`'s props, never a closure over
@@ -235,6 +237,23 @@ and `CommandPalette` already use.
   the pixel-clipping trap `overflow: hidden` alone has: content narrower than
   its own natural width but positioned inside the still-laid-out (just
   invisible) body can't peek through the collapsed rail's clipped edge.
+- **Split and cross-split move also never drop a live session.** A
+  drag-to-edge split or a cross-split move reparents a leaf under a
+  freshly-minted split-node id, which would otherwise remount every leaf
+  underneath — including its attached terminal, since React's keyed
+  reconciliation only compares siblings within one parent's array in one
+  commit. Each pane's terminal is therefore never rendered directly at its
+  tree position: it's portaled once into a stable, pool-owned DOM container
+  (`frontend/src/lib/ptyPool.ts` + an always-mounted `PtyPool` + a `PtySlot`
+  placeholder at each tree position — shared verbatim with the Terminal
+  page, `docs/terminal.md`), and a tree position just relocates that
+  container via `appendChild` whenever it mounts there. Only an explicit
+  close removes an entry from the pool, so a reorganize preserves the
+  `claude attach` scrollback and connection with no reconnect banner. Built
+  primarily for the Terminal page's stronger requirement (there's no
+  background session to reconnect to there, so the pre-fix behavior was an
+  unrecoverable process kill, not just a lost scrollback); fixed here as an
+  incidental consequence of sharing the same mechanism.
 - The list poll itself pauses while collapsed (`pollMs` only set when
   expanded) — nobody can see the list, and each poll costs a `claude agents`
   subprocess; reopening triggers an immediate one-off fetch.

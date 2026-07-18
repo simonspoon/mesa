@@ -110,6 +110,10 @@ type FrameEdgeType = Edge<
     waypoints: Waypoint[]
     fromAnchor: AnchorSide | null
     toAnchor: AnchorSide | null
+    /** Perpendicular bow (px, signed) applied to this edge's drawn path when
+     *  it shares both endpoint frames with one or more other edges — see
+     *  `parallelOffsets` below. Zero for a lone edge between its two frames. */
+    dupOffset: number
     onSaveLabel: (next: string) => Promise<void>
     onDelete: () => void
     onSaveWaypoints: (next: Waypoint[]) => Promise<void>
@@ -554,11 +558,18 @@ function midpointOfPolyline(points: Point[]): Point {
  *
  * Empty case: byte-identical to the original plain-bezier rendering — both
  * endpoint anchors snap toward the *other* frame's centre and a single
- * `getBezierPath` call draws the curve.
+ * `getBezierPath` call draws the curve. Unless `dupOffset` is non-zero (this
+ * edge shares both endpoint frames with at least one other edge), in which
+ * case the drawn path bows perpendicular to the start-end line by that many
+ * px instead — see `parallelOffsets` — so parallel connectors between the
+ * same two frames no longer draw pixel-identical (and so click/select the
+ * wrong one, mesa task 412). `anchors` stays `[start, end]` regardless, so
+ * waypoint insertion/handle rendering (which read `anchors`) are unaffected.
  *
  * Non-empty case: the start anchor snaps toward the first waypoint and the
  * end anchor toward the last one, and the route is a smooth spline through
- * every anchor in order.
+ * every anchor in order. Already-diverging (real waypoints exist), so
+ * `dupOffset` is not applied here.
  */
 function buildRoutedPath(
   from: Rect,
@@ -566,6 +577,7 @@ function buildRoutedPath(
   waypoints: Point[],
   fromAnchor: AnchorSide | null,
   toAnchor: AnchorSide | null,
+  dupOffset = 0,
 ): { path: string; anchors: Point[]; mid: Point } {
   if (waypoints.length === 0) {
     const start = fromAnchor
@@ -574,6 +586,17 @@ function buildRoutedPath(
     const end = toAnchor
       ? lockedAnchor(to, toAnchor as Position)
       : nearestAnchor(to, { x: cx(from), y: cy(from) })
+    const anchors = [start, end]
+    if (dupOffset !== 0) {
+      const dx = end.x - start.x
+      const dy = end.y - start.y
+      const len = Math.hypot(dx, dy) || 1
+      const bow = {
+        x: (start.x + end.x) / 2 - (dy / len) * dupOffset,
+        y: (start.y + end.y) / 2 + (dx / len) * dupOffset,
+      }
+      return { path: smoothPath([start, bow, end]), anchors, mid: bow }
+    }
     const [path] = getBezierPath({
       sourceX: start.x,
       sourceY: start.y,
@@ -582,7 +605,6 @@ function buildRoutedPath(
       targetY: end.y,
       targetPosition: end.position,
     })
-    const anchors = [start, end]
     return { path, anchors, mid: midpointOfPolyline(anchors) }
   }
 
@@ -610,6 +632,34 @@ function distToSegmentSq(p: Point, a: Point, b: Point): number {
   const cx2 = a.x + t * dx
   const cy2 = a.y + t * dy
   return (p.x - cx2) ** 2 + (p.y - cy2) ** 2
+}
+
+/** Perpendicular bow (px) to draw each edge's plain-bezier path with, keyed
+ *  by edge id — zero unless the edge shares both endpoint frames (in either
+ *  direction) with at least one sibling edge, in which case siblings fan out
+ *  evenly around the straight line so they no longer draw pixel-identical
+ *  (mesa task 412: pixel-identical paths meant only the topmost of a pair was
+ *  ever clickable, so the other could never be selected/edited/deleted). */
+function parallelOffsets(
+  edges: { id: number; from_frame: number; to_frame: number }[],
+): Map<number, number> {
+  const SPACING = 40
+  const groups = new Map<string, number[]>()
+  for (const e of edges) {
+    const key =
+      e.from_frame < e.to_frame
+        ? `${e.from_frame}:${e.to_frame}`
+        : `${e.to_frame}:${e.from_frame}`
+    const ids = groups.get(key) ?? []
+    ids.push(e.id)
+    groups.set(key, ids)
+  }
+  const offsets = new Map<number, number>()
+  for (const ids of groups.values()) {
+    if (ids.length < 2) continue
+    ids.forEach((id, i) => offsets.set(id, (i - (ids.length - 1) / 2) * SPACING))
+  }
+  return offsets
 }
 
 /**
@@ -699,6 +749,7 @@ function FrameEdgeView({
     waypoints,
     data.fromAnchor,
     data.toAnchor,
+    data.dupOffset,
   )
   const isEmpty = !(data.label && data.label.trim())
 
@@ -1098,28 +1149,28 @@ export function StoryboardCanvas({
   )
 
   // Edges derive straight from the server view — no local edge state to sync.
-  const edges: FrameEdgeType[] = useMemo(
-    () =>
-      view.edges.map((e) => ({
-        id: String(e.id),
-        source: String(e.from_frame),
-        target: String(e.to_frame),
-        type: 'frame' as const,
-        data: {
-          label: e.label,
-          waypoints: e.waypoints,
-          fromAnchor: e.from_anchor,
-          toAnchor: e.to_anchor,
-          onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
-          onDelete: () => removeEdge(e.id),
-          onSaveWaypoints: (next: Waypoint[]) => editEdgeWaypoints(e.id, next),
-          onSaveAnchor: (end: 'from' | 'to', side: AnchorSide | null) =>
-            editEdgeAnchor(e.id, end, side),
-        },
-        markerEnd: { type: MarkerType.ArrowClosed, color: '#00e5ff' },
-      })),
-    [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints, editEdgeAnchor],
-  )
+  const edges: FrameEdgeType[] = useMemo(() => {
+    const dupOffsets = parallelOffsets(view.edges)
+    return view.edges.map((e) => ({
+      id: String(e.id),
+      source: String(e.from_frame),
+      target: String(e.to_frame),
+      type: 'frame' as const,
+      data: {
+        label: e.label,
+        waypoints: e.waypoints,
+        fromAnchor: e.from_anchor,
+        toAnchor: e.to_anchor,
+        dupOffset: dupOffsets.get(e.id) ?? 0,
+        onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
+        onDelete: () => removeEdge(e.id),
+        onSaveWaypoints: (next: Waypoint[]) => editEdgeWaypoints(e.id, next),
+        onSaveAnchor: (end: 'from' | 'to', side: AnchorSide | null) =>
+          editEdgeAnchor(e.id, end, side),
+      },
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#00e5ff' },
+    }))
+  }, [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints, editEdgeAnchor])
 
   // The shape set this board's diagram_type allows, and — for the gestures
   // that don't offer an explicit shape choice (pane double-click,

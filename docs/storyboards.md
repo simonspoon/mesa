@@ -109,6 +109,21 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   locked, the other floating, or each locked to a different side) is valid.
   No CLI flag for authoring anchors — same "round-trips automatically as a
   struct member, no setter" treatment as `waypoints`.
+- **Parallel edges between the same two frames** (mesa task 412): with no
+  waypoints and both anchors unlocked, `buildRoutedPath` used to compute a
+  byte-identical path/label position for every edge sharing both endpoint
+  frames (in either direction — `A->B` and `B->A` land on the same two anchor
+  points too), so two or more parallel connectors drew fully overlapped and
+  only the topmost was ever clickable — the other could never be selected,
+  relabeled, or deleted. `buildRoutedPath` now takes a `dupOffset` (px,
+  signed): edges sharing an unordered frame pair (`parallelOffsets` in
+  `StoryboardCanvas.tsx`, keyed by edge id) fan out evenly around the straight
+  line via a perpendicular bow (rendered through the existing `smoothPath`
+  spline machinery, `anchors` unchanged at `[start, end]` so waypoint
+  insertion/handle rendering aren't affected). A lone edge between its two
+  frames gets `dupOffset: 0` and renders byte-identical to before this fix;
+  an edge with real waypoints already diverges naturally, so `dupOffset` is
+  only applied in the plain-bezier (no-waypoints) branch.
 - **Diagram types + per-frame shapes** (spec 355): a storyboard carries a
   `diagram_type` (`Storyboard.diagram_type: DiagramType`) — `storyboard`
   (default), `flowchart`, or `erd` — stored as a **bare lowercase string**

@@ -15,7 +15,7 @@ import { updateTaskPosition } from './api'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
-const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
+const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done']
 
 function CardBody({ task }: { task: TaskSummary }) {
   return (

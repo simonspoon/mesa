@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import {
-  createProject,
   getGitStatus,
   listAllAgents,
   listInbox,
@@ -12,6 +11,7 @@ import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { useFetch } from '../useFetch'
 import { ConfirmDelete } from './ConfirmDelete'
+import { CreateProjectModal } from './CreateProjectModal'
 import { isRunningAgent, projectForCwd } from '../agentProject'
 
 /**
@@ -140,8 +140,7 @@ export function Sidebar({
       if (p) activeAgentProjectIds.add(p.id)
     }
   }
-  const [name, setName] = useState('')
-  const [createError, setCreateError] = useState<string | null>(null)
+  const [creatingProject, setCreatingProject] = useState(false)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
   // Full-sidebar collapse: hides the whole nav to give the main content area
@@ -171,20 +170,6 @@ export function Sidebar({
           »
         </button>
       </nav>
-    )
-  }
-
-  function submit(e: React.FormEvent) {
-    e.preventDefault()
-    createProject(name).then(
-      () => {
-        setName('')
-        setCreateError(null)
-        refetch()
-      },
-      (err: unknown) => {
-        setCreateError(err instanceof Error ? err.message : String(err))
-      },
     )
   }
 
@@ -261,17 +246,13 @@ export function Sidebar({
               ))}
             </ul>
           )}
-          <form className="nav-create" onSubmit={submit}>
-            <input
-              type="text"
-              value={name}
-              placeholder="new project"
-              required
-              onChange={(e) => setName(e.target.value)}
-            />
-            <button type="submit">+</button>
-          </form>
-          {createError && <p className="error">{createError}</p>}
+          <button
+            type="button"
+            className="nav-create-button"
+            onClick={() => setCreatingProject(true)}
+          >
+            + new project
+          </button>
         </>
       )}
       <div className="nav-footer">
@@ -281,6 +262,15 @@ export function Sidebar({
           onDelete={handleRestart}
         />
       </div>
+      {creatingProject && (
+        <CreateProjectModal
+          onClose={() => setCreatingProject(false)}
+          onCreated={() => {
+            setCreatingProject(false)
+            refetch()
+          }}
+        />
+      )}
     </nav>
   )
 }

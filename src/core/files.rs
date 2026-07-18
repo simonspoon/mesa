@@ -11,7 +11,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::core::types::{FileContentView, FileTreeEntry};
+use crate::core::types::{DirEntry, DirListing, FileContentView, FileTreeEntry};
 
 /// Mirrors `git.rs`'s `DIFF_CAP` precedent: one huge file can't balloon the
 /// JSON response.
@@ -194,6 +194,70 @@ fn walk_dir(
         });
     }
     out
+}
+
+/// Backs `GET /api/fs/dirs` (the new-project folder picker; see
+/// `.scratch/arch.md` under mesa task 405). UNLIKE every other function in
+/// this module, this is deliberately NOT bound to any root — there is no
+/// `local_path`/project to be contained within, so it does not call or
+/// extend [`safe_path`]. The security boundary is the OS's own permission
+/// model (the caller's OS user, enforced by `fs::read_dir` itself failing on
+/// paths that user can't read) plus the loopback-only access gate at the API
+/// layer — not a path prefix this function checks.
+///
+/// 1. `fs::canonicalize(path)` resolves `.`/`..`/symlinks to one
+///    deterministic absolute path; a nonexistent path errors out to `None`
+///    here rather than round-tripping to `read_dir` first.
+/// 2. Reject if the canonical path is not a directory -> `None`.
+/// 3. `fs::read_dir` the canonical path; any error (permission denied — the
+///    OS boundary above firing) collapses to `None`, same "swallow as not
+///    found" precedent `tree_of`'s per-subdirectory `read_dir` errors use.
+/// 4. List only entries that are themselves directories, using
+///    `entry.path().metadata()` (follows symlinks) rather than
+///    `symlink_metadata()` — the opposite of `walk_dir`'s choice. `walk_dir`
+///    avoids following symlinks because it is a recursive, bound-checked
+///    walk where following could escape the root or cycle; this is a single-
+///    level listing with no root to escape and no recursion to cycle, so a
+///    symlinked directory is just a real, reachable folder the user may
+///    legitimately want to pick. An entry whose `metadata()` fails
+///    (permission denied, dangling symlink) is skipped rather than failing
+///    the whole listing. `EXCLUDED_DIRS` is deliberately not applied either —
+///    `node_modules`/dotfiles must remain pickable as a project root, unlike
+///    in a de-noised recursive tree view.
+///
+/// Each entry's `path` is `entry.path()` — the directory's own location
+/// (`canon.join(name)`), NOT a further-resolved symlink target: a symlinked
+/// entry's `path` still points at the symlink itself (basename always
+/// matches `name`), it is only its directory-ness that follows the link.
+///
+/// `entries` is sorted alphabetically by name; `parent` is the canonical
+/// path's own parent directory, or `None` at the filesystem root.
+pub fn list_dir(path: &str) -> Option<DirListing> {
+    let canon = fs::canonicalize(path).ok()?;
+    if !canon.is_dir() {
+        return None;
+    }
+    let read_dir = fs::read_dir(&canon).ok()?;
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for entry in read_dir.flatten() {
+        let Ok(meta) = entry.path().metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        entries.push(DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry.path().to_string_lossy().into_owned(),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let parent = canon.parent().map(|p| p.to_string_lossy().into_owned());
+    Some(DirListing {
+        path: canon.to_string_lossy().into_owned(),
+        parent,
+        entries,
+    })
 }
 
 /// Resolves `rel` via [`safe_path`], then:
@@ -393,6 +457,93 @@ mod tests {
         symlink(&outside, root.join("linkdir")).unwrap();
 
         assert_eq!(safe_path(root.to_str().unwrap(), "linkdir/f.txt"), None);
+    }
+
+    // --- list_dir --------------------------------------------------------
+
+    #[test]
+    fn list_dir_lists_subdirectories_only_sorted_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("zzz")).unwrap();
+        fs::create_dir_all(root.join("aaa")).unwrap();
+        fs::write(root.join("a_file.txt"), "x").unwrap();
+
+        let listing = list_dir(root.to_str().unwrap()).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["aaa", "zzz"]);
+    }
+
+    #[test]
+    fn list_dir_does_not_exclude_dotfiles_or_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        let listing = list_dir(root.to_str().unwrap()).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".git"));
+        assert!(names.contains(&"node_modules"));
+    }
+
+    #[test]
+    fn list_dir_resolves_canonical_path_and_reports_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+
+        let listing = list_dir(root.join("sub").join("..").to_str().unwrap()).unwrap();
+        let canon_root = fs::canonicalize(root).unwrap();
+        assert_eq!(listing.path, canon_root.to_string_lossy());
+        let parent = canon_root.parent().unwrap().to_string_lossy().into_owned();
+        assert_eq!(listing.parent.as_deref(), Some(parent.as_str()));
+    }
+
+    #[test]
+    fn list_dir_none_for_root_relative_traversal_that_does_not_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            list_dir(root.join("does/not/exist/../../nope").to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn list_dir_none_for_nonexistent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(list_dir(dir.path().join("gone").to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn list_dir_none_for_file_given_as_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        assert_eq!(list_dir(dir.path().join("f.txt").to_str().unwrap()), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_dir_follows_symlinked_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("linkdir")).unwrap();
+
+        let listing = list_dir(root.to_str().unwrap()).unwrap();
+        let entry = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "linkdir")
+            .unwrap();
+        // Listed as a directory (the symlink is followed to classify it),
+        // but its `path` stays the symlink's own location, not the resolved
+        // target — basename(path) == name always holds.
+        let canon_root = fs::canonicalize(&root).unwrap();
+        assert_eq!(entry.path, canon_root.join("linkdir").to_string_lossy());
     }
 
     // --- tree_of ---------------------------------------------------------

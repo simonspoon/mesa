@@ -10,6 +10,7 @@ import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
 import type { DiagramType } from './types/DiagramType'
+import type { DirListing } from './types/DirListing'
 import type { FileContentView } from './types/FileContentView'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
@@ -166,8 +167,12 @@ export interface TaskPatch {
 export function createProject(
   name: string,
   description?: string,
+  local_path?: string,
 ): Promise<Project> {
-  return request('/api/projects', jsonInit('POST', { name, description }))
+  return request(
+    '/api/projects',
+    jsonInit('POST', { name, description, local_path }),
+  )
 }
 
 export function updateProject(id: number, patch: ProjectPatch): Promise<Project> {
@@ -314,6 +319,20 @@ export function getProjectGitCommitDiff(
   return request(
     `/api/projects/${id}/git/commits/${encodeURIComponent(sha)}/diff?path=${encodeURIComponent(path)}`,
   )
+}
+
+// ---- fs (server-side directory listing, backs the new-project folder picker) ----
+
+/**
+ * Directories under `path` (or the server's `$HOME` if omitted). Directories
+ * only, one level deep — used to drive the new-project folder-picker's
+ * navigation (breadcrumb via `parent`, click-to-enter via each entry's
+ * `path`). Loopback-gated server-side, but same-origin fetches from the web
+ * UI clear that transparently.
+ */
+export function listFsDirs(path?: string): Promise<DirListing> {
+  const qs = path !== undefined ? `?path=${encodeURIComponent(path)}` : ''
+  return request(`/api/fs/dirs${qs}`)
 }
 
 // ---- files (read-only file tree + content, local_path-anchored) ----

@@ -1083,6 +1083,37 @@ pub struct FileContentView {
     pub language: Option<String>,
 }
 
+/// One subdirectory entry in a [`DirListing`] (see `core::files::list_dir`).
+/// Directories only — this endpoint never lists files (see arch.md #4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct DirEntry {
+    /// Basename.
+    pub name: String,
+    /// Absolute path (parent's canonical path + this basename). For a
+    /// symlinked directory this is the symlink's own location, not its
+    /// resolved target — `metadata()` follows the link to confirm it's a
+    /// directory, but `path` is never further-resolved, so `basename(path)
+    /// == name` always holds.
+    pub path: String,
+}
+
+/// `GET /api/fs/dirs` response — a single-level, non-recursive listing of one
+/// directory's subdirectories, for the web UI's new-project folder picker.
+/// Unlike [`FileTreeEntry`]/[`ProjectFileTree`], this is not rooted at any
+/// project's `local_path`: `path` is whatever absolute filesystem path the
+/// caller asked for (see `.scratch/arch.md` #0, mesa task 405).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct DirListing {
+    /// Canonical absolute path of the directory actually listed.
+    pub path: String,
+    /// Canonical absolute path of `path`'s parent, or None at `/`. Lets the
+    /// frontend implement "up one level" without doing its own path math.
+    pub parent: Option<String>,
+    pub entries: Vec<DirEntry>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

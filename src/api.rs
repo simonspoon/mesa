@@ -452,6 +452,11 @@ fn router(state: AppState) -> Router {
             "/api/projects/{id}/files/content",
             get(get_project_files_content).patch(update_project_files_content),
         )
+        // New-project folder picker: unscoped (not one project's local_path)
+        // server-side directory listing. Loopback-only in BOTH serve modes,
+        // reusing `require_local_path_write` as-is — see that fn's doc and
+        // `docs/fs-browse.md`. GET, so the Content-Type gate doesn't apply.
+        .route("/api/fs/dirs", get(list_fs_dirs))
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -637,7 +642,12 @@ async fn create_project(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     if body.local_path.is_some() {
-        require_local_path_write(&state, &addr, &headers)?;
+        require_local_path_write(
+            &state,
+            &addr,
+            &headers,
+            "local_path is an agent execution anchor; it can only be set from this machine",
+        )?;
     }
     let mut store = state.store.lock().unwrap();
     let project = store.create_project(
@@ -671,7 +681,12 @@ async fn update_project(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     if body.local_path.is_some() {
-        require_local_path_write(&state, &addr, &headers)?;
+        require_local_path_write(
+            &state,
+            &addr,
+            &headers,
+            "local_path is an agent execution anchor; it can only be set from this machine",
+        )?;
     }
     let patch = ProjectPatch {
         name: body.name,
@@ -1968,6 +1983,69 @@ async fn update_project_files_content(
     view.map(|v| Json(v).into_response()).ok_or_else(not_found)
 }
 
+#[derive(Deserialize)]
+struct FsDirsQuery {
+    path: Option<String>,
+}
+
+/// `GET /api/fs/dirs` — server-side directory listing backing the web UI's
+/// new-project folder picker (mesa task 405; see `.scratch/arch.md`, spec
+/// task 404's Open Question A). UNLIKE the Files tab above, this is not
+/// project-scoped and not rooted at any `local_path`: `path` is an absolute
+/// filesystem path (or omitted, defaulting to `$HOME` via the same
+/// `directories::BaseDirs::new().home_dir()` call `terminal_attach`/
+/// `bridge_attach` already use). Gated by [`require_local_path_write`] as-is
+/// (loopback-only in BOTH `serve` modes) — arch.md §6: browsing the
+/// filesystem is the same capability class as anchoring where an agent
+/// executes, not plain CRUD, so it gets the same boundary. The bound on
+/// *which* paths can be listed is the OS's own permission model, not a mesa-
+/// imposed prefix (arch.md §0-§2) — `core::files::list_dir` does the
+/// resolve/read; any failure (unresolvable path, not a directory, unreadable)
+/// collapses to 404 `not_found`, matching the Files tab's own "one case for
+/// traversal/absolute/unlisted/directory" precedent. GET, so the
+/// Content-Type/CSRF gate does not apply.
+async fn list_fs_dirs(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<FsDirsQuery>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "this endpoint is loopback-only; connect from this machine",
+    )?;
+    let requested = match q.path {
+        Some(p) => p,
+        None => {
+            let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+            match home {
+                Some(h) => h.to_string_lossy().into_owned(),
+                None => {
+                    return Err(ApiError {
+                        status: StatusCode::NOT_FOUND,
+                        code: "not_found",
+                        message: "could not resolve home directory".into(),
+                    });
+                }
+            }
+        }
+    };
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("directory not found: {requested}"),
+    };
+    let lookup = requested.clone();
+    let listing = tokio::task::spawn_blocking(move || files::list_dir(&lookup))
+        .await
+        .unwrap_or(None);
+    listing
+        .map(|v| Json(v).into_response())
+        .ok_or_else(not_found)
+}
+
 /// Terminal access is code execution on this machine — a strictly stronger
 /// capability than the task CRUD the rest of the API exposes. In default
 /// (loopback) mode the agent endpoints are never served to non-local peers.
@@ -1996,16 +2074,23 @@ fn require_loopback(addr: &SocketAddr) -> Result<(), ApiError> {
 /// own hostname in Host — the same confused-deputy the agent routes block —
 /// hence the Host/Origin checks stack on top (in default mode `guard` already
 /// pinned the Host).
+///
+/// Also reused as-is (not duplicated) by the filesystem-browse endpoint
+/// (`GET /api/fs/dirs`, mesa task 405/arch.md §6) — a read-only directory
+/// listing is a different capability than writing `local_path`, but the same
+/// "loopback-only in BOTH modes" rationale applies (filesystem-exposure
+/// adjacent to the execution-anchor concept, not plain CRUD), so `message`
+/// is caller-supplied rather than hardcoded to `local_path`-specific copy.
 fn require_local_path_write(
     state: &AppState,
     addr: &SocketAddr,
     headers: &HeaderMap,
+    message: &'static str,
 ) -> Result<(), ApiError> {
     require_loopback(addr).map_err(|_| ApiError {
         status: StatusCode::FORBIDDEN,
         code: "validation",
-        message: "local_path is an agent execution anchor; it can only be set from this machine"
-            .into(),
+        message: message.into(),
     })?;
     if state.lan {
         require_lan_page_access(addr, headers, state.port)?;
@@ -3226,6 +3311,132 @@ mod tests {
         )
         .await;
         assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    // --- fs/dirs: GET /api/fs/dirs (mesa task 405) --------------------------
+
+    #[tokio::test]
+    async fn fs_dirs_returns_listing_for_loopback_request() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("sub_b")).unwrap();
+        std::fs::create_dir_all(root.join("sub_a")).unwrap();
+        std::fs::write(root.join("a_file.txt"), "x").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+
+        let resp = list_fs_dirs(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Query(FsDirsQuery {
+                path: Some(root_str.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        // Canonicalized, so compare against fs::canonicalize, not the raw
+        // tempdir path (may differ on macOS's /private/tmp symlink).
+        let canon_root = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(body["path"], serde_json::json!(canon_root));
+        let names: Vec<&str> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        // Directories only, alphabetically sorted; the file is excluded.
+        assert_eq!(names, vec!["sub_a", "sub_b"]);
+    }
+
+    #[tokio::test]
+    async fn fs_dirs_defaults_to_home_dir_when_path_omitted() {
+        let (_dir, state) = test_state();
+        let resp = list_fs_dirs(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Query(FsDirsQuery { path: None }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let home = directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_string_lossy()
+            .into_owned();
+        let canon_home = std::fs::canonicalize(&home)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(body["path"], serde_json::json!(canon_home));
+    }
+
+    #[tokio::test]
+    async fn fs_dirs_not_found_for_nonexistent_or_non_directory_path() {
+        let (dir, state) = test_state();
+        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+
+        for bad in [
+            dir.path().join("nope").to_str().unwrap().to_string(),
+            dir.path().join("a.txt").to_str().unwrap().to_string(),
+        ] {
+            let resp = list_fs_dirs(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Query(FsDirsQuery {
+                    path: Some(bad.clone()),
+                }),
+            )
+            .await;
+            let err = resp.unwrap_err();
+            assert_eq!(err.status, StatusCode::NOT_FOUND, "path {bad:?}");
+            assert_eq!(err.code, "not_found", "path {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_dirs_rejects_non_loopback_peer_in_default_mode() {
+        let (dir, state) = test_state();
+        assert!(!state.lan);
+        let resp = list_fs_dirs(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Query(FsDirsQuery {
+                path: Some(dir.path().to_str().unwrap().to_string()),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn fs_dirs_rejects_non_loopback_peer_under_lan_mode() {
+        let (dir, mut state) = test_state();
+        state.lan = true;
+        // A Host/Origin pair that would satisfy `require_lan_page_access` on
+        // its own — the loopback check must still reject this peer first,
+        // proving the endpoint is loopback-only in BOTH modes, not just
+        // default.
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let resp = list_fs_dirs(
+            State(state),
+            ConnectInfo(lan_peer()),
+            headers,
+            Query(FsDirsQuery {
+                path: Some(dir.path().to_str().unwrap().to_string()),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
     }
 
     // --- Locked edge anchors: three-state PATCH validation (mesa task 350) ---

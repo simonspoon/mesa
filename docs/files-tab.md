@@ -15,14 +15,24 @@ this surface.
   requires the result to be `root` itself or a descendant — rejects
   `../` traversal, absolute-path smuggling, symlink escapes, and nonexistent
   paths in one check. `read_file` and `write_file` are its only callers.
-- `pub fn tree_of(root: &str) -> (Vec<FileTreeEntry>, bool)` walks `root`
-  (assumed already verified as a live directory by the caller), excluding
-  `EXCLUDED_DIRS` (`.git`, `node_modules`, `target`, `dist`, `build`, `.venv`,
-  `venv`, `__pycache__`, `.next`, `vendor`, `.cache`) at any depth, sorting
-  directories before files. Stops adding/descending at `MAX_TREE_ENTRIES`
-  (2,000 nodes) or `MAX_TREE_DEPTH` (12 levels), returning a `truncated` flag.
+- `pub fn tree_level(root: &str, rel: &str) -> Option<(Vec<FileTreeEntry>, bool)>`
+  (mesa task 410) lists ONE directory level — `root` itself when `rel` is
+  `""`, else the subdirectory `rel` resolves to underneath `root`, resolved
+  via [`safe_path`] exactly like `read_file`/`write_file` (`None` for
+  traversal, absolute-path smuggling, a nonexistent path, or a `rel` that
+  resolves to a file). Excludes `EXCLUDED_DIRS` (`.git`, `node_modules`,
+  `target`, `dist`, `build`, `.venv`, `venv`, `__pycache__`, `.next`,
+  `vendor`, `.cache`) by name, sorting directories before files. Caps at
+  `MAX_TREE_ENTRIES` (2,000 entries) — now a **per-directory** cap, not a
+  whole-tree one, since a call only ever lists one level; the client re-calls
+  this per directory on expand to go deeper. A single flat directory with
+  more than 2,000 entries is still capped — laziness alone doesn't solve
+  that, it only moves the cap from the whole tree to one folder at a time.
   Symlinks are listed as file leaves and never followed (one rule covers both
-  escape and cycle risk).
+  escape and cycle risk). Replaces the old whole-tree recursive `tree_of`/
+  `walk_dir` (and the `MAX_TREE_DEPTH` cap that bounded its recursion) —
+  depth is now driven entirely by which directories the client has expanded,
+  not by a server-side limit.
 - `pub fn read_file(root: &str, rel: &str) -> Option<FileContentView>`
   resolves `rel` via `safe_path`, rejects directories, detects binaries via an
   extension allowlist or a NUL-byte sniff (`content: ""` for those), else
@@ -42,12 +52,21 @@ this surface.
   `read_file` itself collapses to `None` (traversal, absolute path,
   unlisted/nonexistent path, a directory) — plus an `fs::write` I/O failure —
   collapses the same way here, to `WriteFileError::NotFound`.
-- `GET /api/projects/{id}/files` → `ProjectFileTree` via `files::tree_of`.
-  Same three-rung empty-state ladder as the Git tab: no `local_path` →
+- `GET /api/projects/{id}/files[?path=<rel>]` → `ProjectFileTree` via
+  `files::tree_level` — one directory level per call (mesa task 410). `path`
+  omitted lists `local_path` itself (the root level); `path` given lists that
+  subdirectory instead. The three-rung empty-state ladder (no `local_path` →
   `{path: null, tree: null}`; dead/unreadable folder → `{path, tree: null}`;
-  live folder → `{path, tree: Some(entries), truncated}`. Never an error.
-  Cached 5s per folder (`AppState.files_tree_cache`) — walking a large repo
-  isn't free either.
+  live folder → `{path, tree: Some(entries), truncated}`, never an error)
+  applies only to the root call — a `path`-scoped call for an invalid/
+  traversal/nonexistent/non-directory subpath is 404 `not_found` instead,
+  matching the content route's own collapse-many-causes precedent. Each
+  entry no longer nests a recursive `children` field: the frontend fetches a
+  directory's contents lazily, on first expand, via a separate `?path=` call
+  for that directory, and caches the result itself — "not yet fetched" lives
+  only in frontend state, never on the wire. Cached 5s per `(local_path,
+  path)` pair (`AppState.files_tree_cache`) — walking a directory isn't free
+  either.
 - `GET /api/projects/{id}/files/content?path=<relpath>` → `FileContentView`
   via `files::read_file`. Missing `?path=` is 422 `validation` (matches the
   Git tab's diff routes). No `local_path` / dead folder, or `read_file`
@@ -78,7 +97,16 @@ this surface.
   toggled open/closed in local component state, no deep-linking) and a
   right-hand content pane, registered like the Git/Agents/Storyboards tabs (a
   boolean `files` route prop threaded `App.tsx` → `ProjectTasksPage.tsx`'s tab
-  bar + content switch). A non-binary, non-truncated file's content pane
+  bar + content switch). The root level loads eagerly with the tab (one
+  `getProjectFiles(id)` call); each directory's contents load lazily on
+  first expand (`getProjectFiles(id, path)`) and are cached in a
+  `childrenCache: Map<path, DirState>` (`DirState` = `'loading' | 'error' |
+  {entries, truncated}`) that lives for the component's lifetime, so
+  collapsing and re-expanding a directory never re-fetches it — reset only
+  on project change, same as `selectedPath`/`expanded`. A `truncated`
+  directory shows its own inline note (`.files-tree-note`) rather than one
+  global banner, since the cap is now per-directory (mesa task 410). A
+  non-binary, non-truncated file's content pane
   shows an **Edit** button; clicking it swaps the rendered content for a
   full-height `<textarea>` (`.files-content-editor`) pre-filled with the
   current content, with Save/Cancel actions (Escape cancels, Cmd/Ctrl+Enter

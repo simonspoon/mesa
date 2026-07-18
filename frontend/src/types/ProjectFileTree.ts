@@ -2,17 +2,22 @@
 import type { FileTreeEntry } from "./FileTreeEntry";
 
 /**
- * `GET /api/projects/{id}/files` response. Ladder mirrors `ProjectGitView`:
- * path null = no local_path; path set + tree null = dead/unreadable folder;
- * path set + tree = Some(_) = live folder (root itself always readable at
- * that point, so this is never Some(vec![]) representing "unreadable" — an
- * unreadable root collapses to the dead-folder rung, same as git's is_dir
- * check). Never an error.
+ * `GET /api/projects/{id}/files[?path=<rel>]` response — one directory
+ * level: `local_path` itself when `path` is omitted, else the subdirectory
+ * `path` resolves to. Ladder mirrors `ProjectGitView`, and only applies to
+ * the root call (`path` omitted): tree null = no local_path; path set +
+ * tree null = dead/unreadable folder; path set + tree = Some(_) = live
+ * folder (root itself always readable at that point, so this is never
+ * Some(vec![]) representing "unreadable" — an unreadable root collapses to
+ * the dead-folder rung, same as git's is_dir check). A `path`-scoped call
+ * for an invalid/traversal/nonexistent subdirectory is a 404, not a rung of
+ * this ladder. Never a 5xx.
  */
 export type ProjectFileTree = { path: string | null, tree: Array<FileTreeEntry> | null, 
 /**
- * True iff MAX_TREE_ENTRIES or MAX_TREE_DEPTH was hit anywhere during
- * the walk (one global flag, not per-node — good enough to tell the UI
- * "this repo is bigger than what you're seeing").
+ * True iff MAX_TREE_ENTRIES was hit for THIS level (a per-directory
+ * cap now, not a whole-tree flag — a single flat directory with more
+ * entries than the cap is still capped; laziness alone doesn't solve
+ * that).
  */
 truncated: boolean, };

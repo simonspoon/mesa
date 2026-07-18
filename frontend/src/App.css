@@ -2671,6 +2671,16 @@ body.agent-sidebar-resizing {
   box-shadow: inset 0 0 0 1px var(--cyan-dim);
 }
 
+/* Loading/error/truncated rows under a lazily-expanded directory (mesa task
+   410) — informational, not a row a click does anything with. */
+.files-tree-note {
+  cursor: default;
+}
+
+.files-tree-note:hover {
+  background: none;
+}
+
 .files-content-pane {
   flex: 1;
   min-width: 0;

@@ -17,12 +17,10 @@ use crate::core::types::{DirEntry, DirListing, FileContentView, FileTreeEntry};
 /// JSON response.
 const FILE_CONTENT_CAP: usize = 256 * 1024;
 
-/// Total nodes added across a `tree_of` walk before it stops adding more.
+/// Entries returned for one directory level (`tree_level`) before it stops
+/// adding more. Applies per call now, not to a whole recursive walk — a
+/// directory listing is one level, so this is the only cap that remains.
 const MAX_TREE_ENTRIES: usize = 2_000;
-
-/// Directory nesting levels `tree_of` will descend before it stops
-/// descending further.
-const MAX_TREE_DEPTH: usize = 12;
 
 /// Directory names excluded at any depth — common VCS/dependency/build
 /// output that would otherwise dominate a tree listing.
@@ -111,39 +109,32 @@ pub fn safe_path(root: &str, rel: &str) -> Option<PathBuf> {
     }
 }
 
-/// Walks `root` (assumed already verified as a live, readable directory by
-/// the caller — same division of labor as `git.rs`'s `is_dir` check living
-/// in `api.rs`, not in `view_of`). Excludes [`EXCLUDED_DIRS`] by name at any
-/// depth, sorts directories-before-files alphabetically at each level, stops
-/// descending/adding once [`MAX_TREE_DEPTH`] or [`MAX_TREE_ENTRIES`] is hit.
-/// Symlinks are listed but never followed (`is_dir: false` for a symlinked
-/// dir — avoids both escape and cycle risk with one rule). Any `read_dir`
-/// error on a sub-directory (permissions) is swallowed as "no children" for
-/// that node, not a failure of the whole walk.
-pub fn tree_of(root: &str) -> (Vec<FileTreeEntry>, bool) {
-    let mut count = 0usize;
-    let mut truncated = false;
-    let entries = walk_dir(Path::new(root), "", 0, &mut count, &mut truncated);
-    (entries, truncated)
-}
-
-/// Reads one directory's entries, recursing into subdirectories up to
-/// `MAX_TREE_DEPTH`, tracking the total node count against
-/// `MAX_TREE_ENTRIES` in `count` and setting `truncated` when either cap is
-/// hit anywhere in the walk. `rel_prefix` is `dir`'s own path relative to the
-/// tree root ("" for the root itself), so each entry's relative path is
-/// assembled incrementally instead of re-deriving it from the root each call.
-fn walk_dir(
-    dir: &Path,
-    rel_prefix: &str,
-    depth: usize,
-    count: &mut usize,
-    truncated: &mut bool,
-) -> Vec<FileTreeEntry> {
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return Vec::new();
+/// Lists one directory level — `root` itself when `rel` is `""`, else the
+/// subdirectory `rel` resolves to underneath `root`. `rel` is resolved via
+/// [`safe_path`] exactly like [`read_file`]/[`write_file`] (traversal,
+/// absolute-path smuggling, and symlink escape all collapse to `None` the
+/// same way); a `rel` that resolves to a file rather than a directory is
+/// also `None`. Excludes [`EXCLUDED_DIRS`] by name, sorts directories before
+/// files alphabetically within each group, and caps at [`MAX_TREE_ENTRIES`]
+/// entries (returning `truncated: true` when the cap is hit) — this is now a
+/// per-directory cap, not a whole-tree one, since each call only ever lists
+/// one level; the caller re-calls this per directory on expand to go
+/// deeper. Symlinks are listed but never followed (`is_dir: false` for a
+/// symlinked dir — avoids both escape and cycle risk with one rule). A
+/// `read_dir` failure on an otherwise-valid, already-`safe_path`-verified
+/// directory (permissions changing after the check) is swallowed as "no
+/// entries", not a failure of the whole call — same "unreadable subdir does
+/// not fail the walk" precedent the old recursive `walk_dir` used.
+pub fn tree_level(root: &str, rel: &str) -> Option<(Vec<FileTreeEntry>, bool)> {
+    let anchor = if rel.is_empty() { "." } else { rel };
+    let dir = safe_path(root, anchor)?;
+    if !dir.is_dir() {
+        return None;
+    }
+    let Ok(read_dir) = fs::read_dir(&dir) else {
+        return Some((Vec::new(), false));
     };
-    let mut raw: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut raw: Vec<(String, bool)> = Vec::new();
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if EXCLUDED_DIRS.contains(&name.as_str()) {
@@ -154,46 +145,30 @@ fn walk_dir(
         let Ok(meta) = entry.path().symlink_metadata() else {
             continue;
         };
-        let is_dir = meta.is_dir();
-        raw.push((name, entry.path(), is_dir));
+        raw.push((name, meta.is_dir()));
     }
     // Directories before files, alphabetical within each group.
-    raw.sort_by(|a, b| match (a.2, b.2) {
+    raw.sort_by(|a, b| match (a.1, b.1) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.0.cmp(&b.0),
     });
 
     let mut out = Vec::new();
-    for (name, path, is_dir) in raw {
-        if *count >= MAX_TREE_ENTRIES {
-            *truncated = true;
+    let mut truncated = false;
+    for (name, is_dir) in raw {
+        if out.len() >= MAX_TREE_ENTRIES {
+            truncated = true;
             break;
         }
-        *count += 1;
-        let rel = if rel_prefix.is_empty() {
+        let path = if rel.is_empty() {
             name.clone()
         } else {
-            format!("{rel_prefix}/{name}")
+            format!("{rel}/{name}")
         };
-        let children = if is_dir {
-            if depth + 1 >= MAX_TREE_DEPTH {
-                *truncated = true;
-                Some(Vec::new())
-            } else {
-                Some(walk_dir(&path, &rel, depth + 1, count, truncated))
-            }
-        } else {
-            None
-        };
-        out.push(FileTreeEntry {
-            name,
-            path: rel,
-            is_dir,
-            children,
-        });
+        out.push(FileTreeEntry { name, path, is_dir });
     }
-    out
+    Some((out, truncated))
 }
 
 /// Backs `GET /api/fs/dirs` (the new-project folder picker; see
@@ -211,7 +186,7 @@ fn walk_dir(
 /// 2. Reject if the canonical path is not a directory -> `None`.
 /// 3. `fs::read_dir` the canonical path; any error (permission denied — the
 ///    OS boundary above firing) collapses to `None`, same "swallow as not
-///    found" precedent `tree_of`'s per-subdirectory `read_dir` errors use.
+///    found" precedent `tree_level`'s own unreadable-directory case uses.
 /// 4. List only entries that are themselves directories, using
 ///    `entry.path().metadata()` (follows symlinks) rather than
 ///    `symlink_metadata()` — the opposite of `walk_dir`'s choice. `walk_dir`
@@ -546,10 +521,10 @@ mod tests {
         assert_eq!(entry.path, canon_root.join("linkdir").to_string_lossy());
     }
 
-    // --- tree_of ---------------------------------------------------------
+    // --- tree_level --------------------------------------------------------
 
     #[test]
-    fn tree_of_excludes_vcs_and_dependency_dirs_and_sorts_dirs_first() {
+    fn tree_level_excludes_vcs_and_dependency_dirs_and_sorts_dirs_first() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".git")).unwrap();
@@ -559,9 +534,9 @@ mod tests {
         fs::write(root.join("a_file.txt"), "a").unwrap();
         fs::write(root.join(".git/HEAD"), "ref").unwrap();
 
-        let (tree, truncated) = tree_of(root.to_str().unwrap());
+        let (level, truncated) = tree_level(root.to_str().unwrap(), "").unwrap();
         assert!(!truncated);
-        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = level.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&".git"));
         assert!(!names.contains(&"node_modules"));
         assert!(!names.contains(&"target"));
@@ -569,53 +544,55 @@ mod tests {
         assert_eq!(names[0], "zzz_dir");
         assert_eq!(names[1], "a_file.txt");
 
-        let zzz = tree.iter().find(|e| e.name == "zzz_dir").unwrap();
+        let zzz = level.iter().find(|e| e.name == "zzz_dir").unwrap();
         assert!(zzz.is_dir);
-        assert_eq!(zzz.children, Some(Vec::new()));
-        let file = tree.iter().find(|e| e.name == "a_file.txt").unwrap();
+        let file = level.iter().find(|e| e.name == "a_file.txt").unwrap();
         assert!(!file.is_dir);
-        assert_eq!(file.children, None);
     }
 
     #[test]
-    fn tree_of_reports_truncated_when_entry_cap_hit() {
+    fn tree_level_reports_truncated_when_entry_cap_hit() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         for i in 0..(MAX_TREE_ENTRIES + 5) {
             fs::write(root.join(format!("f{i:05}.txt")), "x").unwrap();
         }
-        let (tree, truncated) = tree_of(root.to_str().unwrap());
+        let (level, truncated) = tree_level(root.to_str().unwrap(), "").unwrap();
         assert!(truncated);
-        assert!(tree.len() <= MAX_TREE_ENTRIES);
+        assert!(level.len() <= MAX_TREE_ENTRIES);
     }
 
     #[test]
-    fn tree_of_reports_truncated_when_depth_cap_hit() {
+    fn tree_level_only_lists_one_level_deep() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cur = dir.path().to_path_buf();
-        for i in 0..(MAX_TREE_DEPTH + 3) {
-            cur = cur.join(format!("d{i}"));
-            fs::create_dir_all(&cur).unwrap();
-        }
-        let (_tree, truncated) = tree_of(dir.path().to_str().unwrap());
-        assert!(truncated);
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/b/c/deep.txt"), "x").unwrap();
+
+        let (level, _truncated) = tree_level(root.to_str().unwrap(), "").unwrap();
+        assert_eq!(level.len(), 1);
+        assert_eq!(level[0].name, "a");
+        assert!(level[0].is_dir);
     }
 
     #[test]
-    fn tree_of_relative_paths_use_forward_slashes() {
+    fn tree_level_relative_paths_use_forward_slashes_and_nest_via_rel() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/f.txt"), "x").unwrap();
-        let (tree, _truncated) = tree_of(root.to_str().unwrap());
-        let sub = tree.iter().find(|e| e.name == "sub").unwrap();
-        let children = sub.children.as_ref().unwrap();
+
+        let (top, _truncated) = tree_level(root.to_str().unwrap(), "").unwrap();
+        let sub = top.iter().find(|e| e.name == "sub").unwrap();
+        assert_eq!(sub.path, "sub");
+
+        let (children, _truncated) = tree_level(root.to_str().unwrap(), "sub").unwrap();
         assert_eq!(children[0].path, "sub/f.txt");
     }
 
     #[test]
     #[cfg(unix)]
-    fn tree_of_lists_symlinked_dir_as_file_leaf_without_following() {
+    fn tree_level_lists_symlinked_dir_as_file_leaf_without_following() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         let outside = dir.path().join("outside");
@@ -624,10 +601,33 @@ mod tests {
         fs::write(outside.join("secret.txt"), "top secret").unwrap();
         symlink(&outside, root.join("linkdir")).unwrap();
 
-        let (tree, _truncated) = tree_of(root.to_str().unwrap());
-        let link = tree.iter().find(|e| e.name == "linkdir").unwrap();
+        let (level, _truncated) = tree_level(root.to_str().unwrap(), "").unwrap();
+        let link = level.iter().find(|e| e.name == "linkdir").unwrap();
         assert!(!link.is_dir);
-        assert_eq!(link.children, None);
+    }
+
+    #[test]
+    fn tree_level_none_for_traversal_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        assert_eq!(tree_level(root.to_str().unwrap(), "../"), None);
+    }
+
+    #[test]
+    fn tree_level_none_for_file_given_as_rel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        assert_eq!(tree_level(root, "f.txt"), None);
+    }
+
+    #[test]
+    fn tree_level_none_for_nonexistent_rel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert_eq!(tree_level(root, "nope"), None);
     }
 
     // --- read_file --------------------------------------------------------

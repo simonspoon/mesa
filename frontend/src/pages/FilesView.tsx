@@ -326,51 +326,92 @@ function FileCode({
   )
 }
 
+/** A directory's fetched-or-not-yet-fetched state (mesa task 410's lazy
+ * per-directory walk). `'loading'`/`'error'` are transient states a
+ * `Loaded` entry replaces once the fetch settles; a `Loaded` entry stays in
+ * the cache across collapse/re-expand so re-opening a directory never
+ * re-fetches it. */
+type DirState =
+  | 'loading'
+  | 'error'
+  | { entries: FileTreeEntry[]; truncated: boolean }
+
 /** One tree row (directory or file), recursing into an expanded directory's
- * children. Returns a fragment of sibling <li>s so it drops straight into
+ * children via the shared `childrenCache` (fetched lazily on first expand,
+ * not carried on the entry itself — the tree endpoint returns one level per
+ * call now). Returns a fragment of sibling <li>s so it drops straight into
  * the parent <ul> with no extra wrapper element. */
 function TreeNode({
   entry,
   depth,
   expanded,
   onToggle,
+  childrenCache,
   selectedPath,
   onSelectFile,
 }: {
   entry: FileTreeEntry
   depth: number
   expanded: Set<string>
-  onToggle: (path: string) => void
+  onToggle: (entry: FileTreeEntry) => void
+  childrenCache: Map<string, DirState>
   selectedPath: string | null
   onSelectFile: (path: string) => void
 }) {
   const indent = { paddingLeft: `${depth * 1.1 + 0.5}rem` }
   if (entry.is_dir) {
     const isOpen = expanded.has(entry.path)
+    const state = childrenCache.get(entry.path)
     return (
       <>
         <li
           className="files-tree-dir"
           style={indent}
-          onClick={() => onToggle(entry.path)}
+          onClick={() => onToggle(entry)}
         >
           <span className={`files-tree-toggle ${isOpen ? 'open' : ''}`}>
             {isOpen ? '▾' : '▸'}
           </span>
           {entry.name}
         </li>
+        {isOpen && state === 'loading' && (
+          <li className="files-tree-note muted" style={indent}>
+            Loading…
+          </li>
+        )}
+        {isOpen && state === 'error' && (
+          <li className="files-tree-note error" style={indent}>
+            Failed to load.
+          </li>
+        )}
         {isOpen &&
-          (entry.children ?? []).map((child) => (
+          state !== undefined &&
+          state !== 'loading' &&
+          state !== 'error' &&
+          state.entries.map((child) => (
             <TreeNode
               key={child.path}
               entry={child}
               depth={depth + 1}
               expanded={expanded}
               onToggle={onToggle}
+              childrenCache={childrenCache}
               selectedPath={selectedPath}
               onSelectFile={onSelectFile}
             />
           ))}
+        {isOpen &&
+          state !== undefined &&
+          state !== 'loading' &&
+          state !== 'error' &&
+          state.truncated && (
+            <li
+              className="files-tree-note muted"
+              style={{ paddingLeft: `${(depth + 1) * 1.1 + 0.5}rem` }}
+            >
+              This folder is larger than what's shown here.
+            </li>
+          )}
       </>
     )
   }
@@ -391,12 +432,15 @@ function TreeNode({
 /**
  * The Files tab: the project's file tree (rooted at local_path) on the left,
  * expandable per directory, with the selected file's content on the right.
- * A non-binary, non-truncated file can be edited and saved back to disk
- * (task 327, `ContentPane`'s Edit affordance); everything else — browsing,
- * the tree, no create/delete/rename — stays read-only. Rendered in place
- * inside ProjectTasksPage's frame, like GitView. Empty states are quiet
- * placeholders, matching the Git tab's ladder, never a hard
- * error (M10).
+ * The root level loads eagerly with the tab; each directory's own contents
+ * load lazily on first expand and are cached thereafter (mesa task 410),
+ * so the per-directory entry cap applies to one folder at a time instead of
+ * truncating the whole tree. A non-binary, non-truncated file can be edited
+ * and saved back to disk (task 327, `ContentPane`'s Edit affordance);
+ * everything else — browsing, the tree, no create/delete/rename — stays
+ * read-only. Rendered in place inside ProjectTasksPage's frame, like
+ * GitView. Empty states are quiet placeholders, matching the Git tab's
+ * ladder, never a hard error (M10).
  */
 export function FilesView({ projectId }: { projectId: number }) {
   const { data, error } = useFetch(
@@ -407,6 +451,12 @@ export function FilesView({ projectId }: { projectId: number }) {
   // deep-linking into the tree, matching GitView's selectedPath).
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // Fetched-directory cache (mesa task 410's lazy per-directory walk):
+  // populated on first expand, kept for the component's lifetime so
+  // collapsing and re-expanding a directory never re-fetches it.
+  const [childrenCache, setChildrenCache] = useState<Map<string, DirState>>(
+    new Map(),
+  )
   // Reset on project change (render-time, off the changed prop — same
   // pattern as GitView/HistoryPane): this component isn't remounted when the
   // route moves between projects, so a stale selection from project A must
@@ -416,15 +466,36 @@ export function FilesView({ projectId }: { projectId: number }) {
     setPrevProject(projectId)
     setSelectedPath(null)
     setExpanded(new Set())
+    setChildrenCache(new Map())
   }
 
-  function toggle(path: string) {
+  function ensureChildren(path: string) {
+    if (childrenCache.has(path)) return // loaded or already loading
+    setChildrenCache((prev) => new Map(prev).set(path, 'loading'))
+    getProjectFiles(projectId, path).then(
+      (res) => {
+        setChildrenCache((prev) =>
+          new Map(prev).set(path, {
+            entries: res.tree ?? [],
+            truncated: res.truncated,
+          }),
+        )
+      },
+      () => {
+        setChildrenCache((prev) => new Map(prev).set(path, 'error'))
+      },
+    )
+  }
+
+  function toggle(entry: FileTreeEntry) {
+    const opening = !expanded.has(entry.path)
     setExpanded((prev) => {
       const next = new Set(prev)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
+      if (next.has(entry.path)) next.delete(entry.path)
+      else next.add(entry.path)
       return next
     })
+    if (opening) ensureChildren(entry.path)
   }
 
   if (error && !data) return <p className="error">{error}</p>
@@ -457,6 +528,7 @@ export function FilesView({ projectId }: { projectId: number }) {
                 depth={0}
                 expanded={expanded}
                 onToggle={toggle}
+                childrenCache={childrenCache}
                 selectedPath={selectedPath}
                 onSelectFile={setSelectedPath}
               />

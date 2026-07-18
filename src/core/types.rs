@@ -1037,10 +1037,12 @@ pub struct Attachment {
     pub created_at: String,
 }
 
-/// One node in a project's file tree, rooted at local_path (see
-/// `core::files::tree_of`). `children` is `Some(_)` for every directory
-/// (possibly `[]` — empty, excluded, or depth-capped) and `None` for every
-/// file — the discriminant IS `is_dir`, `children` is never used to infer it.
+/// One entry in a single directory level of a project's file tree, rooted at
+/// local_path (see `core::files::tree_level`). Lazy tree walk (mesa task
+/// 410): a response only ever carries ONE level — no `children` field,
+/// unlike the whole-tree walk this replaced. A directory's own contents are
+/// fetched by a separate call passing this entry's `path` as `?path=`; the
+/// frontend tracks "not yet fetched" itself, off the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct FileTreeEntry {
@@ -1049,23 +1051,27 @@ pub struct FileTreeEntry {
     /// Relative to local_path, "/"-separated.
     pub path: String,
     pub is_dir: bool,
-    pub children: Option<Vec<FileTreeEntry>>,
 }
 
-/// `GET /api/projects/{id}/files` response. Ladder mirrors `ProjectGitView`:
-/// path null = no local_path; path set + tree null = dead/unreadable folder;
-/// path set + tree = Some(_) = live folder (root itself always readable at
-/// that point, so this is never Some(vec![]) representing "unreadable" — an
-/// unreadable root collapses to the dead-folder rung, same as git's is_dir
-/// check). Never an error.
+/// `GET /api/projects/{id}/files[?path=<rel>]` response — one directory
+/// level: `local_path` itself when `path` is omitted, else the subdirectory
+/// `path` resolves to. Ladder mirrors `ProjectGitView`, and only applies to
+/// the root call (`path` omitted): tree null = no local_path; path set +
+/// tree null = dead/unreadable folder; path set + tree = Some(_) = live
+/// folder (root itself always readable at that point, so this is never
+/// Some(vec![]) representing "unreadable" — an unreadable root collapses to
+/// the dead-folder rung, same as git's is_dir check). A `path`-scoped call
+/// for an invalid/traversal/nonexistent subdirectory is a 404, not a rung of
+/// this ladder. Never a 5xx.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct ProjectFileTree {
     pub path: Option<String>,
     pub tree: Option<Vec<FileTreeEntry>>,
-    /// True iff MAX_TREE_ENTRIES or MAX_TREE_DEPTH was hit anywhere during
-    /// the walk (one global flag, not per-node — good enough to tell the UI
-    /// "this repo is bigger than what you're seeing").
+    /// True iff MAX_TREE_ENTRIES was hit for THIS level (a per-directory
+    /// cap now, not a whole-tree flag — a single flat directory with more
+    /// entries than the cap is still capped; laziness alone doesn't solve
+    /// that).
     pub truncated: bool,
 }
 

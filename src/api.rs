@@ -129,13 +129,15 @@ struct AppState {
     /// so it can't reinsert a pre-spawn snapshot after the invalidation and
     /// briefly hide the just-created session.
     agents_gen: Arc<AtomicU64>,
-    /// Files tab tree listing per project folder, keyed by `local_path` —
-    /// backs `GET /api/projects/{id}/files`. `core::files::tree_of` walks the
-    /// whole tree (bounded by `MAX_TREE_ENTRIES`/`MAX_TREE_DEPTH`, but still
-    /// not free for a large repo), so this reuses the same TTL/eviction-cap
-    /// pattern as `git_view_cache`. File content reads are not cached (mirrors
-    /// the git diff routes — on-demand, one file, cheap).
-    files_tree_cache: Arc<Mutex<HashMap<String, (Instant, (Vec<FileTreeEntry>, bool))>>>,
+    /// Files tab tree listing, one directory level per entry, keyed by
+    /// `(local_path, rel)` — `rel` is `""` for the root level itself — backs
+    /// `GET /api/projects/{id}/files[?path=<rel>]`. `core::files::tree_level`
+    /// lists one level (mesa task 410; bounded by `MAX_TREE_ENTRIES`, but
+    /// still not free for a directory with many entries), so this reuses the
+    /// same TTL/eviction-cap pattern as `git_view_cache`. File content reads
+    /// are not cached (mirrors the git diff routes — on-demand, one file,
+    /// cheap).
+    files_tree_cache: Arc<Mutex<HashMap<(String, String), (Instant, (Vec<FileTreeEntry>, bool))>>>,
     /// Set by `restart_server` before it triggers graceful shutdown; `serve`
     /// checks it right after `axum::serve` returns to decide whether to
     /// relaunch the current binary.
@@ -1828,18 +1830,40 @@ async fn project_files_root(state: &AppState, id: i64) -> ApiResult<(Option<Stri
     Ok((Some(path), is_dir))
 }
 
-/// Files tab tree listing. Empty-state ladder mirrors `ProjectGitView`: no
-/// `local_path` -> `{path: null, tree: null, truncated: false}`; dead/
-/// unreadable folder -> `{path, tree: null, truncated: false}`; live folder ->
-/// `{path, tree: Some(entries), truncated}` via `core::files::tree_of`, cached
-/// per folder in `files_tree_cache`. Never a 5xx for any of these three
-/// states.
+#[derive(Deserialize)]
+struct FilesTreeQuery {
+    path: Option<String>,
+}
+
+/// Files tab tree listing — one directory level per call (mesa task 410).
+/// `path` omitted lists `local_path` itself (the root level); `path` given
+/// lists that subdirectory instead, resolved the same way `read_file`
+/// resolves its own `?path=` (via `core::files::tree_level`, which anchors
+/// through `safe_path`). Empty-state ladder mirrors `ProjectGitView` and
+/// applies only to the root call: no `local_path` -> `{path: null, tree:
+/// null, truncated: false}`; dead/unreadable folder -> `{path, tree: null,
+/// truncated: false}`; live folder -> `{path, tree: Some(entries),
+/// truncated}`, cached per `(local_path, path)` in `files_tree_cache`. A
+/// `path`-scoped call for an invalid/traversal/nonexistent/non-directory
+/// subpath is 404 `not_found` instead — that's not a state of the tree
+/// itself, it's "this specific request doesn't resolve", same as the
+/// content route's own collapse. Never a 5xx.
 async fn get_project_files(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(q): Query<FilesTreeQuery>,
 ) -> ApiResult<Response> {
+    let rel = q.path.filter(|p| !p.is_empty());
+    let not_found_dir = |rel: &str| ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("directory not found: {rel}"),
+    };
     let (path, is_dir) = project_files_root(&state, id).await?;
     if !is_dir {
+        if let Some(rel) = rel {
+            return Err(not_found_dir(&rel));
+        }
         return Ok(Json(ProjectFileTree {
             path,
             tree: None,
@@ -1848,29 +1872,50 @@ async fn get_project_files(
         .into_response());
     }
     let dir = path.clone().expect("is_dir true implies path is Some");
+    let rel_key = rel.clone().unwrap_or_default();
+    let cache_key = (dir.clone(), rel_key.clone());
     let cached = {
         let cache = state.files_tree_cache.lock().unwrap();
         cache
-            .get(&dir)
+            .get(&cache_key)
             .filter(|(at, _)| at.elapsed() < GIT_TTL)
             .map(|(_, v)| v.clone())
     };
-    let (entries, truncated) = match cached {
-        Some(v) => v,
+    let level = match cached {
+        Some(v) => Some(v),
         None => {
-            // Walking a large repo isn't free; keep it off the async workers,
+            // Walking a directory isn't free; keep it off the async workers,
             // same rationale as the git subprocess calls above.
             let d = dir.clone();
-            let v = tokio::task::spawn_blocking(move || files::tree_of(&d))
+            let r = rel_key.clone();
+            let v = tokio::task::spawn_blocking(move || files::tree_level(&d, &r))
                 .await
-                .unwrap_or_else(|_| (Vec::new(), false));
-            let mut cache = state.files_tree_cache.lock().unwrap();
-            if cache.len() >= 64 {
-                cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+                .unwrap_or(None);
+            if let Some(ref v) = v {
+                let mut cache = state.files_tree_cache.lock().unwrap();
+                if cache.len() >= 64 {
+                    cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+                }
+                cache.insert(cache_key, (Instant::now(), v.clone()));
             }
-            cache.insert(dir.clone(), (Instant::now(), v.clone()));
             v
         }
+    };
+    let Some((entries, truncated)) = level else {
+        // `tree_level` only returns None for a `rel` that doesn't resolve
+        // (traversal, nonexistent, or a file) — for the root call `rel` is
+        // always `"."`-anchored against an already-`is_dir`-verified path,
+        // so this rung is a dead-folder race (perms/removal between the
+        // `is_dir` check above and the walk), not the common case.
+        if let Some(rel) = rel {
+            return Err(not_found_dir(&rel));
+        }
+        return Ok(Json(ProjectFileTree {
+            path,
+            tree: None,
+            truncated: false,
+        })
+        .into_response());
     };
     Ok(Json(ProjectFileTree {
         path,
@@ -3043,11 +3088,23 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn no_path_query() -> Query<FilesTreeQuery> {
+        Query(FilesTreeQuery { path: None })
+    }
+
+    fn path_query(path: &str) -> Query<FilesTreeQuery> {
+        Query(FilesTreeQuery {
+            path: Some(path.to_string()),
+        })
+    }
+
     #[tokio::test]
     async fn files_no_local_path_is_null_tree() {
         let (_dir, state) = test_state();
         let id = new_project(&state, None);
-        let resp = get_project_files(State(state), Path(id)).await.unwrap();
+        let resp = get_project_files(State(state), Path(id), no_path_query())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
         assert_eq!(body["path"], serde_json::Value::Null);
@@ -3060,7 +3117,9 @@ mod tests {
         let (dir, state) = test_state();
         let gone = dir.path().join("gone").to_str().unwrap().to_string();
         let id = new_project(&state, Some(&gone));
-        let resp = get_project_files(State(state), Path(id)).await.unwrap();
+        let resp = get_project_files(State(state), Path(id), no_path_query())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
         assert_eq!(body["path"], serde_json::json!(gone));
@@ -3068,7 +3127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn files_live_folder_returns_tree() {
+    async fn files_live_folder_returns_top_level_only() {
         let (dir, state) = test_state();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -3077,7 +3136,9 @@ mod tests {
         let root_str = root.to_str().unwrap().to_string();
         let id = new_project(&state, Some(&root_str));
 
-        let resp = get_project_files(State(state), Path(id)).await.unwrap();
+        let resp = get_project_files(State(state.clone()), Path(id), no_path_query())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
         assert_eq!(body["path"], serde_json::json!(root_str));
@@ -3088,8 +3149,56 @@ mod tests {
         assert!(names.contains(&"a.txt"));
         let sub = tree.iter().find(|e| e["name"] == "sub").unwrap();
         assert_eq!(sub["is_dir"], true);
-        let children = sub["children"].as_array().unwrap();
-        assert_eq!(children[0]["path"], "sub/b.rs");
+        // The root call is one level only — a deeper file's contents don't
+        // ride along, unlike the old whole-tree walk.
+        assert!(sub.get("children").is_none());
+
+        // The subdirectory's own contents are a separate, `?path=`-scoped
+        // call — this is the lazy-expand contract.
+        let resp = get_project_files(State(state), Path(id), path_query("sub"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let tree = body["tree"].as_array().unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0]["path"], "sub/b.rs");
+    }
+
+    #[tokio::test]
+    async fn files_path_query_truncates_per_directory() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("many")).unwrap();
+        // MAX_TREE_ENTRIES (src/core/files.rs) is 2_000; a bit over that in
+        // one flat directory exercises the per-directory truncation.
+        for i in 0..2_005 {
+            std::fs::write(root.join("many").join(format!("f{i:05}.txt")), "x").unwrap();
+        }
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = get_project_files(State(state), Path(id), path_query("many"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn files_path_query_traversal_is_not_found() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let err = get_project_files(State(state), Path(id), path_query("../"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, "not_found");
     }
 
     #[tokio::test]

@@ -338,12 +338,19 @@ export function listFsDirs(path?: string): Promise<DirListing> {
 // ---- files (read-only file tree + content, local_path-anchored) ----
 
 /**
- * File tree rooted at the project's local_path. Empty states are data,
- * never errors: path null = no local_path; path set + tree null = folder
- * gone / unreadable; tree = [] = a real, empty (or fully-excluded) folder.
+ * One directory level of a project's file tree, rooted at local_path:
+ * `local_path` itself when `path` is omitted, else the subdirectory `path`
+ * resolves to (mesa task 410's lazy per-directory walk — a call never
+ * returns more than one level). Empty states are data, never errors: path
+ * null = no local_path; path set + tree null = folder gone / unreadable;
+ * tree = [] = a real, empty (or fully-excluded) directory.
  */
-export function getProjectFiles(id: number): Promise<ProjectFileTree> {
-  return request(`/api/projects/${id}/files`)
+export function getProjectFiles(
+  id: number,
+  path?: string,
+): Promise<ProjectFileTree> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : ''
+  return request(`/api/projects/${id}/files${query}`)
 }
 
 /**

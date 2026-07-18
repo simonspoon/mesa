@@ -25,9 +25,10 @@ import * as ptyPool from '../lib/ptyPool'
  * "attach it to this slot" the same synchronous step every time.
  *
  * Only ever mounted by a leaf that actually wants a PTY: `AgentSidebar`'s
- * permanent session-list leaf renders `AgentListPane` instead, so there is
- * no separate "skip the list leaf" registration path to get right — only
- * leaves that render a `PtySlot` ever register at all.
+ * every tree leaf is now an attached agent terminal (mesa task 414 pulled
+ * the 'Agents' session list out of the tree into its own fixed rail), so
+ * there is no separate "skip a non-PTY leaf" registration path to get
+ * right — only leaves that render a `PtySlot` ever register at all.
  */
 export function PtySlot({
   id,

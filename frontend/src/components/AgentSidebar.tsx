@@ -53,19 +53,22 @@ const DEFAULT_WIDTH = 448 // 28rem, matches the CSS fallback
 // nav sidebar's actual width (collapsed or expanded) instead of assuming one.
 const MIN_MAIN_WIDTH = 320
 
-// Stable id for the one leaf whose content is the session list rather than
-// an attached terminal — an `agentId` from `claude agents --json` is always
-// a short opaque id with no fixed shape, so a `__`-wrapped sentinel can't
-// collide with a real one.
-const LIST_LEAF_ID = '__agent-list__'
+// The 'Agents' session-list rail (mesa task 414): docked to the sidebar
+// body's fixed right edge, independent of the tile area's agent panes —
+// own resizable width, own collapse toggle. Floors on both sides of the
+// rail's own resize drag so neither the rail nor the tile area it sits
+// beside can be squeezed to nothing.
+const MIN_LIST_WIDTH = 160
+const DEFAULT_LIST_WIDTH = 240
+const MIN_TILE_WIDTH = 160
 
 // This sidebar's own `contentKind` union, narrowing the shared generic
 // pane-tree types (`frontend/src/lib/paneTree.ts`, extracted in mesa task
-// 395) to what's specific here — an attached agent terminal, or the
-// permanent session-list pane. A local type alias, not a re-export, so
-// every existing bare `LeafNode`/`SplitNode` reference below keeps working
-// unchanged.
-type AgentLeafKind = 'agent' | 'list'
+// 395) to what's specific here — every leaf is an attached agent terminal;
+// the session-list is its own fixed rail (task 414), not a tree leaf. A
+// local type alias, not a re-export, so every existing bare
+// `LeafNode`/`SplitNode` reference below keeps working unchanged.
+type AgentLeafKind = 'agent'
 type LeafNode = PTLeafNode<AgentLeafKind>
 type SplitNode = PTSplitNode<AgentLeafKind>
 
@@ -77,22 +80,6 @@ function insertLeaf(root: SplitNode, agentId: string): SplitNode {
     children: [
       ...n.children,
       { ratio: DEFAULT_RATIO, node: { kind: 'leaf', contentKind: 'agent', id: agentId } },
-    ],
-  }))
-}
-
-// Seeds the one permanent session-list leaf if the tree doesn't already
-// have one — called once at init and is otherwise a no-op, since nothing
-// in the UI ever closes the list leaf (task 368: it's a pane like any
-// other agent pane, just not a closable one — closing it would strand the
-// sidebar with no way left to open an agent pane).
-function ensureListLeaf(root: SplitNode): SplitNode {
-  if (findPathToLeaf(root, LIST_LEAF_ID)) return root
-  return replaceAtPath(root, [], (n) => ({
-    ...n,
-    children: [
-      { ratio: DEFAULT_RATIO, node: { kind: 'leaf', contentKind: 'list', id: LIST_LEAF_ID } },
-      ...n.children,
     ],
   }))
 }
@@ -141,21 +128,17 @@ function bucketOf(a: AgentSession): Bucket {
 const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE', 'DONE']
 
 /**
- * One pane's chrome inside the split view: a header (drag handle + label +
- * optional extra badge + optional close) over arbitrary content. `ratio` is
- * this pane's share of the stack's flex space (see `AgentSidebar`'s
- * divider-drag comment) — sortable via dnd-kit via `dragId`, so every pane
- * (an attached agent terminal or the session list) is rearrangeable by
- * dragging the header's grip the same way.
- *
- * `onClose` is optional: the session-list pane has none (task 368 — it's a
- * permanent leaf, since closing it would strand the sidebar with no way
- * left to open an agent pane), every agent pane has one.
+ * One agent pane's chrome inside the split view: a header (drag handle +
+ * label + close) over arbitrary content. `ratio` is this pane's share of
+ * the stack's flex space (see `AgentSidebar`'s divider-drag comment) —
+ * sortable via dnd-kit via `dragId`. The 'Agents' session-list is no longer
+ * one of these panes (mesa task 414: it's a fixed rail rendered directly by
+ * `AgentSidebar`, with its own header/collapse chrome) — every pane here is
+ * now an attached agent terminal.
  */
 function PaneShell({
   dragId,
   label,
-  headerExtra,
   ratio,
   onClose,
   dropEdge,
@@ -163,9 +146,8 @@ function PaneShell({
 }: {
   dragId: string
   label: string
-  headerExtra?: ReactNode
   ratio: number
-  onClose?: () => void
+  onClose: () => void
   // Set only while a drag is hovering an edge zone of THIS pane — renders
   // the split-preview overlay below. `null`/absent covers both "no drag in
   // progress" and "hovering this pane's own center zone" (reorder, no new
@@ -200,9 +182,8 @@ function PaneShell({
             ⠿
           </span>
           <span>{label}</span>
-          {headerExtra}
         </span>
-        {onClose && <button onClick={onClose}>close</button>}
+        <button onClick={onClose}>close</button>
       </div>
       {children}
       {dropEdge && <div className={`agent-sidebar-pane-drop-indicator agent-sidebar-pane-drop-indicator-${dropEdge}`} />}
@@ -238,9 +219,8 @@ function AgentPane({
   )
 }
 
-/** Props the session-list pane needs from `AgentSidebar`'s own state/data —
- * bundled into one object so `SplitNodeView` (module-scope, see its own
- * comment) can thread it down without widening its per-callback prop list. */
+/** Props the 'Agents' list rail needs from `AgentSidebar`'s own state/data —
+ * bundled into one object and spread onto `AgentListContent` below. */
 type ListPaneProps = {
   agents: AgentSession[]
   sessionsLoaded: boolean
@@ -252,22 +232,23 @@ type ListPaneProps = {
   onTogglePane: (agentId: string) => void
 }
 
-/** The session list itself, as a pane (task 368) — same `PaneShell` chrome
- * as an agent pane, just not closable and with the bucketed session list as
- * its body instead of a terminal. */
-function AgentListPane({ ratio, list, dropEdge }: { ratio: number; list: ListPaneProps; dropEdge?: DropEdge | null }) {
-  const { agents, sessionsLoaded, error, projects, openIds, collapsedSections, onToggleSection, onTogglePane } =
-    list
+/** The 'Agents' session-list rail's body content (mesa task 414) — the
+ * bucketed session list, unwrapped from any pane chrome since the rail
+ * itself (rendered directly in `AgentSidebar`, not through `SplitNodeView`)
+ * supplies its own fixed header/toggle/resize-handle. */
+function AgentListContent({
+  agents,
+  sessionsLoaded,
+  error,
+  projects,
+  openIds,
+  collapsedSections,
+  onToggleSection,
+  onTogglePane,
+}: ListPaneProps) {
   return (
-    <PaneShell
-      dragId={LIST_LEAF_ID}
-      label="Agents"
-      headerExtra={agents.length > 0 ? <span className="agent-sidebar-count">{agents.length}</span> : null}
-      ratio={ratio}
-      dropEdge={dropEdge}
-    >
-      <div className="agent-sidebar-list">
-        {error && !sessionsLoaded ? (
+    <div className="agent-sidebar-list">
+      {error && !sessionsLoaded ? (
           <p className="error">{error}</p>
         ) : !sessionsLoaded ? (
           <p className="muted">Loading…</p>
@@ -325,8 +306,7 @@ function AgentListPane({ ratio, list, dropEdge }: { ratio: number; list: ListPan
             )
           })
         )}
-      </div>
-    </PaneShell>
+    </div>
   )
 }
 
@@ -352,7 +332,6 @@ function SplitNodeView({
   node,
   path,
   agents,
-  listProps,
   onClose,
   onDividerMouseDown,
   onDividerToggle,
@@ -361,7 +340,6 @@ function SplitNodeView({
   node: SplitNode
   path: number[]
   agents: AgentSession[]
-  listProps: ListPaneProps
   onClose: (agentId: string) => void
   onDividerMouseDown: (
     path: number[],
@@ -387,29 +365,16 @@ function SplitNodeView({
         {node.children.map((child, i) => (
           <Fragment key={child.node.id}>
             {child.node.kind === 'leaf' ? (
-              child.node.contentKind === 'list' ? (
-                <AgentListPane
-                  ratio={child.ratio}
-                  list={listProps}
-                  dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
-                />
-              ) : (
-                <AgentPane
-                  agentId={child.node.id}
-                  label={(() => {
-                    // `contentKind` is a plain union-typed field on a single
-                    // object shape here (paneTree.ts's `LeafNode<K>` isn't a
-                    // discriminated union across shapes), so there's no
-                    // per-variant `id` type to narrow to — just read
-                    // `child.node.id` directly, valid for either contentKind.
-                    const session = agents.find((a) => a.id === child.node.id)
-                    return session ? agentLabel(session) : child.node.id
-                  })()}
-                  ratio={child.ratio}
-                  onClose={() => onClose(child.node.id)}
-                  dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
-                />
-              )
+              <AgentPane
+                agentId={child.node.id}
+                label={(() => {
+                  const session = agents.find((a) => a.id === child.node.id)
+                  return session ? agentLabel(session) : child.node.id
+                })()}
+                ratio={child.ratio}
+                onClose={() => onClose(child.node.id)}
+                dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
+              />
             ) : (
               <div
                 className="agent-sidebar-split-wrapper"
@@ -419,7 +384,6 @@ function SplitNodeView({
                   node={child.node}
                   path={[...path, i]}
                   agents={agents}
-                  listProps={listProps}
                   onClose={onClose}
                   onDividerMouseDown={onDividerMouseDown}
                   onDividerToggle={onDividerToggle}
@@ -484,16 +448,23 @@ function SplitNodeView({
  */
 export function AgentSidebar({ activeProjectId }: { activeProjectId: number | null }) {
   const [collapsed, setCollapsed] = useState(true)
-  // Split tree holding every open pane + how each split's children share its
-  // flex space. Root is always a SplitNode, never a bare leaf/null; the
-  // session-list leaf is seeded in once up front (task 368 — it's a pane
-  // like any other, just permanent) so with no other toggle or divider
-  // ever used it stays a single-child column: one flex container, column
-  // direction, the list pane alone. A session toggles its own leaf in/out
-  // of the tree by clicking it inside the list pane; dragging a pane's
-  // grip (including the list pane's own) reorders it among its split
-  // siblings (dnd-kit sortable).
-  const [root, setRoot] = useState<SplitNode>(() => ensureListLeaf(emptyRoot()))
+  // Split tree holding every open AGENT pane + how each split's children
+  // share its flex space — the 'Agents' session-list is no longer part of
+  // this tree (mesa task 414: it's a fixed rail, see `listWidth`/
+  // `listCollapsed` below), so an empty root (no panes open) is a valid,
+  // common starting state. Root is always a SplitNode, never a bare
+  // leaf/null. A session toggles its own leaf in/out of the tree by
+  // clicking it inside the list rail; dragging a pane's grip reorders it
+  // among its split siblings (dnd-kit sortable).
+  const [root, setRoot] = useState<SplitNode>(() => emptyRoot())
+  // 'Agents' list rail (mesa task 414): its own width + collapse state,
+  // independent of the tile area's agent panes and of the whole sidebar's
+  // own `width`/`collapsed` above — anchored to the sidebar body's right
+  // edge via CSS (`.agent-sidebar-list-rail`), not part of `root`.
+  const [listWidth, setListWidth] = useState(DEFAULT_LIST_WIDTH)
+  const [listCollapsed, setListCollapsed] = useState(false)
+  const [listResizing, setListResizing] = useState(false)
+  const bodyRef = useRef<HTMLDivElement>(null)
   // DONE starts collapsed (stale sessions aren't the thing you want to see
   // first); BLOCKED/ACTIVE start open. `state` from the API is a live status
   // (working/blocked/done/…), not the `collapsed` UI concept below.
@@ -610,6 +581,32 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
       document.body.classList.remove('agent-sidebar-resizing')
     }
   }, [resizing])
+
+  // List-rail drag-resize (mesa task 414): the handle sits on the rail's own
+  // left edge, so the new width is the distance from the pointer to the
+  // sidebar body's own right edge (not the viewport's — the rail lives
+  // inside the body, not the viewport). Floors both sides against
+  // `bodyRef`'s live rect so dragging the rail wide can't squeeze the tile
+  // area (agent panes) to nothing, and vice versa.
+  useEffect(() => {
+    if (!listResizing) return
+    const onMove = (e: MouseEvent) => {
+      const bodyRect = bodyRef.current?.getBoundingClientRect()
+      if (!bodyRect) return
+      const next = bodyRect.right - e.clientX
+      const max = bodyRect.width - MIN_TILE_WIDTH
+      setListWidth(Math.min(max, Math.max(MIN_LIST_WIDTH, next)))
+    }
+    const onUp = () => setListResizing(false)
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.classList.add('agent-sidebar-resizing')
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('agent-sidebar-resizing')
+    }
+  }, [listResizing])
 
   // Divider drag: converts a pixel delta into a ratio delta relative to the
   // two adjacent children's combined ratio, so the same drag distance feels
@@ -998,36 +995,74 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
         </form>
       )}
 
-      <div className="agent-sidebar-body">
-        <DndContext
-          sensors={sensors}
-          // dnd-kit's own default collision detection picks `over` off the
-          // DRAGGED pane's translated bounding box, not the pointer — fine
-          // when everything being dragged is small relative to its
-          // droppables, but every pane here starts out (and often stays)
-          // as wide/tall as the whole sidebar, so that box can overlap
-          // several candidates at once and pick one the cursor isn't even
-          // over. `pointerWithin` resolves `over` from the actual pointer
-          // position instead, matching `computeDropEdge`'s own pointer-based
-          // read below — both now agree on the one thing that has no
-          // dragged-pane-size dependence.
-          collisionDetection={pointerWithin}
-          onDragStart={handlePaneDragStart}
-          onDragMove={handlePaneDragMove}
-          onDragEnd={handlePaneDragEnd}
-          onDragCancel={handlePaneDragCancel}
+      <div className="agent-sidebar-body" ref={bodyRef}>
+        <div className="agent-sidebar-tile-area">
+          <DndContext
+            sensors={sensors}
+            // dnd-kit's own default collision detection picks `over` off the
+            // DRAGGED pane's translated bounding box, not the pointer — fine
+            // when everything being dragged is small relative to its
+            // droppables, but every pane here starts out (and often stays)
+            // as wide/tall as the whole tile area, so that box can overlap
+            // several candidates at once and pick one the cursor isn't even
+            // over. `pointerWithin` resolves `over` from the actual pointer
+            // position instead, matching `computeDropEdge`'s own pointer-based
+            // read below — both now agree on the one thing that has no
+            // dragged-pane-size dependence.
+            collisionDetection={pointerWithin}
+            onDragStart={handlePaneDragStart}
+            onDragMove={handlePaneDragMove}
+            onDragEnd={handlePaneDragEnd}
+            onDragCancel={handlePaneDragCancel}
+          >
+            <SplitNodeView
+              node={root}
+              path={[]}
+              agents={agents}
+              onClose={closePane}
+              onDividerMouseDown={startDivider}
+              onDividerToggle={toggleDividerAt}
+              dropZone={dropZone}
+            />
+          </DndContext>
+        </div>
+
+        {/* 'Agents' session-list rail (mesa task 414): fixed to the body's
+            right edge, own resizable width + own collapse toggle — separate
+            from the tile area's agent-pane split tree above, which reflows
+            into whatever space this rail leaves it. */}
+        <div
+          className={`agent-sidebar-list-rail${listCollapsed ? ' collapsed' : ''}${listResizing ? ' resizing' : ''}`}
+          style={listCollapsed ? undefined : ({ '--agent-list-width': `${listWidth}px` } as CSSProperties)}
         >
-          <SplitNodeView
-            node={root}
-            path={[]}
-            agents={agents}
-            listProps={listProps}
-            onClose={closePane}
-            onDividerMouseDown={startDivider}
-            onDividerToggle={toggleDividerAt}
-            dropZone={dropZone}
-          />
-        </DndContext>
+          {!listCollapsed && (
+            <div
+              className="agent-sidebar-list-resize-handle"
+              onMouseDown={(e) => {
+                e.preventDefault()
+                setListResizing(true)
+              }}
+            />
+          )}
+          <div className="agent-terminal-header agent-sidebar-list-rail-header">
+            <button
+              type="button"
+              className="agent-sidebar-list-toggle"
+              aria-label={listCollapsed ? 'Expand agents list' : 'Collapse agents list'}
+              title={listCollapsed ? 'Expand agents list' : 'Collapse agents list'}
+              onClick={() => setListCollapsed((c) => !c)}
+            >
+              {listCollapsed ? '‹' : '›'}
+            </button>
+            {!listCollapsed && (
+              <span className="agent-sidebar-pane-title">
+                <span>Agents</span>
+                {agents.length > 0 && <span className="agent-sidebar-count">{agents.length}</span>}
+              </span>
+            )}
+          </div>
+          {!listCollapsed && <AgentListContent {...listProps} />}
+        </div>
       </div>
     </aside>
   )

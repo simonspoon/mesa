@@ -84,14 +84,17 @@ touches the mesa store only to read `local_path`. There is deliberately no
 
 A persistent, collapsible right-hand rail (`AgentSidebar`,
 `frontend/src/components/AgentSidebar.tsx`) shows every live session across
-every project, with room to attach
-several at once, arranged as a tree of resizable/rearrangeable,
-mixed-orientation panes. The session list itself is one of those panes (task
-368) — resizable and rearrangeable exactly like an attached agent's pane,
-just permanent rather than closable. Rendered once in
-`App.tsx`, as a sibling of `<main>` outside the hash router, so it is never
-remounted by navigation; the same persistent-shell pattern the left `Sidebar`
-and `CommandPalette` already use.
+every project, with room to attach several at once, arranged as a tree of
+resizable/rearrangeable, mixed-orientation panes. The session list itself is
+**not** one of those panes (mesa task 414 pulled it out of the tree): it's a
+fixed rail docked to the sidebar body's own right edge
+(`.agent-sidebar-list-rail`), always full body height, with its own
+independent drag-resize handle and collapse toggle — separate from the tile
+area beside it, where the tree of attached agent panes lives and reflows
+into whatever space the rail leaves. Rendered once in `App.tsx`, as a sibling
+of `<main>` outside the hash router, so it is never remounted by navigation;
+the same persistent-shell pattern the left `Sidebar` and `CommandPalette`
+already use.
 
 - Data: `listAllAgents()` (`GET /api/agents`, 3s poll) for the session list,
   plus a plain `listProjects()` fetch (no poll) to label each session with the
@@ -108,44 +111,47 @@ and `CommandPalette` already use.
   completion timestamp (`claude agents --json` doesn't report one, only
   `startedAt`), so DONE is ordered by `startedAt` desc as the closest
   available proxy rather than a true completion time. An empty bucket renders
-  no header at all (not an empty section). This bucketed list is itself the
-  body of the session-list **pane** (below) — `AgentListPane` — not a
-  separate fixed element above the pane tree.
-- Layout: panes live in a **split-tree** (`SplitNode`/`LeafNode` in
-  `AgentSidebar.tsx`), not a flat list. Each node is either a leaf (one
-  **pane** — `PaneShell`, wrapping either an attached agent terminal (via
-  `AgentPane`, rendered through the shared pty pool — see below) or the
-  session list itself via `AgentListPane`, per the leaf's own `contentKind`)
-  or a split: an ordered list of children, each
-  carrying its own `ratio` (that slot's flex-grow share within the split)
-  and oriented `row` (side-by-side) or `column` (stacked). The root is
-  always a split node, never a bare leaf; it is seeded on mount with one
-  permanent leaf — the session list, `contentKind: 'list'`, id
-  `LIST_LEAF_ID` — via `ensureListLeaf`, so the tree is never truly empty.
-  The session list is a pane like any other (task 368): resizable via its
-  own dividers and rearrangeable by dragging its header grip, just not
-  closable — `PaneShell`'s `onClose` is omitted for it, since closing the
-  one entry point back into opening agent panes would strand the sidebar.
-  With no orientation ever toggled and no agent pane open, the tree stays
-  one column holding just that leaf — today's plain top-to-bottom stack
-  (list, then whatever agent panes are open) is just the tree's simplest,
-  non-degenerate shape. Clicking a session toggles its **agent** pane in or
-  out of the tree (`insertLeaf`/`removeLeaf`); a new pane always appends to
-  the **root** split's own children, regardless of how deep or mixed the
-  tree has become elsewhere — there's no "insert into the currently-focused
-  split" concept. An agent pane's **close** button removes it from the
-  shared pty pool (below) and detaches (the background session itself keeps
-  running, unaffected — same contract as the per-project tab's detach)
-  without touching any other open pane. `SplitNodeView`, the component that
-  recursively renders one split's own direct children, is declared at module
-  scope (not nested inside `AgentSidebar`) so its identity never changes
-  across a re-render — nesting a per-split component inside `AgentSidebar`'s
-  body would remount every open pane's `PtySlot` beneath it on every poll
-  tick. The
-  session-list data/handlers (`agents`, `collapsedSections`, `onTogglePane`,
-  ...) reach `AgentListPane` the same way — bundled into one `ListPaneProps`
-  object threaded down through `SplitNodeView`'s props, never a closure over
-  `AgentSidebar`'s own state, for the same remount-avoidance reason.
+  no header at all (not an empty section). This bucketed list is the body of
+  the 'Agents' rail's own content (`AgentListContent`), rendered directly by
+  `AgentSidebar` next to the tile area — not a member of the pane tree below.
+- **The 'Agents' list rail** (mesa task 414): a fixed sibling of the tile
+  area inside `.agent-sidebar-body` (a row flexbox), not a tree leaf.
+  `listWidth`/`listCollapsed`/`listResizing` are their own `AgentSidebar`
+  state, independent of the tile area's `root` tree and of the whole
+  sidebar's own `width`/`collapsed`. Its own drag-resize handle
+  (`.agent-sidebar-list-resize-handle`, hand-rolled `mousedown`/
+  `document`-level `mousemove`/`mouseup`, same pattern as the sidebar's own
+  width handle) reads the distance from the pointer to the sidebar body's
+  own right edge (measured off a `bodyRef` rect, not the viewport), floored
+  on both sides — `MIN_LIST_WIDTH` for the rail, `MIN_TILE_WIDTH` for the
+  tile area beside it — so dragging one can't squeeze the other to nothing.
+  Its own collapse toggle (`.agent-sidebar-list-toggle`, a `‹`/`›` button in
+  the rail's own header) shrinks it to a thin full-height strip
+  (`.agent-sidebar-list-rail.collapsed`), independent of the whole sidebar's
+  own collapse — collapsing the rail hands its space back to the tile area;
+  collapsing the whole sidebar (below) hides both.
+- Layout: **agent** panes live in a **split-tree** (`SplitNode`/`LeafNode` in
+  `AgentSidebar.tsx`), not a flat list — the tile area beside the list rail.
+  Each node is either a leaf (one **pane** — `PaneShell`, wrapping an
+  attached agent terminal via `AgentPane`, rendered through the shared pty
+  pool — see below) or a split: an ordered list of children, each carrying
+  its own `ratio` (that slot's flex-grow share within the split) and
+  oriented `row` (side-by-side) or `column` (stacked). The root is always a
+  split node, never a bare leaf, but an **empty** one (no children) is a
+  valid and common state — no agent panes open, just the list rail beside an
+  empty tile area. Clicking a session in the list rail toggles its **agent**
+  pane in or out of the tree (`insertLeaf`/`removeLeaf`); a new pane always
+  appends to the **root** split's own children, regardless of how deep or
+  mixed the tree has become elsewhere — there's no "insert into the
+  currently-focused split" concept. An agent pane's **close** button removes
+  it from the shared pty pool (below) and detaches (the background session
+  itself keeps running, unaffected — same contract as the per-project tab's
+  detach) without touching any other open pane. `SplitNodeView`, the
+  component that recursively renders one split's own direct children, is
+  declared at module scope (not nested inside `AgentSidebar`) so its
+  identity never changes across a re-render — nesting a per-split component
+  inside `AgentSidebar`'s body would remount every open pane's `PtySlot`
+  beneath it on every poll tick.
   - **Mixed orientation via a per-divider toggle**: every divider carries a
     small button (`.agent-sidebar-divider-toggle`, centered on the strip)
     showing the orientation clicking it would *produce* — `⬌` on a column

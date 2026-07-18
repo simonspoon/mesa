@@ -9,13 +9,13 @@ import type { ClientRect } from '@dnd-kit/core'
 // re-deriving it. Every type/function here is content-agnostic — it keys
 // only off a leaf's opaque `id` string, never its content — so it's
 // generalized over the leaf's `contentKind` type parameter `K` (each
-// caller's own union, e.g. `'agent' | 'list'` for the sidebar, `'shell'`
-// for Terminal) rather than hardcoding either caller's shape.
+// caller's own union, e.g. `'agent'` for the sidebar, `'shell'` for
+// Terminal) rather than hardcoding either caller's shape.
 //
 // What stays private to each caller: anything content/session-specific
-// (list-pane seeding, agent-pane construction, all rendering/chrome, the
-// divider-drag and dnd-kit wiring as component-local effects that call
-// into these pure functions).
+// (agent-pane construction, all rendering/chrome, the divider-drag and
+// dnd-kit wiring as component-local effects that call into these pure
+// functions).
 
 export type DropEdge = 'left' | 'right' | 'top' | 'bottom'
 

@@ -2211,16 +2211,90 @@ body.agent-sidebar-resizing {
      under a collapse/expand cycle (see the comment on AgentSidebar.tsx). */
   width: var(--agent-sidebar-width, 28rem);
   display: flex;
-  flex-direction: column;
+  /* Row: the tile area (agent panes) and the 'Agents' list rail (task 414)
+     sit side by side, the rail fixed to the trailing edge. */
+  flex-direction: row;
+  gap: 0.5rem;
   padding: 0.5rem 1rem 1rem;
   overflow: hidden;
 }
 
-/* Body of the session-list pane (task 368: the list itself is now a pane
-   like any other, via `AgentListPane`/`PaneShell` in AgentSidebar.tsx) —
-   fills the remaining flex space below the shared `.agent-terminal-header`
-   and scrolls internally, the same sizing contract `.agent-terminal` uses
-   for an attached terminal's own pane body. */
+/* Tile area: the agent-pane split tree (`SplitNodeView`) reflows to fill
+   whatever space the 'Agents' rail beside it leaves — same column-stacked
+   default the whole body used to have as a single-child flex container. */
+.agent-sidebar-tile-area {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 'Agents' session-list rail (mesa task 414): anchored to the sidebar
+   body's fixed trailing edge, independent of the tile area's agent panes —
+   own resizable width (`--agent-list-width`, dragged via
+   `.agent-sidebar-list-resize-handle`) and own collapse toggle, always the
+   full body height via the row-direction body's default flex stretch. */
+.agent-sidebar-list-rail {
+  position: relative; /* anchors the resize handle below */
+  flex: none;
+  width: var(--agent-list-width, 240px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-bright);
+  background: var(--bg);
+  box-shadow: 0 0 12px rgba(0, 229, 255, 0.1);
+  overflow: hidden;
+  transition: width 0.15s;
+}
+
+.agent-sidebar-list-rail.resizing {
+  transition: none;
+}
+
+.agent-sidebar-list-rail.collapsed {
+  width: 1.9rem;
+}
+
+/* Drag handle on the rail's own left edge — straddles the border so it's
+   grabbable from either side, same trick as the sidebar's own width handle. */
+.agent-sidebar-list-resize-handle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.agent-sidebar-list-resize-handle:hover,
+.agent-sidebar-list-rail.resizing .agent-sidebar-list-resize-handle {
+  background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
+}
+
+.agent-sidebar-list-rail.collapsed .agent-sidebar-list-rail-header {
+  justify-content: center;
+  padding: 0.3rem 0;
+}
+
+.agent-sidebar-list-toggle {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 0.25rem;
+  font-family: var(--font-mono);
+}
+
+.agent-sidebar-list-toggle:hover {
+  color: var(--cyan);
+}
+
+/* Body of the 'Agents' list rail — fills the remaining flex space below the
+   rail's own header and scrolls internally, the same sizing contract
+   `.agent-terminal` uses for an attached terminal's own pane body. */
 .agent-sidebar-list {
   flex: 1;
   min-height: 0;

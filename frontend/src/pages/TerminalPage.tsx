@@ -40,8 +40,8 @@ import { PtySlot } from '../components/PtySlot'
 // This page's own `contentKind` — every pane is a plain global $HOME shell,
 // no other variant (mesa task 395 / .scratch/arch.md §2.3). A local type
 // alias over the shared generic pane-tree types (`frontend/src/lib/
-// paneTree.ts`), same pattern `AgentSidebar.tsx` uses for its own
-// `'agent' | 'list'` union.
+// paneTree.ts`), same pattern `AgentSidebar.tsx` uses for its own `'agent'`
+// leaf kind.
 type ShellLeafKind = 'shell'
 type LeafNode = PTLeafNode<ShellLeafKind>
 type SplitNode = PTSplitNode<ShellLeafKind>

@@ -285,3 +285,19 @@ and `CommandPalette` already use.
   tree via `insertLeaf`, so the new
   session opens attached immediately instead of waiting for the next list
   poll.
+- **Auto Tile** (mesa task 411): a toggle (`agent-sidebar-autotile`) in the
+  header actions, next to maximize, visible only while expanded. Off by
+  default. While on, an effect keyed on `sessions` (the poll result, not the
+  per-render sorted `agents` copy — so it only re-runs when a poll actually
+  returns new data) keeps the pane tree in sync with agent state instead of
+  requiring a click per open/close: every attachable session (`id !== null`)
+  in the ACTIVE or BLOCKED bucket without an open pane gets one
+  (`insertLeaf`), and every open pane whose session has reached DONE gets
+  closed (`ptyPool.remove` + `removeLeaf`) — both buckets auto-open, not just
+  ACTIVE, since a blocked agent is the one most likely waiting on the user.
+  The effect depends on `autoTile` itself, so switching it on syncs
+  immediately against whatever `sessions` already holds rather than only
+  reacting to future transitions; switching it off just stops the sync — it
+  never force-closes panes auto-tile had opened. Interactive sessions
+  (`id === null`) are skipped, same as everywhere else in the sidebar — there
+  is no pane to open for them.

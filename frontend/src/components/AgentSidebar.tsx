@@ -509,6 +509,14 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
   // takeover-view expand toggle. Distinct from `collapsed` — maximized only
   // has an effect while the panel isn't collapsed.
   const [maximized, setMaximized] = useState(false)
+  // Auto Tile: while on, the effect below keeps the pane tree in sync with
+  // agent state instead of requiring a click per open/close — a pane opens
+  // for every attachable session that's ACTIVE or BLOCKED (mesa task 411:
+  // blocked agents need attention most, so they auto-open too, not just
+  // ACTIVE) and closes the moment its session reaches DONE. Off by default;
+  // switching it on syncs immediately against whatever `sessions` already
+  // holds, since the effect depends on `autoTile` itself.
+  const [autoTile, setAutoTile] = useState(false)
 
   // "Add Agent" form: a transient overlay row above the pane tree, not part
   // of it — it starts a session, it isn't one. `open` is a plain boolean
@@ -648,6 +656,38 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
     { pollMs: collapsed ? undefined : 3000 },
   )
   const { data: projects } = useFetch(() => listProjects(), 'agents-sidebar-projects')
+
+  // Auto Tile sync: reacts to `sessions` (not the per-render sorted `agents`
+  // copy below, which would re-run this every render) so it only fires when
+  // the poll actually returns new data — `useFetch` drops byte-identical
+  // polls. Only touches attachable sessions (`a.id !== null`; interactive
+  // sessions have no pane to open). Depending on `autoTile` itself makes
+  // switching it on sync immediately against whatever `sessions` already
+  // holds, not just future transitions. `ptyPool.remove` below is a real
+  // side effect (kills the pooled terminal), so this must run as an effect,
+  // not a render-time derivation.
+  useEffect(() => {
+    if (!autoTile || !sessions) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing pane tree to external poll data + a toggle, not derivable at render time
+    setRoot((r) => {
+      let next = r
+      const openIds = new Set(collectLeafIds(next))
+      for (const a of sessions) {
+        if (a.id === null) continue
+        const bucket = bucketOf(a)
+        const isOpen = openIds.has(a.id)
+        if ((bucket === 'ACTIVE' || bucket === 'BLOCKED') && !isOpen) {
+          next = insertLeaf(next, a.id)
+          openIds.add(a.id)
+        } else if (bucket === 'DONE' && isOpen) {
+          ptyPool.remove(a.id)
+          next = removeLeaf(next, a.id)
+          openIds.delete(a.id)
+        }
+      }
+      return next
+    })
+  }, [autoTile, sessions])
 
   // Relative "started Xm ago" labels are derived from the clock at render
   // time, but useFetch drops byte-identical polls, so an idle list would
@@ -881,6 +921,21 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
             onClick={() => setMaximized((m) => !m)}
           >
             {maximized ? 'restore' : 'maximize'}
+          </button>
+        )}
+        {!collapsed && (
+          <button
+            type="button"
+            className={`agent-sidebar-autotile${autoTile ? ' active' : ''}`}
+            aria-label={autoTile ? 'Disable auto tile' : 'Enable auto tile'}
+            title={
+              autoTile
+                ? 'Disable auto tile'
+                : 'Auto tile: open a pane for every active or blocked agent, close it when done'
+            }
+            onClick={() => setAutoTile((v) => !v)}
+          >
+            auto tile
           </button>
         )}
         {!collapsed && (

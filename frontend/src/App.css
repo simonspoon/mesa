@@ -2879,6 +2879,28 @@ body.agent-sidebar-resizing {
 .files-markdown-body :where(a) {
   color: var(--cyan);
 }
+/* GFM tables (task 432). Browser defaults render them borderless and cramped,
+   which reads as broken next to the rest of the prose. Wide tables scroll
+   inside the pane rather than stretching it. */
+.files-markdown-body :where(table) {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.files-markdown-body :where(th, td) {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.files-markdown-body :where(th) {
+  background: var(--panel-raised);
+  font-weight: 600;
+}
 
 /* Leading YAML frontmatter block (task 283) — a bordered panel above the
    rendered body, visually distinct from prose so it reads as document

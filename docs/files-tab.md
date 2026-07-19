@@ -141,7 +141,11 @@ this surface.
   the pre-281 behavior. `.md` files render as formatted markdown via the
   existing `Markdown` component (`frontend/src/components/Markdown.tsx`,
   already used for storyboard frame cards) instead of raw/highlighted text —
-  safe against untrusted content the same way (no raw HTML passthrough). A
+  safe against untrusted content the same way (no raw HTML passthrough). That
+  component carries `remark-gfm` (task 432), so GitHub-flavoured tables,
+  strikethrough, task lists and autolinks render as real elements rather than
+  raw pipe-and-dash source; it is a source-parser extension only and does not
+  widen the no-raw-HTML guarantee. A
   binary file still renders "Binary file — cannot display" instead of raw
   content; the no-`local_path` and dead-folder empty-state rungs render the
   same quiet-placeholder pattern as the Git tab, never a hard error.

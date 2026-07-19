@@ -1,4 +1,5 @@
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 /**
  * Renders frame card text as markdown, treating the source strictly as DATA.
@@ -13,10 +14,16 @@ import ReactMarkdown from 'react-markdown'
  * Links open in a new tab with `rel="noreferrer"` so a card cannot leak the
  * referrer or hijack the opener. URL protocols are sanitised by react-markdown's
  * default URL transform (javascript: and other unsafe schemes are stripped).
+ *
+ * `remark-gfm` adds the GitHub-flavoured extensions core CommonMark lacks —
+ * tables, strikethrough, task lists, autolinks (task 432). It is a source-text
+ * parser extension only: it emits ordinary mdast nodes, so the no-raw-HTML
+ * guarantee above is unaffected.
  */
 export function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
       components={{
         a: ({ children, href }) => (
           <a href={href} target="_blank" rel="noreferrer">

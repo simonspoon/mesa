@@ -70,6 +70,10 @@ const SHAPES_FOR_TYPE: Record<DiagramType, FrameShape[]> = {
   storyboard: [],
   flowchart: ['process', 'decision', 'start_end'],
   erd: ['entity'],
+  // `idea` first, deliberately: the first entry doubles as `defaultShape` for
+  // the quick-create gestures (pane double-click, drag-to-empty-canvas,
+  // Cmd+D), and those should mint a branch idea, not a second hub.
+  brainstorm: ['idea', 'central'],
 }
 
 /** Display label for each shape's add-frame picker button. */
@@ -78,6 +82,8 @@ const SHAPE_LABELS: Record<FrameShape, string> = {
   decision: 'decision',
   start_end: 'start/end',
   entity: 'entity',
+  central: 'central topic',
+  idea: 'idea',
 }
 
 /** Node payload: the server frame, its selected/editing state (owned by this
@@ -402,6 +408,19 @@ function EntityNode(props: NodeProps<FrameNodeType>) {
       )}
     />
   )
+}
+
+/** Brainstorm "central topic": the mind-map hub the ideas branch off. Same
+ *  card behavior as every other shape; the bold pill styling is CSS only, and
+ *  nothing enforces one-central-per-board — a brainstorm board is as freeform
+ *  as every other storyboard. */
+function CentralNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-central" />
+}
+
+/** Brainstorm "idea": a branch node hanging off the central topic. */
+function IdeaNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-idea" />
 }
 
 type Rect = { x: number; y: number; w: number; h: number }
@@ -961,6 +980,8 @@ const nodeTypes = {
   decision: DecisionNode,
   start_end: StartEndNode,
   entity: EntityNode,
+  central: CentralNode,
+  idea: IdeaNode,
 }
 const edgeTypes = { frame: FrameEdgeView }
 

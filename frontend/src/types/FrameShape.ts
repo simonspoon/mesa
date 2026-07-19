@@ -8,4 +8,4 @@
  * `storyboard`-type board; `Store::create_frame` validates a given shape
  * against the parent board's `DiagramType`.
  */
-export type FrameShape = "process" | "decision" | "start_end" | "entity";
+export type FrameShape = "process" | "decision" | "start_end" | "entity" | "central" | "idea";

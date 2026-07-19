@@ -6,6 +6,7 @@
  * as `project_id`/`author`). Picks the shape set offered for its frames: a
  * `storyboard` board takes the generic frame card, a `flowchart` board takes
  * `process`/`decision`/`start_end` node shapes, an `erd` board takes only the
- * `entity` shape.
+ * `entity` shape, and a `brainstorm` board takes `central`/`idea` mind-map
+ * shapes.
  */
-export type DiagramType = "storyboard" | "flowchart" | "erd";
+export type DiagramType = "storyboard" | "flowchart" | "erd" | "brainstorm";

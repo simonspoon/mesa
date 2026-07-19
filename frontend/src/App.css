@@ -1154,6 +1154,39 @@ main {
   border-color: var(--magenta);
 }
 
+/* Brainstorm mind-map shapes (mesa task 444) — the hub reads as the anchor
+   the ideas hang off, so `central` takes the heavier treatment (thicker amber
+   border + permanent glow, fully rounded) and `idea` the lighter one (a soft
+   rounded rectangle). Nothing enforces one central node per board; the
+   styling is the only thing that says "hub", exactly as the flowchart shapes
+   only *look* like their role. */
+.frame.frame-central {
+  clip-path: none;
+  /* Deliberately NOT the full `999px` stadium `.frame-start-end` uses. At a
+     default 240x140 card that clamps to a 70px corner radius, which eats
+     ~28px of horizontal space at the header's mid-height — more than any
+     sane title padding can clear, so the title's leading letter and the
+     `#id` badge get clipped (the same failure the decision diamond hit, and
+     why it became a `::before` backdrop instead). 32px keeps the hub reading
+     as a soft capsule while leaving the header legible; the 2px amber border
+     + permanent glow, not the silhouette, are what mark it as the hub. */
+  border-radius: 32px;
+  border: 2px solid var(--amber);
+  box-shadow: 0 0 18px rgba(255, 180, 68, 0.3);
+}
+.frame.frame-central .frame-header {
+  border-radius: 30px 30px 0 0;
+  /* Clears what's left of the corner curve at the title's own vertical band. */
+  padding-left: 1.1rem;
+  padding-right: 1.1rem;
+}
+
+.frame.frame-idea {
+  clip-path: none;
+  border-radius: 12px;
+  border-color: var(--green);
+}
+
 .frame-header {
   display: flex;
   justify-content: space-between;

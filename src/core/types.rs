@@ -417,7 +417,8 @@ impl From<&Task> for TaskSummary {
 /// as `project_id`/`author`). Picks the shape set offered for its frames: a
 /// `storyboard` board takes the generic frame card, a `flowchart` board takes
 /// `process`/`decision`/`start_end` node shapes, an `erd` board takes only the
-/// `entity` shape.
+/// `entity` shape, and a `brainstorm` board takes `central`/`idea` mind-map
+/// shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -425,6 +426,7 @@ pub enum DiagramType {
     Storyboard,
     Flowchart,
     Erd,
+    Brainstorm,
 }
 
 impl DiagramType {
@@ -433,6 +435,7 @@ impl DiagramType {
             DiagramType::Storyboard => "storyboard",
             DiagramType::Flowchart => "flowchart",
             DiagramType::Erd => "erd",
+            DiagramType::Brainstorm => "brainstorm",
         }
     }
 
@@ -441,6 +444,7 @@ impl DiagramType {
             "storyboard" => Some(DiagramType::Storyboard),
             "flowchart" => Some(DiagramType::Flowchart),
             "erd" => Some(DiagramType::Erd),
+            "brainstorm" => Some(DiagramType::Brainstorm),
             _ => None,
         }
     }
@@ -460,6 +464,8 @@ pub enum FrameShape {
     Decision,
     StartEnd,
     Entity,
+    Central,
+    Idea,
 }
 
 impl FrameShape {
@@ -469,6 +475,8 @@ impl FrameShape {
             FrameShape::Decision => "decision",
             FrameShape::StartEnd => "start_end",
             FrameShape::Entity => "entity",
+            FrameShape::Central => "central",
+            FrameShape::Idea => "idea",
         }
     }
 
@@ -478,6 +486,8 @@ impl FrameShape {
             "decision" => Some(FrameShape::Decision),
             "start_end" => Some(FrameShape::StartEnd),
             "entity" => Some(FrameShape::Entity),
+            "central" => Some(FrameShape::Central),
+            "idea" => Some(FrameShape::Idea),
             _ => None,
         }
     }
@@ -1136,6 +1146,10 @@ mod tests {
         );
         // The acronym-casing case the arch doc flagged to confirm, not assume.
         assert_eq!(serde_json::to_string(&DiagramType::Erd).unwrap(), "\"erd\"");
+        assert_eq!(
+            serde_json::to_string(&DiagramType::Brainstorm).unwrap(),
+            "\"brainstorm\""
+        );
     }
 
     #[test]
@@ -1156,6 +1170,14 @@ mod tests {
             serde_json::to_string(&FrameShape::Entity).unwrap(),
             "\"entity\""
         );
+        assert_eq!(
+            serde_json::to_string(&FrameShape::Central).unwrap(),
+            "\"central\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FrameShape::Idea).unwrap(),
+            "\"idea\""
+        );
     }
 
     #[test]
@@ -1164,6 +1186,7 @@ mod tests {
             DiagramType::Storyboard,
             DiagramType::Flowchart,
             DiagramType::Erd,
+            DiagramType::Brainstorm,
         ] {
             assert_eq!(DiagramType::parse(dt.as_str()), Some(dt));
         }
@@ -1172,6 +1195,8 @@ mod tests {
             FrameShape::Decision,
             FrameShape::StartEnd,
             FrameShape::Entity,
+            FrameShape::Central,
+            FrameShape::Idea,
         ] {
             assert_eq!(FrameShape::parse(shape.as_str()), Some(shape));
         }

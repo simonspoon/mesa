@@ -124,9 +124,11 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   frames gets `dupOffset: 0` and renders byte-identical to before this fix;
   an edge with real waypoints already diverges naturally, so `dupOffset` is
   only applied in the plain-bezier (no-waypoints) branch.
-- **Diagram types + per-frame shapes** (spec 355): a storyboard carries a
+- **Diagram types + per-frame shapes** (spec 355; `brainstorm` added by mesa
+  task 444): a storyboard carries a
   `diagram_type` (`Storyboard.diagram_type: DiagramType`) — `storyboard`
-  (default), `flowchart`, or `erd` — stored as a **bare lowercase string**
+  (default), `flowchart`, `erd`, or `brainstorm` — stored as a **bare
+  lowercase string**
   (`as_str()`/`parse()`, same convention as `AnchorSide`/`Status`/`Priority`),
   added via migration index 17 alongside `frames.shape` (`ALTER TABLE
   storyboards ADD COLUMN diagram_type TEXT NOT NULL DEFAULT 'storyboard'` /
@@ -152,8 +154,13 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     a `storyboard` board's frames must have `shape: None`; a `flowchart`
     board's frames must be one of `process`/`decision`/`start_end` (not
     `entity`); an `erd` board's frames must be `entity` (not any flowchart
-    shape). A mismatch is `Error::Validation` (`"shape '<shape>' is not valid
-    for a <diagram_type> board"`).
+    shape); a `brainstorm` board's frames must be `central` or `idea`. A
+    mismatch is `Error::Validation` (`"shape '<shape>' is not valid
+    for a <diagram_type> board"`). The whole matrix — every board type against
+    its own shape set and every other shape, including the generic `None` card
+    on a typed board — is covered by
+    `frame_shape_must_belong_to_its_boards_diagram_type` in
+    `src/core/store.rs`.
   - **`shape` is likewise immutable after creation** — no field on
     `FramePatch`/the API's `FrameUpdate`, mirroring `diagram_type`'s
     reasoning: a frame should never carry a shape from the "wrong" type
@@ -161,10 +168,10 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     frame update --shape ...` doesn't exist as a flag; same clap usage-error
     posture as `storyboard update --type`.
   - CLI: `storyboard create <PROJECT> <TITLE> [--type
-    storyboard|flowchart|erd]` (absent → `storyboard`, the column default;
+    storyboard|flowchart|erd|brainstorm]` (absent → `storyboard`, the column default;
     an unrecognized value is a clap usage error, exit 2, same posture as
     `--priority`). `storyboard frame create <STORYBOARD> <TITLE> [--shape
-    process|decision|start_end|entity]` (absent → `None`; an unrecognized
+    process|decision|start_end|entity|central|idea]` (absent → `None`; an unrecognized
     value is a clap usage error, exit 2; a syntactically valid value that's
     wrong for the board's `diagram_type` is the `Store` `validation` error
     above, exit 1 — the CLI does not auto-correct or default a shape for a
@@ -191,7 +198,8 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     `diagram_type` only selects which shape *set* the creation UX offers.
     `toNodes` sets `type: (f.shape ?? 'frame') as FrameNodeKind`; `nodeTypes`
     maps `{ frame: FrameNode, process: ProcessNode, decision: DecisionNode,
-    start_end: StartEndNode, entity: EntityNode }`. All five components
+    start_end: StartEndNode, entity: EntityNode, central: CentralNode,
+    idea: IdeaNode }`. All seven components
     share one implementation, `FrameCardNode` — identical content, editing,
     and connection-handle behavior — distinguished only by an optional
     `shapeClass` (an extra CSS class on the card) and, for `EntityNode` only,
@@ -230,12 +238,35 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
       `Markdown`'s soft-break handling on a generic card — the concrete
       difference the Should #13 "not an opaque markdown blob" requirement is
       checking for.
+    - **Brainstorm shapes** (`.frame-central`/`.frame-idea`, mesa task 444):
+      a mind-map hub plus its branch nodes. `CentralNode`/`IdeaNode` are both
+      plain `FrameCardNode`s with only a `shapeClass` — no `renderBody`
+      override, so bodies still render through `Markdown` like every shape
+      but `entity`. `central` is a soft capsule (32px radius) with a 2px
+      amber border and a permanent glow; `idea` is a lighter 12px-radius
+      rounded rectangle with a green border. **`central` deliberately does
+      not use the `999px` stadium radius `.frame-start-end` uses**: at the
+      default 240x140 card that clamps to a 70px corner radius, which eats
+      ~28px of horizontal space at the header's mid-height — more than any
+      sane title padding clears, so the title's leading letter and the `#id`
+      badge clip (the same failure that turned the decision diamond into a
+      `::before` backdrop; `.frame-start-end` still has it — measured at
+      14.6px title inset against a ~28px curve, filed to the inbox, out of
+      scope here). Nothing enforces one `central` per board — a brainstorm
+      board is as freeform as every other storyboard, and the styling is the
+      only thing that says "hub", exactly as the flowchart shapes only *look*
+      like their roles. `SHAPES_FOR_TYPE.brainstorm` lists `idea` *before*
+      `central` on purpose: the first entry doubles as the `defaultShape` for
+      the quick-create gestures (pane double-click, drag-to-empty-canvas,
+      Cmd+D duplicate), and those should mint a branch idea rather than a
+      second hub.
   - Frontend creation UX: `StoryboardListView.tsx`'s new-storyboard form adds
-    a `diagram_type` `<select>` (options `storyboard`/`flowchart`/`erd`,
-    default `storyboard`) next to title/author, passed straight through to
+    a `diagram_type` `<select>` (options
+    `storyboard`/`flowchart`/`erd`/`brainstorm`, default `storyboard`) next to title/author, passed straight through to
     `createStoryboard(...)`. `StoryboardCanvas.tsx`'s add-frame toolbar reads
     `SHAPES_FOR_TYPE[view.storyboard.diagram_type]` (`storyboard: []`,
-    `flowchart: ['process','decision','start_end']`, `erd: ['entity']` — kept
+    `flowchart: ['process','decision','start_end']`, `erd: ['entity']`,
+    `brainstorm: ['idea','central']` — kept
     in lockstep with `Store::validate_frame_shape`) to decide what to render:
     a `storyboard`-type board (empty shape set) keeps the original single
     "add frame" button, byte-identical markup to before this feature; a

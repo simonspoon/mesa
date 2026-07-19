@@ -407,7 +407,8 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
 
 /// Validates a frame's `shape` against its board's `diagram_type` shape set:
 /// `storyboard` boards take no shape, `flowchart` boards take
-/// `process`/`decision`/`start_end`, `erd` boards take only `entity`.
+/// `process`/`decision`/`start_end`, `erd` boards take only `entity`, and
+/// `brainstorm` boards take `central`/`idea`.
 fn validate_frame_shape(diagram_type: DiagramType, shape: Option<FrameShape>) -> Result<()> {
     let ok = matches!(
         (diagram_type, shape),
@@ -417,6 +418,10 @@ fn validate_frame_shape(diagram_type: DiagramType, shape: Option<FrameShape>) ->
                 Some(FrameShape::Process | FrameShape::Decision | FrameShape::StartEnd),
             )
             | (DiagramType::Erd, Some(FrameShape::Entity))
+            | (
+                DiagramType::Brainstorm,
+                Some(FrameShape::Central | FrameShape::Idea),
+            )
     );
     if ok {
         Ok(())
@@ -1762,7 +1767,8 @@ impl Store {
     /// `new.shape`, if given, must be a member of the board's `diagram_type`
     /// shape set — a `storyboard` board takes no shape, a `flowchart` board
     /// takes `process`/`decision`/`start_end`, an `erd` board takes only
-    /// `entity`; a mismatch is a validation error.
+    /// `entity`, a `brainstorm` board takes `central`/`idea`; a mismatch is a
+    /// validation error.
     pub fn create_frame(&mut self, storyboard_id: i64, new: &FrameNew) -> Result<Frame> {
         let sb = match self.get_storyboard(storyboard_id) {
             Ok(sb) => sb,
@@ -3937,6 +3943,70 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn frame_shape_must_belong_to_its_boards_diagram_type() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        // Each board type accepts exactly its own shape set and rejects every
+        // other one (including the generic `None` card on a typed board).
+        let sets = [
+            (
+                DiagramType::Storyboard,
+                vec![None],
+                vec![Some(FrameShape::Process), Some(FrameShape::Idea)],
+            ),
+            (
+                DiagramType::Flowchart,
+                vec![
+                    Some(FrameShape::Process),
+                    Some(FrameShape::Decision),
+                    Some(FrameShape::StartEnd),
+                ],
+                vec![None, Some(FrameShape::Entity), Some(FrameShape::Central)],
+            ),
+            (
+                DiagramType::Erd,
+                vec![Some(FrameShape::Entity)],
+                vec![None, Some(FrameShape::Process), Some(FrameShape::Idea)],
+            ),
+            (
+                DiagramType::Brainstorm,
+                vec![Some(FrameShape::Central), Some(FrameShape::Idea)],
+                vec![None, Some(FrameShape::Process), Some(FrameShape::Entity)],
+            ),
+        ];
+        for (diagram_type, valid, invalid) in sets {
+            let sb = store
+                .create_storyboard(p.id, diagram_type.as_str(), None, None, Some(diagram_type))
+                .unwrap();
+            for shape in valid {
+                let f = store
+                    .create_frame(
+                        sb.id,
+                        &FrameNew {
+                            shape,
+                            ..frame_new("ok")
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(f.shape, shape);
+            }
+            for shape in invalid {
+                let err = store
+                    .create_frame(
+                        sb.id,
+                        &FrameNew {
+                            shape,
+                            ..frame_new("bad")
+                        },
+                    )
+                    .unwrap_err();
+                assert!(matches!(err, Error::Validation(_)));
+                assert!(err.to_string().contains(diagram_type.as_str()));
+            }
+        }
     }
 
     #[test]

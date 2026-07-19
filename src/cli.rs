@@ -692,8 +692,9 @@ EXAMPLES
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
-        /// Diagram type: storyboard|flowchart|erd (default storyboard);
-        /// immutable after creation — no --type on `storyboard update`
+        /// Diagram type: storyboard|flowchart|erd|brainstorm (default
+        /// storyboard); immutable after creation — no --type on
+        /// `storyboard update`
         #[arg(long = "type", value_parser = parse_diagram_type)]
         diagram_type: Option<DiagramType>,
         /// Free-text actor id of the creator (an agent name or "user")
@@ -806,9 +807,10 @@ EXAMPLES
         /// Optional task id to link (must be in the storyboard's project)
         #[arg(long)]
         task: Option<i64>,
-        /// Node shape: process|decision|start_end|entity, valid only for the
-        /// board's diagram type (must be omitted on a storyboard board);
-        /// immutable after creation — no --shape on `storyboard frame update`
+        /// Node shape: process|decision|start_end|entity|central|idea, valid
+        /// only for the board's diagram type (must be omitted on a storyboard
+        /// board); immutable after creation — no --shape on
+        /// `storyboard frame update`
         #[arg(long, value_parser = parse_frame_shape)]
         shape: Option<FrameShape>,
         /// Free-text actor id of the creator (an agent name or "user")
@@ -943,12 +945,14 @@ fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
 }
 
 fn parse_diagram_type(s: &str) -> std::result::Result<DiagramType, String> {
-    DiagramType::parse(s).ok_or_else(|| format!("'{s}' is not one of storyboard|flowchart|erd"))
+    DiagramType::parse(s)
+        .ok_or_else(|| format!("'{s}' is not one of storyboard|flowchart|erd|brainstorm"))
 }
 
 fn parse_frame_shape(s: &str) -> std::result::Result<FrameShape, String> {
-    FrameShape::parse(s)
-        .ok_or_else(|| format!("'{s}' is not one of process|decision|start_end|entity"))
+    FrameShape::parse(s).ok_or_else(|| {
+        format!("'{s}' is not one of process|decision|start_end|entity|central|idea")
+    })
 }
 
 /// Comma-separated tags; empty string yields the empty set (clears tags).

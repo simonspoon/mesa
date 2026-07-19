@@ -8,7 +8,7 @@ import { useFetch } from '../useFetch'
  *  offered as a plain `<select>` alongside title/author, defaulting to the
  *  original generic board so existing creation behavior is unchanged unless
  *  the user picks otherwise. */
-const DIAGRAM_TYPES: DiagramType[] = ['storyboard', 'flowchart', 'erd']
+const DIAGRAM_TYPES: DiagramType[] = ['storyboard', 'flowchart', 'erd', 'brainstorm']
 
 /**
  * Lists a project's storyboards and creates new ones. A board is a freeform

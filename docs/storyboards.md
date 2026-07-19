@@ -209,9 +209,11 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     non-regression guard).
     - **Flowchart shapes** (`.frame-process`/`.frame-decision`/
       `.frame-start-end` in `frontend/src/App.css`): `process` is a plain
-      rounded rectangle (`clip-path: none`); `start_end` is a pill/stadium
-      shape (`border-radius: 999px`, green border) with extra header padding
-      so the title/id clear the curve; `decision` is **not** a `clip-path`
+      rounded rectangle (`clip-path: none`); `start_end` is a soft capsule
+      (`border-radius: 32px`, green border) with extra header padding so the
+      title/id clear the curve — it was a full `999px` stadium until mesa
+      task 445, which clipped both (see `.frame-central` below for the
+      measurement); `decision` is **not** a `clip-path`
       diamond on the card itself (an earlier attempt clipped the title's
       leading letter and the `#id` badge at the diamond's narrow point) —
       instead the card stays a plain unclipped rectangle
@@ -238,7 +240,8 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
       `Markdown`'s soft-break handling on a generic card — the concrete
       difference the Should #13 "not an opaque markdown blob" requirement is
       checking for.
-    - **Brainstorm shapes** (`.frame-central`/`.frame-idea`, mesa task 444):
+    - **Brainstorm shapes** (`.frame-central`/`.frame-idea`, mesa task 444;
+      the `.frame-start-end` note below is post-task-445):
       a mind-map hub plus its branch nodes. `CentralNode`/`IdeaNode` are both
       plain `FrameCardNode`s with only a `shapeClass` — no `renderBody`
       override, so bodies still render through `Markdown` like every shape
@@ -250,9 +253,11 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
       ~28px of horizontal space at the header's mid-height — more than any
       sane title padding clears, so the title's leading letter and the `#id`
       badge clip (the same failure that turned the decision diamond into a
-      `::before` backdrop; `.frame-start-end` still has it — measured at
-      14.6px title inset against a ~28px curve, filed to the inbox, out of
-      scope here). Nothing enforces one `central` per board — a brainstorm
+      `::before` backdrop). `.frame-start-end` had the identical bug —
+      measured at a 14.6px title inset against a ~28px curve — and mesa
+      task 445 fixed it by adopting these same 32px/1.1rem values, so the
+      two shapes now share one treatment. Nothing enforces one `central`
+      per board — a brainstorm
       board is as freeform as every other storyboard, and the styling is the
       only thing that says "hub", exactly as the flowchart shapes only *look*
       like their roles. `SHAPES_FOR_TYPE.brainstorm` lists `idea` *before*

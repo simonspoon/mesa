@@ -1131,17 +1131,22 @@ main {
 
 .frame.frame-start-end {
   clip-path: none;
-  border-radius: 999px;
+  /* Was the full `999px` stadium (mesa task 445): on the default 240x140 card
+     that clamps to a 70px corner radius, eating ~28px horizontally at the
+     header's mid-height while the header only inset 14.6px — so the title's
+     leading letter and the `#id` badge clipped. Same failure class as the
+     decision diamond, fixed the same way `.frame-central` was: a soft capsule
+     radius the header padding can actually clear. Still reads as the rounded
+     terminator next to `process`'s square corners; the green border does the
+     rest. */
+  border-radius: 32px;
   border-color: var(--green);
 }
 .frame.frame-start-end .frame-header {
-  border-radius: 999px 999px 0 0;
-  /* The rounded ends only eat into the corners (a "stadium" shape, not a
-     true ellipse, whenever w > h — the common case here), but nudge the
-     title/id row's own padding out a bit further so it clears the curve
-     even on a squarer start/end card. */
-  padding-left: 0.85rem;
-  padding-right: 0.85rem;
+  border-radius: 30px 30px 0 0;
+  /* Clears what's left of the corner curve at the title's own vertical band. */
+  padding-left: 1.1rem;
+  padding-right: 1.1rem;
 }
 
 /* ERD "entity" shape (mesa task 359) — a plain rectangle, like `frame-

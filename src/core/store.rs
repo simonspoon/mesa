@@ -1810,7 +1810,15 @@ impl Store {
                 storyboard_id,
                 new.author.as_deref(),
                 "frame_added",
-                &format!("added frame '{}' (#{id})", new.title),
+                // The canvas creates frames untitled so the user types straight
+                // into a focused, empty title field (mesa task 448), so the
+                // common case here is an empty title — spell that out rather
+                // than logging a bare `added frame '' (#N)`.
+                &if new.title.trim().is_empty() {
+                    format!("added untitled frame (#{id})")
+                } else {
+                    format!("added frame '{}' (#{id})", new.title)
+                },
             )?;
             tx.commit()?;
             id

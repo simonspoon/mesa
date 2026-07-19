@@ -283,3 +283,33 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     those keep working on flowchart/erd boards instead of hitting the
     `Store` validation error a bare `shape: null` create would now draw on a
     non-`storyboard` board.
+  - **Untitled-on-create + collapsed description** (mesa task 448): every
+    frame-creating gesture that mints a *fresh* frame (`addFrame` — the
+    toolbar buttons and pane double-click — plus `onConnectEnd`'s
+    drag-to-empty-canvas) sends `title: ''` and sets `editingId` to the new
+    frame, so the card opens straight into a focused, empty title input with
+    nothing to select-all over. That focus comes from a **callback ref that
+    retries across animation frames**, not from React's `autoFocus`: a
+    freshly-created React Flow node renders `visibility: hidden` until React
+    Flow has measured it (two frames, measured in browser QA), and `focus()`
+    on a hidden element is a silent no-op — so `autoFocus` and any one-shot
+    mount effect both land on nothing and `document.activeElement` stays
+    `<body>`. The retry is bounded (30 frames) and stops early once focus is
+    inside the card, so it can't spin forever and can't yank the caret back
+    out of the body textarea.
+    `Store::create_frame` writes `added untitled frame (#N)` rather than
+    `added frame '' (#N)` for the now-common empty title, keeping the
+    storyboard history readable. It otherwise has no
+    non-empty-title check, so an empty title is a legal stored value;
+    `saveTitle` still refuses to *overwrite* a title with an empty one, and
+    read mode renders a muted `untitled` for `f.title.trim() === ''` so an
+    unnamed frame is still legible. `duplicateFrame` is deliberately excluded
+    — a Cmd+D copy carries the source title and should not reopen for editing.
+    Independently, `FrameCardNode` no longer renders the 4-row
+    `.frame-body-input` textarea unconditionally while editing: `bodyOpen`
+    (seeded from `(f.body ?? '') !== ''` and re-seeded on each edit session,
+    same "adjust state during render on a prop change" pattern as the drafts)
+    swaps it for a `.frame-add-body` "+ description" button when the body is
+    empty. The textarea's `autoFocus={(f.body ?? '') === ''}` is true only on
+    that button's click-to-mount path, so opening a frame that already has a
+    body still lands focus on the title input rather than the body.

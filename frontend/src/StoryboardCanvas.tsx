@@ -180,6 +180,36 @@ function FrameCardNode({
     f.task_id !== null ? String(f.task_id) : '',
   )
   const [taskError, setTaskError] = useState<string | null>(null)
+  // An empty body shows no description box at all — just an "add description"
+  // button that mounts the textarea (task 448). Reset per edit session like the
+  // drafts below, so a frame whose body is still empty next time starts
+  // collapsed again rather than remembering a stray click.
+  const [bodyOpen, setBodyOpen] = useState((f.body ?? '') !== '')
+  // Focusing the title input on the *create* path (task 448) can't just be
+  // React's `autoFocus`. A freshly-created React Flow node renders with
+  // `visibility: hidden` until React Flow has measured it — two animation
+  // frames, in browser QA — and `focus()` on a hidden element is a silent
+  // no-op, so both `autoFocus` and a one-shot effect land on nothing and
+  // `document.activeElement` stays `<body>`. Retry across frames until the
+  // node is visible and the focus actually takes, bounded so a node that
+  // never becomes focusable can't spin forever.
+  const focusTitle = useCallback((el: HTMLInputElement | null) => {
+    if (!el) return
+    const card = el.closest('.frame')
+    let tries = 0
+    const attempt = () => {
+      if (!el.isConnected || document.activeElement === el) return
+      // Don't steal the caret back if the user has already moved into the
+      // body textarea or another field on this card.
+      if (card && card.contains(document.activeElement)) return
+      el.focus()
+      if (document.activeElement !== el && ++tries < 30) {
+        requestAnimationFrame(attempt)
+      }
+    }
+    attempt()
+  }, [])
+
   const [wasEditing, setWasEditing] = useState(editing)
   if (editing !== wasEditing) {
     setWasEditing(editing)
@@ -188,6 +218,7 @@ function FrameCardNode({
       setBodyDraft(f.body ?? '')
       setTaskDraft(f.task_id !== null ? String(f.task_id) : '')
       setTaskError(null)
+      setBodyOpen((f.body ?? '') !== '')
     }
   }
 
@@ -250,7 +281,8 @@ function FrameCardNode({
           {editing ? (
             <input
               className="frame-title-input nodrag"
-              autoFocus
+              ref={focusTitle}
+              placeholder="frame title"
               value={titleDraft}
               onChange={(e) => setTitleDraft(e.target.value)}
               onBlur={saveTitle}
@@ -260,8 +292,12 @@ function FrameCardNode({
               }}
             />
           ) : (
-            <span className="frame-title">
-              <Markdown text={f.title} />
+            <span
+              className={'frame-title' + (f.title.trim() === '' ? ' muted' : '')}
+            >
+              {/* New frames are created untitled (task 448), so read mode needs
+                  something to show for a frame the user never named. */}
+              {f.title.trim() === '' ? 'untitled' : <Markdown text={f.title} />}
             </span>
           )}
           <span className="frame-id muted">#{f.id}</span>
@@ -276,14 +312,26 @@ function FrameCardNode({
           )}
         </div>
         {editing ? (
-          <textarea
-            className="frame-body-input"
-            rows={4}
-            value={bodyDraft}
-            placeholder="no body — type to add"
-            onChange={(e) => setBodyDraft(e.target.value)}
-            onBlur={saveBody}
-          />
+          bodyOpen ? (
+            <textarea
+              className="frame-body-input"
+              rows={4}
+              // Focus follows the click that opened it. Only ever true for a
+              // body that started empty, so an edit session on a frame that
+              // already has a body still lands focus on the title input above.
+              autoFocus={(f.body ?? '') === ''}
+              value={bodyDraft}
+              onChange={(e) => setBodyDraft(e.target.value)}
+              onBlur={saveBody}
+            />
+          ) : (
+            <button
+              className="frame-add-body nodrag"
+              onClick={() => setBodyOpen(true)}
+            >
+              + description
+            </button>
+          )
         ) : (
           f.body && (
             <div className="frame-body">
@@ -1203,10 +1251,14 @@ export function StoryboardCanvas({
   const boardShapes = SHAPES_FOR_TYPE[view.storyboard.diagram_type]
   const defaultShape = boardShapes[0]
 
+  /** Creates the frame untitled and opens it for editing, so the user lands in
+   *  a focused, empty title input and just types (task 448) — rather than
+   *  having to select-all over a placeholder "New frame" string first. An
+   *  untitled frame renders as a muted "untitled" until named. */
   function addFrame(shape?: FrameShape, pos?: { x: number; y: number }) {
     const n = view.frames.length
     createFrame(storyboardId, {
-      title: 'New frame',
+      title: '',
       x: pos ? Math.round(pos.x) : 48 + (n % 6) * 28,
       y: pos ? Math.round(pos.y) : 48 + (n % 6) * 28,
       author,
@@ -1215,6 +1267,7 @@ export function StoryboardCanvas({
       setError(null)
       onChanged()
       setSelectedId(f.id)
+      setEditingId(f.id)
     }, showError)
   }
 
@@ -1315,7 +1368,7 @@ export function StoryboardCanvas({
     const pos = inst.screenToFlowPosition({ x: point.clientX, y: point.clientY })
     const fromId = connectionState.fromNode.id
     createFrame(storyboardId, {
-      title: 'New frame',
+      title: '',
       x: Math.round(pos.x),
       y: Math.round(pos.y),
       author,
@@ -1324,6 +1377,7 @@ export function StoryboardCanvas({
       setError(null)
       onChanged()
       setSelectedId(f.id)
+      setEditingId(f.id)
       createEdge(storyboardId, {
         from_frame: Number(fromId),
         to_frame: f.id,

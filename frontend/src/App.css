@@ -1331,6 +1331,15 @@ main {
   resize: vertical;
 }
 
+/* Stand-in for the description textarea while the body is empty: keeps the
+   card compact but leaves the affordance visible (task 448). */
+.frame-add-body {
+  align-self: flex-start;
+  margin: 0.4rem 0.5rem;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.7rem;
+}
+
 .frame-edit-fields {
   display: flex;
   flex-direction: column;

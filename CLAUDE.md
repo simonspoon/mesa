@@ -109,9 +109,11 @@ invariants you must not break — read them before changing `src/`:
   is `not_found` with a hint, a duplicated name `conflict` listing candidate ids.
 - **Create subcommands take their required args positionally or as flags**:
   `task create <PROJECT> <TITLE>`, `storyboard create <PROJECT> <TITLE>`,
-  `frame create <STORYBOARD> <TITLE>`, `edge create <STORYBOARD> <FROM> <TO>` —
-  each positional has an equivalent `--flag` (clap enforces exactly one of the
-  pair; both or neither is `usage`, exit 2), matching `project create <NAME>`.
+  `storyboard frame create <STORYBOARD> <TITLE>`, `storyboard edge create
+  <STORYBOARD> <FROM> <TO>` — each positional has an equivalent `--flag` (clap
+  enforces exactly one of the pair; both or neither is `usage`, exit 2),
+  matching `project create <NAME>`. Frame/edge commands are nested under
+  `storyboard`; there is no top-level `mesa frame`/`mesa edge`.
   The optional project filter on `task list`, `task next`, and
   `storyboard list` takes the same shape: positional `[PROJECT]` or
   `--project`, both is `usage`, neither means unscoped.

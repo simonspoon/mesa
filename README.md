@@ -86,6 +86,9 @@ mesa task create "Website redesign" "Draft homepage copy" --tags writing,web
 # Query: open, unblocked tasks in project 1
 mesa task list --project 1 --status todo --unblocked
 
+# List the child stories of an umbrella task (same filters as GET /api/tasks?parent=42)
+mesa task list --parent 42
+
 # Express a dependency: task 3 is blocked by task 1
 mesa task block 3 --by 1
 

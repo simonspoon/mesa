@@ -96,6 +96,11 @@ run 0 "$MESA" task list --project "$P" --tag design
 [ "$(jqs '.[0].id')" = "$T1" ] || fail "list --tag: wrong task"
 ok "task list --tag filter"
 
+run 0 "$MESA" task list --parent "$T3"
+[ "$(jqs length)" = "1" ] || fail "list --parent: expected 1"
+[ "$(jqs '.[0].parent_id')" = "$T3" ] || fail "list --parent: wrong task"
+ok "task list --parent filter"
+
 run 0 "$MESA" task list --status todo
 [ "$(jqs length)" = "5" ] || fail "list --status todo: expected 5"
 ok "task list --status filter"

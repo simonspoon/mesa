@@ -750,6 +750,9 @@ struct TaskQuery {
     status: Option<Status>,
     #[serde(default)]
     tag: Option<String>,
+    /// Only subtasks of this parent task id, matching the CLI's `--parent`.
+    #[serde(default)]
+    parent: Option<i64>,
     #[serde(default)]
     unblocked: bool,
 }
@@ -771,6 +774,7 @@ async fn list_tasks(
         .filter(|t| q.project.is_none_or(|p| t.project_id == p))
         .filter(|t| q.status.is_none_or(|s| t.status == s))
         .filter(|t| q.tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
+        .filter(|t| q.parent.is_none_or(|p| t.parent_id == Some(p)))
         .filter(|t| !q.unblocked || !t.blocked)
         .map(TaskSummary::from)
         .collect();

@@ -307,3 +307,37 @@ already use.
   never force-closes panes auto-tile had opened. Interactive sessions
   (`id === null`) are skipped, same as everywhere else in the sidebar — there
   is no pane to open for them.
+
+  **While on, Auto Tile owns the layout** (mesa task 466): the tree is
+  rebuilt as a grid (`buildGrid`) rather than patched pane-by-pane, because
+  adding a 4th agent to a 3-pane row has to re-tile everything to reach 2x2.
+  Column count comes from `gridColumns(n, width, height)` — it scores every
+  column count whose cells clear `MIN_GRID_PANE_PX` (360px, below which a
+  terminal wraps into slivers) by how far the resulting cell aspect sits from
+  a target of 1.4 on a log scale, plus a small penalty per empty grid slot,
+  and takes the best. So a 448px-wide sidebar still stacks vertically no
+  matter how many agents run, a ~1400px one puts 4 panes in 2x2 and 6 in 3x2,
+  and 2 panes go side by side. Leaves fill row-major (pane `i` → column
+  `i % cols`), ordered oldest-first, so a newly started agent appends to the
+  end instead of shuffling every existing pane one cell along.
+
+  The width/height fed to `gridColumns` is the **tile area's live measured
+  rect** (a `ResizeObserver` on `agent-sidebar-tile-area` → `tileSize`), not
+  the sidebar's `width` state: that box is resized three independent ways
+  (sidebar drag, maximize, list-rail collapse/resize), so a `width`-derived
+  guess would be wrong in most of them. The rebuild is skipped unless the
+  pane set or the column count actually changed (`autoTileColsRef`), so
+  dragging the sidebar a few px wider — or a poll that returns the same
+  agents — leaves the user's own divider positions and manual rearrangement
+  intact. A manual drag does get overwritten the next time an agent starts
+  or finishes; that is the trade the mode asks for, and turning Auto Tile off
+  freezes the layout as-is.
+
+  Because of that guard, panes opened **by hand** while the mode is on (a
+  list-rail click, or `+ agent`) must re-tile rather than root-append, and
+  both go through `addPane` for exactly that reason: `insertLeaf` would drop
+  the new leaf in as a full-height extra column of the row-oriented grid, and
+  the next poll — seeing a pane set that already matches the sessions list —
+  would leave it that way indefinitely. `addPane` rebuilds the grid with the
+  new id appended, which is also what makes a `+ agent` pane appear tiled
+  immediately instead of on the next poll.

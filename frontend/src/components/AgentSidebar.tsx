@@ -22,10 +22,12 @@ import { projectForCwd } from '../agentProject'
 import * as ptyPool from '../lib/ptyPool'
 import {
   axisPos,
+  buildGrid,
   collectLeafIds,
   computeDropEdge,
   DEFAULT_RATIO,
   emptyRoot,
+  gridColumns,
   findPathToLeaf,
   getNodeAtPath,
   MIN_PANE_PX,
@@ -465,6 +467,18 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
   const [listCollapsed, setListCollapsed] = useState(false)
   const [listResizing, setListResizing] = useState(false)
   const bodyRef = useRef<HTMLDivElement>(null)
+  // Live size of the tile area, the box Auto Tile lays its grid out inside
+  // (mesa task 466). Measured, not derived from `width`: that box is resized
+  // three independent ways — the sidebar's own drag, maximize, and the list
+  // rail's collapse/resize — so a `width`-derived guess would be wrong in
+  // most of them. A ResizeObserver catches all three plus window resizes
+  // with one subscription.
+  const tileAreaRef = useRef<HTMLDivElement>(null)
+  const [tileSize, setTileSize] = useState({ width: 0, height: 0 })
+  // Same measurement as a ref, for the non-render readers below (`addPane`,
+  // reachable from a spawn's `.then` long after the render that started it):
+  // a state read there would be whatever the submitting render captured.
+  const tileSizeRef = useRef(tileSize)
   // DONE starts collapsed (stale sessions aren't the thing you want to see
   // first); BLOCKED/ACTIVE start open. `state` from the API is a live status
   // (working/blocked/done/…), not the `collapsed` UI concept below.
@@ -654,37 +668,95 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
   )
   const { data: projects } = useFetch(() => listProjects(), 'agents-sidebar-projects')
 
-  // Auto Tile sync: reacts to `sessions` (not the per-render sorted `agents`
-  // copy below, which would re-run this every render) so it only fires when
-  // the poll actually returns new data — `useFetch` drops byte-identical
-  // polls. Only touches attachable sessions (`a.id !== null`; interactive
-  // sessions have no pane to open). Depending on `autoTile` itself makes
-  // switching it on sync immediately against whatever `sessions` already
-  // holds, not just future transitions. `ptyPool.remove` below is a real
-  // side effect (kills the pooled terminal), so this must run as an effect,
-  // not a render-time derivation.
+  // Tile-area measurement (mesa task 466). Observed unconditionally rather
+  // than only while `autoTile` is on, so flipping the toggle already has a
+  // real size to lay out against instead of waiting a frame for the first
+  // observation.
   useEffect(() => {
-    if (!autoTile || !sessions) return
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing pane tree to external poll data + a toggle, not derivable at render time
-    setRoot((r) => {
-      let next = r
-      const openIds = new Set(collectLeafIds(next))
-      for (const a of sessions) {
-        if (a.id === null) continue
-        const bucket = bucketOf(a)
-        const isOpen = openIds.has(a.id)
-        if ((bucket === 'ACTIVE' || bucket === 'BLOCKED') && !isOpen) {
-          next = insertLeaf(next, a.id)
-          openIds.add(a.id)
-        } else if (bucket === 'DONE' && isOpen) {
-          ptyPool.remove(a.id)
-          next = removeLeaf(next, a.id)
-          openIds.delete(a.id)
-        }
-      }
-      return next
+    const el = tileAreaRef.current
+    if (!el) return
+    const ro = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      tileSizeRef.current = { width, height }
+      setTileSize((s) => (s.width === width && s.height === height ? s : { width, height }))
     })
-  }, [autoTile, sessions])
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // The column count Auto Tile last laid the grid out at. Compared against
+  // the freshly computed one so a resize only rebuilds the tree when it
+  // actually changes the layout — dragging the sidebar a few px wider
+  // shouldn't blow away the user's divider positions.
+  const autoTileColsRef = useRef(0)
+  // `autoTile` for the same non-render readers as `tileSizeRef` above.
+  const autoTileRef = useRef(autoTile)
+  useEffect(() => {
+    autoTileRef.current = autoTile
+  }, [autoTile])
+
+  /**
+   * Opens `agentId`'s pane. While Auto Tile is on it owns the layout, so a
+   * pane opened by hand (list-rail click, `+ agent`) has to re-tile rather
+   * than root-append: an appended leaf lands as a full-height extra column
+   * in a row-oriented grid, and the sync effect's own "pane set unchanged"
+   * guard would then leave it that way indefinitely — the set it sees on
+   * the next poll already matches. Re-tiling here keeps that guard true in
+   * the sense it's meant: the tree is already the grid the effect would
+   * have built.
+   */
+  function addPane(r: SplitNode, agentId: string): SplitNode {
+    if (!autoTileRef.current) return insertLeaf(r, agentId)
+    const ids = [...collectLeafIds(r).filter((x) => x !== agentId), agentId]
+    const { width, height } = tileSizeRef.current
+    const cols = gridColumns(ids.length, width, height)
+    autoTileColsRef.current = cols
+    return buildGrid(
+      ids.map((id) => ({ kind: 'leaf', contentKind: 'agent', id }) as LeafNode),
+      cols,
+    )
+  }
+
+  // Auto Tile sync (mesa task 411; grid layout, task 466): reacts to
+  // `sessions` (not the per-render sorted `agents` copy below, which would
+  // re-run this every render) so it only fires when the poll actually
+  // returns new data — `useFetch` drops byte-identical polls. Only touches
+  // attachable sessions (`a.id !== null`; interactive sessions have no pane
+  // to open). Depending on `autoTile` itself makes switching it on sync
+  // immediately against whatever `sessions` already holds, not just future
+  // transitions. `ptyPool.remove` below is a real side effect (kills the
+  // pooled terminal), so this must run as an effect, not a render-time
+  // derivation.
+  //
+  // While on, this mode OWNS the layout: the tree is rebuilt as a grid
+  // (`buildGrid`) sized to the tile area, not patched pane-by-pane, since
+  // adding a 4th agent to a 3-pane row has to re-tile everything to reach
+  // 2x2. Rebuilds happen only when the pane set or the column count
+  // changes, so a manual drag/divider drag still survives in between —
+  // until the next agent starts or finishes, which is the trade the mode
+  // asks for.
+  useEffect(() => {
+    if (!autoTile || !sessions || tileSize.width <= 0) return
+    // Oldest first, so a newly started agent appends to the end of the grid
+    // instead of shuffling every existing pane one cell along.
+    const wanted = [...sessions]
+      .filter((a) => a.id !== null && bucketOf(a) !== 'DONE')
+      .sort((a, b) => a.startedAt - b.startedAt)
+      .map((a) => a.id as string)
+    const cols = gridColumns(wanted.length, tileSize.width, tileSize.height)
+    setRoot((r) => {
+      const open = collectLeafIds(r)
+      const wantedSet = new Set(wanted)
+      const sameSet = open.length === wanted.length && open.every((id) => wantedSet.has(id))
+      if (sameSet && cols === autoTileColsRef.current) return r
+      autoTileColsRef.current = cols
+      for (const id of open) if (!wantedSet.has(id)) ptyPool.remove(id)
+      return buildGrid(
+        wanted.map((id) => ({ kind: 'leaf', contentKind: 'agent', id }) as LeafNode),
+        cols,
+      )
+    })
+  }, [autoTile, sessions, tileSize.width, tileSize.height])
 
   // Relative "started Xm ago" labels are derived from the clock at render
   // time, but useFetch drops byte-identical polls, so an idle list would
@@ -731,7 +803,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
     // effect tied to exactly one real close, matching arch.md §6.2's
     // "explicit, colocated with the actual close call site" rule.
     if (findPathToLeaf(root, id)) ptyPool.remove(id)
-    setRoot((r) => (findPathToLeaf(r, id) ? removeLeaf(r, id) : insertLeaf(r, id)))
+    setRoot((r) => (findPathToLeaf(r, id) ? removeLeaf(r, id) : addPane(r, id)))
     refetch()
   }
 
@@ -775,7 +847,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
         // The newly started agent is real either way, so always insert its
         // pane — but only touch the form's own state if this is still the
         // request that owns it.
-        setRoot((r) => insertLeaf(r, spawned.id))
+        setRoot((r) => addPane(r, spawned.id))
         refetch()
         if (addRequestId.current !== requestId) return
         setAdding(false)
@@ -996,7 +1068,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
       )}
 
       <div className="agent-sidebar-body" ref={bodyRef}>
-        <div className="agent-sidebar-tile-area">
+        <div className="agent-sidebar-tile-area" ref={tileAreaRef}>
           <DndContext
             sensors={sensors}
             // dnd-kit's own default collision detection picks `over` off the

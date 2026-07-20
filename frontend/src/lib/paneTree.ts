@@ -334,6 +334,88 @@ export function splitLeafAt<K extends string>(
   return canonicalize(rebuild(root, [])) as SplitNode<K>
 }
 
+// --- Auto-tiled grid layout (mesa task 466) ---------------------------
+//
+// The gestures above are all user-driven — they take a tree and one drag and
+// return a new tree. These two are the opposite direction: given only a set
+// of panes and the space available, lay them out from scratch. Used by the
+// Agent sidebar's Auto Tile mode, which owns the layout while it's on (the
+// whole point of the mode is that you never arrange panes by hand).
+
+// A terminal narrower than this wraps its own output into slivers, which is
+// the failure mode a 4-across grid in a 500px sidebar would produce — so
+// column count is capped by how many panes of at least this width fit,
+// before any aspect-ratio preference is considered. This is why a narrow
+// sidebar still gets a plain vertical stack no matter how many agents run.
+export const MIN_GRID_PANE_PX = 360
+// Terminals read better wide than tall (long lines, short scrollback view),
+// so the "ideal" cell is somewhat wider than square rather than 1:1.
+const TARGET_CELL_ASPECT = 1.4
+// Per unused grid slot, added to a candidate's score — breaks ties toward
+// layouts that fill their last row (3 panes prefer 1x3 or a 2-col grid over
+// 3 columns with two empty cells beneath).
+const EMPTY_SLOT_PENALTY = 0.15
+
+/**
+ * How many columns `n` panes should tile into inside a `width`x`height` box.
+ * Scores every column count that clears `MIN_GRID_PANE_PX` by how far its
+ * resulting cell aspect sits from `TARGET_CELL_ASPECT` (log-scale, so
+ * "twice as wide as ideal" and "half as wide" are penalized equally),
+ * plus a small penalty per empty slot, and returns the best.
+ *
+ * Deliberately measured off the tile area's LIVE rect rather than a
+ * breakpoint on the viewport: this box is resizable three independent ways
+ * (sidebar drag, maximize, list-rail collapse), so a viewport-derived
+ * guess would be wrong in most of those states.
+ */
+export function gridColumns(n: number, width: number, height: number): number {
+  if (n <= 1 || width <= 0 || height <= 0) return 1
+  const maxCols = Math.max(1, Math.min(n, Math.floor(width / MIN_GRID_PANE_PX)))
+  let best = 1
+  let bestScore = Infinity
+  for (let c = 1; c <= maxCols; c++) {
+    const rows = Math.ceil(n / c)
+    const aspect = width / c / (height / rows)
+    const score = Math.abs(Math.log(aspect / TARGET_CELL_ASPECT)) + (c * rows - n) * EMPTY_SLOT_PENALTY
+    if (score < bestScore) {
+      bestScore = score
+      best = c
+    }
+  }
+  return best
+}
+
+/**
+ * Builds a fresh tree tiling `leaves` into `cols` columns, filled
+ * row-major (pane `i` lands in column `i % cols`) so reading order across
+ * the top row matches the order the leaves came in.
+ *
+ * One column is a flat column split, not a row split wrapping one child —
+ * same tree `emptyRoot`+`insertLeaf` would have produced, so toggling Auto
+ * Tile on in a narrow sidebar is a no-op on the layout rather than a
+ * reshuffle. Wider grids are a row of column splits; `canonicalize`
+ * inlines any column that ended up with a single leaf.
+ */
+export function buildGrid<K extends string>(leaves: LeafNode<K>[], cols: number): SplitNode<K> {
+  if (leaves.length === 0) return emptyRoot<K>()
+  const c = Math.max(1, Math.min(cols, leaves.length))
+  const wrap = (l: LeafNode<K>): SplitChild<K> => ({ ratio: DEFAULT_RATIO, node: l })
+  if (c === 1) {
+    return { kind: 'split', id: newSplitId(), orientation: 'column', children: leaves.map(wrap) }
+  }
+  const columns: LeafNode<K>[][] = Array.from({ length: c }, () => [])
+  leaves.forEach((l, i) => columns[i % c].push(l))
+  return canonicalize({
+    kind: 'split',
+    id: newSplitId(),
+    orientation: 'row',
+    children: columns.map((col) => ({
+      ratio: DEFAULT_RATIO,
+      node: { kind: 'split', id: newSplitId(), orientation: 'column', children: col.map(wrap) },
+    })),
+  }) as SplitNode<K>
+}
+
 // Center 40%x40% of the target pane (|dx|,|dy| both under this) is the
 // "reorder" zone — `moveLeaf`/`arrayMove`, no new split, no indicator. The
 // outer 60% is quartered into left/right/top/bottom triangles by whichever

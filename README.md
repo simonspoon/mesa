@@ -241,7 +241,7 @@ start locations in the global Agents sidebar.
   directly.
 - **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
   the database. One point so far — `task-execute`, fired by `mesa task execute
-  <id>` (or the web UI's Execute button) with the full task JSON on stdin and
+  <id>` or `POST /api/tasks/{id}/execute`, with the full task JSON on stdin and
   the project's `local_path` as cwd. The hook's exit code and output come back
   as data.
 - **CC Dashboard** (`mesa cc`, sidebar entry in the web UI): analytics over

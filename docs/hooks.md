@@ -9,8 +9,9 @@ request; firing it is still **code execution**, so the API trigger route
 shares the agents' mode-dependent access gate (`require_agent_access`).
 
 - One hook point so far: **`task-execute`** — fired by `mesa task execute <id>`
-  or `POST /api/tasks/{id}/execute` (the web UI's **Execute** button in the
-  task panel). The command runs under `sh -c` with the full task JSON on
+  or `POST /api/tasks/{id}/execute`. There is no web UI trigger: the task
+  panel's Execute button was removed once the todo watcher took over
+  auto-dispatch (`docs/todo-watcher.md`). The command runs under `sh -c` with the full task JSON on
   stdin, `MESA_HOOK`/`MESA_TASK_ID`/`MESA_TASK_TITLE`/`MESA_PROJECT_ID`/
   `MESA_DB` in the environment, and the project's `local_path` as cwd when
   that folder exists.

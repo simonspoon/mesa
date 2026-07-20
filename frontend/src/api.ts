@@ -17,7 +17,6 @@ import type { FrameEdge } from './types/FrameEdge'
 import type { FrameShape } from './types/FrameShape'
 import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
-import type { HookRun } from './types/HookRun'
 import type { InboxItem } from './types/InboxItem'
 import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
@@ -197,16 +196,6 @@ export function createTask(body: TaskCreate): Promise<Task> {
 
 export function updateTask(id: number, patch: TaskPatch): Promise<Task> {
   return request(`/api/tasks/${id}`, jsonInit('PATCH', patch))
-}
-
-/**
- * Fires the task-execute hook (the shell command configured in the server's
- * local hooks.json). Resolves to the captured run — a nonzero exit_code is
- * carried inside, not thrown. Rejects with `validation` when no hook is
- * configured. Loopback/LAN-page gated like the agents endpoints.
- */
-export function executeTask(id: number): Promise<HookRun> {
-  return request(`/api/tasks/${id}/execute`, jsonInit('POST', {}))
 }
 
 /** Returns the destroyed records: the task plus all cascaded subtasks. */

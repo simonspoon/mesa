@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use crate::core::types::{HookRun, Task};
 
-/// The one hook point so far: the Execute button / `mesa task execute`.
+/// The one hook point so far: `mesa task execute` / `POST /api/tasks/{id}/execute`.
 pub const TASK_EXECUTE: &str = "task-execute";
 
 /// Captured stdout/stderr are capped so a chatty hook can't balloon the JSON

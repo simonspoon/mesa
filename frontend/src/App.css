@@ -561,14 +561,6 @@ main {
   white-space: pre-wrap;
 }
 
-/* Captured task-execute hook output in the task panel: keep long lines from
-   widening the panel. */
-.hook-run pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  overflow-x: auto;
-}
-
 .attachment-name {
   color: var(--text-h);
   overflow-wrap: anywhere;

@@ -833,7 +833,7 @@ async fn delete_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiR
     Ok(Json(store.delete_task(id)?).into_response())
 }
 
-/// Fires the task-execute hook for one task (the UI's Execute button): the
+/// Fires the task-execute hook for one task: the
 /// shell command configured in the local hooks.json, run with the task JSON
 /// on stdin from the project's `local_path`. Triggering local code execution
 /// is the agents' capability class, so it shares `require_agent_access`. The

@@ -5,7 +5,6 @@ import {
   createTask,
   deleteAttachment,
   deleteTask,
-  executeTask,
   getTask,
   listAttachments,
   listDependencies,
@@ -14,7 +13,6 @@ import {
 } from '../api'
 import { parseTags } from '../tags'
 import type { Attachment } from '../types/Attachment'
-import type { HookRun } from '../types/HookRun'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
 import { useFetch } from '../useFetch'
@@ -192,9 +190,6 @@ export function TaskPanel({
   onChanged: () => void
 }) {
   const [selectError, setSelectError] = useState<string | null>(null)
-  const [executing, setExecuting] = useState(false)
-  const [hookRun, setHookRun] = useState<HookRun | null>(null)
-  const [hookError, setHookError] = useState<string | null>(null)
   const { data, error, refetch } = useFetch(async () => {
     const task = await getTask(taskId)
     const [siblings, blockers, attachments] = await Promise.all([
@@ -235,24 +230,6 @@ export function TaskPanel({
   function changed() {
     refetch()
     onChanged()
-  }
-
-  // Fires the server-side task-execute hook; the outcome (including a
-  // nonzero hook exit) renders below the controls.
-  function execute() {
-    setExecuting(true)
-    executeTask(taskId).then(
-      (run) => {
-        setExecuting(false)
-        setHookError(null)
-        setHookRun(run)
-      },
-      (e: unknown) => {
-        setExecuting(false)
-        setHookRun(null)
-        setHookError(e instanceof Error ? e.message : String(e))
-      },
-    )
   }
 
   // Status/priority save on change; errors land in the shared slot below.
@@ -304,22 +281,6 @@ export function TaskPanel({
         {task.blocked && <span className="badge blocked"> blocked</span>}
         {selectError && <span className="error">{selectError}</span>}
       </p>
-      <p className="task-controls">
-        <button onClick={execute} disabled={executing}>
-          {executing ? 'Executing…' : 'Execute'}
-        </button>
-        {hookError && <span className="error"> {hookError}</span>}
-      </p>
-      {hookRun && (
-        <div className="hook-run">
-          <p className="muted">
-            task-execute exited {hookRun.exit_code} —{' '}
-            <code>{hookRun.command}</code>
-          </p>
-          {hookRun.stdout !== '' && <pre>{hookRun.stdout}</pre>}
-          {hookRun.stderr !== '' && <pre className="error">{hookRun.stderr}</pre>}
-        </div>
-      )}
       <p className="tags-line">
         Tags:{' '}
         <InlineEdit

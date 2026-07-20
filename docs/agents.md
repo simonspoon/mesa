@@ -22,7 +22,14 @@ touches the mesa store only to read `local_path`. There is deliberately no
   `local_path` and returns `{id}` — the short job id parsed from the
   "backgrounded · <id>" receipt. Without a prompt the session starts idle.
   No/missing `local_path` is `validation`; a failing/missing `claude` CLI is
-  **502 `unavailable`** on both endpoints.
+  **502 `unavailable`** on both endpoints. Both this route and the list route
+  run their subprocess under `spawn_blocking` and hold no lock across it, so
+  spawns do **not** serialize behind agent-list polls — a slow spawn observed
+  under a *stub* `claude` is a stub artifact, not a mesa lock: `output()`
+  waits for pipe EOF, so a stub that forks a fake long-lived session hangs
+  the call for that child's lifetime (mesa task 468 — reproduced at 30s;
+  the real CLI returns in ~1.0s, idle or with a prompt). Keep stub `--bg`
+  branches fork-free.
 - `GET /api/agents/{id}/attach?cols=&rows=` upgrades to a **WebSocket bridged
   onto `claude attach <id>` in a PTY** (`bridge_attach` in `src/api.rs`,
   portable-pty): server→client binary frames are raw terminal output;

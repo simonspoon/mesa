@@ -83,6 +83,16 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
 /// auto-dispatched session is identifiable at a glance instead of showing up
 /// generically. `claude --bg` prints a human receipt, not JSON; the id is
 /// parsed from its "backgrounded · <id>" line.
+///
+/// **Stub authors:** `Command::output()` below waits for stdout/stderr EOF,
+/// not for the child to exit — so a stub `claude` whose `--bg` branch leaves
+/// a background process holding the inherited pipes (`sleep 3600 &`, a fake
+/// long-lived session) blocks this call for that child's whole lifetime, even
+/// though the stub itself returned instantly. That, not any lock or
+/// serialization in mesa, is what a slow spawn under stub conditions means
+/// (mesa task 468: a 30s stub child → a 30.3s `output()`; measured against
+/// the real CLI, `--bg` returns in ~1.0s idle and ~1.0s with a prompt,
+/// because it detaches its stdio). Keep stub `--bg` branches fork-free.
 pub fn spawn_bg(dir: &str, prompt: Option<&str>, name: Option<&str>) -> Result<String, String> {
     spawn_bg_with(&claude_bin(), dir, prompt, name)
 }

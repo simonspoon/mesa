@@ -3,7 +3,7 @@ import { deleteProject, getProject, listTasks, updateProject } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
-import { TaskPanel } from '../components/TaskPanel'
+import { TaskModal } from '../components/TaskModal'
 import { KanbanBoard } from '../KanbanBoard'
 import { shouldIgnoreShortcut } from '../keyboardScope'
 import { useFetch } from '../useFetch'
@@ -169,20 +169,8 @@ export function ProjectTasksPage({
     if (taskId !== null) window.location.hash = `#/projects/${projectId}`
   }
 
-  const panel =
-    taskId !== null ? (
-      <TaskPanel
-        key={taskId}
-        taskId={taskId}
-        onClose={closePanel}
-        onChanged={onTasksChanged}
-      />
-    ) : null
-
   return (
     <>
-    <div className={panel ? 'project-split' : ''}>
-      <div className="project-main">
         <h1>
           {project ? (
             <InlineEdit
@@ -307,9 +295,14 @@ export function ProjectTasksPage({
             }
           />
         </p>
-      </div>
-      {panel && <aside className="side-panel">{panel}</aside>}
-    </div>
+    {taskId !== null && (
+      <TaskModal
+        key={taskId}
+        taskId={taskId}
+        onClose={closePanel}
+        onChanged={onTasksChanged}
+      />
+    )}
     {creating && (
       <CreateTaskModal
         projectId={projectId}

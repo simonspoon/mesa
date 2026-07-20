@@ -177,8 +177,9 @@ function AttachmentRow({
 }
 
 /**
- * Task detail in the right-hand panel. Mutations call `onChanged` so the
- * project view's list/board refetches alongside the panel's own refetch.
+ * Task detail body, mounted inside `TaskModal`'s centered overlay. Mutations
+ * call `onChanged` so the project view's list/board refetches alongside this
+ * component's own refetch.
  */
 export function TaskPanel({
   taskId,

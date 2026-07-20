@@ -43,6 +43,11 @@ Returns `true` (suppress) for, in order:
    owns its own key handling and is its own spatial surface.
 5. A modal that owns its own key handling is open
    (`.create-task-backdrop`, `.command-palette-backdrop`).
+   `.create-task-backdrop` is the **shared** backdrop class, not one modal's:
+   create-task, create-project and task detail (`TaskModal.tsx`) all mount it,
+   so all three suppress the global shortcuts while open. A new modal that
+   reuses it inherits that for free; one that invents its own backdrop class
+   must be added to rule 5 here and in `keyboardScope.ts`.
 
 Rules 4 and 5 are **document-wide** queries, not `closest()` — nothing inside
 those surfaces is focusable, so the keydown target never lands inside them.

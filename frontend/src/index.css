@@ -172,6 +172,11 @@ textarea:focus {
   box-shadow: 0 0 8px var(--cyan-dim);
 }
 
+/* Shared keyboard-focus highlight for buttons, links, kanban cards and
+   InlineEdit (spec 449, story 453) is defined at the bottom of App.css —
+   see the comment there for why it uses `outline` rather than extending
+   this file's border/box-shadow pattern. */
+
 select {
   text-transform: uppercase;
 }

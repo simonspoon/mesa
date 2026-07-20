@@ -1,16 +1,39 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { deleteProject, getProject, listTasks, updateProject } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskPanel } from '../components/TaskPanel'
 import { KanbanBoard } from '../KanbanBoard'
+import { shouldIgnoreShortcut } from '../keyboardScope'
 import { useFetch } from '../useFetch'
 import { CCDashboardView } from './CCDashboardView'
 import { FilesView } from './FilesView'
 import { GitView } from './GitView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
+
+// 'a' opens the create-task form via the existing #/projects/:id/create-task
+// route (spec req 1) — a hash navigation, no new form plumbing;
+// ProjectTasksPage's own `createTask` prop handling opens the panel on
+// arrival. Board-scoped by construction — `active` is false whenever a
+// non-Board view (Storyboards/Git/Files/Dashboard) is showing, so the
+// listener is a no-op there without a route string check
+// (.scratch/arch-449-keyboard.md §3). `shouldIgnoreShortcut`
+// (keyboardScope.ts) covers modifiers, text-editing contexts, terminals, the
+// storyboard canvas and open modals.
+function useCreateTaskShortcut(active: boolean, projectId: number) {
+  useEffect(() => {
+    if (!active) return
+    const onKey = (e: KeyboardEvent) => {
+      if (shouldIgnoreShortcut(e)) return
+      if (e.key === 'a')
+        window.location.hash = `#/projects/${projectId}/create-task`
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [active, projectId])
+}
 
 export function ProjectTasksPage({
   projectId,
@@ -63,10 +86,18 @@ export function ProjectTasksPage({
   // second palette-triggered arrival at the create-task route (component
   // already mounted on this project) needs the same latest-action-wins
   // treatment as `prevTaskId` above, not just the `useState` seed.
+  // The sync runs both ways: leaving the route (browser Back off
+  // #/projects/:id/create-task) must close the panel, not just arriving
+  // must open it. A one-way `if (createTask) setCreating(true)` left the
+  // panel and its `.create-task-backdrop` mounted on a board route, which
+  // `shouldIgnoreShortcut` reads document-wide as "a modal owns the keys" —
+  // silently killing every global shortcut until a full reload.
+  // Clicking the board's own "add task" button is unaffected: it sets
+  // `creating` without changing `createTask`, so this block never fires.
   const [prevCreateTask, setPrevCreateTask] = useState(createTask)
   if (createTask !== prevCreateTask) {
     setPrevCreateTask(createTask)
-    if (createTask) setCreating(true)
+    setCreating(createTask)
   }
 
   const {
@@ -96,6 +127,16 @@ export function ProjectTasksPage({
   const error =
     projectError ??
     (storyboards || git || files || dashboard ? null : tasksError)
+
+  // Same board-vs-other-view condition the tabs use below (spec req 2: 'a'
+  // is inert on non-Board pages). Called unconditionally, ahead of the
+  // early error return, per the rules of hooks; `active` gates the listener
+  // itself, not this call.
+  useCreateTaskShortcut(
+    !storyboards && !git && !files && !dashboard,
+    projectId,
+  )
+
   if (error) return <p className="error">{error}</p>
 
   function onTasksChanged() {

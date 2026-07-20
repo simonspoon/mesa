@@ -70,7 +70,12 @@ export function InlineEdit({
       <span
         className={`inline-edit${className ? ` ${className}` : ''}`}
         title="click to edit"
+        role="button"
+        tabIndex={0}
         onClick={start}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') start()
+        }}
       >
         {value || <span className="muted">{placeholder}</span>}
       </span>

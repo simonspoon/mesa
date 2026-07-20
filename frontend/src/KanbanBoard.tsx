@@ -49,6 +49,12 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
       }`}
       {...listeners}
       {...attributes}
+      // dnd-kit's `attributes` injects `role="button"`/`tabIndex={0}` for a
+      // KeyboardSensor this board doesn't configure — that would make the
+      // <li> a dead second tab stop ahead of the real one, the <a> below.
+      // Force it back off so Tab lands on the link, which already opens the
+      // task detail on Enter natively.
+      tabIndex={-1}
     >
       <CardBody task={task} />
     </li>

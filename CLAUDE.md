@@ -196,6 +196,12 @@ invariants you must not break — read them before changing `src/`:
   attach`), gated by the same `require_agent_access` stack as the Agents
   attach endpoint; persists across nav via the same visibility-toggle
   pattern as the Agent sidebar. `docs/terminal.md`.
+- **Keyboard shortcuts** — `a` opens create-task on a Board; `hjkl`/arrows
+  move native focus spatially, `Enter` activates. `shouldIgnoreShortcut()`
+  in `frontend/src/keyboardScope.ts` is the sole suppression chokepoint —
+  every new global single-key shortcut must call it, and two of its checks
+  are document-wide, so a modal left mounted after close kills all
+  shortcuts. `docs/keyboard.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
 - **Hooks** — user-configured shell commands fired on events (`task-execute`

@@ -9,6 +9,7 @@ import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { TerminalPage } from './pages/TerminalPage'
+import { useSpatialNav } from './spatialNav'
 import { useFetch } from './useFetch'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
@@ -71,6 +72,10 @@ function App() {
   const [navVersion, setNavVersion] = useState(0)
   const [paletteOpen, setPaletteOpen] = useState(false)
   useCommandPaletteShortcut(() => setPaletteOpen(true))
+  // h/j/k/l + arrow-key spatial focus nav (mesa spec 449 story 454): a
+  // second global window keydown listener, disjoint key set from the
+  // shortcut above, mounted alongside it per arch-449-keyboard.md §3.
+  useSpatialNav()
 
   const inboxMatch = /^\/inbox$/.exec(path)
   // Terminal is not resolved into `page` (see below) — it's a permanent

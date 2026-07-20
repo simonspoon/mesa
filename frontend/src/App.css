@@ -3255,3 +3255,48 @@ body.agent-sidebar-resizing {
     width: 8rem;
   }
 }
+
+/* Shared keyboard-focus highlight (spec 449, story 453): one treatment for
+   every interactive element outside form fields (which already have their
+   own cyan focus style, index.css) — buttons, links, kanban cards and
+   InlineEdit's non-editing label. `:focus-visible`, not `:focus`, so a mouse
+   click never paints it; the glow reuses the same cyan vocabulary as the
+   input focus style rather than inventing a second one.
+
+   `outline`, not `border-color`/`box-shadow`, carries the signal. Several
+   "current selection" states already own those two properties at higher or
+   tied specificity (`.tabs button.active`, `.nav-item.active`, badge
+   variants, ...) and set them to the very same cyan — a border/box-shadow
+   focus rule would then be invisible (or literally overridden) on an
+   element that is both selected and focused, e.g. tabbing onto the already-
+   active "Board" view tab. `outline` is a property nothing else in this
+   stylesheet touches on these elements, so it always renders regardless of
+   which other state classes are present, with no specificity contest to
+   referee. A negative `outline-offset` keeps it inside the border box, so
+   it isn't cropped at the corners on the clip-path-cut buttons/cards the
+   way an outset box-shadow is (`--cut`, index.css). */
+a:focus-visible,
+button:focus-visible,
+.inline-edit:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+  box-shadow: 0 0 8px var(--cyan-dim);
+}
+
+/* Focus lands on the nested <a> (ADR 2, story 451: dnd-kit's injected
+   tabIndex on the <li> is forced to -1), so the highlight belongs on the
+   card, not the link inside it. :has() picks up the descendant's keyboard
+   focus while staying keyboard-only — unlike :focus-within, which also
+   matches a mouse click and would ring every card on click. The link's own
+   outline is suppressed so only the card rings. */
+.kanban-card:has(a:focus-visible) {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+  box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+.kanban-card a:focus-visible {
+  outline: none;
+  box-shadow: none;
+}

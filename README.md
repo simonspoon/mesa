@@ -92,6 +92,9 @@ mesa task list --parent 42
 # Express a dependency: task 3 is blocked by task 1
 mesa task block 3 --by 1
 
+# Ask why task 3 is blocked: its blockers, and the tasks it blocks
+mesa task deps 3
+
 # Ask for the next actionable task (todo + unblocked, deterministic order)
 mesa task next --project 1
 
@@ -146,7 +149,7 @@ mesa serve --lan           # opt-in: bind 0.0.0.0 and serve other LAN devices
 ```
 
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
-`block`/`unblock`/`dependencies` actions, `/api/storyboards` with its
+`block`/`unblock`/`dependencies`/`dependents` actions, `/api/storyboards` with its
 `frames`/`edges`/`events`, `/api/inbox`, `/api/cc`, and
 per-project `git`/`agents` endpoints), with the React web UI served at `/`. The web
 UI does not live-sync; it refetches on window focus.

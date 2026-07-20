@@ -361,6 +361,7 @@ fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
+        .route("/api/tasks/{id}/dependents", get(list_dependents))
         // Attachments: file uploads/downloads scoped to a task. Upload is
         // JSON body + base64 content (not multipart), per arch.md §4 — that
         // keeps the route inside the existing Content-Type gate with no
@@ -884,6 +885,16 @@ async fn list_dependencies(
 ) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
     Ok(Json(store.list_blockers(id)?).into_response())
+}
+
+/// Lists the full task objects this task directly blocks — the reverse of
+/// `list_dependencies`, so a client can walk the edge set both ways.
+async fn list_dependents(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_blocking(id)?).into_response())
 }
 
 async fn block_task(

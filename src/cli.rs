@@ -446,6 +446,20 @@ EXAMPLES
         #[arg(long)]
         on: i64,
     },
+    /// Print a task's dependency edges in both directions
+    ///
+    /// Answers "why is this blocked?" — `blocked_by` lists the tasks this one
+    /// waits on, `blocks` the tasks waiting on it. Both are compact task
+    /// objects (no `description`), same shape as `task list`. The task is
+    /// blocked while any entry in `blocked_by` is not done/cancelled, so the
+    /// culprits are exactly the ones whose status is neither.
+    #[command(after_help = "\
+EXAMPLES
+  mesa task deps 3     # {\"id\":3,\"blocked\":true,\"blocked_by\":[...],\"blocks\":[...]}")]
+    Deps {
+        /// Task id
+        id: i64,
+    },
     /// Print the status-change event log as a JSON array, oldest first
     ///
     /// With a task id, prints that task's events; without one, prints every
@@ -1394,6 +1408,17 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
         TaskCmd::Delete { id } => print_json(&store.delete_task(id)?),
         TaskCmd::Block { id, by } => print_json(&store.add_dependency(id, by)?),
         TaskCmd::Unblock { id, on } => print_json(&store.remove_dependency(id, on)?),
+        TaskCmd::Deps { id } => {
+            let task = store.get_task(id)?;
+            let blocked_by: Vec<_> = store.list_blockers(id)?.iter().map(compact).collect();
+            let blocks: Vec<_> = store.list_blocking(id)?.iter().map(compact).collect();
+            print_json(&json!({
+                "id": task.id,
+                "blocked": task.blocked,
+                "blocked_by": blocked_by,
+                "blocks": blocks,
+            }));
+        }
         TaskCmd::Events { id } => print_json(&store.list_events(id)?),
         TaskCmd::Execute { id } => {
             let task = store.get_task(id)?;

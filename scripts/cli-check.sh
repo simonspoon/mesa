@@ -142,6 +142,27 @@ run 0 "$MESA" task list --project "$P" --unblocked
 [ "$(jqs "any(.[]; .id == $T1)")" = "true" ] || fail "--unblocked: unblocked task must be included"
 ok "task list --unblocked filter"
 
+# ---- deps ----
+# T3 is blocked by T1 at this point; the edge is inspectable from both ends.
+run 0 "$MESA" task deps "$T3"
+[ "$(jqs .id)" = "$T3" ] || fail "deps: echoes the task id"
+[ "$(jqs .blocked)" = "true" ] || fail "deps: blocked mirrors task show"
+[ "$(jqs '.blocked_by | length')" = "1" ] || fail "deps: one blocker"
+[ "$(jqs '.blocked_by[0].id')" = "$T1" ] || fail "deps: names the blocker"
+[ "$(jqs '.blocked_by[0] | has("description")')" = "false" ] || fail "deps: compact objects"
+[ "$(jqs '.blocks | length')" = "0" ] || fail "deps: T3 blocks nothing"
+ok "task deps: blocked_by names the blocker, compact shape"
+
+# ...and the reverse direction from the blocker's side
+run 0 "$MESA" task deps "$T1"
+[ "$(jqs '.blocks[0].id')" = "$T3" ] || fail "deps: reverse edge"
+[ "$(jqs '.blocked_by | length')" = "0" ] || fail "deps: T1 has no blockers"
+ok "task deps: blocks lists the reverse edge"
+
+run 1 "$MESA" task deps 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "deps missing task: error.code"
+ok "task deps on a missing task: exit 1, code=not_found"
+
 # ---- cycle rejection ----
 run 1 "$MESA" task block "$T1" --by "$T3"
 [ "$(jqe .error.code)" = "cycle" ] || fail "cycle: error.code"

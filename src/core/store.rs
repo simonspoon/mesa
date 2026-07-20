@@ -1488,6 +1488,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Lists the tasks that `task_id` directly blocks — the reverse of
+    /// [`list_blockers`](Self::list_blockers) along the same edge set.
+    pub fn list_blocking(&self, task_id: i64) -> Result<Vec<Task>> {
+        self.get_task(task_id)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks t \
+             JOIN dependencies d ON d.task_id = t.id \
+             WHERE d.blocked_by = ?1 ORDER BY t.id"
+        ))?;
+        let rows = stmt.query_map([task_id], row_to_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// True if a path blocker_id -> ... -> task_id already exists along
     /// blocked-by edges, i.e. adding (task_id blocked by blocker_id) would
     /// close a cycle. DFS over the full edge set.
@@ -3416,6 +3429,31 @@ mod tests {
 
         assert!(store.list_blockers(c.id).unwrap().is_empty());
         assert!(matches!(store.list_blockers(999), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn list_blocking_returns_direct_dependents_only() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let a = add_task(&mut store, p.id, "a");
+        let b = add_task(&mut store, p.id, "b");
+        let c = add_task(&mut store, p.id, "c");
+        store.add_dependency(a.id, b.id).unwrap(); // a blocked by b
+        store.add_dependency(b.id, c.id).unwrap(); // b blocked by c
+
+        // c blocks b directly, and a only transitively.
+        let ids: Vec<i64> = store
+            .list_blocking(c.id)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![b.id]);
+
+        // Exact mirror of list_blockers along the same edge.
+        assert_eq!(store.list_blocking(b.id).unwrap()[0].id, a.id, "b blocks a");
+        assert!(store.list_blocking(a.id).unwrap().is_empty());
+        assert!(matches!(store.list_blocking(999), Err(Error::NotFound(_))));
     }
 
     #[test]

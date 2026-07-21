@@ -178,9 +178,10 @@ invariants you must not break — read them before changing `src/`:
 - **Files tab** — project file browser + editor; `safe_path()` is the sole
   traversal-defense chokepoint, the one write route is code-execution-gated.
   `docs/files-tab.md`.
-- **Filesystem browse** — server-side directory listing for the new-project
-  folder picker; unscoped (not one project's local_path), loopback-gated the
-  same way as local_path writes. `docs/fs-browse.md`.
+- **Filesystem browse** — server-side directory listing (plus one
+  create-a-folder mutation) for the new-project folder picker; unscoped (not
+  one project's local_path), both verbs loopback-gated the same way as
+  local_path writes. `docs/fs-browse.md`.
 - **Storyboards** — freeform visual canvas (frames + edges), distinct from
   the kanban board; cycles are allowed here. `docs/storyboards.md`.
 - **Inbox** — global free-text update requests; assigning one converts it

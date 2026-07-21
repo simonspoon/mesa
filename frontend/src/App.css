@@ -439,6 +439,17 @@ main {
   flex-wrap: wrap;
 }
 
+.dir-browser-new {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.dir-browser-new input {
+  flex: 1;
+  min-width: 0;
+}
+
 .dir-browser-list {
   max-height: 12rem;
   overflow-y: auto;

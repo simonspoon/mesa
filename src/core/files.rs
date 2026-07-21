@@ -3,9 +3,10 @@
 //! cross-area contract). Like `core::git`/`core::agents`, this module touches
 //! EXTERNAL filesystem state only — `std::fs`, no `Store` dependency beyond
 //! whatever `local_path` string its caller (279's API layer) already
-//! resolved. `write_file` (task 327) is the one write in the module — it
-//! overwrites an existing text file's content in place; it never creates,
-//! deletes, or renames anything.
+//! resolved. Two writes live here, both narrow: `write_file` (task 327)
+//! overwrites an existing text file's content in place, and `create_dir`
+//! (task 489) makes one empty directory for the folder picker. Nothing in
+//! this module deletes or renames anything.
 
 use std::fs;
 use std::io::Read;
@@ -232,6 +233,66 @@ pub fn list_dir(path: &str) -> Option<DirListing> {
         path: canon.to_string_lossy().into_owned(),
         parent,
         entries,
+    })
+}
+
+/// Why [`create_dir`] rejected the request:
+///   - `NotFound`: `parent` doesn't resolve or isn't a directory — the same
+///     collapse [`list_dir`]'s `None` performs, so browsing a folder and
+///     creating inside it fail identically once it vanishes.
+///   - `Validation(reason)`: `name` isn't a usable single directory name.
+///   - `Conflict`: something already occupies `parent/name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateDirError {
+    NotFound,
+    Validation(&'static str),
+    Conflict,
+}
+
+/// Creates one directory named `name` directly inside `parent`, returning it
+/// as a [`DirEntry`] shaped exactly like the ones [`list_dir`] returns (so a
+/// caller can navigate into it without a second listing).
+///
+/// `name` must be a single path component — separators, NUL, `.` and `..` are
+/// rejected outright, which is what keeps `canon.join(name)` inside `parent`.
+/// That is the whole containment story, deliberately NOT `safe_path`'s
+/// root-plus-relative model, for the same reason [`list_dir`] doesn't use it
+/// (docs/fs-browse.md): there is no root here to be contained within, and the
+/// bound on *where* a directory may be created is the OS's own permission
+/// model plus the endpoint's caller gate, never a mesa-imposed path prefix.
+///
+/// `fs::create_dir`, never `create_dir_all`: one level only, and an existing
+/// path is a `Conflict` the caller is told about rather than a silent success.
+pub fn create_dir(parent: &str, name: &str) -> Result<DirEntry, CreateDirError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CreateDirError::Validation("folder name cannot be empty"));
+    }
+    if name == "." || name == ".." {
+        return Err(CreateDirError::Validation("folder name cannot be . or .."));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(CreateDirError::Validation(
+            "folder name must be a single name, not a path",
+        ));
+    }
+    let canon = fs::canonicalize(parent).map_err(|_| CreateDirError::NotFound)?;
+    if !canon.is_dir() {
+        return Err(CreateDirError::NotFound);
+    }
+    let target = canon.join(name);
+    // `symlink_metadata`, not `exists()`: a dangling symlink is still a name
+    // taken, which `fs::create_dir` would refuse anyway.
+    if target.symlink_metadata().is_ok() {
+        return Err(CreateDirError::Conflict);
+    }
+    fs::create_dir(&target).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => CreateDirError::Conflict,
+        _ => CreateDirError::NotFound,
+    })?;
+    Ok(DirEntry {
+        name: name.to_string(),
+        path: target.to_string_lossy().into_owned(),
     })
 }
 
@@ -496,6 +557,74 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("f.txt"), "hi").unwrap();
         assert_eq!(list_dir(dir.path().join("f.txt").to_str().unwrap()), None);
+    }
+
+    // --- create_dir ------------------------------------------------------
+
+    #[test]
+    fn create_dir_makes_the_folder_and_returns_it_as_a_listable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let entry = create_dir(root.to_str().unwrap(), "new proj").unwrap();
+        assert_eq!(entry.name, "new proj");
+        assert!(fs::metadata(&entry.path).unwrap().is_dir());
+        // The returned path is exactly what `list_dir` would report for it,
+        // so the caller can navigate straight into it.
+        let listing = list_dir(&entry.path).unwrap();
+        assert_eq!(listing.path, entry.path);
+        assert!(
+            list_dir(root.to_str().unwrap())
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.path == entry.path)
+        );
+    }
+
+    #[test]
+    fn create_dir_trims_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = create_dir(dir.path().to_str().unwrap(), "  spaced  ").unwrap();
+        assert_eq!(entry.name, "spaced");
+    }
+
+    #[test]
+    fn create_dir_rejects_empty_dot_and_path_shaped_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        for bad in ["", "   ", ".", "..", "a/b", "../escape", "a\\b", "a\0b"] {
+            assert!(
+                matches!(create_dir(root, bad), Err(CreateDirError::Validation(_))),
+                "expected validation error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_dir_conflicts_on_an_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir(dir.path().join("taken")).unwrap();
+        fs::write(dir.path().join("afile"), "x").unwrap();
+
+        assert_eq!(create_dir(root, "taken"), Err(CreateDirError::Conflict));
+        assert_eq!(create_dir(root, "afile"), Err(CreateDirError::Conflict));
+    }
+
+    #[test]
+    fn create_dir_not_found_for_missing_or_non_directory_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "x").unwrap();
+
+        assert_eq!(
+            create_dir(dir.path().join("gone").to_str().unwrap(), "x"),
+            Err(CreateDirError::NotFound)
+        );
+        assert_eq!(
+            create_dir(dir.path().join("f.txt").to_str().unwrap(), "x"),
+            Err(CreateDirError::NotFound)
+        );
     }
 
     #[test]

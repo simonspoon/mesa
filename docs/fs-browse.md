@@ -3,7 +3,8 @@
 Backs the web UI's new-project folder picker (`CreateProjectModal` /
 `DirBrowser`, mesa task 406): browser-native file pickers withhold real
 absolute paths, so the folder picker instead drives one server-side
-directory-listing endpoint. Unlike the Git/Files tabs, this surface is **not
+directory-listing endpoint (plus, since task 489, a create-one-folder
+mutation on the same route). Unlike the Git/Files tabs, this surface is **not
 project-scoped and not rooted at any project's `local_path`** — it lists any
 directory the calling OS user can read, anywhere on the machine (`/opt`,
 `/Volumes`, an external drive), because that's what picking a not-yet-linked
@@ -27,6 +28,28 @@ folder requires.
   field (every entry already is one, unlike `FileTreeEntry`) and no git-repo
   decoration — that stays exclusively with `GET /api/git-status`, not
   duplicated here.
+- `POST /api/fs/dirs` `{path, name}` → the new `DirEntry`, via
+  `core::files::create_dir` (mesa task 489) — creates ONE folder named `name`
+  directly inside `path`, so a project can be started in a folder that
+  doesn't exist yet. `fs::create_dir`, never `create_dir_all`: one level, and
+  an occupied name is a 409 `conflict` the user sees rather than a silent
+  success. `name` must be a single path component — separators, NUL, `.` and
+  `..` are 422 `validation`, and that rejection is the *entire* containment
+  story (it is what keeps `parent.join(name)` inside `parent`); there is
+  deliberately no `safe_path` here, for the same reason `list_dir` has none.
+  A parent that no longer resolves collapses to the same 404 `not_found` the
+  GET returns for it. The echoed `DirEntry` is shaped exactly like the ones
+  the GET lists, so the picker navigates into the new folder without a second
+  request.
+
+The picker remembers the folder last confirmed with "use this folder" in
+`localStorage` (`frontend/src/lastFolder.ts`, `mesa-last-folder`) and reopens
+there instead of `$HOME`. Machine-local convenience only, like `boardView`/
+`author` — never server or project state, and explicitly NOT a second home
+for `local_path`. A remembered folder that has since been deleted 404s; the
+browser catches that *in its loader*, forgets the key, and falls back to
+`$HOME` (an effect keyed on `error` would set state during an effect, which
+the frontend lint rejects).
 
 ## Access gate: the same `require_local_path_write`, now parameterized
 
@@ -35,12 +58,21 @@ Gated by `require_local_path_write(&state, &addr, &headers, message)`
 the same loopback-only-in-BOTH-`serve`-modes check that already guards
 writing a project's `local_path` (an execution-anchor input for
 `claude --bg`/`claude agents`): `require_loopback` always, plus
-`require_lan_page_access` under `--lan`. A read-only directory listing is a
-different capability than writing `local_path`, but the same rationale class
-applies — filesystem-exposure adjacent to the execution-anchor concept, not
-plain CRUD — so under `--lan` a peer who could already point a future agent
-at an arbitrary folder gains nothing new from also being able to browse for
-one.
+`require_lan_page_access` under `--lan`. Listing a directory (or creating an
+empty one) is a different capability than writing `local_path`, but the same
+rationale class applies — filesystem-exposure adjacent to the execution-anchor
+concept, not plain CRUD — so under `--lan` a peer who could already point a
+future agent at an arbitrary folder gains nothing new from also being able to
+browse for one.
+
+**Both** verbs on the route take that same gate. The POST is deliberately NOT
+on `require_agent_access` (the gate the Files tab's write route uses): that
+gate's `--lan` relaxation is earned by the write being confined to one
+project's `local_path`, where a LAN peer can already spawn an agent. This
+route is unscoped, and creating is a strictly larger capability than
+listing — so it can never be gated more loosely than its own read. Loosening
+the POST alone would be a silent widening of this surface, not a consistency
+fix.
 
 The one adjustment made to land this reuse: `require_local_path_write`'s
 loopback-rejection message used to be hardcoded to `local_path`-specific
@@ -48,12 +80,13 @@ copy ("local_path is an agent execution anchor; it can only be set from this
 machine"), which reads wrong for a listing rejection. It now takes a
 caller-supplied `message: &'static str` — both existing call sites
 (`create_project`, `update_project`) pass their original copy explicitly,
-and `list_fs_dirs` passes its own ("this endpoint is loopback-only; connect
-from this machine"). Do not read this as a second gate: the loopback +
-LAN-page-access logic itself is untouched and still lives in exactly one
-function.
+and `list_fs_dirs`/`create_fs_dir` pass their own ("this endpoint is
+loopback-only; connect from this machine"). Do not read this as a second
+gate: the loopback + LAN-page-access logic itself is untouched and still
+lives in exactly one function.
 
-GET, so the Content-Type/CSRF gate does not apply.
+The GET, being a GET, skips the Content-Type/CSRF gate; the POST sits inside
+it like every other mutation in the API.
 
 ## Navigation bound: the OS permission model, not a mesa-imposed path prefix
 

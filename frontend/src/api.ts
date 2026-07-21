@@ -10,6 +10,7 @@ import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcUsage } from './types/CcUsage'
 import type { DiagramType } from './types/DiagramType'
+import type { DirEntry } from './types/DirEntry'
 import type { DirListing } from './types/DirListing'
 import type { FileContentView } from './types/FileContentView'
 import type { Frame } from './types/Frame'
@@ -322,6 +323,18 @@ export function getProjectGitCommitDiff(
 export function listFsDirs(path?: string): Promise<DirListing> {
   const qs = path !== undefined ? `?path=${encodeURIComponent(path)}` : ''
   return request(`/api/fs/dirs${qs}`)
+}
+
+/**
+ * Creates one folder named `name` directly inside the absolute directory
+ * `path`, so a project can be started in a folder that doesn't exist yet.
+ * `name` must be a single folder name, not a path (`validation` otherwise);
+ * an already-taken name is `conflict`. Echoes the new directory as a
+ * `DirEntry` identical in shape to the ones `listFsDirs` returns, so the
+ * picker can navigate straight into it.
+ */
+export function createFsDir(path: string, name: string): Promise<DirEntry> {
+  return request('/api/fs/dirs', jsonInit('POST', { path, name }))
 }
 
 // ---- files (read-only file tree + content, local_path-anchored) ----

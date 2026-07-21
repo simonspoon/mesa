@@ -456,10 +456,11 @@ fn router(state: AppState) -> Router {
             get(get_project_files_content).patch(update_project_files_content),
         )
         // New-project folder picker: unscoped (not one project's local_path)
-        // server-side directory listing. Loopback-only in BOTH serve modes,
-        // reusing `require_local_path_write` as-is — see that fn's doc and
-        // `docs/fs-browse.md`. GET, so the Content-Type gate doesn't apply.
-        .route("/api/fs/dirs", get(list_fs_dirs))
+        // server-side directory listing, plus creating one folder to pick.
+        // Loopback-only in BOTH serve modes, reusing `require_local_path_write`
+        // as-is — see that fn's doc and `docs/fs-browse.md`. The GET skips the
+        // Content-Type gate; the POST is inside it like every other mutation.
+        .route("/api/fs/dirs", get(list_fs_dirs).post(create_fs_dir))
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
         .route("/api/cc/usage", get(get_cc_usage))
         .route("/api/cc", get(get_cc_dashboard))
@@ -2106,6 +2107,69 @@ async fn list_fs_dirs(
         .ok_or_else(not_found)
 }
 
+#[derive(Deserialize)]
+struct FsDirCreate {
+    path: String,
+    name: String,
+}
+
+/// `POST /api/fs/dirs` — create one folder inside a directory the picker is
+/// already showing, so a project can be started in a folder that doesn't
+/// exist yet (mesa task 489). Body: `{"path": <absolute parent>, "name":
+/// <single folder name>}`; echoes the new `DirEntry`, identical in shape to
+/// the ones the GET lists, so the client can navigate into it without a
+/// second request.
+///
+/// Gated by [`require_local_path_write`] — the SAME gate as the GET beside it,
+/// deliberately: creating a directory is a strictly larger capability than
+/// listing one, so it can never be gated more loosely than its own read. It is
+/// not `require_agent_access` (which `update_project_files_content` uses):
+/// that gate's `--lan` relaxation is justified by the write being confined to
+/// a project's `local_path`, where a LAN peer could already spawn an agent —
+/// this route is unscoped, so it keeps the stricter loopback-only-in-both-modes
+/// bound the rest of this endpoint has. Being a mutation, it also sits inside
+/// the global Content-Type/CSRF gate.
+///
+/// `core::files::create_dir`'s errors map one-to-one: `NotFound` → 404 (the
+/// parent vanished — the same collapse the GET performs), `Validation` → 422
+/// (unusable folder name), `Conflict` → 409 (name already taken).
+async fn create_fs_dir(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<FsDirCreate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "this endpoint is loopback-only; connect from this machine",
+    )?;
+    let parent = body.path.clone();
+    let name = body.name.clone();
+    let created = tokio::task::spawn_blocking(move || files::create_dir(&parent, &name))
+        .await
+        .unwrap_or(Err(files::CreateDirError::NotFound));
+    match created {
+        Ok(entry) => Ok(Json(entry).into_response()),
+        Err(files::CreateDirError::NotFound) => Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: format!("directory not found: {}", body.path),
+        }),
+        Err(files::CreateDirError::Validation(message)) => Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: message.into(),
+        }),
+        Err(files::CreateDirError::Conflict) => Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: format!("already exists: {}", body.name.trim()),
+        }),
+    }
+}
+
 /// Terminal access is code execution on this machine — a strictly stronger
 /// capability than the task CRUD the rest of the API exposes. In default
 /// (loopback) mode the agent endpoints are never served to non-local peers.
@@ -2135,12 +2199,13 @@ fn require_loopback(addr: &SocketAddr) -> Result<(), ApiError> {
 /// hence the Host/Origin checks stack on top (in default mode `guard` already
 /// pinned the Host).
 ///
-/// Also reused as-is (not duplicated) by the filesystem-browse endpoint
-/// (`GET /api/fs/dirs`, mesa task 405/arch.md §6) — a read-only directory
-/// listing is a different capability than writing `local_path`, but the same
-/// "loopback-only in BOTH modes" rationale applies (filesystem-exposure
-/// adjacent to the execution-anchor concept, not plain CRUD), so `message`
-/// is caller-supplied rather than hardcoded to `local_path`-specific copy.
+/// Also reused as-is (not duplicated) by BOTH halves of the filesystem-browse
+/// endpoint (`GET /api/fs/dirs`, mesa task 405/arch.md §6, and `POST
+/// /api/fs/dirs`, task 489) — listing a directory or creating one is a
+/// different capability than writing `local_path`, but the same "loopback-only
+/// in BOTH modes" rationale applies (filesystem-exposure adjacent to the
+/// execution-anchor concept, not plain CRUD), so `message` is caller-supplied
+/// rather than hardcoded to `local_path`-specific copy.
 fn require_local_path_write(
     state: &AppState,
     addr: &SocketAddr,
@@ -3561,6 +3626,116 @@ mod tests {
         )
         .await;
         assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    // --- fs/dirs: POST /api/fs/dirs (mesa task 489) -------------------------
+
+    #[tokio::test]
+    async fn create_fs_dir_makes_the_folder_and_echoes_a_listable_entry() {
+        let (dir, state) = test_state();
+        let root = dir.path().to_str().unwrap().to_string();
+
+        let resp = create_fs_dir(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Json(FsDirCreate {
+                path: root.clone(),
+                name: "  new proj  ".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["name"], serde_json::json!("new proj"));
+        assert!(dir.path().join("new proj").is_dir());
+        // The echoed path is directly listable — the picker navigates into it
+        // without a second round trip to resolve anything.
+        let listed = list_fs_dirs(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Query(FsDirsQuery {
+                path: Some(body["path"].as_str().unwrap().to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_fs_dir_maps_core_errors_to_validation_conflict_and_not_found() {
+        let (dir, state) = test_state();
+        let root = dir.path().to_str().unwrap().to_string();
+        std::fs::create_dir(dir.path().join("taken")).unwrap();
+
+        let cases = [
+            (
+                root.clone(),
+                "../escape",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            (
+                root.clone(),
+                "   ",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            (root.clone(), "taken", StatusCode::CONFLICT, "conflict"),
+            (
+                dir.path().join("gone").to_str().unwrap().to_string(),
+                "x",
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+        ];
+        for (path, name, status, code) in cases {
+            let err = create_fs_dir(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Json(FsDirCreate {
+                    path,
+                    name: name.to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, status, "name {name:?}");
+            assert_eq!(err.code, code, "name {name:?}");
+        }
+        // Nothing escaped the parent while those rejections happened.
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
+    }
+
+    /// The POST is gated exactly like the GET beside it: loopback-only in BOTH
+    /// serve modes, so creating a directory is never reachable more widely
+    /// than listing one.
+    #[tokio::test]
+    async fn create_fs_dir_rejects_non_loopback_peer_in_both_modes() {
+        for lan in [false, true] {
+            let (dir, mut state) = test_state();
+            state.lan = lan;
+            // A Host/Origin pair that would satisfy `require_lan_page_access`
+            // on its own — the loopback check must still reject the peer.
+            let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+            let err = create_fs_dir(
+                State(state),
+                ConnectInfo(lan_peer()),
+                headers,
+                Json(FsDirCreate {
+                    path: dir.path().to_str().unwrap().to_string(),
+                    name: "nope".to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.status.is_client_error(), "lan={lan}");
+            assert!(!dir.path().join("nope").exists(), "lan={lan}");
+        }
     }
 
     // --- Locked edge anchors: three-state PATCH validation (mesa task 350) ---

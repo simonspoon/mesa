@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
-import { deleteProject, getProject, listTasks, updateProject } from '../api'
-import { ConfirmDelete } from '../components/ConfirmDelete'
+import { archiveProject, getProject, listTasks, updateProject } from '../api'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskModal } from '../components/TaskModal'
@@ -114,13 +113,6 @@ export function ProjectTasksPage({
     // dropped in useFetch, so an unchanged view never re-renders.
     { pollMs: 3000 },
   )
-  // Unfiltered count for the delete confirmation: the cascade destroys
-  // every task in the project.
-  const { data: allTasks, refetch: refetchCount } = useFetch(
-    () => listTasks({ project: projectId }),
-    `count-${projectId}`,
-  )
-
   // Storyboards, Git, Files, and Dashboard are their own views with
   // their own fetches/error handling, so a failed task fetch must not block
   // them; only surface it on the Board view.
@@ -137,11 +129,16 @@ export function ProjectTasksPage({
     projectId,
   )
 
+  // Archiving hides the project (reversible), never deletes — spec req 12 /
+  // Won't list: no confirmation prompt, no "this deletes N tasks" copy.
+  // Declared ahead of the early error return below, per the rules of hooks.
+  const [archiving, setArchiving] = useState(false)
+  const [archiveError, setArchiveError] = useState<string | null>(null)
+
   if (error) return <p className="error">{error}</p>
 
   function onTasksChanged() {
     refetch()
-    refetchCount()
   }
 
   // Return to the Board view. When a storyboards route is open this also
@@ -167,6 +164,23 @@ export function ProjectTasksPage({
     // One panel, latest action wins: drop an open task back to the
     // project URL (the create form is not URL-addressed).
     if (taskId !== null) window.location.hash = `#/projects/${projectId}`
+  }
+
+  function handleArchive() {
+    setArchiving(true)
+    setArchiveError(null)
+    archiveProject(projectId)
+      .then(() => {
+        onProjectsChanged()
+        // The project just vanished from the default list/sidebar; land
+        // somewhere still valid instead of leaving the user on a page for
+        // a now-hidden project.
+        window.location.hash = '#/'
+      })
+      .catch((e: unknown) => {
+        setArchiving(false)
+        setArchiveError(e instanceof Error ? e.message : String(e))
+      })
   }
 
   return (
@@ -281,19 +295,18 @@ export function ProjectTasksPage({
           <KanbanBoard tasks={tasks} onMoved={onTasksChanged} />
         )}
 
-        {/* Destructive action tucked away, de-emphasized (spec S8): rarely
-            used, kept reachable in a low-key project footer. */}
+        {/* Retirement action tucked away, de-emphasized (spec S8): rarely
+            used, kept reachable in a low-key project footer. Archiving is
+            reversible (unarchive from the sidebar), so this is a plain
+            button with no confirm step and no destructive copy — spec's
+            Won't list explicitly rules out a confirmation prompt here.
+            Deleting a project is still possible; it's just no longer
+            offered from this control (CLI/API unchanged). */}
         <p className="project-danger">
-          <ConfirmDelete
-            label="delete project"
-            message={`Deletes this project and ${allTasks?.length ?? '?'} task(s).`}
-            onDelete={() =>
-              deleteProject(projectId).then(() => {
-                onProjectsChanged()
-                window.location.hash = '#/'
-              })
-            }
-          />
+          <button onClick={handleArchive} disabled={archiving}>
+            archive project
+          </button>
+          {archiveError && <span className="error">{archiveError}</span>}
         </p>
     {taskId !== null && (
       <TaskModal

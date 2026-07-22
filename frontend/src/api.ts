@@ -82,8 +82,16 @@ export interface TaskFilters {
   unblocked?: boolean
 }
 
-export function listProjects(): Promise<Project[]> {
-  return request('/api/projects')
+/**
+ * Lists projects. Default excludes archived projects (matches CLI/API
+ * default): every existing caller keeps calling `listProjects()` unedited
+ * and inherits the exclusion. Pass `true` to include archived ones too
+ * (the sidebar's "archived (N)" group).
+ */
+export function listProjects(includeArchived = false): Promise<Project[]> {
+  return request(
+    `/api/projects${includeArchived ? '?include_archived=true' : ''}`,
+  )
 }
 
 export function getProject(id: number): Promise<Project> {
@@ -194,6 +202,16 @@ export function deleteProject(
     // mutating methods (src/api.rs Requirement 7 middleware).
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+/** Hides the project from default lists/pickers; reversible, no cascade. */
+export function archiveProject(id: number): Promise<Project> {
+  return request(`/api/projects/${id}/archive`, jsonInit('POST', {}))
+}
+
+/** Reverses `archiveProject`. */
+export function unarchiveProject(id: number): Promise<Project> {
+  return request(`/api/projects/${id}/unarchive`, jsonInit('POST', {}))
 }
 
 export function createTask(body: TaskCreate): Promise<Task> {

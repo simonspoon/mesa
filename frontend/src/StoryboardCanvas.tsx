@@ -155,8 +155,8 @@ const HANDLES = [
  * editing, and connection behavior — the only differences are `shapeClass`,
  * an extra class name that gives the card its silhouette (rectangle/diamond/
  * oval/entity box) in CSS, and the optional `renderBody` override (used only
- * by `EntityNode` to render `Frame.body` as a distinct attribute list
- * instead of markdown — see arch.md §5). A single implementation keeps the
+ * by `EntityNode`, to render `Frame.body` as hard-line-broken markdown in a
+ * monospace field-list style — see arch.md §5). A single implementation keeps the
  * mutation wiring (`data.onSave*`) in one place rather than duplicated per
  * shape.
  */
@@ -425,34 +425,28 @@ function StartEndNode(props: NodeProps<FrameNodeType>) {
   return <FrameCardNode {...props} shapeClass="frame-start-end" />
 }
 
-/** Splits `Frame.body` into its attribute lines: one attribute per non-empty
- *  line, per arch.md §5's line-based convention (no new field, no JSON-in-
- *  `body` structure — `body` stays a plain string round-tripping through the
- *  same `Frame`/`FrameNew`/`FramePatch` shape every other frame uses). */
-function attributeLines(body: string): string[] {
-  return body
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line !== '')
-}
-
 /** ERD "entity" shape: same card/editing/connection behavior as every other
- *  shape, but the body renders as a distinct attribute list — one `<li>` per
- *  non-empty line of `Frame.body` — instead of through the `Markdown`
- *  component every other shape uses for its body. Should #13 only asks for a
- *  readable list, not typed/structured attributes, so this is presentation
- *  only: storage is untouched plain text. */
+ *  shape, but the body renders through `Markdown` in `breaks` mode and in a
+ *  tighter monospace field-list style (`.frame-entity-body`).
+ *
+ *  Before task 492 this split `body` on newlines and emitted one plain-text
+ *  `<li>` per line, so an attribute could never carry emphasis, `code`, or a
+ *  markdown table — an ERD written with tables (one row per column, the shape
+ *  an agent naturally generates) rendered as a wall of literal `|` pipes.
+ *  `remark-breaks` is what makes markdown safe here: a single newline stays a
+ *  visible line break, so the older line-per-attribute convention still reads
+ *  as one attribute per line instead of collapsing into a prose blob the way a
+ *  generic card's soft breaks do. Still presentation only — `Frame.body`
+ *  remains a plain string with no parsed/validated structure. */
 function EntityNode(props: NodeProps<FrameNodeType>) {
   return (
     <FrameCardNode
       {...props}
       shapeClass="frame-entity"
       renderBody={(body) => (
-        <ul className="frame-attr-list">
-          {attributeLines(body).map((line, i) => (
-            <li key={i}>{line}</li>
-          ))}
-        </ul>
+        <div className="frame-entity-body">
+          <Markdown text={body} breaks />
+        </div>
       )}
     />
   )

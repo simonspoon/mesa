@@ -1128,7 +1128,7 @@ main {
 /* ERD "entity" shape (mesa task 359) — a plain rectangle, like `frame-
    process`, but tinted magenta so it reads as its own primitive next to the
    flowchart shapes. Its distinguishing feature is the attribute list below
-   (`.frame-attr-list`), not the silhouette. */
+   (`.frame-entity-body`), not the silhouette. */
 .frame.frame-entity {
   clip-path: none;
   border-radius: 2px;
@@ -1238,21 +1238,40 @@ main {
   color: var(--cyan);
 }
 
-/* Entity attribute list (mesa task 359) — one line of `Frame.body` per row,
-   rendered as a plain list (not through `Markdown`) so it reads as a
-   distinct, tabular field list rather than an opaque prose blob. */
-.frame-attr-list {
-  margin: 0;
-  padding-left: 1.1rem;
-  list-style: disc;
+/* Markdown tables inside cards (mesa task 492). GFM tables were parseable long
+   before this but had no card styling at all, so they rendered as unaligned
+   runs of text; ERD entity bodies are the first surface that leans on them. */
+.frame-body :where(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.2rem 0;
+  font-size: 0.95em;
+}
+.frame-body :where(th, td) {
+  text-align: left;
+  padding: 0.15rem 0.35rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.frame-body :where(th) {
+  color: var(--cyan);
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+}
+
+/* Entity body (mesa task 359; markdown since task 492) — a field list rather
+   than prose, so it stays tighter and monospaced than a generic card body.
+   `EntityNode` renders it through `Markdown` in `breaks` mode: one attribute
+   per line still reads as one line, but emphasis, `code`, and tables now
+   render instead of showing their literal source. */
+.frame-entity-body {
   font-family: var(--font-mono, monospace);
   font-size: 0.76rem;
 }
-.frame-attr-list li {
-  overflow-wrap: anywhere;
-}
-.frame-attr-list li + li {
-  margin-top: 0.2rem;
+.frame-entity-body :where(ul, ol) {
+  padding-left: 1.1rem;
 }
 
 .frame-foot {

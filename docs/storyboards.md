@@ -227,19 +227,25 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     - **ERD shape** (`.frame-entity`): a plain rectangle tinted magenta,
       distinguished from `process` mainly by the attribute list, not the
       silhouette. `EntityNode` passes `FrameCardNode` a `renderBody` that
-      renders `Frame.body` as `attributeLines(body)` — split on `\n`, trim,
-      drop empty lines — mapped into a `<ul className="frame-attr-list">
-      <li>` per line, instead of running `body` through the `Markdown`
-      component every other shape uses. This is presentation-only: `Frame.
-      body` is still a plain string (no new column, no JSON-in-`body`
-      convention, no per-attribute typed structure) — "one attribute per
-      non-empty line" is a rendering convention in `EntityNode` alone, not a
-      parsed/validated format enforced anywhere else. A two-line body like
-      `"id: int PK\nname: string"` therefore reads as two distinct list
-      items on an `entity` frame, versus one collapsed line through
-      `Markdown`'s soft-break handling on a generic card — the concrete
-      difference the Should #13 "not an opaque markdown blob" requirement is
-      checking for.
+      wraps `Frame.body` in `.frame-entity-body` (tighter, monospace) and
+      renders it through `<Markdown breaks>` — the same component every other
+      shape uses, plus `remark-breaks` (mesa task 492). This is
+      presentation-only: `Frame.body` is still a plain string (no new column,
+      no JSON-in-`body` convention, no per-attribute typed structure) —
+      nothing parses or validates an attribute format anywhere.
+      **`breaks` is the load-bearing part.** Under plain CommonMark a single
+      newline is a *soft* break that collapses to a space, so a
+      line-per-attribute body like `"id: int PK\nname: string"` would render
+      as one run-on line — an opaque prose blob, which Should #13 explicitly
+      rules out. `remark-breaks` keeps each newline a visible line break, so
+      that body still reads as two lines while emphasis, `` `code` ``, and GFM
+      tables now render as formatting instead of literal source. Task 492
+      replaced the original plain-text `<ul className="frame-attr-list">`
+      (one trimmed `<li>` per non-empty line) for exactly that reason: an
+      agent-generated ERD that describes columns as a markdown table showed a
+      wall of `|` pipes. Card-scoped table CSS lives at
+      `.frame-body :where(table)` and applies to every shape, not just
+      entities.
     - **Brainstorm shapes** (`.frame-central`/`.frame-idea`, mesa task 444;
       the `.frame-start-end` note below is post-task-445):
       a mind-map hub plus its branch nodes. `CentralNode`/`IdeaNode` are both

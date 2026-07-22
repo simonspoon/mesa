@@ -1,4 +1,5 @@
 import ReactMarkdown from 'react-markdown'
+import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 
 /**
@@ -19,11 +20,18 @@ import remarkGfm from 'remark-gfm'
  * tables, strikethrough, task lists, autolinks (task 432). It is a source-text
  * parser extension only: it emits ordinary mdast nodes, so the no-raw-HTML
  * guarantee above is unaffected.
+ *
+ * `breaks` opts into `remark-breaks`, which turns a single newline into a hard
+ * line break instead of CommonMark's soft break (collapsed to a space). Used by
+ * ERD entity cards (task 492), whose bodies are line-per-attribute lists that
+ * must not run together — see `EntityNode` in `StoryboardCanvas.tsx`. Like
+ * `remark-gfm` it is a source-text parser extension emitting ordinary mdast
+ * nodes, so the no-raw-HTML guarantee is unaffected.
  */
-export function Markdown({ text }: { text: string }) {
+export function Markdown({ text, breaks }: { text: string; breaks?: boolean }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={breaks ? [remarkGfm, remarkBreaks] : [remarkGfm]}
       components={{
         a: ({ children, href }) => (
           <a href={href} target="_blank" rel="noreferrer">

@@ -212,6 +212,26 @@ EXAMPLES
         /// Project id
         id: i64,
     },
+    /// Hide a project from unscoped views; prints the full updated project
+    ///
+    /// Archiving never deletes anything — `project show`/`update`/`delete`
+    /// and every query scoped to this project's explicit id or name are
+    /// unaffected. Idempotent: archiving an already-archived project
+    /// succeeds and returns its current state.
+    Archive {
+        /// Project id or name
+        #[arg(value_name = "ID|NAME")]
+        project: String,
+    },
+    /// Reverse `archive`; prints the full updated project
+    ///
+    /// Idempotent: unarchiving an already-unarchived project succeeds and
+    /// returns its current state.
+    Unarchive {
+        /// Project id or name
+        #[arg(value_name = "ID|NAME")]
+        project: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1268,6 +1288,14 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
         ProjectCmd::Delete { id } => {
             let (project, tasks) = store.delete_project(id)?;
             print_json(&json!({"project": project, "tasks": tasks}));
+        }
+        ProjectCmd::Archive { project } => {
+            let id = resolve_project(&store, &project)?;
+            print_json(&store.archive_project(id)?);
+        }
+        ProjectCmd::Unarchive { project } => {
+            let id = resolve_project(&store, &project)?;
+            print_json(&store.unarchive_project(id)?);
         }
     }
     Ok(())

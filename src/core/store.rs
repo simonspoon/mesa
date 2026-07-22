@@ -255,6 +255,7 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE storyboards ADD COLUMN diagram_type TEXT NOT NULL DEFAULT 'storyboard';
     ALTER TABLE frames ADD COLUMN shape TEXT;
     ",
+    "ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -299,7 +300,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
     })
 }
 
-const PROJECT_COLUMNS: &str = "id, name, description, root_commit, local_path";
+const PROJECT_COLUMNS: &str = "id, name, description, root_commit, local_path, archived";
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -308,6 +309,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         description: row.get(2)?,
         root_commit: row.get(3)?,
         local_path: row.get(4)?,
+        archived: row.get(5)?,
     })
 }
 
@@ -999,6 +1001,24 @@ impl Store {
                 None => Error::Db(e),
             })?;
         Ok(project)
+    }
+
+    /// Hides the project from unscoped views. Idempotent: archiving an
+    /// already-archived project succeeds and returns its current state.
+    pub fn archive_project(&mut self, id: i64) -> Result<Project> {
+        self.get_project(id)?;
+        self.conn
+            .execute("UPDATE projects SET archived = 1 WHERE id = ?1", [id])?;
+        self.get_project(id)
+    }
+
+    /// Reverses `archive_project`. Idempotent: unarchiving an
+    /// already-unarchived project succeeds and returns its current state.
+    pub fn unarchive_project(&mut self, id: i64) -> Result<Project> {
+        self.get_project(id)?;
+        self.conn
+            .execute("UPDATE projects SET archived = 0 WHERE id = ?1", [id])?;
+        self.get_project(id)
     }
 
     /// Deletes the project and all its tasks; returns the destroyed records.
@@ -2665,6 +2685,38 @@ mod tests {
         assert_eq!(deleted, updated);
         assert!(tasks.is_empty());
         assert!(matches!(store.get_project(p.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn archive_and_unarchive_are_idempotent_and_dont_hide_from_get_or_delete() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("alpha", None, None, None).unwrap();
+        assert!(!p.archived);
+
+        let archived = store.archive_project(p.id).unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived.name, p.name);
+        // Idempotent: archiving an already-archived project succeeds and
+        // returns the same state.
+        let archived_again = store.archive_project(p.id).unwrap();
+        assert_eq!(archived_again, archived);
+
+        // get/find_by_name must not filter archived projects (story 503
+        // guardrail) — unarchive-by-name and `project show` depend on this.
+        assert_eq!(store.get_project(p.id).unwrap(), archived);
+        assert_eq!(store.find_project_by_name("alpha").unwrap(), archived);
+
+        let unarchived = store.unarchive_project(p.id).unwrap();
+        assert!(!unarchived.archived);
+        let unarchived_again = store.unarchive_project(p.id).unwrap();
+        assert_eq!(unarchived_again, unarchived);
+
+        // Delete stays byte-identical on an archived project: full cascade,
+        // full echo, no special-casing of the flag.
+        let archived = store.archive_project(p.id).unwrap();
+        let (deleted, tasks) = store.delete_project(p.id).unwrap();
+        assert_eq!(deleted, archived);
+        assert!(tasks.is_empty());
     }
 
     #[test]

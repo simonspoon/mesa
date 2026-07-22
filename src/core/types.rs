@@ -88,6 +88,11 @@ pub struct Project {
     /// sessions belong here, and where new ones start. Auto-learned on
     /// `project create` and refreshed by `project resolve`.
     pub local_path: Option<String>,
+    /// Hides the project from unscoped views (project list, unscoped task
+    /// list/next, sidebar main list) without deleting anything. Flipped via
+    /// `Store::archive_project` / `unarchive_project`; every query scoped to
+    /// an explicit project id/name is unaffected.
+    pub archived: bool,
 }
 
 /// One live Claude Code session as reported by `claude agents --json`.

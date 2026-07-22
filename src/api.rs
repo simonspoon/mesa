@@ -349,6 +349,8 @@ fn router(state: AppState) -> Router {
                 .patch(update_project)
                 .delete(delete_project),
         )
+        .route("/api/projects/{id}/archive", post(archive_project))
+        .route("/api/projects/{id}/unarchive", post(unarchive_project))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route(
             "/api/tasks/{id}",
@@ -706,6 +708,22 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<i64>) -> A
     let mut store = state.store.lock().unwrap();
     let (project, tasks) = store.delete_project(id)?;
     Ok(Json(json!({"project": project, "tasks": tasks})).into_response())
+}
+
+async fn archive_project(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.archive_project(id)?).into_response())
+}
+
+async fn unarchive_project(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.unarchive_project(id)?).into_response())
 }
 
 // ---- tasks ----

@@ -167,6 +167,14 @@ invariants you must not break — read them before changing `src/`:
   Anchors the Agents surface (see `docs/agents.md`); the web UI sidebar
   decorates each project with `local_path`'s git status
   (`GET /api/git-status`, 5s cache, omits projects with no live repo).
+- A project may be **`archived`** — a persisted boolean, default `false`,
+  flipped by `Store::archive_project`/`unarchive_project` (idempotent setters;
+  archiving an already-archived project, or vice versa, succeeds and returns
+  current state), `mesa project archive|unarchive <ID|NAME>` (same id-or-name
+  resolution as every other project-arg command), and `POST
+  /api/projects/{id}/archive`/`unarchive`. Archiving hides a project from
+  unscoped views, it never deletes: `project show`/`update`/`delete` and any
+  query scoped to an explicit project id/name are unaffected by the flag.
 
 ### Per-feature surfaces (see linked doc before touching)
 

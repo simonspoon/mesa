@@ -8,6 +8,16 @@ running `task next` and starting an agent. **Off by default**: auto-spawning
 agents is real API cost and real code execution, so it must not fire just
 because someone ran `mesa serve`.
 
+- The per-tick fan-out is entirely driven by `Store::list_projects()`, which
+  excludes archived projects (mesa task 504) — an archived project is never
+  auto-dispatched onto (main-loop ruling 1), with no separate check of its
+  own: it simply never appears in the list the watcher loops over. Unarchiving
+  restores it starting with the next tick. Regression: a Rust unit test
+  (`api::tests::todo_watcher_tick_skips_archived_project_dispatches_normal_one`)
+  calls `todo_watcher_tick` directly against an archived + a normal project so
+  the exclusion can't silently regress if `list_projects()` were ever swapped
+  for `list_projects_all()`; `scripts/todo-watcher-check.sh` covers the same
+  behavior end-to-end through the real dispatch loop.
 - Each tick (`todo_watcher_tick` in `src/api.rs`), for every project with a
   `local_path` that still exists as a directory: if the project has **no**
   `in_progress` task, it calls `Store::next_task` for that project and, on an
@@ -40,6 +50,7 @@ because someone ran `mesa serve`.
   with `--watch-todo` appended when it was set, so restarting the server
   never silently turns the watcher off.
 - Gate: `scripts/todo-watcher-check.sh` (flag on/off, dispatch + claim,
-  busy-project skip, path-less/stale-path skip, spawn-failure revert)
-  against a stub `claude` binary — no CLI surface of its own beyond the
-  `serve` flag, matching the agents surface's "no `mesa agent` CLI" precedent.
+  busy-project skip, path-less/stale-path skip, spawn-failure revert,
+  archived-project skip + unarchive-resumes-dispatch) against a stub `claude`
+  binary — no CLI surface of its own beyond the `serve` flag, matching the
+  agents surface's "no `mesa agent` CLI" precedent.

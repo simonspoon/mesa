@@ -3889,4 +3889,102 @@ mod tests {
         assert_eq!(stored.result, None);
         assert_eq!(stored.acceptance.as_deref(), Some("a"));
     }
+
+    // --- todo-watcher must skip archived projects (mesa task 506) -----------
+    //
+    // `todo_watcher_tick`'s only project source is `Store::list_projects()`,
+    // which excludes archived rows (mesa task 504); it then calls
+    // `next_task(Some(project.id))`, a scoped/archive-agnostic read (mesa task
+    // 505), so the project list is the sole gate. This test calls the private
+    // `todo_watcher_tick` directly (same crate) against a stub `claude` so it
+    // would fail immediately if a future change swapped in
+    // `list_projects_all()` or otherwise let an archived project's task reach
+    // dispatch.
+
+    /// Writes an executable stub `claude` that only understands `--bg`,
+    /// appending `<cwd>|<name>` to `log_path` and printing a well-formed
+    /// receipt line (mirrors `scripts/todo-watcher-check.sh`'s stub).
+    fn stub_claude_bg(dir: &std::path::Path, log_path: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("claude");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+[ "$1" = "--bg" ] || exit 1
+shift
+NAME=""
+if [ "$1" = "--name" ]; then shift; NAME="$1"; shift; fi
+echo "$(pwd)|$NAME" >> "{}"
+echo "backgrounded · deadbeef (idle — send a prompt to start)"
+"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn todo_watcher_tick_skips_archived_project_dispatches_normal_one() {
+        // SAFETY: ENV_LOCK (shared with attachments/cc tests) gives this test
+        // exclusive access to MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let archived_dir = tempfile::tempdir().unwrap();
+        let normal_dir = tempfile::tempdir().unwrap();
+        let archived_path = archived_dir.path().to_str().unwrap();
+        let normal_path = normal_dir.path().to_str().unwrap();
+
+        let archived_id = new_project(&state, Some(archived_path));
+        let normal_id = new_project(&state, Some(normal_path));
+        let archived_task = new_task(&state, archived_id);
+        let normal_task = new_task(&state, normal_id);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .archive_project(archived_id)
+            .unwrap();
+
+        todo_watcher_tick(&state);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "expected exactly one dispatch (the unarchived project), got: {log:?}"
+        );
+        assert!(
+            log.contains(normal_path),
+            "the unarchived project's task must be dispatched: {log:?}"
+        );
+        assert!(
+            !log.contains(archived_path),
+            "the archived project's task must never be dispatched: {log:?}"
+        );
+
+        let archived_task = state.store.lock().unwrap().get_task(archived_task).unwrap();
+        assert_eq!(
+            archived_task.status,
+            Status::Todo,
+            "archived project's task must stay todo, never claimed"
+        );
+        let normal_task = state.store.lock().unwrap().get_task(normal_task).unwrap();
+        assert_eq!(
+            normal_task.status,
+            Status::InProgress,
+            "unarchived project's task must be claimed in_progress"
+        );
+    }
 }

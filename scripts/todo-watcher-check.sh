@@ -168,4 +168,89 @@ ok "a spawn_bg failure reverts the claimed task back to todo instead of wedging 
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
+# ---- archived project is never auto-dispatched onto (mesa task 506 /
+# main-loop ruling 1); unarchiving lets the next tick dispatch it. Runs
+# against its own throwaway MESA_DB, stub log and server instance -- fully
+# isolated from the A/B/C fixtures above, which otherwise have in-flight
+# claim/revert cycles (spawn-failure retry) that would make shared-log
+# assertions here racy against tick timing. ----
+
+ARCH_DB="$TMP/archived.db"
+ARCH_LOG="$TMP/archived-bg.log"
+touch "$ARCH_LOG"
+ARCH_STUB="$STUB_DIR/claude-archived"
+cat > "$ARCH_STUB" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "--bg" ]; then
+  shift
+  NAME=""
+  if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
+  PROMPT=""
+  if [ "\$1" = "--" ]; then shift; PROMPT="\$1"; fi
+  echo "\$(pwd)|\$NAME|\$PROMPT" >> "$ARCH_LOG"
+  echo "backgrounded · deadbeef (idle — send a prompt to start)"
+  exit 0
+fi
+if [ "\$1" = "agents" ]; then echo '[]'; exit 0; fi
+exit 2
+EOF
+chmod +x "$ARCH_STUB"
+
+mkdir -p "$TMP/normDir" "$TMP/archDir"
+NORM_DIR=$(cd "$TMP/normDir" && pwd -P)
+ARCH_DIR=$(cd "$TMP/archDir" && pwd -P)
+
+export MESA_DB="$ARCH_DB"
+run 0 "$MESA" project create "Norm" --no-git
+NORM=$(jqs .id)
+run 0 "$MESA" project update "$NORM" --path "$NORM_DIR"
+run 0 "$MESA" task create "$NORM" "task norm"
+TASK_NORM=$(jqs .id)
+
+run 0 "$MESA" project create "Arch" --no-git
+ARCH=$(jqs .id)
+run 0 "$MESA" project update "$ARCH" --path "$ARCH_DIR"
+# Archive BEFORE the task exists: a todo task must never be actionable for an
+# already-archived project, not even for the one tick between its creation
+# and a subsequent archive call.
+run 0 "$MESA" project archive "$ARCH"
+run 0 "$MESA" task create "$ARCH" "task arch"
+TASK_ARCH=$(jqs .id)
+
+ARCH_PORT=17782
+MESA_CLAUDE_BIN="$ARCH_STUB" MESA_WATCH_TODO_TICK_MS=150 \
+  "$MESA" serve --port "$ARCH_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$ARCH_PORT"
+
+arch_task_status() { curl -sf "http://127.0.0.1:$ARCH_PORT/api/tasks/$1" | jq -r .status; }
+wait_arch_bg_lines() { # wait_arch_bg_lines <n> -> blocks until ARCH_LOG has >= n lines, or fails
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$ARCH_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n archived-check bg dispatch(es); log:\n$(cat "$ARCH_LOG")"
+}
+
+wait_arch_bg_lines 1
+sleep 1
+[ "$(wc -l < "$ARCH_LOG")" -eq 1 ] || fail "archived project must never be dispatched, even across several ticks"
+LINE=$(head -1 "$ARCH_LOG")
+[ "$LINE" = "$NORM_DIR|Norm: task norm|/execute-mesa-task $TASK_NORM" ] ||
+  fail "expected '$NORM_DIR|Norm: task norm|/execute-mesa-task $TASK_NORM', got '$LINE'"
+[ "$(arch_task_status "$TASK_NORM")" = "in_progress" ] || fail "unarchived project's task must be claimed in_progress"
+[ "$(arch_task_status "$TASK_ARCH")" = "todo" ] || fail "archived project's task must stay todo, never claimed"
+ok "archived project is never auto-dispatched onto while its unarchived sibling is, across several ticks"
+
+run 0 "$MESA" project unarchive "$ARCH"
+wait_arch_bg_lines 2
+LINE=$(sed -n '2p' "$ARCH_LOG")
+[ "$LINE" = "$ARCH_DIR|Arch: task arch|/execute-mesa-task $TASK_ARCH" ] ||
+  fail "expected '$ARCH_DIR|Arch: task arch|/execute-mesa-task $TASK_ARCH', got '$LINE'"
+[ "$(arch_task_status "$TASK_ARCH")" = "in_progress" ] || fail "unarchiving must let the next tick dispatch its actionable todo task"
+ok "unarchiving a project lets the next tick dispatch its actionable todo task"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
 echo "ALL OK ($CHECKS checks)"

@@ -1151,11 +1151,16 @@ impl Store {
         }
     }
 
-    pub fn list_tasks(&self) -> Result<Vec<Task>> {
+    /// Lists tasks. Scoped to `project` if given (archived-agnostic, matching
+    /// every other scoped read); when `None`, excludes tasks whose project is
+    /// archived so unscoped views don't surface an archived project's work.
+    pub fn list_tasks(&self, project: Option<i64>) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks t ORDER BY t.sort_order, t.id"
+            "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
+             WHERE (?1 IS NULL OR t.project_id = ?1) AND (?1 IS NOT NULL OR p.archived = 0) \
+             ORDER BY t.sort_order, t.id"
         ))?;
-        let rows = stmt.query_map([], row_to_task)?;
+        let rows = stmt.query_map([project], row_to_task)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1406,9 +1411,10 @@ impl Store {
         let priority_rank = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END";
         let task = {
             let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM tasks t \
+                "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
                  WHERE t.status = 'todo' AND NOT {blocked_expr} \
                  AND (?1 IS NULL OR t.project_id = ?1) \
+                 AND (?1 IS NOT NULL OR p.archived = 0) \
                  ORDER BY {priority_rank}, t.id LIMIT 1"
             );
             self.conn
@@ -1425,8 +1431,9 @@ impl Store {
         // No actionable task: count by status / blocked within the filter.
         let count = |predicate: &str| -> Result<i64> {
             let sql = format!(
-                "SELECT COUNT(*) FROM tasks t \
-                 WHERE (?1 IS NULL OR t.project_id = ?1) AND {predicate}"
+                "SELECT COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id \
+                 WHERE (?1 IS NULL OR t.project_id = ?1) \
+                 AND (?1 IS NOT NULL OR p.archived = 0) AND {predicate}"
             );
             Ok(self.conn.query_row(&sql, [project], |r| r.get(0))?)
         };
@@ -1704,13 +1711,22 @@ impl Store {
     }
 
     /// Lists storyboards, newest activity is not implied — ordered by id.
-    /// Scoped to `project` if given. Frames and edges are omitted (the compact
-    /// list shape); use `get_storyboard_view` for a board's full contents.
+    /// Scoped to `project` if given (archived-agnostic); when `None`, excludes
+    /// storyboards whose project is archived. Frames and edges are omitted
+    /// (the compact list shape); use `get_storyboard_view` for a board's full
+    /// contents.
     pub fn list_storyboards(&self, project: Option<i64>) -> Result<Vec<Storyboard>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {STORYBOARD_COLUMNS} FROM storyboards \
-             WHERE (?1 IS NULL OR project_id = ?1) ORDER BY id"
-        ))?;
+        // STORYBOARD_COLUMNS is unqualified; under the join both `id` and
+        // `description` collide with `projects` columns, so this query
+        // aliases the table and qualifies every column explicitly instead of
+        // reusing the shared constant.
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.project_id, s.title, s.description, s.author, s.diagram_type, \
+             s.created_at, s.updated_at \
+             FROM storyboards s JOIN projects p ON p.id = s.project_id \
+             WHERE (?1 IS NULL OR s.project_id = ?1) AND (?1 IS NOT NULL OR p.archived = 0) \
+             ORDER BY s.id",
+        )?;
         let rows = stmt.query_map([project], row_to_storyboard)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -2922,7 +2938,7 @@ mod tests {
         assert!(!t.blocked);
 
         assert_eq!(store.get_task(t.id).unwrap(), t);
-        assert_eq!(store.list_tasks().unwrap(), vec![t.clone()]);
+        assert_eq!(store.list_tasks(None).unwrap(), vec![t.clone()]);
 
         // --tags replaces the full set; description clears; status/priority change.
         let updated = store
@@ -3549,7 +3565,7 @@ mod tests {
 
         let restored = Store::open(&snap).unwrap();
         assert_eq!(restored.list_projects().unwrap(), vec![p]);
-        let tasks = restored.list_tasks().unwrap();
+        let tasks = restored.list_tasks(None).unwrap();
         assert_eq!(tasks.len(), 2);
         assert!(restored.get_task(a.id).unwrap().blocked);
         assert!(!restored.get_task(b.id).unwrap().blocked);
@@ -3831,6 +3847,150 @@ mod tests {
         }
     }
 
+    #[test]
+    fn list_tasks_unscoped_excludes_archived_project_scoped_unaffected() {
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let t1 = add_task(&mut store, p1.id, "p1 task");
+        let t2 = add_task(&mut store, p2.id, "p2 task");
+
+        // Before archiving: unscoped sees both.
+        let before: Vec<i64> = store
+            .list_tasks(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(before, vec![t1.id, t2.id]);
+
+        store.archive_project(p2.id).unwrap();
+
+        // Unscoped excludes the archived project's task.
+        let ids: Vec<i64> = store
+            .list_tasks(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![t1.id]);
+
+        // Scoped read of the archived project is completely unaffected.
+        let scoped = store.list_tasks(Some(p2.id)).unwrap();
+        assert_eq!(scoped, vec![t2.clone()]);
+        assert_eq!(scoped[0].blocked, t2.blocked);
+
+        store.unarchive_project(p2.id).unwrap();
+        let ids: Vec<i64> = store
+            .list_tasks(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![t1.id, t2.id]);
+    }
+
+    #[test]
+    fn next_task_unscoped_skips_archived_project_scoped_unaffected() {
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
+        // p2's task is higher priority, so it would win an unscoped pick
+        // unless the archived project is excluded.
+        let in_p2 = create_with_priority(&mut store, p2.id, "p2 high", Priority::High);
+        let in_p1 = add_task(&mut store, p1.id, "p1 task");
+
+        store.archive_project(p2.id).unwrap();
+
+        match store.next_task(None).unwrap() {
+            NextResult::Task(t) => assert_eq!(t.id, in_p1.id),
+            NextResult::None { .. } => panic!("expected p1 task, p2 is archived"),
+        }
+
+        // Scoped read of the archived project still returns its task.
+        match store.next_task(Some(p2.id)).unwrap() {
+            NextResult::Task(t) => assert_eq!(t.id, in_p2.id),
+            NextResult::None { .. } => panic!("expected p2 task via scoped read"),
+        }
+    }
+
+    #[test]
+    fn next_task_unscoped_none_counts_exclude_archived_project() {
+        // Regresses the count closure specifically (store.rs's second patch
+        // site): an archived project with in_progress/blocked/todo tasks must
+        // not be counted into the unscoped NextResult::None totals.
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
+
+        // p1: one task, marked in_progress so it isn't "actionable" but does
+        // count -- keeps the unscoped pick landing in NextResult::None.
+        let p1_task = add_task(&mut store, p1.id, "p1 in progress");
+        store
+            .update_task(
+                p1_task.id,
+                &TaskPatch {
+                    status: Some(Status::InProgress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // p2 (to be archived): a todo task and a blocked todo task, which
+        // would inflate the unscoped counts if not excluded.
+        let p2_blocker = add_task(&mut store, p2.id, "p2 blocker");
+        let p2_blocked = add_task(&mut store, p2.id, "p2 blocked");
+        store.add_dependency(p2_blocked.id, p2_blocker.id).unwrap();
+        // p2_blocker itself is an actionable todo task in p2.
+
+        store.archive_project(p2.id).unwrap();
+
+        match store.next_task(None).unwrap() {
+            NextResult::Task(t) => panic!("expected None, got actionable task {}", t.id),
+            NextResult::None {
+                blocked,
+                in_progress,
+                todo,
+            } => {
+                assert_eq!(blocked, 0, "p2's blocked task must not be counted");
+                assert_eq!(in_progress, 1, "only p1's in_progress task counts");
+                assert_eq!(todo, 0, "p2's actionable todo task must not be counted");
+            }
+        }
+
+        // Scoped read of the archived project still counts its own tasks.
+        match store.next_task(Some(p2.id)).unwrap() {
+            NextResult::Task(t) => assert_eq!(t.id, p2_blocker.id),
+            NextResult::None { .. } => panic!("expected p2's actionable task via scoped read"),
+        }
+    }
+
+    #[test]
+    fn list_storyboards_unscoped_excludes_archived_project_scoped_unaffected() {
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let sb1 = store
+            .create_storyboard(p1.id, "p1 board", None, None, None)
+            .unwrap();
+        let sb2 = store
+            .create_storyboard(p2.id, "p2 board", None, None, None)
+            .unwrap();
+
+        store.archive_project(p2.id).unwrap();
+
+        let ids: Vec<i64> = store
+            .list_storyboards(None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec![sb1.id]);
+
+        // Scoped read of the archived project is completely unaffected.
+        assert_eq!(store.list_storyboards(Some(p2.id)).unwrap(), vec![sb2]);
+    }
+
     fn import_task(ref_: &str, title: &str) -> ImportTask {
         ImportTask {
             ref_: ref_.into(),
@@ -3909,7 +4069,7 @@ mod tests {
         let err = store.import_tasks(&doc).unwrap_err();
         assert!(matches!(err, Error::Cycle(_)));
         // Rolled back: no tasks, no events.
-        assert!(store.list_tasks().unwrap().is_empty());
+        assert!(store.list_tasks(None).unwrap().is_empty());
         assert!(store.list_events(None).unwrap().is_empty());
     }
 
@@ -3927,7 +4087,7 @@ mod tests {
             store.import_tasks(&bad_project).unwrap_err(),
             Error::Validation(_)
         ));
-        assert!(store.list_tasks().unwrap().is_empty());
+        assert!(store.list_tasks(None).unwrap().is_empty());
 
         // blocked_by an undefined ref: validation error, nothing created.
         let bad_ref = ImportDoc {
@@ -3941,7 +4101,7 @@ mod tests {
             store.import_tasks(&bad_ref).unwrap_err(),
             Error::Validation(_)
         ));
-        assert!(store.list_tasks().unwrap().is_empty());
+        assert!(store.list_tasks(None).unwrap().is_empty());
 
         // duplicate ref: validation error.
         let dup = ImportDoc {
@@ -3952,7 +4112,7 @@ mod tests {
             store.import_tasks(&dup).unwrap_err(),
             Error::Validation(_)
         ));
-        assert!(store.list_tasks().unwrap().is_empty());
+        assert!(store.list_tasks(None).unwrap().is_empty());
     }
 
     #[test]

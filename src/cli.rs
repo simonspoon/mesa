@@ -1361,9 +1361,8 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             let project = project.or(project_pos);
             let project = resolve_project_opt(&store, project.as_deref())?;
             let tasks: Vec<_> = store
-                .list_tasks()?
+                .list_tasks(project)?
                 .iter()
-                .filter(|t| project.is_none_or(|p| t.project_id == p))
                 .filter(|t| status.is_none_or(|s| t.status == s))
                 .filter(|t| tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
                 .filter(|t| parent.is_none_or(|p| t.parent_id == Some(p)))

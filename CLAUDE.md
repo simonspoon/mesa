@@ -183,6 +183,18 @@ invariants you must not break — read them before changing `src/`:
   `GET /api/git-status`) is unchanged and simply stops seeing archived
   projects, which is how the watcher and git-status decoration both skip them
   with no edit of their own.
+- Archiving also hides a project's **tasks and storyboards** from unscoped
+  reads, on the same "scoped reads never change" rule.
+  `Store::list_tasks` gained the `project: Option<i64>` argument its siblings
+  (`next_task`, `list_storyboards`) already had; all three share one rule:
+  `Some(id)` returns that project's rows regardless of `archived` (a scoped
+  read of an archived project is byte-identical to before archiving), `None`
+  excludes rows whose project is archived, via an inner join on `projects`.
+  `mesa task list`, `mesa task next`, `GET /api/tasks`, `mesa storyboard list`
+  and `GET /api/storyboards` all resolve their project id/name once and pass
+  it straight into the same `Store` call — the CLI and API no longer
+  re-implement the project filter as a handler-side `.filter(...)`, closing
+  the divergence risk structurally rather than by discipline.
 
 ### Per-feature surfaces (see linked doc before touching)
 

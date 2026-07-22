@@ -195,7 +195,7 @@ fn todo_watcher_tick(state: &AppState) {
                 return;
             }
         };
-        let tasks = match store.list_tasks() {
+        let tasks = match store.list_tasks(None) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("todo-watcher: list_tasks failed: {e}");
@@ -813,9 +813,8 @@ async fn list_tasks(
 ) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
     let tasks: Vec<TaskSummary> = store
-        .list_tasks()?
+        .list_tasks(q.project)?
         .iter()
-        .filter(|t| q.project.is_none_or(|p| t.project_id == p))
         .filter(|t| q.status.is_none_or(|s| t.status == s))
         .filter(|t| q.tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
         .filter(|t| q.parent.is_none_or(|p| t.parent_id == Some(p)))

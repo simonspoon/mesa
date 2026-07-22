@@ -6,6 +6,7 @@ import {
   listProjects,
   listTasks,
   restartServer,
+  unarchiveProject,
 } from '../api'
 import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
@@ -97,10 +98,15 @@ export function Sidebar({
   ccTab: CcTab | null
   version: number
 }) {
-  const { data: projects, error, refetch } = useFetch(
-    () => listProjects(),
+  // One fetch, archived included (arch.md §"Spec 502" §4) — partitioned below
+  // on `p.archived` so the main list and the archived group can never skew
+  // against each other the way two separate requests could.
+  const { data: allProjects, error, refetch } = useFetch(
+    () => listProjects(true),
     `projects-${version}`,
   )
+  const projects = allProjects?.filter((p) => !p.archived)
+  const archivedProjects = allProjects?.filter((p) => p.archived) ?? []
   const { data: inbox } = useFetch(() => listInbox(), 'inbox-nav', {
     pollMs: 5000,
   })
@@ -143,6 +149,20 @@ export function Sidebar({
   const [creatingProject, setCreatingProject] = useState(false)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
+  // Ephemeral collapse of the archived group, same non-persisted pattern as
+  // `projectsCollapsed` above — starts collapsed so a rarely-visited group
+  // doesn't push the active project list down by default.
+  const [archivedCollapsed, setArchivedCollapsed] = useState(true)
+  const [unarchiveError, setUnarchiveError] = useState<string | null>(null)
+
+  function handleUnarchive(id: number): void {
+    setUnarchiveError(null)
+    unarchiveProject(id)
+      .then(() => refetch())
+      .catch((e: unknown) => {
+        setUnarchiveError(e instanceof Error ? e.message : String(e))
+      })
+  }
   // Full-sidebar collapse: hides the whole nav to give the main content area
   // the extra width, leaving only a thin re-expand handle.
   const [collapsed, setCollapsed] = useState(isPhone)
@@ -245,6 +265,46 @@ export function Sidebar({
                 </li>
               ))}
             </ul>
+          )}
+          {archivedProjects.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="nav-item nav-section nav-subsection"
+                aria-expanded={!archivedCollapsed}
+                onClick={() => setArchivedCollapsed((c) => !c)}
+              >
+                <span className="nav-item-label">
+                  archived ({archivedProjects.length})
+                </span>
+                <span className="nav-caret">
+                  {archivedCollapsed ? '▸' : '▾'}
+                </span>
+              </button>
+              {!archivedCollapsed && (
+                <ul className="nav-projects nav-archived">
+                  {archivedProjects.map((p) => (
+                    <li key={p.id}>
+                      <a
+                        className={p.id === activeProjectId ? 'active' : ''}
+                        href={`#/projects/${p.id}`}
+                      >
+                        <span className="nav-project-name">{p.name}</span>
+                      </a>
+                      <button
+                        type="button"
+                        className="nav-unarchive-button"
+                        title="Restore to the main project list"
+                        onClick={() => handleUnarchive(p.id)}
+                      >
+                        restore
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {unarchiveError && <p className="error nav-archived-error">{unarchiveError}</p>}
+            </>
           )}
           <button
             type="button"

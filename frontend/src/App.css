@@ -246,6 +246,50 @@ header {
   padding-left: 1.25rem;
 }
 
+/* Archived-projects disclosure, nested under the Projects section: same
+   `.nav-section` spacing/caret, indented one notch like the CC subnav so it
+   reads as a group within Projects rather than a sibling top-level entry.
+   Muted text — informational, not a primary nav target. */
+.nav-subsection {
+  margin-top: 0.35rem;
+  padding-left: 1.25rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+/* Archived entries: no git line / live-dot / todo badge (main-loop ruling 2 —
+   no live decoration), so the row is just the name plus a restore action. */
+.nav-archived a {
+  padding-left: 1.25rem;
+}
+
+.nav-archived li {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.nav-archived li a {
+  flex: 1;
+  min-width: 0;
+}
+
+.nav-unarchive-button {
+  flex: none;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.nav-unarchive-button:hover:not(:disabled) {
+  color: var(--cyan);
+}
+
+.nav-archived-error {
+  margin: 0.25rem 0 0 1.25rem;
+  font-size: 0.7rem;
+}
+
 .nav-create-button {
   width: 100%;
   margin-top: 1rem;

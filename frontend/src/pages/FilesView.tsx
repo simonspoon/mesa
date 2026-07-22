@@ -284,7 +284,7 @@ function ContentPane({
 function MarkdownBody({ content }: { content: string }) {
   const { frontmatter, body } = splitFrontmatter(content)
   return (
-    <div className="files-markdown-body">
+    <div className="markdown-body">
       {frontmatter !== null && (
         <div className="files-frontmatter">
           <p className="files-frontmatter-label muted">Frontmatter</p>

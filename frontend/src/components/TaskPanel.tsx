@@ -300,10 +300,13 @@ export function TaskPanel({
           </a>
         </p>
       )}
-      <p className="description">
+      {/* A div, not a p: these InlineEdits render markdown, and markdown emits
+          block elements a <p> cannot legally contain (see InlineEdit). */}
+      <div className="description">
         <InlineEdit
           value={task.description ?? ''}
           multiline
+          markdown
           placeholder="no description — click to add"
           onSave={(d) =>
             updateTask(taskId, { description: d === '' ? null : d }).then(
@@ -311,7 +314,49 @@ export function TaskPanel({
             )
           }
         />
+      </div>
+
+      {/* The three long-text fields the CLI writes (`task update
+          --acceptance/--artifact/--result`). Always shown, empty or not, so
+          they read as click-to-fill slots rather than appearing only once an
+          agent has populated them. */}
+      <h2>Acceptance</h2>
+      <div className="description">
+        <InlineEdit
+          value={task.acceptance ?? ''}
+          multiline
+          markdown
+          placeholder="no acceptance criteria — click to add"
+          onSave={(a) =>
+            updateTask(taskId, { acceptance: a === '' ? null : a }).then(changed)
+          }
+        />
+      </div>
+
+      <h2>Artifact</h2>
+      <p>
+        <InlineEdit
+          value={task.artifact ?? ''}
+          placeholder="no artifact — click to add"
+          onSave={(a) =>
+            updateTask(taskId, { artifact: a === '' ? null : a }).then(changed)
+          }
+        />
       </p>
+
+      <h2>Result</h2>
+      <div className="description">
+        <InlineEdit
+          value={task.result ?? ''}
+          multiline
+          markdown
+          placeholder="no result — click to add"
+          onSave={(r) =>
+            updateTask(taskId, { result: r === '' ? null : r }).then(changed)
+          }
+        />
+      </div>
+
       <p>
         <ConfirmDelete
           label="delete task"

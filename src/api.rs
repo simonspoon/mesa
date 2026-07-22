@@ -740,6 +740,17 @@ struct TaskUpdate {
     tags: Option<Vec<String>>,
     #[serde(default, deserialize_with = "double_option")]
     parent_id: Option<Option<i64>>,
+    // The three long-text fields the CLI has always been able to write
+    // (`task update --acceptance/--artifact/--result`). `null` clears, an
+    // omitted key leaves the stored value alone — same `double_option`
+    // convention as `description`, and the counterpart of the CLI's
+    // empty-string-clears (`clear_if_empty`).
+    #[serde(default, deserialize_with = "double_option")]
+    acceptance: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    artifact: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    result: Option<Option<String>>,
     #[serde(default)]
     sort_order: Option<f64>,
 }
@@ -821,9 +832,9 @@ async fn update_task(
         priority: body.priority,
         tags: body.tags,
         parent_id: body.parent_id,
-        acceptance: None,
-        artifact: None,
-        result: None,
+        acceptance: body.acceptance,
+        artifact: body.artifact,
+        result: body.result,
         sort_order: body.sort_order,
     };
     let mut store = state.store.lock().unwrap();
@@ -3031,9 +3042,11 @@ fn unix_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    //! The `--lan` agent-access gate. These are peer-address-sensitive, which
-    //! `scripts/agents-check.sh` cannot exercise (a same-machine curl is always
-    //! a loopback peer), so the cross-origin-attach hole lives or dies here.
+    //! Mostly the `--lan` agent-access gate. Those are peer-address-sensitive,
+    //! which `scripts/agents-check.sh` cannot exercise (a same-machine curl is
+    //! always a loopback peer), so the cross-origin-attach hole lives or dies
+    //! here. Plus the request-body shapes whose absent/null/value distinction
+    //! no shell check can see.
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -3754,5 +3767,96 @@ mod tests {
         assert!(serde_json::from_str::<EdgeUpdate>(r#"{"from_anchor":"top"}"#).is_ok());
         assert!(serde_json::from_str::<EdgeUpdate>(r#"{"to_anchor":null}"#).is_ok());
         assert!(serde_json::from_str::<EdgeUpdate>(r#"{}"#).is_ok());
+    }
+
+    // --- acceptance / artifact / result over PATCH (mesa task 500) ---------
+
+    fn new_task(state: &AppState, project_id: i64) -> i64 {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_task(
+                project_id,
+                "t",
+                None,
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+    }
+
+    async fn patch_task(state: &AppState, id: i64, body: &str) -> serde_json::Value {
+        let body: TaskUpdate = serde_json::from_str(body).unwrap();
+        let resp = update_task(State(state.clone()), Path(id), Ok(Json(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_body(resp).await
+    }
+
+    /// These three were readable over the API but silently unwritable: the
+    /// handler built its `TaskPatch` with `acceptance/artifact/result: None`
+    /// hard-coded, so a PATCH carrying them returned 200 and changed nothing.
+    /// The web UI had no way to set what the CLI had always written.
+    #[tokio::test]
+    async fn task_patch_writes_acceptance_artifact_and_result() {
+        let (_dir, state) = test_state();
+        let pid = new_project(&state, None);
+        let id = new_task(&state, pid);
+
+        let body = patch_task(
+            &state,
+            id,
+            // r## — the markdown heading's `#` would close an `r#` literal.
+            r##"{"acceptance":"passes CI","artifact":"abc123","result":"# done\n\nshipped"}"##,
+        )
+        .await;
+        assert_eq!(body["acceptance"], "passes CI");
+        assert_eq!(body["artifact"], "abc123");
+        assert_eq!(body["result"], "# done\n\nshipped");
+        // Response echo is not proof of a write — re-read from the store.
+        let stored = state.store.lock().unwrap().get_task(id).unwrap();
+        assert_eq!(stored.acceptance.as_deref(), Some("passes CI"));
+        assert_eq!(stored.artifact.as_deref(), Some("abc123"));
+        assert_eq!(stored.result.as_deref(), Some("# done\n\nshipped"));
+    }
+
+    /// `double_option`, same as `description`: an omitted key leaves the
+    /// stored value alone, an explicit `null` clears it. The frontend relies
+    /// on this split — it patches one field at a time and sends `null` for a
+    /// field the user emptied.
+    #[tokio::test]
+    async fn task_patch_distinguishes_omitted_from_null() {
+        let (_dir, state) = test_state();
+        let pid = new_project(&state, None);
+        let id = new_task(&state, pid);
+        patch_task(
+            &state,
+            id,
+            r#"{"acceptance":"a","artifact":"b","result":"c"}"#,
+        )
+        .await;
+
+        // Omitted: untouched, even though the patch does change another field.
+        let body = patch_task(&state, id, r#"{"title":"renamed"}"#).await;
+        assert_eq!(body["title"], "renamed");
+        assert_eq!(body["acceptance"], "a");
+        assert_eq!(body["artifact"], "b");
+        assert_eq!(body["result"], "c");
+
+        // Explicit null: cleared, one field at a time.
+        let body = patch_task(&state, id, r#"{"result":null}"#).await;
+        assert_eq!(body["result"], serde_json::Value::Null);
+        assert_eq!(body["acceptance"], "a");
+        assert_eq!(body["artifact"], "b");
+        let stored = state.store.lock().unwrap().get_task(id).unwrap();
+        assert_eq!(stored.result, None);
+        assert_eq!(stored.acceptance.as_deref(), Some("a"));
     }
 }

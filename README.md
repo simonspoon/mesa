@@ -174,8 +174,11 @@ UI does not live-sync; it refetches on window focus.
 - **Task** — belongs to exactly one project; has a status
   (`todo | in_progress | done | cancelled`), a priority (`low | medium | high`),
   tags, an optional `acceptance` (definition-of-done), `artifact` (work
-  receipt), and `result` (free-text final summary, set via `task update` when
-  the work is done), and may be a subtask of another task in the same project.
+  receipt), and `result` (free-text final summary written when the work is
+  done), and may be a subtask of another task in the same project. The three
+  free-text fields are writable from every surface — `task update`, `PATCH
+  /api/tasks/<id>`, and the web UI's task detail, which renders `description`,
+  `acceptance` and `result` as markdown.
 - **Dependency** — a "blocked-by" edge between tasks. Self-edges and cycles are
   rejected. `blocked` is true while any blocker is not `done`/`cancelled`, and is
   derived on every read.

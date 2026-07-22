@@ -541,8 +541,12 @@ main {
   margin-right: 0.25rem;
 }
 
+/* Long-text task fields (description/acceptance/result). Markdown-rendered
+   since task 500, so the block owns its own whitespace — the `pre-wrap` this
+   rule used to carry would now double the spacing react-markdown emits. A div
+   rather than a p (block children), hence the explicit margin. */
 .description {
-  white-space: pre-wrap;
+  margin: 1rem 0;
 }
 
 .attachment-name {
@@ -2897,34 +2901,35 @@ body.agent-sidebar-resizing {
   padding: 0;
 }
 
-/* Rendered markdown in the Files content pane (task 281) — same react-markdown
-   output as .frame-body, but normal prose measure/spacing instead of the
-   card's tight layout; code spans/blocks stay monospace. */
-.files-markdown-body {
+/* Rendered markdown prose (task 281) — same react-markdown output as
+   .frame-body, but normal prose measure/spacing instead of the card's tight
+   layout; code spans/blocks stay monospace. Shared by the Files content pane
+   and the task modal's markdown InlineEdit fields (task 500). */
+.markdown-body {
   font-size: 0.9rem;
   line-height: 1.5;
 }
-.files-markdown-body :where(h1, h2, h3, h4, h5, h6) {
+.markdown-body :where(h1, h2, h3, h4, h5, h6) {
   margin: 1rem 0 0.4rem;
 }
-.files-markdown-body :where(p, ul, ol, blockquote) {
+.markdown-body :where(p, ul, ol, blockquote) {
   margin: 0.5rem 0;
 }
-.files-markdown-body :where(code) {
+.markdown-body :where(code) {
   font-family: var(--font-mono);
   font-size: 0.85em;
 }
-.files-markdown-body :where(pre) {
+.markdown-body :where(pre) {
   overflow-x: auto;
   white-space: pre-wrap;
 }
-.files-markdown-body :where(a) {
+.markdown-body :where(a) {
   color: var(--cyan);
 }
 /* GFM tables (task 432). Browser defaults render them borderless and cramped,
    which reads as broken next to the rest of the prose. Wide tables scroll
    inside the pane rather than stretching it. */
-.files-markdown-body :where(table) {
+.markdown-body :where(table) {
   display: block;
   width: max-content;
   max-width: 100%;
@@ -2933,13 +2938,13 @@ body.agent-sidebar-resizing {
   border-collapse: collapse;
   font-size: 0.85rem;
 }
-.files-markdown-body :where(th, td) {
+.markdown-body :where(th, td) {
   padding: 0.3rem 0.6rem;
   border: 1px solid var(--border);
   text-align: left;
   vertical-align: top;
 }
-.files-markdown-body :where(th) {
+.markdown-body :where(th) {
   background: var(--panel-raised);
   font-weight: 600;
 }
@@ -2962,7 +2967,7 @@ body.agent-sidebar-resizing {
 }
 /* Frontmatter reuses FileCode (.files-content-text), sized/wrapped for the
    whole-file code view (task 281). Here it sits inside markdown prose, so
-   match .files-markdown-body's font-size and wrap long lines instead of
+   match .markdown-body's font-size and wrap long lines instead of
    scrolling — a metadata panel, not a code block. PrismLight sets
    white-space/overflow as an inline style on BOTH its <pre> and the nested
    <code>, which beats any class-selector rule regardless of specificity, so

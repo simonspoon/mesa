@@ -161,6 +161,11 @@ export interface TaskPatch {
   status?: Status
   priority?: Priority
   tags?: string[]
+  // Long-text fields; `null` clears, omitting leaves the stored value alone
+  // (the server's `double_option`, same as `description`).
+  acceptance?: string | null
+  artifact?: string | null
+  result?: string | null
   sort_order?: number
 }
 

@@ -52,7 +52,13 @@ check_types_clean "uncommitted edits to generated types"
 cargo test
 check_types_clean "export changed generated types; commit the regenerated files"
 
-if [ ! -d frontend/node_modules ]; then
+# `npm ci` copies the lockfile to node_modules/.package-lock.json, so that file
+# is a reliable stamp of what is actually installed. Reinstall when it is
+# missing or older than the lockfile — otherwise a checkout whose node_modules
+# predates a dependency change (e.g. right after merging a branch that added
+# one) silently builds against the old tree and fails with TS2307.
+if [ ! -f frontend/node_modules/.package-lock.json ] ||
+  [ frontend/package-lock.json -nt frontend/node_modules/.package-lock.json ]; then
   npm --prefix frontend ci
 fi
 npm --prefix frontend run build

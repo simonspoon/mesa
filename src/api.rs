@@ -635,9 +635,22 @@ struct ProjectResolve {
     commit: String,
 }
 
-async fn list_projects(State(state): State<AppState>) -> ApiResult<Response> {
+#[derive(Deserialize)]
+struct ProjectQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+async fn list_projects(
+    State(state): State<AppState>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
-    Ok(Json(store.list_projects()?).into_response())
+    if q.include_archived {
+        Ok(Json(store.list_projects_all()?).into_response())
+    } else {
+        Ok(Json(store.list_projects()?).into_response())
+    }
 }
 
 async fn create_project(

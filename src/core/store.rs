@@ -886,8 +886,17 @@ impl Store {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
+        self.list_projects_where("WHERE archived = 0")
+    }
+
+    /// All projects, archived and unarchived, same order as `list_projects`.
+    pub fn list_projects_all(&self) -> Result<Vec<Project>> {
+        self.list_projects_where("")
+    }
+
+    fn list_projects_where(&self, clause: &str) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY id"
+            "SELECT {PROJECT_COLUMNS} FROM projects {clause} ORDER BY id"
         ))?;
         let rows = stmt.query_map([], row_to_project)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2717,6 +2726,25 @@ mod tests {
         let (deleted, tasks) = store.delete_project(p.id).unwrap();
         assert_eq!(deleted, archived);
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn list_projects_excludes_archived_list_projects_all_includes_them() {
+        let (mut store, _dir) = temp_store();
+        let a = store.create_project("alpha", None, None, None).unwrap();
+        let b = store.create_project("beta", None, None, None).unwrap();
+        store.archive_project(b.id).unwrap();
+
+        let visible = store.list_projects().unwrap();
+        assert_eq!(visible.iter().map(|p| p.id).collect::<Vec<_>>(), vec![a.id]);
+        assert!(visible.iter().all(|p| !p.archived));
+
+        let all = store.list_projects_all().unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![a.id, b.id]
+        );
+        assert!(all.iter().any(|p| p.id == b.id && p.archived));
     }
 
     #[test]

@@ -175,6 +175,14 @@ invariants you must not break — read them before changing `src/`:
   /api/projects/{id}/archive`/`unarchive`. Archiving hides a project from
   unscoped views, it never deletes: `project show`/`update`/`delete` and any
   query scoped to an explicit project id/name are unaffected by the flag.
+  `Store::list_projects()` keeps its signature and excludes archived rows;
+  `Store::list_projects_all()` returns both. `mesa project list
+  --include-archived` and `GET /api/projects?include_archived=true` widen to
+  the full set — the unscoped default (CLI/API, and every current caller of
+  `list_projects()`: the todo-watcher's project fan-out and
+  `GET /api/git-status`) is unchanged and simply stops seeing archived
+  projects, which is how the watcher and git-status decoration both skip them
+  with no edit of their own.
 
 ### Per-feature surfaces (see linked doc before touching)
 

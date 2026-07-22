@@ -159,8 +159,13 @@ instead of detecting it.")]
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// List all projects as a bare JSON array
-    List,
+    /// List all projects as a bare JSON array; archived projects are omitted
+    /// unless --include-archived is given
+    List {
+        /// Include archived projects in the result
+        #[arg(long)]
+        include_archived: bool,
+    },
     /// Resolve the project bound to a repo's root commit; prints the full project
     ///
     /// Computes the root (first) commit of the git repo at PATH (default: cwd)
@@ -1231,7 +1236,13 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 local_path.as_deref(),
             )?);
         }
-        ProjectCmd::List => print_json(&store.list_projects()?),
+        ProjectCmd::List { include_archived } => {
+            if include_archived {
+                print_json(&store.list_projects_all()?);
+            } else {
+                print_json(&store.list_projects()?);
+            }
+        }
         ProjectCmd::Resolve { path } => {
             let commit = git_root_commit(path.as_deref()).ok_or_else(|| {
                 Error::Validation(

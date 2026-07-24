@@ -132,20 +132,30 @@ this surface.
   Spec 277 originally shipped this tab with dependency-free color-by-extension
   only (no tokenizing highlighter); task 281 revisited that call and added
   real syntax highlighting via `react-syntax-highlighter`'s `PrismLight`
-  build (`frontend/src/pages/FilesView.tsx`), registered for the same ~15
-  languages `EXTENSION_LANGUAGE` recognizes — the sync "light" Prism build was
-  chosen over the async build specifically because the async build's
-  per-language dynamic-import fallback pulls Prism's entire ~290-language
-  catalog into the bundle even when only a handful are ever registered; an
-  unrecognized language falls back to plain monospace `<pre>` text, matching
-  the pre-281 behavior. `.md` files render as formatted markdown via the
+  build, registered for the same ~15 languages `EXTENSION_LANGUAGE`
+  recognizes — the sync "light" Prism build was chosen over the async build
+  specifically because the async build's per-language dynamic-import fallback
+  pulls Prism's entire ~290-language catalog into the bundle even when only a
+  handful are ever registered; an unrecognized language falls back to plain
+  monospace `<pre>` text, matching the pre-281 behavior. Task 521 lifted that
+  one-time registration (plus the vsc-dark-plus style and the token→grammar
+  resolver `prismGrammar`) out of `FilesView.tsx` into a shared
+  `frontend/src/syntaxHighlighter.ts`, so the same registered grammars now back
+  both this tab and markdown fenced code blocks without registering twice or
+  growing the bundle. `.md` files render as formatted markdown via the
   existing `Markdown` component (`frontend/src/components/Markdown.tsx`,
   already used for storyboard frame cards) instead of raw/highlighted text —
   safe against untrusted content the same way (no raw HTML passthrough). That
   component carries `remark-gfm` (task 432), so GitHub-flavoured tables,
   strikethrough, task lists and autolinks render as real elements rather than
   raw pipe-and-dash source; it is a source-parser extension only and does not
-  widen the no-raw-HTML guarantee. A
+  widen the no-raw-HTML guarantee. Fenced code blocks inside that markdown are
+  themselves colour-coded (task 521): the component's `pre` override routes a
+  block's ```` ```lang ```` tag through the same shared `prismGrammar`/PrismLight
+  pair as this tab, so ` ```rust ` in a task description or frame card tokenises
+  exactly like a `.rs` file here — a bare or unknown-language fence stays a
+  plain monospace literal `<pre>`, and the highlighter only ever emits inert
+  `<span>`s, so untrusted body text can't smuggle markup through it. A
   binary file still renders "Binary file — cannot display" instead of raw
   content; the no-`local_path` and dead-folder empty-state rungs render the
   same quiet-placeholder pattern as the Git tab, never a hard error.

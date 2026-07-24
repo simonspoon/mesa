@@ -1,6 +1,12 @@
+import type { ComponentPropsWithoutRef, ReactElement, ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
+import {
+  SyntaxHighlighter,
+  vscDarkPlus,
+  prismGrammar,
+} from '../syntaxHighlighter'
 
 /**
  * Renders frame card text as markdown, treating the source strictly as DATA.
@@ -27,6 +33,17 @@ import remarkGfm from 'remark-gfm'
  * must not run together — see `EntityNode` in `StoryboardCanvas.tsx`. Like
  * `remark-gfm` it is a source-text parser extension emitting ordinary mdast
  * nodes, so the no-raw-HTML guarantee is unaffected.
+ *
+ * Fenced code blocks render as literal blocks colour-coded by language
+ * (task 521). The `pre` override reads the single `<code>` child react-markdown
+ * nests inside every block, pulls its ```` ```lang ```` tag from the
+ * `language-*` class, and — when we carry a Prism grammar for it (see
+ * `prismGrammar`) — hands the verbatim text to `SyntaxHighlighter`. This stays
+ * inside the no-raw-HTML guarantee: the highlighter tokenises the string into
+ * inert `<span>`s, it never interprets the content as markup. Unknown/no
+ * language falls back to a plain `<pre>` — still a literal block, just
+ * uncoloured. Inline code (no enclosing `pre`) is untouched and keeps the
+ * default `<code>` chip.
  */
 export function Markdown({ text, breaks }: { text: string; breaks?: boolean }) {
   return (
@@ -38,9 +55,40 @@ export function Markdown({ text, breaks }: { text: string; breaks?: boolean }) {
             {children}
           </a>
         ),
+        pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
       }}
     >
       {text}
     </ReactMarkdown>
+  )
+}
+
+/**
+ * Renders one fenced code block. react-markdown always wraps a block in
+ * `<pre><code class="language-xxx">…</code></pre>`, so `children` here is that
+ * lone `<code>` element — we read its class + text rather than re-parsing.
+ */
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const code = children as ReactElement<ComponentPropsWithoutRef<'code'>>
+  const className = code?.props?.className ?? ''
+  const grammar = prismGrammar(/language-([\w-]+)/.exec(className)?.[1])
+  const source = String(code?.props?.children ?? '').replace(/\n$/, '')
+
+  // No grammar (unknown or bare fence): a plain literal block. Keep the inner
+  // `<code>` so it still picks up `.markdown-body`'s monospace rule.
+  if (!grammar)
+    return (
+      <pre>
+        <code className={className}>{source}</code>
+      </pre>
+    )
+  return (
+    <SyntaxHighlighter
+      language={grammar}
+      style={vscDarkPlus}
+      customStyle={{ margin: '0.5rem 0', borderRadius: '4px' }}
+    >
+      {source}
+    </SyntaxHighlighter>
   )
 }

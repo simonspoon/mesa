@@ -1450,6 +1450,22 @@ struct AttachQuery {
     rows: Option<u16>,
 }
 
+/// [`terminal_attach`]'s own query: the same initial size as [`AttachQuery`],
+/// plus the optional project whose `local_path` the shell starts in. Kept
+/// separate rather than adding a field to `AttachQuery`, which is the agent
+/// attach route's contract and has no project scope of its own.
+#[derive(Deserialize)]
+struct TerminalAttachQuery {
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+    /// Omitted = the global Terminal page's `$HOME` shell. Set = the project
+    /// Terminal tab: the shell's cwd is that project's `local_path`.
+    #[serde(default)]
+    project: Option<i64>,
+}
+
 /// How long a listed-sessions snapshot is reused per folder. Kept below the
 /// UI's 3s poll so a single tab always sees near-live data (it re-runs the
 /// ~0.5s `claude agents` each poll); the cache's job is to collapse *concurrent*
@@ -2676,20 +2692,54 @@ async fn attach_agent(
 
 /// Upgrades to a WebSocket bridged onto a real interactive shell in a PTY —
 /// the Terminal page. Distinct from [`attach_agent`]: this spawns `$SHELL`
-/// (falling back to `/bin/sh`) at `$HOME` directly, never `claude attach`,
-/// and has no session id — every connection is its own shell with no
-/// server-side registry (see `.scratch/arch.md` §0). Gated by the exact same
+/// (falling back to `/bin/sh`) directly, never `claude attach`, and has no
+/// session id — every connection is its own shell with no server-side
+/// registry (see `.scratch/arch.md` §0). Gated by the exact same
 /// [`require_agent_access`] used by the agent routes above (terminal access
 /// = code execution either way); see that function's doc for the gate's
 /// mode-branched behavior.
+///
+/// cwd is `$HOME` (the global Terminal page) unless `?project=<id>` is given
+/// (the project Terminal tab), in which case it is that project's
+/// `local_path` — resolved, and rejected, exactly as [`spawn_project_agent`]
+/// resolves its own spawn folder: unknown id is `not_found`, unset or
+/// non-directory `local_path` is `validation`. Both land as a failed
+/// handshake before the upgrade, so no shell is ever spawned somewhere the
+/// caller didn't ask for.
 async fn terminal_attach(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Query(q): Query<AttachQuery>,
+    Query(q): Query<TerminalAttachQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
+    let cwd = match q.project {
+        None => None,
+        Some(id) => {
+            let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+            let Some(path) = local_path else {
+                return Err(ApiError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "validation",
+                    message: format!(
+                        "project {id} has no local_path; run `mesa project resolve` in its repo \
+                         or `mesa project update {id} --path <dir>`"
+                    ),
+                });
+            };
+            if !std::path::Path::new(&path).is_dir() {
+                return Err(ApiError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "validation",
+                    message: format!(
+                        "project {id} local_path {path:?} is not a directory on this machine"
+                    ),
+                });
+            }
+            Some(path)
+        }
+    };
     let size = PtySize {
         rows: q.rows.unwrap_or(40),
         cols: q.cols.unwrap_or(120),
@@ -2700,8 +2750,13 @@ async fn terminal_attach(
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
-        if let Some(dirs) = directories::BaseDirs::new() {
-            cmd.cwd(dirs.home_dir());
+        match cwd {
+            Some(path) => cmd.cwd(path),
+            None => {
+                if let Some(dirs) = directories::BaseDirs::new() {
+                    cmd.cwd(dirs.home_dir());
+                }
+            }
         }
         if let Err(err) = pump_pty(socket, cmd, size).await {
             eprintln!("terminal attach: {err}");

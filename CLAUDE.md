@@ -221,10 +221,13 @@ invariants you must not break — read them before changing `src/`:
   interdependent Host/Origin check stack under `--lan`); `local_path` writes
   are loopback-only in both modes. Includes the global Agent sidebar.
   `docs/agents.md`.
-- **Terminal** — global `$HOME` shell panes (`portable-pty`, not `claude
-  attach`), gated by the same `require_agent_access` stack as the Agents
-  attach endpoint; persists across nav via the same visibility-toggle
-  pattern as the Agent sidebar. `docs/terminal.md`.
+- **Terminal** — shell panes (`portable-pty`, not `claude attach`), gated by
+  the same `require_agent_access` stack as the Agents attach endpoint. The
+  global page (`#/terminal`, cwd `$HOME`) persists across nav via the same
+  visibility-toggle pattern as the Agent sidebar; the same component also
+  renders as a per-project tab (`#/projects/:id/terminal`, cwd = the
+  project's `local_path`, resolved server-side from `?project=<id>` — never
+  a client-supplied path). `docs/terminal.md`.
 - **Keyboard shortcuts** — `a` opens create-task on a Board; `hjkl`/arrows
   move native focus spatially, `Enter` activates. `shouldIgnoreShortcut()`
   in `frontend/src/keyboardScope.ts` is the sole suppression chokepoint —

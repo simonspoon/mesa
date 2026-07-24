@@ -11,12 +11,13 @@ import { FilesView } from './FilesView'
 import { GitView } from './GitView'
 import { StoryboardBoardView } from './StoryboardBoardView'
 import { StoryboardListView } from './StoryboardListView'
+import { TerminalPage } from './TerminalPage'
 
 // 'a' opens the create-task form via the existing #/projects/:id/create-task
 // route (spec req 1) — a hash navigation, no new form plumbing;
 // ProjectTasksPage's own `createTask` prop handling opens the panel on
 // arrival. Board-scoped by construction — `active` is false whenever a
-// non-Board view (Storyboards/Git/Files/Dashboard) is showing, so the
+// non-Board view (Storyboards/Git/Files/Terminal/Dashboard) is showing, so the
 // listener is a no-op there without a route string check
 // (.scratch/arch-449-keyboard.md §3). `shouldIgnoreShortcut`
 // (keyboardScope.ts) covers modifiers, text-editing contexts, terminals, the
@@ -41,6 +42,7 @@ export function ProjectTasksPage({
   storyboardId,
   git,
   files,
+  terminal,
   dashboard,
   createTask,
   onProjectsChanged,
@@ -57,6 +59,10 @@ export function ProjectTasksPage({
   // Files is another URL-driven view: the project's file tree (rooted at
   // local_path) with a content viewer for the selected file.
   files: boolean
+  // Terminal is another URL-driven view: the global Terminal page's pane
+  // tree of live shells, rooted at the project's local_path instead of
+  // $HOME (mesa task 524).
+  terminal: boolean
   // Dashboard is another URL-driven view: this project's scoped CC telemetry
   // (project-scoped CCDashboardView, overview only).
   dashboard: boolean
@@ -113,19 +119,19 @@ export function ProjectTasksPage({
     // dropped in useFetch, so an unchanged view never re-renders.
     { pollMs: 3000 },
   )
-  // Storyboards, Git, Files, and Dashboard are their own views with
-  // their own fetches/error handling, so a failed task fetch must not block
-  // them; only surface it on the Board view.
+  // Storyboards, Git, Files, Terminal, and Dashboard are their own views
+  // with their own fetches/error handling, so a failed task fetch must not
+  // block them; only surface it on the Board view.
   const error =
     projectError ??
-    (storyboards || git || files || dashboard ? null : tasksError)
+    (storyboards || git || files || terminal || dashboard ? null : tasksError)
 
   // Same board-vs-other-view condition the tabs use below (spec req 2: 'a'
   // is inert on non-Board pages). Called unconditionally, ahead of the
   // early error return, per the rules of hooks; `active` gates the listener
   // itself, not this call.
   useCreateTaskShortcut(
-    !storyboards && !git && !files && !dashboard,
+    !storyboards && !git && !files && !terminal && !dashboard,
     projectId,
   )
 
@@ -145,7 +151,7 @@ export function ProjectTasksPage({
   // returns the hash to the project URL so the switch happens in place,
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectBoard() {
-    if (storyboards || git || files || dashboard)
+    if (storyboards || git || files || terminal || dashboard)
       window.location.hash = `#/projects/${projectId}`
   }
 
@@ -228,7 +234,7 @@ export function ProjectTasksPage({
           </button>
           <button
             className={
-              !storyboards && !git && !files && !dashboard
+              !storyboards && !git && !files && !terminal && !dashboard
                 ? 'active'
                 : ''
             }
@@ -263,12 +269,21 @@ export function ProjectTasksPage({
           >
             Files
           </button>
+          <button
+            className={terminal ? 'active' : ''}
+            onClick={() => {
+              if (!terminal)
+                window.location.hash = `#/projects/${projectId}/terminal`
+            }}
+          >
+            Terminal
+          </button>
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
             the Board view only (spec S5), not on Storyboards/
             Git/Files/Dashboard (those carry their own content). */}
-        {!storyboards && !git && !files && !dashboard && (
+        {!storyboards && !git && !files && !terminal && !dashboard && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
@@ -280,6 +295,29 @@ export function ProjectTasksPage({
           <GitView projectId={projectId} />
         ) : files ? (
           <FilesView projectId={projectId} />
+        ) : terminal ? (
+          !project ? (
+            <p className="muted">Loading…</p>
+          ) : project.local_path === null ? (
+            // Same "no linked folder" rung as the Files/Git tabs (M10),
+            // worded for shells. A local_path that exists but is dead is
+            // left to the server's own rejection (the pane shows its
+            // "shell closed" banner) rather than a second client-side
+            // probe — there's no tree/status call here to read it from.
+            <div className="files-placeholder muted">
+              <p>
+                This project has no linked folder, so mesa cannot open a shell
+                in it. Run <code>mesa project resolve</code> inside the repo,
+                or <code>mesa project update {projectId} --path &lt;dir&gt;</code>,
+                to link one.
+              </p>
+            </div>
+          ) : (
+            // Keyed by project so switching projects (this component is not
+            // remounted between them) starts from that project's own tree
+            // rather than carrying the previous one's panes across.
+            <TerminalPage key={`project-${projectId}`} projectId={projectId} />
+          )
         ) : storyboards ? (
           storyboardId !== null ? (
             <StoryboardBoardView

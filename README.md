@@ -234,7 +234,8 @@ so an agent dropped into a working directory finds the right project instead of
 creating a duplicate. (`--no-git` skips binding; `project update --root-commit
 ""` clears it.) The project also remembers its `local_path` — the last-known
 working folder — which powers the web UI's git status, the per-project **Git**
-tab (working-tree file list + per-file diff, read-only), and project labels and
+tab (working-tree file list + per-file diff, read-only), the per-project
+**Terminal** tab (real shells opened in that folder), and project labels and
 start locations in the global Agents sidebar.
 
 ## Agents, hooks & the CC Dashboard

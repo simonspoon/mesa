@@ -2448,6 +2448,19 @@ body.agent-sidebar-resizing {
   padding: 1rem 1.5rem 3rem;
 }
 
+/* The project Terminal tab (mesa task 524) renders the same page inside the
+   project frame's own scroll container, which already supplies the padding
+   and is a plain block flow — `flex: 1` has nothing to grow against there,
+   so the pane body would collapse to zero height. Bound it to the same
+   viewport box the other project tabs use (--tab-viewport-*, shared with
+   the Files/Agents layouts) instead. */
+.terminal-page-embedded {
+  padding: 0;
+  overflow-y: hidden;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
+}
+
 .terminal-page-header {
   display: flex;
   align-items: center;

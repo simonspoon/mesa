@@ -66,8 +66,12 @@ export function PtyTerminal({
     fit.fit()
 
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    // `endpoint` may already carry a query of its own (the project Terminal
+    // tab's `?project=<id>`), so the size params append with the right
+    // separator rather than a hardcoded `?`.
+    const sep = endpoint.includes('?') ? '&' : '?'
     const ws = new WebSocket(
-      `${proto}://${window.location.host}${endpoint}?cols=${term.cols}&rows=${term.rows}`,
+      `${proto}://${window.location.host}${endpoint}${sep}cols=${term.cols}&rows=${term.rows}`,
     )
     ws.binaryType = 'arraybuffer'
     ws.onmessage = (ev) => term.write(new Uint8Array(ev.data as ArrayBuffer))

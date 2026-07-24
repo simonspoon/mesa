@@ -53,6 +53,32 @@ type SplitNode = PTSplitNode<ShellLeafKind>
 // needs: `splitLeafAt`/`moveLeaf` only ever relocate leaves that already
 // exist, so getting from the seeded single pane up to two or three still
 // has to go through this, not a drag alone.
+// Per-scope pane trees, surviving this component's own unmount (mesa task
+// 524). The global page (`scope === 'global'`) is mounted permanently in
+// `App.tsx` and never needs this, but the project Terminal tab renders
+// inside `<main>`'s routed content, so navigating to another tab unmounts
+// it. The panes' shells survive that already — every `PtyTerminal` lives in
+// the always-mounted `PtyPool`, keyed by leaf id, and a `PtySlot` merely
+// relocates its container (see `ptyPool.ts`) — but the *shape* of the tree
+// is plain component state, which would reset to one fresh leaf on the way
+// back and orphan every still-running pane. Keeping it here, keyed by
+// scope, is what makes "navigate away and back" on a project tab behave
+// like the global page's visibility toggle.
+const trees = new Map<string, SplitNode>()
+
+function scopeKey(projectId: number | null): string {
+  return projectId === null ? 'global' : `project:${projectId}`
+}
+
+// Omitted project = the global `$HOME` shell endpoint, unchanged. A project
+// scope passes its id straight through; the server resolves the cwd from
+// that project's `local_path` (never a client-supplied path).
+function scopeEndpoint(projectId: number | null): string {
+  return projectId === null
+    ? '/api/terminal/attach'
+    : `/api/terminal/attach?project=${projectId}`
+}
+
 function appendShellLeaf(root: SplitNode): SplitNode {
   return replaceAtPath(root, [], (n) => ({
     ...n,
@@ -76,11 +102,13 @@ function appendShellLeaf(root: SplitNode): SplitNode {
 function ShellPane({
   id,
   ratio,
+  endpoint,
   onClose,
   dropEdge,
 }: {
   id: string
   ratio: number
+  endpoint: string
   onClose: () => void
   dropEdge?: DropEdge | null
 }) {
@@ -108,7 +136,7 @@ function ShellPane({
         </span>
         <button onClick={onClose}>close</button>
       </div>
-      <PtySlot id={id} endpoint="/api/terminal/attach" closedMessage="shell closed" />
+      <PtySlot id={id} endpoint={endpoint} closedMessage="shell closed" />
       {dropEdge && <div className={`agent-sidebar-pane-drop-indicator agent-sidebar-pane-drop-indicator-${dropEdge}`} />}
     </div>
   )
@@ -133,6 +161,7 @@ function ShellPane({
 function TerminalSplitView({
   node,
   path,
+  endpoint,
   onClose,
   onDividerMouseDown,
   onDividerToggle,
@@ -140,6 +169,7 @@ function TerminalSplitView({
 }: {
   node: SplitNode
   path: number[]
+  endpoint: string
   onClose: (id: string) => void
   onDividerMouseDown: (
     path: number[],
@@ -164,6 +194,7 @@ function TerminalSplitView({
               <ShellPane
                 id={child.node.id}
                 ratio={child.ratio}
+                endpoint={endpoint}
                 onClose={() => onClose(child.node.id)}
                 dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
               />
@@ -175,6 +206,7 @@ function TerminalSplitView({
                 <TerminalSplitView
                   node={child.node}
                   path={[...path, i]}
+                  endpoint={endpoint}
                   onClose={onClose}
                   onDividerMouseDown={onDividerMouseDown}
                   onDividerToggle={onDividerToggle}
@@ -239,9 +271,28 @@ function TerminalSplitView({
  * (mesa task 399) fixes that by keeping each leaf's `PtyTerminal` alive in
  * a stable, pool-owned container that's relocated (not recreated) across
  * tree positions.
+ *
+ * `projectId` (mesa task 524) switches this from the global page to a
+ * project's own Terminal tab: same page, same tree engine, same pool — the
+ * only differences are the endpoint (`?project=<id>`, so the server roots
+ * the shell in that project's `local_path`) and which scope's tree it
+ * restores from `trees`. Every project scope, and the global page, keeps
+ * its own independent pane tree; leaf ids are globally unique, so the flat
+ * pool namespace needs no scope awareness.
  */
-export function TerminalPage() {
-  const [root, setRoot] = useState<SplitNode>(() => appendShellLeaf(emptyRoot<ShellLeafKind>()))
+export function TerminalPage({ projectId = null }: { projectId?: number | null } = {}) {
+  const scope = scopeKey(projectId)
+  const endpoint = scopeEndpoint(projectId)
+  // Restore this scope's tree if it has one (the tab was open before), else
+  // seed the same single pane the global page has always seeded. Callers
+  // render this with `key={scope}`, so a scope change is a fresh mount and
+  // this initializer runs again for the new scope.
+  const [root, setRoot] = useState<SplitNode>(
+    () => trees.get(scope) ?? appendShellLeaf(emptyRoot<ShellLeafKind>()),
+  )
+  useEffect(() => {
+    trees.set(scope, root)
+  }, [scope, root])
 
   const [paneDrag, setPaneDrag] = useState<null | {
     path: number[]
@@ -364,7 +415,7 @@ export function TerminalPage() {
   const paneCount = collectLeafIds(root).length
 
   return (
-    <div className="terminal-page">
+    <div className={`terminal-page${projectId === null ? '' : ' terminal-page-embedded'}`}>
       <div className="terminal-page-header">
         <h2>Terminal</h2>
         <span className="muted">
@@ -386,6 +437,7 @@ export function TerminalPage() {
           <TerminalSplitView
             node={root}
             path={[]}
+            endpoint={endpoint}
             onClose={closePane}
             onDividerMouseDown={startDivider}
             onDividerToggle={toggleDividerAt}

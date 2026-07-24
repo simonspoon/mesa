@@ -1,6 +1,6 @@
-# Terminal (global shell panes)
+# Terminal (shell panes)
 
-The **Terminal** page is a global, non-project-scoped nav entry (`#/terminal`,
+The **Terminal** page is a global nav entry (`#/terminal`,
 left `Sidebar` link next to Inbox) showing a pane-tree of real interactive
 shells — plain `$SHELL` processes at `$HOME`, not `claude attach` sessions.
 Unlike Agents, there is no server-side session registry: every websocket
@@ -9,17 +9,25 @@ with it, and the client owns the pane tree's shape entirely in its own state.
 Mounted once, permanently, in `App.tsx` — never resolved into `<main>` — so
 navigating to another page and back never disturbs an open pane.
 
-- `GET /api/terminal/attach?cols=<u16>&rows=<u16>` upgrades to a **WebSocket
-  bridged onto a real shell in a PTY** (`terminal_attach` in `src/api.rs`,
-  `portable-pty`): server→client binary frames are raw terminal output;
-  client→server binary frames are keystrokes, text frames are JSON control
-  (`{"resize":{cols,rows}}`) — the exact same wire protocol as
+- `GET /api/terminal/attach?cols=<u16>&rows=<u16>[&project=<i64>]` upgrades to
+  a **WebSocket bridged onto a real shell in a PTY** (`terminal_attach` in
+  `src/api.rs`, `portable-pty`): server→client binary frames are raw terminal
+  output; client→server binary frames are keystrokes, text frames are JSON
+  control (`{"resize":{cols,rows}}`) — the exact same wire protocol as
   `/api/agents/{id}/attach`, since both now share one `pump_pty` helper.
-  Spawn command resolution: `$SHELL` env var, falling back to `/bin/sh`; cwd
-  is always `$HOME` (`directories::BaseDirs`); `TERM=xterm-256color`. No path
-  id — each connection is its own shell, so there's nothing to select.
-  Closing the socket (from either side) kills that connection's shell
-  process only; other open panes are unaffected.
+  Spawn command resolution: `$SHELL` env var, falling back to `/bin/sh`;
+  `TERM=xterm-256color`. No path id — each connection is its own shell, so
+  there's nothing to select. Closing the socket (from either side) kills that
+  connection's shell process only; other open panes are unaffected.
+- **cwd is `$HOME`, or a project's folder with `?project=<id>`** (the project
+  Terminal tab, below). The path is never client-supplied: the id is resolved
+  through the store to that project's `local_path`, and rejected exactly as
+  `spawn_project_agent` rejects its own spawn folder — unknown id is
+  `not_found`, unset or non-directory `local_path` is `validation` (422).
+  Both fail the handshake *before* the upgrade, so a bad scope never spawns a
+  shell somewhere the caller didn't ask for. This adds no new reachability:
+  the gate below is unchanged, and any caller that clears it can already run
+  `cd <anywhere>` in a `$HOME` shell.
 - **Shares `require_agent_access` verbatim with the Agents attach
   endpoint** — same gate, same call shape, no new/weaker/stronger logic; see
   `docs/agents.md`'s "All four agent routes share..." writeup for the full
@@ -91,3 +99,41 @@ page's split/move safe at all (there is no backing session to reconnect to,
 unlike `claude attach` — a killed shell here is unrecoverable), and it fixed
 the Agent sidebar's own equivalent scrollback-loss issue as an incidental
 consequence of being shared.
+
+## Project Terminal tab
+
+`#/projects/:id/terminal` is the same `TerminalPage` component rendered as a
+project tab beside Files, with its shells rooted in that project's
+`local_path` instead of `$HOME`. One optional `projectId` prop is the whole
+difference: it picks the endpoint (`?project=<id>`, so the *server* resolves
+the folder) and the scope key. Everything else — the tree engine, the
+drag/split/resize model, `PtySlot`/`PtyPool`, `+ new shell` — is the global
+page's code unchanged.
+
+- **Every scope keeps its own pane tree**, in a module-level `Map` in
+  `TerminalPage.tsx` keyed `global` / `project:<id>`. Unlike the global page,
+  the tab is inside `<main>`'s routed content and therefore *unmounts* when
+  you switch tabs. The panes' shells survive that on their own (they live in
+  the always-mounted `PtyPool`, and a detached pool container is relocated,
+  never recreated) — but the tree's *shape* is plain component state, which
+  would reset to one fresh leaf and orphan every still-running pane. The map
+  is what closes that gap; `ProjectTasksPage` renders the page with
+  `key={`project-${projectId}`}` so switching projects is a fresh mount that
+  restores the new scope's own tree. There is deliberately **no**
+  second permanent mount and no `visibility` toggle for this surface: the
+  pool already provides the process-level persistence that motivated the
+  global page's permanent mount.
+- **Sizing**: the embedded page adds `.terminal-page-embedded`, which drops
+  the standalone padding/scroll and binds the pane body to the same
+  `--tab-viewport-*` box the Files/Agents layouts use — inside the project
+  frame's block flow, `flex: 1` has nothing to grow against and the panes
+  would otherwise collapse to zero height.
+- **A project with no `local_path`** shows the Files/Git tabs' "no linked
+  folder" placeholder instead of a pane tree, so the dead case is a quiet
+  empty state, not a socket that opens and immediately closes. A
+  `local_path` that is set but no longer a directory is left to the server's
+  own `validation` rejection (the pane shows its "shell closed" banner) —
+  there's no tree/status call on this tab to read that rung from.
+- The `'a'` create-task shortcut is inert on this tab, like every other
+  non-Board view (`ProjectTasksPage`'s `useCreateTaskShortcut`), on top of
+  `shouldIgnoreShortcut`'s existing `.xterm`/`.agent-terminal` suppression.

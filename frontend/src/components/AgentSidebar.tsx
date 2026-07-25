@@ -946,196 +946,214 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
   }
 
   return (
-    <aside
-      className={`agent-sidebar${collapsed ? ' collapsed' : ''}${resizing ? ' resizing' : ''}${maximized ? ' maximized' : ''}`}
-      style={{ '--agent-sidebar-width': `${width}px` } as CSSProperties}
-    >
-      {!collapsed && !maximized && (
+    <>
+      {/* Phone-only scrim, mirroring the nav sidebar's (mesa task 555): this
+          panel is the other <= 600px overlay drawer, so it needs the same
+          tap-to-dismiss target and the same block on touch-scrolling the page
+          behind it. Collapsing here matches the toggle button below rather
+          than only flipping `collapsed`. */}
+      {!collapsed && (
         <div
-          className="agent-sidebar-resize-handle"
-          onMouseDown={(e) => {
-            e.preventDefault()
-            setResizing(true)
-          }}
-        />
-      )}
-      <div className="agent-sidebar-header-actions">
-        <button
-          type="button"
-          className="sidebar-toggle agent-sidebar-toggle"
-          aria-label={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
-          title={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
+          className="drawer-scrim"
+          aria-hidden="true"
           onClick={() => {
-            setCollapsed((c) => !c)
+            setCollapsed(true)
             setMaximized(false)
             closeAddAgent()
           }}
-        >
-          {collapsed ? '«' : '»'}
-        </button>
-        {!collapsed && (
-          <button
-            type="button"
-            className={`agent-sidebar-maximize${maximized ? ' active' : ''}`}
-            aria-label={
-              maximized
-                ? 'Restore agents sidebar width'
-                : 'Expand agents sidebar to fill the main content area'
-            }
-            title={
-              maximized
-                ? 'Restore panel width (Esc)'
-                : 'Expand panel to fill the main content area'
-            }
-            onClick={() => setMaximized((m) => !m)}
-          >
-            {maximized ? 'restore' : 'maximize'}
-          </button>
-        )}
-        {!collapsed && (
-          <button
-            type="button"
-            className={`agent-sidebar-autotile${autoTile ? ' active' : ''}`}
-            aria-label={autoTile ? 'Disable auto tile' : 'Enable auto tile'}
-            title={
-              autoTile
-                ? 'Disable auto tile'
-                : 'Auto tile: open a pane for every active or blocked agent, close it when done'
-            }
-            onClick={() => setAutoTile((v) => !v)}
-          >
-            auto tile
-          </button>
-        )}
-        {!collapsed && (
-          <button
-            type="button"
-            className={`agent-sidebar-add${addOpen ? ' active' : ''}`}
-            aria-label={addOpen ? 'Cancel starting an agent' : 'Start a new agent'}
-            title={addOpen ? 'Cancel starting an agent' : 'Start a new agent'}
-            onClick={() => (addOpen ? closeAddAgent() : openAddAgent())}
-          >
-            + agent
-          </button>
-        )}
-      </div>
-
-      {/* A transient overlay above the pane tree, not a pane itself — it
-          starts a session, it isn't one (unlike an attached agent or the
-          permanent list pane, both members of `root`). */}
-      {!collapsed && addOpen && (
-        <form className="agent-sidebar-add-form" onSubmit={submitAddAgent}>
-          <select
-            value={selectedAddProjectId}
-            onChange={(e) => setAddProjectId(e.target.value ? Number(e.target.value) : '')}
-            required
-          >
-            <option value="" disabled>
-              select project…
-            </option>
-            {startableAddProjects.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </select>
-          <input
-            type="text"
-            value={addPrompt}
-            placeholder="optional first prompt — blank starts idle"
-            onChange={(e) => setAddPrompt(e.target.value)}
-          />
-          <div className="agent-sidebar-add-form-actions">
-            <button type="submit" disabled={adding || selectedAddProjectId === ''}>
-              {adding ? 'starting…' : 'start agent'}
-            </button>
-            <button type="button" onClick={closeAddAgent}>
-              cancel
-            </button>
-          </div>
-          {addError && <span className="error">{addError}</span>}
-          {/* `projects === null` is "still loading" (the initial `useFetch`
-              value), not "confirmed zero" — showing this message during that
-              window would claim no project is linked when one might be about
-              to load. */}
-          {projects !== null && startableAddProjects.length === 0 && (
-            <span className="muted">
-              No project has a linked folder yet — run{' '}
-              <code>mesa project resolve</code> inside a repo to link one.
-            </span>
-          )}
-        </form>
+        />
       )}
-
-      <div className="agent-sidebar-body" ref={bodyRef}>
-        <div className="agent-sidebar-tile-area" ref={tileAreaRef}>
-          <DndContext
-            sensors={sensors}
-            // dnd-kit's own default collision detection picks `over` off the
-            // DRAGGED pane's translated bounding box, not the pointer — fine
-            // when everything being dragged is small relative to its
-            // droppables, but every pane here starts out (and often stays)
-            // as wide/tall as the whole tile area, so that box can overlap
-            // several candidates at once and pick one the cursor isn't even
-            // over. `pointerWithin` resolves `over` from the actual pointer
-            // position instead, matching `computeDropEdge`'s own pointer-based
-            // read below — both now agree on the one thing that has no
-            // dragged-pane-size dependence.
-            collisionDetection={pointerWithin}
-            onDragStart={handlePaneDragStart}
-            onDragMove={handlePaneDragMove}
-            onDragEnd={handlePaneDragEnd}
-            onDragCancel={handlePaneDragCancel}
+      <aside
+        className={`agent-sidebar${collapsed ? ' collapsed' : ''}${resizing ? ' resizing' : ''}${maximized ? ' maximized' : ''}`}
+        style={{ '--agent-sidebar-width': `${width}px` } as CSSProperties}
+      >
+        {!collapsed && !maximized && (
+          <div
+            className="agent-sidebar-resize-handle"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              setResizing(true)
+            }}
+          />
+        )}
+        <div className="agent-sidebar-header-actions">
+          <button
+            type="button"
+            className="sidebar-toggle agent-sidebar-toggle"
+            aria-label={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
+            title={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
+            onClick={() => {
+              setCollapsed((c) => !c)
+              setMaximized(false)
+              closeAddAgent()
+            }}
           >
-            <SplitNodeView
-              node={root}
-              path={[]}
-              agents={agents}
-              onClose={closePane}
-              onDividerMouseDown={startDivider}
-              onDividerToggle={toggleDividerAt}
-              dropZone={dropZone}
-            />
-          </DndContext>
-        </div>
-
-        {/* 'Agents' session-list rail (mesa task 414): fixed to the body's
-            right edge, own resizable width + own collapse toggle — separate
-            from the tile area's agent-pane split tree above, which reflows
-            into whatever space this rail leaves it. */}
-        <div
-          className={`agent-sidebar-list-rail${listCollapsed ? ' collapsed' : ''}${listResizing ? ' resizing' : ''}`}
-          style={listCollapsed ? undefined : ({ '--agent-list-width': `${listWidth}px` } as CSSProperties)}
-        >
-          {!listCollapsed && (
-            <div
-              className="agent-sidebar-list-resize-handle"
-              onMouseDown={(e) => {
-                e.preventDefault()
-                setListResizing(true)
-              }}
-            />
-          )}
-          <div className="agent-terminal-header agent-sidebar-list-rail-header">
+            {collapsed ? '«' : '»'}
+          </button>
+          {!collapsed && (
             <button
               type="button"
-              className="agent-sidebar-list-toggle"
-              aria-label={listCollapsed ? 'Expand agents list' : 'Collapse agents list'}
-              title={listCollapsed ? 'Expand agents list' : 'Collapse agents list'}
-              onClick={() => setListCollapsed((c) => !c)}
+              className={`agent-sidebar-maximize${maximized ? ' active' : ''}`}
+              aria-label={
+                maximized
+                  ? 'Restore agents sidebar width'
+                  : 'Expand agents sidebar to fill the main content area'
+              }
+              title={
+                maximized
+                  ? 'Restore panel width (Esc)'
+                  : 'Expand panel to fill the main content area'
+              }
+              onClick={() => setMaximized((m) => !m)}
             >
-              {listCollapsed ? '‹' : '›'}
+              {maximized ? 'restore' : 'maximize'}
             </button>
-            {!listCollapsed && (
-              <span className="agent-sidebar-pane-title">
-                <span>Agents</span>
-                {agents.length > 0 && <span className="agent-sidebar-count">{agents.length}</span>}
+          )}
+          {!collapsed && (
+            <button
+              type="button"
+              className={`agent-sidebar-autotile${autoTile ? ' active' : ''}`}
+              aria-label={autoTile ? 'Disable auto tile' : 'Enable auto tile'}
+              title={
+                autoTile
+                  ? 'Disable auto tile'
+                  : 'Auto tile: open a pane for every active or blocked agent, close it when done'
+              }
+              onClick={() => setAutoTile((v) => !v)}
+            >
+              auto tile
+            </button>
+          )}
+          {!collapsed && (
+            <button
+              type="button"
+              className={`agent-sidebar-add${addOpen ? ' active' : ''}`}
+              aria-label={addOpen ? 'Cancel starting an agent' : 'Start a new agent'}
+              title={addOpen ? 'Cancel starting an agent' : 'Start a new agent'}
+              onClick={() => (addOpen ? closeAddAgent() : openAddAgent())}
+            >
+              + agent
+            </button>
+          )}
+        </div>
+
+        {/* A transient overlay above the pane tree, not a pane itself — it
+            starts a session, it isn't one (unlike an attached agent or the
+            permanent list pane, both members of `root`). */}
+        {!collapsed && addOpen && (
+          <form className="agent-sidebar-add-form" onSubmit={submitAddAgent}>
+            <select
+              value={selectedAddProjectId}
+              onChange={(e) => setAddProjectId(e.target.value ? Number(e.target.value) : '')}
+              required
+            >
+              <option value="" disabled>
+                select project…
+              </option>
+              {startableAddProjects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <input
+              type="text"
+              value={addPrompt}
+              placeholder="optional first prompt — blank starts idle"
+              onChange={(e) => setAddPrompt(e.target.value)}
+            />
+            <div className="agent-sidebar-add-form-actions">
+              <button type="submit" disabled={adding || selectedAddProjectId === ''}>
+                {adding ? 'starting…' : 'start agent'}
+              </button>
+              <button type="button" onClick={closeAddAgent}>
+                cancel
+              </button>
+            </div>
+            {addError && <span className="error">{addError}</span>}
+            {/* `projects === null` is "still loading" (the initial `useFetch`
+                value), not "confirmed zero" — showing this message during that
+                window would claim no project is linked when one might be about
+                to load. */}
+            {projects !== null && startableAddProjects.length === 0 && (
+              <span className="muted">
+                No project has a linked folder yet — run{' '}
+                <code>mesa project resolve</code> inside a repo to link one.
               </span>
             )}
+          </form>
+        )}
+
+        <div className="agent-sidebar-body" ref={bodyRef}>
+          <div className="agent-sidebar-tile-area" ref={tileAreaRef}>
+            <DndContext
+              sensors={sensors}
+              // dnd-kit's own default collision detection picks `over` off the
+              // DRAGGED pane's translated bounding box, not the pointer — fine
+              // when everything being dragged is small relative to its
+              // droppables, but every pane here starts out (and often stays)
+              // as wide/tall as the whole tile area, so that box can overlap
+              // several candidates at once and pick one the cursor isn't even
+              // over. `pointerWithin` resolves `over` from the actual pointer
+              // position instead, matching `computeDropEdge`'s own pointer-based
+              // read below — both now agree on the one thing that has no
+              // dragged-pane-size dependence.
+              collisionDetection={pointerWithin}
+              onDragStart={handlePaneDragStart}
+              onDragMove={handlePaneDragMove}
+              onDragEnd={handlePaneDragEnd}
+              onDragCancel={handlePaneDragCancel}
+            >
+              <SplitNodeView
+                node={root}
+                path={[]}
+                agents={agents}
+                onClose={closePane}
+                onDividerMouseDown={startDivider}
+                onDividerToggle={toggleDividerAt}
+                dropZone={dropZone}
+              />
+            </DndContext>
           </div>
-          {!listCollapsed && <AgentListContent {...listProps} />}
+
+          {/* 'Agents' session-list rail (mesa task 414): fixed to the body's
+              right edge, own resizable width + own collapse toggle — separate
+              from the tile area's agent-pane split tree above, which reflows
+              into whatever space this rail leaves it. */}
+          <div
+            className={`agent-sidebar-list-rail${listCollapsed ? ' collapsed' : ''}${listResizing ? ' resizing' : ''}`}
+            style={listCollapsed ? undefined : ({ '--agent-list-width': `${listWidth}px` } as CSSProperties)}
+          >
+            {!listCollapsed && (
+              <div
+                className="agent-sidebar-list-resize-handle"
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  setListResizing(true)
+                }}
+              />
+            )}
+            <div className="agent-terminal-header agent-sidebar-list-rail-header">
+              <button
+                type="button"
+                className="agent-sidebar-list-toggle"
+                aria-label={listCollapsed ? 'Expand agents list' : 'Collapse agents list'}
+                title={listCollapsed ? 'Expand agents list' : 'Collapse agents list'}
+                onClick={() => setListCollapsed((c) => !c)}
+              >
+                {listCollapsed ? '‹' : '›'}
+              </button>
+              {!listCollapsed && (
+                <span className="agent-sidebar-pane-title">
+                  <span>Agents</span>
+                  {agents.length > 0 && <span className="agent-sidebar-count">{agents.length}</span>}
+                </span>
+              )}
+            </div>
+            {!listCollapsed && <AgentListContent {...listProps} />}
+          </div>
         </div>
-      </div>
-    </aside>
+      </aside>
+    </>
   )
 }

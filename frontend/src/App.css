@@ -680,7 +680,14 @@ main {
   padding: 0.4rem 0.5rem;
   margin-bottom: 0.5rem;
   cursor: grab;
-  touch-action: none;
+  /* `pan-y`, not `none` (mesa task 555): the browser keeps vertical scrolling,
+     which on a phone is the only way to move down the board — at <= 600px the
+     kanban is a single column, so `none` here blocked the scroll gesture over
+     nearly the whole page. Safe only because the board's touch activation is a
+     250ms delay rather than a 5px distance (KanbanBoard.tsx): a swipe cancels
+     the pending drag instead of becoming one, and once a drag *has* activated
+     dnd-kit preventDefault()s the touchmove itself. */
+  touch-action: pan-y;
   transition: box-shadow 0.15s;
   overflow-wrap: anywhere;
 }
@@ -3359,6 +3366,14 @@ body.agent-sidebar-resizing {
   padding: 0.75rem 1.5rem 1.5rem;
 }
 
+/* Backdrop for the two phone drawers (mesa task 555). Both sidebars render it
+   whenever they are expanded; off by default, because above 600px they are
+   in-flow columns and a scrim over the page would be nonsense. Kept out of the
+   media block below so the `display: none` default is unconditional. */
+.drawer-scrim {
+  display: none;
+}
+
 @media (max-width: 600px) {
   :root {
     /* Header + tabs + chrome are tighter on a phone; let viewport-bound panes
@@ -3377,6 +3392,22 @@ body.agent-sidebar-resizing {
 
   h1 {
     font-size: 1.2rem;
+  }
+
+  /* Sits under both drawers (1200) and over everything else. Two jobs:
+     tap-to-dismiss, and — via `touch-action: none` — swallowing the touch
+     gestures that used to fall straight through an open drawer's exposed
+     margin and scroll `main` behind it, which read as "scrolling scrolls the
+     background instead of the window in front". `overscroll-behavior` would
+     not have covered this: the page behind was never the drawer's scroll
+     chain, it was simply the element under the finger. */
+  .drawer-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 1150;
+    background: rgba(6, 10, 16, 0.6);
+    touch-action: none;
   }
 
   /* The expanded sidebar overlays the page as a drawer (it starts collapsed

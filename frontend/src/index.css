@@ -191,6 +191,15 @@ select option {
   :root {
     --tab-viewport-height: calc(100dvh - 18rem);
   }
+
+  /* The shell itself needs it more than the panes do (mesa task 555): `#root`
+     is the viewport lock and `main` is the only scroller, so a `100vh` that
+     overshoots the visible area by the height of the browser toolbar pushes
+     the bottom of `main` — and with it the last cards of a column — under the
+     toolbar with nothing left to scroll. */
+  #root {
+    height: 100dvh;
+  }
 }
 
 /* fixed background-attachment forces full repaints per scroll frame on

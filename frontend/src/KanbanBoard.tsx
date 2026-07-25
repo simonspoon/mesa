@@ -2,7 +2,8 @@ import { useState } from 'react'
 import {
   DndContext,
   DragOverlay,
-  PointerSensor,
+  MouseSensor,
+  TouchSensor,
   useDroppable,
   useSensor,
   useSensors,
@@ -138,10 +139,26 @@ export function KanbanBoard({
 }) {
   const [error, setError] = useState<string | null>(null)
   const [activeId, setActiveId] = useState<number | null>(null)
-  // distance: 5 lets plain clicks reach the card's link without starting
-  // a drag.
+  // Mouse and touch get *different* activation gestures, which is why this is
+  // MouseSensor + TouchSensor rather than the one PointerSensor that covers
+  // both (mesa task 555).
+  //
+  // Mouse — distance: 5 lets plain clicks reach the card's link without
+  // starting a drag.
+  //
+  // Touch — delay, NOT distance. Under a distance constraint a 5px swipe is
+  // already a drag, so the card had to carry `touch-action: none` to stop the
+  // browser panning first; on a phone the board is a single column of cards
+  // (App.css `@media (max-width: 600px)`), so that made almost the whole board
+  // un-scrollable by touch. A delay constraint inverts it: dnd-kit's
+  // AbstractPointerSensor.handleMove returns *before* its `preventDefault()`
+  // while activation is still pending, and cancels outright once the finger
+  // passes `tolerance` — so a swipe scrolls natively and only a stationary
+  // 250ms press becomes a drag. That is what lets `.kanban-card` drop to
+  // `touch-action: pan-y`.
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
   )
 
   function handleDragStart(event: DragStartEvent) {

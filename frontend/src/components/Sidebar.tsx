@@ -207,143 +207,155 @@ export function Sidebar({
   }
 
   return (
-    <nav className="sidebar">
-      <button
-        type="button"
-        className="sidebar-toggle"
-        aria-label="Collapse sidebar"
-        title="Collapse sidebar"
+    <>
+      {/* Phone-only scrim behind the drawer (mesa task 555). Rendered whenever
+          the sidebar is expanded and hidden by CSS above 600px, so there is no
+          second JS media query to keep in sync with App.css. It gives the
+          drawer a tap-to-dismiss target and, via `touch-action: none`, stops a
+          touch landing outside the drawer from scrolling `main` behind it. */}
+      <div
+        className="drawer-scrim"
+        aria-hidden="true"
         onClick={() => setCollapsed(true)}
-      >
-        «
-      </button>
-      <a
-        className={`nav-item${ccTab === 'overview' ? ' active' : ''}`}
-        href="#/cc"
-      >
-        <span className="nav-item-label">CC Dashboard</span>
-      </a>
-      <ul className="nav-projects nav-subnav">
-        {CC_SUBNAV.map((s) => (
-          <li key={s.tab}>
-            <a className={ccTab === s.tab ? 'active' : ''} href={s.hash}>
-              {s.label}
-            </a>
-          </li>
-        ))}
-      </ul>
-      <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
-        <span className="nav-item-label">Inbox</span>
-        {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
-      </a>
-      <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
-        <span className="nav-item-label">Terminal</span>
-      </a>
-      <button
-        type="button"
-        className="nav-item nav-section"
-        aria-expanded={!projectsCollapsed}
-        onClick={() => setProjectsCollapsed((c) => !c)}
-      >
-        <span className="nav-item-label">Projects</span>
-        <span className="nav-caret">{projectsCollapsed ? '▸' : '▾'}</span>
-      </button>
-      {!projectsCollapsed && (
-        <>
-          {error ? (
-            <p className="error">{error}</p>
-          ) : !projects ? (
-            <p className="muted">Loading…</p>
-          ) : projects.length === 0 ? (
-            <p className="muted">No projects yet.</p>
-          ) : (
-            <ul className="nav-projects">
-              {projects.map((p) => (
-                <li key={p.id}>
-                  <a
-                    className={p.id === activeProjectId ? 'active' : ''}
-                    href={`#/projects/${p.id}`}
-                  >
-                    <span className="nav-project-name">{p.name}</span>
-                    {activeAgentProjectIds.has(p.id) && (
-                      <span className="live-dot on" title="agent running" />
-                    )}
-                    {(todoCounts.get(p.id) ?? 0) > 0 && (
-                      <span className="inbox-badge todo-badge">
-                        {todoCounts.get(p.id)}
-                      </span>
-                    )}
-                    <GitLine git={gitByProject.get(p.id)} />
-                  </a>
-                </li>
-              ))}
-            </ul>
-          )}
-          {archivedProjects.length > 0 && (
-            <>
-              <button
-                type="button"
-                className="nav-item nav-section nav-subsection"
-                aria-expanded={!archivedCollapsed}
-                onClick={() => setArchivedCollapsed((c) => !c)}
-              >
-                <span className="nav-item-label">
-                  archived ({archivedProjects.length})
-                </span>
-                <span className="nav-caret">
-                  {archivedCollapsed ? '▸' : '▾'}
-                </span>
-              </button>
-              {!archivedCollapsed && (
-                <ul className="nav-projects nav-archived">
-                  {archivedProjects.map((p) => (
-                    <li key={p.id}>
-                      <a
-                        className={p.id === activeProjectId ? 'active' : ''}
-                        href={`#/projects/${p.id}`}
-                      >
-                        <span className="nav-project-name">{p.name}</span>
-                      </a>
-                      <button
-                        type="button"
-                        className="nav-unarchive-button"
-                        title="Restore to the main project list"
-                        onClick={() => handleUnarchive(p.id)}
-                      >
-                        restore
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {unarchiveError && <p className="error nav-archived-error">{unarchiveError}</p>}
-            </>
-          )}
-          <button
-            type="button"
-            className="nav-create-button"
-            onClick={() => setCreatingProject(true)}
-          >
-            + new project
-          </button>
-        </>
-      )}
-      <div className="nav-footer">
-        <ConfirmDelete
-          label="Restart server"
-          message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."
-          onDelete={handleRestart}
-        />
-      </div>
-      {creatingProject && (
-        <CreateProjectModal
-          onClose={() => setCreatingProject(false)}
-          onCreated={() => {
-            setCreatingProject(false)
-            refetch()
-          }}
-        />
-      )}
-    </nav>
+      />
+      <nav className="sidebar">
+        <button
+          type="button"
+          className="sidebar-toggle"
+          aria-label="Collapse sidebar"
+          title="Collapse sidebar"
+          onClick={() => setCollapsed(true)}
+        >
+          «
+        </button>
+        <a
+          className={`nav-item${ccTab === 'overview' ? ' active' : ''}`}
+          href="#/cc"
+        >
+          <span className="nav-item-label">CC Dashboard</span>
+        </a>
+        <ul className="nav-projects nav-subnav">
+          {CC_SUBNAV.map((s) => (
+            <li key={s.tab}>
+              <a className={ccTab === s.tab ? 'active' : ''} href={s.hash}>
+                {s.label}
+              </a>
+            </li>
+          ))}
+        </ul>
+        <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
+          <span className="nav-item-label">Inbox</span>
+          {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+        </a>
+        <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
+          <span className="nav-item-label">Terminal</span>
+        </a>
+        <button
+          type="button"
+          className="nav-item nav-section"
+          aria-expanded={!projectsCollapsed}
+          onClick={() => setProjectsCollapsed((c) => !c)}
+        >
+          <span className="nav-item-label">Projects</span>
+          <span className="nav-caret">{projectsCollapsed ? '▸' : '▾'}</span>
+        </button>
+        {!projectsCollapsed && (
+          <>
+            {error ? (
+              <p className="error">{error}</p>
+            ) : !projects ? (
+              <p className="muted">Loading…</p>
+            ) : projects.length === 0 ? (
+              <p className="muted">No projects yet.</p>
+            ) : (
+              <ul className="nav-projects">
+                {projects.map((p) => (
+                  <li key={p.id}>
+                    <a
+                      className={p.id === activeProjectId ? 'active' : ''}
+                      href={`#/projects/${p.id}`}
+                    >
+                      <span className="nav-project-name">{p.name}</span>
+                      {activeAgentProjectIds.has(p.id) && (
+                        <span className="live-dot on" title="agent running" />
+                      )}
+                      {(todoCounts.get(p.id) ?? 0) > 0 && (
+                        <span className="inbox-badge todo-badge">
+                          {todoCounts.get(p.id)}
+                        </span>
+                      )}
+                      <GitLine git={gitByProject.get(p.id)} />
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {archivedProjects.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  className="nav-item nav-section nav-subsection"
+                  aria-expanded={!archivedCollapsed}
+                  onClick={() => setArchivedCollapsed((c) => !c)}
+                >
+                  <span className="nav-item-label">
+                    archived ({archivedProjects.length})
+                  </span>
+                  <span className="nav-caret">
+                    {archivedCollapsed ? '▸' : '▾'}
+                  </span>
+                </button>
+                {!archivedCollapsed && (
+                  <ul className="nav-projects nav-archived">
+                    {archivedProjects.map((p) => (
+                      <li key={p.id}>
+                        <a
+                          className={p.id === activeProjectId ? 'active' : ''}
+                          href={`#/projects/${p.id}`}
+                        >
+                          <span className="nav-project-name">{p.name}</span>
+                        </a>
+                        <button
+                          type="button"
+                          className="nav-unarchive-button"
+                          title="Restore to the main project list"
+                          onClick={() => handleUnarchive(p.id)}
+                        >
+                          restore
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {unarchiveError && <p className="error nav-archived-error">{unarchiveError}</p>}
+              </>
+            )}
+            <button
+              type="button"
+              className="nav-create-button"
+              onClick={() => setCreatingProject(true)}
+            >
+              + new project
+            </button>
+          </>
+        )}
+        <div className="nav-footer">
+          <ConfirmDelete
+            label="Restart server"
+            message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."
+            onDelete={handleRestart}
+          />
+        </div>
+        {creatingProject && (
+          <CreateProjectModal
+            onClose={() => setCreatingProject(false)}
+            onCreated={() => {
+              setCreatingProject(false)
+              refetch()
+            }}
+          />
+        )}
+      </nav>
+    </>
   )
 }

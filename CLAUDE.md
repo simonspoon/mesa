@@ -248,6 +248,13 @@ invariants you must not break — read them before changing `src/`:
   every new global single-key shortcut must call it, and two of its checks
   are document-wide, so a modal left mounted after close kills all
   shortcuts. `docs/keyboard.md`.
+- **Mobile (phone form factor)** — two width tiers (`860px` narrow, `600px`
+  phone) at the end of `App.css`. Three invariants: a phone-tier draggable
+  may never set `touch-action: none` (use `pan-y` + a dnd-kit **delay**
+  activation, not `distance`); an overlay drawer must render a
+  `.drawer-scrim`, whose `touch-action: none` is what stops touches falling
+  through to the page behind it; and `#root` binds to `100dvh`, not `100vh`.
+  `docs/mobile.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
 - **Inbox watcher** — `mesa serve --watch-inbox`'s periodic auto-triage

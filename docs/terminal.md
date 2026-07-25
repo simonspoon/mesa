@@ -82,6 +82,28 @@ websocket, PTY, and xterm scrollback completely untouched — no reconnect, no
 PTY restart, verified via `ps` (same PIDs before/after) and a live command
 (e.g. `sleep 300`) continuing exactly where it was.
 
+**A pane's flex chain must carry `min-width: 0`, not just `min-height: 0`**
+(mesa task 552). `.agent-terminal` and `.agent-terminal-screen` — the two
+boxes `PtyTerminal` renders, shared by this page and the Agent sidebar — are
+flex items, and a flex item defaults to `min-width: auto`, i.e. it refuses to
+shrink below its content's min-content width. An xterm's content is a
+character grid, so its min-content width is `cols × cell width`: when the
+surrounding layout gets *narrower*, the box stays pinned at the old size,
+`FitAddon.fit()` measures that stale width (it reads
+`terminal.element.parentElement`), derives a cols count still too large, and
+xterm re-lays-out — which resizes the box again and re-fires the
+`ResizeObserver` that called `fit()`. The loop walks the terminal down two
+columns per frame until it reaches the true fit, sending one
+`{"resize":…}` frame per step: **89 frames measured from a single
+un-maximize click**, i.e. 89 SIGWINCHes into the attached process. A raw
+shell shrugs that off; the `claude attach` bridge does not — Claude Code's
+Ink TUI redraws its prompt box on every one, which surfaced as the input box
+steadily gaining line breaks. With `min-width: 0` on both boxes the same
+click sends exactly 1. Both are required: `.agent-terminal-screen` alone
+still stormed at 89, since its own parent still refused to shrink. The
+mirror of the `display: none` trap above — that one collapses the measured
+box to zero, this one pins it too wide.
+
 **Surviving a split or move, not just navigation.** A drag-to-edge split or a
 cross-split move reparents a leaf under a freshly-minted split-node id, which
 would otherwise remount every leaf in that subtree — including its live

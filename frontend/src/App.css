@@ -2091,8 +2091,25 @@ main {
   box-shadow: 0 0 12px rgba(0, 229, 255, 0.1);
 }
 
+/* `min-width: 0` is as load-bearing as `min-height: 0`, and for a subtler
+   reason (mesa task 552). A flex item defaults to `min-width: auto`, i.e. it
+   refuses to shrink below its content's min-content width — and an xterm's
+   content is a grid whose min-content width is `cols × cell width`. So when
+   the surrounding layout gets NARROWER (sidebar expanded, pane split, drag
+   made the pane smaller), this box stays stuck at the old, too-wide size.
+   FitAddon measures that stale width, derives a cols count still too large
+   for the space, and xterm re-lays-out — which changes this box's size
+   again, re-firing `PtyTerminal`'s `ResizeObserver`. The result is a
+   feedback loop that walks the terminal down two columns per frame:
+   measured at ~89 `{"resize":…}` frames from ONE un-maximize click, i.e. ~89
+   SIGWINCHes into the attached `claude` process, whose Ink TUI redraws its
+   input box on every one (the reported symptom: the prompt box keeps
+   gaining line breaks). With `min-width: 0` the same click sends exactly 1.
+   Applies to both PTY surfaces — these are `PtyTerminal`'s own classes,
+   shared by the Agent sidebar and the Terminal page. */
 .agent-terminal {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -2122,8 +2139,15 @@ main {
 
 /* xterm needs an explicitly sized box to fit into: this one flex-fills its
    pane, so the terminal is exactly the available space — never taller. */
+/* `min-width: 0` here for the same reason as on `.agent-terminal` above —
+   BOTH are required: this is the box FitAddon actually measures
+   (`terminal.element.parentElement`), and its parent is what constrains it,
+   so leaving either at the `auto` default keeps the loop alive. Verified by
+   A/B: `.agent-terminal-screen` alone still stormed at 89 frames per
+   un-maximize; both together dropped it to 1. */
 .agent-terminal-screen {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
 }

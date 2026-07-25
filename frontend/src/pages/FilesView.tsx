@@ -5,14 +5,18 @@ import {
   prismGrammar,
 } from '../syntaxHighlighter'
 import { Markdown } from '../components/Markdown'
+import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
 import {
   ApiError,
   getProjectFiles,
   getProjectFilesContent,
+  getProjectGitCommitDiff,
+  getProjectGitFileLog,
   updateProjectFilesContent,
 } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
+import type { GitCommit } from '../types/GitCommit'
 import { useFetch } from '../useFetch'
 
 // Extension -> language tag, a client-side copy of core::files::language_of's
@@ -140,13 +144,29 @@ function ContentPane({
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  // History pane (task 542): a per-file commit list beside the content, and
+  // the commit currently being shown as a side-by-side diff in place of the
+  // content. Both live here rather than in FilesView so they reset with the
+  // same `key={selectedPath}` remount that discards an in-progress edit —
+  // one file's history must never be shown against another file's content.
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [selectedCommit, setSelectedCommit] = useState<GitCommit | null>(null)
 
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
 
   const editable = !data.is_binary && !data.truncated
 
+  function closeHistory() {
+    setHistoryOpen(false)
+    setSelectedCommit(null)
+  }
+
   function startEdit() {
+    // Editing and browsing history are mutually exclusive views of the same
+    // area — entering edit mode closes history rather than trying to show a
+    // textarea and a commit diff in the same pane.
+    closeHistory()
     setDraft(data!.content)
     setSaveError(null)
     setEditing(true)
@@ -171,6 +191,29 @@ function ContentPane({
     }
   }
 
+  // The file itself, in whichever form applies. Pulled out of the JSX below
+  // because history mode renders it in a narrower column beside the commit
+  // list — and swaps it for a commit's diff once one is picked.
+  const body = editing ? (
+    <textarea
+      autoFocus
+      className="files-content-editor"
+      value={draft}
+      spellCheck={false}
+      onChange={(e) => setDraft(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') cancelEdit()
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') save()
+      }}
+    />
+  ) : data.is_binary ? (
+    <p className="muted">Binary file — cannot display.</p>
+  ) : data.language === 'markdown' ? (
+    <MarkdownBody content={data.content} />
+  ) : (
+    <FileCode content={data.content} language={data.language} />
+  )
+
   return (
     <div className="files-content">
       <p className={`files-content-header ${accentClass(data.language)}`}>
@@ -181,10 +224,20 @@ function ContentPane({
         {data.truncated && (
           <span className="badge files-truncated-badge">truncated</span>
         )}
-        {editable && !editing && (
-          <button className="files-edit-btn" onClick={startEdit}>
-            Edit
-          </button>
+        {!editing && (
+          <span className="files-header-actions">
+            {editable && (
+              <button className="files-edit-btn" onClick={startEdit}>
+                Edit
+              </button>
+            )}
+            <button
+              className="files-edit-btn"
+              onClick={() => (historyOpen ? closeHistory() : setHistoryOpen(true))}
+            >
+              {historyOpen ? 'Hide history' : 'History'}
+            </button>
+          </span>
         )}
         {editing && (
           <span className="files-edit-actions">
@@ -198,26 +251,121 @@ function ContentPane({
         )}
       </p>
       {saveError && <p className="error">{saveError}</p>}
-      {editing ? (
-        <textarea
-          autoFocus
-          className="files-content-editor"
-          value={draft}
-          spellCheck={false}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') cancelEdit()
-            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') save()
-          }}
-        />
-      ) : data.is_binary ? (
-        <p className="muted">Binary file — cannot display.</p>
-      ) : data.language === 'markdown' ? (
-        <MarkdownBody content={data.content} />
+      {historyOpen ? (
+        <div className="files-history-layout">
+          <FileHistoryPane
+            projectId={projectId}
+            path={path}
+            selected={selectedCommit}
+            onSelect={setSelectedCommit}
+          />
+          <div className="files-history-main">
+            {selectedCommit !== null ? (
+              <CommitSideBySidePane
+                projectId={projectId}
+                commit={selectedCommit}
+                path={path}
+                onBack={() => setSelectedCommit(null)}
+              />
+            ) : (
+              body
+            )}
+          </div>
+        </div>
       ) : (
-        <FileCode content={data.content} language={data.language} />
+        body
       )}
     </div>
+  )
+}
+
+/** The selected file's own commit history, as a vertical pane beside the
+ * content. Same three-rung empty-state ladder as GitView's HistoryPane —
+ * quiet placeholders, never a hard error — plus a fourth rung this route
+ * adds: an empty list means the file exists on disk but has no commits yet
+ * (never committed), which is a state, not a failure. */
+function FileHistoryPane({
+  projectId,
+  path,
+  selected,
+  onSelect,
+}: {
+  projectId: number
+  path: string
+  selected: GitCommit | null
+  onSelect: (commit: GitCommit) => void
+}) {
+  const { data, error } = useFetch(
+    () => getProjectGitFileLog(projectId, path),
+    `files-log-${projectId}-${path}`,
+  )
+  if (error) return <div className="files-history-pane error">{error}</div>
+  if (!data) return <div className="files-history-pane muted">Loading…</div>
+  if (data.path === null || data.commits === null) {
+    return (
+      <div className="files-history-pane muted">
+        No git repository for this project's folder.
+      </div>
+    )
+  }
+  if (data.commits.length === 0) {
+    return (
+      <div className="files-history-pane muted">
+        No commits touch this file yet.
+      </div>
+    )
+  }
+  return (
+    <ul className="card-list files-history-pane">
+      {data.commits.map((c) => (
+        <li
+          key={c.hash}
+          className={c.hash === selected?.hash ? 'selected' : ''}
+          onClick={() => onSelect(c)}
+        >
+          <span className="badge git-status-badge">{c.short_hash}</span>
+          <span className="git-file-path">{c.subject}</span>
+          <div className="muted git-file-label">
+            {c.author} · {c.date}
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** One commit's change to the selected file, rendered old|new. Reuses the
+ * Git tab's per-commit diff route verbatim — every commit `FileHistoryPane`
+ * lists is one that route accepts for this path (that's why the server's
+ * file log doesn't follow renames). */
+function CommitSideBySidePane({
+  projectId,
+  commit,
+  path,
+  onBack,
+}: {
+  projectId: number
+  commit: GitCommit
+  path: string
+  onBack: () => void
+}) {
+  const { data, error } = useFetch(
+    () => getProjectGitCommitDiff(projectId, commit.hash, path),
+    `files-commit-diff-${projectId}-${commit.hash}-${path}`,
+  )
+  return (
+    <>
+      <button type="button" className="git-back" onClick={onBack}>
+        ← File
+      </button>
+      <p className="git-commit-summary">
+        <span className="badge git-status-badge">{commit.short_hash}</span>{' '}
+        {commit.subject}
+      </p>
+      {error && <p className="error">{error}</p>}
+      {!data && !error && <p className="muted">Loading…</p>}
+      {data && <SideBySideDiff diff={data.diff} />}
+    </>
   )
 }
 

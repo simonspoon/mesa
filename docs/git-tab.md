@@ -34,7 +34,7 @@ nothing.
   the same way as the view route above) — traversal/absolute/unlisted paths
   are 404 `not_found`. Untracked files (status `??`) diff via the
   `--no-index` route.
-- The History routes below (`log`, `commits/{sha}/files`,
+- The History routes below (`log`, `file-log`, `commits/{sha}/files`,
   `commits/{sha}/diff`) take no `?worktree=` — commit history is shared
   across every worktree of one repo, so they always read `local_path`.
 - `GET /api/projects/{id}/git/log` → `ProjectGitLog` via `git::commit_log_of`
@@ -43,6 +43,26 @@ nothing.
   no `local_path` → `{path: null, commits: null}`; dead folder/non-repo →
   `{path, commits: null}`; real repo → `{path, commits: Some(vec)}` (`[]` on
   an unborn HEAD). Cached 5s per folder (`AppState.git_log_cache`).
+- `GET /api/projects/{id}/git/file-log?path=<rel>` → `ProjectGitLog` (the same
+  type and empty-state ladder as `/git/log`) via `git::file_log_of` — the
+  whole-repo log narrowed by a pathspec (`git log … -- <rel>`), same `LOG_CAP`
+  and parse. Added for the Files tab's per-file History pane (mesa task 542,
+  `docs/files-tab.md`); it lives here because it is a git read with this
+  tab's posture, not the Files tab's. Missing `?path=` is 422 `validation`.
+  `?path=` is resolved by **`files::safe_path`** against `local_path` — the
+  Files tab's own chokepoint, not a git-output allowlist like the two diff
+  routes — so traversal, absolute paths, symlink escapes and nonexistent
+  paths are 404 `not_found`. That's the coherent gate for this route: its
+  caller is browsing the filesystem tree, and a file not being in git *yet*
+  is a legitimate answer (`commits: Some([])`), not a 404. Cached 5s per
+  `(local_path, rel)` (`AppState.git_file_log_cache`).
+  **Deliberately not `--follow`:** rename-following would list commits in
+  which the file lived under a different path, and those commits' own
+  changed-file lists — which allowlist the per-commit diff route below —
+  don't contain the path that was asked about, so every pre-rename row would
+  404 when clicked. The invariant "every commit `file_log_of` returns is
+  diffable for that same path" is what the UI leans on, and is covered by a
+  test in `git.rs` (`every_file_log_commit_is_diffable_for_that_path`).
 - `GET /api/projects/{id}/git/commits/{sha}/files` → `Vec<GitCommitFile>` via
   `git::commit_files_of` (`git show --name-status`). `GitCommitFile` is a
   distinct type from `GitFile`: its `status` is a single name-status token

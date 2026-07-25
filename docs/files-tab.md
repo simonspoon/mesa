@@ -89,6 +89,15 @@ this surface.
   `--lan` a peer who can already spawn an agent or run a hook in this folder
   gains nothing new here, so reusing that gate is the coherent choice, not a
   looser one.
+- The tab reads one route it does not own: `GET
+  /api/projects/{id}/git/file-log?path=<rel>` (mesa task 542) backs the
+  per-file History pane below. It is documented with the other git reads in
+  `docs/git-tab.md` — it is a `git log` shell-out with that tab's posture —
+  but its `?path=` is gated by this tab's own `safe_path`, not by a
+  git-output allowlist, because the path always comes from the file tree
+  here. The commit a user then picks is diffed through the **existing**
+  `GET /api/projects/{id}/git/commits/{sha}/diff?path=` route unchanged; no
+  new diff endpoint exists for this feature.
 - Tree listing and content reads stay standard-guard-only, like the Git tab —
   no agent-style gate (browsing executes nothing) and no Content-Type gate
   (GET-only). The write above is the one exception, gated as just described.
@@ -119,7 +128,36 @@ this surface.
   `InlineEdit`'s own error handling. Switching to a different file mid-edit
   silently discards the draft (`ContentPane` is `key={selectedPath}`-remounted
   on every selection change) — no confirm, matching this app's
-  no-confirmation posture on other destructive UI actions. Tree-row and
+  no-confirmation posture on other destructive UI actions.
+  Beside **Edit** sits a **History** toggle (task 542). Open, it renders
+  `FileHistoryPane` — a vertical commit list (`.files-history-pane`) for the
+  selected file — to the *left* of the content, which keeps rendering as
+  normal; picking a commit swaps only that content half for
+  `CommitSideBySidePane`, an old|new rendering of that commit's change to
+  this file, with a `← File` affordance back. History state lives in
+  `ContentPane`, so the same `key={selectedPath}` remount that discards an
+  edit draft also clears it — one file's history can never be shown against
+  another file's content. Edit and History are mutually exclusive views of
+  the same area: entering edit mode closes history rather than trying to
+  show a textarea and a commit diff at once. The pane's empty states are the
+  Git tab's ladder plus one rung this route adds — an empty commit list
+  means the file exists on disk but was never committed, a state, not a
+  failure.
+  `SideBySideDiff` (`frontend/src/components/SideBySideDiff.tsx`) does the
+  splitting **client-side** from the same unified diff the Git tab renders —
+  no second endpoint, no server-side split-diff format. It pairs each run of
+  `-` lines opposite the matching run of `+` lines, renders the leftover of
+  the longer run against a blank cell, and takes real line numbers from each
+  `@@ -a,b +c,d @@` header. Everything before the first hunk is dropped (the
+  pane already names the file, and `git show`'s commit header would
+  otherwise be misread as content by the `-`/`+` prefix checks); a diff with
+  no hunk at all — a binary file's `Binary files … differ`, an empty diff —
+  falls back to rendering the server's text verbatim. Cells go straight into
+  one four-column grid with no per-row wrapper, so both halves of a line
+  share column tracks and stay aligned however a long line wraps. Diff text
+  is untrusted: every line is a plain text node in a `<span>`, classified by
+  prefix for CSS only, exactly as in `GitView`'s unified `DiffText`.
+  Tree-row and
   content-header tinting is still extension/language-derived:
   tree rows derive their tint client-side from `FileTreeEntry.name`'s
   extension via a local copy of `files.rs`'s extension→language table (the

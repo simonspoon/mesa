@@ -262,17 +262,48 @@ fn capped(bytes: &[u8]) -> String {
 /// yet" in practice, and either way an empty list is the correct quiet
 /// result (M9).
 pub fn commit_log_of(dir: &str) -> Vec<GitCommit> {
-    let out = Command::new("git")
-        .args(["-C", dir])
-        .args([
-            "log",
-            "-n",
-            &LOG_CAP.to_string(),
-            "--date=iso-strict",
-            "--pretty=format:%H%x1f%h%x1f%an%x1f%aI%x1f%s",
-        ])
-        .stdin(Stdio::null())
-        .output();
+    run_log(dir, None)
+}
+
+/// Commits that touched ONE path, newest first — `commit_log_of` with a
+/// pathspec (`git log … -- <rel>`), same cap, same parse, same empty-vec-on-
+/// failure contract, so a file's history and the repo's can never drift in
+/// shape. `rel` is a path relative to `dir` and is placed after `--`, so git
+/// can never read it as a flag; the caller is expected to have already
+/// resolved it through `files::safe_path` (the Files tab's own traversal
+/// chokepoint) — this function does not itself vouch for the path.
+///
+/// Deliberately NOT `--follow`: rename-following would list commits in which
+/// the file lived under a DIFFERENT path, and those commits' own
+/// changed-file lists (which allowlist the per-commit diff route) don't
+/// contain the path the caller asked about — every pre-rename row would be
+/// a 404 when clicked. Plain pathspec history keeps every listed commit
+/// diffable. An empty vec is a legitimate answer: a file that exists on
+/// disk but was never committed simply has no history.
+pub fn file_log_of(dir: &str, rel: &str) -> Vec<GitCommit> {
+    run_log(dir, Some(rel))
+}
+
+/// Shared body of `commit_log_of`/`file_log_of`. `pathspec` is passed after
+/// `--` when present. Empty vec on ANY failure — not a repo, or a real repo
+/// with an unborn HEAD (no commits yet) are indistinguishable at this level
+/// on purpose; the caller has already established repo validity via
+/// `project_git_view`, so here "git log failed" only ever means "no commits
+/// yet" in practice, and either way an empty list is the correct quiet
+/// result (M9).
+fn run_log(dir: &str, pathspec: Option<&str>) -> Vec<GitCommit> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", dir]).args([
+        "log",
+        "-n",
+        &LOG_CAP.to_string(),
+        "--date=iso-strict",
+        "--pretty=format:%H%x1f%h%x1f%an%x1f%aI%x1f%s",
+    ]);
+    if let Some(rel) = pathspec {
+        cmd.arg("--").arg(rel);
+    }
+    let out = cmd.stdin(Stdio::null()).output();
     let Ok(out) = out else {
         return Vec::new();
     };
@@ -742,6 +773,59 @@ mod tests {
         assert_eq!(log[1].hash, root_sha);
         assert_eq!(log[1].subject, "root commit");
         assert!(log.len() <= LOG_CAP);
+    }
+
+    #[test]
+    fn file_log_of_lists_only_commits_touching_that_path() {
+        let (dir, root_sha, second_sha) = synthetic_history_repo();
+        let path = dir.path().to_str().unwrap();
+        // a.txt was added by the root commit and modified by the second.
+        let a = file_log_of(path, "a.txt");
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].hash, second_sha);
+        assert_eq!(a[1].hash, root_sha);
+        // c.txt only came into existence in the second commit.
+        let c = file_log_of(path, "c.txt");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].hash, second_sha);
+        assert_eq!(c[0].subject, "modify a, rename b to c");
+    }
+
+    #[test]
+    fn file_log_of_empty_for_untracked_path_and_non_repo() {
+        let (dir, _root_sha, _second_sha) = synthetic_history_repo();
+        let path = dir.path().to_str().unwrap();
+        // Exists in no commit — a real answer ("no history"), not an error.
+        assert_eq!(file_log_of(path, "never-committed.txt"), Vec::new());
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            file_log_of(plain.path().to_str().unwrap(), "a.txt"),
+            Vec::new()
+        );
+    }
+
+    /// The contract the UI leans on: every commit `file_log_of` lists is one
+    /// the per-commit diff route will accept for that same path — i.e. the
+    /// path appears in that commit's own changed-file list, as `path` or (on
+    /// a rename) `orig_path`. This is why `file_log_of` doesn't use
+    /// `--follow`.
+    #[test]
+    fn every_file_log_commit_is_diffable_for_that_path() {
+        let (dir, _root_sha, _second_sha) = synthetic_history_repo();
+        let path = dir.path().to_str().unwrap();
+        for target in ["a.txt", "b.txt", "c.txt"] {
+            for commit in file_log_of(path, target) {
+                let files = commit_files_of(path, &commit.hash).unwrap();
+                assert!(
+                    files
+                        .iter()
+                        .any(|f| f.path == target || f.orig_path.as_deref() == Some(target)),
+                    "{target} not listed in commit {}",
+                    commit.hash
+                );
+                assert!(commit_file_diff_of(path, &commit.hash, target).is_some());
+            }
+        }
     }
 
     #[test]

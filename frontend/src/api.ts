@@ -310,6 +310,22 @@ export function getProjectGitLog(id: number): Promise<ProjectGitLog> {
   return request(`/api/projects/${id}/git/log`)
 }
 
+/** Commit history for ONE file under the project's local_path — backs the
+ * Files tab's History pane. Same `ProjectGitLog` shape and empty-state ladder
+ * as `getProjectGitLog` above, with one extra reading: `commits = []` here
+ * means the file itself has no commits yet (untracked / never committed),
+ * not that the repo is empty. 404s on a path that doesn't resolve inside
+ * local_path. Takes no worktree — history is shared across a repo's
+ * worktrees, like the whole-repo log. */
+export function getProjectGitFileLog(
+  id: number,
+  path: string,
+): Promise<ProjectGitLog> {
+  return request(
+    `/api/projects/${id}/git/file-log?path=${encodeURIComponent(path)}`,
+  )
+}
+
 /** Files changed in one commit. 404s (surfaced as a thrown/rejected error
  * by `request`, same as any other endpoint) on an unknown/invalid sha. */
 export function getProjectGitCommitFiles(

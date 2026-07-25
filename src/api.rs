@@ -124,6 +124,11 @@ struct AppState {
     /// GIT_TTL/eviction-cap machinery as every other cache here rather than
     /// special-casing "cache forever" for one map.
     git_commit_files_cache: Arc<Mutex<HashMap<(String, String), (Instant, Vec<GitCommitFile>)>>>,
+    /// One file's commit history, keyed by `(local_path, rel)` — backs the
+    /// Files tab's per-file History pane. Separate map from `git_log_cache`
+    /// (whole-repo log, keyed by folder alone) because the key shape differs;
+    /// same GIT_TTL/eviction-cap pattern as every other cache here.
+    git_file_log_cache: Arc<Mutex<HashMap<(String, String), (Instant, Vec<GitCommit>)>>>,
     /// Bumped whenever a spawn invalidates the list cache. A concurrent list
     /// whose subprocess started before the spawn checks this before caching,
     /// so it can't reinsert a pre-spawn snapshot after the invalidation and
@@ -284,6 +289,7 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> 
         git_worktrees_cache: Arc::new(Mutex::new(HashMap::new())),
         git_log_cache: Arc::new(Mutex::new(HashMap::new())),
         git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
+        git_file_log_cache: Arc::new(Mutex::new(HashMap::new())),
         files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
         restart_requested: restart_requested.clone(),
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
@@ -437,6 +443,13 @@ fn router(state: AppState) -> Router {
         // commit-file's diff. Same read-only/standard-guard-only posture as
         // the two routes above — these execute nothing but `git` shell-outs.
         .route("/api/projects/{id}/git/log", get(get_project_git_log))
+        // One file's commit history — the whole-repo log above, narrowed by
+        // a pathspec. Backs the Files tab's History pane; same read-only,
+        // standard-guard-only posture as its siblings.
+        .route(
+            "/api/projects/{id}/git/file-log",
+            get(get_project_git_file_log),
+        )
         .route(
             "/api/projects/{id}/git/commits/{sha}/files",
             get(get_project_git_commit_files),
@@ -1789,6 +1802,87 @@ async fn get_project_git_log(
         _ => None,
     };
     Ok(Json(ProjectGitLog { path, commits }).into_response())
+}
+
+#[derive(Deserialize)]
+struct GitFileLogQuery {
+    path: Option<String>,
+}
+
+/// Commit history for ONE file under the project's `local_path` — the Files
+/// tab's History pane (mesa task 542). Deliberately carries no `?worktree=`,
+/// like its `/git/log` sibling: every worktree of a repo shares one history.
+///
+/// `?path=` is required (missing -> 422 `validation`, matching the diff
+/// routes) and is a path relative to `local_path`, resolved through
+/// `files::safe_path` — the SAME chokepoint the Files tab's own tree/content
+/// routes use, so traversal, absolute-path smuggling, symlink escapes and
+/// nonexistent paths all collapse to 404 `not_found` here exactly as they do
+/// there. Reusing that resolver (rather than allowlisting against git's file
+/// lists, as the working-tree and per-commit diff routes do) is the coherent
+/// choice for this route: the client is browsing the *filesystem* tree, and
+/// a file's not being in git yet is a legitimate state this route answers
+/// with an empty list, not a 404.
+///
+/// Empty-state ladder mirrors `get_project_git_log`'s exactly: no
+/// `local_path` -> `{path: None, commits: None}`; dead folder / non-repo ->
+/// `{path, commits: None}`; live repo -> `{path, commits: Some(vec)}`, where
+/// `[]` means "this file has no commits yet". Cached 5s per
+/// `(local_path, rel)`.
+async fn get_project_git_file_log(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<GitFileLogQuery>,
+) -> ApiResult<Response> {
+    let wanted = q.path.ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let (path, repo) = project_git_view(&state, id).await?;
+    let (Some(dir), Some(_)) = (&path, &repo) else {
+        return Ok(Json(ProjectGitLog {
+            path,
+            commits: None,
+        })
+        .into_response());
+    };
+    if files::safe_path(dir, &wanted).is_none() {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: format!("file not found: {wanted}"),
+        });
+    }
+    let key = (dir.clone(), wanted.clone());
+    let cached = {
+        let cache = state.git_file_log_cache.lock().unwrap();
+        cache
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < GIT_TTL)
+            .map(|(_, c)| c.clone())
+    };
+    let commits = match cached {
+        Some(c) => c,
+        None => {
+            let d = dir.clone();
+            let rel = wanted.clone();
+            let c = tokio::task::spawn_blocking(move || git::file_log_of(&d, &rel))
+                .await
+                .unwrap_or_default();
+            let mut cache = state.git_file_log_cache.lock().unwrap();
+            if cache.len() >= 64 {
+                cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+            }
+            cache.insert(key, (Instant::now(), c.clone()));
+            c
+        }
+    };
+    Ok(Json(ProjectGitLog {
+        path,
+        commits: Some(commits),
+    })
+    .into_response())
 }
 
 /// Validates `sha`'s shape, resolves the project's repo dir via
@@ -3242,6 +3336,7 @@ mod tests {
             git_worktrees_cache: Arc::new(Mutex::new(HashMap::new())),
             git_log_cache: Arc::new(Mutex::new(HashMap::new())),
             git_commit_files_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_file_log_cache: Arc::new(Mutex::new(HashMap::new())),
             files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
             restart_requested: Arc::new(AtomicBool::new(false)),
             shutdown_tx: Arc::new(Mutex::new(None)),

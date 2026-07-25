@@ -2904,16 +2904,111 @@ body.agent-sidebar-resizing {
   overflow-wrap: anywhere;
 }
 
-/* Edit affordance (task 327) — pinned to the header's right edge, same
-   0.8rem button sizing as .inline-edit-actions for visual consistency with
-   the rest of the app's inline edit controls. */
-.files-content-header .files-edit-btn,
+/* Edit (task 327) + History (task 542) affordances — pinned as one group to
+   the header's right edge, same 0.8rem button sizing as .inline-edit-actions
+   for visual consistency with the rest of the app's inline edit controls. */
+.files-content-header .files-header-actions,
 .files-content-header .files-edit-actions {
   margin-left: auto;
 }
 
+.files-header-actions {
+  display: inline-flex;
+  gap: 0.5rem;
+}
+
 .files-edit-btn {
   font-size: 0.8rem;
+}
+
+/* File history (task 542): a commit list pinned beside the file, inside the
+   content pane rather than replacing it — the file stays on screen until a
+   commit is picked, at which point .files-history-main swaps to that
+   commit's side-by-side diff. The list scrolls on its own so a long history
+   never pushes the diff off screen. */
+.files-history-layout {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.files-history-pane {
+  flex: none;
+  width: 17rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.files-history-pane li {
+  cursor: pointer;
+}
+
+.files-history-pane li.selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan-dim);
+}
+
+.files-history-main {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Side-by-side diff: one 4-column grid (old no | old text | new no | new
+   text) with cells emitted directly into it, so the two halves of a line
+   share column tracks and stay aligned however a long line wraps. Diff text
+   is untrusted — these classes are colour only. */
+.diff-split {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.diff-split > span {
+  padding: 0 0.35rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diff-split-full {
+  grid-column: 1 / -1;
+}
+
+.diff-split-hunk {
+  color: var(--cyan);
+}
+
+.diff-split-meta {
+  color: var(--muted);
+}
+
+.diff-split-del {
+  color: var(--red);
+  background: rgba(255, 59, 92, 0.08);
+}
+
+.diff-split-add {
+  color: var(--green);
+  background: rgba(43, 255, 156, 0.07);
+}
+
+/* The blank half of an unpaired add/delete — faintly filled so the eye reads
+   it as "nothing here", not as an empty line of content. */
+.diff-split-empty {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* After the tint rules so line numbers stay muted on add/delete rows while
+   keeping the row's background tint (which those rules set, and this one
+   doesn't touch). */
+.diff-split-no {
+  text-align: right;
+  color: var(--muted);
+  user-select: none;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
 }
 
 .files-edit-actions {
@@ -3125,6 +3220,18 @@ body.agent-sidebar-resizing {
   .files-content-pane {
     height: var(--tab-viewport-height);
     min-height: var(--tab-viewport-min);
+  }
+
+  /* File history: commit list flows above the file/diff rather than beside
+     it, same treatment as the two-pane layouts above. */
+  .files-history-layout {
+    flex-direction: column;
+  }
+
+  .files-history-pane {
+    width: auto;
+    align-self: stretch;
+    max-height: 30vh;
   }
 }
 

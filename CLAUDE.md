@@ -47,6 +47,11 @@ scripts/agents-check.sh
 # against a stub `claude` binary, with a shortened tick (MESA_WATCH_TODO_TICK_MS)
 scripts/todo-watcher-check.sh
 
+# Inbox-watcher gate: `mesa serve --watch-inbox`'s periodic triage-dispatch
+# loop against a stub `claude` binary, with a shortened tick
+# (MESA_WATCH_INBOX_TICK_MS) and a throwaway HOME (the watcher spawns in $HOME)
+scripts/inbox-watcher-check.sh
+
 # Hooks gate: task-execute contract over CLI + API against a throwaway
 # hooks file (MESA_HOOKS_FILE)
 scripts/hooks-check.sh
@@ -245,6 +250,13 @@ invariants you must not break — read them before changing `src/`:
   shortcuts. `docs/keyboard.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
+- **Inbox watcher** — `mesa serve --watch-inbox`'s periodic auto-triage
+  loop (`/inbox-triage <id>` per pending item, cwd `$HOME` since an inbox
+  item belongs to no project), off by default and independent of
+  `--watch-todo`. An inbox item has no status column to claim with, so the
+  re-dispatch guard is an **in-memory** set on `AppState`, not a db write —
+  load-bearing, because the triage skill's "no confident project match"
+  outcome leaves the item in place forever. `docs/inbox-watcher.md`.
 - **Hooks** — user-configured shell commands fired on events (`task-execute`
   so far); a nonzero exit is data, not a failure. `docs/hooks.md`.
 - **CC Dashboard** — analytics over Claude Code's own transcripts, ingested

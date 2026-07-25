@@ -109,6 +109,15 @@ enum Command {
         /// action.
         #[arg(long, default_value_t = false)]
         watch_todo: bool,
+        /// Periodically auto-start a background `claude` agent to triage each
+        /// pending item in the global inbox (prompt: `/inbox-triage <id>`, cwd
+        /// `$HOME` — an inbox item belongs to no project). Off by default:
+        /// this spawns real agents (API cost, code execution) with no user
+        /// request behind it. Independent of --watch-todo. Each item is
+        /// dispatched at most once per server run. Preserved across the web
+        /// UI's Restart Server action.
+        #[arg(long, default_value_t = false)]
+        watch_inbox: bool,
     },
     /// Snapshot the database to a file (safe while the server runs)
     ///
@@ -550,15 +559,17 @@ EXAMPLES
         /// Inbox item id
         id: i64,
     },
-    /// Assign an item to a project: convert it into a todo task there
+    /// Assign an item to a project: convert it into a backlog task there
     ///
-    /// Routing an item to a project turns it into a todo task in that project
-    /// (title from the item's body, full body as the task description) and
-    /// removes it from the inbox. Prints the created task. Assigning to an
-    /// unknown project is a validation error.
+    /// Routing an item to a project turns it into a BACKLOG task in that
+    /// project (title from the item's body, full body as the task
+    /// description) and removes it from the inbox. Backlog, not todo: an
+    /// assigned item lands in the review queue, not the actionable one.
+    /// Prints the created task. Assigning to an unknown project is a
+    /// validation error.
     #[command(after_help = "\
 EXAMPLES
-  mesa inbox assign 3 1        # convert item 3 into a todo task in project 1")]
+  mesa inbox assign 3 1        # convert item 3 into a backlog task in project 1")]
     Assign {
         /// Inbox item id
         id: i64,
@@ -1189,7 +1200,8 @@ fn execute(command: Command) -> Result<()> {
             port,
             lan,
             watch_todo,
-        } => crate::api::serve(port, lan, watch_todo),
+            watch_inbox,
+        } => crate::api::serve(port, lan, watch_todo, watch_inbox),
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;
@@ -1720,8 +1732,8 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
         }
         InboxCmd::Show { id } => print_json(&store.get_inbox_item(id)?),
         InboxCmd::Assign { id, project } => {
-            // Assigning converts the item into a todo task in the project and
-            // deletes it from the inbox; the created task is what we echo.
+            // Assigning converts the item into a BACKLOG task in the project
+            // and deletes it from the inbox; the created task is what we echo.
             let project = resolve_project(&store, &project)?;
             print_json(&store.assign_inbox_item(id, project)?);
         }

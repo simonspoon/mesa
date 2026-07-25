@@ -38,9 +38,9 @@ use serde_json::json;
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, NextResult, Priority, ProjectAgents, ProjectFileTree,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store, StoryboardPatch,
-    TaskPatch, TaskSummary, Waypoint, agents, attachments, files, git, hooks,
+    GitRepoView, GitStatus, GitWorktree, InboxItem, NextResult, Priority, ProjectAgents,
+    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store,
+    StoryboardPatch, TaskPatch, TaskSummary, Waypoint, agents, attachments, files, git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -152,6 +152,17 @@ struct AppState {
     /// concurrent restart click reports "already restarting" instead of
     /// panicking on a consumed oneshot.
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Inbox item ids the inbox-watcher (`watch_inbox`) has already dispatched
+    /// a triage agent for. The inbox-watcher's answer to the todo-watcher's
+    /// `in_progress` claim — but in memory, not in the db, because an inbox
+    /// item has no status column to claim with (`docs/inbox.md`: an item *is*
+    /// the record, and assignment converts + deletes it). Pruned each tick to
+    /// the ids still present in the inbox, so it can't grow unboundedly on a
+    /// long-lived server. Deliberately not persisted: a restart re-triages
+    /// whatever is still sitting in the inbox, which is the recoverable
+    /// direction (a duplicate triage of an item is cheap; a permanently
+    /// skipped item is not) — see `docs/inbox-watcher.md`.
+    inbox_dispatched: Arc<Mutex<std::collections::HashSet<i64>>>,
 }
 
 /// How often the todo-watcher (`watch_todo`) checks every project for
@@ -167,6 +178,125 @@ fn watch_todo_tick() -> Duration {
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_TODO_TICK)
+}
+
+/// How often the inbox-watcher (`watch_inbox`) checks the global inbox for
+/// items to triage. Same fixed-cadence rationale as [`WATCH_TODO_TICK`];
+/// `MESA_WATCH_INBOX_TICK_MS` is the matching test seam.
+const WATCH_INBOX_TICK: Duration = Duration::from_secs(60);
+
+fn watch_inbox_tick() -> Duration {
+    std::env::var("MESA_WATCH_INBOX_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_INBOX_TICK)
+}
+
+/// How much of an inbox body goes into an auto-dispatched session's name,
+/// in `char`s (not bytes — bodies are free text and may be non-ASCII).
+const INBOX_SESSION_NAME_CHARS: usize = 60;
+
+/// Names an auto-dispatched triage session after the item it triages, so it
+/// is identifiable in the prompt box, `/resume` picker, terminal title and
+/// Agents sidebar — the same reason the todo-watcher names its sessions
+/// `<project>: <title>`. Uses the body's first non-empty line, truncated;
+/// inbox bodies are free-form markdown and may be long or multi-line.
+///
+/// The body is **untrusted data**: it reaches `claude` as a single `--name`
+/// process argument (`Command::arg`, no shell), never interpolated into a
+/// shell string, and nothing here interprets it.
+fn inbox_session_name(item: &InboxItem) -> String {
+    let first = item
+        .body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.is_empty() {
+        return format!("inbox {}", item.id);
+    }
+    let mut head: String = first.chars().take(INBOX_SESSION_NAME_CHARS).collect();
+    if first.chars().count() > INBOX_SESSION_NAME_CHARS {
+        head.push('…');
+    }
+    format!("inbox {}: {head}", item.id)
+}
+
+/// One inbox-watcher pass: dispatch a background `claude` agent running
+/// `/inbox-triage <id>` for every pending inbox item this process has not
+/// already dispatched. The inbox is one **global** queue that lives above
+/// projects, so — unlike the todo-watcher, which is naturally capped at one
+/// agent per project — every un-dispatched item goes out in the same tick.
+///
+/// cwd is `$HOME`, not a project folder: an inbox item belongs to no project
+/// (`project_id` is null for its whole life) and the triage skill derives the
+/// project itself, reading each candidate repo by absolute `local_path`. Same
+/// `$HOME` the global Terminal page uses.
+///
+/// The dedup set (`AppState::inbox_dispatched`) stands in for the
+/// todo-watcher's `in_progress` claim, which has no inbox equivalent — an
+/// item has no status column. Two of the triage skill's three outcomes remove
+/// the item (a viable request becomes a task and the item is deleted; a
+/// non-viable one is converted by `assign_inbox_item`), but the third leaves
+/// it **untouched** — no confident project match. Without the set, that third
+/// outcome would re-dispatch an agent for the same item every single tick,
+/// forever. Ids are claimed *before* the spawn (closing the window where a
+/// second tick fires while `claude --bg` is still starting) and released
+/// again only if the spawn failed, so a transient `claude` failure retries
+/// next tick instead of silently dropping the item — the same shape as the
+/// todo-watcher's revert-to-`todo`.
+///
+/// Two-phase, like [`todo_watcher_tick`] and `spawn_project_agent`: the store
+/// lock is dropped before the blocking `claude --bg` shell-outs. Holding it
+/// across a spawn would freeze every other API request for the duration of
+/// each spawn — a regression this codebase has shipped once already.
+fn inbox_watcher_tick(state: &AppState) {
+    let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+        eprintln!("inbox-watcher: no home directory to dispatch in");
+        return;
+    };
+    let home = home.to_string_lossy().into_owned();
+
+    let items = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        match store.list_inbox_items(None) {
+            Ok(items) => items,
+            Err(e) => {
+                eprintln!("inbox-watcher: list_inbox_items failed: {e}");
+                return;
+            }
+        }
+    };
+
+    let pending: Vec<(i64, String)> = {
+        let mut dispatched = match state.inbox_dispatched.lock() {
+            Ok(d) => d,
+            Err(e) => e.into_inner(),
+        };
+        let present: std::collections::HashSet<i64> = items.iter().map(|i| i.id).collect();
+        dispatched.retain(|id| present.contains(id));
+        items
+            .iter()
+            .filter(|item| dispatched.insert(item.id))
+            .map(|item| (item.id, inbox_session_name(item)))
+            .collect()
+    };
+
+    for (id, session_name) in pending {
+        let prompt = format!("/inbox-triage {id}");
+        if let Err(e) = agents::spawn_bg(&home, Some(&prompt), Some(&session_name)) {
+            eprintln!("inbox-watcher: spawn failed for inbox item {id}: {e}");
+            let mut dispatched = match state.inbox_dispatched.lock() {
+                Ok(d) => d,
+                Err(e) => e.into_inner(),
+            };
+            dispatched.remove(&id);
+        }
+    }
 }
 
 /// One todo-watcher pass: for every project with a live `local_path` and no
@@ -267,9 +397,12 @@ fn todo_watcher_tick(state: &AppState) {
 /// Opens the default store and serves the API, blocking until the process is
 /// killed. Binds 127.0.0.1 by default; with `lan`, binds 0.0.0.0 so other
 /// devices on the local network can reach it (no auth — see `serve --help`).
-/// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`]);
-/// off by default, propagated across the web UI's Restart Server action.
-pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> {
+/// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`])
+/// and `watch_inbox` the periodic inbox-watcher (see [`inbox_watcher_tick`]);
+/// both off by default, both propagated across the web UI's Restart Server
+/// action. They are independent flags over independent queues — neither
+/// implies the other.
+pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate::core::Result<()> {
     let store = Store::open_default()?;
     let restart_requested = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -293,6 +426,7 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> 
         files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
         restart_requested: restart_requested.clone(),
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+        inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -307,6 +441,17 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> 
                     ticker.tick().await;
                     let state = watch_state.clone();
                     let _ = tokio::task::spawn_blocking(move || todo_watcher_tick(&state)).await;
+                }
+            });
+        }
+        if watch_inbox {
+            let watch_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(watch_inbox_tick());
+                loop {
+                    ticker.tick().await;
+                    let state = watch_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || inbox_watcher_tick(&state)).await;
                 }
             });
         }
@@ -338,6 +483,9 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool) -> crate::core::Result<()> 
         }
         if watch_todo {
             args.push("--watch-todo".to_string());
+        }
+        if watch_inbox {
+            args.push("--watch-inbox".to_string());
         }
         std::process::Command::new(exe).args(args).spawn()?;
         std::process::exit(0);
@@ -3340,6 +3488,7 @@ mod tests {
             files_tree_cache: Arc::new(Mutex::new(HashMap::new())),
             restart_requested: Arc::new(AtomicBool::new(false)),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
         (dir, state)
     }
@@ -4063,12 +4212,16 @@ mod tests {
                 r#"#!/bin/sh
 [ "$1" = "--bg" ] || exit 1
 shift
+[ -e "{fail}" ] && {{ echo "stub claude is down" >&2; exit 1; }}
 NAME=""
 if [ "$1" = "--name" ]; then shift; NAME="$1"; shift; fi
-echo "$(pwd)|$NAME" >> "{}"
+PROMPT=""
+if [ "$1" = "--" ]; then shift; PROMPT="$1"; fi
+echo "$(pwd)|$NAME|$PROMPT" >> "{log}"
 echo "backgrounded · deadbeef (idle — send a prompt to start)"
 "#,
-                log_path.display()
+                fail = dir.join("fail").display(),
+                log = log_path.display()
             ),
         )
         .unwrap();
@@ -4136,5 +4289,175 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Status::InProgress,
             "unarchived project's task must be claimed in_progress"
         );
+    }
+
+    // --- inbox watcher (mesa task 544) -----------------------------------
+
+    #[test]
+    fn inbox_session_name_uses_first_nonempty_line_truncated() {
+        let item = |body: &str| InboxItem {
+            id: 7,
+            project_id: None,
+            author: None,
+            body: body.to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert_eq!(
+            inbox_session_name(&item(
+                "\n\n  khora: eval errors on undefined  \nmore detail"
+            )),
+            "inbox 7: khora: eval errors on undefined"
+        );
+        // Truncation counts chars, not bytes — a multi-byte body must not
+        // panic on a mid-codepoint slice.
+        let long = "é".repeat(INBOX_SESSION_NAME_CHARS + 5);
+        let name = inbox_session_name(&item(&long));
+        assert_eq!(
+            name,
+            format!("inbox 7: {}…", "é".repeat(INBOX_SESSION_NAME_CHARS))
+        );
+        // A body with no usable line still names the item it triages.
+        assert_eq!(inbox_session_name(&item("   \n\t\n")), "inbox 7");
+    }
+
+    /// The dedup set is what stands in for the todo-watcher's `in_progress`
+    /// claim: every pending item is dispatched once, and a second tick over
+    /// the same inbox dispatches nothing — the triage skill's "no confident
+    /// project match" outcome leaves the item in place, so without this the
+    /// watcher would respawn an agent for it every 60s forever.
+    #[test]
+    fn inbox_watcher_tick_dispatches_each_item_once_then_picks_up_new_ones() {
+        // SAFETY: ENV_LOCK (shared with attachments/cc tests) gives this test
+        // exclusive access to MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let first = state
+            .store
+            .lock()
+            .unwrap()
+            .create_inbox_item(Some("agent-7"), "khora: eval errors on undefined")
+            .unwrap();
+        let second = state
+            .store
+            .lock()
+            .unwrap()
+            .create_inbox_item(None, "loki: find exits 0 on no match")
+            .unwrap();
+
+        // The whole pending inbox goes out in one tick — the inbox is one
+        // global queue, with no per-project cap to pace it.
+        inbox_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "both pending items must dispatch in the first tick: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("/inbox-triage {}", first.id))
+                && log.contains(&format!("/inbox-triage {}", second.id)),
+            "each dispatch's prompt must name its own item: {log:?}"
+        );
+        assert!(
+            log.contains(&format!(
+                "inbox {}: khora: eval errors on undefined",
+                first.id
+            )),
+            "session name must identify the item: {log:?}"
+        );
+
+        // Second tick, same inbox: nothing re-dispatches.
+        inbox_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "an already-dispatched item must not dispatch again: {log:?}"
+        );
+
+        // A newly-arrived item still dispatches on the next tick.
+        let third = state
+            .store
+            .lock()
+            .unwrap()
+            .create_inbox_item(None, "mesa: add an inbox watcher")
+            .unwrap();
+        inbox_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            3,
+            "a new item must dispatch even though older ones are claimed: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("/inbox-triage {}", third.id)),
+            "the new item's own id must be dispatched: {log:?}"
+        );
+
+        // Triage removing an item prunes it from the set, so it can't grow
+        // unboundedly on a long-lived server.
+        state
+            .store
+            .lock()
+            .unwrap()
+            .delete_inbox_item(first.id)
+            .unwrap();
+        inbox_watcher_tick(&state);
+        assert!(
+            !state.inbox_dispatched.lock().unwrap().contains(&first.id),
+            "an item that left the inbox must be pruned from the dedup set"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    /// A spawn failure must release the claim, so a transient `claude`
+    /// outage retries next tick instead of silently dropping the item —
+    /// the inbox equivalent of the todo-watcher's revert-to-`todo`.
+    #[test]
+    fn inbox_watcher_tick_releases_claim_when_spawn_fails() {
+        // SAFETY: see `inbox_watcher_tick_dispatches_each_item_once_...`.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        // `stub_claude_bg`'s `--bg` branch fails while this marker exists.
+        std::fs::write(stub_dir.path().join("fail"), "").unwrap();
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let item = state
+            .store
+            .lock()
+            .unwrap()
+            .create_inbox_item(None, "mesa: something to triage")
+            .unwrap();
+
+        inbox_watcher_tick(&state);
+        assert!(
+            !state.inbox_dispatched.lock().unwrap().contains(&item.id),
+            "a failed spawn must not leave the item claimed"
+        );
+
+        // With the stub healthy again, the next tick dispatches it.
+        std::fs::remove_file(stub_dir.path().join("fail")).unwrap();
+        inbox_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains(&format!("/inbox-triage {}", item.id)),
+            "the item must dispatch once the spawn succeeds: {log:?}"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
     }
 }

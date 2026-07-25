@@ -1,5 +1,11 @@
 import { useEffect, useState } from 'react'
-import { archiveProject, getProject, listTasks, updateProject } from '../api'
+import {
+  archiveProject,
+  getProject,
+  listTasks,
+  unarchiveProject,
+  updateProject,
+} from '../api'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskModal } from '../components/TaskModal'
@@ -138,6 +144,9 @@ export function ProjectTasksPage({
   // Archiving hides the project (reversible), never deletes — spec req 12 /
   // Won't list: no confirmation prompt, no "this deletes N tasks" copy.
   // Declared ahead of the early error return below, per the rules of hooks.
+  // One in-flight flag / one error slot covers both directions: the footer
+  // only ever offers whichever of archive/unarchive this project isn't
+  // already in (task 509).
   const [archiving, setArchiving] = useState(false)
   const [archiveError, setArchiveError] = useState<string | null>(null)
 
@@ -189,6 +198,26 @@ export function ProjectTasksPage({
       })
   }
 
+  // Restoring keeps the user where they are (the page was already valid while
+  // archived — `show` is a scoped read, unaffected by the flag), so unlike
+  // `handleArchive` there is no navigation and the in-flight flag has to be
+  // cleared here. Refetching the project is what flips this footer back to
+  // "archive project" and drops the header badge.
+  function handleUnarchive() {
+    setArchiving(true)
+    setArchiveError(null)
+    unarchiveProject(projectId)
+      .then(() => {
+        setArchiving(false)
+        refetchProject()
+        onProjectsChanged()
+      })
+      .catch((e: unknown) => {
+        setArchiving(false)
+        setArchiveError(e instanceof Error ? e.message : String(e))
+      })
+  }
+
   return (
     <>
         <h1>
@@ -204,6 +233,18 @@ export function ProjectTasksPage({
             />
           ) : (
             `Project ${projectId}`
+          )}
+          {/* An archived project's page is otherwise identical to a live
+              one's — every read here is project-scoped, so the flag changes
+              nothing about it (task 509). Says so plainly, next to the name,
+              and reuses the existing task badge styling. */}
+          {project?.archived && (
+            <span
+              className="badge project-archived-badge"
+              title="Hidden from the sidebar's main list and from unscoped task/storyboard views. Restore below."
+            >
+              archived
+            </span>
           )}
         </h1>
         {project && (
@@ -335,17 +376,30 @@ export function ProjectTasksPage({
 
         {/* Retirement action tucked away, de-emphasized (spec S8): rarely
             used, kept reachable in a low-key project footer. Archiving is
-            reversible (unarchive from the sidebar), so this is a plain
+            reversible (this same footer, or the sidebar's archived group,
+            restores it), so this is a plain
             button with no confirm step and no destructive copy — spec's
             Won't list explicitly rules out a confirmation prompt here.
             Deleting a project is still possible; it's just no longer
             offered from this control (CLI/API unchanged). */}
-        <p className="project-danger">
-          <button onClick={handleArchive} disabled={archiving}>
-            archive project
-          </button>
-          {archiveError && <span className="error">{archiveError}</span>}
-        </p>
+        {/* Rendered only once the project is loaded: the footer's verb depends
+            on `archived`, and offering "archive project" for a moment on a
+            project that is already archived is the very confusion task 509
+            reports. */}
+        {project && (
+          <p className="project-danger">
+            {project.archived ? (
+              <button onClick={handleUnarchive} disabled={archiving}>
+                unarchive project
+              </button>
+            ) : (
+              <button onClick={handleArchive} disabled={archiving}>
+                archive project
+              </button>
+            )}
+            {archiveError && <span className="error">{archiveError}</span>}
+          </p>
+        )}
     {taskId !== null && (
       <TaskModal
         key={taskId}

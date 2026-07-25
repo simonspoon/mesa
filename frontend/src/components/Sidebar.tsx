@@ -116,18 +116,22 @@ export function Sidebar({
     : 0
   // Per-project todo counts for the project rows; polls like the inbox badge
   // so counts stay current as agents create/close tasks.
-  const { data: todos } = useFetch(() => listTasks({ status: 'todo' }), 'todo-nav', {
-    pollMs: 5000,
-  })
+  const { data: todos, refetch: refetchTodos } = useFetch(
+    () => listTasks({ status: 'todo' }),
+    'todo-nav',
+    { pollMs: 5000 },
+  )
   const todoCounts = new Map<number, number>()
   for (const t of todos ?? []) {
     todoCounts.set(t.project_id, (todoCounts.get(t.project_id) ?? 0) + 1)
   }
   // Git status per project (branch + dirty/ahead/behind) under each name.
   // Server caches per folder, so a slower poll than the badges is plenty.
-  const { data: gitStatuses } = useFetch(() => getGitStatus(), 'git-nav', {
-    pollMs: 10000,
-  })
+  const { data: gitStatuses, refetch: refetchGit } = useFetch(
+    () => getGitStatus(),
+    'git-nav',
+    { pollMs: 10000 },
+  )
   const gitByProject = new Map<number, GitStatus>()
   for (const g of gitStatuses ?? []) {
     gitByProject.set(g.project_id, g.git)
@@ -158,7 +162,16 @@ export function Sidebar({
   function handleUnarchive(id: number): void {
     setUnarchiveError(null)
     unarchiveProject(id)
-      .then(() => refetch())
+      .then(() => {
+        refetch()
+        // The row's decorations come from their own fetches, and both of them
+        // read the *unscoped* endpoints, which omit archived projects — so a
+        // restored project has no todo count and no git line in the data
+        // already on hand. Re-run them alongside the project list instead of
+        // leaving the returned row bare until the next poll tick (task 509).
+        refetchTodos()
+        refetchGit()
+      })
       .catch((e: unknown) => {
         setUnarchiveError(e instanceof Error ? e.message : String(e))
       })

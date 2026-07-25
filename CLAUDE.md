@@ -195,6 +195,15 @@ invariants you must not break — read them before changing `src/`:
   it straight into the same `Store` call — the CLI and API no longer
   re-implement the project filter as a handler-side `.filter(...)`, closing
   the divergence risk structurally rather than by discipline.
+- In the web UI both directions are reachable from two places. The sidebar's
+  collapsible `archived (N)` group carries a per-row `restore`; the project
+  page's own footer offers `unarchive project` (and its title an `archived`
+  badge) whenever `project.archived` is set — the page keeps working while
+  archived, since every read on it is project-scoped. The sidebar's restore
+  must re-run the two **unscoped** nav fetches
+  (`GET /api/tasks?status=todo`, `GET /api/git-status`) alongside the project
+  list: those omit archived projects, so a restored row otherwise sits with no
+  todo badge and no git line until the next poll tick.
 
 ### Per-feature surfaces (see linked doc before touching)
 

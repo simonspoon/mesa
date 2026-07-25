@@ -575,6 +575,18 @@ main {
   border-color: var(--border);
 }
 
+/* Archived marker beside a project's name (task 509): the shared chip, nudged
+   off the title and onto its optical middle, in the amber this palette already
+   uses for an attention state rather than a failure. Two-class selector like
+   the variants above — `.badge`'s own muted `color` is declared here, so a
+   single-class rule earlier in the file would lose to it. */
+.badge.project-archived-badge {
+  margin-left: 0.5rem;
+  vertical-align: middle;
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
 .tag {
   display: inline-block;
   background: rgba(255, 43, 214, 0.1);

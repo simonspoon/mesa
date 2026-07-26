@@ -2095,6 +2095,17 @@ main {
   border-color: rgba(255, 59, 92, 0.6);
 }
 
+/* An upstream `working` mesa has reclassified as done (mesa task 571). Muted
+   rather than hidden: the badge stays visible so the disagreement with
+   `claude agents --json` is inspectable, but it must not read as amber
+   "this agent is running" inside the DONE bucket. Three classes to
+   `.agent-state-working`'s two, so it wins on specificity, not source order. */
+.badge.agent-state-working.agent-state-stale {
+  color: var(--muted);
+  border-color: var(--border);
+  border-style: dashed;
+}
+
 .agent-terminal-panel {
   flex: 1;
   min-height: 0;

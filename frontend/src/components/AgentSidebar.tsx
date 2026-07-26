@@ -121,12 +121,53 @@ type Bucket = 'BLOCKED' | 'ACTIVE' | 'DONE'
 // `AgentSession` carries no completion timestamp (only `startedAt`, the
 // session's start time) — `claude agents --json` doesn't report one. DONE is
 // sorted by `startedAt` desc as the closest available proxy for "most
-// recently completed"; the bucketing itself is exact, driven by `state`.
+// recently completed".
+//
+// `state` alone is NOT a reliable completion signal, which is why `status`
+// is consulted too (mesa task 571). `claude agents --json` computes `state`
+// live — it is stored in no file, and `~/.claude/sessions/<pid>.json` carries
+// no `state` key at all — and it can stick at `working` indefinitely for a
+// background session that has finished its turn and gone idle. Measured on
+// claude 2.1.220: three watcher-spawned sessions sat at `idle`/`working` for
+// 80+ minutes after their final turn ended (`stop_reason: end_turn`, stop
+// hook run, `turn_duration` emitted), while sessions with byte-identical
+// transcript tails reported `done`. The stick is not a function of age (a
+// `done` at 34m alongside a `working` at 80m), of process liveness (all 39
+// sessions were alive, contradicting an earlier claim in `docs/agents.md`
+// that DONE means the process exited), or of the daemon's `bg settled` sweep
+// (sessions reach `done` without one).
+//
+// `status: 'idle'` + `state: 'working'` has no legitimate meaning, so it is
+// safe to read as finished. The three states a background session can
+// actually be in are each distinguishable without it:
+//   - never prompted / awaiting input -> `idle` + `blocked` (verified by
+//     spawning a bare `claude --bg`, which reports exactly that)
+//   - actively running                -> `busy` + `working`
+//   - finished                        -> `idle` + `done`
+// A genuinely running agent held `busy` steadily across 20 samples over 40s
+// with no flap to `idle`, so this does not race a live session into DONE.
+// The `blocked` check stays first: an idle session that is *waiting* on
+// something says so via `state`, and must keep its own bucket.
+function isStaleWorking(a: AgentSession): boolean {
+  return a.kind === 'background' && a.status === 'idle' && a.state === 'working'
+}
+
 function bucketOf(a: AgentSession): Bucket {
   if (a.state === 'blocked') return 'BLOCKED'
   if (a.state === 'done' || a.state === 'failed' || a.state === 'stopped') return 'DONE'
+  if (isStaleWorking(a)) return 'DONE'
   return 'ACTIVE' // 'working', or no state at all (interactive sessions)
 }
+
+// Upstream's own `working` is still rendered for a reclassified session
+// rather than suppressed — mesa reports external state faithfully, and
+// hiding the disagreement would make the DONE bucket look authoritative
+// when it is an inference. The tooltip is what keeps a `working` badge
+// inside DONE from reading as a mesa bug.
+const STALE_WORKING_HINT =
+  'claude reports this session as "working", but it is idle with its turn ended — ' +
+  'upstream `state` can stick at "working" after a background session finishes. ' +
+  'mesa treats idle+working as done.'
 
 const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE', 'DONE']
 
@@ -321,7 +362,12 @@ function AgentListContent({
                           <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
                           {a.status && <span className={`badge agent-status-${a.status}`}>{a.status}</span>}
                           {a.state && a.state !== a.status && (
-                            <span className={`badge agent-state-${a.state}`}>{a.state}</span>
+                            <span
+                              className={`badge agent-state-${a.state}${isStaleWorking(a) ? ' agent-state-stale' : ''}`}
+                              title={isStaleWorking(a) ? STALE_WORKING_HINT : undefined}
+                            >
+                              {a.state}
+                            </span>
                           )}
                           {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
                           <div className="muted agent-meta">

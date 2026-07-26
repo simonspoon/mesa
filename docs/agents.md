@@ -112,13 +112,39 @@ already use.
 - The session list is grouped into three collapsible sections — BLOCKED
   (`state === "blocked"`), ACTIVE (`state === "working"` or no `state` at all,
   which covers interactive sessions — those never get a `state`), and DONE
-  (`state` is `done`/`failed`/`stopped`, i.e. the process has exited) — each a
-  `<button>` header toggling its own `collapsedSections[bucket]` entry; DONE
-  starts collapsed, BLOCKED/ACTIVE start open. `AgentSession` carries no
-  completion timestamp (`claude agents --json` doesn't report one, only
-  `startedAt`), so DONE is ordered by `startedAt` desc as the closest
-  available proxy rather than a true completion time. An empty bucket renders
-  no header at all (not an empty section). This bucketed list is the body of
+  (`state` is `done`/`failed`/`stopped`, **or** the stale-`working` case
+  below) — each a `<button>` header toggling its own
+  `collapsedSections[bucket]` entry; DONE starts collapsed, BLOCKED/ACTIVE
+  start open. `AgentSession` carries no completion timestamp (`claude agents
+  --json` doesn't report one, only `startedAt`), so DONE is ordered by
+  `startedAt` desc as the closest available proxy rather than a true
+  completion time. An empty bucket renders no header at all (not an empty
+  section). Note DONE does **not** mean the process has exited: `claude
+  agents --json` lists live processes, and every session it reports as `done`
+  is still running (measured, mesa task 571 — 33 of 33). A `done` session is
+  one that has finished its work, not one that has gone away.
+- **`state` alone is not a reliable completion signal**, so `bucketOf` also
+  reads `status`: a **background** session reporting `status === "idle"` and
+  `state === "working"` is bucketed DONE (mesa task 571). Upstream computes
+  `state` live — it is persisted nowhere, and `~/.claude/sessions/<pid>.json`
+  has no `state` key — and it can stick at `working` indefinitely once a
+  background session finishes its turn and goes idle. Measured on claude
+  2.1.220: three inbox-watcher sessions sat at `idle`/`working` for 90+
+  minutes after their final turn ended, while sessions with byte-identical
+  transcript tails reported `done`. Ruled out as the mechanism: age (a `done`
+  at 34m alongside a `working` at 90m), process liveness (all 39 alive), and
+  the daemon's `bg settled` sweep (sessions reach `done` without one). The
+  override is safe because `idle` + `working` has no legitimate meaning — a
+  never-prompted session is `idle` + **`blocked`** (verified by spawning a
+  bare `claude --bg`), a running one is `busy` + `working` (held steady
+  across 20 samples over 40s, no flap to `idle`), and a finished one is
+  `idle` + `done`. The `blocked` test stays first so an idle session that is
+  genuinely *waiting* keeps its own bucket. This is an inference about
+  upstream, not a fact from it, so the row still renders upstream's own
+  `working` badge — muted, dashed, and tooltipped rather than suppressed.
+  Because it is upstream behavior, the residue is worth re-checking against
+  future `claude` releases: if `state` becomes trustworthy, this override
+  becomes dead code rather than wrong code. This bucketed list is the body of
   the 'Agents' rail's own content (`AgentListContent`), rendered directly by
   `AgentSidebar` next to the tile area — not a member of the pane tree below.
 - **The 'Agents' list rail** (mesa task 414): a fixed sibling of the tile
@@ -308,6 +334,10 @@ already use.
   (`insertLeaf`), and every open pane whose session has reached DONE gets
   closed (`ptyPool.remove` + `removeLeaf`) — both buckets auto-open, not just
   ACTIVE, since a blocked agent is the one most likely waiting on the user.
+  Because this keys off `bucketOf`, the stale-`working` override above fixes
+  auto-tile too: before it, a finished session stuck at `idle`/`working` was
+  never in DONE, so its pane stayed open indefinitely and a new one opened
+  for every subsequent agent (mesa task 571).
   The effect depends on `autoTile` itself, so switching it on syncs
   immediately against whatever `sessions` already holds rather than only
   reacting to future transitions; switching it off just stops the sync — it

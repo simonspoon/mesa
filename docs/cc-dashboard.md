@@ -21,7 +21,7 @@ CLI and API share it and never diverge.
 - **A tool call's `input` is read for exactly one bounded field, never stored
   whole.** `cc::tool_target` lifts the first string under an ordered key list
   (`skill`, `command`, `file_path`, `url`, `query`, `pattern`, `path`, `name`,
-  `subject`, `title`, `description`) into `cc_tool_calls.target` (migration 16),
+  `subject`, `title`, `description`) into `cc_tool_calls.target` (migration 22),
   which is what lets a graph node say `Bash / cargo test` instead of `Bash`.
   Everything else in the payload is still dropped: the bulk keys (`content`,
   `new_string`, `prompt`, `script`) are absent from the list on purpose, since
@@ -60,12 +60,12 @@ CLI and API share it and never diverge.
   (`{agentType, description, toolUseId, spawnDepth, parentAgentId?}`). None of
   it appears on the transcript lines, so without it a `Task` tool call and the
   subagent it started are two unrelated rows. `cc::apply_sidecar` folds it into
-  the file's `cc_agent_runs` after parsing (migration 15 added the four
+  the file's `cc_agent_runs` after parsing (migration 21 added the four
   columns); it is applied to every run in the batch rather than matched by
   `agent_id`, because a subagent transcript is exactly one run's transcript.
   Missing/unparseable sidecar → the fields stay `NULL` and the run still
   ingests. All four columns upsert through `COALESCE(existing, new)`, so
-  `cc sync --rebuild` **does** backfill rows ingested before migration 15 (they
+  `cc sync --rebuild` **does** backfill rows ingested before migration 21 (they
   are NULL there) — the additive-not-corrective rule below is unchanged, since
   this only fills gaps. Coverage is partial by nature: measured over 1168 real
   sidecars, 776 carry a `toolUseId` (Task-tool subagents) and 392 are
@@ -123,10 +123,10 @@ CLI and API share it and never diverge.
     the skill name has become the name. Its id keeps the `tool:` prefix — it is
     still one `cc_tool_calls` row, and that is what lets a skill parent the
     subagent it spawned. The promotion keys on the target being present, so a
-    row ingested before migration 16 stays a plain `tool` node named `Skill`
+    row ingested before migration 22 stays a plain `tool` node named `Skill`
     rather than becoming a `skill` node with nothing to call itself.
     `target` is `None` on every non-`tool` kind.
-  - `target` is only on rows ingested since migration 16; migration 17 (a bare
+  - `target` is only on rows ingested since migration 22; migration 23 (a bare
     `DELETE FROM cc_files`) is what delivers it to the rows that predate it,
     by clearing the ingest cursors so the *next automatic* `cc::sync` re-walks
     the tree once and takes the backfill below. Without it those rows stay

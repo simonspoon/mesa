@@ -900,7 +900,7 @@ pub struct CcGraphNode {
     /// `tool` only: what the call acted on — a Bash command, a file path, a
     /// URL — sanitized and capped at [`crate::core::cc::TARGET_MAX_CHARS`].
     /// `None` on every other kind, on tools with no meaningful target, and on
-    /// calls ingested before migration 16 that no `cc sync --rebuild` has
+    /// calls ingested before migration 22 that no `cc sync --rebuild` has
     /// revisited. A `skill` node carries its skill in `name` instead, so this
     /// stays `None` there.
     ///

@@ -2649,7 +2649,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(tool_use_id) DO NOTHING",
             )?;
-            // `target` arrived after these rows did (migration 16), so it needs
+            // `target` arrived after these rows did (migration 22), so it needs
             // the backfill the agent-run upsert gets from its `COALESCE` arms.
             // It cannot ride the same `DO UPDATE`: that reports one changed row
             // per conflict, which would count every re-ingested call as newly
@@ -5937,7 +5937,7 @@ mod tests {
                 skill: Some("other".into()), // must NOT overwrite
                 // Absent on the first batch, so these DO land — the backfill
                 // path a `cc sync --rebuild` takes over rows ingested before
-                // migration 15 added the columns.
+                // migration 21 added the columns.
                 tool_use_id: Some("toolu_1".into()),
                 description: Some("spawned".into()),
                 spawn_depth: Some(2),
@@ -5971,7 +5971,7 @@ mod tests {
         assert_eq!(run[0].parent_agent_id.as_deref(), Some("p"));
     }
 
-    /// `target` (migration 16) lands on rows ingested before it existed, the
+    /// `target` (migration 22) lands on rows ingested before it existed, the
     /// way `cc sync --rebuild` delivers it — but without the re-ingest being
     /// counted as new rows, which is what a `DO UPDATE` upsert would have done.
     #[test]
@@ -6005,7 +6005,7 @@ mod tests {
                 .unwrap()
         };
 
-        // Ingested before migration 16 existed: the row lands with no target.
+        // Ingested before migration 22 existed: the row lands with no target.
         let first = store
             .cc_ingest_file("/t/a.jsonl", &cursor, &row(None))
             .unwrap();

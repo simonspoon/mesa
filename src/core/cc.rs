@@ -1412,7 +1412,7 @@ pub fn session_graph(
         // A `Skill` call is promoted to its own kind and labelled with the
         // skill itself — `Skill`/`Skill`/`Skill` down a column says nothing.
         // The promotion needs the target (that *is* the skill name), so a row
-        // ingested before migration 16 stays a plain tool node rather than
+        // ingested before migration 22 stays a plain tool node rather than
         // becoming a `skill` node with nothing to call itself.
         let is_skill = c.name == "Skill" && c.target.is_some();
         let (kind, name, target) = if is_skill {
@@ -2616,7 +2616,7 @@ mod tests {
 
     #[test]
     fn session_graph_leaves_a_pre_migration_skill_call_alone() {
-        // A row ingested before migration 16 has `target IS NULL`. The skill
+        // A row ingested before migration 22 has `target IS NULL`. The skill
         // promotion keys on the target (that IS the name), so such a row must
         // stay a plain `tool` node rather than become a `skill` node labelled
         // "Skill" — the graph degrades to its old picture instead of lying.

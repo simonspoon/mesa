@@ -10,10 +10,11 @@ equal specificity:
 | narrow | `@media (max-width: 860px)` | tablet / split-screen; layout thins, nav unchanged |
 | phone | `@media (max-width: 600px)` | the drawer + single-column tier |
 
-`isPhone()` in `Sidebar.tsx` (`matchMedia('(max-width: 600px)')`) is the one
-JS mirror of the phone tier. Anything new that needs the phone tier should
-prefer a CSS rule over a second JS media query — see *The scrim* below for the
-pattern.
+`isPhone()` in `frontend/src/phoneTier.ts` (`matchMedia('(max-width: 600px)')`)
+is the one JS mirror of the phone tier. Anything new that needs the phone tier
+should prefer a CSS rule over a second JS media query — see *The scrim* below
+for the pattern; both `.drawer-scrim` and `.phone-tabbar` are rendered
+unconditionally and switched on by CSS alone.
 
 ## The three phone invariants
 
@@ -72,8 +73,9 @@ under the finger. The scrim also gives the drawer a tap-to-dismiss target,
 which it previously lacked entirely.
 
 `z-index` ladder, lowest first: storyboard takeover `1000` → scrim `1150` →
-drawers `1200` → modal backdrop `1250` → command palette `1300`. A modal
-therefore still opens above an open drawer.
+drawers `1200` → **tab bar `1220`** → modal backdrop `1250` → command palette
+`1300`. A modal therefore still opens above an open drawer, and the tab bar
+stays tappable while a drawer is open (see *Bottom tab bar* below).
 
 ### 3. The shell is bound to `dvh`, not `vh`
 
@@ -92,8 +94,9 @@ that already lived there.
 
 | Surface | Phone state |
 |---|---|
+| Bottom nav | four-slot tab bar; the only nav chrome on a phone |
 | Board (kanban) | single column; touch-scroll + long-press drag both work |
-| Sidebars | overlay drawers with scrim + tap-to-dismiss |
+| Sidebars | overlay drawers with scrim + tap-to-dismiss; rails hidden, opened from the tab bar |
 | Git tab | `.git-layout` stacks; diff pane keeps a viewport-bound box |
 | CC Dashboard | grids collapse to 1 column; wide tables scroll inside `.cc-panel` |
 | History rows | wrap instead of holding fixed timestamp/actor columns |
@@ -103,15 +106,14 @@ that already lived there.
 | Terminal / Agent panes | **no phone rules**; no on-screen-keyboard handling |
 | Inbox / project pages | inherit the shell only; unaudited |
 
-## Planned: phone-first navigation
+## Bottom tab bar
 
-The tiers above make the desktop layout *survive* a phone. They do not make it
-a phone UI: the two collapsed sidebar rails still consume horizontal space on
-a 390px screen purely to host their re-expand handles, and every destination
-is behind a drawer.
+The tiers above make the desktop layout *survive* a phone. They did not make
+it a phone UI: the two collapsed sidebar rails consumed horizontal space on a
+390px screen purely to host their re-expand handles, and every destination sat
+behind a drawer.
 
-The agreed direction is a **bottom tab bar** at the phone tier, replacing both
-rails:
+`PhoneTabBar.tsx` replaces both rails with a fixed four-slot bar:
 
 ```
 ┌──────────────────────┐
@@ -121,27 +123,44 @@ rails:
 │  [ card ]            │  main — full width, no rails
 │  [ card ]            │
 ├──────────────────────┤
-│ Board  Inbox  Agents │  fixed tab bar
-│                  ⋯   │
+│ Board Inbox Agents ⋯ │  fixed tab bar (⋯ = More)
 └──────────────────────┘
 ```
 
-- Four slots: **Board** (active project, else Projects), **Inbox** (carries
-  the existing unassigned badge), **Agents** (opens the right drawer), **More**
-  (opens the left drawer — CC Dashboard + subnav, Terminal, project list,
-  archived group).
+- Four slots: **Board** (the active project; with no active project the slot
+  reads *Projects* and opens the left drawer, since there is no `#/projects`
+  index route), **Inbox** (carries the unassigned badge), **Agents** (opens
+  the right drawer), **More** (opens the left drawer — CC Dashboard + subnav,
+  Terminal, project list, archived group).
 - The bar is fixed with `padding-bottom: env(safe-area-inset-bottom)` so iOS's
-  home indicator does not sit on the tap targets.
-- At the phone tier the collapsed `.sidebar` / `.agent-sidebar` rails are
-  hidden; the tab bar is the only way to reach the drawers, so the drawers keep
-  their scrim and self-close behavior unchanged.
+  home indicator does not sit on the tap targets. `--phone-tabbar-reserve`
+  (bar height + that inset) is what `main`, `.terminal-page` and both drawers
+  keep clear.
+- The collapsed rails are gone at this tier, but by two *different* mechanisms,
+  and the difference is load-bearing. `.sidebar.collapsed` holds nothing but
+  its handle, so it is `display: none`. `.agent-sidebar.collapsed` may not be:
+  its body is deliberately `visibility: hidden` rather than `display: none` so
+  an attached terminal's fitted layout box survives a collapse/expand cycle
+  with no refit. It is clipped to `width: 0` instead — the same mechanism as
+  its usual 2.5rem collapse, with no rail left over.
+- The bar sits *above* the drawers in the `z-index` ladder, so switching tabs
+  while a drawer is open is one tap rather than dismiss-then-tap. The drawers
+  otherwise keep their scrim and self-close behavior unchanged.
+- Both sidebars' `collapsed` state moved to `App.tsx`, since the bar is now a
+  third party driving what were two private booleans. Slots that navigate also
+  close both drawers explicitly: the left drawer's self-close listens for
+  `hashchange`, which does not fire when you tap the project you are already
+  on, and the right drawer never self-closed on navigation at all.
+- One inbox poll lives in `App.tsx` and feeds both badges. `useFetch` caches
+  nothing across components, so an identical `key` in each would still be two
+  requests and the two counts could skew by a poll interval.
 
 **The constraint that governs the implementation:** `AgentSidebar` and the
 Terminal page are permanent sibling mounts in `App.tsx` and must never
 unmount — they own live PTY sessions through `PtyPool`. The existing
 `.main-slot-pane` visibility toggle is the established pattern. A tab bar that
-conditionally renders its panes would kill every attached terminal on tab
-switch; it must toggle visibility, exactly as `terminalActive` already does.
+conditionally rendered its panes would kill every attached terminal on tab
+switch; it toggles visibility only, exactly as `terminalActive` already does.
 
 ## Verifying a phone change
 
@@ -158,3 +177,7 @@ Three checks worth re-running after any change to this surface:
    long-press on the same card still starts a drag.
 3. The shell fills the visible viewport with the browser toolbar both shown and
    hidden — no clipped footer, no second scrollbar.
+4. Attach a terminal in the Agents drawer, tab away, tab back: it is still
+   attached and still scrolled where it was. This is the one check a tab-bar
+   change can silently break, and it fails loudly only in a *live* browser —
+   nothing about the JSX makes a conditional render look wrong.

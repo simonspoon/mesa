@@ -3374,11 +3374,24 @@ body.agent-sidebar-resizing {
   display: none;
 }
 
+/* Phone-tier bottom nav (mesa task 556). Same "off by default, switched on
+   inside the media block" shape as `.drawer-scrim` above, for the same reason:
+   `App.tsx` renders it unconditionally, so the breakpoint lives in CSS alone
+   and there is no second `matchMedia` to keep in sync. */
+.phone-tabbar {
+  display: none;
+}
+
 @media (max-width: 600px) {
   :root {
     /* Header + tabs + chrome are tighter on a phone; let viewport-bound panes
        (storyboard canvas, agents terminal) fit without forcing page scroll. */
     --tab-viewport-min: 16rem;
+    /* Tap-target row of the bottom tab bar, excluding the home-indicator
+       inset. `--phone-tabbar-reserve` is the whole thing — what everything
+       above the bar has to keep clear. */
+    --phone-tabbar-height: 3rem;
+    --phone-tabbar-reserve: calc(3rem + env(safe-area-inset-bottom));
   }
 
   header {
@@ -3387,7 +3400,7 @@ body.agent-sidebar-resizing {
 
   main,
   .terminal-page {
-    padding: 0.75rem 0.75rem 3rem;
+    padding: 0.75rem 0.75rem calc(var(--phone-tabbar-reserve) + 1rem);
   }
 
   h1 {
@@ -3410,14 +3423,90 @@ body.agent-sidebar-resizing {
     touch-action: none;
   }
 
+  /* Bottom tab bar (mesa task 556) — the phone tier's whole navigation, and
+     the reason the two collapsed rails below can go away.
+
+     Sits at 1220: ABOVE both drawers (1200) so switching tabs while a drawer
+     is open is one tap rather than dismiss-then-tap, and below the modal
+     backdrop (1250) so a modal is still exclusive. Full ladder, lowest first:
+     storyboard takeover 1000 → scrim 1150 → drawers 1200 → tab bar 1220 →
+     modal backdrop 1250 → command palette 1300. */
+  .phone-tabbar {
+    display: flex;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1220;
+    align-items: stretch;
+    background: rgba(6, 10, 16, 0.97);
+    border-top: 1px solid var(--border-bright);
+    /* Keeps the tap targets clear of the iOS home indicator. */
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* Reset the global button chrome (border, clip-path, shadow) the same way
+     `.sidebar-toggle` does, so the <a> and <button> slots are identical. */
+  .phone-tab {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    height: var(--phone-tabbar-height);
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    clip-path: none;
+    background: none;
+    box-shadow: none;
+    color: var(--muted);
+    font-size: 0.8rem;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .phone-tab:hover {
+    background: none;
+    box-shadow: none;
+  }
+
+  /* After :hover deliberately — equal specificity, so the later rule wins on a
+     tab that is both active and under a finger. */
+  .phone-tab.active {
+    color: var(--cyan);
+    background: none;
+    box-shadow: inset 0 2px 0 var(--cyan);
+  }
+
+  /* The collapsed rails exist only to host their re-expand handles, which the
+     tab bar has replaced — on a 390px screen that is pure width tax.
+
+     The nav rail holds nothing else, so it can go entirely. The agents rail
+     may NOT: `.agent-sidebar.collapsed .agent-sidebar-body` is deliberately
+     `visibility: hidden` rather than `display: none` so an attached
+     terminal's fitted layout box survives a collapse/expand cycle with no
+     refit. Clip the aside to zero width instead — the same mechanism as its
+     usual 2.5rem collapse (`overflow: hidden` on the aside, an explicit width
+     on the body inside), just with no rail left over. */
+  .sidebar.collapsed {
+    display: none;
+  }
+
+  .agent-sidebar.collapsed {
+    width: 0;
+    border-left: none;
+  }
+
   /* The expanded sidebar overlays the page as a drawer (it starts collapsed
-     on phones and closes itself after navigation — Sidebar.tsx); the
-     collapsed rail stays in-flow so the reopen handle is always visible. */
+     on phones and closes itself after navigation — Sidebar.tsx). Both drawers
+     stop above the tab bar rather than running under it, since the bar stays
+     tappable while they are open. */
   .sidebar:not(.collapsed) {
     position: fixed;
     top: 0;
     left: 0;
-    bottom: 0;
+    bottom: var(--phone-tabbar-reserve);
     width: min(16rem, 85vw);
     min-height: 0;
     overflow-y: auto;
@@ -3427,14 +3516,13 @@ body.agent-sidebar-resizing {
     box-shadow: 4px 0 24px rgba(0, 0, 0, 0.6);
   }
 
-  /* Same drawer treatment, mirrored to the right edge — it defaults to
-     collapsed (AgentSidebar.tsx), so the reopen handle stays in-flow here
-     too. */
+  /* Same drawer treatment, mirrored to the right edge — opened by the tab
+     bar's Agents slot. */
   .agent-sidebar:not(.collapsed) {
     position: fixed;
     top: 0;
     right: 0;
-    bottom: 0;
+    bottom: var(--phone-tabbar-reserve);
     width: min(24rem, 90vw);
     height: auto;
     z-index: 1200;

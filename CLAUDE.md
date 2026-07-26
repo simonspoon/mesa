@@ -254,7 +254,10 @@ invariants you must not break — read them before changing `src/`:
   activation, not `distance`); an overlay drawer must render a
   `.drawer-scrim`, whose `touch-action: none` is what stops touches falling
   through to the page behind it; and `#root` binds to `100dvh`, not `100vh`.
-  `docs/mobile.md`.
+  Phone nav is a bottom tab bar (`PhoneTabBar.tsx`) that replaces both
+  collapsed sidebar rails and opens the drawers — it may only toggle
+  visibility, never conditionally render, since `AgentSidebar`/`TerminalPage`
+  own live PTY sessions. `docs/mobile.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
 - **Inbox watcher** — `mesa serve --watch-inbox`'s periodic auto-triage

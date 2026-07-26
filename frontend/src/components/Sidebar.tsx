@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import {
   getGitStatus,
   listAllAgents,
-  listInbox,
   listProjects,
   listTasks,
   restartServer,
@@ -10,6 +9,7 @@ import {
 } from '../api'
 import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
+import { isPhone } from '../phoneTier'
 import { useFetch } from '../useFetch'
 import { ConfirmDelete } from './ConfirmDelete'
 import { CreateProjectModal } from './CreateProjectModal'
@@ -44,11 +44,6 @@ async function handleRestart(): Promise<void> {
 
 // CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
 // overview (charts + KPIs); these are the table views split out beneath it.
-// Phone-width check (matches the @media blocks in App.css): below this the
-// expanded sidebar overlays the content as a drawer, so it starts collapsed
-// and closes itself after navigation.
-const isPhone = () => window.matchMedia('(max-width: 600px)').matches
-
 const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
   { tab: 'skills-agents', label: 'Skills / Agents', hash: '#/cc/skills-agents' },
   { tab: 'projects', label: 'Projects', hash: '#/cc/projects' },
@@ -91,13 +86,27 @@ export function Sidebar({
   terminalActive,
   ccTab,
   version,
+  unassigned,
+  collapsed,
+  onCollapsedChange,
 }: {
   activeProjectId: number | null
   inboxActive: boolean
   terminalActive: boolean
   ccTab: CcTab | null
   version: number
+  // Count of inbox items still awaiting triage, for the Inbox badge. Fetched
+  // in `App.tsx` and shared with the phone tab bar's own badge so the two can
+  // never disagree (task 556).
+  unassigned: number
+  // Full-sidebar collapse: hides the whole nav to give the main content area
+  // the extra width, leaving only a thin re-expand handle — and at the phone
+  // tier, the difference between a closed drawer and an open one. Owned by
+  // `App.tsx` since the phone tab bar's "More" slot opens this drawer too.
+  collapsed: boolean
+  onCollapsedChange: (collapsed: boolean) => void
 }) {
+  const setCollapsed = onCollapsedChange
   // One fetch, archived included (arch.md §"Spec 502" §4) — partitioned below
   // on `p.archived` so the main list and the archived group can never skew
   // against each other the way two separate requests could.
@@ -107,13 +116,6 @@ export function Sidebar({
   )
   const projects = allProjects?.filter((p) => !p.archived)
   const archivedProjects = allProjects?.filter((p) => p.archived) ?? []
-  const { data: inbox } = useFetch(() => listInbox(), 'inbox-nav', {
-    pollMs: 5000,
-  })
-  // Badge counts items still awaiting triage (no project assigned yet).
-  const unassigned = inbox
-    ? inbox.filter((i) => i.project_id === null).length
-    : 0
   // Per-project todo counts for the project rows; polls like the inbox badge
   // so counts stay current as agents create/close tasks.
   const { data: todos, refetch: refetchTodos } = useFetch(
@@ -159,6 +161,16 @@ export function Sidebar({
   const [archivedCollapsed, setArchivedCollapsed] = useState(true)
   const [unarchiveError, setUnarchiveError] = useState<string | null>(null)
 
+  // On phones the expanded sidebar is an overlay drawer; close it once the
+  // user has picked a destination so it doesn't sit over the new page.
+  useEffect(() => {
+    const onNav = () => {
+      if (isPhone()) setCollapsed(true)
+    }
+    window.addEventListener('hashchange', onNav)
+    return () => window.removeEventListener('hashchange', onNav)
+  }, [setCollapsed])
+
   function handleUnarchive(id: number): void {
     setUnarchiveError(null)
     unarchiveProject(id)
@@ -176,20 +188,6 @@ export function Sidebar({
         setUnarchiveError(e instanceof Error ? e.message : String(e))
       })
   }
-  // Full-sidebar collapse: hides the whole nav to give the main content area
-  // the extra width, leaving only a thin re-expand handle.
-  const [collapsed, setCollapsed] = useState(isPhone)
-
-  // On phones the expanded sidebar is an overlay drawer; close it once the
-  // user has picked a destination so it doesn't sit over the new page.
-  useEffect(() => {
-    const onNav = () => {
-      if (isPhone()) setCollapsed(true)
-    }
-    window.addEventListener('hashchange', onNav)
-    return () => window.removeEventListener('hashchange', onNav)
-  }, [])
-
   if (collapsed) {
     return (
       <nav className="sidebar collapsed">

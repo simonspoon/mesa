@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
 import './App.css'
-import { getTask } from './api'
+import { getTask, listInbox } from './api'
 import { AgentSidebar } from './components/AgentSidebar'
 import { CommandPalette } from './components/CommandPalette'
+import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { TerminalPage } from './pages/TerminalPage'
+import { isPhone } from './phoneTier'
 import { useSpatialNav } from './spatialNav'
 import { useFetch } from './useFetch'
 
@@ -78,6 +80,28 @@ function App() {
   // second global window keydown listener, disjoint key set from the
   // shortcut above, mounted alongside it per arch-449-keyboard.md §3.
   useSpatialNav()
+  // Both sidebars' collapse state lives here rather than inside each of them
+  // (mesa task 556): the phone tab bar's Agents/More slots open the drawers,
+  // so a third party now drives what used to be two private booleans. The
+  // sidebars are otherwise unchanged — in particular they are still permanent
+  // mounts that only ever toggle CSS, never unmount, which is what keeps
+  // AgentSidebar's live PTY sessions alive across a tab switch.
+  //
+  // The nav sidebar starts collapsed on phones (it is an overlay drawer
+  // there); the agents sidebar defaults to collapsed at every width.
+  const [navCollapsed, setNavCollapsed] = useState(isPhone)
+  const [agentsCollapsed, setAgentsCollapsed] = useState(true)
+  // One inbox poll for two badges. The sidebar's nav entry and the phone tab
+  // bar both show the count of items still awaiting triage, and a fetch each
+  // would let them skew by up to a poll interval — `useFetch` caches nothing
+  // across components, so an identical `key` in both would still be two
+  // independent requests.
+  const { data: inbox } = useFetch(() => listInbox(), 'inbox-nav', {
+    pollMs: 5000,
+  })
+  const unassigned = inbox
+    ? inbox.filter((i) => i.project_id === null).length
+    : 0
 
   const inboxMatch = /^\/inbox$/.exec(path)
   // Terminal is not resolved into `page` (see below) — it's a permanent
@@ -294,6 +318,9 @@ function App() {
           terminalActive={terminalActive}
           ccTab={ccTab}
           version={navVersion}
+          unassigned={unassigned}
+          collapsed={navCollapsed}
+          onCollapsedChange={setNavCollapsed}
         />
         <div className="main-slot">
           {/* Both panes are permanent siblings, never conditionally rendered —
@@ -309,7 +336,11 @@ function App() {
             <TerminalPage />
           </div>
         </div>
-        <AgentSidebar activeProjectId={activeProjectId} />
+        <AgentSidebar
+          activeProjectId={activeProjectId}
+          collapsed={agentsCollapsed}
+          onCollapsedChange={setAgentsCollapsed}
+        />
         {/* Single always-mounted owner of every open leaf's PtyTerminal
             (mesa task 399, .scratch/arch.md §6.2), across BOTH AgentSidebar
             and TerminalPage — a permanent sibling, never inside `page` or
@@ -317,6 +348,18 @@ function App() {
             itself already relies on. */}
         <PtyPool />
       </div>
+      {/* Phone-tier only (hidden by CSS above 600px), outside `.shell-body`
+          because it is `position: fixed` and must not participate in the
+          shell's flex row. */}
+      <PhoneTabBar
+        activeProjectId={activeProjectId}
+        inboxActive={inboxMatch !== null}
+        unassigned={unassigned}
+        navOpen={!navCollapsed}
+        agentsOpen={!agentsCollapsed}
+        onNavOpenChange={(open) => setNavCollapsed(!open)}
+        onAgentsOpenChange={(open) => setAgentsCollapsed(!open)}
+      />
       {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} />}
     </>
   )

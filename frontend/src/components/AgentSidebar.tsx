@@ -448,8 +448,20 @@ function SplitNodeView({
  * a collapse/expand cycle with no reconnect, exactly like leaving the tab
  * and coming back — now true for every open pane, not just one.
  */
-export function AgentSidebar({ activeProjectId }: { activeProjectId: number | null }) {
-  const [collapsed, setCollapsed] = useState(true)
+export function AgentSidebar({
+  activeProjectId,
+  collapsed,
+  onCollapsedChange,
+}: {
+  activeProjectId: number | null
+  // Owned by `App.tsx` since mesa task 556: the phone tab bar's "Agents" slot
+  // opens this drawer, so the collapse is no longer this component's private
+  // state. Nothing else changes — collapsing still only alters CSS, never the
+  // React tree, which is what lets every open pane's WebSocket survive it.
+  collapsed: boolean
+  onCollapsedChange: (collapsed: boolean) => void
+}) {
+  const setCollapsed = onCollapsedChange
   // Split tree holding every open AGENT pane + how each split's children
   // share its flex space — the 'Agents' session-list is no longer part of
   // this tree (mesa task 414: it's a fixed rail, see `listWidth`/
@@ -983,7 +995,7 @@ export function AgentSidebar({ activeProjectId }: { activeProjectId: number | nu
             aria-label={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
             title={collapsed ? 'Expand agents sidebar' : 'Collapse agents sidebar'}
             onClick={() => {
-              setCollapsed((c) => !c)
+              setCollapsed(!collapsed)
               setMaximized(false)
               closeAddAgent()
             }}

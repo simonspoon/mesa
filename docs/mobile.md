@@ -217,7 +217,7 @@ rather than a second `isPhone()` call.
 | CC Dashboard | grids collapse to 1 column; wide tables scroll inside `.cc-panel` |
 | History rows | wrap instead of holding fixed timestamp/actor columns |
 | Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
-| Files tab | **no phone rules** |
+| Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified — see *Files tab and the unified diff* |
 | Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
 | Terminal / Agent panes | **no phone rules**; no on-screen-keyboard handling |
 | Inbox / project pages | inherit the shell only; unaudited |
@@ -314,6 +314,65 @@ Three things about that are load-bearing rather than cosmetic:
   to tap. `.panel-head` is therefore `position: sticky` at the phone tier,
   with negative horizontal margins so the bar spans the sheet's padding.
 
+## Files tab and the unified diff
+
+The ≤860px tier had already stacked `.files-layout` into a column since the
+Files tab shipped, so this surface was never a two-columns-at-390px problem —
+which is what made it look done. The defect was vertical. The tree is a full
+column of rows sitting *above* the file, and measured at 390×844 with a file
+open, `.files-content-pane`'s top sat at **643px of an 844px viewport**: the
+file the tab exists to show was almost entirely below the fold, reachable only
+by scrolling `main` past a tree that had already done its job.
+
+So opening a file collapses the tree (`FilesView`'s `treeOpen`), behind a
+toggle that doubles as a breadcrumb (`▸ file tree — <path>`). Same measurement
+after: content top **287px**, full width. `display: none` rather than a height
+cap because on a phone the tree is a *navigation step*, not a persistent
+sidebar — once you are reading, a 30vh stub of folders is still a third of the
+screen spent on the thing you have finished with.
+
+Two things are worth knowing before touching it:
+
+- **`treeOpen` is inert above 600px, and deliberately so.** The button is
+  `display: none` and `.files-tree-collapsed` has no rule outside the phone
+  block, so a desktop user who opened a file has the flag set and the tree
+  still up. That is the same "the breakpoint lives in CSS alone" rule the tab
+  bar follows — no second `matchMedia` for a component to keep in sync — and
+  it is what a desktop regression check should assert: `treeCls` containing
+  `files-tree-collapsed` while `treeDisplay` reads `block`.
+- **Nothing resizes `.files-content-pane` to go with the collapse.** An
+  attempt to was measured inert and removed: the pane is `flex: 1 1 0%` in a
+  column whose height the ≤860px tier already relaxed to `auto`, so flex-basis
+  beats any `height` and the pane sizes to its content. That is what this tier
+  wants — a long file grows the pane and scrolls `main` rather than trapping
+  the reader in a nested scroller (`Cargo.lock`: 32890px pane, 33286px `main`).
+
+**`SideBySideDiff` goes unified at the phone tier, in CSS alone.** Its two text
+tracks measured 150px each at 390px — narrower than the code they quote, so
+every line wrapped several times and the alignment two columns buy was worth
+nothing. Dropping the grid to two columns converts the *same* markup, because
+the cells are emitted flat into one grid with no per-row wrapper: the leftovers
+reflow in source order, so a changed row's old half lands on one grid row and
+its new half on the next — exactly old-above-new. Two cells have to disappear
+for that to read correctly:
+
+- the **right half of a context row** (it is the identical line, printed twice)
+- **either half that stands for "nothing here"** on an unpaired add/delete
+
+Both are addressable only because each cell carries its side
+(`diff-split-l`/`-r`, added for this) — the tint classes cannot tell a context
+row's two halves apart, since both are `diff-split-ctx`. `::before` markers
+(`-`/`+`/space) restore the gutter the parser strips, which stops being
+decoration once colour is the only other signal and the two lines are stacked
+rather than side by side. Measured after: text column 150px → **306px**.
+
+The Git tab is *not* part of this. It renders its own unified `<pre
+class="git-diff-text">` (`GitView.tsx`) and never touches `SideBySideDiff`;
+verified readable at 390×844 as-is — single column, 250 lines, mono, scrolling
+both ways per the same verbatim doctrine as the file viewer. Its file list has
+the same push-below-the-fold shape the tree had (diff pane top at 680px), which
+is a real but separate gap.
+
 ## Verifying a phone change
 
 Drive a real browser at a phone viewport (390×844 is the reference size) —
@@ -352,3 +411,11 @@ Checks worth re-running after any change to this surface:
    and pressing `a` while it is open does **not** open the create-task modal.
    Scroll the board first, so "returns to the same position" is a claim with
    a non-zero number in it.
+7. Open the Files tab, open a file: the tree goes, the toggle carries the
+   path, and the content pane's top moves up the screen — quote the `top`,
+   not "it looks better". Tap the toggle: the tree returns with the file
+   still open. Then open that file's history and pick a commit: the diff is
+   two grid columns, a context line appears **once**, and a changed line's
+   `-` row sits directly above its `+` row. Re-run the same three at 1440px
+   and assert the diff is back to four columns with zero hidden cells — that
+   is the check that catches a phone rule leaking out of its media block.

@@ -128,6 +128,14 @@ export function SideBySideDiff({ diff }: { diff: string }) {
   // so both halves of a row share the grid's column tracks and stay aligned
   // however a long line wraps. Tint is per side, not per row: a `chg` row is
   // deletion-tinted on the left and addition-tinted on the right.
+  //
+  // Each cell also carries which side it belongs to (`diff-split-l`/`-r`).
+  // Nothing here reads it, but it is what lets the phone tier collapse this
+  // same markup to a *unified* diff in CSS alone (App.css, ≤600px): a
+  // 2-column grid plus `display: none` on the right half of a context row
+  // and on either half that is empty leaves every remaining cell to reflow
+  // into old-above-new order. The side is otherwise unrecoverable from the
+  // class list, since a context row is tinted `ctx` on both halves.
   return (
     <div className="diff-split">
       {rows.map((row, i) => {
@@ -144,16 +152,20 @@ export function SideBySideDiff({ diff }: { diff: string }) {
           row.kind === 'ctx' ? 'ctx' : row.right !== null ? 'add' : 'empty'
         return (
           <Fragment key={i}>
-            <span className={`diff-split-no diff-split-${leftTint}`}>
+            <span className={`diff-split-no diff-split-l diff-split-${leftTint}`}>
               {row.left?.no ?? ''}
             </span>
-            <span className={`diff-split-text diff-split-${leftTint}`}>
+            <span
+              className={`diff-split-text diff-split-l diff-split-${leftTint}`}
+            >
               {row.left?.text ?? ''}
             </span>
-            <span className={`diff-split-no diff-split-${rightTint}`}>
+            <span className={`diff-split-no diff-split-r diff-split-${rightTint}`}>
               {row.right?.no ?? ''}
             </span>
-            <span className={`diff-split-text diff-split-${rightTint}`}>
+            <span
+              className={`diff-split-text diff-split-r diff-split-${rightTint}`}
+            >
               {row.right?.text ?? ''}
             </span>
           </Fragment>

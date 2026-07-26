@@ -257,7 +257,11 @@ invariants you must not break — read them before changing `src/`:
   Phone nav is a bottom tab bar (`PhoneTabBar.tsx`) that replaces both
   collapsed sidebar rails and opens the drawers — it may only toggle
   visibility, never conditionally render, since `AgentSidebar`/`TerminalPage`
-  own live PTY sessions. `docs/mobile.md`.
+  own live PTY sessions. Where a component *does* carry phone-only state
+  (`FilesView`'s `treeOpen`), the breakpoint still lives in CSS alone: the
+  flag stays set at every width and only the phone block has a rule that
+  reads it, so there is no second `matchMedia` to keep in sync.
+  `docs/mobile.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
 - **Inbox watcher** — `mesa serve --watch-inbox`'s periodic auto-triage

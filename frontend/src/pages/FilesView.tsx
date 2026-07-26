@@ -550,6 +550,14 @@ export function FilesView({ projectId }: { projectId: number }) {
   const [childrenCache, setChildrenCache] = useState<Map<string, DirState>>(
     new Map(),
   )
+  // Whether the tree is showing. Only the phone tier can turn this off, and
+  // only the phone tier renders anything that reacts to it — above 600px the
+  // toggle button is `display: none` and `.files-tree-collapsed` has no rule
+  // at all, so the tree is always up and this flag is inert. That is
+  // deliberate: the breakpoint stays in CSS alone, with no second
+  // `matchMedia` for the component to keep in sync (same rule the phone tab
+  // bar follows, App.css).
+  const [treeOpen, setTreeOpen] = useState(true)
   // Reset on project change (render-time, off the changed prop — same
   // pattern as GitView/HistoryPane): this component isn't remounted when the
   // route moves between projects, so a stale selection from project A must
@@ -560,6 +568,7 @@ export function FilesView({ projectId }: { projectId: number }) {
     setSelectedPath(null)
     setExpanded(new Set())
     setChildrenCache(new Map())
+    setTreeOpen(true)
   }
 
   function ensureChildren(path: string) {
@@ -613,7 +622,22 @@ export function FilesView({ projectId }: { projectId: number }) {
         <p className="muted">This folder is empty.</p>
       ) : (
         <div className="files-layout">
-          <ul className="files-tree">
+          {/* Phone-tier affordance for the collapse above; hidden by CSS at
+              every wider tier, where the tree never leaves. Rendered before
+              the tree so it stays put as the tree comes and goes, and so the
+              two read as one control in the tab order. */}
+          <button
+            type="button"
+            className="files-tree-phone-toggle"
+            aria-expanded={treeOpen}
+            onClick={() => setTreeOpen((open) => !open)}
+          >
+            {treeOpen ? '▾' : '▸'} file tree
+            {!treeOpen && selectedPath !== null && (
+              <span className="files-tree-phone-crumb"> — {selectedPath}</span>
+            )}
+          </button>
+          <ul className={`files-tree${treeOpen ? '' : ' files-tree-collapsed'}`}>
             {data.tree.map((entry) => (
               <TreeNode
                 key={entry.path}
@@ -623,7 +647,16 @@ export function FilesView({ projectId }: { projectId: number }) {
                 onToggle={toggle}
                 childrenCache={childrenCache}
                 selectedPath={selectedPath}
-                onSelectFile={setSelectedPath}
+                onSelectFile={(path) => {
+                  setSelectedPath(path)
+                  // Opening a file closes the tree, which is what makes the
+                  // phone tier's stacked layout usable: the tree is a full
+                  // column of rows, so leaving it up pushes the file itself
+                  // below the fold (measured at 390x844: the content pane's
+                  // top sat at 643px of an 844px viewport). Inert above
+                  // 600px, per `treeOpen` above.
+                  setTreeOpen(false)
+                }}
               />
             ))}
           </ul>

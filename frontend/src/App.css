@@ -2881,6 +2881,16 @@ body.agent-sidebar-resizing {
   background: var(--panel);
 }
 
+/* Phone-tier tree collapse (mesa task 559). Off by default and switched on
+   inside the ≤600px block — the same "the breakpoint lives in CSS alone"
+   shape as `.drawer-scrim` and `.phone-tabbar`, so `FilesView` needs no
+   `matchMedia` of its own. There is deliberately no `.files-tree-collapsed`
+   rule out here either: above 600px the tree never leaves, whatever the
+   component's `treeOpen` flag happens to be. */
+.files-tree-phone-toggle {
+  display: none;
+}
+
 .files-tree li {
   padding: 0.25rem 0.5rem;
   cursor: pointer;
@@ -3760,6 +3770,92 @@ body.agent-sidebar-resizing {
 
   .canvas-hint-touch {
     display: inline;
+  }
+
+  /* ── Files tab (mesa task 559) ──────────────────────────────────────────
+     The ≤860px tier already stacks `.files-layout` into a column, so the
+     tree and the content pane were never side by side here. What it did not
+     do is bound the tree: it is a full column of rows sitting *above* the
+     file, and measured at 390x844 with `build.rs` open the content pane's
+     top was at 643px of an 844px viewport — the file it exists to show was
+     almost entirely below the fold, reachable only by scrolling `main` past
+     a tree that had already done its job.
+
+     So opening a file collapses the tree (FilesView's `treeOpen`), and this
+     button brings it back. `display: none` rather than a height cap because
+     the tree is a *navigation* step on a phone, not a persistent sidebar —
+     once you are reading a file, a 30vh stub of folders is still a third of
+     the screen spent on the thing you have finished with. */
+  .files-tree-phone-toggle {
+    display: block;
+    width: 100%;
+    /* 44px tap floor, matching the canvas controls above. */
+    min-height: 44px;
+    text-align: left;
+    font-size: 0.85rem;
+    /* The file path can be long; let it wrap rather than clip the label. */
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* The path is context for a collapsed tree, not a second label — muted so
+     the control still reads as "file tree" at a glance. */
+  .files-tree-phone-crumb {
+    color: var(--muted);
+  }
+
+  .files-tree.files-tree-collapsed {
+    display: none;
+  }
+
+  /* Nothing needs to resize `.files-content-pane` to go with this, and an
+     attempt to was measured inert and removed: the pane is `flex: 1 1 0%`
+     inside a column that the ≤860px tier already relaxed to `height: auto`,
+     so its flex base size wins over any `height` here and it simply sizes
+     to its content. That is the behaviour this tier wants — a short file
+     gets a short box, and a long one grows the pane and scrolls `main`
+     rather than trapping the reader in a nested scroller (measured at
+     390x844: `Cargo.lock` produced a 32890px pane and a 33286px `main`). */
+
+  /* ── Side-by-side diff → unified (mesa task 559) ────────────────────────
+     `.diff-split` is one grid with four cells emitted per row and no row
+     wrapper, which is what keeps the two halves aligned on desktop. At
+     390px those two text tracks measured 150px each — narrower than the
+     column width of the code they are quoting, so every line wrapped
+     several times and the alignment they buy is worth nothing.
+
+     Dropping the grid to two columns turns the *same* markup into a unified
+     diff with no extra render path, because the leftover cells reflow in
+     source order: a changed row's old half lands on one grid row and its
+     new half on the next, which is exactly old-above-new. Two cells have to
+     go for that to read correctly — the right half of a context row (it is
+     the identical line, printed twice) and either half that stands for
+     "nothing here" on an unpaired add/delete. Both are only addressable
+     because the cells carry their side (`SideBySideDiff`); the tint classes
+     alone cannot tell a context row's two halves apart. */
+  .diff-split {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .diff-split-r.diff-split-ctx,
+  .diff-split-empty {
+    display: none;
+  }
+
+  /* Unified diffs mark the side in the gutter, and here that is not
+     decoration: colour is the only other signal, one line now sits directly
+     above its replacement rather than beside it, and the markers were
+     stripped during parsing. A static literal, never file content. */
+  .diff-split-text.diff-split-del::before {
+    content: '-';
+  }
+
+  .diff-split-text.diff-split-add::before {
+    content: '+';
+  }
+
+  .diff-split-text.diff-split-ctx::before {
+    content: ' ';
   }
 }
 

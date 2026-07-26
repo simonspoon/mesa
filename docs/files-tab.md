@@ -114,7 +114,11 @@ this surface.
   collapsing and re-expanding a directory never re-fetches it — reset only
   on project change, same as `selectedPath`/`expanded`. A `truncated`
   directory shows its own inline note (`.files-tree-note`) rather than one
-  global banner, since the cap is now per-directory (mesa task 410). A
+  global banner, since the cap is now per-directory (mesa task 410). At the
+  phone tier the two panes are stacked (≤860px) and opening a file also
+  *collapses* the tree behind a breadcrumb toggle (`treeOpen`, task 559),
+  because a full tree above the file pushes the file below the fold; the flag
+  is inert at every wider width, and the reasoning is in `docs/mobile.md`. A
   non-binary, non-truncated file's content pane
   shows an **Edit** button; clicking it swaps the rendered content for a
   full-height `<textarea>` (`.files-content-editor`) pre-filled with the
@@ -154,7 +158,11 @@ this surface.
   no hunk at all — a binary file's `Binary files … differ`, an empty diff —
   falls back to rendering the server's text verbatim. Cells go straight into
   one four-column grid with no per-row wrapper, so both halves of a line
-  share column tracks and stay aligned however a long line wraps. Diff text
+  share column tracks and stay aligned however a long line wraps. That flat
+  emission is also what lets the phone tier turn the *same* markup into a
+  unified diff in CSS alone — hence the `diff-split-l`/`-r` side class every
+  cell carries, which nothing in the component reads (task 559,
+  `docs/mobile.md`). Diff text
   is untrusted: every line is a plain text node in a `<span>`, classified by
   prefix for CSS only, exactly as in `GitView`'s unified `DiffText`.
   Tree-row and

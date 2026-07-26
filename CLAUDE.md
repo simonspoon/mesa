@@ -308,12 +308,21 @@ invariants you must not break — read them before changing `src/`:
   own live PTY sessions. Where a component *does* carry phone-only state
   (`FilesView`'s `treeOpen`), the breakpoint still lives in CSS alone: the
   flag stays set at every width and only the phone block has a rule that
-  reads it, so there is no second `matchMedia` to keep in sync. The **one**
-  sanctioned exception is `usePhoneTier()` — the PTY surfaces collapse their
-  pane *tree* to a single pane here, and a tree is a JS structure that CSS
-  can only hide, which on a live xterm is the zero-size-box trap. It
-  subscribes to the same `MediaQueryList` `isPhone()` reads, so the app still
-  has exactly one query. Separately, `100dvh` is **not** enough on a
+  reads it, so there is no second `matchMedia` to keep in sync. Two
+  sanctioned exceptions exist, both in `phoneTier.ts` and both over the *same*
+  `MediaQueryList` `isPhone()` reads — so the app still has exactly one query,
+  which is the invariant, not the export count. `usePhoneTier()` reports the
+  current tier: the PTY surfaces collapse their pane *tree* to a single pane
+  here, and a tree is a JS structure that CSS can only hide, which on a live
+  xterm is the zero-size-box trap. `onPhoneTierChange()` reports the
+  **crossing**, for the one piece of state whose *meaning* differs either side
+  of the breakpoint — both sidebars' `collapsed`, an in-flow sidebar above and
+  a fixed overlay drawer below. That one must be edge-triggered, never derived
+  from the current tier: `useState(isPhone)` decided it once at mount and left
+  a widened phone rail stubbed at 34px and a shrunk desktop sidebar sitting as
+  a 256px drawer nobody opened, while a derived `collapsed = phone` would
+  instead re-assert every render and reopen a drawer the user just closed
+  (task 562). Separately, `100dvh` is **not** enough on a
   terminal: a keyboard shrinks only the *visual* viewport, so
   `visualViewport.ts` publishes `--visual-viewport-height` (written at every
   width, read only inside the phone block) and `#root` plus both fixed

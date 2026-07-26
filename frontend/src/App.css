@@ -172,6 +172,15 @@ header {
   gap: 0.5rem;
 }
 
+/* Inbox bodies are free text from agents and frequently carry a bare URL,
+   which has no break opportunity at all — measured 726px wide inside a 340px
+   column at 390x844, scrolling `main` sideways to 751px (mesa task 562). Same
+   rule, for the same reason, as `.description` / `.frame-title` / `.frame-body`,
+   which are the other markdown-rendering containers. */
+.inbox-body {
+  overflow-wrap: anywhere;
+}
+
 .inbox-body > :first-child {
   margin-top: 0;
 }
@@ -185,6 +194,23 @@ header {
   align-items: center;
   gap: 1rem;
   flex-wrap: wrap;
+}
+
+/* A <select>'s intrinsic width is its widest <option>, so the assign control
+   was as wide as the longest project name — 424px in a 340px row at 390x844,
+   putting the control itself off-screen (mesa task 562). `flex-wrap` above
+   can move the label to its own line but cannot shrink it: as a flex item it
+   keeps the default `min-width: auto`, i.e. never below its content's
+   min-content width. Unsetting that is what lets `max-width` on the select
+   actually bind, and both halves are required — either alone is inert.
+   Unscoped rather than phone-tier, because the overflow is a function of the
+   longest project name, not of the viewport. */
+.inbox-actions label {
+  min-width: 0;
+}
+
+.inbox-actions select {
+  max-width: 100%;
 }
 
 .nav-projects {

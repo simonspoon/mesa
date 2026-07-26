@@ -30,6 +30,29 @@ function subscribe(cb: () => void): () => void {
 }
 
 /**
+ * Subscribe to *crossings* of the phone breakpoint, for state whose meaning
+ * differs either side of it rather than merely its styling (mesa task 562:
+ * both sidebars' `collapsed` flag, which is an in-flow sidebar above 600px
+ * and a fixed overlay drawer below).
+ *
+ * Edge-triggered by construction — `change` fires only when `matches` flips —
+ * which is the point: a caller adjusting a tier-dependent *default* must not
+ * re-assert it on every render, or it overrides the user's own toggle. That
+ * also keeps the setState in a subscription callback rather than an effect
+ * body, which is what `react-hooks/set-state-in-effect` asks for.
+ *
+ * Distinct from `usePhoneTier()` above, which reports the current *value* for
+ * components that render differently per tier. Same one `MediaQueryList`.
+ */
+export function onPhoneTierChange(
+  cb: (phone: boolean) => void,
+): () => void {
+  const handler = (e: MediaQueryListEvent) => cb(e.matches)
+  mql.addEventListener('change', handler)
+  return () => mql.removeEventListener('change', handler)
+}
+
+/**
  * Reactive form of `isPhone()`, for the one case CSS genuinely cannot cover
  * (mesa task 560): the PTY surfaces collapse their pane *tree* to a single
  * pane at this tier, and a tree is a JS data structure — a CSS rule can only

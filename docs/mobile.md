@@ -220,7 +220,10 @@ rather than a second `isPhone()` call.
 | Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified — see *Files tab and the unified diff* |
 | Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
 | Terminal / Agent panes | one pane, no split UI; shell height follows the on-screen keyboard — see *Terminal and agent panes* |
-| Inbox / project pages | inherit the shell only; unaudited |
+| Inbox | body text wraps unbreakable URLs; the assign `<select>` is capped to its row — see *Crossing the breakpoint* for the audit's other half |
+| Project page header / tab strip | `.tabs` already wraps to two rows at 390px; all six tabs in-view and hit-testable, no change needed |
+| Command palette | 351px wide inside a 390px viewport, input autofocused; no change needed |
+| Archived projects group | drawer rows hold at 223px with a 56-char name; `restore` stays visible and hittable |
 
 ## Bottom tab bar
 
@@ -488,7 +491,9 @@ hides `+ new shell`, the only control that can mint a second.
 This is the one place the "prefer a CSS rule, keep the breakpoint out of JS"
 rule is broken on purpose, and `usePhoneTier()` in `phoneTier.ts` — a
 `useSyncExternalStore` over the *same* `MediaQueryList` `isPhone()` already
-uses, so there is still exactly one query in the app — is how. CSS could only
+uses, so there is still exactly one query in the app — is how. (`phoneTier.ts`
+exports a second subscriber, `onPhoneTierChange()`, over that same one query;
+it answers a different question — see *Crossing the breakpoint*.) CSS could only
 have *hidden* the extra panes, which is strictly worse twice over:
 `display: none` collapses the box `FitAddon` measures to zero (the trap
 `docs/terminal.md` names for the cross-nav `visibility` toggle), and a
@@ -554,12 +559,69 @@ repeats, stays at 1.
   `visualViewport` resize in Chrome — faithful for height, silent on
   scroll-to-focus (above).
 
+## Crossing the breakpoint
+
+Most phone state is styling, and CSS re-evaluates a media query for free when
+the viewport changes. The exception is a **React state value whose meaning
+differs either side of 600px** — and there is exactly one: both sidebars'
+`collapsed` flag, which selects an in-flow sidebar above the breakpoint and a
+fixed overlay drawer below it (`.sidebar:not(.collapsed)` in the phone block).
+
+`App.tsx` seeded that flag with `useState(isPhone)`, which decides it once, at
+mount, and never again. Nothing re-decided it on a rotation, an iPad split-view
+change, or a desktop window resize, so the flag stayed valid while its meaning
+changed underneath it. Measured on the unfixed build:
+
+| mounted at | resized to | result |
+|---|---|---|
+| 1200px, sidebar expanded | 390px | stayed expanded — a 256px overlay drawer nobody opened, covering two-thirds of the screen |
+| 390px, sidebar collapsed | 1200px | stayed collapsed — a 34px stub rail on a wide screen |
+
+The rule: **tier-dependent state is edge-triggered on the crossing, never
+derived from the current tier.** `onPhoneTierChange()` in `phoneTier.ts` is
+that edge — it wraps the same one `MediaQueryList`'s `change` event, which
+fires only when `matches` flips.
+
+Deriving instead (`collapsed = phone`) is the tempting shape and is wrong: it
+re-asserts on every render, so it would reopen a drawer the user just closed.
+Edge-triggering leaves intra-tier behaviour untouched — verified by opening the
+drawer at 390px and resizing to 375px, where it stays open.
+
+Entering the phone tier collapses **both** drawers, since both become fixed
+overlays there and neither was opened as one. Leaving it restores only the nav:
+the nav's wide-screen default is expanded, while the agents sidebar defaults to
+collapsed at every width, so auto-expanding it on the way out would invent
+state nobody asked for.
+
+Keep the setState in the subscription callback rather than an effect body —
+`react-hooks/set-state-in-effect` is a CI-gated lint error, and it is pointing
+at the right design here, not merely a style.
+
 ## Verifying a phone change
 
 Drive a real browser at a phone viewport (390×844 is the reference size) —
 `@media` rules and touch gestures are not observable from a test suite or a
 `curl`. Use a throwaway `MESA_DB` and a non-default port; never QA against a
 live server holding real data.
+
+Two traps specific to this rig, both of which make a broken build look fine:
+
+- **A mount-only check cannot see a crossing bug.** Load at one width, resize
+  to the other *without reloading*, and assert again — the whole class of
+  defect above is invisible to a page that is only ever loaded at its final
+  size.
+- **`khora navigate` to the same hash is a no-op reload** on a hash-routed SPA,
+  so React state survives it and leaks into the next case. Force a real remount
+  with `location.reload()` between cases. A crossing test that skips this reads
+  whatever the previous case left behind.
+
+Measure overflow against `documentElement.scrollWidth - clientWidth` rather
+than eyeballing a screenshot, and check `main`'s own `scrollWidth` too: `main`
+is `overflow-x: auto`, so it absorbs runaway content into a sideways scroll and
+the page-level number stays 0 while content sits off-screen. When walking
+elements for offenders, an ancestor with `width: 0; overflow: hidden` (the
+collapsed agent sidebar) clips its children without any of them reporting
+`visibility: hidden` — those are false positives, not defects.
 
 A wheel event cannot stand in for a swipe: `touch-action` governs touch
 panning only, so a mouse-driven check reports on the presence of an

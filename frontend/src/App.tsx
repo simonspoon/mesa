@@ -10,7 +10,7 @@ import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { TerminalPage } from './pages/TerminalPage'
-import { isPhone } from './phoneTier'
+import { isPhone, onPhoneTierChange } from './phoneTier'
 import { useSpatialNav } from './spatialNav'
 import { useFetch } from './useFetch'
 import { useVisualViewportHeightVar } from './visualViewport'
@@ -96,6 +96,35 @@ function App() {
   // there); the agents sidebar defaults to collapsed at every width.
   const [navCollapsed, setNavCollapsed] = useState(isPhone)
   const [agentsCollapsed, setAgentsCollapsed] = useState(true)
+  // `useState(isPhone)` above decides the nav drawer's state once, at mount,
+  // and nothing re-decided it afterwards (mesa task 562; the flaw predates the
+  // hoist to App and was filed against Sidebar.tsx, where it used to live).
+  // That is not merely a stale default: the same boolean *means* two different
+  // things either side of 600px — an in-flow sidebar above it, a fixed overlay
+  // drawer below (`.sidebar:not(.collapsed)` in App.css's phone block) — so
+  // crossing the boundary without re-deciding strands the nav in the other
+  // tier's interpretation. Measured at 390x844: an expanded desktop sidebar
+  // became a 256px overlay drawer nobody opened, and a collapsed phone rail
+  // stayed a 34px stub on a 1200px window.
+  //
+  // Keyed on the *crossing*, not on the current value. A plain derived value
+  // (`collapsed = phone`) would re-assert on every render and fight the user's
+  // own toggle — reopening a drawer they just closed — so within a tier this
+  // is inert and manual toggles survive (verified at 390 -> 375).
+  useEffect(
+    () =>
+      onPhoneTierChange((phone) => {
+        // Entering the phone tier collapses both drawers, because both become
+        // fixed overlays there and neither was opened *as* one. Leaving it
+        // only restores the nav: the nav's wide-screen default is expanded,
+        // while the agents sidebar defaults to collapsed at every width, so
+        // auto-expanding it on the way out would invent state nobody asked
+        // for.
+        setNavCollapsed(phone)
+        if (phone) setAgentsCollapsed(true)
+      }),
+    [],
+  )
   // One inbox poll for two badges. The sidebar's nav entry and the phone tab
   // bar both show the count of items still awaiting triage, and a fetch each
   // would let them skew by up to a poll interval — `useFetch` caches nothing

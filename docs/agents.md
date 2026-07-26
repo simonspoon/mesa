@@ -144,7 +144,18 @@ already use.
   `working` badge — muted, dashed, and tooltipped rather than suppressed.
   Because it is upstream behavior, the residue is worth re-checking against
   future `claude` releases: if `state` becomes trustworthy, this override
-  becomes dead code rather than wrong code. This bucketed list is the body of
+  becomes dead code rather than wrong code.
+- The stale-`working` test is `isStaleWorking` in `frontend/src/agentProject.ts`,
+  **not** a local helper in `AgentSidebar.tsx`, because two surfaces ask the
+  same question and must not drift: the sidebar's `bucketOf` above, and
+  `isRunningAgent` — which drives the project sidebar's per-project
+  "an agent is running here" dot (`Sidebar.tsx`). Fixing only the bucketing
+  would have left that dot lit forever for a **todo**-watcher agent that went
+  stale, since those spawn in a project's `local_path` and so do match a
+  project (inbox-watcher sessions spawn in `$HOME` and match none, which is
+  why the sidebar was the visible half of this bug and the dot was not).
+  Note `isRunningAgent`'s `pid !== null` test is a *separate* condition and
+  not a liveness check on the terminal states — see the DONE note above. This bucketed list is the body of
   the 'Agents' rail's own content (`AgentListContent`), rendered directly by
   `AgentSidebar` next to the tile area — not a member of the pane tree below.
 - **The 'Agents' list rail** (mesa task 414): a fixed sibling of the tile

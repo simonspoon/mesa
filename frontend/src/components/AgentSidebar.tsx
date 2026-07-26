@@ -18,7 +18,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
-import { projectForCwd } from '../agentProject'
+import { isStaleWorking, projectForCwd } from '../agentProject'
 import * as ptyPool from '../lib/ptyPool'
 import {
   axisPos,
@@ -123,35 +123,11 @@ type Bucket = 'BLOCKED' | 'ACTIVE' | 'DONE'
 // sorted by `startedAt` desc as the closest available proxy for "most
 // recently completed".
 //
-// `state` alone is NOT a reliable completion signal, which is why `status`
-// is consulted too (mesa task 571). `claude agents --json` computes `state`
-// live — it is stored in no file, and `~/.claude/sessions/<pid>.json` carries
-// no `state` key at all — and it can stick at `working` indefinitely for a
-// background session that has finished its turn and gone idle. Measured on
-// claude 2.1.220: three watcher-spawned sessions sat at `idle`/`working` for
-// 80+ minutes after their final turn ended (`stop_reason: end_turn`, stop
-// hook run, `turn_duration` emitted), while sessions with byte-identical
-// transcript tails reported `done`. The stick is not a function of age (a
-// `done` at 34m alongside a `working` at 80m), of process liveness (all 39
-// sessions were alive, contradicting an earlier claim in `docs/agents.md`
-// that DONE means the process exited), or of the daemon's `bg settled` sweep
-// (sessions reach `done` without one).
-//
-// `status: 'idle'` + `state: 'working'` has no legitimate meaning, so it is
-// safe to read as finished. The three states a background session can
-// actually be in are each distinguishable without it:
-//   - never prompted / awaiting input -> `idle` + `blocked` (verified by
-//     spawning a bare `claude --bg`, which reports exactly that)
-//   - actively running                -> `busy` + `working`
-//   - finished                        -> `idle` + `done`
-// A genuinely running agent held `busy` steadily across 20 samples over 40s
-// with no flap to `idle`, so this does not race a live session into DONE.
-// The `blocked` check stays first: an idle session that is *waiting* on
-// something says so via `state`, and must keep its own bucket.
-function isStaleWorking(a: AgentSession): boolean {
-  return a.kind === 'background' && a.status === 'idle' && a.state === 'working'
-}
-
+// `state` alone is NOT a reliable completion signal, so `isStaleWorking`
+// (see `agentProject.ts` for the measured upstream behavior behind it) also
+// routes a finished-but-idle background session here (mesa task 571).
+// `blocked` is tested first so an idle session that is genuinely *waiting*
+// keeps its own bucket.
 function bucketOf(a: AgentSession): Bucket {
   if (a.state === 'blocked') return 'BLOCKED'
   if (a.state === 'done' || a.state === 'failed' || a.state === 'stopped') return 'DONE'

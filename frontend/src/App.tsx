@@ -13,6 +13,7 @@ import { TerminalPage } from './pages/TerminalPage'
 import { isPhone } from './phoneTier'
 import { useSpatialNav } from './spatialNav'
 import { useFetch } from './useFetch'
+import { useVisualViewportHeightVar } from './visualViewport'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
 // #/projects/:id/tasks/:tid (task open in the side panel),
@@ -80,6 +81,10 @@ function App() {
   // second global window keydown listener, disjoint key set from the
   // shortcut above, mounted alongside it per arch-449-keyboard.md §3.
   useSpatialNav()
+  // Keeps `--visual-viewport-height` current for the phone tier's
+  // keyboard-aware shell (mesa task 560). Mounted here because `#root` is the
+  // element the var sizes and App is the only permanent owner of it.
+  useVisualViewportHeightVar()
   // Both sidebars' collapse state lives here rather than inside each of them
   // (mesa task 556): the phone tab bar's Agents/More slots open the drawers,
   // so a third party now drives what used to be two private booleans. The

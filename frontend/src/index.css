@@ -20,6 +20,11 @@
   --red: #ff3b5c;
   --font-display: 'Orbitron', sans-serif;
   --font-mono: 'Share Tech Mono', monospace;
+  /* xterm's own font size (mesa task 560). Lives here rather than as a
+     literal in `PtyTerminal.tsx` so the phone tier can override it in CSS
+     like every other breakpoint-dependent value — xterm reads it as a JS
+     option, but the media query stays in one place. */
+  --pty-font-size: 13px;
   /* A project-tab body pane that fills the viewport below the header/tabs/
      chrome and scrolls internally (storyboard canvas, agents terminal). */
   --tab-viewport-height: calc(100vh - 18rem);

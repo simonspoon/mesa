@@ -219,7 +219,7 @@ rather than a second `isPhone()` call.
 | Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
 | Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified — see *Files tab and the unified diff* |
 | Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
-| Terminal / Agent panes | **no phone rules**; no on-screen-keyboard handling |
+| Terminal / Agent panes | one pane, no split UI; shell height follows the on-screen keyboard — see *Terminal and agent panes* |
 | Inbox / project pages | inherit the shell only; unaudited |
 
 ## Bottom tab bar
@@ -373,6 +373,141 @@ both ways per the same verbatim doctrine as the file viewer. Its file list has
 the same push-below-the-fold shape the tree had (diff pane top at 680px), which
 is a real but separate gap.
 
+## Terminal and agent panes
+
+Three surfaces share one component tree — the global Terminal page
+(`#/terminal`), the project Terminal tab (`#/projects/:id/terminal`) and the
+Agent sidebar's attached panes — and none of them had a phone rule before mesa
+task 560. All numbers below were measured at 390×844 against the release
+binary.
+
+### The fourth viewport unit
+
+Invariant 3 above says the shell is bound to `dvh`, not `vh`. That is still
+true and still necessary, and it is **not sufficient on a terminal**, because
+`dvh` tracks the browser's dynamic toolbars and nothing else. An on-screen
+keyboard does not resize the layout viewport at all — it shrinks the *visual*
+viewport — so a `100dvh` shell keeps believing it is 844px tall while the
+bottom 444px of it sits under the keyboard. On a terminal that bottom is the
+prompt.
+
+`frontend/src/visualViewport.ts` publishes `window.visualViewport.height` as
+`--visual-viewport-height` on `<html>`, at every width; the phone block is the
+only place that reads it, via `--phone-shell-height` (which falls back to
+`100dvh`, the value it equals whenever no keyboard is up). Three boxes are
+sized from it: `#root`, and both overlay drawers — the drawers need it
+separately because a `position: fixed` box is laid out against the *layout*
+viewport, so `bottom: <reserve>` alone puts an open drawer's floor behind the
+keyboard.
+
+Measured, with the visual viewport driven to 400px:
+
+| | before | after |
+|---|---|---|
+| `#root` height | 844px | 400px |
+| terminal screen bottom | 764px | 322px |
+| prompt visible above a keyboard at 400 | **no** | yes |
+| PTY `{"resize":…}` frames per keyboard open | 0 (nothing reacted) | **1** |
+| …per close | 0 | **1** |
+
+The frame count is the number mesa task 552 makes load-bearing: one resize
+frame is one SIGWINCH into an attached `claude attach` process, and 89 of them
+is the bug that task fixed. One per keyboard transition, per live PTY, is the
+bounded result — verified by hooking `WebSocket.prototype.send` and counting,
+not by assuming. A drawer with an agent attached alongside the always-mounted
+Terminal page emits 2 frames per transition, which is 1 each, not a storm.
+
+Updates are coalesced into one `requestAnimationFrame` per burst, because iOS
+emits a stream of `resize` events through the keyboard's slide-in animation
+and each one would otherwise refit every open xterm.
+
+**Deliberately not handled: `visualViewport.offsetTop`.** A browser that
+scrolls the layout viewport to keep a focused input above the keyboard reports
+it there, and a matching translate is the usual companion fix. It is absent
+because it could not be verified — the rig for this change drives Chrome with
+a synthetic `visualViewport` resize, which reproduces the height change exactly
+and the scroll-to-focus behaviour not at all. Shipping it would have been an
+unmeasured claim, not a fix.
+
+### One pane, and why it is JS
+
+A 390px screen has no room for a split: two side-by-side xterms are ~23
+columns each, and every affordance the split UI has — divider drag, pane grip,
+drop zones — is a pointer gesture with no touch equivalent. So both PTY
+surfaces render exactly one pane here (`SoloShellPane` / `SoloAgentPane`,
+deliberate siblings of the sortable versions since `useSortable` requires a
+`DndContext` and the point is that there isn't one), and the Terminal page
+hides `+ new shell`, the only control that can mint a second.
+
+This is the one place the "prefer a CSS rule, keep the breakpoint out of JS"
+rule is broken on purpose, and `usePhoneTier()` in `phoneTier.ts` — a
+`useSyncExternalStore` over the *same* `MediaQueryList` `isPhone()` already
+uses, so there is still exactly one query in the app — is how. CSS could only
+have *hidden* the extra panes, which is strictly worse twice over:
+`display: none` collapses the box `FitAddon` measures to zero (the trap
+`docs/terminal.md` names for the cross-nav `visibility` toggle), and a
+hidden-but-connected shell is a process the user can neither see nor reach.
+
+**The pane tree is left intact, not pruned.** The unrendered leaves keep their
+sockets open in `PtyPool` with their containers simply detached — the same
+state a mid-reparent leaf is in for one commit — so widening past 600px
+restores the whole layout. Pruning would have to kill them, and a Terminal-page
+shell has no server-side session to reattach to. Verified: three panes carrying
+distinct typed markers, narrowed to 390 (one rendered, header still reading
+"3 panes", zero detached panes emitting frames), widened back to 1440 — all
+three markers present, zero "shell closed" banners. The pane shown is the
+**last** leaf, so that the Agent sidebar's rule is the same sentence: over
+there the newest pane is the one you just tapped in the session list.
+
+### The Agent drawer's list rail
+
+The drawer is `min(24rem, 90vw)` — 351px — and the 'Agents' session-list rail
+claimed 240 of that, leaving ~11 columns of terminal. Side-by-side is not
+survivable at this width, but the rail *collapsed* is a 1.9rem strip, which
+is. So the rail stays in flow when collapsed and becomes a full-drawer
+`position: absolute` overlay when expanded, and `AgentSidebar` drives the two
+states from the actions that mean them: attaching a session collapses the list
+(otherwise the terminal renders underneath the list you opened it from), and
+the pane's `close` — the only way back — re-expands it.
+
+Measured with a stub agent attached: pane 296px wide, 44×53, rail collapsed to
+30px; expanding the rail covers the pane (`z-index: 2`) without unmounting it,
+and closing the pane returns the full-width list.
+
+### Font size
+
+xterm's font size is a JS option, so `--pty-font-size` carries it (13px in
+`index.css`, 11px in the phone block) and `PtyTerminal`'s `ptyFontSize()`
+reads the resolved value — the breakpoint stays in CSS with no second `600px`
+in JS. Measured at 390×844: 13px is a 7.02px cell, 48 columns of a 337px
+screen; 11px is 5.94px and **56 columns**. A phone pane is the whole screen,
+so the columns are worth more than the glyph.
+
+Changing the font changes the *cell*, not the box, so the `ResizeObserver`
+never fires and an already-open terminal would keep stale `cols`/`rows` — the
+explicit `fit()` after the option write is required, and was confirmed by
+watching `cols` fail to move without it. A tier crossing therefore costs a
+short converging burst (6 frames, 50→56 columns, measured) rather than one.
+That is bounded and only reachable by a rotation, since portrait and landscape
+sit on opposite sides of 600px; the keyboard path, which is the one that
+repeats, stays at 1.
+
+### Known gaps
+
+- **The project Terminal tab is chrome-starved with a keyboard up.** 227px of
+  project header and tabs plus 64px of `main` padding leave 112px of a 400px
+  shell, i.e. a 1-row terminal — the prompt is visible (bottom 296 against a
+  keyboard at 400) but little else is. `--tab-viewport-min`'s 256px floor is
+  dropped for this one surface, and the duplicate `.terminal-page-header` is
+  hidden here (the project tab strip above it already reads "Terminal"), which
+  is what bought the prompt its place on screen. The global `#/terminal` page
+  is the phone surface: same keyboard, 182px of terminal, 14 rows. Closing the
+  rest of the gap means hiding the project chrome on focus, which is its own
+  change.
+- Nothing was verified on real hardware. The keyboard is a synthetic
+  `visualViewport` resize in Chrome — faithful for height, silent on
+  scroll-to-focus (above).
+
 ## Verifying a phone change
 
 Drive a real browser at a phone viewport (390×844 is the reference size) —
@@ -419,3 +554,20 @@ Checks worth re-running after any change to this surface:
    `-` row sits directly above its `+` row. Re-run the same three at 1440px
    and assert the diff is back to four columns with zero hidden cells — that
    is the check that catches a phone rule leaking out of its media block.
+8. Open `#/terminal`: one pane, full width, no `+ new shell`. Then simulate a
+   keyboard and count PTY frames — this check has no shortcut, because
+   `100dvh` looks correct right up until a keyboard exists. Chrome cannot
+   raise one, so shadow the height and fire the event the app listens on:
+
+   ```js
+   Object.defineProperty(window.visualViewport, 'height',
+     { get: () => 400, configurable: true })
+   window.visualViewport.dispatchEvent(new Event('resize'))
+   ```
+
+   with `WebSocket.prototype.send` hooked per `docs/terminal.md`'s frame
+   counter. Assert the terminal screen's `bottom` is `<= 400` **and** that
+   exactly one `{"resize":…}` frame went out per live PTY. Prove the predicate
+   first by pinning `#root` back to `100dvh` and re-running: the bottom must
+   read 764, i.e. off screen. A passing `bottom` with `#root` still at 844px
+   means the var never reached the box.

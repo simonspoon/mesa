@@ -104,6 +104,44 @@ still stormed at 89, since its own parent still refused to shrink. The
 mirror of the `display: none` trap above — that one collapses the measured
 box to zero, this one pins it too wide.
 
+**At the phone tier there is no split at all** (mesa task 560). Both this page
+and the Agent sidebar render a single pane below 600px — `SoloShellPane` here,
+`SoloAgentPane` there, plain siblings of the sortable versions rather than a
+prop on them, since `useSortable` requires an enclosing `DndContext` and the
+whole point is that there isn't one. `+ new shell` is not rendered, so the
+tree cannot grow past the seeded leaf.
+
+The tree itself is **not** pruned to match. The unrendered leaves keep their
+sockets open in `PtyPool` with their containers detached, exactly as a leaf is
+for one commit mid-reparent, so widening past 600px restores the layout with
+every shell's scrollback intact (verified with distinct per-pane markers across
+a 1440 → 390 → 1440 round trip). Pruning would have to kill them, and — as the
+`PtySlot`/`PtyPool` section below says — a shell killed on this surface is
+unrecoverable. This is also why it cannot be a CSS rule: `display: none` on a
+live pane is the same zero-size-box trap the `visibility` toggle above avoids.
+See `docs/mobile.md` for the rest, including the on-screen-keyboard sizing and
+the measured frame counts.
+
+**Counting a pane's outbound resize frames.** The measurement behind mesa task
+552's number, and the one any change to the resize path owes: hook the socket
+from inside the page and read `window.__sent`.
+
+```js
+const o = WebSocket.prototype.send
+window.__sent = []
+WebSocket.prototype.send = function (d) {
+  window.__sent.push({ t: Math.round(performance.now()),
+    s: typeof d === 'string' ? 'TEXT:' + d : 'BIN' })
+  return o.apply(this, arguments)
+}
+```
+
+Text frames are the `{"resize":{cols,rows}}` controls; binary frames are
+keystrokes. A healthy transition sends **one** text frame per live PTY. A
+climbing sequence (`…,52,54,55,56`) is `FitAddon` converging — expected after a
+font-size change, and the signature of the task-552 feedback loop if it appears
+after a plain width change.
+
 **Surviving a split or move, not just navigation.** A drag-to-edge split or a
 cross-split move reparents a leaf under a freshly-minted split-node id, which
 would otherwise remount every leaf in that subtree — including its live
@@ -149,7 +187,11 @@ page's code unchanged.
   the standalone padding/scroll and binds the pane body to the same
   `--tab-viewport-*` box the Files/Agents layouts use — inside the project
   frame's block flow, `flex: 1` has nothing to grow against and the panes
-  would otherwise collapse to zero height.
+  would otherwise collapse to zero height. At the phone tier this box drops
+  `--tab-viewport-min`'s 256px floor and hides its own
+  `.terminal-page-header`: with an on-screen keyboard up the tab has 112px to
+  work with, and the floor alone put the prompt back under the keyboard
+  (`docs/mobile.md`). The global page keeps its header.
 - **A project with no `local_path`** shows the Files/Git tabs' "no linked
   folder" placeholder instead of a pane tree, so the dead case is a quiet
   empty state, not a socket that opens and immediately closes. A

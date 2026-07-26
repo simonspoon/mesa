@@ -260,8 +260,16 @@ invariants you must not break — read them before changing `src/`:
   own live PTY sessions. Where a component *does* carry phone-only state
   (`FilesView`'s `treeOpen`), the breakpoint still lives in CSS alone: the
   flag stays set at every width and only the phone block has a rule that
-  reads it, so there is no second `matchMedia` to keep in sync.
-  `docs/mobile.md`.
+  reads it, so there is no second `matchMedia` to keep in sync. The **one**
+  sanctioned exception is `usePhoneTier()` — the PTY surfaces collapse their
+  pane *tree* to a single pane here, and a tree is a JS structure that CSS
+  can only hide, which on a live xterm is the zero-size-box trap. It
+  subscribes to the same `MediaQueryList` `isPhone()` reads, so the app still
+  has exactly one query. Separately, `100dvh` is **not** enough on a
+  terminal: a keyboard shrinks only the *visual* viewport, so
+  `visualViewport.ts` publishes `--visual-viewport-height` (written at every
+  width, read only inside the phone block) and `#root` plus both fixed
+  drawers size from it. `docs/mobile.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
   loop, off by default. `docs/todo-watcher.md`.
 - **Inbox watcher** — `mesa serve --watch-inbox`'s periodic auto-triage

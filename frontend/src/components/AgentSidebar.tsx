@@ -39,6 +39,7 @@ import {
   type LeafNode as PTLeafNode,
   type SplitNode as PTSplitNode,
 } from '../lib/paneTree'
+import { usePhoneTier } from '../phoneTier'
 import type { AgentSession } from '../types/AgentSession'
 import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
@@ -218,6 +219,34 @@ function AgentPane({
     <PaneShell dragId={agentId} label={label} ratio={ratio} onClose={onClose} dropEdge={dropEdge}>
       <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
     </PaneShell>
+  )
+}
+
+/**
+ * The phone tier's whole pane UI (mesa task 560) — one attached agent, no
+ * grip, no divider, no drag context. Sibling of `AgentPane` rather than a
+ * prop on it for the same reason `SoloShellPane` is a sibling of `ShellPane`
+ * on the Terminal page: `useSortable` needs an enclosing `DndContext`, and
+ * the point of this path is that there isn't one.
+ */
+function SoloAgentPane({
+  agentId,
+  label,
+  onClose,
+}: {
+  agentId: string
+  label: string
+  onClose: () => void
+}) {
+  const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
+  return (
+    <div className="agent-sidebar-pane">
+      <div className="agent-terminal-header">
+        <span className="agent-sidebar-pane-title">{label}</span>
+        <button onClick={onClose}>close</button>
+      </div>
+      <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
+    </div>
   )
 }
 
@@ -781,6 +810,19 @@ export function AgentSidebar({
 
   const agents = [...(sessions ?? [])].sort((a, b) => b.startedAt - a.startedAt)
   const openIds = collectLeafIds(root)
+  // Phone tier (mesa task 560): this drawer is `min(24rem, 90vw)` — 351px at
+  // 390 — and the list rail already claims 240 of that, so a split tree here
+  // is not merely awkward, it is two ~11-column terminals. One pane, the
+  // newest (the one you just tapped in the list), full drawer width.
+  //
+  // As on the Terminal page, the tree is left intact rather than pruned: the
+  // other panes' `claude attach` bridges stay open in `PtyPool` with their
+  // containers detached, and widening past 600px brings the whole layout
+  // back. Auto Tile keeps running underneath and is simply not visible — it
+  // owns the tree, and the tree is what desktop width goes back to.
+  const phone = usePhoneTier()
+  const soloId = phone ? openIds[openIds.length - 1] ?? null : null
+  const soloSession = soloId !== null ? agents.find((a) => a.id === soloId) : undefined
   // Computed once per render and reused by both the add-form's option list
   // and its empty-state check below, rather than each re-filtering `projects`
   // independently.
@@ -814,14 +856,23 @@ export function AgentSidebar({
     // (React StrictMode) — reading `root` here, once, keeps that side
     // effect tied to exactly one real close, matching arch.md §6.2's
     // "explicit, colocated with the actual close call site" rule.
-    if (findPathToLeaf(root, id)) ptyPool.remove(id)
+    const wasOpen = findPathToLeaf(root, id) !== null
+    if (wasOpen) ptyPool.remove(id)
     setRoot((r) => (findPathToLeaf(r, id) ? removeLeaf(r, id) : addPane(r, id)))
+    // At the phone tier the list rail overlays the pane area instead of
+    // sitting beside it (App.css), so opening a session has to get the list
+    // out of its own way — otherwise the terminal you just attached is
+    // rendered underneath the list you attached it from.
+    if (!wasOpen && phone) setListCollapsed(true)
     refetch()
   }
 
   function closePane(id: string) {
     ptyPool.remove(id)
     setRoot((r) => removeLeaf(r, id))
+    // The mirror of the collapse in `togglePane`: on a phone the pane's
+    // `close` is the only way back, so it has to reveal the list again.
+    if (phone) setListCollapsed(false)
   }
 
   function openAddAgent() {
@@ -1098,6 +1149,17 @@ export function AgentSidebar({
 
         <div className="agent-sidebar-body" ref={bodyRef}>
           <div className="agent-sidebar-tile-area" ref={tileAreaRef}>
+            {phone ? (
+              <div className="agent-sidebar-panes agent-sidebar-panes-column">
+                {soloId !== null && (
+                  <SoloAgentPane
+                    agentId={soloId}
+                    label={soloSession ? agentLabel(soloSession) : soloId}
+                    onClose={() => closePane(soloId)}
+                  />
+                )}
+              </div>
+            ) : (
             <DndContext
               sensors={sensors}
               // dnd-kit's own default collision detection picks `over` off the
@@ -1126,6 +1188,7 @@ export function AgentSidebar({
                 dropZone={dropZone}
               />
             </DndContext>
+            )}
           </div>
 
           {/* 'Agents' session-list rail (mesa task 414): fixed to the body's

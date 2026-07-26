@@ -3409,6 +3409,34 @@ body.agent-sidebar-resizing {
        above the bar has to keep clear. */
     --phone-tabbar-height: 3rem;
     --phone-tabbar-reserve: calc(3rem + env(safe-area-inset-bottom));
+    /* The keyboard-aware height of the app shell (mesa task 560), and the
+       only place `--visual-viewport-height` (published by
+       `frontend/src/visualViewport.ts`) is read.
+
+       `100dvh` is the correct fallback and not merely a defensive one: it is
+       what every non-phone width uses, what a browser with no
+       `window.visualViewport` gets, and what the value equals whenever no
+       on-screen keyboard is up. The two units differ in exactly one
+       situation — a keyboard open — because a keyboard does not resize the
+       layout viewport at all. See `docs/mobile.md`. */
+    --phone-shell-height: var(--visual-viewport-height, 100dvh);
+    /* 48 columns of a 337px screen at 13px, 56 at 11px (measured, mesa task
+       560). A phone pane is the whole screen, so the columns buy more than
+       the glyph does. Read by `PtyTerminal.tsx`'s `ptyFontSize()`. */
+    --pty-font-size: 11px;
+    /* Same substitution for the project-tab viewport box, so the embedded
+       project Terminal tab shrinks with the keyboard the way the global page
+       does. `18rem` is the desktop rule's own chrome allowance, unchanged. */
+    --tab-viewport-height: calc(var(--phone-shell-height) - 18rem);
+  }
+
+  /* The keyboard case `100dvh` cannot see. `index.css` locks `#root` to the
+     viewport and makes `main` the only scroller; on a phone that lock has to
+     follow the VISUAL viewport, or an open keyboard covers the bottom of a
+     shell that still believes it is 844px tall — and on a terminal the bottom
+     of the shell is the prompt you are typing into. */
+  #root {
+    height: var(--phone-shell-height);
   }
 
   header {
@@ -3519,11 +3547,18 @@ body.agent-sidebar-resizing {
      on phones and closes itself after navigation — Sidebar.tsx). Both drawers
      stop above the tab bar rather than running under it, since the bar stays
      tappable while they are open. */
+  /* `height` rather than `bottom`, for both drawers (mesa task 560): a
+     `position: fixed` box is laid out against the LAYOUT viewport, which an
+     on-screen keyboard does not shrink — so `bottom: <reserve>` puts the
+     bottom of an open drawer behind the keyboard, and with it the prompt of
+     any terminal attached inside it. Sizing off `--phone-shell-height`
+     instead keeps the drawer inside the visible area. Identical to `100dvh -
+     reserve` whenever no keyboard is up. */
   .sidebar:not(.collapsed) {
     position: fixed;
     top: 0;
     left: 0;
-    bottom: var(--phone-tabbar-reserve);
+    height: calc(var(--phone-shell-height) - var(--phone-tabbar-reserve));
     width: min(16rem, 85vw);
     min-height: 0;
     overflow-y: auto;
@@ -3539,9 +3574,8 @@ body.agent-sidebar-resizing {
     position: fixed;
     top: 0;
     right: 0;
-    bottom: var(--phone-tabbar-reserve);
     width: min(24rem, 90vw);
-    height: auto;
+    height: calc(var(--phone-shell-height) - var(--phone-tabbar-reserve));
     z-index: 1200;
     background: rgba(6, 10, 16, 0.97);
     border-left: 1px solid var(--border-bright);
@@ -3550,6 +3584,66 @@ body.agent-sidebar-resizing {
 
   .agent-sidebar:not(.collapsed) .agent-sidebar-body {
     width: 100%;
+    /* Anchors the list rail's overlay below; also the reason the rail can
+       leave the flex row at all. */
+    position: relative;
+    /* 1rem a side of a 351px drawer is 6% of the terminal's width. */
+    padding: 0.5rem 0.5rem 0.75rem;
+  }
+
+  /* The 'Agents' session-list rail stops being a column beside the panes and
+     becomes a full-drawer overlay over them (mesa task 560).
+
+     Side by side it took 240px of a 351px drawer, leaving ~11 columns of
+     terminal. Collapsed it is a 1.9rem strip, which IS affordable — so the
+     rail stays in flow when collapsed (that strip is the only way back to the
+     list) and only overlays when expanded. `AgentSidebar` collapses it on
+     open and re-expands it on the pane's `close`, so the two states line up
+     with "picking an agent" and "done with this agent". */
+  .agent-sidebar-list-rail:not(.collapsed) {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    z-index: 2;
+  }
+
+  /* The single pane both PTY surfaces render at this tier (mesa task 560's
+     `SoloShellPane` / `SoloAgentPane`) has no `useSortable`, so it carries
+     none of the inline `flexGrow`/`flexBasis`/`min*` a `ShellPane` gets — and
+     without them it is a `flex: 0 1 auto` item that sizes to its content,
+     which for an xterm inside a `flex: 1` slot means zero height. Stated once
+     here rather than inlined twice in TSX; the desktop path's inline styles
+     win over it anyway, so it cannot leak upward. `min-width: 0` for the
+     mesa-task-552 reason, unchanged. */
+  .agent-sidebar-panes > .agent-sidebar-pane {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  /* `--tab-viewport-min` (16rem) is a floor against a project tab collapsing
+     to nothing, and for every other tab it is exactly right. On the embedded
+     Terminal tab with a keyboard up it is the one thing that can push the
+     prompt back off screen: the height calc resolves to 112px (400px shell −
+     227px of project chrome − 64px of `main` padding, all measured at
+     390x844), the 256px floor overrides it, and the pane's bottom lands at
+     410 against a keyboard at 400. Ten pixels, and the prompt is gone again.
+
+     Dropping the floor for this one surface costs nothing the others rely on
+     — the pane is `flex: 1` inside an explicitly-sized box either way, and
+     with no keyboard the height is unchanged at 556px. */
+  .terminal-page-embedded {
+    min-height: 0;
+  }
+
+  /* Every row this header holds is already on screen or gone: the project
+     tab strip directly above it reads "Terminal", `+ new shell` is not
+     rendered at this tier, and the pane count is one by construction. It was
+     ~40px of a 112px box with the keyboard up — the difference between one
+     row of terminal and four. The GLOBAL page keeps its header; there the
+     `<h2>` is the only thing naming the surface. */
+  .terminal-page-embedded .terminal-page-header {
+    display: none;
   }
 
   .kanban {

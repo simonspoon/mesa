@@ -3,6 +3,22 @@ import type { ReactNode } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
+import { usePhoneTier } from '../phoneTier'
+
+// xterm's font size is a JS option, not a stylesheet property — but the
+// *breakpoint* that chooses it still lives in CSS alone (`--pty-font-size`,
+// `App.css`), per `docs/mobile.md`'s rule. This reads the resolved value
+// rather than branching on `isPhone()` here, so there is no second copy of
+// `600px` to keep in step.
+//
+// Measured at 390x844 (mesa task 560): 13px gives a 7.02px cell, i.e. 48
+// columns of a 337px screen; 11px gives 56. The pane is the whole phone, so
+// the columns are worth more than the extra 2px of glyph.
+function ptyFontSize(): number {
+  const v = getComputedStyle(document.documentElement).getPropertyValue('--pty-font-size')
+  const n = Number.parseFloat(v)
+  return Number.isFinite(n) && n > 0 ? n : 13
+}
 
 /**
  * An xterm.js terminal wired to a raw PTY over a websocket. Generalized out
@@ -31,6 +47,10 @@ export function PtyTerminal({
   closedMessage: ReactNode
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
+  // Held only so the tier effect below can retune an already-open terminal;
+  // everything else about the terminal stays inside the connect effect.
+  const termRef = useRef<Terminal | null>(null)
+  const fitRef = useRef<FitAddon | null>(null)
   const [closed, setClosed] = useState(false)
   // Bumped by the reconnect button to force the effect to re-run and open a
   // fresh socket without unmounting (the parent's key is its own pane
@@ -51,7 +71,7 @@ export function PtyTerminal({
     const term = new Terminal({
       cursorBlink: true,
       fontFamily: '"Share Tech Mono", Menlo, monospace',
-      fontSize: 13,
+      fontSize: ptyFontSize(),
       scrollback: 5000,
       theme: {
         background: '#060a10',
@@ -96,6 +116,8 @@ export function PtyTerminal({
     const observer = new ResizeObserver(() => fit.fit())
     observer.observe(el)
     term.focus()
+    termRef.current = term
+    fitRef.current = fit
 
     return () => {
       disposed = true
@@ -104,8 +126,32 @@ export function PtyTerminal({
       resizeSub.dispose()
       ws.close()
       term.dispose()
+      termRef.current = null
+      fitRef.current = null
     }
   }, [endpoint, epoch])
+
+  // Retunes an already-open terminal when the phone tier engages or lifts.
+  // The explicit `fit()` is not belt-and-braces: changing the font changes
+  // the CELL size, not the box, so the `ResizeObserver` above never fires and
+  // the terminal would keep its old `cols`/`rows` at the new glyph size —
+  // verified by watching `cols` fail to move without it. Skipped on the first
+  // run, where the connect effect already constructed at the right size and a
+  // second fit would be one gratuitous `{"resize":…}` frame.
+  const phone = usePhoneTier()
+  const firstTier = useRef(true)
+  useEffect(() => {
+    if (firstTier.current) {
+      firstTier.current = false
+      return
+    }
+    const term = termRef.current
+    if (!term) return
+    const size = ptyFontSize()
+    if (term.options.fontSize === size) return
+    term.options.fontSize = size
+    fitRef.current?.fit()
+  }, [phone])
 
   return (
     <div className="agent-terminal">

@@ -36,6 +36,7 @@ import {
   type SplitNode as PTSplitNode,
 } from '../lib/paneTree'
 import { PtySlot } from '../components/PtySlot'
+import { usePhoneTier } from '../phoneTier'
 
 // This page's own `contentKind` — every pane is a plain global $HOME shell,
 // no other variant (mesa task 395 / .scratch/arch.md §2.3). A local type
@@ -138,6 +139,32 @@ function ShellPane({
       </div>
       <PtySlot id={id} endpoint={endpoint} closedMessage="shell closed" />
       {dropEdge && <div className={`agent-sidebar-pane-drop-indicator agent-sidebar-pane-drop-indicator-${dropEdge}`} />}
+    </div>
+  )
+}
+
+/**
+ * The phone tier's whole pane UI (mesa task 560): one pane, no grip, no
+ * divider, no drag context. Deliberately a sibling of `ShellPane` rather than
+ * a prop on it — `useSortable` requires an enclosing `DndContext`, and the
+ * point here is that there isn't one.
+ */
+function SoloShellPane({
+  id,
+  endpoint,
+  onClose,
+}: {
+  id: string
+  endpoint: string
+  onClose: () => void
+}) {
+  return (
+    <div className="agent-sidebar-pane">
+      <div className="agent-terminal-header">
+        <span className="agent-sidebar-pane-title">shell</span>
+        <button onClick={onClose}>close</button>
+      </div>
+      <PtySlot id={id} endpoint={endpoint} closedMessage="shell closed" />
     </div>
   )
 }
@@ -412,7 +439,26 @@ export function TerminalPage({ projectId = null }: { projectId?: number | null }
     })
   }
 
-  const paneCount = collectLeafIds(root).length
+  const leafIds = collectLeafIds(root)
+  const paneCount = leafIds.length
+  // A 390px screen has no room for a split at all: two side-by-side xterms
+  // are ~23 columns each, and the divider/grip/drop-zone affordances are all
+  // pointer gestures with no touch equivalent. So the phone tier renders
+  // exactly one pane and hides the only control that can mint a second.
+  //
+  // The tree itself is left ALONE — not collapsed, not pruned. The other
+  // leaves' shells stay in `PtyPool` with their sockets open and their
+  // containers simply detached (the same state a mid-reparent leaf is in for
+  // one commit), so widening back past 600px restores every pane exactly as
+  // it was. Pruning would have to kill them: a Terminal-page shell has no
+  // server-side session to reattach to.
+  //
+  // The pane shown is the LAST leaf, not the first, so that this rule and the
+  // Agent sidebar's share one sentence — over there the newest pane is the
+  // one you just opened from the session list, and showing anything else
+  // would make attaching look broken.
+  const phone = usePhoneTier()
+  const soloId = phone ? leafIds[leafIds.length - 1] ?? null : null
 
   return (
     <div className={`terminal-page${projectId === null ? '' : ' terminal-page-embedded'}`}>
@@ -421,11 +467,24 @@ export function TerminalPage({ projectId = null }: { projectId?: number | null }
         <span className="muted">
           {paneCount} pane{paneCount === 1 ? '' : 's'}
         </span>
-        <button type="button" onClick={addPane}>
-          + new shell
-        </button>
+        {!phone && (
+          <button type="button" onClick={addPane}>
+            + new shell
+          </button>
+        )}
       </div>
       <div className="terminal-page-body">
+        {phone ? (
+          <div className="agent-sidebar-panes agent-sidebar-panes-column">
+            {soloId && (
+              <SoloShellPane
+                id={soloId}
+                endpoint={endpoint}
+                onClose={() => closePane(soloId)}
+              />
+            )}
+          </div>
+        ) : (
         <DndContext
           sensors={sensors}
           collisionDetection={pointerWithin}
@@ -444,6 +503,7 @@ export function TerminalPage({ projectId = null }: { projectId?: number | null }
             dropZone={dropZone}
           />
         </DndContext>
+        )}
       </div>
     </div>
   )

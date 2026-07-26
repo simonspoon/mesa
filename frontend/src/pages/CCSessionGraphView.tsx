@@ -11,7 +11,7 @@ import {
 } from '@xyflow/react'
 import { getCcSessionGraph } from '../api'
 import { usePhoneTier } from '../phoneTier'
-import { formatTokens, layoutSessionGraph, shortModel, shortTarget } from '../sessionGraph'
+import { formatTokens, layoutSessionGraph, shortModel, shortTarget, toolColor } from '../sessionGraph'
 import type { CcGraphNode } from '../types/CcGraphNode'
 import { useFetch } from '../useFetch'
 
@@ -29,12 +29,16 @@ type CcFlowNode = RFNode<CcGraphNode, 'cc'>
 
 // The minimap draws raw fills, not the CSS-variable border of the real node,
 // so the kind colours are repeated here as literals, copied from index.css's
-// --cyan / --magenta / --border to match `.cc-graph-node`'s left border.
-const MINIMAP_COLOR: Record<CcGraphNode['kind'], string> = {
+// --cyan / --magenta to match `.cc-graph-node`'s left border. `tool` is absent
+// deliberately: a tool's colour comes from its *name*, via `toolColor`.
+const MINIMAP_KIND_COLOR: Record<Exclude<CcGraphNode['kind'], 'tool'>, string> = {
   session: '#00e5ff',
   agent: '#ff2bd6',
   skill: '#7c5cff',
-  tool: '#16384a',
+}
+
+function nodeColor(n: CcGraphNode): string {
+  return n.kind === 'tool' ? toolColor(n.name) : MINIMAP_KIND_COLOR[n.kind]
 }
 
 export function CCSessionGraphView({ sessionId }: { sessionId: string }) {
@@ -111,7 +115,7 @@ export function CCSessionGraphView({ sessionId }: { sessionId: string }) {
               <MiniMap
                 pannable
                 zoomable
-                nodeColor={(n) => MINIMAP_COLOR[(n.data as CcGraphNode).kind]}
+                nodeColor={(n) => nodeColor(n.data as CcGraphNode)}
                 maskColor="rgba(6, 10, 16, 0.72)"
               />
             )}
@@ -137,10 +141,20 @@ function GraphNode({ data }: NodeProps<CcFlowNode>) {
   // A subagent's spawn description and a tool's target both want the node's
   // one title slot, and no node ever has both (`description` is agent-only).
   const title = data.description ?? data.target ?? undefined
+  // Tool nodes are coloured per tool *name* (the other three kinds have their
+  // own fixed colours in App.css), so the value can only come from JS — the
+  // set of tool names is open-ended and unknowable to a stylesheet.
+  const tint = data.kind === 'tool' ? toolColor(data.name) : undefined
   return (
-    <div className={`cc-graph-node kind-${data.kind}`} title={title}>
+    <div
+      className={`cc-graph-node kind-${data.kind}`}
+      title={title}
+      style={tint ? { borderLeftColor: tint } : undefined}
+    >
       <Handle type="target" position={Position.Left} isConnectable={false} />
-      <div className="cc-graph-node-name">{data.name}</div>
+      <div className="cc-graph-node-name" style={tint ? { color: tint } : undefined}>
+        {data.name}
+      </div>
       {/* Untrusted: `target` is verbatim model-authored input (a command, a
           path). It is rendered as a text child — never as HTML, a URL, or an
           attribute that could act on it. */}

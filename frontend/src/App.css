@@ -4342,6 +4342,9 @@ button:focus-visible,
   border-left-color: #7c5cff;
 }
 
+/* Fallback only. A tool node's real colour is per tool *name* and arrives as
+   an inline style from `toolColor()` — the name set is open-ended, so it can
+   never live in a stylesheet. This is what shows if that ever returns nothing. */
 .cc-graph-node.kind-tool {
   border-left-color: var(--border);
 }

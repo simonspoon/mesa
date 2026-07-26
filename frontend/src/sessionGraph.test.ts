@@ -7,6 +7,7 @@ import {
   layoutSessionGraph,
   shortModel,
   shortTarget,
+  toolColor,
 } from './sessionGraph'
 import type { CcGraphNode } from './types/CcGraphNode'
 import type { CcSessionGraph } from './types/CcSessionGraph'
@@ -251,6 +252,65 @@ describe('shortTarget', () => {
     // A trailing slash yields the directory, never ''.
     expect(t('Read', '/a/b/')).toBe('b')
     expect(t('Read', '/')).toBe('/')
+  })
+})
+
+describe('toolColor', () => {
+  it('is total — every name gets a real colour, including ones we have never seen', () => {
+    for (const name of ['Bash', 'mcp__ccd_session__mark_chapter', 'SomeToolShippedNextMonth', '']) {
+      expect(toolColor(name)).toMatch(/^hsl\(/)
+    }
+  })
+
+  it('is stable for a given name', () => {
+    // The point of the feature: the same tool is the same colour on every
+    // reload and in every session, so a reader can learn the mapping.
+    expect(toolColor('Grep')).toBe(toolColor('Grep'))
+    expect(toolColor('mcp__x__y')).toBe(toolColor('mcp__x__y'))
+  })
+
+  it('never gives two high-volume tools the same colour', () => {
+    // These are ~95% of the calls in a real transcript, so a collision here
+    // would flatten most of the column back to one stripe. Ordered by observed
+    // volume in the cc_tool_calls table.
+    const hot = [
+      'Bash',
+      'Read',
+      'Edit',
+      'WebFetch',
+      'Write',
+      'StructuredOutput',
+      'Agent',
+      'WebSearch',
+      'ToolSearch',
+      'AskUserQuestion',
+      'Glob',
+      'Skill',
+      'EnterWorktree',
+      'TaskUpdate',
+    ]
+    const colors = hot.map(toolColor)
+    expect(new Set(colors).size).toBe(hot.length)
+  })
+
+  it('never lets an unknown tool land on a high-volume tool colour', () => {
+    // The hash draws from a reserved tail of the palette, so a name nobody has
+    // seen can share with another rare tool but can never impersonate `Bash`.
+    // Regression: `advisor` used to hash exactly onto `Write`.
+    const hot = new Set(['Bash', 'Read', 'Edit', 'Write', 'WebFetch', 'Skill'].map(toolColor))
+    for (const name of ['advisor', 'mcp__ccd_session__mark_chapter', 'Xyzzy', 'ReportFindings']) {
+      expect(hot.has(toolColor(name))).toBe(false)
+    }
+  })
+
+  it('gives one act one colour under all its spellings', () => {
+    // Deliberate sharing, not a collision: colouring these apart would invent
+    // a distinction a reader scanning the column does not have.
+    expect(toolColor('Task')).toBe(toolColor('Agent'))
+    expect(toolColor('Grep')).toBe(toolColor('Glob'))
+    expect(toolColor('EnterWorktree')).toBe(toolColor('ExitWorktree'))
+    expect(toolColor('TaskCreate')).toBe(toolColor('TaskStop'))
+    expect(toolColor('SendMessage')).toBe(toolColor('SendUserFile'))
   })
 })
 

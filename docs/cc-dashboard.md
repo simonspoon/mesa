@@ -194,6 +194,18 @@ CLI and API share it and never diverge.
   the root halfway down a column thousands of pixels tall. `fitView` is clamped
   (`minZoom: 0.55`) for the same reason — unclamped it squeezes a 17,000px tree
   into the canvas and every label becomes a smudge.
+  Node colour is two-level. The three structural kinds (session, agent, skill)
+  have fixed colours in `App.css`; a **tool** node is coloured by its tool
+  *name* — `toolColor()` in `sessionGraph.ts`, applied as an inline style on
+  the left border and the name line, because the set of tool names is
+  open-ended (`mcp__*`, whatever ships next) and can never live in a
+  stylesheet. It is a hand-assigned palette slot for the tools that dominate a
+  transcript (Bash/Read/Edit are ~80% of all calls and must not sit on
+  neighbouring hues) with an FNV-1a hash fallback for everything else, so a new
+  tool gets a real colour rather than the old undifferentiated grey. Keyed on
+  `name` alone, never `target` — the same reason the ingest keeps them in
+  separate columns. The MiniMap draws raw fills and cannot see any of that, so
+  it is fed the *same* mapping explicitly via `nodeColor`.
   The canvas is read-only (no drag/connect/select, `deleteKeyCode={null}`),
   which is also what keeps it clear of the touch traps `docs/mobile.md`
   records: its `Handle`s exist only as edge anchors and are

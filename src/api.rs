@@ -40,7 +40,8 @@ use crate::core::{
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, NextResult, Priority, ProjectAgents,
     ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store,
-    StoryboardPatch, TaskPatch, TaskSummary, Waypoint, agents, attachments, files, git, hooks,
+    StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, files, git,
+    hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -299,9 +300,35 @@ fn inbox_watcher_tick(state: &AppState) {
     }
 }
 
+/// Walks `task` down to the actionable task the todo watcher should really
+/// dispatch: the top-ranked actionable descendant of `task`, recursively, or
+/// `task` itself once nothing under it is actionable.
+///
+/// The watcher's unit of work is an actionable **leaf**. A task that still
+/// has actionable subtasks is a *batch*, and claiming it would break the
+/// umbrella rule from the other side: the very next tick would see an
+/// `in_progress` task with children, treat it as an umbrella, and spawn a
+/// second agent on one of its own children in the same repo (mesa task 570).
+/// An epic therefore gets dispatched only once its subtree is exhausted —
+/// which is exactly the roll-up moment its acceptance describes.
+///
+/// Bounded, so a malformed `parent_id` cycle can only cost a few queries
+/// rather than spinning the tick forever; real task trees are a few levels
+/// deep at most.
+fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
+    const MAX_DEPTH: usize = 16;
+    for _ in 0..MAX_DEPTH {
+        match store.next_subtask(&[task.id])? {
+            Some(child) => task = child,
+            None => break,
+        }
+    }
+    Ok(task)
+}
+
 /// One todo-watcher pass: for every project with a live `local_path` and no
-/// `in_progress` task, pick the next actionable task (`Store::next_task`) and
-/// dispatch a background `claude` agent on it. Marks the task `in_progress`
+/// `in_progress` **leaf** task, pick the next actionable task and dispatch a
+/// background `claude` agent on it. Marks the task `in_progress`
 /// itself *before* spawning — closing the race window between dispatch and
 /// the agent's own `/execute-mesa-task` pickup step, so a second tick can't
 /// double-dispatch the same task while the agent is still starting up. A
@@ -310,6 +337,26 @@ fn inbox_watcher_tick(state: &AppState) {
 /// detected here (task-status, not live-session, is the "in process" signal)
 /// and leaves that project quiet until someone intervenes — an accepted v1
 /// tradeoff over polling `claude agents` for every project every tick.
+///
+/// "Busy" is per-project but not per-`in_progress`-row: an `in_progress` task
+/// that has subtasks is an **umbrella**, not a worker, so it does not wedge
+/// the project (mesa task 570). A project whose only `in_progress` tasks are
+/// umbrellas stays dispatchable, but the pick narrows from
+/// `Store::next_task` (any actionable todo in the project) to
+/// `Store::next_subtask` (an actionable todo *under* one of those umbrellas)
+/// — an open umbrella unblocks its own children and nothing else, so the
+/// watcher never starts unrelated work alongside a parent someone is still
+/// holding.
+///
+/// The invariant that keeps this to one watcher-spawned agent per project is
+/// [`deepest_actionable`]: whatever the pick, the watcher claims an
+/// actionable *leaf*, which re-marks the project busy on the next tick. It
+/// never claims a task that still has actionable subtasks — that task would
+/// otherwise read as an umbrella one tick later and get a second agent
+/// spawned on its own child. (Residual, inherent to the status-not-liveness
+/// signal: a *new* subtask created under an already-`in_progress` task
+/// mid-run does turn it into an umbrella, and the next tick dispatches that
+/// child alongside whoever holds the parent.)
 ///
 /// Two-phase, like `spawn_project_agent`: the store lock is held only long
 /// enough to decide and claim (phase 1), then dropped before the blocking
@@ -337,11 +384,20 @@ fn todo_watcher_tick(state: &AppState) {
                 return;
             }
         };
-        let busy_projects: std::collections::HashSet<i64> = tasks
-            .iter()
-            .filter(|t| t.status == Status::InProgress)
-            .map(|t| t.project_id)
-            .collect();
+        // A task that is somebody's parent is an umbrella; only a *leaf*
+        // in_progress task means "an agent is working this project".
+        let parents: std::collections::HashSet<i64> =
+            tasks.iter().filter_map(|t| t.parent_id).collect();
+        let mut busy_projects: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut umbrellas: std::collections::HashMap<i64, Vec<i64>> =
+            std::collections::HashMap::new();
+        for task in tasks.iter().filter(|t| t.status == Status::InProgress) {
+            if parents.contains(&task.id) {
+                umbrellas.entry(task.project_id).or_default().push(task.id);
+            } else {
+                busy_projects.insert(task.project_id);
+            }
+        }
         let mut claimed = Vec::new();
         for project in projects {
             let Some(local_path) = project.local_path.as_deref() else {
@@ -353,12 +409,37 @@ fn todo_watcher_tick(state: &AppState) {
             if busy_projects.contains(&project.id) {
                 continue;
             }
-            let task = match store.next_task(Some(project.id)) {
-                Ok(NextResult::Task(task)) => task,
-                Ok(NextResult::None { .. }) => continue,
+            // Open umbrella(s) → dispatch only from under them; otherwise the
+            // project is idle and the whole backlog is fair game.
+            let picked = match umbrellas.get(&project.id) {
+                Some(parent_ids) => match store.next_subtask(parent_ids) {
+                    Ok(Some(task)) => task,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        eprintln!(
+                            "todo-watcher: next_subtask failed for project {}: {e}",
+                            project.id
+                        );
+                        continue;
+                    }
+                },
+                None => match store.next_task(Some(project.id)) {
+                    Ok(NextResult::Task(task)) => *task,
+                    Ok(NextResult::None { .. }) => continue,
+                    Err(e) => {
+                        eprintln!(
+                            "todo-watcher: next_task failed for project {}: {e}",
+                            project.id
+                        );
+                        continue;
+                    }
+                },
+            };
+            let task = match deepest_actionable(&store, picked) {
+                Ok(task) => task,
                 Err(e) => {
                     eprintln!(
-                        "todo-watcher: next_task failed for project {}: {e}",
+                        "todo-watcher: next_subtask failed for project {}: {e}",
                         project.id
                     );
                     continue;
@@ -4316,6 +4397,210 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Status::InProgress,
             "unarchived project's task must be claimed in_progress"
         );
+    }
+
+    // --- todo-watcher umbrella tasks (mesa task 570) -----------------------
+    //
+    // An `in_progress` task that has subtasks must not wedge its project: the
+    // watcher keeps dispatching, but only from under that umbrella. An
+    // `in_progress` *leaf* still wedges, as before.
+
+    fn new_subtask(state: &AppState, project_id: i64, parent: i64, title: &str) -> i64 {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_task(
+                project_id,
+                title,
+                None,
+                Priority::Medium,
+                &[],
+                Some(parent),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+    }
+
+    fn set_status(state: &AppState, id: i64, status: Status) {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .update_task(
+                id,
+                &TaskPatch {
+                    status: Some(status),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn todo_watcher_tick_dispatches_subtask_under_in_progress_parent() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+
+        // An unrelated todo, an umbrella held in_progress, and two children.
+        let outsider = new_task(&state, project);
+        let parent = new_task(&state, project);
+        let child_a = new_subtask(&state, project, parent, "child a");
+        let child_b = new_subtask(&state, project, parent, "child b");
+        set_status(&state, parent, Status::InProgress);
+
+        todo_watcher_tick(&state);
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "an open umbrella must not wedge its project: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("/execute-mesa-task {child_a}")),
+            "the umbrella's first child must be the dispatched task: {log:?}"
+        );
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(child_a), Status::InProgress);
+        assert_eq!(get(parent), Status::InProgress, "the umbrella is untouched");
+        assert_eq!(
+            get(outsider),
+            Status::Todo,
+            "an open umbrella unblocks only its own children"
+        );
+
+        // The dispatched child is a leaf, so the project is busy again: the
+        // second child must wait rather than fan out concurrently.
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "an in_progress leaf still wedges the project: {log:?}"
+        );
+        assert_eq!(get(child_b), Status::Todo);
+
+        // Child done -> the next tick takes the umbrella's second child.
+        set_status(&state, child_a, Status::Done);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 2, "second child dispatched: {log:?}");
+        assert!(
+            log.contains(&format!("/execute-mesa-task {child_b}")),
+            "{log:?}"
+        );
+
+        // Subtree exhausted while the umbrella is still open -> the watcher
+        // stops rather than reaching for the unrelated todo.
+        set_status(&state, child_b, Status::Done);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "an exhausted subtree must not fall back to the wider project: {log:?}"
+        );
+        assert_eq!(get(outsider), Status::Todo);
+
+        // Umbrella closed -> the project is plainly idle again.
+        set_status(&state, parent, Status::Done);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 3, "idle project resumes: {log:?}");
+        assert!(
+            log.contains(&format!("/execute-mesa-task {outsider}")),
+            "{log:?}"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn todo_watcher_tick_never_dispatches_a_task_with_actionable_subtasks() {
+        // The umbrella rule's other half: if the watcher itself claimed a
+        // *todo* epic, that epic would read as an umbrella on the very next
+        // tick and a second agent would be spawned onto one of its own
+        // children, in the same repo. `deepest_actionable` prevents it --
+        // the watcher claims leaves, and an epic only once its subtree is
+        // exhausted.
+        //
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+
+        // An all-todo epic: lowest id, so a plain `next_task` picks it.
+        let epic = new_task(&state, project);
+        let child = new_subtask(&state, project, epic, "child");
+        let grandchild = new_subtask(&state, project, child, "grandchild");
+
+        todo_watcher_tick(&state);
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 1, "one dispatch: {log:?}");
+        assert!(
+            log.contains(&format!("/execute-mesa-task {grandchild}")),
+            "the deepest actionable descendant is the unit of work, not the epic: {log:?}"
+        );
+        assert_eq!(get(epic), Status::Todo, "the epic must not be claimed");
+        assert_eq!(get(child), Status::Todo, "the mid-level parent likewise");
+
+        // Second tick: the claimed grandchild is a leaf, so the project is
+        // busy. Without the leaf rule the epic would have been in_progress
+        // here and this tick would spawn a second agent alongside it.
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "no second agent in the repo: {log:?}"
+        );
+
+        // Subtree exhausted -> the epic is finally the actionable leaf, and
+        // its own claim parks the project rather than dispatching alongside.
+        set_status(&state, grandchild, Status::Done);
+        set_status(&state, child, Status::Done);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 2, "roll-up dispatched: {log:?}");
+        assert!(
+            log.contains(&format!("/execute-mesa-task {epic}")),
+            "{log:?}"
+        );
+        assert_eq!(get(epic), Status::InProgress);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "an epic holding its own claim parks the project: {log:?}"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
     }
 
     // --- inbox watcher (mesa task 544) -----------------------------------

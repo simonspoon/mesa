@@ -295,7 +295,10 @@ invariants you must not break — read them before changing `src/`:
   width, read only inside the phone block) and `#root` plus both fixed
   drawers size from it. `docs/mobile.md`.
 - **Todo watcher** — `mesa serve --watch-todo`'s periodic auto-dispatch
-  loop, off by default. `docs/todo-watcher.md`.
+  loop, off by default. A project is "busy" (skipped) on an `in_progress`
+  **leaf** task only: an `in_progress` task that has subtasks is an umbrella,
+  which never wedges its project but does narrow that tick's pick to its own
+  descendants (`Store::next_subtask`, not `next_task`). `docs/todo-watcher.md`.
 - **Inbox watcher** — `mesa serve --watch-inbox`'s periodic auto-triage
   loop (`/inbox-triage <id>` per pending item, cwd `$HOME` since an inbox
   item belongs to no project), off by default and independent of

@@ -253,4 +253,145 @@ ok "unarchiving a project lets the next tick dispatch its actionable todo task"
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
+# ---- an in_progress task WITH subtasks is an umbrella, not a worker: it must
+# not wedge its project, and dispatch narrows to its own descendants (mesa
+# task 570). Isolated db/log/server, same reason as the archived block. ----
+
+UMB_DB="$TMP/umbrella.db"
+UMB_LOG="$TMP/umbrella-bg.log"
+touch "$UMB_LOG"
+UMB_STUB="$STUB_DIR/claude-umbrella"
+sed "s#$ARCH_LOG#$UMB_LOG#" "$ARCH_STUB" > "$UMB_STUB"
+chmod +x "$UMB_STUB"
+
+mkdir -p "$TMP/umbDir"
+UMB_DIR=$(cd "$TMP/umbDir" && pwd -P)
+
+export MESA_DB="$UMB_DB"
+run 0 "$MESA" project create "Umb" --no-git
+UMB=$(jqs .id)
+run 0 "$MESA" project update "$UMB" --path "$UMB_DIR"
+# `outsider` is created first so it wins any project-wide pick on id order --
+# if the umbrella's scoping ever regressed to a plain next_task, this is the
+# task that would be dispatched instead of a child.
+run 0 "$MESA" task create "$UMB" "outsider"
+TASK_OUT=$(jqs .id)
+run 0 "$MESA" task create "$UMB" "epic"
+TASK_EPIC=$(jqs .id)
+run 0 "$MESA" task create "$UMB" "child one" --parent "$TASK_EPIC"
+TASK_C1=$(jqs .id)
+run 0 "$MESA" task create "$UMB" "child two" --parent "$TASK_EPIC"
+TASK_C2=$(jqs .id)
+run 0 "$MESA" task update "$TASK_EPIC" --status in_progress
+
+UMB_PORT=17783
+MESA_CLAUDE_BIN="$UMB_STUB" MESA_WATCH_TODO_TICK_MS=150 \
+  "$MESA" serve --port "$UMB_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$UMB_PORT"
+
+umb_task_status() { curl -sf "http://127.0.0.1:$UMB_PORT/api/tasks/$1" | jq -r .status; }
+wait_umb_bg_lines() { # wait_umb_bg_lines <n>
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$UMB_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n umbrella-check bg dispatch(es); log:\n$(cat "$UMB_LOG")"
+}
+
+wait_umb_bg_lines 1
+sleep 1
+[ "$(wc -l < "$UMB_LOG")" -eq 1 ] || fail "the dispatched child is a leaf: it must wedge the project again"
+LINE=$(head -1 "$UMB_LOG")
+[ "$LINE" = "$UMB_DIR|Umb: child one|/execute-mesa-task $TASK_C1" ] ||
+  fail "expected '$UMB_DIR|Umb: child one|/execute-mesa-task $TASK_C1', got '$LINE'"
+[ "$(umb_task_status "$TASK_EPIC")" = "in_progress" ] || fail "the umbrella itself must be left alone"
+[ "$(umb_task_status "$TASK_OUT")" = "todo" ] || fail "an open umbrella unblocks only its own children"
+[ "$(umb_task_status "$TASK_C2")" = "todo" ] || fail "children must not fan out concurrently"
+ok "an in_progress task with subtasks does not wedge its project: its first child is dispatched, siblings and unrelated tasks wait"
+
+run 0 "$MESA" task update "$TASK_C1" --status done
+wait_umb_bg_lines 2
+LINE=$(sed -n '2p' "$UMB_LOG")
+[ "$LINE" = "$UMB_DIR|Umb: child two|/execute-mesa-task $TASK_C2" ] ||
+  fail "expected '$UMB_DIR|Umb: child two|/execute-mesa-task $TASK_C2', got '$LINE'"
+ok "a finished child lets the next tick take the umbrella's next subtask"
+
+run 0 "$MESA" task update "$TASK_C2" --status done
+sleep 1
+[ "$(wc -l < "$UMB_LOG")" -eq 2 ] || fail "an exhausted subtree must not fall back to the wider project"
+[ "$(umb_task_status "$TASK_OUT")" = "todo" ] || fail "unrelated todo must stay untouched while the umbrella is open"
+ok "an open umbrella with no actionable subtasks left keeps the rest of the project parked"
+
+run 0 "$MESA" task update "$TASK_EPIC" --status done
+wait_umb_bg_lines 3
+LINE=$(sed -n '3p' "$UMB_LOG")
+[ "$LINE" = "$UMB_DIR|Umb: outsider|/execute-mesa-task $TASK_OUT" ] ||
+  fail "expected '$UMB_DIR|Umb: outsider|/execute-mesa-task $TASK_OUT', got '$LINE'"
+ok "closing the umbrella returns the project to plain whole-backlog dispatch"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
+# ---- the umbrella rule's other half: the watcher must never CLAIM a task
+# that still has actionable subtasks. If it did, that task would read as an
+# umbrella one tick later and a second agent would be spawned onto its own
+# child in the same repo (mesa task 570). ----
+
+EPIC_DB="$TMP/epic.db"
+EPIC_LOG="$TMP/epic-bg.log"
+touch "$EPIC_LOG"
+EPIC_STUB="$STUB_DIR/claude-epic"
+sed "s#$ARCH_LOG#$EPIC_LOG#" "$ARCH_STUB" > "$EPIC_STUB"
+chmod +x "$EPIC_STUB"
+
+mkdir -p "$TMP/epicDir"
+EPIC_DIR=$(cd "$TMP/epicDir" && pwd -P)
+
+export MESA_DB="$EPIC_DB"
+run 0 "$MESA" project create "Epic" --no-git
+EPIC_P=$(jqs .id)
+run 0 "$MESA" project update "$EPIC_P" --path "$EPIC_DIR"
+# All todo, epic created first so a plain `next_task` would pick it.
+run 0 "$MESA" task create "$EPIC_P" "epic"
+T_EPIC=$(jqs .id)
+run 0 "$MESA" task create "$EPIC_P" "story" --parent "$T_EPIC"
+T_STORY=$(jqs .id)
+
+EPIC_PORT=17784
+MESA_CLAUDE_BIN="$EPIC_STUB" MESA_WATCH_TODO_TICK_MS=150 \
+  "$MESA" serve --port "$EPIC_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$EPIC_PORT"
+
+epic_task_status() { curl -sf "http://127.0.0.1:$EPIC_PORT/api/tasks/$1" | jq -r .status; }
+wait_epic_bg_lines() { # wait_epic_bg_lines <n>
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$EPIC_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n epic-check bg dispatch(es); log:\n$(cat "$EPIC_LOG")"
+}
+
+wait_epic_bg_lines 1
+sleep 1
+[ "$(wc -l < "$EPIC_LOG")" -eq 1 ] || fail "claiming an epic would let the next tick spawn a second agent on its own child"
+LINE=$(head -1 "$EPIC_LOG")
+[ "$LINE" = "$EPIC_DIR|Epic: story|/execute-mesa-task $T_STORY" ] ||
+  fail "expected '$EPIC_DIR|Epic: story|/execute-mesa-task $T_STORY', got '$LINE'"
+[ "$(epic_task_status "$T_EPIC")" = "todo" ] || fail "a task with actionable subtasks must never be claimed by the watcher"
+ok "the watcher claims an actionable leaf, never a task that still has actionable subtasks"
+
+run 0 "$MESA" task update "$T_STORY" --status done
+wait_epic_bg_lines 2
+LINE=$(sed -n '2p' "$EPIC_LOG")
+[ "$LINE" = "$EPIC_DIR|Epic: epic|/execute-mesa-task $T_EPIC" ] ||
+  fail "expected '$EPIC_DIR|Epic: epic|/execute-mesa-task $T_EPIC', got '$LINE'"
+sleep 1
+[ "$(wc -l < "$EPIC_LOG")" -eq 2 ] || fail "an epic holding its own claim must park the project"
+ok "an exhausted epic is dispatched last (its roll-up) and parks the project while it holds the claim"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
 echo "ALL OK ($CHECKS checks)"

@@ -270,6 +270,16 @@ const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.descript
      EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON b.id = d.blocked_by \
             WHERE d.task_id = t.id AND b.status NOT IN ('done', 'cancelled'))";
 
+/// True iff task `t` has an unresolved dependency. Shared by every
+/// "actionable?" query so `next_task` and `next_subtask` can never drift on
+/// what blocked means.
+const BLOCKED_EXPR: &str = "EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON b.id = d.blocked_by \
+     WHERE d.task_id = t.id AND b.status NOT IN ('done', 'cancelled'))";
+
+/// Actionable-task ordering: high > medium > low, then ascending id. Shared
+/// for the same reason as [`BLOCKED_EXPR`].
+const PRIORITY_RANK: &str = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END";
+
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let status: String = row.get(5)?;
     let priority: String = row.get(6)?;
@@ -1513,9 +1523,8 @@ impl Store {
     /// status counts (scoped to the same filter) so the caller can tell "all
     /// done" from "stuck/blocked" from "work in flight".
     pub fn next_task(&self, project: Option<i64>) -> Result<NextResult> {
-        let blocked_expr = "EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON b.id = d.blocked_by \
-             WHERE d.task_id = t.id AND b.status NOT IN ('done', 'cancelled'))";
-        let priority_rank = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END";
+        let blocked_expr = BLOCKED_EXPR;
+        let priority_rank = PRIORITY_RANK;
         let task = {
             let sql = format!(
                 "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
@@ -1549,6 +1558,42 @@ impl Store {
             in_progress: count("t.status = 'in_progress'")?,
             todo: count(&format!("t.status = 'todo' AND NOT {blocked_expr}"))?,
         })
+    }
+
+    /// Selects the next actionable task from among the **descendants** of
+    /// `parents` (their subtasks, at any depth) — the same `todo`-and-not-
+    /// blocked rule and the same priority-then-id ordering as
+    /// [`Store::next_task`], scoped to a set of subtrees instead of a project.
+    /// The parents themselves are never candidates. Returns `None` when
+    /// `parents` is empty or nothing under them is actionable.
+    ///
+    /// Like any project-scoped read, this ignores `projects.archived`; a
+    /// subtask shares its parent's project, so the caller has already chosen
+    /// the project by choosing the parents (mesa task 570).
+    pub fn next_subtask(&self, parents: &[i64]) -> Result<Option<Task>> {
+        if parents.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = parents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // `UNION` (not `UNION ALL`) so a malformed parent cycle terminates
+        // instead of recursing forever.
+        let sql = format!(
+            "WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM tasks WHERE parent_id IN ({placeholders}) \
+                 UNION \
+                 SELECT c.id FROM tasks c JOIN sub ON c.parent_id = sub.id \
+             ) \
+             SELECT {TASK_COLUMNS} FROM tasks t WHERE t.id IN (SELECT id FROM sub) \
+             AND t.status = 'todo' AND NOT {BLOCKED_EXPR} \
+             ORDER BY {PRIORITY_RANK}, t.id LIMIT 1"
+        );
+        self.conn
+            .query_row(&sql, rusqlite::params_from_iter(parents), row_to_task)
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(Error::Db(e)),
+            })
     }
 
     /// Lists status-change events, oldest first. For one task if `task_id` is
@@ -4031,6 +4076,82 @@ mod tests {
         match store.next_task(None).unwrap() {
             NextResult::Task(t) => assert_eq!(t.title, "med"),
             NextResult::None { .. } => panic!("expected a task"),
+        }
+    }
+
+    #[test]
+    fn next_subtask_scopes_to_descendants_shares_next_task_rules() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let sub = |store: &mut Store, parent: i64, title: &str, priority: Priority| -> Task {
+            store
+                .create_task(
+                    p.id,
+                    title,
+                    None,
+                    priority,
+                    &[],
+                    Some(parent),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+
+        // An unrelated high-priority todo would win any project-wide pick;
+        // next_subtask must never see it.
+        let outsider = create_with_priority(&mut store, p.id, "outsider", Priority::High);
+        let parent = add_task(&mut store, p.id, "umbrella");
+        let child_med = sub(&mut store, parent.id, "child med", Priority::Medium);
+        let child_high = sub(&mut store, parent.id, "child high", Priority::High);
+        let grandchild = sub(&mut store, child_med.id, "grandchild", Priority::High);
+
+        // Empty parents is None, never a project-wide fallback.
+        assert!(store.next_subtask(&[]).unwrap().is_none());
+
+        // Priority ordering, same as next_task; the parent itself and the
+        // unrelated task are both out of scope.
+        let picked = store.next_subtask(&[parent.id]).unwrap().unwrap();
+        assert_eq!(picked.id, child_high.id);
+
+        // Blocked descendants are skipped on the same rule as next_task, and
+        // depth is unlimited: with child_high blocked and child_med done, the
+        // grandchild is next.
+        store.add_dependency(child_high.id, outsider.id).unwrap();
+        store
+            .update_task(
+                child_med.id,
+                &TaskPatch {
+                    status: Some(Status::Done),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let picked = store.next_subtask(&[parent.id]).unwrap().unwrap();
+        assert_eq!(
+            picked.id, grandchild.id,
+            "descendants are found at any depth"
+        );
+
+        // Nothing actionable under the subtree -> None, even though the
+        // project still has an actionable todo (`outsider`).
+        store
+            .update_task(
+                grandchild.id,
+                &TaskPatch {
+                    status: Some(Status::Done),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store.next_subtask(&[parent.id]).unwrap().is_none(),
+            "an exhausted subtree must not fall back to the wider project"
+        );
+        match store.next_task(Some(p.id)).unwrap() {
+            NextResult::Task(t) => assert_eq!(t.id, outsider.id),
+            NextResult::None { .. } => panic!("outsider is still actionable project-wide"),
         }
     }
 

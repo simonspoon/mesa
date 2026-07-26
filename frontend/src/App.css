@@ -4272,7 +4272,7 @@ button:focus-visible,
    agree or the tidy-tree spacing drifts. */
 .cc-graph-node {
   width: 210px;
-  height: 66px;
+  height: 80px;
   box-sizing: border-box;
   padding: 0.4rem 0.55rem;
   border: 1px solid var(--border);
@@ -4288,6 +4288,18 @@ button:focus-visible,
 .cc-graph-node-name {
   font-size: 0.8rem;
   color: var(--text-h);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* What the call acted on: a command, a file name, a URL. Monospace because
+   it is nearly always a shell fragment or a path, and one line only — the
+   full value lives in the node's hover title. */
+.cc-graph-node-target {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4321,6 +4333,13 @@ button:focus-visible,
 
 .cc-graph-node.kind-agent {
   border-left-color: var(--magenta);
+}
+
+/* A skill sits between a subagent and a plain tool call — its own colour so a
+   long column of tool calls still shows where each skill was entered. Mirrored
+   as a literal in CCSessionGraphView's MINIMAP_COLOR. */
+.cc-graph-node.kind-skill {
+  border-left-color: #7c5cff;
 }
 
 .cc-graph-node.kind-tool {

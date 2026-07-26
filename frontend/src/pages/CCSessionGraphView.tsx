@@ -11,7 +11,7 @@ import {
 } from '@xyflow/react'
 import { getCcSessionGraph } from '../api'
 import { usePhoneTier } from '../phoneTier'
-import { formatTokens, layoutSessionGraph, shortModel } from '../sessionGraph'
+import { formatTokens, layoutSessionGraph, shortModel, shortTarget } from '../sessionGraph'
 import type { CcGraphNode } from '../types/CcGraphNode'
 import { useFetch } from '../useFetch'
 
@@ -33,6 +33,7 @@ type CcFlowNode = RFNode<CcGraphNode, 'cc'>
 const MINIMAP_COLOR: Record<CcGraphNode['kind'], string> = {
   session: '#00e5ff',
   agent: '#ff2bd6',
+  skill: '#7c5cff',
   tool: '#16384a',
 }
 
@@ -129,10 +130,21 @@ function GraphNode({ data }: NodeProps<CcFlowNode>) {
   const tokenTitle = data.tokens_are_rollup
     ? 'Total tokens for this thread'
     : 'Tokens of the assistant message that issued this call (shared with sibling calls)'
+  // What the call acted on. Shortened to fit the box; the untruncated value
+  // is the hover title, which is also the only place a long Bash command or a
+  // full file path can be read.
+  const target = shortTarget(data)
+  // A subagent's spawn description and a tool's target both want the node's
+  // one title slot, and no node ever has both (`description` is agent-only).
+  const title = data.description ?? data.target ?? undefined
   return (
-    <div className={`cc-graph-node kind-${data.kind}`} title={data.description ?? undefined}>
+    <div className={`cc-graph-node kind-${data.kind}`} title={title}>
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="cc-graph-node-name">{data.name}</div>
+      {/* Untrusted: `target` is verbatim model-authored input (a command, a
+          path). It is rendered as a text child — never as HTML, a URL, or an
+          attribute that could act on it. */}
+      {target && <div className="cc-graph-node-target">{target}</div>}
       <div className="cc-graph-node-row">
         {model && <span className="cc-graph-model">{model}</span>}
         <span className="cc-graph-tokens" title={tokenTitle}>

@@ -869,6 +869,12 @@ pub enum CcGraphNodeKind {
     Session,
     /// One subagent run (`cc_agent_runs`).
     Agent,
+    /// One `Skill` tool call — a skill invocation, split out of `Tool` so a
+    /// reader can pick skills out of a long call sequence at a glance. The
+    /// node's `name` is the skill itself (`inaros-swe:refine`), not `"Skill"`.
+    /// Its id keeps the `tool:` prefix: it is still one `cc_tool_calls` row,
+    /// and a skill that spawns a subagent is the parent of that `agent:` node.
+    Skill,
     /// One tool call (`cc_tool_calls`).
     Tool,
 }
@@ -889,8 +895,17 @@ pub struct CcGraphNode {
     /// `"tool:<tool_use_id>"`.
     pub id: String,
     pub kind: CcGraphNodeKind,
-    /// Tool name, subagent name, or the session's short id.
+    /// Tool name, skill name, subagent name, or the session's short id.
     pub name: String,
+    /// `tool` only: what the call acted on — a Bash command, a file path, a
+    /// URL — sanitized and capped at [`crate::core::cc::TARGET_MAX_CHARS`].
+    /// `None` on every other kind, on tools with no meaningful target, and on
+    /// calls ingested before migration 16 that no `cc sync --rebuild` has
+    /// revisited. A `skill` node carries its skill in `name` instead, so this
+    /// stays `None` there.
+    ///
+    /// Untrusted: it is verbatim model-authored input. Render it as data.
+    pub target: Option<String>,
     /// The issuing message's model (`tool`), or the thread's most-used model
     /// (`session`/`agent`). `None` when no usage-carrying message backs it.
     pub model: Option<String>,

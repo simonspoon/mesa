@@ -24,7 +24,7 @@ trap 'rm -rf "$TMP"; [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null;
 mkdir -p "$TMP/tree/-demo-project/s/subagents"
 cat > "$TMP/tree/-demo-project/s.jsonl" <<'JSONL'
 {"type":"user","sessionId":"a","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/demo","gitBranch":"main","entrypoint":"cli","message":{"role":"user","content":"hi"}}
-{"type":"assistant","uuid":"u1","sessionId":"a","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/demo","attributionSkill":"build","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","caller":"skill:build"}]}}
+{"type":"assistant","uuid":"u1","sessionId":"a","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/demo","attributionSkill":"build","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","caller":"skill:build","input":{"command":"grep -rn 'x'\tsrc/","description":"search"}},{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/home/me/demo/src/core/cc.rs","limit":20}},{"type":"tool_use","id":"toolu_3","name":"Skill","input":{"skill":"inaros-swe:refine","args":"583"}},{"type":"tool_use","id":"toolu_4","name":"AskUserQuestion","input":{"questions":[]}}]}}
 JSONL
 cat > "$TMP/tree/-demo-project/s/subagents/x.jsonl" <<'JSONL'
 {"type":"assistant","uuid":"u2","isSidechain":true,"sessionId":"a","agentId":"x1","timestamp":"2026-06-15T01:10:00.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
@@ -32,8 +32,8 @@ JSONL
 # The `.meta.json` sidecar Claude Code writes beside a subagent transcript: it
 # carries the spawn provenance (`toolUseId`), which is the only link from a
 # subagent back to the call that started it, and so the only thing that makes
-# `cc graph` a tree rather than a flat list. Points at `toolu_1` — the one tool
-# call this fixture has — so the graph under test is session -> tool -> agent.
+# `cc graph` a tree rather than a flat list. Points at `toolu_1` — the Bash
+# call — so the graph under test is session -> tool -> agent.
 # NOT a `.jsonl`, so `collect_files` ignores it and the file counts above hold.
 cat > "$TMP/tree/-demo-project/s/subagents/x.meta.json" <<'JSON'
 {"agentType":"Explore","description":"look around","toolUseId":"toolu_1","spawnDepth":1}
@@ -54,7 +54,7 @@ assert r["files_scanned"]==2, r
 assert r["files_ingested"]==2, r
 assert r["sessions"]==1, r
 assert r["messages_added"]==2, r
-assert r["tool_calls_added"]==1, r
+assert r["tool_calls_added"]==4, r
 print("sync ok")
 ' || fail "sync report shape/counts"
 
@@ -99,6 +99,12 @@ assert o["est_cost_usd"]>0
 assert d["since"] is None
 t=[t for t in d["tools"] if t["name"]=="Bash"]
 assert t and t[0]["caller"]=="skill:build" and t[0]["calls"]==1, d["tools"]
+# The tool breakdown buckets by (name, caller) and must stay that way now that
+# a call also carries a per-call `target`: one Bash bucket, named "Bash", NOT
+# one bucket per distinct command. This is why `target` is its own column
+# rather than being folded into `name`.
+assert len(t)==1 and t[0]["name"]=="Bash", d["tools"]
+assert {x["name"] for x in d["tools"]}=={"Bash","Read","Skill","AskUserQuestion"}, d["tools"]
 assert any(a["agent"]=="Explore" for a in d["agents"]), d["agents"]
 print("summary ok")
 ' || fail "summary shape/counts"
@@ -112,7 +118,7 @@ r=rows[0]
 assert r["project"]=="demo", r["project"]
 assert r["used_subagent"] is True
 assert r["duration_minutes"]==10.0, r["duration_minutes"]
-assert r["tool_calls"]==1, r["tool_calls"]
+assert r["tool_calls"]==4, r["tool_calls"]
 assert r["agent_runs"]==1, r["agent_runs"]
 print("sessions ok")
 ' || fail "sessions shape"
@@ -139,7 +145,7 @@ assert o["sessions"]==1 and o["messages"]==2 and o["total_tokens"]==380, o
 assert any(a["agent"]=="Explore" for a in d["agents"]), d["agents"]
 assert any(t["name"]=="Bash" for t in d["tools"]), d["tools"]
 s=d["sessions"][0]
-assert s["used_subagent"] is True and s["agent_runs"]==1 and s["tool_calls"]==1, s
+assert s["used_subagent"] is True and s["agent_runs"]==1 and s["tool_calls"]==4, s
 print("survives deletion ok")
 ' || fail "history did not survive transcript deletion"
 
@@ -230,18 +236,43 @@ g=json.load(sys.stdin)
 assert g["session_id"]=="a", g
 assert g["project"]=="demo", g
 by={n["id"]:n for n in g["nodes"]}
-assert set(by)=={"session","tool:toolu_1","agent:x1"}, sorted(by)
+assert set(by)=={"session","tool:toolu_1","tool:toolu_2","tool:toolu_3","tool:toolu_4",
+                 "agent:x1"}, sorted(by)
 # The tree: exactly one root, every other node has exactly one parent.
 parents={}
 for e in g["edges"]:
     assert e["from"] in by and e["to"] in by, e
     assert e["to"] not in parents, f"two parents for {e['to']}"
     parents[e["to"]]=e["from"]
-assert parents=={"tool:toolu_1":"session","agent:x1":"tool:toolu_1"}, parents
+assert parents=={"tool:toolu_1":"session","tool:toolu_2":"session","tool:toolu_3":"session",
+                 "tool:toolu_4":"session","agent:x1":"tool:toolu_1"}, parents
 
 s,t,a=by["session"],by["tool:toolu_1"],by["agent:x1"]
 assert s["kind"]=="session" and t["kind"]=="tool" and a["kind"]=="agent", g["nodes"]
 assert t["name"]=="Bash" and a["name"]=="Explore", g["nodes"]
+
+# ---- what each call acted on (task 583) ----
+# A Bash node carries its command, with the tab in the fixture collapsed to a
+# single space: a stored target is one line, never able to span rows or move a
+# cursor when this JSON is catted.
+assert t["target"]=="grep -rn '"'"'x'"'"' src/", repr(t["target"])
+# A file tool carries the FULL path; shortening to a basename is the web UI`s
+# job, so the payload an agent reads stays unambiguous.
+r=by["tool:toolu_2"]
+assert r["kind"]=="tool" and r["name"]=="Read", r
+assert r["target"]=="/home/me/demo/src/core/cc.rs", r
+# A Skill call is its own kind and is named for the skill — not four nodes all
+# labelled "Skill". Its id keeps the `tool:` prefix (it is still one
+# cc_tool_calls row), which is what lets a skill parent a subagent.
+k=by["tool:toolu_3"]
+assert k["kind"]=="skill", k
+assert k["name"]=="inaros-swe:refine", k
+assert k["target"] is None, k
+# A tool with no target-bearing input key is unchanged from before this landed.
+q=by["tool:toolu_4"]
+assert q["kind"]=="tool" and q["name"]=="AskUserQuestion" and q["target"] is None, q
+# Only tool nodes ever carry one.
+assert s["target"] is None and a["target"] is None, (s,a)
 assert a["skill"] is None and a["description"]=="look around" and a["spawn_depth"]==1, a
 # Node labels the ticket asks for: name + model + total tokens, on every node.
 assert s["model"]=="claude-opus-4-8" and a["model"]=="claude-haiku-4-5", (s,a)
@@ -259,14 +290,16 @@ print("cc graph: session -> tool -> agent tree ok")
 ' || fail "cc graph did not return the expected session call tree"
 
 # --limit never drops a subagent or the call that spawned it, so the tree stays
-# connected however low the cap goes.
+# connected however low the cap goes. The three non-spawning calls DO drop, so
+# this also exercises the truncation counter itself — with only the one
+# structural call in the fixture, `omitted_tool_calls` could never leave 0.
 "$BIN" cc graph a --limit 0 | python3 -c '
 import json,sys
 g=json.load(sys.stdin)
 by={n["id"] for n in g["nodes"]}
 assert by=={"session","tool:toolu_1","agent:x1"}, sorted(by)
 assert all(e["from"] in by and e["to"] in by for e in g["edges"]), g["edges"]
-assert g["omitted_tool_calls"]==0, g
+assert g["truncated"] is True and g["omitted_tool_calls"]==3, g
 print("cc graph: --limit 0 keeps the spawning call ok")
 ' || fail "cc graph --limit dropped a structural node"
 
@@ -337,9 +370,15 @@ curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/a/graph" | python3 -c '
 import json,sys
 g=json.load(sys.stdin)
 by={n["id"]:n for n in g["nodes"]}
-assert set(by)=={"session","tool:toolu_1","agent:x1"}, sorted(by)
+assert set(by)=={"session","tool:toolu_1","tool:toolu_2","tool:toolu_3","tool:toolu_4",
+                 "agent:x1"}, sorted(by)
 assert by["agent:x1"]["name"]=="Explore" and by["agent:x1"]["total_tokens"]==30, by["agent:x1"]
 assert by["tool:toolu_1"]["tokens_are_rollup"] is False, by["tool:toolu_1"]
+# The kind/name/target trio reaches HTTP identically to the CLI — one `core`
+# builder, two surfaces.
+assert by["tool:toolu_1"]["target"]=="grep -rn '"'"'x'"'"' src/", by["tool:toolu_1"]
+assert by["tool:toolu_3"]["kind"]=="skill", by["tool:toolu_3"]
+assert by["tool:toolu_3"]["name"]=="inaros-swe:refine", by["tool:toolu_3"]
 assert g["total_tokens"]==380, g
 print("api cc graph: payload matches the CLI ok")
 ' || fail "GET /api/cc/sessions/{id}/graph did not match the CLI payload"

@@ -6,6 +6,7 @@ import {
   formatTokens,
   layoutSessionGraph,
   shortModel,
+  shortTarget,
 } from './sessionGraph'
 import type { CcGraphNode } from './types/CcGraphNode'
 import type { CcSessionGraph } from './types/CcSessionGraph'
@@ -27,6 +28,7 @@ const node = (
   id,
   kind,
   name: id,
+  target: null,
   model: null,
   tokens: ZERO,
   total_tokens: 0,
@@ -213,6 +215,42 @@ describe('shortModel', () => {
   it('passes through an unknown model and null', () => {
     expect(shortModel('<synthetic>')).toBe('<synthetic>')
     expect(shortModel(null)).toBeNull()
+  })
+})
+
+describe('shortTarget', () => {
+  const t = (name: string, target: string | null) => shortTarget({ name, target })
+
+  it('shows a file tool its file name, not the path to it', () => {
+    expect(t('Read', '/Users/me/inaros/projects/tools/mesa/src/core/cc.rs')).toBe('cc.rs')
+    expect(t('Edit', '/a/b/App.css')).toBe('App.css')
+    expect(t('Write', 'relative/dir/notes.md')).toBe('notes.md')
+  })
+
+  it('leaves a command whole, including one that opens with a path', () => {
+    expect(t('Bash', 'git status --short')).toBe('git status --short')
+    // The flags are the informative half — basenaming this to `foo` would
+    // throw away everything the reader is scanning for.
+    expect(t('Bash', '/usr/local/bin/foo --flag')).toBe('/usr/local/bin/foo --flag')
+    expect(t('WebFetch', 'https://example.dev/a/b')).toBe('https://example.dev/a/b')
+  })
+
+  it('basenames an unrecognised tool only when the value looks like a bare path', () => {
+    expect(t('SomeNewFileTool', '/a/b/c.txt')).toBe('c.txt')
+    expect(t('SomeNewFileTool', './rel/c.txt')).toBe('c.txt')
+    expect(t('SomeNewFileTool', '~/notes/c.txt')).toBe('c.txt')
+    // Spaces mean it is a command line, not a path.
+    expect(t('SomeNewTool', '/a/b/c.txt --flag')).toBe('/a/b/c.txt --flag')
+    // No leading path marker, so it is a query/name and stays whole.
+    expect(t('SomeNewTool', 'src/core/cc.rs')).toBe('src/core/cc.rs')
+  })
+
+  it('degrades instead of returning an empty label', () => {
+    expect(t('Read', null)).toBeNull()
+    expect(t('Bash', null)).toBeNull()
+    // A trailing slash yields the directory, never ''.
+    expect(t('Read', '/a/b/')).toBe('b')
+    expect(t('Read', '/')).toBe('/')
   })
 })
 

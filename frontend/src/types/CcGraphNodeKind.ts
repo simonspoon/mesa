@@ -3,4 +3,4 @@
 /**
  * What one [`CcGraphNode`] stands for.
  */
-export type CcGraphNodeKind = "session" | "agent" | "tool";
+export type CcGraphNodeKind = "session" | "agent" | "skill" | "tool";

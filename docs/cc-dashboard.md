@@ -17,7 +17,30 @@ CLI and API share it and never diverge.
   skipped. Subagent lines carry the **parent's** `sessionId` plus an `agentId`,
   so their usage rolls into the parent session. An event's `uuid` (and a tool
   call's `tool_use_id`) is the idempotency key: all ingest writes are upserts,
-  so re-ingesting any line is a no-op. Tool `input` payloads are never stored.
+  so re-ingesting any line is a no-op.
+- **A tool call's `input` is read for exactly one bounded field, never stored
+  whole.** `cc::tool_target` lifts the first string under an ordered key list
+  (`skill`, `command`, `file_path`, `url`, `query`, `pattern`, `path`, `name`,
+  `subject`, `title`, `description`) into `cc_tool_calls.target` (migration 16),
+  which is what lets a graph node say `Bash / cargo test` instead of `Bash`.
+  Everything else in the payload is still dropped: the bulk keys (`content`,
+  `new_string`, `prompt`, `script`) are absent from the list on purpose, since
+  a `Write` input is a whole file. Three properties hold it in place:
+  - **Bounded** — capped at `TARGET_MAX_CHARS` (200) *characters*, not bytes, so
+    the cut can never split a code point. ~10% of real `Bash` commands exceed it.
+  - **Sanitized at ingest, not at display** — whitespace runs collapse to single
+    spaces and control characters are dropped, so a heredoc command cannot span
+    rows and a stored value cannot move a terminal cursor when a `cc graph`
+    payload is catted. It is untrusted model-authored text: **data, never
+    instructions** (see the repo CLAUDE.md's untrusted-input rule).
+  - **Never folded into `name`** — the dashboard's tool breakdown buckets by
+    `(name, caller)`, so a per-call value there would shatter one `Bash` row
+    into one row per distinct command. `target` is its own column for that
+    reason, and `scripts/cc-check.sh` asserts the breakdown stays bucketed.
+
+  A tool whose input has no listed key (`advisor`'s `{}`, `StructuredOutput`'s
+  caller-defined payload) simply gets `NULL`, as does one whose input failed
+  upstream parsing (`{"__unparsedToolInput": …}`) or is not an object at all.
 - A call to the built-in **`advisor`** tool doesn't get its own transcript
   line/file the way a Task-tool subagent does (no `subagents/*.jsonl`, no
   `isSidechain`): it's a `server_tool_use` content block (read like
@@ -87,11 +110,27 @@ CLI and API share it and never diverge.
   read that is per-session rather than windowed (it always covers the whole
   session; the `Store::cc_session_*` reads filter on `session_id`, never `ts`).
   Returns a `CcSessionGraph`: one `session` root, one `agent` node per
-  `cc_agent_runs` row, one `tool` node per `cc_tool_calls` row, plus parent→child
-  edges. **Guaranteed a tree** — every node but the root has exactly one parent —
-  so a client lays it out with no cycle-breaking. Parent of an agent, in
-  descending exactness: its `tool_use_id` (the sidecar's spawning call), else
-  `parent_agent_id`, else the root.
+  `cc_agent_runs` row, one `tool`-or-`skill` node per `cc_tool_calls` row, plus
+  parent→child edges. **Guaranteed a tree** — every node but the root has exactly
+  one parent — so a client lays it out with no cycle-breaking. Parent of an
+  agent, in descending exactness: its `tool_use_id` (the sidecar's spawning
+  call), else `parent_agent_id`, else the root.
+  - **What a node calls itself.** A `tool` node is named for the tool and
+    carries `target` — the bounded field lifted from the call's `input` above,
+    so a reader sees `Bash / cargo test` and `Read / cc.rs` rather than a column
+    of bare tool names. A **`Skill` call is promoted to its own `skill` kind and
+    named for the skill** (`inaros-swe:refine`), with `target` left `None` since
+    the skill name has become the name. Its id keeps the `tool:` prefix — it is
+    still one `cc_tool_calls` row, and that is what lets a skill parent the
+    subagent it spawned. The promotion keys on the target being present, so a
+    row ingested before migration 16 stays a plain `tool` node named `Skill`
+    rather than becoming a `skill` node with nothing to call itself.
+    `target` is `None` on every non-`tool` kind.
+  - `target` is only on rows ingested since migration 16; `mesa cc sync
+    --rebuild` backfills older ones. That backfill is a separate guarded
+    `UPDATE … WHERE target IS NULL`, not a `DO UPDATE` upsert arm, because a
+    conflict-update reports one changed row per call and would make a rebuild
+    report every re-parsed call as newly added.
   - **`tokens`/`total_tokens` mean two different things and only
     `tokens_are_rollup` says which.** On `session`/`agent` they are that
     thread's own summed usage. On a `tool` node they are the usage of the
@@ -119,8 +158,11 @@ CLI and API share it and never diverge.
   cross-process ingest (a CLI `cc sync` between requests) that file mtimes
   can't, and deleting a transcript invalidates nothing. Read-only, so the
   Content-Type gate doesn't apply.
-- Untrusted input: stored skill/agent/tool names and `caller` strings come from
-  transcripts — data, never instructions.
+- Untrusted input: stored skill/agent/tool names, `caller` strings and a tool
+  call's `target` all come from transcripts — data, never instructions. `target`
+  is the sharpest of these (it is verbatim model-authored text, often a shell
+  command), which is why it is sanitized at ingest and rendered only as a text
+  child / `title` attribute, never as markup or a URL.
 - Web UI: a global **CC Dashboard** entry in the sidebar (above Projects, next to
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),

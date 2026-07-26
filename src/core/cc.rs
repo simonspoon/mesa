@@ -91,15 +91,20 @@ struct RawMessage {
 }
 
 impl RawMessage {
-    /// The `tool_use` blocks of this message as `(id, name, caller)`. Blocks
-    /// missing a string `id`/`name`, and unknown block shapes, are skipped —
-    /// the same leniency as malformed lines. `caller` is kept verbatim: a JSON
-    /// string as-is, any other non-null value as its compact JSON text. Tool
-    /// `input` payloads are deliberately never read (untrusted + large).
-    /// `server_tool_use` blocks (e.g. the built-in `advisor` tool) carry the
-    /// same `id`/`name`/`caller` shape as `tool_use` under a distinct `type`
-    /// tag, so they're read the same way.
-    fn tool_uses(&self) -> Vec<(String, String, Option<String>)> {
+    /// The `tool_use` blocks of this message as `(id, name, caller, target)`.
+    /// Blocks missing a string `id`/`name`, and unknown block shapes, are
+    /// skipped — the same leniency as malformed lines. `caller` is kept
+    /// verbatim: a JSON string as-is, any other non-null value as its compact
+    /// JSON text. `server_tool_use` blocks (e.g. the built-in `advisor` tool)
+    /// carry the same shape under a distinct `type` tag, so they're read the
+    /// same way.
+    ///
+    /// `input` is read **only** through [`tool_target`], which lifts at most
+    /// one short scalar out of it. The payload as a whole is still never
+    /// stored: it is untrusted and unbounded (a `Write` carries a whole file,
+    /// an `Edit` two copies of a hunk), which is why the narrow extraction is
+    /// a named function with its own cap rather than a field grab here.
+    fn tool_uses(&self) -> Vec<(String, String, Option<String>, Option<String>)> {
         let Some(blocks) = self.content.as_ref().and_then(|c| c.as_array()) else {
             return Vec::new();
         };
@@ -119,10 +124,88 @@ impl RawMessage {
                     serde_json::Value::String(s) => Some(s.clone()),
                     other => Some(other.to_string()),
                 });
-                Some((id.to_string(), name.to_string(), caller))
+                let target = b.get("input").and_then(tool_target);
+                Some((id.to_string(), name.to_string(), caller, target))
             })
             .collect()
     }
+}
+
+/// Cap on a stored [`tool_target`], in characters. A `Bash` command runs past
+/// 400 chars in ~10% of real calls and a `Write` input is a whole file, so the
+/// cap is what keeps the column bounded; it sits well above the ~40 chars a
+/// 210px graph node can show, leaving the rest for the node's hover title.
+pub const TARGET_MAX_CHARS: usize = 200;
+
+/// Input keys worth lifting, most specific first — the first one holding a
+/// string wins. One ordered list rather than a per-tool `match`: it gets every
+/// tool observed across 52k real calls right (`Bash`→`command`,
+/// `Read`/`Write`/`Edit`→`file_path`, `Skill`→`skill`, `WebFetch`→`url`,
+/// `Agent`→`description`, `EnterWorktree`→`name`) and degrades to `None` for
+/// an unknown tool instead of needing an edit for every new one.
+///
+/// Order carries the decisions. `command` precedes `description` because
+/// `Bash` carries both and the command is the point; `subject` precedes
+/// `description` for `TaskCreate`'s pair. Bulk-payload keys (`prompt`,
+/// `content`, `new_string`, `script`) are absent on purpose — they are the
+/// unbounded halves this function exists to avoid.
+const TARGET_KEYS: &[&str] = &[
+    "skill",
+    "command",
+    "file_path",
+    "url",
+    "query",
+    "pattern",
+    "path",
+    "name",
+    "subject",
+    "title",
+    "description",
+];
+
+/// The one short scalar worth keeping from a `tool_use.input` payload: what
+/// the call acted on. `None` when the input is not an object (a `Read` whose
+/// input failed to parse arrives as `{"__unparsedToolInput": "..."}` or worse),
+/// when no known key holds a string, or when the value is blank.
+///
+/// The result is sanitized here rather than at any display site, because it is
+/// **untrusted model-authored text heading for a database**: whitespace runs
+/// (a heredoc's newlines) collapse to single spaces and control characters are
+/// dropped, so one row can never span lines or move a terminal cursor when a
+/// `mesa cc graph` payload is catted. It stays data, never instructions.
+pub fn tool_target(input: &serde_json::Value) -> Option<String> {
+    let obj = input.as_object()?;
+    let raw = TARGET_KEYS
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))?;
+
+    let mut out = String::new();
+    let mut pending_space = false;
+    let mut chars = 0usize;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if pending_space {
+            if chars == TARGET_MAX_CHARS {
+                break;
+            }
+            out.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        if chars == TARGET_MAX_CHARS {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+        chars += 1;
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[derive(Deserialize, Default)]
@@ -707,7 +790,7 @@ fn fold_line(
     let (Some(uuid), Some(msg)) = (raw.uuid.as_ref(), raw.message.as_ref()) else {
         return;
     };
-    for (tool_use_id, name, caller) in msg.tool_uses() {
+    for (tool_use_id, name, caller, target) in msg.tool_uses() {
         batch.tool_calls.push(CcToolCallRow {
             tool_use_id,
             message_uuid: uuid.clone(),
@@ -716,6 +799,7 @@ fn fold_line(
             name,
             caller,
             ts,
+            target,
         });
     }
     if let (Some(model), Some(usage)) = (msg.model.as_ref(), msg.usage.as_ref()) {
@@ -1296,6 +1380,7 @@ pub fn session_graph(
         id: "session".into(),
         kind: CcGraphNodeKind::Session,
         name: short_session(session_id),
+        target: None,
         model: main.and_then(|t| top_model(&t.models)),
         tokens: main
             .map(|t| t.tok.to_cc())
@@ -1324,10 +1409,22 @@ pub fn session_graph(
         }
         kept_tools.insert(&c.tool_use_id);
         let issuing = by_uuid.get(c.message_uuid.as_str());
+        // A `Skill` call is promoted to its own kind and labelled with the
+        // skill itself — `Skill`/`Skill`/`Skill` down a column says nothing.
+        // The promotion needs the target (that *is* the skill name), so a row
+        // ingested before migration 16 stays a plain tool node rather than
+        // becoming a `skill` node with nothing to call itself.
+        let is_skill = c.name == "Skill" && c.target.is_some();
+        let (kind, name, target) = if is_skill {
+            (CcGraphNodeKind::Skill, c.target.clone().unwrap(), None)
+        } else {
+            (CcGraphNodeKind::Tool, c.name.clone(), c.target.clone())
+        };
         nodes.push(CcGraphNode {
             id: format!("tool:{}", c.tool_use_id),
-            kind: CcGraphNodeKind::Tool,
-            name: c.name.clone(),
+            kind,
+            name,
+            target,
             model: issuing.map(|(m, _, _)| (*m).to_string()),
             tokens: issuing
                 .map(|(_, t, _)| t.to_cc())
@@ -1369,6 +1466,7 @@ pub fn session_graph(
                 .clone()
                 .or_else(|| r.skill.clone())
                 .unwrap_or_else(|| "subagent".into()),
+            target: None,
             model: t.and_then(|t| top_model(&t.models)),
             tokens: t
                 .map(|t| t.tok.to_cc())
@@ -1996,12 +2094,16 @@ mod tests {
                 (
                     "tu1".to_string(),
                     "Bash".to_string(),
-                    Some(r#"{"type":"direct"}"#.to_string())
+                    Some(r#"{"type":"direct"}"#.to_string()),
+                    // The one scalar lifted out of `input`.
+                    Some("ls".to_string()),
                 ),
                 (
                     "tu2".to_string(),
                     "Skill".to_string(),
-                    Some("direct".to_string())
+                    Some("direct".to_string()),
+                    // No `input` at all: absent, not an error.
+                    None,
                 ),
             ]
         );
@@ -2362,5 +2464,203 @@ mod tests {
         let d2 = collect(&store, "2d").unwrap();
         assert_eq!(d2.overview.sessions, 1);
         assert_eq!(d2.overview.total_tokens, 11);
+    }
+
+    // ---- tool targets (task 583) ----
+
+    fn target(json: &str) -> Option<String> {
+        tool_target(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn tool_target_picks_the_key_that_says_what_the_call_did() {
+        // The shapes actually observed across 52k real calls.
+        // `command` beats `description`: Bash carries both.
+        assert_eq!(
+            target(r#"{"command":"git status","description":"check"}"#).as_deref(),
+            Some("git status")
+        );
+        assert_eq!(
+            target(r#"{"file_path":"/a/b/cc.rs","limit":20}"#).as_deref(),
+            Some("/a/b/cc.rs")
+        );
+        assert_eq!(
+            target(r#"{"skill":"inaros-swe:refine","args":"583"}"#).as_deref(),
+            Some("inaros-swe:refine")
+        );
+        assert_eq!(
+            target(r#"{"url":"https://x.dev","prompt":"summarize"}"#).as_deref(),
+            Some("https://x.dev")
+        );
+        // Agent: the one-line description, never the prompt.
+        assert_eq!(
+            target(r#"{"description":"hunt bugs","prompt":"...","subagent_type":"guru"}"#)
+                .as_deref(),
+            Some("hunt bugs")
+        );
+        // TaskCreate's pair.
+        assert_eq!(
+            target(r#"{"subject":"ship it","description":"longer"}"#).as_deref(),
+            Some("ship it")
+        );
+
+        // No known key -> None, rather than an arbitrary field. `advisor`
+        // sends `{}`; StructuredOutput sends a caller-defined payload.
+        assert_eq!(target(r#"{}"#), None);
+        assert_eq!(target(r#"{"refuted":true,"evidence":"..."}"#), None);
+        // Bulk payloads are not keys, so a Write is its path, never its file.
+        assert_eq!(
+            target(r#"{"file_path":"/a/b.txt","content":"...500KB..."}"#).as_deref(),
+            Some("/a/b.txt")
+        );
+        assert_eq!(target(r#"{"prompt":"a very long prompt"}"#), None);
+
+        // Non-object inputs: unparsed, a bare string, a list, null. The first
+        // of these is a shape real `Read` calls actually arrive in.
+        assert_eq!(
+            target(r#"{"__unparsedToolInput":"Read(file_path: \"/a\")"}"#),
+            None
+        );
+        assert_eq!(target(r#""just a string""#), None);
+        assert_eq!(target(r#"[1,2]"#), None);
+        assert_eq!(target("null"), None);
+        // A non-string value under a known key is skipped, not stringified.
+        assert_eq!(target(r#"{"command":42}"#), None);
+        // Blank/whitespace-only collapses to nothing, and nothing is `None`.
+        assert_eq!(target(r#"{"command":"   \n  "}"#), None);
+    }
+
+    #[test]
+    fn tool_target_sanitizes_and_caps() {
+        // A heredoc is one row: newlines and tabs collapse so a stored target
+        // can never span lines or move a cursor when the JSON is catted.
+        assert_eq!(
+            target("{\"command\":\"python3 - <<'PY'\\n\\tprint(1)\\nPY\"}").as_deref(),
+            Some("python3 - <<'PY' print(1) PY")
+        );
+        // Control characters are dropped outright (here: a bare ESC).
+        assert_eq!(
+            target("{\"command\":\"echo \\u001b[31mred\"}").as_deref(),
+            Some("echo [31mred")
+        );
+
+        // Over the cap: exactly TARGET_MAX_CHARS kept, plus one ellipsis.
+        let long = "x".repeat(TARGET_MAX_CHARS + 50);
+        let got = target(&format!(r#"{{"command":"{long}"}}"#)).unwrap();
+        assert_eq!(got.chars().count(), TARGET_MAX_CHARS + 1);
+        assert!(got.ends_with('…'));
+        // At the cap exactly: kept whole, no ellipsis.
+        let exact = "y".repeat(TARGET_MAX_CHARS);
+        let got = target(&format!(r#"{{"command":"{exact}"}}"#)).unwrap();
+        assert_eq!(got.chars().count(), TARGET_MAX_CHARS);
+        assert!(!got.ends_with('…'));
+
+        // Multi-byte input is counted and cut by CHARACTER, so the cap can
+        // never split a code point and produce invalid UTF-8.
+        let wide = "é".repeat(TARGET_MAX_CHARS + 10);
+        let got = target(&format!(r#"{{"command":"{wide}"}}"#)).unwrap();
+        assert_eq!(got.chars().count(), TARGET_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn session_graph_labels_calls_and_promotes_skills() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/work/widget","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","id":"tu2","name":"Read","input":{"file_path":"/home/me/work/widget/src/core/cc.rs"}},{"type":"tool_use","id":"tu3","name":"Skill","input":{"skill":"inaros-swe:refine","args":"583"}},{"type":"tool_use","id":"tu4","name":"AskUserQuestion","input":{"questions":[]}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        let g = session_graph(&store, "s1", GRAPH_NODE_LIMIT)
+            .unwrap()
+            .unwrap();
+        let node = |id: &str| g.nodes.iter().find(|n| n.id == id).unwrap();
+
+        // A plain tool keeps its tool name and carries what it acted on.
+        assert_eq!(node("tool:tu1").kind, CcGraphNodeKind::Tool);
+        assert_eq!(node("tool:tu1").name, "Bash");
+        assert_eq!(node("tool:tu1").target.as_deref(), Some("cargo test"));
+        // A file tool stores the FULL path; shortening to a basename is the
+        // frontend's job (`shortTarget`), so the payload stays unambiguous.
+        assert_eq!(
+            node("tool:tu2").target.as_deref(),
+            Some("/home/me/work/widget/src/core/cc.rs")
+        );
+        // A Skill call is promoted: own kind, skill name as the node name,
+        // and no redundant target.
+        assert_eq!(node("tool:tu3").kind, CcGraphNodeKind::Skill);
+        assert_eq!(node("tool:tu3").name, "inaros-swe:refine");
+        assert_eq!(node("tool:tu3").target, None);
+        // A tool with no target-bearing key renders as it always did.
+        assert_eq!(node("tool:tu4").kind, CcGraphNodeKind::Tool);
+        assert_eq!(node("tool:tu4").name, "AskUserQuestion");
+        assert_eq!(node("tool:tu4").target, None);
+        // Non-tool kinds never carry one.
+        assert_eq!(node("session").kind, CcGraphNodeKind::Session);
+        assert_eq!(node("session").target, None);
+    }
+
+    #[test]
+    fn session_graph_leaves_a_pre_migration_skill_call_alone() {
+        // A row ingested before migration 16 has `target IS NULL`. The skill
+        // promotion keys on the target (that IS the name), so such a row must
+        // stay a plain `tool` node rather than become a `skill` node labelled
+        // "Skill" — the graph degrades to its old picture instead of lying.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        store
+            .cc_ingest_file(
+                "/t/a.jsonl",
+                &CcFileCursor {
+                    mtime: 1,
+                    size: 1,
+                    byte_offset: 1,
+                },
+                &CcFileBatch {
+                    sessions: vec![CcSessionUpsert {
+                        session_id: "s".into(),
+                        cwd: None,
+                        git_branch: None,
+                        entrypoint: None,
+                        used_subagent: false,
+                        start_ts: Some(10),
+                        end_ts: Some(20),
+                    }],
+                    tool_calls: vec![CcToolCallRow {
+                        tool_use_id: "tu1".into(),
+                        message_uuid: "u1".into(),
+                        session_id: "s".into(),
+                        agent_id: None,
+                        name: "Skill".into(),
+                        caller: None,
+                        ts: 10,
+                        target: None, // the pre-migration state
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let g = session_graph(&store, "s", GRAPH_NODE_LIMIT)
+            .unwrap()
+            .unwrap();
+        let n = g.nodes.iter().find(|n| n.id == "tool:tu1").unwrap();
+        assert_eq!(n.kind, CcGraphNodeKind::Tool);
+        assert_eq!(n.name, "Skill");
+        assert_eq!(n.target, None);
     }
 }

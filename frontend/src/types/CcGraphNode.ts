@@ -20,9 +20,20 @@ export type CcGraphNode = {
  */
 id: string, kind: CcGraphNodeKind, 
 /**
- * Tool name, subagent name, or the session's short id.
+ * Tool name, skill name, subagent name, or the session's short id.
  */
 name: string, 
+/**
+ * `tool` only: what the call acted on — a Bash command, a file path, a
+ * URL — sanitized and capped at [`crate::core::cc::TARGET_MAX_CHARS`].
+ * `None` on every other kind, on tools with no meaningful target, and on
+ * calls ingested before migration 16 that no `cc sync --rebuild` has
+ * revisited. A `skill` node carries its skill in `name` instead, so this
+ * stays `None` there.
+ *
+ * Untrusted: it is verbatim model-authored input. Render it as data.
+ */
+target: string | null, 
 /**
  * The issuing message's model (`tool`), or the thread's most-used model
  * (`session`/`agent`). `None` when no usage-carrying message backs it.

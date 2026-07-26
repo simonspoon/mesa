@@ -271,6 +271,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE cc_agent_runs ADD COLUMN parent_agent_id TEXT;
     CREATE INDEX idx_cc_agent_runs_tool ON cc_agent_runs(tool_use_id);
     ",
+    // What a tool call acted on — the one bounded, sanitized field lifted out
+    // of the otherwise-unread `tool_use.input` (see `core::cc::tool_target`).
+    // Deliberately NOT folded into `name`: the dashboard's tool breakdown
+    // buckets by `(name, caller)`, and a per-call value there would shatter
+    // "Bash x 27408" into 27408 rows of one.
+    "ALTER TABLE cc_tool_calls ADD COLUMN target TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -821,6 +827,11 @@ pub struct CcToolCallRow {
     pub name: String,
     pub caller: Option<String>,
     pub ts: i64,
+    /// What the call acted on (a Bash command, a file path, a skill name),
+    /// already sanitized and length-capped by [`crate::core::cc::tool_target`].
+    /// `None` when the tool has no meaningful target, or when its input was
+    /// unparseable.
+    pub target: Option<String>,
 }
 
 /// One `cc_sessions` row as read back for the dashboard (`cc_read_sessions`).
@@ -2622,12 +2633,24 @@ impl Store {
 
             let mut call = tx.prepare(
                 "INSERT INTO cc_tool_calls \
-                     (tool_use_id, message_uuid, session_id, agent_id, name, caller, ts) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     (tool_use_id, message_uuid, session_id, agent_id, name, caller, ts, target) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(tool_use_id) DO NOTHING",
             )?;
+            // `target` arrived after these rows did (migration 16), so it needs
+            // the backfill the agent-run upsert gets from its `COALESCE` arms.
+            // It cannot ride the same `DO UPDATE`: that reports one changed row
+            // per conflict, which would count every re-ingested call as newly
+            // added and turn `cc sync --rebuild` into a fake 52k-row import.
+            // A separate guarded UPDATE keeps `tool_calls_added` meaning
+            // "rows inserted" and still fills the gap on a rebuild, while
+            // `target IS NULL` preserves keep-first for a stored value.
+            let mut backfill = tx.prepare(
+                "UPDATE cc_tool_calls SET target = ?2 \
+                 WHERE tool_use_id = ?1 AND target IS NULL",
+            )?;
             for c in &batch.tool_calls {
-                counts.tool_calls_added += call.execute((
+                let added = call.execute((
                     &c.tool_use_id,
                     &c.message_uuid,
                     &c.session_id,
@@ -2635,7 +2658,12 @@ impl Store {
                     &c.name,
                     &c.caller,
                     c.ts,
+                    &c.target,
                 ))? as i64;
+                counts.tool_calls_added += added;
+                if added == 0 && c.target.is_some() {
+                    backfill.execute((&c.tool_use_id, &c.target))?;
+                }
             }
 
             tx.execute(
@@ -2705,7 +2733,7 @@ impl Store {
     /// Tool-call rows with `ts >= cutoff` (`None` = all).
     pub fn cc_read_tool_calls(&self, cutoff: Option<i64>) -> Result<Vec<CcToolCallRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tool_use_id, message_uuid, session_id, agent_id, name, caller, ts \
+            "SELECT tool_use_id, message_uuid, session_id, agent_id, name, caller, ts, target \
              FROM cc_tool_calls WHERE ?1 IS NULL OR ts >= ?1",
         )?;
         let rows = stmt.query_map([cutoff], |r| {
@@ -2717,6 +2745,7 @@ impl Store {
                 name: r.get(4)?,
                 caller: r.get(5)?,
                 ts: r.get(6)?,
+                target: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2778,7 +2807,7 @@ impl Store {
     /// Every tool-call row for one session, oldest first.
     pub fn cc_session_tool_calls(&self, session_id: &str) -> Result<Vec<CcToolCallRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tool_use_id, message_uuid, session_id, agent_id, name, caller, ts \
+            "SELECT tool_use_id, message_uuid, session_id, agent_id, name, caller, ts, target \
              FROM cc_tool_calls WHERE session_id = ?1 ORDER BY ts, tool_use_id",
         )?;
         let rows = stmt.query_map([session_id], |r| {
@@ -2790,6 +2819,7 @@ impl Store {
                 name: r.get(4)?,
                 caller: r.get(5)?,
                 ts: r.get(6)?,
+                target: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -5641,6 +5671,7 @@ mod tests {
                 name: "Bash".into(),
                 caller: Some("main".into()),
                 ts: 1500,
+                target: Some("ls -la".into()),
             }],
         }
     }
@@ -5879,6 +5910,65 @@ mod tests {
         assert_eq!(run[0].description.as_deref(), Some("spawned"));
         assert_eq!(run[0].spawn_depth, Some(2));
         assert_eq!(run[0].parent_agent_id.as_deref(), Some("p"));
+    }
+
+    /// `target` (migration 16) lands on rows ingested before it existed, the
+    /// way `cc sync --rebuild` delivers it — but without the re-ingest being
+    /// counted as new rows, which is what a `DO UPDATE` upsert would have done.
+    #[test]
+    fn cc_tool_call_target_backfills_without_inflating_the_add_count() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 1,
+            size: 1,
+            byte_offset: 1,
+        };
+        let row = |target: Option<&str>| CcFileBatch {
+            tool_calls: vec![CcToolCallRow {
+                tool_use_id: "tu1".into(),
+                message_uuid: "u1".into(),
+                session_id: "s".into(),
+                agent_id: None,
+                name: "Bash".into(),
+                caller: None,
+                ts: 10,
+                target: target.map(str::to_string),
+            }],
+            ..Default::default()
+        };
+        let target = |s: &Store| -> Option<String> {
+            s.conn
+                .query_row(
+                    "SELECT target FROM cc_tool_calls WHERE tool_use_id = 'tu1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // Ingested before migration 16 existed: the row lands with no target.
+        let first = store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &row(None))
+            .unwrap();
+        assert_eq!(first.tool_calls_added, 1);
+        assert_eq!(target(&store), None);
+
+        // Re-parsed by a rebuild, now with a target: the gap fills, and the
+        // row is NOT re-counted as added (a 52k-call rebuild must not report
+        // 52k new rows).
+        let second = store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &row(Some("cargo test")))
+            .unwrap();
+        assert_eq!(second.tool_calls_added, 0);
+        assert_eq!(target(&store).as_deref(), Some("cargo test"));
+        assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
+
+        // Keep-first, like every other cc column: a stored value is never
+        // overwritten by a later parse.
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &row(Some("rm -rf /")))
+            .unwrap();
+        assert_eq!(target(&store).as_deref(), Some("cargo test"));
     }
 
     #[test]

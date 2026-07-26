@@ -358,11 +358,18 @@ invariants you must not break — read them before changing `src/`:
   into `cc_*` tables; the dashboard reads only the db, never the files.
   Includes the per-session **call tree** (`mesa cc graph`,
   `GET /api/cc/sessions/{id}/graph`, `#/cc/sessions/:id`): a node per tool call
-  and per subagent, rooted at the main thread. Two invariants there — the
+  and per subagent, rooted at the main thread. Three invariants there — the
   payload is always a **tree** (one parent per node, so clients need no
-  cycle-breaking), and a `tool` node's tokens are the *issuing message's*, not
-  its own, so they are **not additive**; `tokens_are_rollup` is the only thing
-  that distinguishes them. `docs/cc-dashboard.md`.
+  cycle-breaking); a `tool` node's tokens are the *issuing message's*, not
+  its own, so they are **not additive**, and `tokens_are_rollup` is the only
+  thing that distinguishes them; and a call's **`target`** — the one bounded,
+  sanitized field `cc::tool_target` lifts out of the otherwise-unstored
+  `tool_use.input`, so a node reads `Bash / cargo test` — must stay its own
+  column and **never be folded into `name`**, because the dashboard's tool
+  breakdown buckets by `(name, caller)` and would shatter into one row per
+  distinct command. A `Skill` call is the one promoted kind (`skill`, named
+  for the skill), keeping its `tool:` id so it can still parent a subagent.
+  `docs/cc-dashboard.md`.
 
 ## Untrusted input
 

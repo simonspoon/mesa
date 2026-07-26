@@ -15,7 +15,7 @@ import type { CcSessionGraph } from './types/CcSessionGraph'
 /** Node box, in flow units. Kept in sync with `.cc-graph-node` in App.css —
  *  React Flow positions by top-left and needs a size before measuring. */
 export const NODE_W = 210
-export const NODE_H = 66
+export const NODE_H = 80
 const GAP_X = 80 // between depths, along the flow axis
 const GAP_Y = 14 // between siblings, on the cross axis
 
@@ -160,4 +160,33 @@ export function formatTokens(n: number): string {
 export function shortModel(model: string | null): string | null {
   if (!model) return null
   return model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+}
+
+/** Tools whose `target` is a path, so the node shows its last segment. The
+ *  server stores the full path (it is the unambiguous thing to store); which
+ *  part of it fits in 210px is a rendering question, so it is decided here. */
+const FILE_TOOLS = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Artifact'])
+
+/** The node's second line: what the call acted on, shortened to what the box
+ *  can hold. A file tool shows the file name (`cc.rs`, not 58 characters of
+ *  `/Users/…/src/core/`); everything else — a Bash command, a URL, a query —
+ *  shows the target as stored, since its front is already the informative end.
+ *
+ *  Path shortening keys on the tool name first and falls back to "looks like a
+ *  path" (leading `/`, `./` or `~`, no spaces) so an unrecognised file-ish tool
+ *  still reads well. A Bash command is never shortened this way even when it
+ *  starts with an absolute path, because it holds spaces the moment it takes an
+ *  argument — and `/usr/local/bin/foo --flag` wants its flags, not `foo`.
+ *
+ *  The full value stays available as the node's hover title: this returns the
+ *  display form only, and never claims to round-trip. */
+export function shortTarget(node: Pick<CcGraphNode, 'name' | 'target'>): string | null {
+  const t = node.target
+  if (!t) return null
+  const pathLike = FILE_TOOLS.has(node.name) || (/^[~./]/.test(t) && !/\s/.test(t))
+  if (!pathLike) return t
+  // `filter(Boolean)` so a trailing slash yields the directory name rather
+  // than an empty string.
+  const parts = t.split('/').filter(Boolean)
+  return parts.length > 0 ? parts[parts.length - 1] : t
 }

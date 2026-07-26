@@ -277,6 +277,18 @@ const MIGRATIONS: &[&str] = &[
     // buckets by `(name, caller)`, and a per-call value there would shatter
     // "Bash x 27408" into 27408 rows of one.
     "ALTER TABLE cc_tool_calls ADD COLUMN target TEXT;",
+    // Adding the column above left every already-ingested row at `target IS
+    // NULL`, and ingest is cursor-driven: an unchanged transcript is skipped
+    // unread, so a plain `sync` would never revisit those rows and the value
+    // would only ever appear on calls made *after* the upgrade. On a real db
+    // that is 70k of 70k rows blank — the graph shows `Bash` with nothing
+    // beside it and, because a `Skill` node is promoted only when it has a
+    // target to name itself, no skill nodes at all. Clearing the cursors here
+    // makes the next `cc::sync` re-walk the tree once and take the guarded
+    // `target IS NULL` backfill in `ingest_cc_batch`, which is exactly what
+    // `cc sync --rebuild` does by hand. Cheap and one-shot (~9s over 3.5k
+    // transcripts) and additive-only — `cc_files` holds cursors, not data.
+    "DELETE FROM cc_files;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -4727,6 +4739,53 @@ mod tests {
         // reopening an already-migrated db must not fail
         let store = Store::open(&path).unwrap();
         assert!(store.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cursor_reset_migration_reopens_ingest_without_dropping_cc_rows() {
+        // The `target` column shipped with no way back to the rows that
+        // predated it: ingest skips a transcript whose `cc_files` cursor
+        // still matches, so those rows stay `NULL` forever and the session
+        // graph renders bare `Bash` nodes and zero skill nodes. The last
+        // migration clears the cursors so the next `cc::sync` re-walks once.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre.db");
+        let last = MIGRATIONS.len() - 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..last] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", last as i64)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO cc_files (path, mtime, size, byte_offset) \
+                 VALUES ('/p/s1.jsonl', 1, 2, 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cc_tool_calls \
+                     (tool_use_id, message_uuid, session_id, name, ts) \
+                 VALUES ('tu1', 'u1', 's1', 'Bash', 100)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        // The cursor is gone, so the transcript is read again on next sync...
+        let cursors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM cc_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cursors, 0);
+        // ...while the ingested rows themselves are untouched: `cc_files`
+        // holds cursors, not data, so this is additive-only.
+        let calls: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM cc_tool_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -126,8 +126,20 @@ CLI and API share it and never diverge.
     row ingested before migration 16 stays a plain `tool` node named `Skill`
     rather than becoming a `skill` node with nothing to call itself.
     `target` is `None` on every non-`tool` kind.
-  - `target` is only on rows ingested since migration 16; `mesa cc sync
-    --rebuild` backfills older ones. That backfill is a separate guarded
+  - `target` is only on rows ingested since migration 16; migration 17 (a bare
+    `DELETE FROM cc_files`) is what delivers it to the rows that predate it,
+    by clearing the ingest cursors so the *next automatic* `cc::sync` re-walks
+    the tree once and takes the backfill below. Without it those rows stay
+    `NULL` forever — an unchanged transcript is skipped unread, so the value
+    would only ever appear on calls made after the upgrade, and on a real db
+    that was 70,241 of 70,250 rows blank: bare `Bash` nodes with nothing
+    beside them and, since the `Skill` promotion keys on the target, zero
+    skill nodes (task 584). **A migration that adds a derived `cc_*` column
+    must clear the cursors in the same breath** — the column and the reparse
+    are one change, and `cc sync --rebuild` is an operator action nobody
+    thinks to run. Cheap and one-shot: ~9s over 3.5k transcripts, and
+    additive-only, since `cc_files` holds cursors, not data.
+    That backfill is a separate guarded
     `UPDATE … WHERE target IS NULL`, not a `DO UPDATE` upsert arm, because a
     conflict-update reports one changed row per call and would make a rebuild
     report every re-parsed call as newly added.

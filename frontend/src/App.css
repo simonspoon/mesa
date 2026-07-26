@@ -3543,6 +3543,70 @@ body.agent-sidebar-resizing {
     min-height: 4rem;
   }
 
+  /* Modals become full-screen sheets (mesa task 557). At 390px a centred
+     `min(64rem, 92vw)` box gives the task detail's description, subtask list
+     and attachment previews a narrow column inside a floating card, with the
+     page showing around the edges.
+
+     The backdrop switches from centring its child to stretching it, so the
+     sheet owns the whole viewport. That is also what makes the touch story
+     work with no extra machinery: with no exposed backdrop margin left, every
+     touch lands on the sheet rather than falling through to `main` behind it
+     (the same failure the drawers needed `.drawer-scrim` for, docs/mobile.md
+     invariant 2). `overscroll-behavior: contain` then stops a scroll that
+     reaches the sheet's end from chaining out into the page.
+
+     The backdrop keeps its class name and its z-index 1250 — `.create-task-
+     backdrop` is what `shouldIgnoreShortcut()` matches on to suppress the
+     global single-key shortcuts (docs/keyboard.md), and 1250 is what keeps a
+     modal above the drawers (1200) and the tab bar (1220). */
+  .create-task-backdrop {
+    align-items: stretch;
+  }
+
+  .create-task-modal,
+  .task-modal {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    overscroll-behavior: contain;
+    /* The decorative shell belongs to a floating card: at the viewport edge
+       the `--cut` corner notch clips against the screen rather than reading
+       as a bevel, and a border/glow on an edge with nothing behind it is
+       just a seam. */
+    border: none;
+    clip-path: none;
+    box-shadow: none;
+    /* No top padding — the sticky head below supplies its own. The bottom
+       clears the iOS home indicator; the sheet covers the tab bar (1250 >
+       1220), so `--phone-tabbar-reserve` would be reserving space for
+       something that is not there. */
+    padding: 0 0.75rem calc(1.5rem + env(safe-area-inset-bottom));
+  }
+
+  /* All three panels already render a `.panel-head` with the ✕ as their first
+     child (TaskPanel, CreateTaskPanel, CreateProjectPanel). Full-screen, the
+     body is long enough to scroll the close affordance off the top, and there
+     is no longer any backdrop to tap instead — so pin it. Negative margins
+     span the sheet's horizontal padding so the bar reaches both edges. */
+  .create-task-modal .panel-head,
+  .task-modal .panel-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    margin: 0 -0.75rem;
+    padding: 0.4rem 0.75rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .create-task-modal .panel-close,
+  .task-modal .panel-close {
+    padding: 0.35rem 0.8rem;
+    font-size: 1rem;
+  }
+
   .cc-dashboard-page {
     padding: 0.75rem 0.75rem 3rem;
   }

@@ -11,6 +11,9 @@ import { TaskPanel } from './TaskPanel'
  * backdrop class (CreateProjectModal uses it too), and one of the selectors
  * `shouldIgnoreShortcut()` already watches, so global single-key shortcuts
  * stay suppressed while this is open (docs/keyboard.md).
+ *
+ * Below 600px the same markup renders as a full-screen sheet instead, in CSS
+ * alone — no second `matchMedia` here (mesa task 557, docs/mobile.md).
  */
 export function TaskModal({
   taskId,

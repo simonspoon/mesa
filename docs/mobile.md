@@ -100,7 +100,7 @@ that already lived there.
 | Git tab | `.git-layout` stacks; diff pane keeps a viewport-bound box |
 | CC Dashboard | grids collapse to 1 column; wide tables scroll inside `.cc-panel` |
 | History rows | wrap instead of holding fixed timestamp/actor columns |
-| Task detail modal | still a centred `min(64rem, 92vw)` box — **not** adapted |
+| Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
 | Files tab | **no phone rules** |
 | Storyboard canvas | **no phone rules**; `.frame-header` blocks touch scroll |
 | Terminal / Agent panes | **no phone rules**; no on-screen-keyboard handling |
@@ -162,6 +162,42 @@ unmount — they own live PTY sessions through `PtyPool`. The existing
 conditionally rendered its panes would kill every attached terminal on tab
 switch; it toggles visibility only, exactly as `terminalActive` already does.
 
+## Full-screen modal sheets
+
+All three modals share one backdrop (`.create-task-backdrop`) and two box
+classes: `.task-modal` (task detail, `min(64rem, 92vw)`) and
+`.create-task-modal` (new task *and* new project, `min(26rem, 90vw)`). At the
+phone tier the backdrop stops centring its child and the box fills the
+viewport instead — full width and height, no `--cut` corner notch, no border
+or glow, body scrolling inside itself.
+
+Three things about that are load-bearing rather than cosmetic:
+
+- **A full-bleed sheet is what makes the touch story work**, and it needs no
+  scrim to do it. Invariant 2 above exists because an overlay that leaves
+  backdrop margin exposed lets a touch land on `main` and scroll the page
+  behind it. A sheet at `inset: 0` has no exposed margin, so every touch is
+  already the sheet's. What remains is *chaining* — a scroll that reaches the
+  sheet's end continuing into the page — and `overscroll-behavior: contain`
+  on the box covers that. There is deliberately no body-scroll lock: the board
+  keeps its scroll position for free, which is what closing the sheet has to
+  return to.
+- **The class names and the z-index are contracts, not styling.**
+  `shouldIgnoreShortcut()` (`keyboardScope.ts`) matches
+  `.create-task-backdrop` in the DOM to suppress global single-key shortcuts
+  while a modal is open (`docs/keyboard.md`) — a phone-tier rename would
+  silently re-arm `a` behind an open sheet. `z-index: 1250` is what keeps the
+  sheet above the drawers (1200) and the tab bar (1220); the sheet covers the
+  bar rather than sitting above it, so it clears `env(safe-area-inset-bottom)`
+  directly instead of `--phone-tabbar-reserve`.
+- **The close affordance is pinned.** Every panel inside these boxes
+  (`TaskPanel`, `CreateTaskPanel`, `CreateProjectPanel`) already renders a
+  `.panel-head` with a ✕ as its first child. Centred, it was always on screen
+  and the backdrop was a second way out; full-screen, both of those go away —
+  a long task detail scrolls the ✕ off the top and there is no backdrop left
+  to tap. `.panel-head` is therefore `position: sticky` at the phone tier,
+  with negative horizontal margins so the bar spans the sheet's padding.
+
 ## Verifying a phone change
 
 Drive a real browser at a phone viewport (390×844 is the reference size) —
@@ -169,7 +205,7 @@ Drive a real browser at a phone viewport (390×844 is the reference size) —
 `curl`. Use a throwaway `MESA_DB` and a non-default port; never QA against a
 live server holding real data.
 
-Three checks worth re-running after any change to this surface:
+Checks worth re-running after any change to this surface:
 
 1. Open a drawer → the scrim paints, tapping it closes the drawer, and a drag
    outside the drawer does not scroll the content behind it.
@@ -181,3 +217,8 @@ Three checks worth re-running after any change to this surface:
    attached and still scrolled where it was. This is the one check a tab-bar
    change can silently break, and it fails loudly only in a *live* browser —
    nothing about the JSX makes a conditional render look wrong.
+5. Open a task detail: the sheet fills the viewport, its body scrolls while
+   the board behind holds its scroll position, the ✕ stays pinned at the top,
+   and pressing `a` while it is open does **not** open the create-task modal.
+   Scroll the board first, so "returns to the same position" is a claim with
+   a non-zero number in it.

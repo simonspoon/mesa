@@ -7,6 +7,7 @@ import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
+import { CCSessionGraphView } from './pages/CCSessionGraphView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { TerminalPage } from './pages/TerminalPage'
@@ -150,7 +151,17 @@ function App() {
   // (#/cc/skills-agents, #/cc/projects, #/cc/sessions) carry the table views;
   // capture group 1 is the active sub-page, undefined for the overview.
   const ccMatch = /^\/(?:cc(?:\/(skills-agents|projects|sessions))?)?$/.exec(path)
-  const ccTab = ccMatch ? ((ccMatch[1] ?? 'overview') as CcTab) : null
+  // One session's call tree, drilled into from the Sessions table. Session ids
+  // are UUIDs, but the segment is matched loosely and decoded rather than
+  // pattern-matched, so an id shape change upstream can't silently 404 here.
+  const ccGraphMatch = /^\/cc\/sessions\/([^/]+)$/.exec(path)
+  // The graph is a drill-down *of* the Sessions tab, so the nav keeps
+  // highlighting Sessions while it is open.
+  const ccTab = ccMatch
+    ? ((ccMatch[1] ?? 'overview') as CcTab)
+    : ccGraphMatch
+      ? ('sessions' as CcTab)
+      : null
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
   const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
@@ -190,6 +201,10 @@ function App() {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
     page = <InboxView />
+  } else if (ccGraphMatch) {
+    // Checked before `ccMatch` for readability only — the two patterns are
+    // disjoint (`ccMatch` anchors the end right after `sessions`).
+    page = <CCSessionGraphView sessionId={decodeURIComponent(ccGraphMatch[1])} />
   } else if (ccMatch) {
     // CC Dashboard: global telemetry view, also above projects. `ccTab` is
     // non-null whenever ccMatch is.

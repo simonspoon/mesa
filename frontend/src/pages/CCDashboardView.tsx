@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { getCcDashboard, getCcLive, getCcUsage, getProjectCcDashboard } from '../api'
 import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
+import { shortModel } from '../sessionGraph'
 import type { CcDashboard } from '../types/CcDashboard'
 import type { CcLiveSession } from '../types/CcLiveSession'
 import type { CcUsageWindow } from '../types/CcUsageWindow'
@@ -53,7 +54,10 @@ const fmtMin = (n: number) =>
 const fmtPct = (n: number) => `${(n * 100).toFixed(1)}%`
 const fmtAgo = (s: number) =>
   s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`
-const shortModel = (m: string) => m.replace('claude-', '')
+// `shortModel` lives in sessionGraph.ts (the unit-tested module) rather than
+// here: two same-named model shorteners in one feature is exactly the kind of
+// drift where one gets fixed and the other keeps the old reading.
+const modelLabel = (m: string) => shortModel(m) ?? m
 
 // ---- generic sortable table ----
 
@@ -72,6 +76,7 @@ function DataTable<T>({
   initialDir = 'desc',
   empty,
   rowKey,
+  rowHref,
 }: {
   rows: T[]
   cols: Col<T>[]
@@ -80,6 +85,11 @@ function DataTable<T>({
   empty: string
   // Stable identity per row so React reconciles correctly across re-sorts.
   rowKey: (r: T) => string
+  // Optional drill-down target. The first cell becomes a real `<a>` — so the
+  // row is reachable by keyboard, announced as a link, and middle-clickable —
+  // and the whole row additionally navigates on click, which is what a table
+  // of clickable rows is expected to do.
+  rowHref?: (r: T) => string
 }) {
   const [key, setKey] = useState(initialKey)
   const [dir, setDir] = useState<'asc' | 'desc'>(initialDir)
@@ -122,15 +132,33 @@ function DataTable<T>({
           </tr>
         </thead>
         <tbody>
-          {sorted.map((r) => (
-            <tr key={rowKey(r)}>
-              {cols.map((c) => (
-                <td key={c.key} className={c.numeric ? 'num' : ''}>
-                  {c.render(r)}
-                </td>
-              ))}
-            </tr>
-          ))}
+          {sorted.map((r) => {
+            const href = rowHref?.(r)
+            return (
+              <tr
+                key={rowKey(r)}
+                className={href ? 'cc-row-link' : undefined}
+                onClick={
+                  href
+                    ? (e) => {
+                        // The first cell's own `<a>` already navigates, and a
+                        // drag that ends up selecting text is not a click —
+                        // reacting to either would hijack the gesture.
+                        if ((e.target as HTMLElement).closest('a')) return
+                        if (window.getSelection()?.toString()) return
+                        window.location.hash = href
+                      }
+                    : undefined
+                }
+              >
+                {cols.map((c, i) => (
+                  <td key={c.key} className={c.numeric ? 'num' : ''}>
+                    {href && i === 0 ? <a href={href}>{c.render(r)}</a> : c.render(r)}
+                  </td>
+                ))}
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>
@@ -435,7 +463,7 @@ function LiveCard({ s }: { s: CcLiveSession }) {
         </span>
         {s.git_branch && <span className="cc-live-branch">{s.git_branch}</span>}
         {s.used_subagent && <span className="cc-badge">subagent</span>}
-        <span className="cc-live-models">{s.models.map(shortModel).join(', ')}</span>
+        <span className="cc-live-models">{s.models.map(modelLabel).join(', ')}</span>
         <span className="cc-live-ago">{fmtAgo(s.idle_seconds)}</span>
       </div>
       <Sparkbars values={s.spark} color={active ? 'var(--green)' : 'var(--amber)'} />
@@ -458,7 +486,7 @@ function LiveCard({ s }: { s: CcLiveSession }) {
               <span className="cc-live-sub-name">{sa.agent ?? 'subagent'}</span>
               {sa.skill && <span className="cc-live-sub-skill">/{sa.skill}</span>}
               {sa.models.length > 0 && (
-                <span className="cc-live-sub-models">{sa.models.map(shortModel).join(', ')}</span>
+                <span className="cc-live-sub-models">{sa.models.map(modelLabel).join(', ')}</span>
               )}
               <span className="cc-live-sub-tok">{fmtTok(sa.total_tokens)} tok</span>
               <span className="cc-live-sub-ago">{fmtAgo(sa.idle_seconds)}</span>
@@ -606,12 +634,13 @@ function SessionsPanel({ data }: { data: CcDashboard }) {
       <DataTable
         rows={data.sessions}
         rowKey={(s) => s.session_id}
+        rowHref={(s) => `#/cc/sessions/${encodeURIComponent(s.session_id)}`}
         initialKey="start"
         empty="No sessions in this window."
         cols={[
           { key: 'start', label: 'Started', render: (s) => s.start.replace('T', ' ').slice(0, 16), sort: (s) => s.start },
           { key: 'project', label: 'Project', render: (s) => s.project ?? '—', sort: (s) => s.project ?? '' },
-          { key: 'models', label: 'Model(s)', render: (s) => s.models.map((m) => m.replace('claude-', '')).join(', ') },
+          { key: 'models', label: 'Model(s)', render: (s) => s.models.map(modelLabel).join(', ') },
           { key: 'dur', label: 'Duration', numeric: true, render: (s) => fmtMin(s.duration_minutes), sort: (s) => s.duration_minutes },
           { key: 'msgs', label: 'Msgs', numeric: true, render: (s) => fmtInt(s.messages), sort: (s) => s.messages },
           { key: 'tokens', label: 'Tokens', numeric: true, render: (s) => fmtTok(s.total_tokens), sort: (s) => s.total_tokens },

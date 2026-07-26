@@ -712,6 +712,10 @@ fn router(state: AppState) -> Router {
         .route("/api/cc", get(get_cc_dashboard))
         // Live sessions: cheap, frequently-polled slice of the telemetry.
         .route("/api/cc/live", get(get_cc_live))
+        .route(
+            "/api/cc/sessions/{session_id}/graph",
+            get(get_cc_session_graph),
+        )
         // Project-scoped CC Dashboard: same telemetry, filtered to sessions
         // whose cwd matches this project's local_path. Reads the store only
         // for the project's local_path (like the git tab), so the standard
@@ -3322,6 +3326,40 @@ async fn get_cc_dashboard(
         cache.insert(window, (stamp, dash.clone()));
     }
     Ok(Json(dash).into_response())
+}
+
+#[derive(Deserialize)]
+struct CcGraphQuery {
+    /// Cap on tool nodes; defaults to `cc::GRAPH_NODE_LIMIT`.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Returns one session's call tree (`CcSessionGraph`). Syncs first like the
+/// dashboard read, but is **not** cached: it is a single-session drill-down
+/// opened on demand, not a hot poll, and the per-session queries are indexed.
+/// An unknown/never-ingested session is `not_found` (404), never an empty
+/// graph — an empty tree is a real answer for a session that made no calls.
+async fn get_cc_session_graph(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<CcGraphQuery>,
+) -> ApiResult<Response> {
+    // Clamp: `limit` is arbitrary caller input, and the cost of a graph is
+    // linear in the nodes it serializes.
+    let limit = q
+        .limit
+        .unwrap_or(crate::core::cc::GRAPH_NODE_LIMIT)
+        .min(5_000);
+    let graph = {
+        let mut store = state.store.lock().unwrap();
+        crate::core::cc::sync(&mut store, false)?;
+        crate::core::cc::session_graph(&store, &session_id, limit)?
+    };
+    match graph {
+        Some(g) => Ok(Json(g).into_response()),
+        None => Err(Error::NotFound(format!("no ingested session {session_id}")).into()),
+    }
 }
 
 /// Project-scoped CC Dashboard: same `CcDashboard` shape as `get_cc_dashboard`,

@@ -260,6 +260,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tasks ADD COLUMN owner TEXT;
     ALTER TABLE tasks ADD COLUMN claimed_at TEXT;
     ",
+    // Subagent spawn provenance, read from each subagent transcript's
+    // `<file>.meta.json` sidecar (see `core::cc::sidecar`). `tool_use_id` is
+    // the `Task` tool call that spawned the run — the edge that turns a flat
+    // session into the call tree `cc::session_graph` renders.
+    "
+    ALTER TABLE cc_agent_runs ADD COLUMN tool_use_id TEXT;
+    ALTER TABLE cc_agent_runs ADD COLUMN description TEXT;
+    ALTER TABLE cc_agent_runs ADD COLUMN spawn_depth INTEGER;
+    ALTER TABLE cc_agent_runs ADD COLUMN parent_agent_id TEXT;
+    CREATE INDEX idx_cc_agent_runs_tool ON cc_agent_runs(tool_use_id);
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -754,13 +765,27 @@ pub struct CcSessionUpsert {
 }
 
 /// One subagent run under a parent session. Keyed `(session_id, agent_id)`;
-/// `agent`/`skill` attribution is keep-first on conflict.
+/// every optional field is keep-first on conflict.
+///
+/// `agent`/`skill` come from the transcript lines themselves; the four spawn
+/// fields come from the run's `.meta.json` sidecar (`core::cc::sidecar`) and
+/// are `None` for a run whose sidecar is missing or unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CcAgentRunUpsert {
     pub session_id: String,
     pub agent_id: String,
     pub agent: Option<String>,
     pub skill: Option<String>,
+    /// The `Task` tool call that spawned this run — the parent edge in
+    /// [`crate::core::cc::session_graph`].
+    pub tool_use_id: Option<String>,
+    /// The spawning call's one-line description.
+    pub description: Option<String>,
+    /// 1 for a run spawned by the main thread, 2+ for a nested subagent.
+    pub spawn_depth: Option<i64>,
+    /// The spawning subagent's `agent_id`, when nested. Only a fallback: the
+    /// `tool_use_id` edge is exact and present on every sidecar observed.
+    pub parent_agent_id: Option<String>,
 }
 
 /// One assistant usage event. Keyed by the event `uuid`; re-inserting is a
@@ -2541,15 +2566,35 @@ impl Store {
                 ))?;
             }
 
+            // Every optional column is `COALESCE(existing, new)`, so a rebuild
+            // backfills the spawn fields onto runs ingested before migration
+            // 15 added them (they are NULL there) without ever overwriting a
+            // value already stored.
             let mut run = tx.prepare(
-                "INSERT INTO cc_agent_runs (session_id, agent_id, agent, skill) \
-                 VALUES (?1, ?2, ?3, ?4) \
+                "INSERT INTO cc_agent_runs \
+                     (session_id, agent_id, agent, skill, tool_use_id, description, \
+                      spawn_depth, parent_agent_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(session_id, agent_id) DO UPDATE SET \
                      agent = COALESCE(cc_agent_runs.agent, excluded.agent), \
-                     skill = COALESCE(cc_agent_runs.skill, excluded.skill)",
+                     skill = COALESCE(cc_agent_runs.skill, excluded.skill), \
+                     tool_use_id = COALESCE(cc_agent_runs.tool_use_id, excluded.tool_use_id), \
+                     description = COALESCE(cc_agent_runs.description, excluded.description), \
+                     spawn_depth = COALESCE(cc_agent_runs.spawn_depth, excluded.spawn_depth), \
+                     parent_agent_id = \
+                         COALESCE(cc_agent_runs.parent_agent_id, excluded.parent_agent_id)",
             )?;
             for r in &batch.agent_runs {
-                run.execute((&r.session_id, &r.agent_id, &r.agent, &r.skill))?;
+                run.execute((
+                    &r.session_id,
+                    &r.agent_id,
+                    &r.agent,
+                    &r.skill,
+                    &r.tool_use_id,
+                    &r.description,
+                    r.spawn_depth,
+                    &r.parent_agent_id,
+                ))?;
             }
 
             let mut msg = tx.prepare(
@@ -2672,6 +2717,101 @@ impl Store {
                 name: r.get(4)?,
                 caller: r.get(5)?,
                 ts: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- session-scoped cc reads (`cc::session_graph`) ----
+    //
+    // The dashboard reads above are window-scoped and whole-table; a single
+    // session's call tree is the opposite shape, so these filter on
+    // `session_id` (both hot tables are indexed on it) and never on `ts` — a
+    // graph of a session always shows the whole session.
+
+    /// One `cc_sessions` row by id, or `None` when the session was never
+    /// ingested.
+    pub fn cc_session(&self, session_id: &str) -> Result<Option<CcSessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, cwd, git_branch, entrypoint, used_subagent, start_ts, end_ts \
+             FROM cc_sessions WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([session_id], |r| {
+            Ok(CcSessionRecord {
+                session_id: r.get(0)?,
+                cwd: r.get(1)?,
+                git_branch: r.get(2)?,
+                entrypoint: r.get(3)?,
+                used_subagent: r.get::<_, i64>(4)? != 0,
+                start_ts: r.get(5)?,
+                end_ts: r.get(6)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Every message row for one session, oldest first.
+    pub fn cc_session_messages(&self, session_id: &str) -> Result<Vec<CcMessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
+                    cache_read_tokens, cache_creation_tokens, skill, agent \
+             FROM cc_messages WHERE session_id = ?1 ORDER BY ts, uuid",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok(CcMessageRow {
+                uuid: r.get(0)?,
+                session_id: r.get(1)?,
+                agent_id: r.get(2)?,
+                ts: r.get(3)?,
+                model: r.get(4)?,
+                input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
+                cache_read_tokens: r.get(7)?,
+                cache_creation_tokens: r.get(8)?,
+                skill: r.get(9)?,
+                agent: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every tool-call row for one session, oldest first.
+    pub fn cc_session_tool_calls(&self, session_id: &str) -> Result<Vec<CcToolCallRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_use_id, message_uuid, session_id, agent_id, name, caller, ts \
+             FROM cc_tool_calls WHERE session_id = ?1 ORDER BY ts, tool_use_id",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok(CcToolCallRow {
+                tool_use_id: r.get(0)?,
+                message_uuid: r.get(1)?,
+                session_id: r.get(2)?,
+                agent_id: r.get(3)?,
+                name: r.get(4)?,
+                caller: r.get(5)?,
+                ts: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every subagent run recorded under one session.
+    pub fn cc_session_agent_runs(&self, session_id: &str) -> Result<Vec<CcAgentRunUpsert>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, agent_id, agent, skill, tool_use_id, description, \
+                    spawn_depth, parent_agent_id \
+             FROM cc_agent_runs WHERE session_id = ?1 ORDER BY agent_id",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok(CcAgentRunUpsert {
+                session_id: r.get(0)?,
+                agent_id: r.get(1)?,
+                agent: r.get(2)?,
+                skill: r.get(3)?,
+                tool_use_id: r.get(4)?,
+                description: r.get(5)?,
+                spawn_depth: r.get(6)?,
+                parent_agent_id: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -5460,6 +5600,10 @@ mod tests {
                 agent_id: "agent-1".into(),
                 agent: Some("Explore".into()),
                 skill: None,
+                tool_use_id: None,
+                description: None,
+                spawn_depth: None,
+                parent_agent_id: None,
             }],
             messages: vec![
                 CcMessageRow {
@@ -5687,6 +5831,10 @@ mod tests {
                 agent_id: "a".into(),
                 agent: None,
                 skill: Some("khora".into()),
+                tool_use_id: None,
+                description: None,
+                spawn_depth: None,
+                parent_agent_id: None,
             }],
             ..Default::default()
         };
@@ -5697,6 +5845,13 @@ mod tests {
                 agent_id: "a".into(),
                 agent: Some("Explore".into()),
                 skill: Some("other".into()), // must NOT overwrite
+                // Absent on the first batch, so these DO land — the backfill
+                // path a `cc sync --rebuild` takes over rows ingested before
+                // migration 15 added the columns.
+                tool_use_id: Some("toolu_1".into()),
+                description: Some("spawned".into()),
+                spawn_depth: Some(2),
+                parent_agent_id: Some("p".into()),
             }],
             ..Default::default()
         };
@@ -5715,6 +5870,15 @@ mod tests {
         assert_eq!(agent.as_deref(), Some("Explore")); // gap filled
         assert_eq!(skill.as_deref(), Some("khora")); // keep-first held
         assert_eq!(cc_count(&store, "cc_agent_runs"), 1);
+
+        // The sidecar columns take the same COALESCE path: all four were NULL
+        // after the first batch, so the second backfills every one of them.
+        let run = store.cc_session_agent_runs("s").unwrap();
+        assert_eq!(run.len(), 1);
+        assert_eq!(run[0].tool_use_id.as_deref(), Some("toolu_1"));
+        assert_eq!(run[0].description.as_deref(), Some("spawned"));
+        assert_eq!(run[0].spawn_depth, Some(2));
+        assert_eq!(run[0].parent_agent_id.as_deref(), Some("p"));
     }
 
     #[test]

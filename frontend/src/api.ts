@@ -8,6 +8,7 @@ import type { AnchorSide } from './types/AnchorSide'
 import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
+import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
 import type { DiagramType } from './types/DiagramType'
 import type { DirEntry } from './types/DirEntry'
@@ -639,6 +640,15 @@ export function getProjectCcDashboard(
 /** Currently-running Claude Code sessions over the last `minutes`. */
 export function getCcLive(minutes: number): Promise<CcLive> {
   return request(`/api/cc/live?minutes=${minutes}`)
+}
+
+/**
+ * One session's call tree (nodes + edges). 404s for a session that was never
+ * ingested — an empty graph is a real answer for a session that made no calls,
+ * so the two are kept distinct.
+ */
+export function getCcSessionGraph(sessionId: string): Promise<CcSessionGraph> {
+  return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/graph`)
 }
 
 /** Live subscription usage (plan limits + reset times), fetched from Anthropic. */

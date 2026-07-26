@@ -115,7 +115,7 @@ invariants you must not break — read them before changing `src/`:
   `cargo test`. There is no React testing library and no component rendering:
   the suite's subject is the handful of side-effect-free modules the
   components import (`agentProject.ts`, `boardView.ts`, `keyboardScope.ts`,
-  `layout.ts`, `time.ts`) — the predicates that historically shipped wrong and
+  `layout.ts`, `sessionGraph.ts`, `time.ts`) — the predicates that historically shipped wrong and
   were caught by review rather than by a gate. Logic worth testing therefore
   belongs in one of those modules rather than inline in a `.tsx`; that is the
   same reason `isStaleWorking` was hoisted out of `AgentSidebar`. Anything
@@ -356,7 +356,13 @@ invariants you must not break — read them before changing `src/`:
   so far); a nonzero exit is data, not a failure. `docs/hooks.md`.
 - **CC Dashboard** — analytics over Claude Code's own transcripts, ingested
   into `cc_*` tables; the dashboard reads only the db, never the files.
-  `docs/cc-dashboard.md`.
+  Includes the per-session **call tree** (`mesa cc graph`,
+  `GET /api/cc/sessions/{id}/graph`, `#/cc/sessions/:id`): a node per tool call
+  and per subagent, rooted at the main thread. Two invariants there — the
+  payload is always a **tree** (one parent per node, so clients need no
+  cycle-breaking), and a `tool` node's tokens are the *issuing message's*, not
+  its own, so they are **not additive**; `tokens_are_rollup` is the only thing
+  that distinguishes them. `docs/cc-dashboard.md`.
 
 ## Untrusted input
 

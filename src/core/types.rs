@@ -860,6 +860,105 @@ pub struct CcSessionRow {
     pub used_subagent: bool,
 }
 
+/// What one [`CcGraphNode`] stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum CcGraphNodeKind {
+    /// The session's main thread — always exactly one, always the root.
+    Session,
+    /// One subagent run (`cc_agent_runs`).
+    Agent,
+    /// One tool call (`cc_tool_calls`).
+    Tool,
+}
+
+/// One node of a session's call tree.
+///
+/// **`tokens`/`total_tokens` mean different things per `kind`, and only
+/// `tokens_are_rollup` distinguishes them.** On a `session` or `agent` node
+/// they are that thread's own summed usage. On a `tool` node they are the
+/// usage of the assistant message that *issued* the call — a message may emit
+/// several `tool_use` blocks, so sibling tool nodes then repeat one message's
+/// usage and **tool-node tokens must never be summed**.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcGraphNode {
+    /// Stable within one graph, and namespaced by kind so a `tool_use_id` can
+    /// never collide with an `agent_id`: `"session"`, `"agent:<agent_id>"`,
+    /// `"tool:<tool_use_id>"`.
+    pub id: String,
+    pub kind: CcGraphNodeKind,
+    /// Tool name, subagent name, or the session's short id.
+    pub name: String,
+    /// The issuing message's model (`tool`), or the thread's most-used model
+    /// (`session`/`agent`). `None` when no usage-carrying message backs it.
+    pub model: Option<String>,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    /// True when `tokens` is this node's own rolled-up usage (`session`,
+    /// `agent`); false on a `tool` node — see the type-level note.
+    pub tokens_are_rollup: bool,
+    pub est_cost_usd: f64,
+    /// First event timestamp (ISO-8601 UTC), when known.
+    pub ts: Option<String>,
+    /// `agent` only: the run's attributed skill.
+    pub skill: Option<String>,
+    /// `agent` only: the spawning call's one-line description (sidecar).
+    pub description: Option<String>,
+    /// `agent` only: 1 for a main-thread spawn, 2+ when nested (sidecar).
+    #[ts(type = "number | null")]
+    pub spawn_depth: Option<i64>,
+    /// `session`/`agent` only: usage-carrying messages in that thread.
+    #[ts(type = "number")]
+    pub messages: i64,
+    /// `session`/`agent` only: tool calls made directly by that thread.
+    #[ts(type = "number")]
+    pub tool_calls: i64,
+    /// `tool` only: the `tool_use.caller`, verbatim.
+    pub caller: Option<String>,
+}
+
+/// A parent→child edge in the call tree: session→tool, tool→agent (the
+/// spawning `Task` call), agent→tool.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcGraphEdge {
+    pub from: String,
+    pub to: String,
+}
+
+/// One session's call tree — `GET /api/cc/sessions/{id}/graph` and
+/// `mesa cc graph <SESSION_ID>`. Always a tree: every node but the root has
+/// exactly one parent, so a client can lay it out without cycle-breaking.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionGraph {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub project: Option<String>,
+    pub git_branch: Option<String>,
+    /// Session span (ISO-8601 UTC), when known.
+    pub start: Option<String>,
+    pub end: Option<String>,
+    /// Whole-session rolled-up usage — the honest total, since tool-node
+    /// tokens are not additive.
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+    /// Root first, then the rest oldest-first.
+    pub nodes: Vec<CcGraphNode>,
+    pub edges: Vec<CcGraphEdge>,
+    /// True when `limit` dropped tool nodes. Subagent nodes and the tool calls
+    /// that spawned them are never dropped, so the tree stays connected.
+    pub truncated: bool,
+    /// How many tool nodes were dropped.
+    #[ts(type = "number")]
+    pub omitted_tool_calls: i64,
+}
+
 /// The full CC dashboard payload returned by `mesa cc summary` and `GET /api/cc`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]

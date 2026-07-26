@@ -716,6 +716,26 @@ EXAMPLES
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Print one session's call tree as a JSON graph (nodes + edges)
+    ///
+    /// One node per tool call and per subagent run, rooted at the session's
+    /// main thread. A subagent hangs off the `Task` call that spawned it.
+    /// Session and agent nodes carry their own rolled-up tokens; a tool node
+    /// carries the tokens of the assistant message that ISSUED the call, which
+    /// siblings share — `tokens_are_rollup` marks the difference, and tool-node
+    /// tokens must never be summed.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc graph 72c9161c-16c9-47f4-8217-39fde068a39b
+  mesa cc graph <ID> --limit 100   # smaller tree; subagents are never dropped")]
+    Graph {
+        /// The session id (as printed by `mesa cc sessions`)
+        session_id: String,
+        /// Cap on tool nodes. Subagent runs and the calls that spawned them
+        /// are always kept, so the tree stays connected.
+        #[arg(long, default_value_t = crate::core::cc::GRAPH_NODE_LIMIT)]
+        limit: usize,
+    },
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
         /// Time window: 7d | 30d | 90d | all | <n>d
@@ -1708,6 +1728,18 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
                 rows.truncate(n);
             }
             print_json(&rows);
+        }
+        CcCmd::Graph { session_id, limit } => {
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store, false)?;
+            match crate::core::cc::session_graph(&store, &session_id, limit)? {
+                Some(g) => print_json(&g),
+                None => {
+                    return Err(Error::NotFound(format!(
+                        "no ingested session {session_id} (see `mesa cc sessions`)"
+                    )));
+                }
+            }
         }
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;

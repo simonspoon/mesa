@@ -32,6 +32,22 @@ CLI and API share it and never diverge.
   same line always derives the same key) and tagged agent `"advisor"`, so an
   advisor call's real tokens/cost/model show up distinctly instead of being
   folded invisibly into the caller's tiny wrapper usage.
+- **Spawn provenance comes from a sidecar, not the transcript.** Beside each
+  subagent transcript Claude Code writes `<file>.meta.json`
+  (`{agentType, description, toolUseId, spawnDepth, parentAgentId?}`). None of
+  it appears on the transcript lines, so without it a `Task` tool call and the
+  subagent it started are two unrelated rows. `cc::apply_sidecar` folds it into
+  the file's `cc_agent_runs` after parsing (migration 15 added the four
+  columns); it is applied to every run in the batch rather than matched by
+  `agent_id`, because a subagent transcript is exactly one run's transcript.
+  Missing/unparseable sidecar → the fields stay `NULL` and the run still
+  ingests. All four columns upsert through `COALESCE(existing, new)`, so
+  `cc sync --rebuild` **does** backfill rows ingested before migration 15 (they
+  are NULL there) — the additive-not-corrective rule below is unchanged, since
+  this only fills gaps. Coverage is partial by nature: measured over 1168 real
+  sidecars, 776 carry a `toolUseId` (Task-tool subagents) and 392 are
+  `workflow-subagent` entries that carry only `agentType`/`spawnDepth` — those
+  have no spawning call to hang off and land on the session root.
 - **Ingest is incremental**: `cc::sync(store, rebuild)` walks the tree against a
   per-file cursor (`cc_files`: mtime + size + byte offset), skipping unchanged
   files and resuming appended ones from the last complete line; each file
@@ -67,7 +83,33 @@ CLI and API share it and never diverge.
   `MESA_DB` isolates the store as everywhere else.
 - The read entry point is `cc::collect(store, window) -> CcDashboard` (overview +
   daily series + model/skill/agent/project/tool breakdowns + capped session rows).
-- CLI: `mesa cc {summary,sessions,skills,sync}` (JSON only; `summary` prints the
+- **Session call tree** — `cc::session_graph(store, session_id, limit)`, the one
+  read that is per-session rather than windowed (it always covers the whole
+  session; the `Store::cc_session_*` reads filter on `session_id`, never `ts`).
+  Returns a `CcSessionGraph`: one `session` root, one `agent` node per
+  `cc_agent_runs` row, one `tool` node per `cc_tool_calls` row, plus parent→child
+  edges. **Guaranteed a tree** — every node but the root has exactly one parent —
+  so a client lays it out with no cycle-breaking. Parent of an agent, in
+  descending exactness: its `tool_use_id` (the sidecar's spawning call), else
+  `parent_agent_id`, else the root.
+  - **`tokens`/`total_tokens` mean two different things and only
+    `tokens_are_rollup` says which.** On `session`/`agent` they are that
+    thread's own summed usage. On a `tool` node they are the usage of the
+    assistant message that *issued* the call — one message can emit several
+    `tool_use` blocks (rare: ~0.25% of real calls), so sibling tool nodes repeat
+    one message's usage and **tool-node tokens must never be summed**. The
+    whole-session total on the payload is the additive one. The web UI prefixes
+    a non-rollup number with `≈`.
+  - `limit` caps `tool` nodes only (default `cc::GRAPH_NODE_LIMIT` = 600; the
+    API clamps caller input to 5000). Agent nodes and the calls that spawned
+    them are **never** dropped, so the tree stays connected at any cap —
+    the largest observed real session has ~6.6k tool calls.
+  - CLI `mesa cc graph <SESSION_ID> [--limit N]`; API
+    `GET /api/cc/sessions/{id}/graph?limit=`. A never-ingested session is
+    `not_found` (CLI exit 1, HTTP 404) — distinct from an empty graph, which is
+    the right answer for a session that made no calls. Unlike `GET /api/cc`
+    this response is **not** cached: it is an on-demand drill-down, not a poll.
+- CLI: `mesa cc {summary,sessions,skills,graph,sync}` (JSON only; `summary` prints the
   full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
   `--limit` on `sessions` and `--rebuild` on `sync`). Like every other handler
   these open the database; only `cc live` and `cc usage` stay store-less.
@@ -88,6 +130,25 @@ CLI and API share it and never diverge.
   table's min-content width routinely exceeds its panel; scrolling the panel
   instead carries its own heading and hint off-screen. Phone-tier readability
   (the frozen identity column) is in `docs/mobile.md`.
+- **Session graph page** (`#/cc/sessions/:id`): clicking a Sessions row opens
+  the call tree on a React Flow canvas (`CCSessionGraphView.tsx`). Layout is a
+  hand-rolled tidy tree in `frontend/src/sessionGraph.ts` — React Flow ships no
+  layout algorithm, and unlike `layout.ts` (whose storyboard edges may be
+  cyclic) this input is a guaranteed tree, so it needs no cycle-breaking. Flow
+  runs left→right by depth; a parent aligns with its **first** child, not the
+  midpoint, because a main thread of hundreds of calls would otherwise strand
+  the root halfway down a column thousands of pixels tall. `fitView` is clamped
+  (`minZoom: 0.55`) for the same reason — unclamped it squeezes a 17,000px tree
+  into the canvas and every label becomes a smudge.
+  The canvas is read-only (no drag/connect/select, `deleteKeyCode={null}`),
+  which is also what keeps it clear of the touch traps `docs/mobile.md`
+  records: its `Handle`s exist only as edge anchors and are
+  `pointer-events: none`, so there is nothing hover-revealed to swallow a pan.
+  The MiniMap is omitted at the phone tier (`usePhoneTier()`) — 200x150 is a
+  sixth of a phone canvas and parks over the corner it blocks.
+  The Sessions table's drill-down is a real `<a>` in the first cell (keyboard,
+  middle-click) *plus* a row-level click handler, which skips the gesture when
+  the click landed on that anchor or ended a text selection.
 - **Project-scoped view**: a project page's **Dashboard** tab (`#/projects/:id/dashboard`,
   first tab, before Board) reads `GET /api/projects/{id}/cc?window=` and renders
   the same `CCDashboardView` component with a `projectId` prop (`scoped` mode):
@@ -100,7 +161,10 @@ CLI and API share it and never diverge.
 - Gate: `scripts/cc-check.sh` drives `mesa cc` against a synthetic transcript
   tree (`MESA_CC_PROJECTS_DIR`) + throwaway db (`MESA_DB`) and asserts the JSON
   contract, sync idempotency, tool-call/subagent rows, persistence across
-  transcript deletion, and auto-ingest on a plain read.
+  transcript deletion, auto-ingest on a plain read, and the `cc graph` call tree
+  over both CLI and HTTP (the sidecar-driven session→tool→agent shape, the
+  one-parent-per-node tree property, `tokens_are_rollup`, `--limit` never
+  dropping a spawning call, and `not_found`/404 on an unknown session).
 
 ## Subscription usage (the one network read)
 

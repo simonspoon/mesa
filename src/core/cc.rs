@@ -41,8 +41,9 @@ use super::store::{
     Result, Store,
 };
 use super::types::{
-    CcAgentStat, CcDashboard, CcDayPoint, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat,
-    CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens, CcToolStat,
+    CcAgentStat, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
+    CcLiveSession, CcLiveSubagent, CcModelStat, CcOverview, CcProjectStat, CcSessionGraph,
+    CcSessionRow, CcSkillStat, CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -520,7 +521,8 @@ pub fn sync(store: &mut Store, rebuild: bool) -> Result<CcSyncReport> {
         };
         let Ok(bytes) = fs::read(&f) else { continue };
         let start = start.min(bytes.len());
-        let (batch, consumed) = parse_batch(&bytes[start..]);
+        let (mut batch, consumed) = parse_batch(&bytes[start..]);
+        apply_sidecar(&f, &mut batch);
         for s in &batch.sessions {
             sessions_touched.insert(s.session_id.clone());
         }
@@ -538,6 +540,58 @@ pub fn sync(store: &mut Store, rebuild: bool) -> Result<CcSyncReport> {
     }
     report.sessions = sessions_touched.len() as i64;
     Ok(report)
+}
+
+/// The `.meta.json` sidecar Claude Code writes beside each subagent
+/// transcript: how the run was spawned. Not telemetry — none of it appears on
+/// the transcript lines, so without this the `Task` call that started a
+/// subagent and the subagent itself are two unrelated rows.
+#[derive(Deserialize)]
+struct RawSidecar {
+    #[serde(rename = "toolUseId")]
+    tool_use_id: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "spawnDepth")]
+    spawn_depth: Option<i64>,
+    #[serde(rename = "parentAgentId")]
+    parent_agent_id: Option<String>,
+}
+
+/// Fold `<transcript>.meta.json` into the batch's agent runs, when the file is
+/// a subagent transcript that has one.
+///
+/// Applied to *every* run in the batch rather than matched by `agent_id`: a
+/// subagent transcript is one run's transcript (its lines all carry the same
+/// `agentId`), and the sidecar's own name encodes that same id, so there is
+/// nothing to disambiguate. An ordinary session transcript has no sidecar and
+/// no `agentId` lines, so this is a no-op there twice over.
+///
+/// Missing, unreadable, or unparseable sidecar → leave the fields `None`. The
+/// spawn edge is an enrichment; a run without it still ingests and still shows
+/// up in the graph (reparented onto the root).
+fn apply_sidecar(transcript: &Path, batch: &mut CcFileBatch) {
+    if batch.agent_runs.is_empty() {
+        return;
+    }
+    let meta = transcript.with_extension("meta.json");
+    let Ok(bytes) = fs::read(&meta) else { return };
+    let Ok(raw) = serde_json::from_slice::<RawSidecar>(&bytes) else {
+        return;
+    };
+    for r in &mut batch.agent_runs {
+        if r.tool_use_id.is_none() {
+            r.tool_use_id.clone_from(&raw.tool_use_id);
+        }
+        if r.description.is_none() {
+            r.description.clone_from(&raw.description);
+        }
+        if r.spawn_depth.is_none() {
+            r.spawn_depth = raw.spawn_depth;
+        }
+        if r.parent_agent_id.is_none() {
+            r.parent_agent_id.clone_from(&raw.parent_agent_id);
+        }
+    }
 }
 
 /// Fold the complete (`\n`-terminated) lines of `bytes` into a [`CcFileBatch`],
@@ -631,6 +685,13 @@ fn fold_line(
                 agent_id: aid.clone(),
                 agent: None,
                 skill: None,
+                // Spawn provenance is not on the transcript lines at all — it
+                // lives in the run's `.meta.json` sidecar, which `sync` folds
+                // in after parsing (see `apply_sidecar`).
+                tool_use_id: None,
+                description: None,
+                spawn_depth: None,
+                parent_agent_id: None,
             });
         if r.agent.is_none() {
             r.agent = raw.attribution_agent.clone();
@@ -1133,6 +1194,257 @@ impl Agg {
             sessions,
         }
     }
+}
+
+// ---- session call tree (`mesa cc graph`, `GET /api/cc/sessions/{id}/graph`) ----
+
+/// Default cap on `tool` nodes in one graph. The largest real session observed
+/// carries ~6.6k tool calls, which is a useless picture and a slow canvas;
+/// subagent nodes and the calls that spawned them are never counted against
+/// this, so the tree stays connected however low it goes.
+pub const GRAPH_NODE_LIMIT: usize = 600;
+
+/// Build one session's call tree from the persisted `cc_*` rows. `Ok(None)`
+/// when the session was never ingested.
+///
+/// The tree is `session → tool → agent → tool → …`: a subagent hangs off the
+/// `Task` call that spawned it (`cc_agent_runs.tool_use_id`, from the run's
+/// `.meta.json` sidecar). A run whose sidecar was missing falls back to its
+/// `parent_agent_id`, then to the root — so a pre-sidecar row still renders,
+/// just flattened.
+pub fn session_graph(
+    store: &Store,
+    session_id: &str,
+    limit: usize,
+) -> Result<Option<CcSessionGraph>> {
+    let Some(sess) = store.cc_session(session_id)? else {
+        return Ok(None);
+    };
+    let messages = store.cc_session_messages(session_id)?;
+    let tool_calls = store.cc_session_tool_calls(session_id)?;
+    let runs = store.cc_session_agent_runs(session_id)?;
+
+    // ---- per-thread rollups, keyed by agent_id (None = the main thread) ----
+    #[derive(Default)]
+    struct Thread {
+        tok: Tok,
+        cost: f64,
+        messages: i64,
+        tool_calls: i64,
+        /// model -> message count, for "the model this thread mostly ran on".
+        models: BTreeMap<String, i64>,
+    }
+    let mut threads: HashMap<Option<String>, Thread> = HashMap::new();
+    // tool_use_id -> its issuing message's (model, tokens, cost). A tool_use
+    // can sit on an event carrying no usage, so this is a lookup, not a join.
+    let mut by_uuid: HashMap<&str, (&str, Tok, f64)> = HashMap::new();
+
+    for m in &messages {
+        let (i, o, cr, cw) = prices(&m.model);
+        let cost = (m.input_tokens as f64 * i
+            + m.output_tokens as f64 * o
+            + m.cache_read_tokens as f64 * cr
+            + m.cache_creation_tokens as f64 * cw)
+            / 1_000_000.0;
+        let t = threads.entry(m.agent_id.clone()).or_default();
+        t.tok.input += m.input_tokens;
+        t.tok.output += m.output_tokens;
+        t.tok.cache_read += m.cache_read_tokens;
+        t.tok.cache_creation += m.cache_creation_tokens;
+        t.cost += cost;
+        t.messages += 1;
+        *t.models.entry(m.model.clone()).or_insert(0) += 1;
+        by_uuid.insert(
+            &m.uuid,
+            (
+                &m.model,
+                Tok {
+                    input: m.input_tokens,
+                    output: m.output_tokens,
+                    cache_read: m.cache_read_tokens,
+                    cache_creation: m.cache_creation_tokens,
+                },
+                cost,
+            ),
+        );
+    }
+    for c in &tool_calls {
+        threads.entry(c.agent_id.clone()).or_default().tool_calls += 1;
+    }
+
+    // ---- which tool calls are structural (spawned a subagent) ----
+    let spawning: HashSet<&str> = runs
+        .iter()
+        .filter_map(|r| r.tool_use_id.as_deref())
+        .collect();
+
+    // ---- truncation: keep every spawning call, fill the rest oldest-first ----
+    let plain = tool_calls
+        .iter()
+        .filter(|c| !spawning.contains(c.tool_use_id.as_str()))
+        .count();
+    let keep_plain = limit.saturating_sub(spawning.len());
+    let omitted = plain.saturating_sub(keep_plain) as i64;
+    let mut budget = keep_plain;
+
+    let mut nodes: Vec<CcGraphNode> = Vec::new();
+    let mut edges: Vec<CcGraphEdge> = Vec::new();
+
+    // ---- root ----
+    let main = threads.get(&None);
+    nodes.push(CcGraphNode {
+        id: "session".into(),
+        kind: CcGraphNodeKind::Session,
+        name: short_session(session_id),
+        model: main.and_then(|t| top_model(&t.models)),
+        tokens: main
+            .map(|t| t.tok.to_cc())
+            .unwrap_or_else(|| Tok::default().to_cc()),
+        total_tokens: main.map_or(0, |t| t.tok.total()),
+        tokens_are_rollup: true,
+        est_cost_usd: round4(main.map_or(0.0, |t| t.cost)),
+        ts: sess.start_ts.map(fmt_ts),
+        skill: None,
+        description: None,
+        spawn_depth: None,
+        messages: main.map_or(0, |t| t.messages),
+        tool_calls: main.map_or(0, |t| t.tool_calls),
+        caller: None,
+    });
+
+    // ---- tool nodes, oldest first ----
+    let mut kept_tools: HashSet<&str> = HashSet::new();
+    for c in &tool_calls {
+        let structural = spawning.contains(c.tool_use_id.as_str());
+        if !structural {
+            if budget == 0 {
+                continue;
+            }
+            budget -= 1;
+        }
+        kept_tools.insert(&c.tool_use_id);
+        let issuing = by_uuid.get(c.message_uuid.as_str());
+        nodes.push(CcGraphNode {
+            id: format!("tool:{}", c.tool_use_id),
+            kind: CcGraphNodeKind::Tool,
+            name: c.name.clone(),
+            model: issuing.map(|(m, _, _)| (*m).to_string()),
+            tokens: issuing
+                .map(|(_, t, _)| t.to_cc())
+                .unwrap_or_else(|| Tok::default().to_cc()),
+            total_tokens: issuing.map_or(0, |(_, t, _)| t.total()),
+            // The issuing message's usage, not this call's own — see
+            // `CcGraphNode`. Never sum these.
+            tokens_are_rollup: false,
+            est_cost_usd: round4(issuing.map_or(0.0, |(_, _, c)| *c)),
+            ts: Some(fmt_ts(c.ts)),
+            skill: None,
+            description: None,
+            spawn_depth: None,
+            messages: 0,
+            tool_calls: 0,
+            caller: c.caller.clone(),
+        });
+        edges.push(CcGraphEdge {
+            from: match c.agent_id.as_deref() {
+                Some(a) => format!("agent:{a}"),
+                None => "session".into(),
+            },
+            to: format!("tool:{}", c.tool_use_id),
+        });
+    }
+
+    // ---- agent nodes ----
+    for r in &runs {
+        let t = threads.get(&Some(r.agent_id.clone()));
+        let first_ts = messages
+            .iter()
+            .find(|m| m.agent_id.as_deref() == Some(r.agent_id.as_str()))
+            .map(|m| fmt_ts(m.ts));
+        nodes.push(CcGraphNode {
+            id: format!("agent:{}", r.agent_id),
+            kind: CcGraphNodeKind::Agent,
+            name: r
+                .agent
+                .clone()
+                .or_else(|| r.skill.clone())
+                .unwrap_or_else(|| "subagent".into()),
+            model: t.and_then(|t| top_model(&t.models)),
+            tokens: t
+                .map(|t| t.tok.to_cc())
+                .unwrap_or_else(|| Tok::default().to_cc()),
+            total_tokens: t.map_or(0, |t| t.tok.total()),
+            tokens_are_rollup: true,
+            est_cost_usd: round4(t.map_or(0.0, |t| t.cost)),
+            ts: first_ts,
+            skill: r.skill.clone(),
+            description: r.description.clone(),
+            spawn_depth: r.spawn_depth,
+            messages: t.map_or(0, |t| t.messages),
+            tool_calls: t.map_or(0, |t| t.tool_calls),
+            caller: None,
+        });
+        // Parent, in descending order of exactness. `kept_tools` matters:
+        // a spawning call is never truncated, so the first arm only misses
+        // when the call itself was never ingested.
+        let from = match r.tool_use_id.as_deref() {
+            Some(tid) if kept_tools.contains(tid) => format!("tool:{tid}"),
+            _ => match r.parent_agent_id.as_deref() {
+                Some(p) if runs.iter().any(|o| o.agent_id == p) => format!("agent:{p}"),
+                _ => "session".into(),
+            },
+        };
+        edges.push(CcGraphEdge {
+            from,
+            to: format!("agent:{}", r.agent_id),
+        });
+    }
+
+    // ---- whole-session totals (the only additive numbers here) ----
+    let mut all = Tok::default();
+    let mut cost = 0.0;
+    for t in threads.values() {
+        all.input += t.tok.input;
+        all.output += t.tok.output;
+        all.cache_read += t.tok.cache_read;
+        all.cache_creation += t.tok.cache_creation;
+        cost += t.cost;
+    }
+
+    Ok(Some(CcSessionGraph {
+        session_id: session_id.to_string(),
+        project: sess.cwd.as_deref().map(short_project),
+        cwd: sess.cwd,
+        git_branch: sess.git_branch,
+        start: sess.start_ts.map(fmt_ts),
+        end: sess.end_ts.map(fmt_ts),
+        total_tokens: all.total(),
+        tokens: all.to_cc(),
+        est_cost_usd: round4(cost),
+        nodes,
+        edges,
+        truncated: omitted > 0,
+        omitted_tool_calls: omitted,
+    }))
+}
+
+/// The model a thread mostly ran on: most messages, ties broken by name so the
+/// answer is stable across runs.
+fn top_model(models: &BTreeMap<String, i64>) -> Option<String> {
+    models
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(m, _)| m.clone())
+}
+
+/// First dash-group of a session UUID — enough to recognise, short enough to
+/// sit in a graph node.
+fn short_session(session_id: &str) -> String {
+    session_id
+        .split('-')
+        .next()
+        .unwrap_or(session_id)
+        .to_string()
 }
 
 // ---- small helpers ----

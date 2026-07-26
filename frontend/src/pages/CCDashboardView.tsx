@@ -103,33 +103,37 @@ function DataTable<T>({
   }
   if (rows.length === 0) return <p className="muted">{empty}</p>
   return (
-    <table className="cc-table">
-      <thead>
-        <tr>
-          {cols.map((c) => (
-            <th
-              key={c.key}
-              className={`${c.numeric ? 'num' : ''}${c.sort ? ' sortable' : ''}`}
-              onClick={() => clickHeader(c)}
-            >
-              {c.label}
-              {c.key === key ? (dir === 'asc' ? ' ▲' : ' ▼') : ''}
-            </th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {sorted.map((r) => (
-          <tr key={rowKey(r)}>
+    // The scroll box wraps the table only — scrolling the panel instead takes
+    // its heading and hint along, which is what a 390px screen exposed.
+    <div className="cc-table-wrap">
+      <table className="cc-table">
+        <thead>
+          <tr>
             {cols.map((c) => (
-              <td key={c.key} className={c.numeric ? 'num' : ''}>
-                {c.render(r)}
-              </td>
+              <th
+                key={c.key}
+                className={`${c.numeric ? 'num' : ''}${c.sort ? ' sortable' : ''}`}
+                onClick={() => clickHeader(c)}
+              >
+                {c.label}
+                {c.key === key ? (dir === 'asc' ? ' ▲' : ' ▼') : ''}
+              </th>
             ))}
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {sorted.map((r) => (
+            <tr key={rowKey(r)}>
+              {cols.map((c) => (
+                <td key={c.key} className={c.numeric ? 'num' : ''}>
+                  {c.render(r)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 

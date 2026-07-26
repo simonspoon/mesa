@@ -214,7 +214,7 @@ rather than a second `isPhone()` call.
 | Board (kanban) | single column; touch-scroll + long-press drag both work |
 | Sidebars | overlay drawers with scrim + tap-to-dismiss; rails hidden, opened from the tab bar |
 | Git tab | `.git-layout` stacks; diff pane keeps a viewport-bound box |
-| CC Dashboard | grids collapse to 1 column; wide tables scroll inside `.cc-panel` |
+| CC Dashboard | grids collapse to 1 column; wide tables scroll inside `.cc-table-wrap` behind a frozen identity column — see *CC Dashboard tables* |
 | History rows | wrap instead of holding fixed timestamp/actor columns |
 | Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
 | Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified — see *Files tab and the unified diff* |
@@ -372,6 +372,52 @@ verified readable at 390×844 as-is — single column, 250 lines, mono, scrollin
 both ways per the same verbatim doctrine as the file viewer. Its file list has
 the same push-below-the-fold shape the tree had (diff pane top at 680px), which
 is a real but separate gap.
+
+## CC Dashboard tables
+
+Everything the ≤600px tier needed here was already in place before mesa task
+561 — the grids collapse at 860px, the charts are `preserveAspectRatio="none"`
+SVG that reflow to any width, and no page anywhere overflows 390px
+(`documentElement.scrollWidth` measured at 390 on all four routes, before and
+after). The KPI grid lands on two 165px columns, the model donut is a fixed
+168px inside a 305px panel, the subscription card's bars are block-level and
+fit at 340/340. So this was a readability pass, and it found two things.
+
+**The scroll box belongs on the table, not the panel.** `.cc-table` cells are
+`white-space: nowrap`, so a table's min-content width is set by its content:
+575px (skills), 792px (sessions) inside a 305px content box. The phone tier had
+answered that with `overflow-x: auto` on `.cc-panel`, which works — a trusted
+swipe scrolls it — but the panel also holds the `<h2>` and the hint line, so
+scrolling 234px to reach the token columns took the word "Sessions" with it.
+`.cc-table-wrap` (in `DataTable`, at every width) scrolls the table alone.
+Desktop benefits too: the Skills table sits in a 497px `.cc-pair` cell at
+1440px and used to spill out of its panel.
+
+**A frozen first column is what makes the scroll usable.** Scrolled right, every
+row read `opus-5` / `fable-5, opus-5` with nothing naming it. The first column
+goes `position: sticky; left: 0` at ≤600px only. Two things that has to carry:
+
+- `border-collapse: separate` (with `border-spacing: 0`, so nothing else
+  changes). Under `collapse` the borders live in a table-wide layer that does
+  not travel with a sticky cell, and the frozen column loses its row rules.
+  The separating rule is a `box-shadow`, not a `border-right`, which would
+  widen the cell and shift every column behind it.
+- A **pinned** width — `min-width` and `max-width` both `6.5rem`. Automatic
+  table layout sizes a column from its content and neither end behaves on its
+  own: uncapped, a skill id took 225px of the 340px panel; capped only, a
+  timestamp collapsed to 65px and spilled over three lines.
+
+The wrapping mode is `overflow-wrap: break-word`, and `anywhere` is a trap
+worth naming: the two differ in whether the break opportunity counts towards
+min-content, and this column is sized *from* min-content. Under `anywhere` its
+min-content became one character, so the column was handed 1ch and every
+timestamp rendered one glyph per line at ~380px a row. Every computed-style
+assert (`position: sticky`, `left: 0px`, the pinned `104px`) still reported
+correct — only the screenshot showed it.
+
+Separately, `.cc-live-card-top` and `.cc-live-sub` were `flex-wrap: nowrap`
+rows of five or six chips; at 278px a session with a subagent badge and two
+models pushed its own age off the card. They wrap at this tier.
 
 ## Terminal and agent panes
 
@@ -571,3 +617,9 @@ Checks worth re-running after any change to this surface:
    first by pinning `#root` back to `100dvh` and re-running: the bottom must
    read 764, i.e. off screen. A passing `bottom` with `#root` still at 844px
    means the var never reached the box.
+9. Open `#/cc/sessions` and swipe the table left: the panel's `<h2>` and the
+   first column both hold their `left`, while column 2 goes negative. All
+   three numbers matter — a sticky column that never moved because the
+   scroll never happened reads exactly the same. Then **look at the rows**:
+   the identity column is the one place a computed-style pass cannot tell a
+   wrapped timestamp from a one-glyph-per-line column.

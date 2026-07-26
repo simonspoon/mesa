@@ -2027,6 +2027,15 @@ main {
 }
 
 /* Tables */
+
+/* Every `.cc-table` is `white-space: nowrap`, so its min-content width is set
+   by its content and routinely exceeds its panel — the scroll has to live on a
+   box that wraps the table alone. Putting it on `.cc-panel` instead scrolls the
+   panel's own heading and hint out of view with it. */
+.cc-table-wrap {
+  overflow-x: auto;
+}
+
 .cc-table {
   width: 100%;
   border-collapse: collapse;
@@ -3763,9 +3772,64 @@ body.agent-sidebar-resizing {
     padding: 0.75rem 0.75rem 3rem;
   }
 
-  /* Wide tables (sessions, skills) scroll inside their panel, not the page. */
-  .cc-panel {
-    overflow-x: auto;
+  /* ── CC Dashboard (mesa task 561) ───────────────────────────────────────
+     The wide tables scroll inside `.cc-table-wrap` at every width now, so the
+     phone tier no longer scrolls the whole `.cc-panel`: measured at 390x844,
+     a 234px horizontal scroll of the Sessions panel carried its <h2> and hint
+     off-screen with the table. What is left here is what a 390px column
+     actually needs on top of that.
+
+     Freeze the identity column. Every table is 1.7x-2.4x the 340px panel
+     (skills 575px, sessions 821px, measured), so a reader who scrolls right
+     to reach Tokens/Est. cost otherwise sees a column of bare numbers with
+     nothing naming the row. `border-collapse: separate` is required, not
+     cosmetic: under `collapse` the shared border layer does not travel with a
+     sticky cell, so the frozen column loses its row rules. `border-spacing: 0`
+     plus the existing bottom-only borders keeps the rendering identical. */
+  .cc-table {
+    border-collapse: separate;
+    border-spacing: 0;
+  }
+
+  .cc-table th:first-child,
+  .cc-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--panel);
+    /* A separating rule the frozen column can carry itself — a `border-right`
+       would widen the cell and shift every column behind it. */
+    box-shadow: 1px 0 0 var(--border);
+    /* Wrap rather than ellipsis: the first column is the row's identity (a
+       skill id, a project, a timestamp) and truncating it defeats the point
+       of freezing it.
+
+       Pinned rather than merely capped, because automatic table layout sizes
+       a column from its content and neither end behaves: uncapped, a Skill
+       name took 225px of the 340px panel; capped, a timestamp collapsed to
+       65px and spilled over three lines. One width for all four tables gives
+       ~10 monospace characters — `2026-07-26` on one line, `inaros-swe:…`
+       over two.
+
+       `break-word`, never `anywhere`: the two differ in whether the break
+       opportunity counts towards min-content, and a table column is sized
+       from min-content. Under `anywhere` this column's min-content became a
+       single character, so automatic table layout handed it 1ch and every
+       timestamp rendered one glyph per line at ~380px a row — which every
+       computed-style assert still reported as correct. */
+    min-width: 6.5rem;
+    max-width: 6.5rem;
+    white-space: normal;
+    overflow-wrap: break-word;
+  }
+
+  /* A live-session card header is five or six chips in one `nowrap` row; at
+     390px they stop fitting and the trailing age was silently clipped off the
+     card (observed with a subagent badge + two models). Same shape, same fix
+     for the per-subagent rows underneath. */
+  .cc-live-card-top,
+  .cc-live-sub {
+    flex-wrap: wrap;
   }
 
   /* History rows carry fixed-width timestamp/actor columns; let them wrap. */

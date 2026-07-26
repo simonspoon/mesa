@@ -83,7 +83,11 @@ CLI and API share it and never diverge.
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
   and sortable skill/agent/project/session tables. The **skills** table is the
-  headline view for optimizing where token spend goes.
+  headline view for optimizing where token spend goes. Every table is wrapped in
+  a `.cc-table-wrap` scroll box — the cells are `white-space: nowrap`, so a
+  table's min-content width routinely exceeds its panel; scrolling the panel
+  instead carries its own heading and hint off-screen. Phone-tier readability
+  (the frozen identity column) is in `docs/mobile.md`.
 - **Project-scoped view**: a project page's **Dashboard** tab (`#/projects/:id/dashboard`,
   first tab, before Board) reads `GET /api/projects/{id}/cc?window=` and renders
   the same `CCDashboardView` component with a `projectId` prop (`scoped` mode):

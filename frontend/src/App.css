@@ -837,9 +837,16 @@ main {
   background: rgba(6, 10, 16, 0.85);
 }
 
-.canvas-hint {
+.canvas-hint,
+.canvas-hint-touch {
   font-size: 0.72rem;
   line-height: 1.3;
+}
+
+/* The touch wording is the phone tier's; the mouse one above is the default.
+   Both spans always render — the phone tier swaps which is displayed. */
+.canvas-hint-touch {
+  display: none;
 }
 
 /* Expand/collapse toggle (a React Flow Panel pins it top-right). */
@@ -3626,8 +3633,153 @@ body.agent-sidebar-resizing {
     width: auto;
   }
 
+  /* ── Storyboard canvas (mesa task 558) ──────────────────────────────────
+     The canvas is the phone tier's one *pan/zoom* surface rather than a
+     scrolling list, so it plays by the opposite rule to the kanban board:
+     React Flow's own `.react-flow__pane` and `.react-flow__node` set
+     `touch-action: none` and the canvas owns every touch inside its box.
+     The gesture model, and why `.frame-header`'s `touch-action: none` is
+     correct here where the kanban card's was a bug, are in docs/mobile.md
+     ("The canvas gesture model"). What is left for this tier is sizing:
+     everything inside the box is now reachable only by finger. */
+
+  /* Because the canvas swallows every touch it receives, `main` can only be
+     scrolled from the page strips above and below the box — so those strips
+     have to keep existing. Measured at 390x844 the box is 556px tall against
+     a 652px ceiling here, i.e. this is a guard rather than a change; it
+     stops a future `--tab-viewport-height` bump from stranding the reader on
+     a canvas with nothing left to scroll by. `:not(.expanded)` because the
+     takeover mode below is `position: fixed; inset: 0` and wants the lot. */
+  .storyboard:not(.expanded) .storyboard-viewport {
+    max-height: calc(100dvh - var(--phone-tabbar-reserve) - 9rem);
+  }
+
+  /* Takeover mode covers the viewport at z-index 1000; the tab bar (1220)
+     stays on top of it, so without this the bar sits over the bottom of the
+     canvas — including React Flow's own zoom controls, which pin there. */
+  .storyboard.expanded {
+    padding-bottom: calc(0.6rem + var(--phone-tabbar-reserve));
+  }
+
+  /* 200x150 of a 364x556 canvas is a sixth of the drawing surface, parked on
+     the bottom-right corner where it also blocks panning. A phone has no
+     room for a second, smaller copy of the thing it is already looking at. */
+  .storyboard .react-flow__minimap {
+    display: none;
+  }
+
+  /* React Flow ships 26x26 zoom buttons. */
+  .storyboard .react-flow__controls button {
+    width: 44px;
+    height: 44px;
+  }
+
+  .storyboard .react-flow__controls button svg {
+    max-width: 16px;
+    max-height: 16px;
+  }
+
+  /* The desktop cluster is a 9.5rem column of full-width buttons. Kept as a
+     column with 44px rows it measured ~500px tall on a 556px canvas — the
+     controls covering the drawing. A row wraps instead, so the cluster costs
+     one button-height plus the hint. */
   .canvas-controls {
-    width: 8rem;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    /* Leaves the top-right expand button its corner. */
+    width: calc(100% - 6.5rem);
+    gap: 0.3rem;
+  }
+
+  .add-frame-picker {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+
+  /* Primary canvas actions to the 44px floor (measured: 26px tall before).
+     Width goes from 100% to content, which is what lets them sit in a row. */
+  .canvas-controls button,
+  .add-frame-picker button,
+  .canvas-expand {
+    min-height: 44px;
+  }
+
+  .canvas-controls button,
+  .add-frame-picker button {
+    width: auto;
+    padding: 0 0.55rem;
+    white-space: nowrap;
+  }
+
+  /* `.react-flow__panel` sets no `pointer-events`, so the cluster's whole
+     bounding box — including the gaps between buttons — swallowed the pan
+     gesture in the canvas's top-left corner. Only the buttons should. */
+  .canvas-controls,
+  .canvas-hint-touch {
+    pointer-events: none;
+  }
+
+  .canvas-controls button,
+  .canvas-controls .error {
+    pointer-events: auto;
+  }
+
+  /* Its own row beneath the buttons rather than a fourth column entry. */
+  .canvas-hint-touch {
+    flex-basis: 100%;
+  }
+
+  /* The frame drag handle — 28px, and the only way to move a card. Raising
+     it to 44 costs a third of a default 140px card's height, which is the
+     right trade when the alternative is a handle you cannot reliably hit. */
+  .frame-header {
+    min-height: 44px;
+  }
+
+  /* Deliberately NOT 44px. These two float over the graph itself rather than
+     over chrome, and a 44px chip on a 390px-wide canvas hides the connector
+     it belongs to. 28px is the compromise: comfortably hittable, still small
+     enough to read as an annotation on the edge. */
+  .edge-del {
+    min-width: 28px;
+    min-height: 28px;
+  }
+
+  .edge-label {
+    min-height: 28px;
+  }
+
+  /* The desktop hint names mouse gestures ("double-click", "drag a side
+     dot"); the touch one names the gestures this tier actually has. Both are
+     rendered and switched here, so there is no second JS media query. */
+  .canvas-hint {
+    display: none;
+  }
+
+  .canvas-hint-touch {
+    display: inline;
+  }
+}
+
+/* Coarse-pointer tier (mesa task 558) — a *capability* query, not a width
+   one, and the only such block in this file. The defect it fixes is caused
+   by the absence of hover, not by a narrow screen: a 900px touch tablet has
+   it and a 500px desktop window does not, so neither width tier above can
+   express it.
+
+   `.storyboard .react-flow__handle` is `opacity: 0` until its node is
+   hovered, but it keeps `pointer-events: all` — 22x22 each, four per frame.
+   With no hover to reveal them they are invisible traps: measured at
+   390x844, six of the board's 28 handles sat on screen at rest, and a
+   one-finger drag that started on one produced no pan, no page scroll and
+   nothing on screen to explain the refusal. Showing them makes the hit
+   target and the visible affordance agree, and it is also the only way to
+   start an edge by touch at all. */
+@media (hover: none) and (pointer: coarse) {
+  .storyboard .react-flow__handle {
+    opacity: 0.55;
   }
 }
 

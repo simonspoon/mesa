@@ -1521,9 +1521,17 @@ export function StoryboardCanvas({
             >
               {layoutDirection === 'vertical' ? '↓ vertical' : '→ horizontal'}
             </button>
+            {/* Two hints, one per pointer type, swapped in CSS at the phone
+                tier (App.css) rather than by a second `isPhone()` call — the
+                gestures differ, not just the wording. See docs/mobile.md,
+                "The canvas gesture model". */}
             <span className="canvas-hint muted">
               drag a header to move · drag a side dot to connect ·
               double-click a card to edit
+            </span>
+            <span className="canvas-hint-touch muted">
+              drag to pan · pinch to zoom · drag a header to move · double-tap
+              to edit
             </span>
             {error && <span className="error">{error}</span>}
           </Panel>

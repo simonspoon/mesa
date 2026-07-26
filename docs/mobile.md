@@ -10,6 +10,12 @@ equal specificity:
 | narrow | `@media (max-width: 860px)` | tablet / split-screen; layout thins, nav unchanged |
 | phone | `@media (max-width: 600px)` | the drawer + single-column tier |
 
+One further block sits after those two and is **not** a width tier:
+`@media (hover: none) and (pointer: coarse)`, for the single rule whose
+trigger is the absence of hover rather than a narrow screen (see *The canvas
+gesture model*). Reach for it only when that distinction is real — width is
+the default.
+
 `isPhone()` in `frontend/src/phoneTier.ts` (`matchMedia('(max-width: 600px)')`)
 is the one JS mirror of the phone tier. Anything new that needs the phone tier
 should prefer a CSS rule over a second JS media query — see *The scrim* below
@@ -47,8 +53,13 @@ so the board could not be scrolled by touch anywhere it mattered.
 
 **The rule:** a draggable that fills a scrollable phone view may not set
 `touch-action: none`. Give it `pan-y` and move its sensor to a delay
-constraint. `.frame-header` (the storyboard canvas) still has the old
-combination and is the known remaining instance.
+constraint.
+
+**Scope, and the one place it does not apply.** The rule is about draggables
+inside a *scrolling* view. `.frame-header` on the storyboard canvas keeps
+`touch-action: none` and is correct to — a pan/zoom canvas is the other case
+entirely, and copying the kanban's `pan-y` there would break it. See *The
+canvas gesture model* below.
 
 ### 2. An overlay drawer owns the whole viewport, via a scrim
 
@@ -90,6 +101,111 @@ toolbar with nothing left to scroll to reach it.
 `@supports (height: 100dvh)`, alongside the `--tab-viewport-height` override
 that already lived there.
 
+## The canvas gesture model
+
+The storyboard is the one phone surface that is **not** a scrolling list, so
+invariant 1 inverts on it. It is a pan/zoom canvas (React Flow / `@xyflow`
+v12, `StoryboardCanvas.tsx`), and a canvas has to own every touch that lands
+inside it — a browser that "helpfully" panned the page mid-pinch would make
+it unusable. React Flow says so itself: its own stylesheet puts
+`touch-action: none` on `.react-flow__pane` **and** `.react-flow__node`.
+`.frame-header` matching that is the canvas agreeing with its library, not
+the kanban bug surviving in a second place.
+
+Inside `.storyboard-viewport`, measured at 390×844:
+
+| Gesture | Owner | Measured |
+|---|---|---|
+| one finger on the background | canvas pans | viewport transform `0` → `-230px` |
+| two fingers | canvas zooms | `scale(1)` → `scale(2.13)` |
+| one finger on `.frame-header` | that frame moves | node `translate(84,124)` → `(108,188)` |
+| one finger on a frame's **body** | nothing | node unmoved, page unmoved |
+| tap / double-tap a card | select / edit | — |
+
+`main.scrollTop` stayed `0` through every one of those. It is not zero because
+nothing tried: the same swipe dispatched on the page *above* the canvas
+scrolls it `0 → 219`.
+
+Two consequences worth stating, because both are choices rather than
+accidents:
+
+- **The card body is deliberately inert to drag.** It holds markdown, links
+  and inline editors, so it is not a drag handle on desktop either; the phone
+  keeps that split rather than inventing a second one. Pan from the
+  background, move from the header.
+- **The page can only be scrolled by the strips around the canvas box**, since
+  the box itself absorbs everything. So the box may never grow tall enough to
+  leave no strip — `.storyboard:not(.expanded) .storyboard-viewport` carries a
+  `max-height` guard for that. At 390×844 the box is 556px against a 652px
+  ceiling, i.e. the guard is currently slack; it exists so a future
+  `--tab-viewport-height` change cannot strand the reader. Scrolled to the
+  bottom the whole canvas sits on screen (top 231, bottom 787, tab bar at 796).
+
+### The hazard this tier actually has: invisible hit targets
+
+Not `touch-action` — a canvas that owns its gestures is only as good as the
+agreement between what is hittable and what is visible, and hover is what
+desktop uses to keep those in sync. With no hover, anything
+`pointer-events: all` and invisible becomes a trap that swallows the pan with
+nothing on screen to explain the refusal. Two were found and fixed:
+
+- **Connection handles.** `.storyboard .react-flow__handle` is `opacity: 0`
+  until its node is hovered, but stays hit-testable — 22×22, four per frame,
+  28 on the test board with six of them on screen at rest. They are now shown
+  (`opacity: 0.55`) on coarse pointers, which also makes touch edge-creation
+  possible at all.
+- **The control cluster's bounding box.** `.react-flow__panel` sets no
+  `pointer-events`, so the gaps *between* the buttons ate the gesture across
+  the canvas's whole top-left corner. The panel is now `pointer-events: none`
+  with its buttons `auto`.
+
+The handle fix lives in a third, **capability-scoped** block at the end of
+`App.css` — `@media (hover: none) and (pointer: coarse)`, the only one in the
+file. That is deliberate: the defect tracks the absence of hover, not the
+width. A 900px touch tablet has it; a 500px desktop window does not, and
+neither width tier could say so. Verified both ways — under touch emulation
+the query matches and the handles read `0.55`; in a plain 390px desktop
+window it does not match and they stay `0`.
+
+### Sizing
+
+Touch targets at the phone tier, all measured after the change:
+
+| Control | Before | After |
+|---|---|---|
+| React Flow zoom buttons | 26×26 | 44×44 |
+| add frame / auto layout / direction | 128×26 | ~110×44, wrapped into a row |
+| expand | 87×26 | 87×44 |
+| `.frame-header` (the drag handle) | 238×28 | 238×44 |
+| edge label ✕ | 19×18 | 28×28 |
+
+The edge chips stop at 28px on purpose. They float over the graph rather than
+over chrome, and a 44px chip on a 390px-wide canvas hides the connector it
+annotates — the 44px floor applies to the controls, not to annotations.
+
+Two layout changes follow from the same budget. The MiniMap is `display: none`
+here: 200×150 is a sixth of a 366×556 canvas, parked over the corner, and it
+blocks panning there. And the control cluster becomes a wrapping **row** — as
+a column of 44px rows it measured ~500px of a 556px canvas, i.e. the controls
+covering the drawing; as a row it is 260×128, 23% of the canvas height.
+
+The canvas hint is rendered twice, `.canvas-hint` and `.canvas-hint-touch`,
+swapped by CSS at this tier — the desktop copy names mouse gestures
+("double-click", "drag a side dot") that do not exist here, so the difference
+is the gesture model itself, not the wording. Two spans and a `display` swap,
+rather than a second `isPhone()` call.
+
+### Known gaps
+
+- **Waypoint handles and anchor-lock dots are unreachable by touch.** Both are
+  10px and both are rendered only while their edge is hovered (`FrameEdgeView`
+  keeps that in React state), so on a phone they are never in the DOM at all —
+  confirmed, not assumed: `.anchor-lock-halo`, `.anchor-lock-dot` and
+  `.waypoint-handle` all query to `0` at rest. Edge re-routing and anchor
+  locking are therefore desktop-only for now. Enlarging them would not help;
+  they need a touch-reachable way to be *revealed* first.
+- Frame resize has no touch affordance either, for the same reason.
+
 ## Current per-surface state
 
 | Surface | Phone state |
@@ -102,7 +218,7 @@ that already lived there.
 | History rows | wrap instead of holding fixed timestamp/actor columns |
 | Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
 | Files tab | **no phone rules** |
-| Storyboard canvas | **no phone rules**; `.frame-header` blocks touch scroll |
+| Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
 | Terminal / Agent panes | **no phone rules**; no on-screen-keyboard handling |
 | Inbox / project pages | inherit the shell only; unaudited |
 
@@ -205,6 +321,16 @@ Drive a real browser at a phone viewport (390×844 is the reference size) —
 `curl`. Use a throwaway `MESA_DB` and a non-default port; never QA against a
 live server holding real data.
 
+A wheel event cannot stand in for a swipe: `touch-action` governs touch
+panning only, so a mouse-driven check reports on the presence of an
+intercepting element and nothing about the gesture. The driver needs real
+`Input.dispatchTouchEvent` — khora gained `swipe`/`touch`/`long-press` and
+`emulate-touch` after 0.3.17. On an older build, talk to the session's CDP
+port directly (multi-finger pinch needs that anyway, since `swipe` is one
+contact); do the emulation, the gesture and the read-back on **one**
+connection, because Chrome drops both the touch-emulation and
+device-metrics overrides when a client disconnects.
+
 Checks worth re-running after any change to this surface:
 
 1. Open a drawer → the scrim paints, tapping it closes the drawer, and a drag
@@ -217,7 +343,11 @@ Checks worth re-running after any change to this surface:
    attached and still scrolled where it was. This is the one check a tab-bar
    change can silently break, and it fails loudly only in a *live* browser —
    nothing about the JSX makes a conditional render look wrong.
-5. Open a task detail: the sheet fills the viewport, its body scrolls while
+5. Open a storyboard: one finger on the canvas background pans it, two
+   fingers zoom, a drag on a frame header moves that frame, and
+   `main.scrollTop` stays put through all three. Quote the transform values —
+   "the canvas panned" is not a number.
+6. Open a task detail: the sheet fills the viewport, its body scrolls while
    the board behind holds its scroll position, the ✕ stays pinned at the top,
    and pressing `a` while it is open does **not** open the create-task modal.
    Scroll the board first, so "returns to the same position" is a claim with

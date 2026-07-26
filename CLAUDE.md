@@ -34,6 +34,13 @@ scripts/cli-check.sh
 # Storyboard CLI JSON-contract gate (board/frame/edge CRUD, cascade, history)
 scripts/storyboard-check.sh
 
+# HTTP gate: the task routes' JSON contract + status codes over a live
+# `mesa serve` — CRUD, derived `blocked`, block/unblock/cycle, the claim/release
+# routes, archived scoping, and BOTH halves of the security boundary
+# (Host allowlist + Content-Type gate) in default and `--lan` mode.
+# The API-side counterpart to cli-check.sh, which never speaks HTTP.
+scripts/api-check.sh
+
 # Concurrency gate: 20 interleaved CLI + API writes against one db
 scripts/concurrent-check.sh
 
@@ -152,7 +159,10 @@ invariants you must not break — read them before changing `src/`:
   - **Content-Type gate** (cross-site form posts): requires
     `Content-Type: application/json` on mutating methods. Enforced in BOTH modes.
   No auth in either mode. Removing the Content-Type check, or letting `--lan`
-  leak into default mode, removes the boundary.
+  leak into default mode, removes the boundary. Gate: `scripts/api-check.sh`
+  asserts both halves against a live server in both modes — including that
+  `--lan` skips the Host check while the Content-Type gate still fires, the
+  exact pairing that must not drift apart.
 - **Concurrency safety** = WAL + `busy_timeout = 5000` (`src/core/store.rs`).
   Concurrent CLI + server writes queue instead of `SQLITE_BUSY`. The web UI does
   not live-sync — it refetches on window focus.
@@ -188,7 +198,10 @@ invariants you must not break — read them before changing `src/`:
   unguarded and idempotent by design — it is the stale-claim breaker, so it
   takes no owner. Both fields ride on `TaskSummary` too (`task list`,
   `GET /api/tasks`), so one call scans a project for live-vs-abandoned rows.
-  Note `task next` is unaffected: it only ever returns `todo` tasks, so a
+  Gate: `scripts/api-check.sh` pins the HTTP half of all of the above —
+  including the asymmetry itself, by sleeping past the one-second timestamp
+  granularity and asserting that an ordinary `PATCH` moves `updated_at` and
+  leaves `claimed_at` alone. Note `task next` is unaffected: it only ever returns `todo` tasks, so a
   claim is already invisible to it and there is nothing for a TTL to skip.
   The web UI reads the same two fields off those payloads: the task detail
   panel renders a `claimed by <owner> · <age>` line, and a Board card carries

@@ -288,10 +288,14 @@ cargo test                  # Rust tests; store logic lives in src/core/store.rs
 cargo test <name>           # single test by name substring
 
 scripts/cli-check.sh        # CLI JSON-contract end-to-end gate
+scripts/api-check.sh        # HTTP task-route contract + the security boundary, over a live server
 scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
+scripts/attachments-check.sh    # attachment contract over CLI + API, including cascade-delete
 scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
+scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`
+scripts/inbox-watcher-check.sh  # `serve --watch-inbox` triage loop against a stub `claude`
 scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)

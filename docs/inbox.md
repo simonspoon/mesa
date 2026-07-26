@@ -17,9 +17,10 @@ instructions**; `author` is free-text attribution.
   assigned item lands in the review queue for a person to promote, not
   straight into the actionable one.
   The new task's title is the item's body (first non-empty line, trimmed,
-  truncated to 120 chars), its description the **full body verbatim** (dropped
-  when a one-line body equals the title), priority **medium**, status
-  **backlog**.
+  truncated to 120 chars), its description the **full body verbatim** —
+  **`null`** when the whole body trims to exactly that title, so a one-line item
+  never carries a description that merely repeats its own title — priority
+  **medium**, status **backlog**.
   The task insert (+ its creation event) and the inbox delete are **one
   transaction** (`assign_inbox_item` in `Store`, returns the created `Task`), so a
   triaged item never disappears without a task to show for it. An agent never

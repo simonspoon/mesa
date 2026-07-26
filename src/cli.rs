@@ -562,11 +562,13 @@ EXAMPLES
     /// Assign an item to a project: convert it into a backlog task there
     ///
     /// Routing an item to a project turns it into a BACKLOG task in that
-    /// project (title from the item's body, full body as the task
-    /// description) and removes it from the inbox. Backlog, not todo: an
-    /// assigned item lands in the review queue, not the actionable one.
-    /// Prints the created task. Assigning to an unknown project is a
-    /// validation error.
+    /// project and removes it from the inbox. Backlog, not todo: an assigned
+    /// item lands in the review queue, not the actionable one. The task's
+    /// title is the item's body (first non-empty line, trimmed, truncated to
+    /// 120 chars) and its description the full body verbatim — except when
+    /// the whole body trims to exactly that title, in which case the
+    /// description is null rather than a copy of it. Prints the created task.
+    /// Assigning to an unknown project is a validation error.
     #[command(after_help = "\
 EXAMPLES
   mesa inbox assign 3 1        # convert item 3 into a backlog task in project 1")]

@@ -2249,8 +2249,10 @@ impl Store {
     /// Routes an inbox item to a project by **converting it into a backlog
     /// task** in that project and then deleting the item — it "moves" out of
     /// the inbox onto the board, pending triage. The task's title is the item's
-    /// body (first line, truncated), its description the full body verbatim;
-    /// priority defaults to medium. Returns the created `Task`. Assigning to an
+    /// body (first non-empty line, trimmed, truncated to 120 chars), its
+    /// description the full body verbatim — except when the whole body trims to
+    /// exactly that title, where the description is `None` instead of a copy of
+    /// it; priority defaults to medium. Returns the created `Task`. Assigning to an
     /// unknown project is a `validation` error, mirroring a task's `--project`.
     /// Atomic: the task insert (with its creation event) and the inbox delete
     /// happen in one transaction, so a triaged item never vanishes without a

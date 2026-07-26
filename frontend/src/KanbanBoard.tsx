@@ -13,6 +13,7 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { updateTaskPosition } from './api'
+import { formatTimestamp, timeAgo } from './time'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
@@ -28,6 +29,26 @@ function CardBody({ task }: { task: TaskSummary }) {
       <div>
         <span className={`badge priority-${task.priority}`}>{task.priority}</span>
         {task.blocked && <span className="badge blocked">blocked</span>}
+        {/* Claim marker. A non-null `owner` only ever occurs on an
+            `in_progress` row (Store clears the claim on any status change out
+            of it), so this needs no column check of its own — see TaskPanel.
+            The card has no room for the age, so it rides in the tooltip
+            alongside the untruncated owner. */}
+        {task.owner !== null && (
+          <span
+            className="badge claim-badge"
+            title={
+              `held by ${task.owner}` +
+              (task.claimed_at === null
+                ? ''
+                : ` · claimed ${timeAgo(task.claimed_at)} (${formatTimestamp(
+                    task.claimed_at,
+                  )})`)
+            }
+          >
+            held {task.owner}
+          </span>
+        )}
       </div>
     </>
   )

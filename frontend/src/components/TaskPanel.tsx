@@ -12,6 +12,7 @@ import {
   updateTask,
 } from '../api'
 import { parseTags } from '../tags'
+import { formatTimestamp, timeAgo } from '../time'
 import type { Attachment } from '../types/Attachment'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
@@ -282,6 +283,23 @@ export function TaskPanel({
         {task.blocked && <span className="badge blocked"> blocked</span>}
         {selectError && <span className="error">{selectError}</span>}
       </p>
+      {/* Claim (task 563 backend, surfaced here by 576). No status guard is
+          needed: `Store::update_task` clears the claim whenever the status
+          leaves `in_progress`, so a non-null `owner` *is* an in_progress hold.
+          `claimed_at` is guarded separately only because the two columns are
+          independently nullable in the generated type. */}
+      {task.owner !== null && (
+        <p className="claim-line">
+          <span className="badge claim-badge">claimed</span> by{' '}
+          <span className="claim-owner">{task.owner}</span>
+          {task.claimed_at !== null && (
+            <span className="muted" title={formatTimestamp(task.claimed_at)}>
+              {' '}
+              · {timeAgo(task.claimed_at)}
+            </span>
+          )}
+        </p>
+      )}
       <p className="tags-line">
         Tags:{' '}
         <InlineEdit

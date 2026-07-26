@@ -176,6 +176,16 @@ invariants you must not break — read them before changing `src/`:
   `GET /api/tasks`), so one call scans a project for live-vs-abandoned rows.
   Note `task next` is unaffected: it only ever returns `todo` tasks, so a
   claim is already invisible to it and there is nothing for a TTL to skip.
+  The web UI reads the same two fields off those payloads: the task detail
+  panel renders a `claimed by <owner> · <age>` line, and a Board card carries
+  a `held <owner>` badge. Neither checks `status` — a non-null `owner` *is*
+  an `in_progress` hold, because `update_task` clears the claim on the way
+  out — so the badge is styled in the same amber as `status-in_progress`.
+  `.badge.claim-badge` must keep `text-transform: none`: `.badge` uppercases,
+  and an `owner` is a case-sensitive id the reader pastes into `claude attach
+  <owner>`. Ages come from `frontend/src/time.ts`, which exists because every
+  mesa timestamp is SQLite `datetime('now')` — UTC with no zone marker, which
+  bare `new Date()` would read as local time.
 - A project may bind a **`root_commit`** — the repo's root commit hash, the
   stable identity of "this source code" across clones/worktrees/moves. A
   commit binds to **at most one project** (DB-unique; a second bind is

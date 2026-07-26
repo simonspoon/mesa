@@ -195,7 +195,10 @@ UI does not live-sync; it refetches on window focus.
   so `ps aux | grep "claude attach <owner>"` settles it). Claiming a task
   another owner holds `in_progress` is a `conflict` — the guard against two
   agents in one repo — which `--force` breaks. The claim is dropped
-  automatically when the task leaves `in_progress`.
+  automatically when the task leaves `in_progress`. The web UI surfaces it as
+  well: the task detail panel shows a `claimed by <owner>` line with the
+  claim's age (hover for the absolute time), and a claimed card on the Board
+  carries a `held <owner>` marker.
 - **Dependency** — a "blocked-by" edge between tasks. Self-edges and cycles are
   rejected. `blocked` is true while any blocker is not `done`/`cancelled`, and is
   derived on every read.

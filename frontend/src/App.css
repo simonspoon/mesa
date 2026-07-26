@@ -587,6 +587,36 @@ main {
   border-color: rgba(255, 180, 68, 0.5);
 }
 
+/* Claim marker (task 576), in the same amber the `in_progress` status badge
+   uses — a claim only exists on an in_progress row, so the two always agree.
+   `text-transform: none` is the load-bearing part: `.badge` uppercases, and
+   an `owner` is an opaque case-sensitive session id the reader pastes into
+   `claude attach <owner>`, so an uppercased one would display a string that
+   does not work. Two-class selector for the same reason as the variants
+   above — `.badge` declares its own `color`. */
+.badge.claim-badge {
+  text-transform: none;
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* Claim line on the task detail panel. The body face is already the mono one,
+   so the owner only lifts to the bright text colour; `user-select: all` makes
+   one click select the whole id to paste, the only thing anyone does with it. */
+.claim-line {
+  margin: 0.25rem 0;
+}
+
+.claim-owner {
+  color: var(--text-h);
+  user-select: all;
+}
+
 .tag {
   display: inline-block;
   background: rgba(255, 43, 214, 0.1);

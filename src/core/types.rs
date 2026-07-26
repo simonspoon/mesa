@@ -345,6 +345,16 @@ pub struct Task {
     /// per-status), so a task keeps its relative position when its status
     /// changes. Not a dense rank — a sortable value; ties break on `id`.
     pub sort_order: f64,
+    /// Who currently holds the task (task 563): an opaque caller-supplied
+    /// identifier — for an agent, its Claude Code session id, so a reader can
+    /// check liveness out-of-band (`ps aux | grep "claude attach <owner>"`)
+    /// instead of guessing from `updated_at`. Null when unclaimed; cleared
+    /// automatically when the task leaves `in_progress`.
+    pub owner: Option<String>,
+    /// When the current claim was taken or last renewed (SQLite `datetime`
+    /// text, UTC). Unlike `updated_at` it moves ONLY on claim/renew, never on
+    /// an ordinary field write — that is the whole point of the pair.
+    pub claimed_at: Option<String>,
     /// Derived: true if any dependency is not done/cancelled. Always present.
     pub blocked: bool,
 }
@@ -396,6 +406,11 @@ pub struct TaskSummary {
     /// Done board column sorts on this as a completion-time proxy (spec 366)
     /// since a done task is not normally edited again.
     pub updated_at: String,
+    /// Current claim holder; see `Task::owner`. Carried in `list` so an agent
+    /// can scan a project for live-vs-abandoned `in_progress` rows in one call.
+    pub owner: Option<String>,
+    /// When the current claim was taken/renewed; see `Task::claimed_at`.
+    pub claimed_at: Option<String>,
     pub blocked: bool,
 }
 
@@ -412,6 +427,8 @@ impl From<&Task> for TaskSummary {
             acceptance: t.acceptance.clone(),
             sort_order: t.sort_order,
             updated_at: t.updated_at.clone(),
+            owner: t.owner.clone(),
+            claimed_at: t.claimed_at.clone(),
             blocked: t.blocked,
         }
     }

@@ -122,6 +122,68 @@ run 2 "$MESA" task update "$T1"
 [ "$(jqe .error.code)" = "usage" ] || fail "empty update: error.code"
 ok "task update with no fields: exit 2, code=usage"
 
+# ---- claim / release (task 563) ----
+run 0 "$MESA" task show "$T2"
+[ "$(jqs .owner)" = "null" ] || fail "claim: a fresh task must be unowned"
+[ "$(jqs .claimed_at)" = "null" ] || fail "claim: a fresh task has no claimed_at"
+ok "task show: owner/claimed_at present and null when unclaimed"
+
+run 0 "$MESA" task claim "$T2" --owner sess-a
+[ "$(jqs .status)" = "in_progress" ] || fail "claim: moves the task to in_progress"
+[ "$(jqs .owner)" = "sess-a" ] || fail "claim: records the owner"
+[ "$(jqs .claimed_at)" != "null" ] || fail "claim: must stamp claimed_at"
+ok "task claim: in_progress + owner + claimed_at"
+
+# the guard against two agents in one repo
+run 1 "$MESA" task claim "$T2" --owner sess-b
+[ "$(jqe .error.code)" = "conflict" ] || fail "claim by another owner: error.code"
+ok "task claim held by another owner: exit 1, code=conflict"
+
+# same owner = renewal, not conflict
+run 0 "$MESA" task claim "$T2" --owner sess-a
+[ "$(jqs .owner)" = "sess-a" ] || fail "claim: re-claiming with the same owner renews"
+ok "task claim by the same owner: renews the lease"
+
+run 0 "$MESA" task claim "$T2" --owner sess-b --force
+[ "$(jqs .owner)" = "sess-b" ] || fail "claim --force: breaks the stale claim"
+ok "task claim --force: breaks another owner's claim"
+
+# claims travel in `list` too, so a project can be scanned in one call
+run 0 "$MESA" task list --project "$P"
+[ "$(jqs "any(.[]; .id == $T2 and .owner == \"sess-b\")")" = "true" ] ||
+  fail "list: owner must be carried on compact objects"
+[ "$(jqs 'all(.[]; has("claimed_at"))')" = "true" ] || fail "list: claimed_at always present"
+ok "task list: owner/claimed_at on compact objects"
+
+run 0 "$MESA" task release "$T2"
+[ "$(jqs .owner)" = "null" ] || fail "release: clears owner"
+[ "$(jqs .claimed_at)" = "null" ] || fail "release: clears claimed_at"
+[ "$(jqs .status)" = "in_progress" ] || fail "release: leaves status untouched"
+ok "task release: clears the claim, status untouched"
+
+run 0 "$MESA" task release "$T2"
+[ "$(jqs .owner)" = "null" ] || fail "release: idempotent"
+ok "task release on an unclaimed task: idempotent"
+
+# leaving in_progress drops the claim rather than leaving a done task owned
+run 0 "$MESA" task claim "$T2" --owner sess-a
+run 0 "$MESA" task update "$T2" --status done
+[ "$(jqs .owner)" = "null" ] || fail "done: claim must be dropped"
+[ "$(jqs .claimed_at)" = "null" ] || fail "done: claimed_at must be dropped"
+ok "leaving in_progress drops the claim"
+
+# restore T2 to the state this section found it in (in_progress, unclaimed),
+# so the assertions further down are unaffected by this block
+run 0 "$MESA" task update "$T2" --status in_progress
+
+run 1 "$MESA" task claim 999999 --owner sess-a
+[ "$(jqe .error.code)" = "not_found" ] || fail "claim missing task: error.code"
+ok "task claim on a missing task: exit 1, code=not_found"
+
+run 2 "$MESA" task claim "$T2"
+[ "$(jqe .error.code)" = "usage" ] || fail "claim without --owner: error.code"
+ok "task claim without --owner: exit 2, code=usage"
+
 # ---- block ----
 run 0 "$MESA" task block "$T3" --by "$T1"
 [ "$(jqs .blocked)" = "true" ] || fail "block: blocked must be true"

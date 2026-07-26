@@ -451,6 +451,48 @@ EXAMPLES
         /// Task id
         id: i64,
     },
+    /// Claim a task for a session and move it to in_progress
+    ///
+    /// `--owner` is an opaque identifier the reader can check for liveness —
+    /// for an agent, its Claude Code session id, so "is this in_progress task
+    /// actually held?" is answered by looking for that session rather than by
+    /// guessing from `updated_at` (which moves on any field write). Prints the
+    /// full updated task, including `owner` and `claimed_at`.
+    ///
+    /// Re-claiming with the SAME owner is a renewal: it restamps `claimed_at`,
+    /// so a long run can heartbeat instead of ageing into looking abandoned.
+    /// Claiming a task another owner holds in_progress is rejected (exit 1,
+    /// code "conflict"); `--force` breaks that claim. An in_progress task with
+    /// no owner, or a task in any other status, is claimed without --force.
+    ///
+    /// The claim is dropped automatically when the task leaves in_progress.
+    #[command(after_help = "\
+EXAMPLES
+  mesa task claim 3 --owner 5b043350          # take the task
+  mesa task claim 3 --owner 5b043350          # ...and again: renew the lease
+  mesa task claim 3 --owner other --force     # break an abandoned claim")]
+    Claim {
+        /// Task id
+        id: i64,
+        /// Opaque claim holder (convention: the agent's session id)
+        #[arg(long)]
+        owner: String,
+        /// Take the task even if another owner holds it
+        #[arg(long)]
+        force: bool,
+    },
+    /// Drop a task's claim, leaving its status unchanged
+    ///
+    /// Idempotent and unguarded — this is the tool for clearing an abandoned
+    /// claim, so it takes no owner and never conflicts. Releasing a task that
+    /// is not claimed succeeds and is a no-op.
+    #[command(after_help = "\
+EXAMPLES
+  mesa task release 3          # clear owner/claimed_at; task stays in_progress")]
+    Release {
+        /// Task id
+        id: i64,
+    },
     /// Make a task blocked by another task
     ///
     /// Blocking is informational: a blocked task can still be closed. A task
@@ -1141,6 +1183,8 @@ fn compact(t: &Task) -> serde_json::Value {
         "acceptance": t.acceptance,
         "sort_order": t.sort_order,
         "updated_at": t.updated_at,
+        "owner": t.owner,
+        "claimed_at": t.claimed_at,
         "blocked": t.blocked,
     })
 }
@@ -1458,6 +1502,8 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             print_json(&store.update_task(id, &patch)?);
         }
         TaskCmd::Delete { id } => print_json(&store.delete_task(id)?),
+        TaskCmd::Claim { id, owner, force } => print_json(&store.claim_task(id, &owner, force)?),
+        TaskCmd::Release { id } => print_json(&store.release_task(id)?),
         TaskCmd::Block { id, by } => print_json(&store.add_dependency(id, by)?),
         TaskCmd::Unblock { id, on } => print_json(&store.remove_dependency(id, on)?),
         TaskCmd::Deps { id } => {

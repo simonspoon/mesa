@@ -31,6 +31,20 @@ updated_at: string,
  */
 sort_order: number, 
 /**
+ * Who currently holds the task (task 563): an opaque caller-supplied
+ * identifier — for an agent, its Claude Code session id, so a reader can
+ * check liveness out-of-band (`ps aux | grep "claude attach <owner>"`)
+ * instead of guessing from `updated_at`. Null when unclaimed; cleared
+ * automatically when the task leaves `in_progress`.
+ */
+owner: string | null, 
+/**
+ * When the current claim was taken or last renewed (SQLite `datetime`
+ * text, UTC). Unlike `updated_at` it moves ONLY on claim/renew, never on
+ * an ordinary field write — that is the whole point of the pair.
+ */
+claimed_at: string | null, 
+/**
  * Derived: true if any dependency is not done/cancelled. Always present.
  */
 blocked: boolean, };

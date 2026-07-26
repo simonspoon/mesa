@@ -256,12 +256,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE frames ADD COLUMN shape TEXT;
     ",
     "ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
+    "
+    ALTER TABLE tasks ADD COLUMN owner TEXT;
+    ALTER TABLE tasks ADD COLUMN claimed_at TEXT;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
 const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
      t.status, t.priority, t.tags, \
      t.acceptance, t.artifact, t.result, t.created_at, t.updated_at, t.sort_order, \
+     t.owner, t.claimed_at, \
      EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON b.id = d.blocked_by \
             WHERE d.task_id = t.id AND b.status NOT IN ('done', 'cancelled'))";
 
@@ -284,7 +289,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         sort_order: row.get(13)?,
-        blocked: row.get(14)?,
+        owner: row.get(14)?,
+        claimed_at: row.get(15)?,
+        blocked: row.get(16)?,
     })
 }
 
@@ -1207,11 +1214,20 @@ impl Store {
         }
         let tags_json = serde_json::to_string(&task.tags).expect("tags serialize");
         let status_changed = task.status != old_status;
+        // A claim is only meaningful while the task is `in_progress`, so any
+        // move out of it drops the claim rather than leaving a done/cancelled
+        // row owned forever. Moving *into* `in_progress` leaves the claim
+        // fields alone — `claim_task` is what takes ownership.
+        if status_changed && task.status != Status::InProgress {
+            task.owner = None;
+            task.claimed_at = None;
+        }
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE tasks SET title = ?1, description = ?2, status = ?3, priority = ?4, \
              tags = ?5, parent_id = ?6, acceptance = ?7, artifact = ?8, result = ?9, \
-             sort_order = ?10, updated_at = datetime('now') WHERE id = ?11",
+             sort_order = ?10, owner = ?12, claimed_at = ?13, \
+             updated_at = datetime('now') WHERE id = ?11",
             (
                 &task.title,
                 &task.description,
@@ -1224,6 +1240,8 @@ impl Store {
                 &task.result,
                 task.sort_order,
                 id,
+                &task.owner,
+                &task.claimed_at,
             ),
         )?;
         if status_changed {
@@ -1235,6 +1253,95 @@ impl Store {
         }
         tx.commit()?;
         // Re-read: a status change can alter dependents' (and this task's) blocked flag.
+        self.get_task(id)
+    }
+
+    /// Takes (or renews) the claim on a task and moves it to `in_progress`.
+    ///
+    /// `owner` is opaque to `Store` — the convention is the caller's Claude
+    /// Code session id, which makes the claim's liveness checkable out-of-band
+    /// rather than inferred from a timestamp. Renewing (same `owner`) restamps
+    /// `claimed_at`, so a long-running holder can heartbeat.
+    ///
+    /// Held by a *different* owner while `in_progress` is a `Conflict` — that
+    /// is the guard against two agents in one repo. `force` breaks such a
+    /// claim (the documented stale-claim override). A claim on a task that is
+    /// not `in_progress` is not a live hold, so it is taken over without
+    /// `force`; the same goes for an `in_progress` row with no owner at all
+    /// (a status flip by something that predates claims, e.g. the dispatcher).
+    ///
+    /// The conflict check and the write share ONE `Immediate` transaction, so
+    /// this is not check-then-write: a concurrent claimer (CLI vs server, or
+    /// two CLI processes — mesa supports both, see the WAL + `busy_timeout`
+    /// note in the crate docs) either waits for the write lock and then reads
+    /// the winner's owner, or times out. Reading the row outside the
+    /// transaction would let two claimers both see "unowned" and both write,
+    /// silently handing the task to whoever committed last — the exact
+    /// two-agents-in-one-repo failure the conflict exists to prevent.
+    pub fn claim_task(&mut self, id: i64, owner: &str, force: bool) -> Result<Task> {
+        let owner = owner.trim();
+        if owner.is_empty() {
+            return Err(Error::Validation("owner must not be empty".into()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (status, held_by, claimed_at) = tx
+            .query_row(
+                "SELECT status, owner, claimed_at FROM tasks WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("task {id}")),
+                e => Error::Db(e),
+            })?;
+        let status = Status::parse(&status).expect("invalid status in db");
+        if !force
+            && status == Status::InProgress
+            && let Some(held_by) = &held_by
+            && held_by != owner
+        {
+            return Err(Error::Conflict(format!(
+                "task {id} is claimed by {held_by} (since {}); \
+                 pass --force to break the claim",
+                claimed_at.as_deref().unwrap_or("unknown")
+            )));
+        }
+        let status_changed = status != Status::InProgress;
+        tx.execute(
+            "UPDATE tasks SET status = 'in_progress', owner = ?1, \
+             claimed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?2",
+            (owner, id),
+        )?;
+        if status_changed {
+            tx.execute(
+                "INSERT INTO task_events (task_id, from_status, to_status, at) \
+                 VALUES (?1, ?2, 'in_progress', datetime('now'))",
+                (id, status.as_str()),
+            )?;
+        }
+        tx.commit()?;
+        self.get_task(id)
+    }
+
+    /// Drops the claim on a task, leaving its status untouched. Idempotent: an
+    /// unclaimed task releases successfully. Deliberately unguarded — this is
+    /// the tool for clearing an abandoned claim, so it takes no owner and
+    /// never conflicts.
+    pub fn release_task(&mut self, id: i64) -> Result<Task> {
+        self.get_task(id)?;
+        self.conn.execute(
+            "UPDATE tasks SET owner = NULL, claimed_at = NULL, \
+             updated_at = datetime('now') WHERE id = ?1",
+            [id],
+        )?;
         self.get_task(id)
     }
 
@@ -2970,6 +3077,203 @@ mod tests {
         let deleted = store.delete_task(t.id).unwrap();
         assert_eq!(deleted, vec![updated]);
         assert!(matches!(store.get_task(t.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn claim_sets_owner_and_moves_to_in_progress() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        assert_eq!(t.owner, None);
+        assert_eq!(t.claimed_at, None);
+
+        let claimed = store.claim_task(t.id, "sess-a", false).unwrap();
+        assert_eq!(claimed.status, Status::InProgress);
+        assert_eq!(claimed.owner.as_deref(), Some("sess-a"));
+        assert!(claimed.claimed_at.is_some());
+        // Persisted, not just returned.
+        assert_eq!(
+            store.get_task(t.id).unwrap().owner.as_deref(),
+            Some("sess-a")
+        );
+        // The status move is recorded like any other.
+        let events = store.list_events(Some(t.id)).unwrap();
+        assert_eq!(events.last().unwrap().to_status, Status::InProgress);
+    }
+
+    #[test]
+    fn claim_rejects_a_different_live_owner_unless_forced() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        store.claim_task(t.id, "sess-a", false).unwrap();
+
+        assert!(matches!(
+            store.claim_task(t.id, "sess-b", false),
+            Err(Error::Conflict(_))
+        ));
+        // The rejected claim changed nothing.
+        assert_eq!(
+            store.get_task(t.id).unwrap().owner.as_deref(),
+            Some("sess-a")
+        );
+
+        let stolen = store.claim_task(t.id, "sess-b", true).unwrap();
+        assert_eq!(stolen.owner.as_deref(), Some("sess-b"));
+    }
+
+    #[test]
+    fn a_claim_conflicts_across_two_connections() {
+        // The claim guards CLI-vs-server and CLI-vs-CLI, which are separate
+        // processes on separate connections — so the conflict must be raised
+        // from the *database*, not from anything cached in one Store. The
+        // check and the write share one Immediate transaction for the same
+        // reason; this test covers the visibility half of that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut a = Store::open(&path).unwrap();
+        let p = a.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut a, p.id, "work");
+        a.claim_task(t.id, "sess-a", false).unwrap();
+
+        let mut b = Store::open(&path).unwrap();
+        assert!(
+            matches!(b.claim_task(t.id, "sess-b", false), Err(Error::Conflict(_))),
+            "a second connection must see the first's claim"
+        );
+        assert_eq!(b.get_task(t.id).unwrap().owner.as_deref(), Some("sess-a"));
+        // ...and --force still works across connections.
+        assert_eq!(
+            b.claim_task(t.id, "sess-b", true).unwrap().owner.as_deref(),
+            Some("sess-b")
+        );
+        assert_eq!(a.get_task(t.id).unwrap().owner.as_deref(), Some("sess-b"));
+    }
+
+    #[test]
+    fn claim_by_the_same_owner_renews_the_lease() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        store.claim_task(t.id, "sess-a", false).unwrap();
+        // Backdate the claim so the renewal is observable without sleeping:
+        // `datetime('now')` has one-second resolution.
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET claimed_at = '2000-01-01 00:00:00' WHERE id = ?1",
+                [t.id],
+            )
+            .unwrap();
+        let renewed = store.claim_task(t.id, "sess-a", false).unwrap();
+        assert_eq!(renewed.owner.as_deref(), Some("sess-a"));
+        assert_ne!(
+            renewed.claimed_at.as_deref(),
+            Some("2000-01-01 00:00:00"),
+            "re-claiming with the same owner must restamp claimed_at"
+        );
+    }
+
+    #[test]
+    fn claim_takes_over_an_in_progress_task_with_no_owner() {
+        // The pre-claims world (and any plain `--status in_progress` flip):
+        // in_progress with a null owner is not a live hold, so no --force.
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    status: Some(Status::InProgress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let claimed = store.claim_task(t.id, "sess-a", false).unwrap();
+        assert_eq!(claimed.owner.as_deref(), Some("sess-a"));
+    }
+
+    #[test]
+    fn release_clears_the_claim_and_is_idempotent() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        store.claim_task(t.id, "sess-a", false).unwrap();
+
+        let released = store.release_task(t.id).unwrap();
+        assert_eq!(released.owner, None);
+        assert_eq!(released.claimed_at, None);
+        // Status is deliberately untouched — release breaks a claim, it does
+        // not un-start the work.
+        assert_eq!(released.status, Status::InProgress);
+        // Releasing again is a no-op, not an error.
+        assert_eq!(store.release_task(t.id).unwrap().owner, None);
+    }
+
+    #[test]
+    fn leaving_in_progress_drops_the_claim() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        store.claim_task(t.id, "sess-a", false).unwrap();
+
+        let done = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    status: Some(Status::Done),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(done.owner, None, "a done task must not stay owned");
+        assert_eq!(done.claimed_at, None);
+    }
+
+    #[test]
+    fn an_ordinary_update_leaves_the_claim_alone() {
+        // The whole point of `claimed_at`: `updated_at` moves on any field
+        // write, `claimed_at` only on claim/renew.
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        store.claim_task(t.id, "sess-a", false).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET claimed_at = '2000-01-01 00:00:00' WHERE id = ?1",
+                [t.id],
+            )
+            .unwrap();
+
+        let edited = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    title: Some("work, renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(edited.owner.as_deref(), Some("sess-a"));
+        assert_eq!(
+            edited.claimed_at.as_deref(),
+            Some("2000-01-01 00:00:00"),
+            "an ordinary field write must not restamp claimed_at"
+        );
+    }
+
+    #[test]
+    fn claim_rejects_an_empty_owner() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "work");
+        assert!(matches!(
+            store.claim_task(t.id, "   ", false),
+            Err(Error::Validation(_))
+        ));
+        assert_eq!(store.get_task(t.id).unwrap().status, Status::Todo);
     }
 
     #[test]

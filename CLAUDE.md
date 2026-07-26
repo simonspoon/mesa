@@ -152,6 +152,30 @@ invariants you must not break — read them before changing `src/`:
 - A task's project is immutable after creation.
 - A subtask shares its parent's project.
 - Dependency self-edges and cycles are rejected (`cycle`).
+- A task may carry a **claim** — `owner` (opaque, caller-supplied) plus
+  `claimed_at` — taken by `Store::claim_task` (`mesa task claim <ID> --owner
+  <WHO> [--force]`, `POST /api/tasks/{id}/claim`) and dropped by
+  `Store::release_task` (`mesa task release <ID>`, `POST
+  /api/tasks/{id}/release`). The pair exists because `updated_at` cannot
+  distinguish a live holder from an abandoned run: it moves on **any** field
+  write, so `claimed_at` must move **only** on claim/renew — that asymmetry is
+  the feature, and any code that restamps `claimed_at` from an ordinary update
+  destroys it. `owner` is deliberately unvalidated and opaque to `Store`; the
+  convention (an agent's Claude Code session id) is what makes liveness
+  checkable out-of-band rather than inferred from a timestamp, so mesa
+  computes no staleness and enforces no TTL. `claim_task` moves the task to
+  `in_progress` and is a **renewal** when re-issued with the same owner;
+  a *different* owner on an `in_progress` task is `conflict` unless `--force`
+  — that conflict is the only guard against two agents in one repo. An
+  `in_progress` task with a null owner is not a live hold (a plain
+  `--status in_progress` flip, or a pre-claim row), so it is claimed without
+  `--force`. `update_task` clears the claim whenever the status leaves
+  `in_progress`, so no done/cancelled row stays owned. `release_task` is
+  unguarded and idempotent by design — it is the stale-claim breaker, so it
+  takes no owner. Both fields ride on `TaskSummary` too (`task list`,
+  `GET /api/tasks`), so one call scans a project for live-vs-abandoned rows.
+  Note `task next` is unaffected: it only ever returns `todo` tasks, so a
+  claim is already invisible to it and there is nothing for a TTL to skip.
 - A project may bind a **`root_commit`** — the repo's root commit hash, the
   stable identity of "this source code" across clones/worktrees/moves. A
   commit binds to **at most one project** (DB-unique; a second bind is

@@ -89,6 +89,12 @@ mesa task list --project 1 --status todo --unblocked
 # List the child stories of an umbrella task (same filters as GET /api/tasks?parent=42)
 mesa task list --parent 42
 
+# Claim a task before working it, so other agents can tell live from abandoned
+# (--owner is opaque; an agent passes its own session id). Re-claiming with the
+# same owner renews the lease; another owner is rejected unless --force.
+mesa task claim 3 --owner 5b043350
+mesa task release 3          # drop a claim without changing status
+
 # Express a dependency: task 3 is blocked by task 1
 mesa task block 3 --by 1
 
@@ -179,6 +185,17 @@ UI does not live-sync; it refetches on window focus.
   free-text fields are writable from every surface — `task update`, `PATCH
   /api/tasks/<id>`, and the web UI's task detail, which renders `description`,
   `acceptance` and `result` as markdown.
+- **Claim** — an optional `owner` + `claimed_at` pair on a task, taken with
+  `mesa task claim <id> --owner <who>` and dropped with `mesa task release
+  <id>`. It answers the question `updated_at` cannot: is this `in_progress`
+  task actually held, or was it abandoned mid-run? `updated_at` moves on any
+  field write, so a stale row reads identically to a live one; `claimed_at`
+  moves *only* on claim/renew, and `owner` is an identifier the reader can
+  check liveness of out-of-band (an agent passes its Claude Code session id,
+  so `ps aux | grep "claude attach <owner>"` settles it). Claiming a task
+  another owner holds `in_progress` is a `conflict` — the guard against two
+  agents in one repo — which `--force` breaks. The claim is dropped
+  automatically when the task leaves `in_progress`.
 - **Dependency** — a "blocked-by" edge between tasks. Self-edges and cycles are
   rejected. `blocked` is true while any blocker is not `done`/`cancelled`, and is
   derived on every read.

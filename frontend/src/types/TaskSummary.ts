@@ -20,4 +20,13 @@ sort_order: number,
  * Done board column sorts on this as a completion-time proxy (spec 366)
  * since a done task is not normally edited again.
  */
-updated_at: string, blocked: boolean, };
+updated_at: string, 
+/**
+ * Current claim holder; see `Task::owner`. Carried in `list` so an agent
+ * can scan a project for live-vs-abandoned `in_progress` rows in one call.
+ */
+owner: string | null, 
+/**
+ * When the current claim was taken/renewed; see `Task::claimed_at`.
+ */
+claimed_at: string | null, blocked: boolean, };

@@ -514,6 +514,8 @@ fn router(state: AppState) -> Router {
         // the local hooks.json) — code execution, so it shares the agents'
         // mode-dependent access gate.
         .route("/api/tasks/{id}/execute", post(execute_task))
+        .route("/api/tasks/{id}/claim", post(claim_task))
+        .route("/api/tasks/{id}/release", post(release_task))
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
@@ -1108,6 +1110,31 @@ async fn block_task(
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.add_dependency(id, body.on)?).into_response())
+}
+
+/// Body for `POST /api/tasks/{id}/claim`, mirroring `mesa task claim`.
+#[derive(Deserialize)]
+struct ClaimBody {
+    /// Opaque claim holder, matching the CLI's `--owner`.
+    owner: String,
+    /// Break another owner's claim, matching the CLI's `--force`.
+    #[serde(default)]
+    force: bool,
+}
+
+async fn claim_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<ClaimBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.claim_task(id, &body.owner, body.force)?).into_response())
+}
+
+async fn release_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.release_task(id)?).into_response())
 }
 
 async fn unblock_task(

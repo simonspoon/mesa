@@ -11,7 +11,14 @@ import {
 } from '@xyflow/react'
 import { getCcSessionGraph } from '../api'
 import { usePhoneTier } from '../phoneTier'
-import { formatTokens, layoutSessionGraph, shortModel, shortTarget, toolColor } from '../sessionGraph'
+import {
+  formatTokens,
+  layoutSessionGraph,
+  minimapStrokeWidth,
+  shortModel,
+  shortTarget,
+  toolColor,
+} from '../sessionGraph'
 import type { CcGraphNode } from '../types/CcGraphNode'
 import { useFetch } from '../useFetch'
 
@@ -116,6 +123,12 @@ export function CCSessionGraphView({ sessionId }: { sessionId: string }) {
                 pannable
                 zoomable
                 nodeColor={(n) => nodeColor(n.data as CcGraphNode)}
+                // Stroke, not fill, carries the mark on a tall graph: a few
+                // hundred stacked calls shrink an 80-unit node to a fifth of a
+                // pixel. Same colour as the fill so the result reads as one
+                // bigger node rather than an outline.
+                nodeStrokeColor={(n) => nodeColor(n.data as CcGraphNode)}
+                nodeStrokeWidth={minimapStrokeWidth(laid.nodes)}
                 maskColor="rgba(6, 10, 16, 0.72)"
               />
             )}

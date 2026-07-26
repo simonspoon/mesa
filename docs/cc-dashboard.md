@@ -206,6 +206,18 @@ CLI and API share it and never diverge.
   `name` alone, never `target` — the same reason the ingest keeps them in
   separate columns. The MiniMap draws raw fills and cannot see any of that, so
   it is fed the *same* mapping explicitly via `nodeColor`.
+  Two non-obvious things keep that MiniMap drawing at all. First, every laid-out
+  node carries an explicit `width`/`height` (`NODE_W`/`NODE_H`): React Flow only
+  writes a node's *measured* size back through `onNodesChange`, which this
+  read-only canvas does not have, so `node.measured` stays undefined and
+  `<MiniMap>` — which reads the user node, not the internal one — skips every
+  node without a size. The main canvas is unaffected (it measures the DOM), so
+  the symptom is a MiniMap drawing its mask and nothing else. Second, a session's
+  main thread is one tall column, so a few hundred calls make the graph tens of
+  thousands of flow units tall and shrink an 80-unit node to a fifth of a pixel;
+  `minimapStrokeWidth()` derives a size-aware `nodeStrokeWidth` (in flow units,
+  same colour as the fill) that floors each mark at ~3px, and returns 0 on a
+  graph small enough not to need it.
   The canvas is read-only (no drag/connect/select, `deleteKeyCode={null}`),
   which is also what keeps it clear of the touch traps `docs/mobile.md`
   records: its `Handle`s exist only as edge anchors and are

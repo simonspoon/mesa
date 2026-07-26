@@ -21,11 +21,21 @@ const GAP_Y = 14 // between siblings, on the cross axis
 
 /** A positioned node, in the shape React Flow's `nodes` prop wants. Typed
  *  locally rather than importing `@xyflow/react` so this module stays pure and
- *  unit-testable with no canvas in scope. */
+ *  unit-testable with no canvas in scope.
+ *
+ *  `width`/`height` are not optional decoration. React Flow only ever writes a
+ *  node's *measured* size back into the array you passed via `onNodesChange`,
+ *  and this graph is a static read-only layout with no such handler — so
+ *  `node.measured` stays undefined forever. The main canvas doesn't care (it
+ *  measures the real DOM), but `<MiniMap>` reads the user node and skips any
+ *  whose `measured ?? width ?? initialWidth` is undefined, so without these two
+ *  fields it draws its mask and zero node rects. */
 export type FlowNode = {
   id: string
   type: 'cc'
   position: { x: number; y: number }
+  width: number
+  height: number
   data: CcGraphNode
 }
 
@@ -137,12 +147,49 @@ export function layoutSessionGraph(graph: CcSessionGraph): {
     id: n.id,
     type: 'cc',
     position: pos.get(n.id)!,
+    width: NODE_W,
+    height: NODE_H,
     data: n,
   }))
   const edges: FlowEdge[] = graph.edges
     .filter((e) => byId.has(e.from) && byId.has(e.to))
     .map((e) => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to }))
   return { nodes, edges }
+}
+
+/** Minimap height in CSS pixels — React Flow's `<MiniMap>` default, repeated
+ *  here because the stroke below has to reason about it. */
+const MINIMAP_H = 150
+/** Smallest node mark worth drawing, in CSS pixels. Below ~3px a node is a
+ *  sub-pixel smear that antialiases into the background. */
+const MIN_MARK_PX = 3
+
+/** Stroke width, in flow units, for `<MiniMap nodeStrokeWidth>`.
+ *
+ *  A session's main thread is one tall column, so a few hundred calls make the
+ *  graph tens of thousands of flow units tall while the minimap stays 150px —
+ *  an 80-unit node then renders at a fifth of a pixel. Non-zero, and invisible.
+ *  React Flow scales the minimap's stroke in *flow* units too, so padding each
+ *  rect by a size-derived stroke restores a legible mark without touching the
+ *  real canvas.
+ *
+ *  Returns 0 — no stroke at all, overriding React Flow's default 2 — whenever
+ *  the graph is small enough that nodes already clear `MIN_MARK_PX`, so a
+ *  two-node session gets plain rects rather than a blob. */
+export function minimapStrokeWidth(nodes: readonly FlowNode[]): number {
+  if (nodes.length === 0) return 0
+  let top = Infinity
+  let bottom = -Infinity
+  for (const n of nodes) {
+    if (n.position.y < top) top = n.position.y
+    if (n.position.y + n.height > bottom) bottom = n.position.y + n.height
+  }
+  const flowHeight = bottom - top
+  if (!Number.isFinite(flowHeight) || flowHeight <= 0) return 0
+  // Flow units per minimap pixel, then the padding that lifts NODE_H to the
+  // floor. Stroke straddles the rect edge, so it adds its full width overall.
+  const unitsPerPx = flowHeight / MINIMAP_H
+  return Math.max(0, Math.round(MIN_MARK_PX * unitsPerPx - NODE_H))
 }
 
 /** Compact token count for a node label: `231`, `44.7k`, `2.05M`. Graph nodes

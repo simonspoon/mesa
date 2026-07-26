@@ -5,6 +5,7 @@ import {
   childrenByParent,
   formatTokens,
   layoutSessionGraph,
+  minimapStrokeWidth,
   shortModel,
   shortTarget,
   toolColor,
@@ -95,6 +96,25 @@ describe('layoutSessionGraph', () => {
     expect(edges).toEqual([])
   })
 
+  // Load-bearing for <MiniMap>, not cosmetic: with a static `nodes` array and
+  // no `onNodesChange`, React Flow never writes `measured` back, so a node
+  // carrying no explicit size is skipped by the minimap entirely (mesa 589).
+  it('gives every node an explicit size', () => {
+    const g = graph(
+      [node('session', 'session'), node('t1', 'tool'), node('a1', 'agent')],
+      [
+        { from: 'session', to: 't1' },
+        { from: 't1', to: 'a1' },
+      ],
+    )
+    const { nodes } = layoutSessionGraph(g)
+    expect(nodes).toHaveLength(3)
+    for (const n of nodes) {
+      expect(n.width).toBe(NODE_W)
+      expect(n.height).toBe(NODE_H)
+    }
+  })
+
   it('puts a lone root at the origin', () => {
     const { nodes } = layoutSessionGraph(graph([node('session', 'session')], []))
     expect(nodes[0].position).toEqual({ x: 0, y: 0 })
@@ -181,6 +201,39 @@ describe('layoutSessionGraph', () => {
     expect(layoutSessionGraph(g).edges).toEqual([
       { id: 'session->t1', source: 'session', target: 't1' },
     ])
+  })
+})
+
+describe('minimapStrokeWidth', () => {
+  const col = (n: number) =>
+    layoutSessionGraph(
+      graph(
+        [node('session', 'session'), ...Array.from({ length: n }, (_, i) => node(`t${i}`, 'tool'))],
+        Array.from({ length: n }, (_, i) => ({ from: 'session', to: `t${i}` })),
+      ),
+    ).nodes
+
+  it('is zero for an empty graph', () => {
+    expect(minimapStrokeWidth([])).toBe(0)
+  })
+
+  it('leaves a short graph alone, where nodes already render big enough', () => {
+    // 3 rows ≈ 268 flow units: at 150px tall an 80-unit node is already ~45px.
+    expect(minimapStrokeWidth(col(3))).toBe(0)
+  })
+
+  it('pads a tall graph until a node clears the 3px floor', () => {
+    const nodes = col(600)
+    const stroke = minimapStrokeWidth(nodes)
+    expect(stroke).toBeGreaterThan(0)
+    const top = Math.min(...nodes.map((n) => n.position.y))
+    const bottom = Math.max(...nodes.map((n) => n.position.y + n.height))
+    // The whole point: the padded mark is at least 3 minimap pixels tall.
+    expect(((NODE_H + stroke) * 150) / (bottom - top)).toBeGreaterThanOrEqual(3)
+  })
+
+  it('grows with the graph', () => {
+    expect(minimapStrokeWidth(col(600))).toBeGreaterThan(minimapStrokeWidth(col(200)))
   })
 })
 

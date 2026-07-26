@@ -37,11 +37,21 @@ STUB_DIR="$TMP/stub"
 mkdir -p "$STUB_DIR"
 BG_LOG="$TMP/bg.log"
 touch "$BG_LOG"
+# Failed --bg invocations (those made while $STUB_DIR/fail exists) are logged
+# separately, so a check can wait for proof that the watcher actually *tried*
+# to spawn. Without that, "the task is todo" is satisfied by a watcher that
+# never claimed it at all.
+FAIL_LOG="$TMP/bg-fail.log"
+touch "$FAIL_LOG"
 cat > "$STUB_DIR/claude" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "--bg" ]; then
   shift
-  [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; exit 1; }
+  [ -e "$STUB_DIR/fail" ] && {
+    echo "\$(pwd)" >> "$FAIL_LOG"
+    echo "stub claude is down" >&2
+    exit 1
+  }
   NAME=""
   if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
   PROMPT=""
@@ -99,6 +109,23 @@ wait_bg_lines() { # wait_bg_lines <n> -> blocks until BG_LOG has >= n lines, or 
     sleep 0.1
   done
   fail "timed out waiting for $n bg dispatch(es); log:\n$(cat "$BG_LOG")"
+}
+wait_fail_lines() { # wait_fail_lines <n> -> blocks until FAIL_LOG has >= n lines
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$FAIL_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n failed spawn attempt(s)"
+}
+wait_status() { # wait_status <id> <expected> -> blocks until the task reads <expected>
+  local id=$1 want=$2 got=""
+  for _ in $(seq 1 20); do
+    got=$(task_status "$id")
+    [ "$got" = "$want" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for task $id to read '$want' (last saw '$got')"
 }
 
 # ---- flag OFF: no dispatch, ever, even with an actionable todo task ----
@@ -158,10 +185,17 @@ ok "project with a stale (deleted) local_path is skipped"
 
 # ---- spawn failure reverts the claimed task back to todo (no wedge) ----
 
+# Two-step on purpose. The watcher claims -> spawns -> reverts on a 150ms
+# tick, so the task oscillates between in_progress and todo for as long as the
+# stub keeps failing: a single sample after a fixed sleep can land inside the
+# claim-to-revert window and fail on a correct build (observed during mesa task
+# 570), so poll for todo instead. But polling alone would be vacuous -- TASK_C
+# is *already* todo on entry -- so first wait for the stub to record a failed
+# attempt, which is what proves the claim-and-revert cycle actually ran.
 touch "$STUB_DIR/fail"
 mkdir -p "$DIR_C"
-sleep 1
-[ "$(task_status "$TASK_C")" = "todo" ] || fail "failed spawn must revert the task to todo, not wedge it in_progress"
+wait_fail_lines 1
+wait_status "$TASK_C" todo
 [ "$(wc -l < "$BG_LOG")" -eq 1 ] || fail "failed spawn must not log a successful bg line"
 rm "$STUB_DIR/fail"
 ok "a spawn_bg failure reverts the claimed task back to todo instead of wedging the project"

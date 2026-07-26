@@ -52,8 +52,8 @@ scripts/build.sh          # tests, builds the frontend, embeds it, compiles
 
 `scripts/build.sh` is the only supported release build: it runs `cargo test`
 (which re-exports the TypeScript types), fails if `frontend/src/types/` is dirty,
-builds the frontend into `frontend/dist`, then compiles the binary with the
-frontend embedded. Output: `target/release/mesa`.
+runs the frontend unit tests, builds the frontend into `frontend/dist`, then
+compiles the binary with the frontend embedded. Output: `target/release/mesa`.
 
 `scripts/install.sh` runs the same build and copies the binary onto your PATH
 (default `~/.local/bin`; override with `PREFIX=/usr/local`).
@@ -298,6 +298,7 @@ scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synt
 npm --prefix frontend run dev
 npm --prefix frontend run build
 npm --prefix frontend run lint
+npm --prefix frontend run test  # vitest over the pure logic modules
 ```
 
 ### Architecture

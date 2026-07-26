@@ -115,8 +115,18 @@ comparison involved.
 
 ## Verifying changes here
 
-Drive real keys with `khora key` (CDP `Input.dispatchKeyEvent`) — synthetic
-`KeyboardEvent` dispatch is not trusted and won't exercise these handlers.
+`shouldIgnoreShortcut` itself has unit tests (`npm --prefix frontend run
+test`, `frontend/src/keyboardScope.test.ts`) covering each of its five checks
+against a jsdom tree. They cover the **decision** and nothing below it: the
+test dispatches a synthetic bubbling `keydown` from a chosen element, so it
+pins what the predicate answers for a given `e.target` — never that a real
+browser would have delivered the keystroke to that target in the first place.
+Focus routing, `isTrusted`, and whether a handler is mounted at all are still
+only answerable live.
+
+So: drive real keys with `khora key` (CDP `Input.dispatchKeyEvent`) —
+synthetic `KeyboardEvent` dispatch is not trusted and won't exercise these
+handlers.
 `khora key` sends no character, so it cannot test text entry; use
 `khora type-keys <session> <selector> <text>` for that.
 

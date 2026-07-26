@@ -14,8 +14,9 @@ apply everywhere.
 
 ```bash
 # Build a release binary — the ONLY supported release build. Runs cargo test
-# (which re-exports the TS types), fails if frontend/src/types/ is dirty,
-# builds the frontend, then compiles with the dist embedded. Output: target/release/mesa
+# (which re-exports the TS types), fails if frontend/src/types/ is dirty, runs
+# the frontend unit tests (vitest), builds the frontend, then compiles with the
+# dist embedded. Output: target/release/mesa
 scripts/build.sh
 
 # build.sh + copy the binary onto PATH (default ~/.local/bin; PREFIX=/usr/local overrides)
@@ -64,6 +65,7 @@ scripts/cc-check.sh
 npm --prefix frontend run dev     # Vite dev server; proxies /api → 127.0.0.1:7770 (needs `mesa serve`)
 npm --prefix frontend run build   # tsc -b && vite build
 npm --prefix frontend run lint    # eslint
+npm --prefix frontend run test    # vitest (jsdom); also gated by build.sh + CI
 
 # Run the app
 target/release/mesa serve --port 7770   # HTTP API + web UI on 127.0.0.1
@@ -101,6 +103,18 @@ invariants you must not break — read them before changing `src/`:
   (`frontend/dist`, `Assets` in `src/api.rs`), served at `/` with SPA fallback.
   Release builds need `frontend/dist` to exist before the Rust compile (build.sh
   orders this); debug builds read the folder from disk at runtime.
+- **Frontend unit tests cover the pure logic modules, not components.** vitest
+  (jsdom) over `frontend/src/*.test.ts`, run by `build.sh` and CI alongside
+  `cargo test`. There is no React testing library and no component rendering:
+  the suite's subject is the handful of side-effect-free modules the
+  components import (`agentProject.ts`, `boardView.ts`, `keyboardScope.ts`,
+  `layout.ts`, `time.ts`) — the predicates that historically shipped wrong and
+  were caught by review rather than by a gate. Logic worth testing therefore
+  belongs in one of those modules rather than inline in a `.tsx`; that is the
+  same reason `isStaleWorking` was hoisted out of `AgentSidebar`. Anything
+  needing a rendered tree, real focus routing, or a trusted event stays with
+  khora — a jsdom test pins what a predicate answers for a given `e.target`,
+  never that a browser would have delivered the event there.
 
 ### Contracts that agents/clients depend on
 

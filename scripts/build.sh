@@ -2,7 +2,8 @@
 # The pinned build pipeline (spec Requirement 14) — the only supported way to
 # produce a release binary:
 #
-#   cargo test (exports TS types) -> npm run build -> cargo build --release
+#   cargo test (exports TS types) -> npm run test -> npm run build
+#     -> cargo build --release
 #
 # Fails if frontend/src/types/ is dirty, checked both before the export
 # (uncommitted manual edits) and after it (committed types stale against the
@@ -21,14 +22,16 @@ check_types_clean() {
   fi
 }
 
-# Vite 8 / rolldown require node ^20.19 || >=22.12. Under an older node, npm
-# silently skips the native rolldown binding (an optional dep gated on
-# `engines`) and `vite build` fails. Prefer a conforming node over a stale
-# one on PATH (e.g. an old nvm default shadowing the Homebrew install).
+# Vite 8 / rolldown require node ^20.19 || >=22.12, and jsdom (the vitest
+# environment) ^20.19 || ^22.13 || >=24 — so the floor on the 22 line is .13,
+# the stricter of the two. Under an older node, npm silently skips the native
+# rolldown binding (an optional dep gated on `engines`) and `vite build` fails.
+# Prefer a conforming node over a stale one on PATH (e.g. an old nvm default
+# shadowing the Homebrew install).
 node_ok() {
   command -v "$1" >/dev/null 2>&1 &&
     "$1" -e 'const [a, b] = process.versions.node.split(".").map(Number);
-             if (!((a === 20 && b >= 19) || (a === 22 && b >= 12) || a > 22)) process.exit(1)'
+             if (!((a === 20 && b >= 19) || (a === 22 && b >= 13) || a > 22)) process.exit(1)'
 }
 if ! node_ok node; then
   for dir in /opt/homebrew/bin /usr/local/bin; do
@@ -61,6 +64,12 @@ if [ ! -f frontend/node_modules/.package-lock.json ] ||
   [ frontend/package-lock.json -nt frontend/node_modules/.package-lock.json ]; then
   npm --prefix frontend ci
 fi
+
+# The frontend's own unit tests (vitest, over the pure logic modules) sit
+# alongside `cargo test` as a release gate rather than being CI-only — the
+# release binary embeds this bundle, so a build that ships it should have run
+# both suites.
+npm --prefix frontend run test
 npm --prefix frontend run build
 
 # rust-embed reads frontend/dist during macro expansion, baking the files into

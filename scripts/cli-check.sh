@@ -52,7 +52,8 @@ T1=$(jqs .id)
 [ "$(jqs '.tags == ["design","web"]')" = "true" ] || fail "task create: tags"
 ok "task create returns full object with blocked present"
 
-run 0 "$MESA" task create --project "$P" --title "Write copy" --description "homepage"
+run 0 "$MESA" task create --project "$P" --title "Write copy" --description "homepage" --tag draft
+[ "$(jqs '.tags == ["draft"]')" = "true" ] || fail "task create --tag is an alias for --tags"
 T2=$(jqs .id)
 run 0 "$MESA" task create --project "$P" --title "Ship it"
 T3=$(jqs .id)
@@ -96,6 +97,11 @@ run 0 "$MESA" task list --project "$P" --tag design
 [ "$(jqs '.[0].id')" = "$T1" ] || fail "list --tag: wrong task"
 ok "task list --tag filter"
 
+run 0 "$MESA" task list --project "$P" --tags design
+[ "$(jqs length)" = "1" ] || fail "list --tags alias: expected 1"
+[ "$(jqs '.[0].id')" = "$T1" ] || fail "list --tags alias: wrong task"
+ok "task list --tags is an alias for --tag"
+
 run 0 "$MESA" task list --parent "$T3"
 [ "$(jqs length)" = "1" ] || fail "list --parent: expected 1"
 [ "$(jqs '.[0].parent_id')" = "$T3" ] || fail "list --parent: wrong task"
@@ -112,6 +118,13 @@ run 0 "$MESA" task update "$T2" --status in_progress --description "" --tags cop
 [ "$(jqs '.tags == ["copy"]')" = "true" ] || fail "update: --tags must replace the full set"
 [ "$(jqs .blocked)" = "false" ] || fail "update: blocked present"
 ok "task update: full object, description cleared, tags replaced"
+
+# --tag is an alias for --tags on update (and --tags for --tag on list, above)
+run 0 "$MESA" task update "$T2" --tag copy,urgent
+[ "$(jqs '.tags == ["copy","urgent"]')" = "true" ] || fail "update --tag alias: tag set"
+run 0 "$MESA" task update "$T2" --tags copy
+[ "$(jqs '.tags == ["copy"]')" = "true" ] || fail "update: restore tags"
+ok "task update --tag is an alias for --tags"
 
 run 0 "$MESA" task list --project "$P" --status in_progress
 [ "$(jqs length)" = "1" ] && [ "$(jqs '.[0].id')" = "$T2" ] || fail "list --status after update"

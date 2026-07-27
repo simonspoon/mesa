@@ -285,8 +285,8 @@ EXAMPLES
         /// Initial status: backlog|todo|in_progress|done|cancelled (default todo)
         #[arg(long, value_parser = parse_status, default_value = "todo")]
         status: Status,
-        /// Comma-separated tags, e.g. --tags writing,web
-        #[arg(long)]
+        /// Comma-separated tags, e.g. --tags writing,web (alias --tag)
+        #[arg(long, alias = "tag")]
         tags: Option<String>,
         /// Parent task id (makes this a subtask; same project required)
         #[arg(long)]
@@ -322,8 +322,8 @@ EXAMPLES
         /// Only tasks with this status: backlog|todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
-        /// Only tasks carrying this tag
-        #[arg(long)]
+        /// Only tasks carrying this tag (alias --tags; still a single tag)
+        #[arg(long, alias = "tags")]
         tag: Option<String>,
         /// Only subtasks of this parent task id
         #[arg(long)]
@@ -412,8 +412,8 @@ EXAMPLES
         /// New priority: low|medium|high
         #[arg(long, value_parser = parse_priority, group = "fields")]
         priority: Option<Priority>,
-        /// Comma-separated tags; replaces the FULL tag set ("" clears)
-        #[arg(long, group = "fields")]
+        /// Comma-separated tags; replaces the FULL tag set ("" clears); alias --tag
+        #[arg(long, alias = "tag", group = "fields")]
         tags: Option<String>,
         /// New parent task id (same project required)
         #[arg(long, group = "fields", conflicts_with = "no_parent")]

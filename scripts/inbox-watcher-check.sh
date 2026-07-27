@@ -47,6 +47,9 @@ cat > "$STUB_DIR/claude" <<EOF
 if [ "\$1" = "--bg" ]; then
   shift
   [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; exit 1; }
+  AGENT=""
+  if [ "\$1" = "--agent" ]; then shift; AGENT="\$1"; shift; fi
+  echo "\$AGENT" > "$STUB_DIR/last-agent"
   NAME=""
   if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
   PROMPT=""
@@ -137,6 +140,11 @@ LINE=$(head -1 "$BG_LOG")
 EXPECT="$FAKE_HOME|inbox $ITEM_1: khora: eval errors on undefined|/inbox-triage $ITEM_1"
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
 ok "spawn failure releases the claim; the next tick retries and dispatches in \$HOME, prompt '/inbox-triage <id>', session named 'inbox <id>: <first body line>'"
+
+# Triage sessions run under an agent persona too (default `swe`).
+[ "$(cat "$STUB_DIR/last-agent")" = "swe" ] ||
+  fail "triage dispatch must pass --agent swe, got '$(cat "$STUB_DIR/last-agent")'"
+ok "triage session is spawned with --agent swe"
 
 # ---- already dispatched: no re-dispatch, tick after tick ----
 

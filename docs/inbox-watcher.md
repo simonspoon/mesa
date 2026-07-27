@@ -29,7 +29,8 @@ claims a task or dispatches `/execute-mesa-task`.
   see `docs/inbox.md`), so there is no `local_path` to spawn in; the triage
   skill derives the project itself and reads each candidate repo by absolute
   path. Consequence: these sessions appear in the **global** Agent sidebar
-  only, never under a project's Agents tab.
+  only, never under a project's Agents tab. Like every mesa-started session it
+  runs under the `swe` agent persona (`MESA_CLAUDE_AGENT`, `docs/agents.md`).
 - The session name is `inbox <id>: <first non-empty body line>`, truncated to
   60 **chars** (not bytes — bodies are free text and may be non-ASCII). It
   reaches `claude` as `-n/--name`, so an auto-dispatched triage session is

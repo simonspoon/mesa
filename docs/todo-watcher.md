@@ -27,7 +27,9 @@ because someone ran `mesa serve`.
   "/execute-mesa-task <task-id>", Some("<project name>: <task title>"))`. The
   name reaches `claude --bg` as `-n/--name`, so the auto-dispatched session
   shows up identifiably (prompt box, `/resume` picker, terminal title, Agents
-  sidebar) instead of generically. Claiming the task before the spawn closes
+  sidebar) instead of generically. The session runs under the `swe` agent
+  persona (`MESA_CLAUDE_AGENT`, `docs/agents.md`) — dispatch goes through
+  `spawn_bg`, so this is not a watcher-local choice. Claiming the task before the spawn closes
   the race window between dispatch and the agent's own `/execute-mesa-task`
   pickup step, so a later tick can't double-dispatch the same task while the
   agent is still starting up. A project with no `local_path`, or a stale one

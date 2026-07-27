@@ -8,6 +8,17 @@ terminals attached to running sessions. Like the CC Dashboard it reads
 touches the mesa store only to read `local_path`. There is deliberately no
 `mesa agent` CLI: an agent in a terminal would just use `claude` directly.
 
+**Every session mesa *starts* runs under an agent persona.** `agents::spawn_bg`
+is the single spawn chokepoint (the two watchers and the POST route all go
+through it) and passes `--agent <name>`, defaulting to **`swe`** — mesa
+auto-dispatches engineering work, and the generic assistant persona is the
+wrong front door for it. `MESA_CLAUDE_AGENT` overrides the name; set it
+**empty** to drop the flag and get a plain session (an unknown agent name is a
+hard startup failure in the claude CLI, not a warning, so a machine without a
+`swe` agent needs this escape hatch). The flag is placed after `--bg` and
+before the `--` prompt separator. `claude agents --json` and the attach bridge
+don't start a session, so neither takes it.
+
 - `GET /api/projects/{id}/agents` → `{path, agents}` via `claude agents
   --json` (sessions started under that folder, background and interactive),
   filtered to `local_path` **in Rust** (`agents::is_under`) against each

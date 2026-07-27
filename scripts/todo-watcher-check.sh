@@ -52,6 +52,9 @@ if [ "\$1" = "--bg" ]; then
     echo "stub claude is down" >&2
     exit 1
   }
+  AGENT=""
+  if [ "\$1" = "--agent" ]; then shift; AGENT="\$1"; shift; fi
+  echo "\$AGENT" > "$STUB_DIR/last-agent"
   NAME=""
   if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
   PROMPT=""
@@ -154,6 +157,12 @@ LINE=$(head -1 "$BG_LOG")
 [ "$(task_status "$TASK_A")" = "in_progress" ] || fail "dispatched task must be claimed in_progress"
 ok "watch_todo on: dispatches next actionable task, prompt is /execute-mesa-task <id>, session named '<project>: <title>', claims in_progress"
 
+# Auto-dispatched sessions run under an agent persona (default `swe`) — the
+# stub records whatever `--agent` value arrived ahead of --name/--.
+[ "$(cat "$STUB_DIR/last-agent")" = "swe" ] ||
+  fail "dispatch must pass --agent swe, got '$(cat "$STUB_DIR/last-agent")'"
+ok "dispatched session is spawned with --agent swe"
+
 # ---- project already busy (in_progress task present): a second todo task
 # in the SAME project must NOT be dispatched while the first is in flight ----
 
@@ -217,6 +226,9 @@ cat > "$ARCH_STUB" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "--bg" ]; then
   shift
+  AGENT=""
+  if [ "\$1" = "--agent" ]; then shift; AGENT="\$1"; shift; fi
+  echo "\$AGENT" > "$STUB_DIR/last-agent"
   NAME=""
   if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
   PROMPT=""

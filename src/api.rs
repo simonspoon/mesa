@@ -4347,8 +4347,11 @@ mod tests {
     // dispatch.
 
     /// Writes an executable stub `claude` that only understands `--bg`,
-    /// appending `<cwd>|<name>` to `log_path` and printing a well-formed
-    /// receipt line (mirrors `scripts/todo-watcher-check.sh`'s stub).
+    /// appending `<cwd>|<name>|<prompt>` to `log_path` and printing a
+    /// well-formed receipt line (mirrors `scripts/todo-watcher-check.sh`'s
+    /// stub). `--agent <name>` is consumed ahead of `--name`/`--` and written
+    /// to `<dir>/last-agent` — argv order matters, so a stub that parses
+    /// positionally has to know about every flag `spawn_bg` may emit.
     fn stub_claude_bg(dir: &std::path::Path, log_path: &std::path::Path) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("claude");
@@ -4359,6 +4362,9 @@ mod tests {
 [ "$1" = "--bg" ] || exit 1
 shift
 [ -e "{fail}" ] && {{ echo "stub claude is down" >&2; exit 1; }}
+AGENT=""
+if [ "$1" = "--agent" ]; then shift; AGENT="$1"; shift; fi
+echo "$AGENT" > "{agent_log}"
 NAME=""
 if [ "$1" = "--name" ]; then shift; NAME="$1"; shift; fi
 PROMPT=""
@@ -4367,6 +4373,7 @@ echo "$(pwd)|$NAME|$PROMPT" >> "{log}"
 echo "backgrounded · deadbeef (idle — send a prompt to start)"
 "#,
                 fail = dir.join("fail").display(),
+                agent_log = dir.join("last-agent").display(),
                 log = log_path.display()
             ),
         )
@@ -4414,6 +4421,11 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             1,
             "expected exactly one dispatch (the unarchived project), got: {log:?}"
         );
+        // Auto-dispatch spawns under an agent persona (`MESA_CLAUDE_AGENT`,
+        // default `swe`) — asserted here because the watcher path is the one
+        // that must never regress to a generic session.
+        let agent = std::fs::read_to_string(stub_dir.path().join("last-agent")).unwrap_or_default();
+        assert_eq!(agent.trim(), "swe", "dispatch must pass --agent swe");
         assert!(
             log.contains(normal_path),
             "the unarchived project's task must be dispatched: {log:?}"

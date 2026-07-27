@@ -105,6 +105,7 @@ case "\$1" in
     printf '[{"pid":123,"id":"abc12345","cwd":"/one/project","kind":"background","startedAt":1783000000000,"sessionId":"abc12345-0000-0000-0000-000000000000","name":"stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"},{"pid":456,"id":"def67890","cwd":"/another/project","kind":"background","startedAt":1783000001000,"sessionId":"def67890-0000-0000-0000-000000000000","name":"other stub agent","status":"busy","state":"working"},{"pid":789,"id":"toplvl001","cwd":"$TOPLEVEL","kind":"background","startedAt":1783000002000,"sessionId":"toplvl001-0000-0000-0000-000000000000","name":"toplevel stub agent","status":"idle","state":"blocked","waitingFor":"permission prompt"}]\n'
     ;;
   --bg)
+    printf '%s\n' "\$*" > "$STUB_DIR/last-bg-argv"
     echo "Starting background service…"
     echo "backgrounded · deadbeef (idle — send a prompt to start)"
     ;;
@@ -151,6 +152,16 @@ api 201 POST "/api/projects/$P/agents" '{}'
 api 201 POST "/api/projects/$P/agents" '{"prompt":"do the thing"}'
 [ "$(jqb .id)" = "deadbeef" ] || fail "POST agents with prompt: parsed job id"
 ok "POST /api/projects/{id}/agents starts a --bg session (with/without prompt)"
+
+# Every session mesa starts runs under an agent persona (default `swe`,
+# MESA_CLAUDE_AGENT overrides, empty disables) — the flag must sit between
+# `--bg` and the `--` separator or a prompt-leading `-` swallows it.
+ARGV=$(cat "$STUB_DIR/last-bg-argv")
+case "$ARGV" in
+  "--bg --agent swe -- do the thing") ;;
+  *) fail "spawn argv: expected '--bg --agent swe -- do the thing', got '$ARGV'" ;;
+esac
+ok "spawns pass --agent before the prompt separator"
 
 api 422 POST "/api/projects/$D/agents" '{}'
 [ "$(jqb .error.code)" = "validation" ] || fail "POST agents (no path): validation"

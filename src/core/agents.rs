@@ -17,6 +17,25 @@ pub fn claude_bin() -> String {
     std::env::var("MESA_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// Default agent persona for sessions mesa spawns (`claude --agent <name>`).
+/// mesa auto-dispatches engineering work (todo-watcher, inbox-watcher) and the
+/// generic assistant persona is the wrong front door for it.
+const DEFAULT_CLAUDE_AGENT: &str = "swe";
+
+/// The agent to spawn sessions under. `MESA_CLAUDE_AGENT` overrides it; set it
+/// **empty** to omit `--agent` entirely and get a plain `claude` session (the
+/// escape hatch for a machine with no `swe` agent installed — an unknown agent
+/// name is a hard startup failure in the claude CLI, not a warning).
+/// Read-only sessions (`claude agents --json`) and the attach bridge don't
+/// start a session, so neither takes this flag.
+pub fn claude_agent() -> Option<String> {
+    match std::env::var("MESA_CLAUDE_AGENT") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v),
+        Err(_) => Some(DEFAULT_CLAUDE_AGENT.to_string()),
+    }
+}
+
 /// Lists live Claude Code sessions started under `dir`. Filtered here in
 /// Rust against `list_all()`'s parsed `cwd` field, rather than trusting
 /// `claude agents --json --cwd <dir>`'s own matching: live QA on mesa task
@@ -81,7 +100,8 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
 /// passed as `claude`'s `-n/--name` (shown in the prompt box, `/resume`
 /// picker, and terminal title) — the todo-watcher uses this so an
 /// auto-dispatched session is identifiable at a glance instead of showing up
-/// generically. `claude --bg` prints a human receipt, not JSON; the id is
+/// generically. The session runs under [`claude_agent`]'s persona unless that
+/// is disabled. `claude --bg` prints a human receipt, not JSON; the id is
 /// parsed from its "backgrounded · <id>" line.
 ///
 /// **Stub authors:** `Command::output()` below waits for stdout/stderr EOF,
@@ -94,17 +114,23 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
 /// the real CLI, `--bg` returns in ~1.0s idle and ~1.0s with a prompt,
 /// because it detaches its stdio). Keep stub `--bg` branches fork-free.
 pub fn spawn_bg(dir: &str, prompt: Option<&str>, name: Option<&str>) -> Result<String, String> {
-    spawn_bg_with(&claude_bin(), dir, prompt, name)
+    spawn_bg_with(&claude_bin(), claude_agent().as_deref(), dir, prompt, name)
 }
 
+/// `agent` is threaded in rather than read from the env here for the same
+/// reason `bin` is: tests pin both without mutating process-global state.
 fn spawn_bg_with(
     bin: &str,
+    agent: Option<&str>,
     dir: &str,
     prompt: Option<&str>,
     name: Option<&str>,
 ) -> Result<String, String> {
     let mut cmd = Command::new(bin);
     cmd.arg("--bg").current_dir(dir).stdin(Stdio::null());
+    if let Some(agent) = agent {
+        cmd.arg("--agent").arg(agent);
+    }
     if let Some(name) = name {
         cmd.arg("--name").arg(name);
     }
@@ -315,8 +341,49 @@ JSON"#,
             dir.path(),
             r#"[ "$1" = "--bg" ] || exit 1; echo "backgrounded · deadbeef (idle — send a prompt to start)""#,
         );
-        let id = spawn_bg_with(&bin, dir.path().to_str().unwrap(), None, None).unwrap();
+        let id = spawn_bg_with(&bin, None, dir.path().to_str().unwrap(), None, None).unwrap();
         assert_eq!(id, "deadbeef");
+    }
+
+    #[test]
+    fn spawn_bg_passes_agent_before_name_and_prompt() {
+        // `--agent` must land after `--bg` and before the `--` separator, or a
+        // prompt-leading `-` swallows it. The stub asserts the full argv.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_claude(
+            dir.path(),
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] &&
+              [ "$4" = "--name" ] && [ "$5" = "n" ] && [ "$6" = "--" ] && [ "$7" = "go" ] ||
+              { echo "bad argv: $*" >&2; exit 1; }
+echo "backgrounded · 5we00000 · n""#,
+        );
+        let id = spawn_bg_with(
+            &bin,
+            Some("swe"),
+            dir.path().to_str().unwrap(),
+            Some("go"),
+            Some("n"),
+        )
+        .unwrap();
+        assert_eq!(id, "5we00000");
+    }
+
+    #[test]
+    fn claude_agent_defaults_to_swe_and_empty_disables() {
+        // Env-driven; `MESA_CLAUDE_AGENT` is process-global. Takes the
+        // crate-wide lock, not a private one — api.rs's watcher test reads the
+        // same var through `spawn_bg`, so a second mutex would let these two
+        // run concurrently and flake.
+        let _guard = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("MESA_CLAUDE_AGENT") };
+        assert_eq!(claude_agent().as_deref(), Some("swe"));
+        unsafe { std::env::set_var("MESA_CLAUDE_AGENT", "reviewer") };
+        assert_eq!(claude_agent().as_deref(), Some("reviewer"));
+        unsafe { std::env::set_var("MESA_CLAUDE_AGENT", "  ") };
+        assert_eq!(claude_agent(), None);
+        unsafe { std::env::remove_var("MESA_CLAUDE_AGENT") };
     }
 
     #[test]
@@ -330,7 +397,14 @@ JSON"#,
 echo "backgrounded · abc00000"
 echo "prompt was: $3" >&2"#,
         );
-        let id = spawn_bg_with(&bin, dir.path().to_str().unwrap(), Some("--resume"), None).unwrap();
+        let id = spawn_bg_with(
+            &bin,
+            None,
+            dir.path().to_str().unwrap(),
+            Some("--resume"),
+            None,
+        )
+        .unwrap();
         assert_eq!(id, "abc00000");
     }
 
@@ -345,6 +419,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         );
         let id = spawn_bg_with(
             &bin,
+            None,
             dir.path().to_str().unwrap(),
             Some("/execute-mesa-task 1"),
             Some("proj: do the thing"),

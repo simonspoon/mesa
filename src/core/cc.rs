@@ -129,6 +129,31 @@ impl RawMessage {
             })
             .collect()
     }
+
+    /// This message's prose: the `text` of every `type: "text"` block, in
+    /// array order, joined with a single space and then run once through
+    /// [`sanitize_capped`]. `None` when `content` is not an array (a user
+    /// line carries a plain string), holds no `text` block (a tool-use-only
+    /// assistant turn), or when nothing survives sanitization.
+    ///
+    /// One preview per *message*, never one per block: the graph draws one
+    /// response node per message, and joining before sanitizing is what makes
+    /// the cap bound the whole message rather than each block separately.
+    ///
+    /// `thinking` blocks are deliberately excluded. They would land reasoning
+    /// prose in the same unlabelled `preview` field with no way for a reader
+    /// to tell it from the reply, and thinking routinely dwarfs the response —
+    /// it would win the cap and push the actual reply out.
+    fn assistant_text(&self) -> Option<String> {
+        let blocks = self.content.as_ref()?.as_array()?;
+        let joined = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        sanitize_capped(&joined)
+    }
 }
 
 /// Cap on a stored [`tool_target`], in characters. A `Bash` command runs past
@@ -168,17 +193,32 @@ const TARGET_KEYS: &[&str] = &[
 /// input failed to parse arrives as `{"__unparsedToolInput": "..."}` or worse),
 /// when no known key holds a string, or when the value is blank.
 ///
-/// The result is sanitized here rather than at any display site, because it is
-/// **untrusted model-authored text heading for a database**: whitespace runs
-/// (a heredoc's newlines) collapse to single spaces and control characters are
-/// dropped, so one row can never span lines or move a terminal cursor when a
+/// The result is sanitized and capped by [`sanitize_capped`] before it is
+/// returned — at ingest, never at a display site — because it is **untrusted
+/// model-authored text heading for a database**: whitespace runs (a heredoc's
+/// newlines) collapse to single spaces and control characters are dropped, so
+/// one row can never span lines or move a terminal cursor when a
 /// `mesa cc graph` payload is catted. It stays data, never instructions.
 pub fn tool_target(input: &serde_json::Value) -> Option<String> {
     let obj = input.as_object()?;
     let raw = TARGET_KEYS
         .iter()
         .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))?;
+    sanitize_capped(raw)
+}
 
+/// Sanitize and cap untrusted model-authored text on its way into the db:
+/// whitespace runs collapse to a single space, control characters are dropped,
+/// and the result is cut at [`TARGET_MAX_CHARS`] **characters** (never bytes)
+/// with a trailing `…`. `None` when nothing survives.
+///
+/// One policy, shared by every transcript-derived string mesa stores —
+/// [`tool_target`]'s lifted `tool_use.input` scalar and
+/// [`RawMessage::assistant_text`]'s prose preview. Sanitizing here rather than
+/// at any display site is what guarantees a stored row can never span lines or
+/// move a terminal cursor when a `mesa cc graph` payload is catted. It stays
+/// data, never instructions.
+pub fn sanitize_capped(raw: &str) -> Option<String> {
     let mut out = String::new();
     let mut pending_space = false;
     let mut chars = 0usize;
@@ -815,9 +855,11 @@ fn fold_line(
             cache_creation_tokens: usage.cache_creation_input_tokens,
             skill: raw.attribution_skill.clone(),
             agent: raw.attribution_agent.clone(),
-            // Extraction of the `content[]` text blocks lands in the next
-            // story; the column and its backfill path exist first.
-            preview: None,
+            // The prose this assistant turn emitted, already sanitized and
+            // capped. `None` for a tool-use-only turn — indistinguishable
+            // from a row that predates the column, by design: both mean
+            // "no response node".
+            preview: msg.assistant_text(),
         });
         // An advisor call's own model turn is nested inside this event's
         // usage.iterations rather than being its own transcript line (unlike
@@ -2566,6 +2608,140 @@ mod tests {
         let wide = "é".repeat(TARGET_MAX_CHARS + 10);
         let got = target(&format!(r#"{{"command":"{wide}"}}"#)).unwrap();
         assert_eq!(got.chars().count(), TARGET_MAX_CHARS + 1);
+    }
+
+    /// `RawMessage::assistant_text` over a raw `message` object.
+    fn prose(json: &str) -> Option<String> {
+        let msg: RawMessage = serde_json::from_str(json).unwrap();
+        msg.assistant_text()
+    }
+
+    #[test]
+    fn assistant_text_lifts_prose_and_ignores_everything_else() {
+        // The common real shape: a sentence, then the calls it introduced.
+        // The prose is the preview; the tool blocks contribute nothing.
+        assert_eq!(
+            prose(
+                r#"{"content":[{"type":"text","text":"Let me read the file."},
+                    {"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/a"}}]}"#
+            )
+            .as_deref(),
+            Some("Let me read the file.")
+        );
+        // Tool-use only -> nothing stored, so no response node.
+        assert_eq!(
+            prose(r#"{"content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}"#),
+            None
+        );
+        // Prose that sanitizes to empty is the same as no prose.
+        assert_eq!(
+            prose(r#"{"content":[{"type":"text","text":"  \n\t "}]}"#),
+            None
+        );
+        assert_eq!(prose(r#"{"content":[{"type":"text","text":""}]}"#), None);
+        // Non-array content (a user line carries a bare string), absent
+        // content, and a `text` block whose `text` is missing or non-string.
+        assert_eq!(prose(r#"{"content":"just a string"}"#), None);
+        assert_eq!(prose(r#"{}"#), None);
+        assert_eq!(prose(r#"{"content":[{"type":"text"}]}"#), None);
+        assert_eq!(prose(r#"{"content":[{"type":"text","text":42}]}"#), None);
+        // `thinking` blocks are excluded: reasoning prose would be
+        // indistinguishable from the reply in the same field, and would win
+        // the cap over it.
+        assert_eq!(
+            prose(
+                r#"{"content":[{"type":"thinking","thinking":"weighing options"},
+                    {"type":"text","text":"Done."}]}"#
+            )
+            .as_deref(),
+            Some("Done.")
+        );
+        assert_eq!(
+            prose(r#"{"content":[{"type":"thinking","thinking":"weighing options"}]}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn assistant_text_joins_blocks_in_order_then_sanitizes_once() {
+        // Several text blocks are ONE preview, in array order.
+        assert_eq!(
+            prose(
+                r#"{"content":[{"type":"text","text":"First."},
+                    {"type":"tool_use","id":"tu1","name":"Bash","input":{}},
+                    {"type":"text","text":"Second."},
+                    {"type":"text","text":"Third."}]}"#
+            )
+            .as_deref(),
+            Some("First. Second. Third.")
+        );
+        // Same sanitizer as `tool_target`: newline/tab runs collapse to one
+        // space and control characters are dropped, so a stored preview can
+        // never span lines or move a terminal cursor.
+        assert_eq!(
+            prose("{\"content\":[{\"type\":\"text\",\"text\":\"line one\\n\\n\\tline two\"}]}")
+                .as_deref(),
+            Some("line one line two")
+        );
+        assert_eq!(
+            prose("{\"content\":[{\"type\":\"text\",\"text\":\"red \\u001b[31malert\"}]}")
+                .as_deref(),
+            Some("red [31malert")
+        );
+
+        // A long paragraph is capped in CHARACTERS, not bytes — the cap is
+        // shared with `tool_target`, there is no second constant.
+        let long = "é".repeat(10_000);
+        let got = prose(&format!(
+            r#"{{"content":[{{"type":"text","text":"{long}"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(got.chars().count(), TARGET_MAX_CHARS + 1);
+        assert!(got.ends_with('…'));
+        assert!(got.len() < 10_000);
+
+        // The cap bounds the MESSAGE, not each block: two blocks each at the
+        // cap yield one capped preview, not two. (Here the cut lands on the
+        // joining space, which the shipped sanitizer drops without an
+        // ellipsis — `tool_target`'s behaviour, reused verbatim.)
+        let half = "z".repeat(TARGET_MAX_CHARS);
+        let got = prose(&format!(
+            r#"{{"content":[{{"type":"text","text":"{half}"}},{{"type":"text","text":"{half}"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(got.chars().count(), TARGET_MAX_CHARS);
+    }
+
+    #[test]
+    fn ingest_stores_a_preview_for_a_prose_bearing_message_only() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                // Prose + a tool call in one message.
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"Reading\nthe file."},{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/a"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                // Tool-use only.
+                r#"{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-06-15T01:00:01.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        let msgs = store.cc_session_messages("s1").unwrap();
+        let by = |u: &str| msgs.iter().find(|m| m.uuid == u).unwrap().preview.clone();
+        assert_eq!(by("u1").as_deref(), Some("Reading the file."));
+        assert_eq!(by("u2"), None);
     }
 
     #[test]

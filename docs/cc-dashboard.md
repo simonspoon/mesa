@@ -55,7 +55,21 @@ CLI and API share it and never diverge.
   cursor clear that *delivers* that re-walk ships with the change that makes
   ingest emit a preview, never with the bare column — the re-walk is one-shot,
   and spending it under a binary that still writes `NULL` is task 583's
-  9-of-70,250 outcome all over again.
+  9-of-70,250 outcome all over again. (That cursor clear is migration 25,
+  appended alongside the extraction; one ordinary `cc sync` afterwards fills
+  ~19.5k of 138k rows on the real db.)
+
+  What is extracted (`RawMessage::assistant_text`): the `text` of every
+  `type: "text"` block of one assistant line, **in array order, joined with a
+  single space, then sanitized and capped once** — one preview per *message*,
+  never one per block, so the 200-character cap bounds the message. The
+  sanitizer is `tool_target`'s, factored out as `sanitize_capped`: one policy
+  for every untrusted transcript string mesa stores, not a second one.
+  `thinking` blocks are **excluded**: they would land reasoning prose in the
+  same unlabelled column with nothing to tell it from the reply, and thinking
+  routinely dwarfs the response, so it would win the cap and push the actual
+  reply out. On real transcripts most assistant messages have no preview at
+  all — the majority are pure `tool_use` or pure `thinking` turns.
 - A call to the built-in **`advisor`** tool doesn't get its own transcript
   line/file the way a Task-tool subagent does (no `subagents/*.jsonl`, no
   `isSidechain`): it's a `server_tool_use` content block (read like

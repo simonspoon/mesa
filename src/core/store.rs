@@ -309,6 +309,22 @@ const MIGRATIONS: &[&str] = &[
     // — task 583's 9-of-70,250 outcome, reproduced. 606 and 607 therefore ship
     // as ONE binary; releasing this migration alone is the bug.
     "ALTER TABLE cc_messages ADD COLUMN preview TEXT;",
+    // The cursor clear promised above, now that ingest actually extracts a
+    // preview (`core::cc::RawMessage::assistant_text`). Without it every row
+    // ingested before this binary stays `preview IS NULL` forever: ingest is
+    // cursor-driven, so an unchanged transcript is skipped unread and the
+    // guarded `preview IS NULL` backfill in `ingest_cc_batch` is never
+    // reached — on a real db that is ~138k of ~138k messages blank, i.e. a
+    // session graph with no response nodes at all except on sessions recorded
+    // after the upgrade. Clearing the cursors makes the next ORDINARY
+    // `cc::sync` re-walk the tree once and take that backfill; `cc sync
+    // --rebuild` is an operator command nobody runs and is not the remedy.
+    // Same shape and same reasoning as migration 23 did for
+    // `cc_tool_calls.target`: a shipped `DELETE FROM cc_files;` cannot be
+    // reused, since `user_version` is already past it. One-shot, cheap (~9s
+    // over 3.5k transcripts) and additive-only — `cc_files` holds cursors,
+    // not data.
+    "DELETE FROM cc_files;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.

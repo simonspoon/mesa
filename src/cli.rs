@@ -381,13 +381,20 @@ EXAMPLES
     /// Only the flags you pass change; at least one is required.
     /// `--description ""` clears the description. `--tags` REPLACES the full
     /// tag set (`--tags ""` clears it). The task's project cannot change.
+    ///
+    /// `--append` flips the three free-text bodies (description, acceptance,
+    /// result) from replace to append, so a batch of tasks can be annotated
+    /// without reading each body back first. It composes with the `--*-file`
+    /// forms, including `-` for stdin.
     #[command(after_help = "\
 EXAMPLES
   mesa task update 3 --status in_progress
   mesa task update 3 --tags writing,urgent    # replaces all tags
   mesa task update 3 --description \"\"         # clears the description
   mesa task update 3 --no-parent              # detach from its parent
-  mesa task update 3 --status done --result \"shipped in a3985c1\"")]
+  mesa task update 3 --status done --result \"shipped in a3985c1\"
+  mesa task update 3 --append --description \"DESIGN CONTRACT: see task 605\"
+  mesa task update 3 --append --result-file - < note.md")]
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
         /// Task id
@@ -441,6 +448,13 @@ EXAMPLES
         /// Read the new result from a file (`-` = stdin); conflicts with --result
         #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "result")]
         result_file: Option<String>,
+        /// APPEND the description/acceptance/result you pass instead of
+        /// replacing it, separated from the stored body by a blank line
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--append` alone is still clap's "no field given" usage error.
+        #[arg(long)]
+        append: bool,
     },
     /// Delete a task AND all its subtasks (no confirmation)
     ///
@@ -1498,11 +1512,34 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             artifact,
             result,
             result_file,
+            append,
         } => {
             let mut stdin_used = false;
             let description = resolve_field(description, description_file, &mut stdin_used)?;
             let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
             let result = resolve_field(result, result_file, &mut stdin_used)?;
+            if append {
+                // Append only means anything for the three free-text bodies,
+                // and appending nothing (or "clearing by appending") is a
+                // contradiction — both are usage errors rather than silent
+                // no-ops, so a mistyped batch call fails loudly on task one.
+                let bodies = [&description, &acceptance, &result];
+                if bodies.iter().all(|f| f.is_none()) {
+                    print_error(
+                        "usage",
+                        "--append needs one of --description/--acceptance/--result \
+                         (or their --*-file forms)",
+                    );
+                    std::process::exit(2);
+                }
+                if bodies.iter().any(|f| f.as_deref() == Some("")) {
+                    print_error(
+                        "usage",
+                        "--append cannot append an empty value; omit --append to clear a field",
+                    );
+                    std::process::exit(2);
+                }
+            }
             let patch = TaskPatch {
                 title,
                 description: description.map(clear_if_empty),
@@ -1518,6 +1555,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 artifact: artifact.map(clear_if_empty),
                 result: result.map(clear_if_empty),
                 sort_order: None,
+                append,
             };
             print_json(&store.update_task(id, &patch)?);
         }

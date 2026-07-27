@@ -1114,6 +1114,10 @@ async fn update_task(
         artifact: body.artifact,
         result: body.result,
         sort_order: body.sort_order,
+        // Append mode (spec 612) is a CLI-side batch-annotation affordance;
+        // the HTTP wire type deliberately does not expose it, so PATCH keeps
+        // its replace-only semantics.
+        append: false,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_task(id, &patch)?).into_response())

@@ -668,6 +668,24 @@ pub struct TaskPatch {
     /// Manual board order (spec 328); caller (the API) computes the
     /// fractional value from the drop position, `Store` just persists it.
     pub sort_order: Option<f64>,
+    /// Append mode (spec 612): the three free-text bodies —
+    /// `description`, `acceptance`, `result` — are appended to the stored
+    /// value instead of replacing it, so a caller can annotate a batch of
+    /// tasks without round-tripping every body through its own context.
+    /// Every other field is unaffected. `Some(None)` (clear) is meaningless
+    /// under append and is rejected by the caller, not here.
+    pub append: bool,
+}
+
+/// Join an appended body onto the stored one (spec 612): trailing newlines on
+/// the stored value are trimmed and exactly one blank line separates the two,
+/// so repeated appends produce a stable markdown-ish block sequence. An empty
+/// or absent stored value means the appended text becomes the whole field.
+fn append_text(existing: Option<&str>, added: &str) -> String {
+    match existing.map(|e| e.trim_end_matches('\n')).unwrap_or("") {
+        "" => added.to_string(),
+        base => format!("{base}\n\n{added}"),
+    }
 }
 
 /// Fields to change on a storyboard; `None` means leave unchanged. A
@@ -1277,7 +1295,13 @@ impl Store {
             task.title = title.clone();
         }
         if let Some(description) = &patch.description {
-            task.description = description.clone();
+            task.description = if patch.append {
+                description
+                    .as_deref()
+                    .map(|added| append_text(task.description.as_deref(), added))
+            } else {
+                description.clone()
+            };
         }
         if let Some(status) = patch.status {
             task.status = status;
@@ -1300,13 +1324,25 @@ impl Store {
             task.parent_id = parent_id;
         }
         if let Some(acceptance) = &patch.acceptance {
-            task.acceptance = acceptance.clone();
+            task.acceptance = if patch.append {
+                acceptance
+                    .as_deref()
+                    .map(|added| append_text(task.acceptance.as_deref(), added))
+            } else {
+                acceptance.clone()
+            };
         }
         if let Some(artifact) = &patch.artifact {
             task.artifact = artifact.clone();
         }
         if let Some(result) = &patch.result {
-            task.result = result.clone();
+            task.result = if patch.append {
+                result
+                    .as_deref()
+                    .map(|added| append_text(task.result.as_deref(), added))
+            } else {
+                result.clone()
+            };
         }
         if let Some(sort_order) = patch.sort_order {
             task.sort_order = sort_order;
@@ -3351,6 +3387,7 @@ mod tests {
                     artifact: None,
                     result: None,
                     sort_order: None,
+                    append: false,
                 },
             )
             .unwrap();
@@ -3593,6 +3630,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cleared.result, None);
+    }
+
+    /// Spec 612: `append` turns the three free-text bodies into appends,
+    /// separated from the stored value by exactly one blank line however many
+    /// trailing newlines it carried, and leaves every other field replacing.
+    #[test]
+    fn update_task_appends_the_free_text_bodies() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "story");
+        let seeded = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    // A trailing newline is what a `--description-file` body
+                    // normally ends with; it must not double the blank line.
+                    description: Some(Some("Story body.\n".into())),
+                    acceptance: Some(Some("Ships.".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(seeded.result, None);
+
+        let annotated = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    description: Some(Some("DESIGN CONTRACT: see task 605".into())),
+                    acceptance: Some(Some("...and is documented.".into())),
+                    // An absent body: the appended text becomes the whole value.
+                    result: Some(Some("first note".into())),
+                    title: Some("renamed".into()),
+                    append: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            annotated.description.as_deref(),
+            Some("Story body.\n\nDESIGN CONTRACT: see task 605")
+        );
+        assert_eq!(
+            annotated.acceptance.as_deref(),
+            Some("Ships.\n\n...and is documented.")
+        );
+        assert_eq!(annotated.result.as_deref(), Some("first note"));
+        assert_eq!(
+            annotated.title, "renamed",
+            "append must not leak into non-text fields"
+        );
+        assert_eq!(
+            store.get_task(t.id).unwrap().description,
+            annotated.description
+        );
+
+        // Repeated appends stack rather than nesting blank lines.
+        let twice = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    result: Some(Some("second note".into())),
+                    append: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(twice.result.as_deref(), Some("first note\n\nsecond note"));
+
+        // Without `append` the same patch replaces, exactly as before.
+        let replaced = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    result: Some(Some("third note".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced.result.as_deref(), Some("third note"));
     }
 
     #[test]

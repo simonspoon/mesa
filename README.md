@@ -129,6 +129,13 @@ mesa backup /tmp/mesa-snap.db
   stdin) instead of an inline arg, so multi-line text with shell metacharacters (backticks, `$()`,
   `<>`) round-trips verbatim. Each conflicts with its inline flag; only one
   field may read `-` per call.
+- **Append instead of replace.** `task update --append` flips the three
+  free-text bodies (`description`, `acceptance`, `result`) from replacing to
+  appending, separated from the stored text by a blank line — so a batch of
+  tasks can be annotated without reading each body back first. It composes
+  with the `--*-file` forms, applies to no other field, and rejects both an
+  empty value and a call passing no body (usage, exit 2). `PATCH
+  /api/tasks/{id}` is deliberately replace-only.
 
 Run `mesa <command> --help` for the full, self-documenting reference.
 

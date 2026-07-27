@@ -319,6 +319,18 @@ export function toolColor(name: string): string {
   return TOOL_PALETTE[FALLBACK_FROM + ((h >>> 0) % (TOOL_PALETTE.length - FALLBACK_FROM))]
 }
 
+/** Reserved node colour for `kind: response`.
+ *
+ *  Deliberately NOT a `toolColor()` slot: that function keys on a tool *name*,
+ *  and a response node has none to key on — asking it would mean a hashed
+ *  fallback, i.e. a colour that could land on any low-traffic tool's hue.
+ *
+ *  Low-saturation and light on purpose. Every `TOOL_PALETTE` entry sits at 35%+
+ *  saturation and the three structural kinds own neon cyan (session), violet
+ *  (skill) and magenta (agent), so a pale warm neutral is the one band nothing
+ *  else can reach, hashed or otherwise. */
+export const RESPONSE_COLOR = 'hsl(36, 30%, 76%)'
+
 /** Tools whose `target` is a path, so the node shows its last segment. The
  *  server stores the full path (it is the unambiguous thing to store); which
  *  part of it fits in 210px is a rendering question, so it is decided here. */
@@ -336,10 +348,15 @@ const FILE_TOOLS = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Artifact']
  *  argument — and `/usr/local/bin/foo --flag` wants its flags, not `foo`.
  *
  *  The full value stays available as the node's hover title: this returns the
- *  display form only, and never claims to round-trip. */
-export function shortTarget(node: Pick<CcGraphNode, 'name' | 'target'>): string | null {
+ *  display form only, and never claims to round-trip.
+ *
+ *  A `response` node's target is prose, not a target, and is passed through
+ *  untouched: the "looks like a path" heuristic would otherwise mangle a
+ *  one-word reply such as `/clear` into a path segment. */
+export function shortTarget(node: Pick<CcGraphNode, 'kind' | 'name' | 'target'>): string | null {
   const t = node.target
   if (!t) return null
+  if (node.kind === 'response') return t
   const pathLike = FILE_TOOLS.has(node.name) || (/^[~./]/.test(t) && !/\s/.test(t))
   if (!pathLike) return t
   // `filter(Boolean)` so a trailing slash yields the directory name rather

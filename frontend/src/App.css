@@ -4356,6 +4356,15 @@ button:focus-visible,
   border-left-color: #7c5cff;
 }
 
+/* One assistant message's prose. Pale warm neutral: every tool hue is 35%+
+   saturation and the three structural kinds own cyan/violet/magenta, so this is
+   the one band nothing else can reach — a response can never be mistaken for a
+   call. Mirrored as RESPONSE_COLOR in sessionGraph.ts (the minimap draws raw
+   fills and cannot read this rule). */
+.cc-graph-node.kind-response {
+  border-left-color: hsl(36, 30%, 76%);
+}
+
 /* Fallback only. A tool node's real colour is per tool *name* and arrives as
    an inline style from `toolColor()` — the name set is open-ended, so it can
    never live in a stylesheet. This is what shows if that ever returns nothing. */

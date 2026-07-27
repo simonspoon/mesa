@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   NODE_H,
   NODE_W,
+  RESPONSE_COLOR,
   childrenByParent,
   formatTokens,
   layoutSessionGraph,
@@ -63,6 +64,7 @@ const graph = (
   edges,
   truncated: false,
   omitted_tool_calls: 0,
+  omitted_responses: 0,
 })
 
 describe('childrenByParent', () => {
@@ -83,6 +85,31 @@ describe('childrenByParent', () => {
     expect(childrenByParent(g).get('session')).toEqual(['b', 'a', 'c'])
   })
 
+  // A message's prose and the calls it issued carry the SAME `ts` — the server
+  // (mesa 608) breaks that tie by emitting the response node first, and this is
+  // the frontend half of that contract: equal `ts` falls back to server order,
+  // so the reply reads before the calls it introduces. Sorting by `ts` alone
+  // would leave the order at the mercy of the edge list.
+  it('keeps a response ahead of the tool calls it shares a timestamp with', () => {
+    const TS = '2026-07-26T10:00:03Z'
+    const g = graph(
+      [
+        node('session', 'session'),
+        node('msg:m1', 'response', { name: 'Response', target: 'Reading the file now.', ts: TS }),
+        node('tool:t1', 'tool', { name: 'Read', ts: TS }),
+        node('tool:t2', 'tool', { name: 'Grep', ts: TS }),
+      ],
+      [
+        // Edge order deliberately does NOT match node order: the tie-break must
+        // come from `nodes`, not from however the edges happen to arrive.
+        { from: 'session', to: 'tool:t1' },
+        { from: 'session', to: 'tool:t2' },
+        { from: 'session', to: 'msg:m1' },
+      ],
+    )
+    expect(childrenByParent(g).get('session')).toEqual(['msg:m1', 'tool:t1', 'tool:t2'])
+  })
+
   it('ignores an edge naming a node that is not in the payload', () => {
     const g = graph([node('session', 'session')], [{ from: 'session', to: 'ghost' }])
     expect(childrenByParent(g).get('session')).toBeUndefined()
@@ -101,14 +128,20 @@ describe('layoutSessionGraph', () => {
   // carrying no explicit size is skipped by the minimap entirely (mesa 589).
   it('gives every node an explicit size', () => {
     const g = graph(
-      [node('session', 'session'), node('t1', 'tool'), node('a1', 'agent')],
+      [
+        node('session', 'session'),
+        node('t1', 'tool'),
+        node('a1', 'agent'),
+        node('msg:m1', 'response', { name: 'Response', target: 'hello' }),
+      ],
       [
         { from: 'session', to: 't1' },
         { from: 't1', to: 'a1' },
+        { from: 'session', to: 'msg:m1' },
       ],
     )
     const { nodes } = layoutSessionGraph(g)
-    expect(nodes).toHaveLength(3)
+    expect(nodes).toHaveLength(4)
     for (const n of nodes) {
       expect(n.width).toBe(NODE_W)
       expect(n.height).toBe(NODE_H)
@@ -273,7 +306,7 @@ describe('shortModel', () => {
 })
 
 describe('shortTarget', () => {
-  const t = (name: string, target: string | null) => shortTarget({ name, target })
+  const t = (name: string, target: string | null) => shortTarget({ kind: 'tool', name, target })
 
   it('shows a file tool its file name, not the path to it', () => {
     expect(t('Read', '/Users/me/inaros/projects/tools/mesa/src/core/cc.rs')).toBe('cc.rs')
@@ -297,6 +330,15 @@ describe('shortTarget', () => {
     expect(t('SomeNewTool', '/a/b/c.txt --flag')).toBe('/a/b/c.txt --flag')
     // No leading path marker, so it is a query/name and stays whole.
     expect(t('SomeNewTool', 'src/core/cc.rs')).toBe('src/core/cc.rs')
+  })
+
+  it('passes a response preview through untouched', () => {
+    const r = (target: string) => shortTarget({ kind: 'response', name: 'Response', target })
+    // Prose, not a target: the path heuristic would basename a slash-command
+    // reply into `clear` and a bare sentence-free reply into its last segment.
+    expect(r('/clear')).toBe('/clear')
+    expect(r('~/notes/c.txt')).toBe('~/notes/c.txt')
+    expect(r('Done — the migration is applied.')).toBe('Done — the migration is applied.')
   })
 
   it('degrades instead of returning an empty label', () => {
@@ -364,6 +406,45 @@ describe('toolColor', () => {
     expect(toolColor('EnterWorktree')).toBe(toolColor('ExitWorktree'))
     expect(toolColor('TaskCreate')).toBe(toolColor('TaskStop'))
     expect(toolColor('SendMessage')).toBe(toolColor('SendUserFile'))
+  })
+})
+
+describe('RESPONSE_COLOR', () => {
+  it('is reserved — no tool can reach it, by table or by hash', () => {
+    // One name per fixed slot (0-17), so the whole table is covered, plus a
+    // spread of unknown names to exercise every hashed fallback slot. A
+    // response node is not a tool and has no name to key on, so if `toolColor`
+    // could ever return this hue the kind would stop being distinguishable.
+    const named = [
+      'Bash',
+      'Read',
+      'Edit',
+      'Write',
+      'WebFetch',
+      'WebSearch',
+      'Skill',
+      'Agent',
+      'Glob',
+      'ToolSearch',
+      'StructuredOutput',
+      'AskUserQuestion',
+      'EnterWorktree',
+      'TaskCreate',
+      'Monitor',
+      'Workflow',
+      'SendMessage',
+      'ScheduleWakeup',
+    ]
+    const hashed = Array.from({ length: 300 }, (_, i) => `mcp__unknown__tool_${i}`)
+    for (const name of [...named, ...hashed]) {
+      expect(toolColor(name)).not.toBe(RESPONSE_COLOR)
+    }
+  })
+
+  it('is distinct from the three structural kind colours', () => {
+    // Mirrored from MINIMAP_KIND_COLOR in CCSessionGraphView (session / agent /
+    // skill), which is itself the minimap's copy of App.css's left borders.
+    expect(['#00e5ff', '#ff2bd6', '#7c5cff']).not.toContain(RESPONSE_COLOR)
   })
 })
 

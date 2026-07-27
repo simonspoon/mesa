@@ -12,6 +12,7 @@ import {
 import { getCcSessionGraph } from '../api'
 import { usePhoneTier } from '../phoneTier'
 import {
+  RESPONSE_COLOR,
   formatTokens,
   layoutSessionGraph,
   minimapStrokeWidth,
@@ -42,6 +43,10 @@ const MINIMAP_KIND_COLOR: Record<Exclude<CcGraphNode['kind'], 'tool'>, string> =
   session: '#00e5ff',
   agent: '#ff2bd6',
   skill: '#7c5cff',
+  // A response is not a tool and has no name to hash, so its colour is reserved
+  // rather than derived — the one literal that lives in sessionGraph.ts, since
+  // vitest asserts it collides with no tool colour and no other kind.
+  response: RESPONSE_COLOR,
 }
 
 function nodeColor(n: CcGraphNode): string {
@@ -77,10 +82,26 @@ export function CCSessionGraphView({ sessionId }: { sessionId: string }) {
         )}
       </header>
 
+      {/* Two populations, two budgets, two counts: `truncated` is now "either
+          was cut", so each sentence is shown only when its own counter fired —
+          otherwise a response-only truncation would report "0 omitted" tool
+          calls. Neither count is folded into the other; `omitted_tool_calls`
+          still means tool calls exactly. */}
       {data?.truncated && (
         <p className="cc-graph-note">
-          Showing the first {data.nodes.filter((n) => n.kind === 'tool').length} tool calls —{' '}
-          {data.omitted_tool_calls.toLocaleString()} omitted. Every subagent is shown.
+          {data.omitted_tool_calls > 0 && (
+            <>
+              Showing the first {data.nodes.filter((n) => n.kind === 'tool').length} tool calls —{' '}
+              {data.omitted_tool_calls.toLocaleString()} omitted. Every subagent is shown.
+            </>
+          )}
+          {data.omitted_responses > 0 && (
+            <>
+              {data.omitted_tool_calls > 0 ? ' ' : ''}
+              Showing the first {data.nodes.filter((n) => n.kind === 'response').length} responses —{' '}
+              {data.omitted_responses.toLocaleString()} omitted.
+            </>
+          )}
         </p>
       )}
 
@@ -141,12 +162,12 @@ export function CCSessionGraphView({ sessionId }: { sessionId: string }) {
 
 function GraphNode({ data }: NodeProps<CcFlowNode>) {
   const model = shortModel(data.model)
-  // A tool node's tokens are the issuing assistant message's, shared with any
-  // sibling calls in that message — never this call's own. Say so rather than
-  // printing a number that looks additive but is not.
+  // A tool or response node's tokens are the issuing assistant message's,
+  // shared with every other node that message produced — never this node's own.
+  // Say so rather than printing a number that looks additive but is not.
   const tokenTitle = data.tokens_are_rollup
     ? 'Total tokens for this thread'
-    : 'Tokens of the assistant message that issued this call (shared with sibling calls)'
+    : 'Tokens of the assistant message this node came from (shared with its sibling nodes)'
   // What the call acted on. Shortened to fit the box; the untruncated value
   // is the hover title, which is also the only place a long Bash command or a
   // full file path can be read.

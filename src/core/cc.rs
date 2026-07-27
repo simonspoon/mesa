@@ -1333,7 +1333,9 @@ impl Agg {
 /// Default cap on `tool` nodes in one graph. The largest real session observed
 /// carries ~6.6k tool calls, which is a useless picture and a slow canvas;
 /// subagent nodes and the calls that spawned them are never counted against
-/// this, so the tree stays connected however low it goes.
+/// this, so the tree stays connected however low it goes. `response` nodes are
+/// the second unbounded population and get this same cap as their own,
+/// separately counted budget.
 pub const GRAPH_NODE_LIMIT: usize = 600;
 
 /// Build one session's call tree from the persisted `cc_*` rows. `Ok(None)`
@@ -1344,6 +1346,10 @@ pub const GRAPH_NODE_LIMIT: usize = 600;
 /// `.meta.json` sidecar). A run whose sidecar was missing falls back to its
 /// `parent_agent_id`, then to the root — so a pre-sidecar row still renders,
 /// just flattened.
+///
+/// A message that emitted prose also gets a `response` node (`msg:<uuid>`),
+/// hung off the same parent as that message's tool nodes and emitted before
+/// them when they share a timestamp.
 pub fn session_graph(
     store: &Store,
     session_id: &str,
@@ -1445,6 +1451,31 @@ pub fn session_graph(
         caller: None,
     });
 
+    // ---- response budget: its own `limit`, oldest-first, its own counter ----
+    //
+    // Response nodes are a second unbounded population. Riding the tool budget
+    // would make `omitted_tool_calls` count non-tools, so the same limit is
+    // applied to them independently and what it drops is reported separately.
+    // `messages` is already ordered by (ts, uuid), so `take` keeps the oldest.
+    let prose = messages.iter().filter(|m| m.preview.is_some());
+    let prose_total = prose.clone().count();
+    let omitted_responses = prose_total.saturating_sub(limit) as i64;
+
+    // Tool and response nodes are emitted in ONE merged, ts-ordered pass. They
+    // routinely share a `ts` (one assistant message emits prose and its calls
+    // at the same instant) and the frontend tie-breaks equal `ts` by server
+    // order, so the ordering must be deterministic here, not an artifact of
+    // which loop happened to push first: sort by (ts, kind_rank, id) with
+    // response = 0, tool = 1. Emitting all responses in a pass of their own
+    // would instead break `nodes`' documented "oldest first" for every reader.
+    struct Pending {
+        ts: i64,
+        rank: u8,
+        node: CcGraphNode,
+        edge: CcGraphEdge,
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+
     // ---- tool nodes, oldest first ----
     let mut kept_tools: HashSet<&str> = HashSet::new();
     for c in &tool_calls {
@@ -1468,7 +1499,7 @@ pub fn session_graph(
         } else {
             (CcGraphNodeKind::Tool, c.name.clone(), c.target.clone())
         };
-        nodes.push(CcGraphNode {
+        let node = CcGraphNode {
             id: format!("tool:{}", c.tool_use_id),
             kind,
             name,
@@ -1489,14 +1520,73 @@ pub fn session_graph(
             messages: 0,
             tool_calls: 0,
             caller: c.caller.clone(),
-        });
-        edges.push(CcGraphEdge {
+        };
+        let edge = CcGraphEdge {
             from: match c.agent_id.as_deref() {
                 Some(a) => format!("agent:{a}"),
                 None => "session".into(),
             },
             to: format!("tool:{}", c.tool_use_id),
+        };
+        pending.push(Pending {
+            ts: c.ts,
+            rank: 1,
+            node,
+            edge,
         });
+    }
+
+    // ---- response nodes: one per message that emitted prose ----
+    //
+    // A flat sibling of that message's tool nodes — same parent, never their
+    // parent — carrying the message's own usage, the same numbers those
+    // siblings carry. `tokens_are_rollup: false` is what says so; nothing here
+    // is summable and no aggregate changes.
+    for m in prose.take(limit) {
+        let issuing = by_uuid.get(m.uuid.as_str());
+        let node = CcGraphNode {
+            id: format!("msg:{}", m.uuid),
+            kind: CcGraphNodeKind::Response,
+            name: "Response".into(),
+            target: m.preview.clone(),
+            model: Some(m.model.clone()),
+            tokens: issuing
+                .map(|(_, t, _)| t.to_cc())
+                .unwrap_or_else(|| Tok::default().to_cc()),
+            total_tokens: issuing.map_or(0, |(_, t, _)| t.total()),
+            tokens_are_rollup: false,
+            est_cost_usd: round4(issuing.map_or(0.0, |(_, _, c)| *c)),
+            ts: Some(fmt_ts(m.ts)),
+            skill: None,
+            description: None,
+            spawn_depth: None,
+            messages: 0,
+            tool_calls: 0,
+            caller: None,
+        };
+        let edge = CcGraphEdge {
+            from: match m.agent_id.as_deref() {
+                Some(a) => format!("agent:{a}"),
+                None => "session".into(),
+            },
+            to: format!("msg:{}", m.uuid),
+        };
+        pending.push(Pending {
+            ts: m.ts,
+            rank: 0,
+            node,
+            edge,
+        });
+    }
+
+    pending.sort_by(|a, b| {
+        a.ts.cmp(&b.ts)
+            .then_with(|| a.rank.cmp(&b.rank))
+            .then_with(|| a.node.id.cmp(&b.node.id))
+    });
+    for p in pending {
+        nodes.push(p.node);
+        edges.push(p.edge);
     }
 
     // ---- agent nodes ----
@@ -1569,8 +1659,9 @@ pub fn session_graph(
         est_cost_usd: round4(cost),
         nodes,
         edges,
-        truncated: omitted > 0,
+        truncated: omitted > 0 || omitted_responses > 0,
         omitted_tool_calls: omitted,
+        omitted_responses,
     }))
 }
 
@@ -2794,6 +2885,93 @@ mod tests {
         // Non-tool kinds never carry one.
         assert_eq!(node("session").kind, CcGraphNodeKind::Session);
         assert_eq!(node("session").target, None);
+    }
+
+    #[test]
+    fn session_graph_emits_response_nodes_as_ordered_flat_siblings() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                // Prose + two tool calls in ONE message: all three nodes share
+                // the message's ts, which is the tie the ordering must break.
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"Reading the file."},{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/a"}},{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                // Prose only, later.
+                r#"{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-06-15T01:00:01.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                // Tool-use only: no prose, so no response node.
+                r#"{"type":"assistant","uuid":"u3","sessionId":"s1","timestamp":"2026-06-15T01:00:02.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu3","name":"Bash","input":{"command":"pwd"}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        let g = session_graph(&store, "s1", GRAPH_NODE_LIMIT)
+            .unwrap()
+            .unwrap();
+        let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        // Root first, then oldest-first — and at the equal ts of message u1 the
+        // response comes before the two tool nodes it issued.
+        assert_eq!(
+            ids,
+            vec![
+                "session", "msg:u1", "tool:tu1", "tool:tu2", "msg:u2", "tool:tu3",
+            ]
+        );
+
+        let r = g.nodes.iter().find(|n| n.id == "msg:u1").unwrap();
+        assert_eq!(r.kind, CcGraphNodeKind::Response);
+        assert_eq!(r.name, "Response");
+        assert_eq!(r.target.as_deref(), Some("Reading the file."));
+        assert_eq!(r.model.as_deref(), Some("claude-opus-4-8"));
+        // The issuing message's own usage — the same numbers its sibling tool
+        // nodes carry, so it must declare itself non-summable.
+        assert!(!r.tokens_are_rollup);
+        assert_eq!(r.total_tokens, 30);
+        assert_eq!(r.total_tokens, node_total(&g, "tool:tu1"));
+        // A prose-free message contributes no response node.
+        assert!(!ids.contains(&"msg:u3"));
+
+        // Flat sibling: same parent as the message's tool nodes, and never
+        // their parent.
+        let parent = |to: &str| {
+            g.edges
+                .iter()
+                .find(|e| e.to == to)
+                .map(|e| e.from.as_str())
+                .unwrap()
+        };
+        assert_eq!(parent("msg:u1"), "session");
+        assert_eq!(parent("tool:tu1"), "session");
+        assert_eq!(parent("tool:tu2"), "session");
+        assert!(!g.edges.iter().any(|e| e.from == "msg:u1"));
+
+        assert!(!g.truncated);
+        assert_eq!(g.omitted_responses, 0);
+
+        // The response budget is the tool budget's peer, not its tenant: with
+        // room for one node of each population, each counter reports only its
+        // own drops.
+        let g1 = session_graph(&store, "s1", 1).unwrap().unwrap();
+        let ids1: Vec<&str> = g1.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids1, vec!["session", "msg:u1", "tool:tu1"]);
+        assert!(g1.truncated);
+        assert_eq!(g1.omitted_responses, 1);
+        assert_eq!(g1.omitted_tool_calls, 2);
+    }
+
+    fn node_total(g: &CcSessionGraph, id: &str) -> i64 {
+        g.nodes.iter().find(|n| n.id == id).unwrap().total_tokens
     }
 
     #[test]

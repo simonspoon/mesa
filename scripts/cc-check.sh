@@ -225,6 +225,17 @@ EMPTY_PATH=$(cd "$EMPTY_DIR" && pwd -P)
 MISMATCH_ID=$("$BIN" project create "Mismatched proj" --no-git | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 "$BIN" project update "$MISMATCH_ID" --path "$EMPTY_PATH" >/dev/null
 
+# A session with prose: one message emitting a `text` block AND two tool_use
+# blocks (so all three nodes share the message's timestamp — the equal-ts tie
+# the response ordering has to break), plus a prose-free message. Added here,
+# after every whole-dashboard count above, so it perturbs none of them.
+mkdir -p "$TMP/tree/-prose-project"
+cat > "$TMP/tree/-prose-project/p.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"p1","sessionId":"p","timestamp":"2026-06-18T01:00:00.000Z","cwd":"/home/me/prose","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Reading the file.\nThen tests."},{"type":"tool_use","id":"pu_1","name":"Read","input":{"file_path":"/home/me/prose/a.rs"}},{"type":"tool_use","id":"pu_2","name":"Bash","input":{"command":"cargo test"}}]}}
+{"type":"assistant","uuid":"p2","sessionId":"p","timestamp":"2026-06-18T01:00:01.000Z","cwd":"/home/me/prose","message":{"model":"claude-opus-4-8","usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"pu_3","name":"Bash","input":{"command":"pwd"}}]}}
+JSONL
+"$BIN" cc sync >/dev/null || fail "cc sync did not ingest the prose transcript"
+
 # ---- cc graph: the session call tree (CLI half) ----
 #
 # Shape under test: session -> tool(Bash, toolu_1) -> agent(Explore, x1). The
@@ -286,6 +297,12 @@ assert t["model"]=="claude-opus-4-8" and t["caller"]=="skill:build", t
 # Whole-session total is the honest sum: both threads.
 assert g["total_tokens"]==380, g
 assert g["truncated"] is False and g["omitted_tool_calls"]==0, g
+# A prose-free session is byte-identical to before response nodes existed: the
+# same ids in the same order, no `msg:` node, and an honest zero counter.
+assert [n["id"] for n in g["nodes"]]==["session","tool:toolu_1","tool:toolu_2","tool:toolu_3",
+                                       "tool:toolu_4","agent:x1"], [n["id"] for n in g["nodes"]]
+assert not any(n["id"].startswith("msg:") for n in g["nodes"]), g["nodes"]
+assert g["omitted_responses"]==0, g
 print("cc graph: session -> tool -> agent tree ok")
 ' || fail "cc graph did not return the expected session call tree"
 
@@ -302,6 +319,71 @@ assert all(e["from"] in by and e["to"] in by for e in g["edges"]), g["edges"]
 assert g["truncated"] is True and g["omitted_tool_calls"]==3, g
 print("cc graph: --limit 0 keeps the spawning call ok")
 ' || fail "cc graph --limit dropped a structural node"
+
+# ---- cc graph: assistant response nodes (mesa task 605) ----
+"$BIN" cc graph p | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+ids=[n["id"] for n in g["nodes"]]
+by={n["id"]:n for n in g["nodes"]}
+assert len(ids)==len(by), ids
+# One response node per PROSE-BEARING message, in its own `msg:` id namespace —
+# disjoint from session/agent:/tool:, so nothing can collide with a tool_use_id.
+assert [i for i in ids if i.startswith("msg:")]==["msg:p1"], ids
+# p2 emitted only a tool_use, so it contributes a tool node and nothing else.
+assert "msg:p2" not in by and "tool:pu_3" in by, ids
+# Emission order: root first, then oldest-first, and at p1`s equal timestamp the
+# response comes BEFORE the two calls that message issued — the frontend
+# tie-breaks equal ts by this order, so it is the contract, not an accident.
+assert ids==["session","msg:p1","tool:pu_1","tool:pu_2","tool:pu_3"], ids
+
+r=by["msg:p1"]
+assert r["kind"]=="response" and r["name"]=="Response", r
+# The preview rides the existing `target` field, sanitized at ingest: the
+# newline in the fixture is one space, so this JSON can never span rows.
+assert r["target"]=="Reading the file. Then tests.", repr(r["target"])
+assert r["model"]=="claude-opus-4-8", r
+# The issuing message`s own usage — the same numbers its sibling tool nodes
+# carry — and it says so, so nothing here is summable and no total moved.
+assert r["tokens_are_rollup"] is False, r
+assert r["total_tokens"]==30 and by["tool:pu_1"]["total_tokens"]==30, (r,by["tool:pu_1"])
+assert r["messages"]==0 and r["tool_calls"]==0 and r["caller"] is None, r
+assert r["skill"] is None and r["description"] is None and r["spawn_depth"] is None, r
+assert g["total_tokens"]==40, g
+
+# Flat sibling: the response hangs off the same parent as the message`s tool
+# nodes and is never their parent.
+parents={e["to"]:e["from"] for e in g["edges"]}
+assert len(parents)==len(g["edges"]), g["edges"]
+assert parents=={"msg:p1":"session","tool:pu_1":"session","tool:pu_2":"session",
+                 "tool:pu_3":"session"}, parents
+assert not any(e["from"]=="msg:p1" for e in g["edges"]), g["edges"]
+assert g["truncated"] is False and g["omitted_responses"]==0, g
+print("cc graph: response nodes ok")
+' || fail "cc graph did not return the expected response nodes"
+
+# Responses are budgeted separately from tool calls: with room for one of each,
+# each counter reports only its own drops — omitted_tool_calls never counts a
+# non-tool, and no node vanishes uncounted.
+"$BIN" cc graph p --limit 1 | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+assert [n["id"] for n in g["nodes"]]==["session","msg:p1","tool:pu_1"], [n["id"] for n in g["nodes"]]
+assert g["truncated"] is True, g
+assert g["omitted_responses"]==0 and g["omitted_tool_calls"]==2, g
+print("cc graph: response budget is separate ok")
+' || fail "cc graph --limit did not budget responses separately"
+
+# A dropped response is still counted: omitted stays honest for both
+# populations, so a reader can tell a small graph from a truncated one.
+"$BIN" cc graph p --limit 0 | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+assert [n["id"] for n in g["nodes"]]==["session"], [n["id"] for n in g["nodes"]]
+assert g["truncated"] is True, g
+assert g["omitted_responses"]==1 and g["omitted_tool_calls"]==3, g
+print("cc graph: omitted responses counted ok")
+' || fail "cc graph --limit 0 did not count the dropped response"
 
 # Unknown session is not_found (exit 1), never an empty graph — an empty graph
 # is a real answer for a session that made no calls.
@@ -382,6 +464,20 @@ assert by["tool:toolu_3"]["name"]=="inaros-swe:refine", by["tool:toolu_3"]
 assert g["total_tokens"]==380, g
 print("api cc graph: payload matches the CLI ok")
 ' || fail "GET /api/cc/sessions/{id}/graph did not match the CLI payload"
+
+# The response node reaches HTTP identically — one `core` builder, two surfaces,
+# including the emission order the frontend`s equal-ts tie-break depends on.
+curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/p/graph" | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+assert [n["id"] for n in g["nodes"]]==["session","msg:p1","tool:pu_1","tool:pu_2","tool:pu_3"], g["nodes"]
+r=[n for n in g["nodes"] if n["id"]=="msg:p1"][0]
+assert r["kind"]=="response" and r["name"]=="Response", r
+assert r["target"]=="Reading the file. Then tests.", repr(r["target"])
+assert r["tokens_are_rollup"] is False and r["total_tokens"]==30, r
+assert g["omitted_responses"]==0, g
+print("api cc graph: response node ok")
+' || fail "GET /api/cc/sessions/{id}/graph did not carry the response node"
 
 STATUS=$(curl -s -o "$TMP/graph-404" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/no-such-session/graph")
 [ "$STATUS" = "404" ] || fail "api cc graph: unknown session expected 404, got $STATUS ($(cat "$TMP/graph-404"))"

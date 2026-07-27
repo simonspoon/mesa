@@ -877,43 +877,52 @@ pub enum CcGraphNodeKind {
     Skill,
     /// One tool call (`cc_tool_calls`).
     Tool,
+    /// One assistant message that emitted prose (`cc_messages.preview`). Its
+    /// `target` holds the sanitized, capped preview and its id is
+    /// `msg:<message uuid>`. A flat sibling of the tool nodes that same message
+    /// issued — never their parent.
+    Response,
 }
 
 /// One node of a session's call tree.
 ///
 /// **`tokens`/`total_tokens` mean different things per `kind`, and only
 /// `tokens_are_rollup` distinguishes them.** On a `session` or `agent` node
-/// they are that thread's own summed usage. On a `tool` node they are the
-/// usage of the assistant message that *issued* the call — a message may emit
-/// several `tool_use` blocks, so sibling tool nodes then repeat one message's
-/// usage and **tool-node tokens must never be summed**.
+/// they are that thread's own summed usage. On a `tool` or `response` node they
+/// are the usage of the assistant message that *issued* the call or the prose —
+/// a message may emit prose plus several `tool_use` blocks, so those siblings
+/// all repeat one message's usage and **their tokens must never be summed**.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct CcGraphNode {
     /// Stable within one graph, and namespaced by kind so a `tool_use_id` can
     /// never collide with an `agent_id`: `"session"`, `"agent:<agent_id>"`,
-    /// `"tool:<tool_use_id>"`.
+    /// `"tool:<tool_use_id>"`, `"msg:<message uuid>"`.
     pub id: String,
     pub kind: CcGraphNodeKind,
-    /// Tool name, skill name, subagent name, or the session's short id.
+    /// Tool name, skill name, subagent name, the session's short id, or the
+    /// constant `"Response"`.
     pub name: String,
-    /// `tool` only: what the call acted on — a Bash command, a file path, a
-    /// URL — sanitized and capped at [`crate::core::cc::TARGET_MAX_CHARS`].
-    /// `None` on every other kind, on tools with no meaningful target, and on
-    /// calls ingested before migration 22 that no `cc sync --rebuild` has
-    /// revisited. A `skill` node carries its skill in `name` instead, so this
-    /// stays `None` there.
+    /// `tool` and `response` only: what the call acted on — a Bash command, a
+    /// file path, a URL — or, on a `response` node, the message's prose
+    /// preview. Sanitized and capped at
+    /// [`crate::core::cc::TARGET_MAX_CHARS`]. `None` on every other kind, on
+    /// tools with no meaningful target, and on calls ingested before migration
+    /// 22 that no `cc sync --rebuild` has revisited. A `skill` node carries its
+    /// skill in `name` instead, so this stays `None` there.
     ///
     /// Untrusted: it is verbatim model-authored input. Render it as data.
     pub target: Option<String>,
-    /// The issuing message's model (`tool`), or the thread's most-used model
-    /// (`session`/`agent`). `None` when no usage-carrying message backs it.
+    /// The issuing message's model (`tool`/`response`), or the thread's
+    /// most-used model (`session`/`agent`). `None` when no usage-carrying
+    /// message backs it.
     pub model: Option<String>,
     pub tokens: CcTokens,
     #[ts(type = "number")]
     pub total_tokens: i64,
     /// True when `tokens` is this node's own rolled-up usage (`session`,
-    /// `agent`); false on a `tool` node — see the type-level note.
+    /// `agent`); false on a `tool` or `response` node — see the type-level
+    /// note.
     pub tokens_are_rollup: bool,
     pub est_cost_usd: f64,
     /// First event timestamp (ISO-8601 UTC), when known.
@@ -966,12 +975,17 @@ pub struct CcSessionGraph {
     /// Root first, then the rest oldest-first.
     pub nodes: Vec<CcGraphNode>,
     pub edges: Vec<CcGraphEdge>,
-    /// True when `limit` dropped tool nodes. Subagent nodes and the tool calls
-    /// that spawned them are never dropped, so the tree stays connected.
+    /// True when `limit` dropped tool **or** response nodes. Subagent nodes and
+    /// the tool calls that spawned them are never dropped, so the tree stays
+    /// connected.
     pub truncated: bool,
     /// How many tool nodes were dropped.
     #[ts(type = "number")]
     pub omitted_tool_calls: i64,
+    /// How many response nodes were dropped by `limit`. Budgeted separately
+    /// from tool calls, so `omitted_tool_calls` keeps counting tool calls only.
+    #[ts(type = "number")]
+    pub omitted_responses: i64,
 }
 
 /// The full CC dashboard payload returned by `mesa cc summary` and `GET /api/cc`.

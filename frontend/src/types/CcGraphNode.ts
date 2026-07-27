@@ -7,41 +7,45 @@ import type { CcTokens } from "./CcTokens";
  *
  * **`tokens`/`total_tokens` mean different things per `kind`, and only
  * `tokens_are_rollup` distinguishes them.** On a `session` or `agent` node
- * they are that thread's own summed usage. On a `tool` node they are the
- * usage of the assistant message that *issued* the call — a message may emit
- * several `tool_use` blocks, so sibling tool nodes then repeat one message's
- * usage and **tool-node tokens must never be summed**.
+ * they are that thread's own summed usage. On a `tool` or `response` node they
+ * are the usage of the assistant message that *issued* the call or the prose —
+ * a message may emit prose plus several `tool_use` blocks, so those siblings
+ * all repeat one message's usage and **their tokens must never be summed**.
  */
 export type CcGraphNode = { 
 /**
  * Stable within one graph, and namespaced by kind so a `tool_use_id` can
  * never collide with an `agent_id`: `"session"`, `"agent:<agent_id>"`,
- * `"tool:<tool_use_id>"`.
+ * `"tool:<tool_use_id>"`, `"msg:<message uuid>"`.
  */
 id: string, kind: CcGraphNodeKind, 
 /**
- * Tool name, skill name, subagent name, or the session's short id.
+ * Tool name, skill name, subagent name, the session's short id, or the
+ * constant `"Response"`.
  */
 name: string, 
 /**
- * `tool` only: what the call acted on — a Bash command, a file path, a
- * URL — sanitized and capped at [`crate::core::cc::TARGET_MAX_CHARS`].
- * `None` on every other kind, on tools with no meaningful target, and on
- * calls ingested before migration 22 that no `cc sync --rebuild` has
- * revisited. A `skill` node carries its skill in `name` instead, so this
- * stays `None` there.
+ * `tool` and `response` only: what the call acted on — a Bash command, a
+ * file path, a URL — or, on a `response` node, the message's prose
+ * preview. Sanitized and capped at
+ * [`crate::core::cc::TARGET_MAX_CHARS`]. `None` on every other kind, on
+ * tools with no meaningful target, and on calls ingested before migration
+ * 22 that no `cc sync --rebuild` has revisited. A `skill` node carries its
+ * skill in `name` instead, so this stays `None` there.
  *
  * Untrusted: it is verbatim model-authored input. Render it as data.
  */
 target: string | null, 
 /**
- * The issuing message's model (`tool`), or the thread's most-used model
- * (`session`/`agent`). `None` when no usage-carrying message backs it.
+ * The issuing message's model (`tool`/`response`), or the thread's
+ * most-used model (`session`/`agent`). `None` when no usage-carrying
+ * message backs it.
  */
 model: string | null, tokens: CcTokens, total_tokens: number, 
 /**
  * True when `tokens` is this node's own rolled-up usage (`session`,
- * `agent`); false on a `tool` node — see the type-level note.
+ * `agent`); false on a `tool` or `response` node — see the type-level
+ * note.
  */
 tokens_are_rollup: boolean, est_cost_usd: number, 
 /**

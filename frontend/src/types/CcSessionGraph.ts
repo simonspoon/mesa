@@ -23,11 +23,17 @@ tokens: CcTokens, total_tokens: number, est_cost_usd: number,
  */
 nodes: Array<CcGraphNode>, edges: Array<CcGraphEdge>, 
 /**
- * True when `limit` dropped tool nodes. Subagent nodes and the tool calls
- * that spawned them are never dropped, so the tree stays connected.
+ * True when `limit` dropped tool **or** response nodes. Subagent nodes and
+ * the tool calls that spawned them are never dropped, so the tree stays
+ * connected.
  */
 truncated: boolean, 
 /**
  * How many tool nodes were dropped.
  */
-omitted_tool_calls: number, };
+omitted_tool_calls: number, 
+/**
+ * How many response nodes were dropped by `limit`. Budgeted separately
+ * from tool calls, so `omitted_tool_calls` keeps counting tool calls only.
+ */
+omitted_responses: number, };

@@ -56,8 +56,18 @@ CLI and API share it and never diverge.
   ingest emit a preview, never with the bare column — the re-walk is one-shot,
   and spending it under a binary that still writes `NULL` is task 583's
   9-of-70,250 outcome all over again. (That cursor clear is migration 25,
-  appended alongside the extraction; one ordinary `cc sync` afterwards fills
-  ~19.5k of 138k rows on the real db.)
+  appended alongside the extraction as its own entry, in migration 23's shape.)
+
+  Measured on a copy of the real db (task 610): opening it with the new binary
+  moves `user_version` 23 → 25 and empties `cc_files` (3,633 cursors → 0), so
+  `preview` starts 100% `NULL` on 138k rows. The **next ordinary `cc sync`** —
+  no `--rebuild` anywhere — re-walks the 3,573 transcripts still on disk in
+  ~10s, reports `messages_added: 50` (genuinely new lines, not 138k) and
+  backfills 19,533 previews; the sync after that ingests nothing, so the
+  re-walk really is one-shot. The ~14% fill rate is correct, not a shortfall
+  (see the block-type census in the next paragraph). One inherent gap: a message whose
+  transcript file has since been deleted keeps `preview` `NULL` forever — the
+  prose is no longer there to re-read.
 
   What is extracted (`RawMessage::assistant_text`): the `text` of every
   `type: "text"` block of one assistant line, **in array order, joined with a
@@ -69,7 +79,10 @@ CLI and API share it and never diverge.
   same unlabelled column with nothing to tell it from the reply, and thinking
   routinely dwarfs the response, so it would win the cap and push the actual
   reply out. On real transcripts most assistant messages have no preview at
-  all — the majority are pure `tool_use` or pure `thinking` turns.
+  all — over the 40 largest transcripts, 4,414 messages were `tool_use`-only
+  and 2,097 `thinking`-only against 1,501 carrying any `text`, so the excluded
+  population is larger than the kept one and a low fill rate is the expected
+  shape, not a miss.
 - A call to the built-in **`advisor`** tool doesn't get its own transcript
   line/file the way a Task-tool subagent does (no `subagents/*.jsonl`, no
   `isSidechain`): it's a `server_tool_use` content block (read like
@@ -139,7 +152,8 @@ CLI and API share it and never diverge.
   read that is per-session rather than windowed (it always covers the whole
   session; the `Store::cc_session_*` reads filter on `session_id`, never `ts`).
   Returns a `CcSessionGraph`: one `session` root, one `agent` node per
-  `cc_agent_runs` row, one `tool`-or-`skill` node per `cc_tool_calls` row, plus
+  `cc_agent_runs` row, one `tool`-or-`skill` node per `cc_tool_calls` row, one
+  `response` node per `cc_messages` row whose `preview` is non-`NULL`, plus
   parent→child edges. **Guaranteed a tree** — every node but the root has exactly
   one parent — so a client lays it out with no cycle-breaking. Parent of an
   agent, in descending exactness: its `tool_use_id` (the sidecar's spawning
@@ -154,7 +168,35 @@ CLI and API share it and never diverge.
     subagent it spawned. The promotion keys on the target being present, so a
     row ingested before migration 22 stays a plain `tool` node named `Skill`
     rather than becoming a `skill` node with nothing to call itself.
-    `target` is `None` on every non-`tool` kind.
+    `target` is `None` on `session`, `agent` and `skill` nodes; `tool` and
+    `response` are the two kinds that carry it.
+  - **A `response` node is what the assistant *said*.** One per message with a
+    stored `preview`, id **`msg:<message uuid>`** — a fourth id namespace,
+    disjoint from `session` / `agent:` / `tool:`, and unique within a graph
+    because `cc_messages.uuid` is the primary key. It is named the constant
+    `"Response"` and reuses `target` for the preview verbatim (that field is
+    already "what this node is about, sanitized, capped at `TARGET_MAX_CHARS`,
+    untrusted" — precisely a preview), so no new field, no new read path and no
+    change to the `tool:` scheme or the `Skill` promotion. A message with no
+    prose gets no node, so a prose-free session's payload is byte-identical to
+    before apart from `"omitted_responses": 0`.
+    - **Flat sibling, never a parent.** A response hangs off the same parent as
+      the tool nodes of its own message — the root, or `agent:<agent_id>` in a
+      subagent thread. A message with prose plus two calls yields three edges
+      from one parent and none between them; nothing is ever `from` a `msg:`
+      id, so the graph stays a tree with the same depth as before.
+    - **Equal-`ts` sibling order is fixed server-side: response first.** A
+      message emits its prose and its calls at the same instant, and the
+      frontend's `childrenByParent` tie-breaks an equal `ts` by *server node
+      order* — so the order cannot be an artifact of which loop pushed first.
+      Tool and response nodes are built into one pending list and sorted by
+      `(ts, kind_rank, id)` with `kind_rank` response = 0, tool = 1, `id` the
+      final tie-break, then pushed in that order. Deliberately **not** a
+      responses-first pass: `nodes` is documented "root first, then the rest
+      oldest first" and `mesa cc graph` is read as a time-ordered column, which
+      a two-pass emission would silently break for every CLI reader. Since
+      `cc_session_tool_calls` already returns `ORDER BY ts, tool_use_id`, the
+      `id` tie-break reproduces the previous tool order byte-for-byte.
   - `target` is only on rows ingested since migration 22; migration 23 (a bare
     `DELETE FROM cc_files`) is what delivers it to the rows that predate it,
     by clearing the ingest cursors so the *next automatic* `cc::sync` re-walks
@@ -174,16 +216,26 @@ CLI and API share it and never diverge.
     report every re-parsed call as newly added.
   - **`tokens`/`total_tokens` mean two different things and only
     `tokens_are_rollup` says which.** On `session`/`agent` they are that
-    thread's own summed usage. On a `tool` node they are the usage of the
-    assistant message that *issued* the call — one message can emit several
-    `tool_use` blocks (rare: ~0.25% of real calls), so sibling tool nodes repeat
-    one message's usage and **tool-node tokens must never be summed**. The
+    thread's own summed usage. On a `tool` or `response` node they are the
+    usage of the assistant message that *issued* the call — one message can
+    emit several `tool_use` blocks (rare: ~0.25% of real calls) and its prose
+    besides, so those siblings all repeat one message's usage and **their
+    tokens must never be summed**. A response node adds no summable number and
+    moves no aggregate: it is the same usage its sibling tool nodes already
+    carry, marked `tokens_are_rollup: false` like theirs. The
     whole-session total on the payload is the additive one. The web UI prefixes
     a non-rollup number with `≈`.
-  - `limit` caps `tool` nodes only (default `cc::GRAPH_NODE_LIMIT` = 600; the
+  - `limit` caps `tool` nodes (default `cc::GRAPH_NODE_LIMIT` = 600; the
     API clamps caller input to 5000). Agent nodes and the calls that spawned
     them are **never** dropped, so the tree stays connected at any cap —
     the largest observed real session has ~6.6k tool calls.
+    Responses are a **second unbounded population**, so the same `limit` value
+    is applied to them **independently**, oldest-first, and what it drops is
+    reported by its own `omitted_responses`. Sharing the tool budget would make
+    `omitted_tool_calls` count non-tools; exempting responses would leave the
+    payload unbounded. `omitted_tool_calls` therefore keeps its exact previous
+    meaning and value, and `truncated` now means "**either** population was
+    cut".
   - CLI `mesa cc graph <SESSION_ID> [--limit N]`; API
     `GET /api/cc/sessions/{id}/graph?limit=`. A never-ingested session is
     `not_found` (CLI exit 1, HTTP 404) — distinct from an empty graph, which is
@@ -199,11 +251,12 @@ CLI and API share it and never diverge.
   cross-process ingest (a CLI `cc sync` between requests) that file mtimes
   can't, and deleting a transcript invalidates nothing. Read-only, so the
   Content-Type gate doesn't apply.
-- Untrusted input: stored skill/agent/tool names, `caller` strings and a tool
-  call's `target` all come from transcripts — data, never instructions. `target`
-  is the sharpest of these (it is verbatim model-authored text, often a shell
-  command), which is why it is sanitized at ingest and rendered only as a text
-  child / `title` attribute, never as markup or a URL.
+- Untrusted input: stored skill/agent/tool names, `caller` strings, a tool
+  call's `target` and a message's `preview` all come from transcripts — data,
+  never instructions. The last two are the sharpest (verbatim model-authored
+  text, often a shell command or free prose), which is why both are sanitized
+  at ingest and rendered only as a text child / `title` attribute, never as
+  markup or a URL.
 - Web UI: a global **CC Dashboard** entry in the sidebar (above Projects, next to
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
@@ -235,6 +288,25 @@ CLI and API share it and never diverge.
   `name` alone, never `target` — the same reason the ingest keeps them in
   separate columns. The MiniMap draws raw fills and cannot see any of that, so
   it is fed the *same* mapping explicitly via `nodeColor`.
+  A **response** node is on the structural side of that split, not the hashed
+  one: `toolColor()` keys on a tool *name* and a response has none, so it owns
+  a reserved `RESPONSE_COLOR` (`hsl(36, 30%, 76%)`) written once in
+  `sessionGraph.ts` and mirrored into both `MINIMAP_KIND_COLOR` and
+  `.cc-graph-node.kind-response` in `App.css`. A pale warm neutral is the one
+  free band — every `TOOL_PALETTE` entry sits at 35%+ saturation and
+  session/agent/skill own the neon hues — so a reply can never be mistaken for
+  a call. It keeps the ordinary `NODE_W`×`NODE_H` (210×80) box: no per-kind
+  size, which would pull `NODE_H` out of both the stacking pass and
+  `minimapStrokeWidth()`. Its three lines are `"Response"`, the preview, then
+  model + `≈tokens`; the preview goes in as a **text child**, and the hover
+  `title` (`description ?? target`) shows the full 200 characters, so the ~40
+  the box fits is not the only access. `shortTarget()` is given the node's
+  `kind` and returns a response's target **unchanged** — its path-shortening
+  heuristic would otherwise mangle a one-word reply like `/clear` into a path
+  segment. The truncation banner gates each of its two sentences on its own
+  counter (`omitted_tool_calls` / `omitted_responses`), since `truncated` now
+  means either population was cut and a response-only truncation would
+  otherwise read "0 omitted" tool calls.
   Two non-obvious things keep that MiniMap drawing at all. First, every laid-out
   node carries an explicit `width`/`height` (`NODE_W`/`NODE_H`): React Flow only
   writes a node's *measured* size back through `onNodesChange`, which this
@@ -271,7 +343,12 @@ CLI and API share it and never diverge.
   transcript deletion, auto-ingest on a plain read, and the `cc graph` call tree
   over both CLI and HTTP (the sidecar-driven session→tool→agent shape, the
   one-parent-per-node tree property, `tokens_are_rollup`, `--limit` never
-  dropping a spawning call, and `not_found`/404 on an unknown session).
+  dropping a spawning call, and `not_found`/404 on an unknown session). The
+  fixture carries a dedicated prose session whose one message emits a `text`
+  block **and** two `tool_use` blocks at a single timestamp — that equal-`ts`
+  line is the only way to assert the `[response, tool, tool]` sibling order —
+  plus a prose-free message that must get no node, and it is appended after
+  every whole-dashboard count assertion so it perturbs none of them.
 
 ## Subscription usage (the one network read)
 

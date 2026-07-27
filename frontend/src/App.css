@@ -4214,11 +4214,25 @@ button:focus-visible,
   color: var(--amber);
 }
 
-/* Same viewport box as the storyboard canvas and the project tabs, so the
-   graph shrinks with the phone keyboard for free (--tab-viewport-* is
-   re-pointed at the visual viewport inside the phone block). */
+/* Standalone page, not a project tab: it fills `main` and lets the canvas take
+   whatever the header/note leave, instead of the --tab-viewport-* box (which
+   subtracts 18rem of project-tab chrome this page does not have, and stranded
+   ~170px below the canvas). `main` has a definite height (`#root` is
+   viewport-locked, index.css), so `height: 100%` resolves — and on a phone
+   `#root` tracks `--phone-shell-height` (the VISUAL viewport), so the graph
+   still shrinks with the on-screen keyboard for free. */
+.cc-graph-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+/* `flex: 1` on the column's main axis — a `height` here would be inert
+   (a definite flex-basis wins), so the fill is expressed as flex, not height.
+   `min-height` still works as a floor on that axis. */
 .cc-graph-canvas {
-  height: var(--tab-viewport-height);
+  flex: 1;
   min-height: var(--tab-viewport-min);
   border: 1px solid var(--border);
   background: var(--panel);

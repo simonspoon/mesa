@@ -41,6 +41,21 @@ CLI and API share it and never diverge.
   A tool whose input has no listed key (`advisor`'s `{}`, `StructuredOutput`'s
   caller-defined payload) simply gets `NULL`, as does one whose input failed
   upstream parsing (`{"__unparsedToolInput": …}`) or is not an object at all.
+- **An assistant message's own prose is kept only as a bounded preview** —
+  `cc_messages.preview` (migration 24, nullable), the second derived `cc_*`
+  column and the one deliberate relaxation of "bulk keys are never stored".
+  `NULL` means the message emitted no prose, which is also how every row
+  ingested before the column existed reads, so no reader has to distinguish
+  "no prose" from "not extracted yet". It carries the same three properties
+  `target` does — bounded by characters, sanitized at ingest, its own column —
+  and the same two-part upgrade path: a row that predates the column is filled
+  by a separate guarded `UPDATE … WHERE uuid = ?1 AND preview IS NULL` rather
+  than a `DO UPDATE` arm, so a re-walk of an already-ingested db reports the
+  handful of genuinely new rows instead of a fake 138k-row import; and the
+  cursor clear that *delivers* that re-walk ships with the change that makes
+  ingest emit a preview, never with the bare column — the re-walk is one-shot,
+  and spending it under a binary that still writes `NULL` is task 583's
+  9-of-70,250 outcome all over again.
 - A call to the built-in **`advisor`** tool doesn't get its own transcript
   line/file the way a Task-tool subagent does (no `subagents/*.jsonl`, no
   `isSidechain`): it's a `server_tool_use` content block (read like

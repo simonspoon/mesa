@@ -289,6 +289,26 @@ const MIGRATIONS: &[&str] = &[
     // `cc sync --rebuild` does by hand. Cheap and one-shot (~9s over 3.5k
     // transcripts) and additive-only — `cc_files` holds cursors, not data.
     "DELETE FROM cc_files;",
+    // A bounded preview of the assistant prose that message emitted — the one
+    // part of a transcript mesa otherwise never stores (`content[]` text blocks
+    // are read for tool_use and discarded). Nullable and NULL-means-no-prose:
+    // a tool-use-only message, an event whose text sanitizes to empty, and
+    // every row ingested before this migration all read the same way, so no
+    // reader needs to distinguish "not extracted yet" from "no prose".
+    // Sanitizing and capping happen at ingest (`core::cc`), never at display —
+    // this is untrusted model-authored text, and the column stores it
+    // already-bounded.
+    //
+    // The matching `DELETE FROM cc_files;` — the cursor clear that makes the
+    // next ORDINARY sync re-walk and fill this column on rows that predate it,
+    // exactly as migration 23 did for `cc_tool_calls.target` — is deliberately
+    // NOT here. It belongs to the change that makes ingest actually *emit* a
+    // preview (task 607). The re-walk is one-shot: spent under a binary that
+    // still writes `preview: None`, it would advance every cursor again and the
+    // guarded `preview IS NULL` backfill below would never get a second chance
+    // — task 583's 9-of-70,250 outcome, reproduced. 606 and 607 therefore ship
+    // as ONE binary; releasing this migration alone is the bug.
+    "ALTER TABLE cc_messages ADD COLUMN preview TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -823,6 +843,11 @@ pub struct CcMessageRow {
     pub cache_creation_tokens: i64,
     pub skill: Option<String>,
     pub agent: Option<String>,
+    /// A bounded preview of the prose this message emitted, already sanitized
+    /// and character-capped by the ingest layer. `None` = the message carried
+    /// no prose (tool-use only, or text that sanitized to empty), which is
+    /// also how every row ingested before migration 24 reads.
+    pub preview: Option<String>,
 }
 
 /// One tool_use block. Keyed by `tool_use_id`; re-inserting is a no-op.
@@ -2623,12 +2648,24 @@ impl Store {
             let mut msg = tx.prepare(
                 "INSERT INTO cc_messages \
                      (uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
-                      cache_read_tokens, cache_creation_tokens, skill, agent) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                      cache_read_tokens, cache_creation_tokens, skill, agent, preview) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(uuid) DO NOTHING",
             )?;
+            // `preview` arrived after these rows did (migration 24), so it needs
+            // the same treatment `cc_tool_calls.target` gets below: a separate
+            // guarded UPDATE, deliberately NOT folded into a `DO UPDATE` arm.
+            // `DO UPDATE` reports one changed row per conflict, which would
+            // count every re-ingested message as newly added and turn a
+            // cursor-cleared re-walk into a fake full-table import. Guarding on
+            // `preview IS NULL` keeps `messages_added` meaning "rows inserted"
+            // and preserves keep-first for an already-stored value.
+            let mut msg_backfill = tx.prepare(
+                "UPDATE cc_messages SET preview = ?2 \
+                 WHERE uuid = ?1 AND preview IS NULL",
+            )?;
             for m in &batch.messages {
-                counts.messages_added += msg.execute((
+                let added = msg.execute((
                     &m.uuid,
                     &m.session_id,
                     &m.agent_id,
@@ -2640,7 +2677,12 @@ impl Store {
                     m.cache_creation_tokens,
                     &m.skill,
                     &m.agent,
+                    &m.preview,
                 ))? as i64;
+                counts.messages_added += added;
+                if added == 0 && m.preview.is_some() {
+                    msg_backfill.execute((&m.uuid, &m.preview))?;
+                }
             }
 
             let mut call = tx.prepare(
@@ -2721,7 +2763,7 @@ impl Store {
     pub fn cc_read_messages(&self, cutoff: Option<i64>) -> Result<Vec<CcMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
-                    cache_read_tokens, cache_creation_tokens, skill, agent \
+                    cache_read_tokens, cache_creation_tokens, skill, agent, preview \
              FROM cc_messages WHERE ?1 IS NULL OR ts >= ?1",
         )?;
         let rows = stmt.query_map([cutoff], |r| {
@@ -2737,6 +2779,7 @@ impl Store {
                 cache_creation_tokens: r.get(8)?,
                 skill: r.get(9)?,
                 agent: r.get(10)?,
+                preview: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2795,7 +2838,7 @@ impl Store {
     pub fn cc_session_messages(&self, session_id: &str) -> Result<Vec<CcMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
-                    cache_read_tokens, cache_creation_tokens, skill, agent \
+                    cache_read_tokens, cache_creation_tokens, skill, agent, preview \
              FROM cc_messages WHERE session_id = ?1 ORDER BY ts, uuid",
         )?;
         let rows = stmt.query_map([session_id], |r| {
@@ -2811,6 +2854,7 @@ impl Store {
                 cache_creation_tokens: r.get(8)?,
                 skill: r.get(9)?,
                 agent: r.get(10)?,
+                preview: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -4747,16 +4791,32 @@ mod tests {
         // predated it: ingest skips a transcript whose `cc_files` cursor
         // still matches, so those rows stay `NULL` forever and the session
         // graph renders bare `Bash` nodes and zero skill nodes. The last
-        // migration clears the cursors so the next `cc::sync` re-walks once.
+        // Migration 23 clears the cursors so the next `cc::sync` re-walks once.
+        //
+        // Pinned to 23 by index, NOT `MIGRATIONS.len() - 1`. The positional
+        // form silently re-aimed at whatever shipped last, so it only kept
+        // testing this behaviour while the newest migration happened to be a
+        // cursor clear — the moment task 606 appended a plain `ALTER TABLE`
+        // it started asserting that an unrelated migration clears cursors,
+        // and failed. The subject is migration 23 specifically.
+        //
+        // Index 22, not 23: prose elsewhere numbers migrations by the
+        // `user_version` they leave behind (1-based), the array is 0-based.
+        const CURSOR_RESET: usize = 22;
+        assert_eq!(
+            MIGRATIONS[CURSOR_RESET].trim(),
+            "DELETE FROM cc_files;",
+            "migration {CURSOR_RESET} is no longer the cursor reset — a shipped \
+             migration was edited or reordered, which is never allowed"
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre.db");
-        let last = MIGRATIONS.len() - 1;
         {
             let conn = Connection::open(&path).unwrap();
-            for sql in &MIGRATIONS[..last] {
+            for sql in &MIGRATIONS[..CURSOR_RESET] {
                 conn.execute_batch(sql).unwrap();
             }
-            conn.pragma_update(None, "user_version", last as i64)
+            conn.pragma_update(None, "user_version", CURSOR_RESET as i64)
                 .unwrap();
             conn.execute(
                 "INSERT INTO cc_files (path, mtime, size, byte_offset) \
@@ -5707,6 +5767,7 @@ mod tests {
                     cache_creation_tokens: 40,
                     skill: Some("orchestrate".into()),
                     agent: None,
+                    preview: Some("Reading the store.".into()),
                 },
                 CcMessageRow {
                     uuid: "uuid-2".into(),
@@ -5720,6 +5781,8 @@ mod tests {
                     cache_creation_tokens: 4,
                     skill: None,
                     agent: Some("Explore".into()),
+                    // A tool-use-only message: no prose, so no preview.
+                    preview: None,
                 },
             ],
             tool_calls: vec![CcToolCallRow {
@@ -6028,6 +6091,78 @@ mod tests {
             .cc_ingest_file("/t/a.jsonl", &cursor, &row(Some("rm -rf /")))
             .unwrap();
         assert_eq!(target(&store).as_deref(), Some("cargo test"));
+    }
+
+    // Same contract as the `target` test above, for the `preview` column added
+    // by migration 24. Kept as its own test rather than folded in: they cover
+    // two independent statements in `cc_ingest_file`, and a regression in one
+    // must not be masked by the other.
+    #[test]
+    fn cc_message_preview_backfills_without_inflating_the_add_count() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 1,
+            size: 1,
+            byte_offset: 1,
+        };
+        let row = |preview: Option<&str>| CcFileBatch {
+            messages: vec![CcMessageRow {
+                uuid: "u1".into(),
+                session_id: "s".into(),
+                agent_id: None,
+                ts: 10,
+                model: "claude-fable-5".into(),
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_tokens: 3,
+                cache_creation_tokens: 4,
+                skill: None,
+                agent: None,
+                preview: preview.map(str::to_string),
+            }],
+            ..Default::default()
+        };
+        let preview = |s: &Store| -> Option<String> {
+            s.conn
+                .query_row(
+                    "SELECT preview FROM cc_messages WHERE uuid = 'u1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // Ingested before migration 24 existed: the row lands with no preview.
+        let first = store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &row(None))
+            .unwrap();
+        assert_eq!(first.messages_added, 1);
+        assert_eq!(preview(&store), None);
+
+        // Re-walked after the migration cleared the cursors, now carrying
+        // prose: the gap fills, and the row is NOT re-counted as added — the
+        // whole reason this is a guarded UPDATE and not a `DO UPDATE` arm.
+        let second = store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &row(Some("Let me check that.")))
+            .unwrap();
+        assert_eq!(second.messages_added, 0);
+        assert_eq!(preview(&store).as_deref(), Some("Let me check that."));
+        assert_eq!(cc_count(&store, "cc_messages"), 1);
+
+        // Keep-first: a stored preview is never overwritten by a later parse.
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &row(Some("something else")))
+            .unwrap();
+        assert_eq!(preview(&store).as_deref(), Some("Let me check that."));
+
+        // And the round-trip reader surfaces it, so the column is not
+        // write-only for the graph story that consumes it next.
+        assert_eq!(
+            store.cc_session_messages("s").unwrap()[0]
+                .preview
+                .as_deref(),
+            Some("Let me check that.")
+        );
     }
 
     #[test]

@@ -815,6 +815,9 @@ fn fold_line(
             cache_creation_tokens: usage.cache_creation_input_tokens,
             skill: raw.attribution_skill.clone(),
             agent: raw.attribution_agent.clone(),
+            // Extraction of the `content[]` text blocks lands in the next
+            // story; the column and its backfill path exist first.
+            preview: None,
         });
         // An advisor call's own model turn is nested inside this event's
         // usage.iterations rather than being its own transcript line (unlike
@@ -844,6 +847,9 @@ fn fold_line(
                 cache_creation_tokens: it.cache_creation_input_tokens,
                 skill: raw.attribution_skill.clone(),
                 agent: Some("advisor".to_string()),
+                // A synthesized row for a nested advisor turn — it has no
+                // `content[]` of its own to preview.
+                preview: None,
             });
         }
     }

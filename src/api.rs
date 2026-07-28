@@ -4585,6 +4585,74 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
     }
 
     #[test]
+    fn todo_watcher_tick_never_dispatches_backlog_tasks() {
+        // `backlog` is the agent-side opt-out an orchestrating agent relies on
+        // (mesa task 613, `docs/todo-watcher.md`): tasks it authored and
+        // intends to dispatch itself must not be picked up by the watcher in
+        // the window between creation and dispatch. Both picks
+        // (`next_task` and, under an umbrella, `next_subtask`) filter on
+        // `status = 'todo'`, so this holds on both paths -- and the watcher is
+        // the only place that contract is observable end to end.
+        //
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+
+        // Idle project whose only work is backlog: nothing to dispatch.
+        let shelved = new_task(&state, project);
+        set_status(&state, shelved, Status::Backlog);
+
+        todo_watcher_tick(&state);
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.is_empty(),
+            "a backlog task must never be auto-dispatched: {log:?}"
+        );
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(shelved), Status::Backlog, "and must not be claimed");
+
+        // Same on the umbrella path: an agent holding a parent in_progress and
+        // creating its children as backlog keeps its own subtree to itself.
+        let parent = new_task(&state, project);
+        let child = new_subtask(&state, project, parent, "child");
+        set_status(&state, child, Status::Backlog);
+        set_status(&state, parent, Status::InProgress);
+
+        todo_watcher_tick(&state);
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.is_empty(),
+            "a backlog subtask must not be dispatched under an open umbrella: {log:?}"
+        );
+        assert_eq!(get(child), Status::Backlog);
+
+        // The opt-out is the status and nothing else: releasing the child to
+        // `todo` dispatches it on the very next tick.
+        set_status(&state, child, Status::Todo);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains(&format!("/execute-mesa-task {child}")),
+            "a released child must dispatch normally: {log:?}"
+        );
+        assert_eq!(get(child), Status::InProgress);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
     fn todo_watcher_tick_never_dispatches_a_task_with_actionable_subtasks() {
         // The umbrella rule's other half: if the watcher itself claimed a
         // *todo* epic, that epic would read as an umbrella on the very next

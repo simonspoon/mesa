@@ -71,13 +71,28 @@ because someone ran `mesa serve`.
     task into an umbrella, so the next tick dispatches the new child
     alongside whoever holds the parent. That is the feature the ticket asked
     for; it is only surprising if the parent was a leaf when its agent
-    started.
+    started. An agent that means to orchestrate its own children takes the
+    `backlog` opt-out below rather than racing the tick.
   - Regressions: `api::tests::todo_watcher_tick_dispatches_subtask_under_in_progress_parent`
     (whole lifecycle: first child dispatched, siblings and unrelated tasks
     wait, exhausted subtree does not fall back, closing the umbrella resumes
     whole-backlog dispatch) plus
     `core::store::tests::next_subtask_scopes_to_descendants_shares_next_task_rules`,
     and the same lifecycle end-to-end in `scripts/todo-watcher-check.sh`.
+- **`backlog` is the agent-side opt-out, and the only one** (mesa task 613).
+  Both picks filter `status = 'todo'`, so a `backlog` task is invisible to the
+  watcher on either path — an agent that authors tasks it intends to dispatch
+  itself (a planner writing stories, any agent creating subtasks mid-run)
+  creates them `--status backlog` and flips each to `in_progress` at the
+  moment it hands the work out. Left as `todo`, they are simply unclaimed
+  work in a project the watcher serves, and it will dispatch one within a
+  tick — correctly, by its own rule. Note what does *not* help: a `claim`
+  does not gate dispatch (`next_task` only ever returns `todo` rows, so the
+  claim is already invisible to it), and `updated_at` freshness is not
+  consulted at all. Regression:
+  `api::tests::todo_watcher_tick_never_dispatches_backlog_tasks` (both picks,
+  plus release-to-`todo` dispatching normally, so the opt-out is proven to be
+  the status and nothing else).
 - If `spawn_bg` fails (the `claude` CLI missing or erroring), the claimed
   task is reverted back to `todo` so the project isn't wedged — an
   unrecoverable spawn must not silently stop that project from ever being

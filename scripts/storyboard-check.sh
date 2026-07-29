@@ -301,4 +301,236 @@ run 2 "$MESA" storyboard frame update "$DECIDE" --shape process
 [ "$(jqe .error.code)" = "usage" ] || fail "--shape on frame update: error.code"
 ok "frame update --shape: exit 2, code=usage (no such flag; immutable)"
 
+# ---- --quiet on the storyboard/frame/edge group (spec 644) ----
+# Self-contained: its own project, created and deleted here. Quiet output is
+# compared through files written with `printf '%s'`, never `echo "$var"` —
+# echo expands escapes and corrupts JSON carrying \n in a description/body.
+#
+# The contract under test: --quiet drops ONLY the unbounded free text
+# (Storyboard.description, Frame.body; a FrameEdge has none, so quiet == full),
+# and the {storyboard, frames, edges} / {frame, edges} composites keep their
+# container keys while compacting their members.
+
+# minus_ok <label> <full-file> <quiet-file> <key...> — the quiet record must be
+# EXACTLY the full record minus the named keys: every other key present AND
+# byte-equal. With no keys, quiet must equal full outright.
+minus_ok() {
+  local label=$1 full=$2 q=$3; shift 3
+  local filter="." k
+  for k in "$@"; do filter="$filter | del(.$k)"; done
+  jq -e --slurpfile q "$q" "$filter == \$q[0]" "$full" >/dev/null ||
+    fail "$label: quiet output must be the full record minus [$*]"
+}
+
+# capture <file> — write the last run's stdout verbatim.
+capture() { printf '%s' "$STDOUT" >"$1"; }
+
+run 0 "$MESA" project create "Quiet board project" --no-git
+QP=$(jqs .id)
+
+QBODY="line one
+line two"
+
+# ---- storyboard create ----
+run 0 "$MESA" storyboard create "$QP" "Quiet board" --description "$QBODY" --author agent-q
+QSB=$(jqs .id)
+[ "$(jqs 'has("description")')" = "true" ] ||
+  fail "storyboard create (no --quiet): description must be present"
+
+run 0 "$MESA" storyboard create "$QP" "Quiet board 2" --description "$QBODY" --quiet
+QSB2=$(jqs .id)
+[ "$(jqs 'has("description")')" = "false" ] ||
+  fail "storyboard create --quiet: description must be dropped"
+capture "$TMP/sb2-quiet.json"
+# parity against the same record read back in full (a read, so nothing moves)
+run 0 "$MESA" storyboard show "$QSB2"
+capture "$TMP/sb2-view.json"
+jq '.storyboard' "$TMP/sb2-view.json" >"$TMP/sb2-full.json"
+minus_ok "storyboard create --quiet" "$TMP/sb2-full.json" "$TMP/sb2-quiet.json" description
+ok "storyboard create --quiet: description dropped, every other key present and equal"
+
+run 0 "$MESA" storyboard delete "$QSB2"
+
+# frames + edges on the main board so the composites are non-empty
+run 0 "$MESA" storyboard frame create "$QSB" "Quiet frame A" --body "$QBODY"
+QF1=$(jqs .id)
+[ "$(jqs 'has("body")')" = "true" ] || fail "frame create (no --quiet): body must be present"
+
+run 0 "$MESA" storyboard frame create "$QSB" "Quiet frame B" --body "$QBODY" --x 400 --quiet
+QF2=$(jqs .id)
+[ "$(jqs 'has("body")')" = "false" ] || fail "frame create --quiet: body must be dropped"
+[ "$(jqs .title)" = "Quiet frame B" ] || fail "frame create --quiet: title"
+capture "$TMP/f2-quiet.json"
+
+run 0 "$MESA" storyboard edge create "$QSB" "$QF1" "$QF2" --label then
+QE1=$(jqs .id)
+
+# ---- storyboard show: composite keys identical, members compacted (M7) ----
+run 0 "$MESA" storyboard show "$QSB"
+capture "$TMP/view-full.json"
+run 0 "$MESA" storyboard show "$QSB" --quiet
+capture "$TMP/view-quiet.json"
+jq -e --slurpfile q "$TMP/view-quiet.json" '
+  (keys == ($q[0] | keys))
+  and ((.storyboard | del(.description)) == $q[0].storyboard)
+  and ((.frames | map(del(.body))) == $q[0].frames)
+  and (.edges == $q[0].edges)
+' "$TMP/view-full.json" >/dev/null ||
+  fail "storyboard show --quiet: same keys, members = full minus description/body"
+[ "$(jqs '.storyboard | has("description")')" = "false" ] ||
+  fail "storyboard show --quiet: storyboard.description must be dropped"
+[ "$(jqs 'any(.frames[]; has("body"))')" = "false" ] ||
+  fail "storyboard show --quiet: frame bodies must be dropped"
+[ "$(jqs '.frames | length')" = "2" ] || fail "storyboard show --quiet: 2 frames"
+[ "$(jqs '.edges | length')" = "1" ] || fail "storyboard show --quiet: 1 edge"
+ok "storyboard show --quiet: {storyboard, frames, edges} keys unchanged, members compacted"
+
+# ---- frame create/update --quiet parity against the board view ----
+jq --argjson id "$QF2" '.frames[] | select(.id == $id)' "$TMP/view-full.json" \
+  >"$TMP/f2-full.json"
+minus_ok "frame create --quiet" "$TMP/f2-full.json" "$TMP/f2-quiet.json" body
+
+run 0 "$MESA" storyboard frame update "$QF1" --x 120 --y 90 --quiet
+[ "$(jqs 'has("body")')" = "false" ] || fail "frame update --quiet: body must be dropped"
+[ "$(jqs '.x == 120')" = "true" ] || fail "frame update --quiet: x moved"
+capture "$TMP/f1-upd-quiet.json"
+run 0 "$MESA" storyboard show "$QSB"
+capture "$TMP/view-after.json"
+jq --argjson id "$QF1" '.frames[] | select(.id == $id)' "$TMP/view-after.json" \
+  >"$TMP/f1-upd-full.json"
+minus_ok "frame update --quiet" "$TMP/f1-upd-full.json" "$TMP/f1-upd-quiet.json" body
+ok "frame create/update --quiet: body dropped, every other key present and equal"
+
+# ---- edges: no unbounded field, so --quiet output EQUALS full output ----
+run 0 "$MESA" storyboard edge update "$QE1" --label "next"
+capture "$TMP/e1-upd-full.json"
+run 0 "$MESA" storyboard edge update "$QE1" --label "next" --quiet
+capture "$TMP/e1-upd-quiet.json"
+cmp -s "$TMP/e1-upd-full.json" "$TMP/e1-upd-quiet.json" ||
+  fail "edge update --quiet: stdout must be byte-identical to the non-quiet form"
+minus_ok "edge update --quiet" "$TMP/e1-upd-full.json" "$TMP/e1-upd-quiet.json"
+[ "$(jqs .label)" = "next" ] || fail "edge update --quiet: label"
+ok "edge update --quiet: byte-identical to the full output (an edge has no free text)"
+
+run 0 "$MESA" storyboard edge create "$QSB" "$QF2" "$QF1" --quiet
+QE2=$(jqs .id)
+[ "$(jqs .from_frame)" = "$QF2" ] || fail "edge create --quiet: from_frame"
+[ "$(jqs 'has("label")')" = "true" ] || fail "edge create --quiet: full edge still echoed"
+run 0 "$MESA" storyboard edge delete "$QE2" --quiet
+[ "$(jqs .id)" = "$QE2" ] || fail "edge delete --quiet: echoes the destroyed edge"
+[ "$(jqs 'has("to_frame")')" = "true" ] || fail "edge delete --quiet: full edge still echoed"
+ok "edge create/delete --quiet: accepted, full record still echoed"
+
+# ---- frame delete composite: {frame, edges} keys kept, frame body dropped ----
+run 0 "$MESA" storyboard frame create "$QSB" "Doomed full" --body "$QBODY"
+QFD1=$(jqs .id)
+run 0 "$MESA" storyboard edge create "$QSB" "$QF1" "$QFD1"
+run 0 "$MESA" storyboard frame delete "$QFD1"
+capture "$TMP/fdel-full.json"
+[ "$(jqs '.frame | has("body")')" = "true" ] ||
+  fail "frame delete (no --quiet): frame.body must be present"
+[ "$(jqs '.edges | length')" = "1" ] || fail "frame delete: cascaded edge echoed"
+
+run 0 "$MESA" storyboard frame create "$QSB" "Doomed quiet" --body "$QBODY"
+QFD2=$(jqs .id)
+run 0 "$MESA" storyboard edge create "$QSB" "$QF1" "$QFD2"
+run 0 "$MESA" storyboard frame delete "$QFD2" --quiet
+capture "$TMP/fdel-quiet.json"
+# the two deletes destroy different frames, so ids differ — compare key SETS:
+# the container keys and the echoed edge must be identical, and the frame must
+# differ by exactly `body`.
+jq -e --slurpfile q "$TMP/fdel-quiet.json" '
+  (keys == ($q[0] | keys))
+  and ((.frame | keys) - ["body"] == ($q[0].frame | keys))
+  and ((.edges[0] | keys) == ($q[0].edges[0] | keys))
+' "$TMP/fdel-full.json" >/dev/null ||
+  fail "frame delete --quiet: {frame, edges} keys kept, frame minus body, edges full"
+[ "$(jqs '.frame | has("body")')" = "false" ] ||
+  fail "frame delete --quiet: frame.body must be dropped"
+[ "$(jqs '.frame.id')" = "$QFD2" ] || fail "frame delete --quiet: frame echoed"
+[ "$(jqs '.edges | length')" = "1" ] || fail "frame delete --quiet: cascaded edge echoed"
+ok "frame delete --quiet: {frame, edges} keys kept, frame body dropped, edges full"
+
+# ---- storyboard update / delete ----
+run 0 "$MESA" storyboard update "$QSB" --title "Quiet board v2" --quiet
+[ "$(jqs 'has("description")')" = "false" ] ||
+  fail "storyboard update --quiet: description must be dropped"
+[ "$(jqs .title)" = "Quiet board v2" ] || fail "storyboard update --quiet: title"
+capture "$TMP/sb-upd-quiet.json"
+run 0 "$MESA" storyboard show "$QSB"
+capture "$TMP/view-upd.json"
+jq '.storyboard' "$TMP/view-upd.json" >"$TMP/sb-upd-full.json"
+minus_ok "storyboard update --quiet" "$TMP/sb-upd-full.json" "$TMP/sb-upd-quiet.json" description
+
+# delete echoes the destroyed view; --quiet waives the full recovery transcript
+run 0 "$MESA" storyboard delete "$QSB" --quiet
+capture "$TMP/sbdel-quiet.json"
+jq -e --slurpfile q "$TMP/sbdel-quiet.json" 'keys == ($q[0] | keys)' \
+  "$TMP/view-upd.json" >/dev/null ||
+  fail "storyboard delete --quiet: container keys must stay {storyboard, frames, edges}"
+[ "$(jqs '.storyboard.id')" = "$QSB" ] || fail "storyboard delete --quiet: storyboard echoed"
+[ "$(jqs '.storyboard | has("description")')" = "false" ] ||
+  fail "storyboard delete --quiet: description must be dropped"
+[ "$(jqs 'any(.frames[]; has("body"))')" = "false" ] ||
+  fail "storyboard delete --quiet: frame bodies must be dropped"
+ok "storyboard update/delete --quiet: compact members, container keys unchanged"
+
+# ---- flag surface (M2/M3) ----
+run 0 "$MESA" storyboard create "$QP" "Surface board"
+SSB=$(jqs .id)
+run 0 "$MESA" storyboard frame create "$SSB" "Surface frame A"
+SF1=$(jqs .id)
+run 0 "$MESA" storyboard frame create "$SSB" "Surface frame B" --x 400
+SF2=$(jqs .id)
+run 0 "$MESA" storyboard edge create "$SSB" "$SF1" "$SF2"
+SE=$(jqs .id)
+
+# --quiet is a modifier, not a field: alone on an update it must be a loud usage
+# error, so a batch caller fails on item one instead of silently no-opping.
+for TARGET in "storyboard update $SSB" "storyboard frame update $SF1" \
+  "storyboard edge update $SE"; do
+  # shellcheck disable=SC2086
+  run 2 "$MESA" $TARGET --quiet
+  [ -z "$STDOUT" ] || fail "$TARGET --quiet alone: stdout must be empty"
+  [ "$(jqe .error.code)" = "usage" ] || fail "$TARGET --quiet alone: code=usage"
+done
+ok "storyboard/frame/edge update --quiet with no field flag: exit 2, code=usage"
+
+run 2 "$MESA" storyboard show "$SSB" -q
+ok "storyboard show -q: exit 2 (long form only, no short alias)"
+
+run 2 "$MESA" storyboard list --quiet
+run 2 "$MESA" storyboard events "$SSB" --quiet
+ok "storyboard list/events --quiet: exit 2 (unknown argument; out of scope)"
+
+# all 10 in-scope subcommands advertise the flag
+while read -r SUB; do
+  # shellcheck disable=SC2086
+  run 0 "$MESA" $SUB --help
+  grep -q -- "--quiet" <<<"$STDOUT" || fail "mesa $SUB --help: must list --quiet"
+done <<'SUBS'
+storyboard create
+storyboard show
+storyboard update
+storyboard delete
+storyboard frame create
+storyboard frame update
+storyboard frame delete
+storyboard edge create
+storyboard edge update
+storyboard edge delete
+SUBS
+ok "all 10 storyboard/frame/edge subcommands list --quiet in --help"
+
+# --quiet changes stdout only: exit code and stderr payload are untouched
+run 1 "$MESA" storyboard show 9999
+printf '%s' "$STDERR" >"$TMP/err-full.txt"
+run 1 "$MESA" storyboard show 9999 --quiet
+printf '%s' "$STDERR" >"$TMP/err-quiet.txt"
+cmp -s "$TMP/err-full.txt" "$TMP/err-quiet.txt" ||
+  fail "storyboard show --quiet: stderr must be byte-identical on the error path"
+ok "error path: exit 1 and byte-identical stderr with and without --quiet"
+
+run 0 "$MESA" project delete "$QP"
+
 echo "all $CHECKS checks passed"

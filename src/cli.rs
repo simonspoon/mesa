@@ -16,8 +16,9 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    DiagramType, EdgePatch, Error, FrameNew, FramePatch, FrameShape, ImportDoc, NextResult,
-    Priority, ProjectPatch, Result, Status, Store, StoryboardPatch, Task, TaskPatch,
+    DiagramType, EdgePatch, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
+    NextResult, Priority, ProjectPatch, Result, Status, Store, Storyboard, StoryboardPatch,
+    StoryboardView, Task, TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -860,6 +861,9 @@ EXAMPLES
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Print the storyboard without its `description` instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// List storyboards as a bare JSON array (no frames/edges; use `show`)
     List {
@@ -875,6 +879,10 @@ EXAMPLES
     Show {
         /// Storyboard id
         id: i64,
+        /// Keep the {storyboard, frames, edges} keys but drop each member's
+        /// free text (the storyboard's `description`, every frame's `body`)
+        #[arg(long)]
+        quiet: bool,
     },
     /// Update a storyboard's title/description; prints the full storyboard
     ///
@@ -893,6 +901,14 @@ EXAMPLES
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Print the storyboard without its `description` instead of the full
+        /// object
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Delete a storyboard AND all its frames and edges (no confirmation)
     ///
@@ -902,6 +918,12 @@ EXAMPLES
     Delete {
         /// Storyboard id
         id: i64,
+        /// Echo the destroyed view with each member's free text dropped
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Print a storyboard's change history as a JSON array, oldest first
     ///
@@ -976,6 +998,9 @@ EXAMPLES
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Print the frame without its `body` instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// Update a frame; prints the full updated frame
     ///
@@ -1020,6 +1045,13 @@ EXAMPLES
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Print the frame without its `body` instead of the full object
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Delete a frame AND the edges touching it (no confirmation)
     ///
@@ -1031,6 +1063,12 @@ EXAMPLES
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Echo the destroyed {frame, edges} with the frame's `body` dropped
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -1069,6 +1107,10 @@ EXAMPLES
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Accepted for uniformity with the rest of the group; an edge has no
+        /// unbounded field, so the output is the same either way
+        #[arg(long)]
+        quiet: bool,
     },
     /// Update an edge's label; prints the full updated edge
     ///
@@ -1084,6 +1126,14 @@ EXAMPLES
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Accepted for uniformity with the rest of the group; an edge has no
+        /// unbounded field, so the output is the same either way
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Delete an edge; echoes the destroyed edge
     Delete {
@@ -1092,6 +1142,10 @@ EXAMPLES
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Accepted for uniformity with the rest of the group; an edge has no
+        /// unbounded field, so the output is the same either way
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -1291,24 +1345,20 @@ fn print_tasks(tasks: &[Task], quiet: bool) {
 #[allow(dead_code)]
 const QUIET_DROP_PROJECT: &[&str] = &["description"];
 /// Keys dropped from a `Storyboard` under `--quiet`.
-#[allow(dead_code)]
 const QUIET_DROP_STORYBOARD: &[&str] = &["description"];
 /// Keys dropped from a `Frame` under `--quiet`.
-#[allow(dead_code)]
 const QUIET_DROP_FRAME: &[&str] = &["body"];
 /// Keys dropped from an `InboxItem` under `--quiet`.
 #[allow(dead_code)]
 const QUIET_DROP_INBOX_ITEM: &[&str] = &["body"];
 /// A `FrameEdge` has no unbounded field: quiet output equals full output.
 /// The flag is still accepted on edge subcommands, for uniformity.
-#[allow(dead_code)]
 const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
 
 /// Quiet projection of one record: the serialized record minus `drop`ped keys.
 ///
 /// `Task` does NOT go through here — its quiet shape is the existing
 /// [`compact`], the same bounded object `task list` already emits.
-#[allow(dead_code)] // call sites land with the per-subcommand `--quiet` wiring
 fn quiet(value: &impl serde::Serialize, drop: &[&str]) -> serde_json::Value {
     let mut value = serde_json::to_value(value).expect("json serialize");
     if let Some(obj) = value.as_object_mut() {
@@ -1317,6 +1367,61 @@ fn quiet(value: &impl serde::Serialize, drop: &[&str]) -> serde_json::Value {
         }
     }
     value
+}
+
+/// Print one record, applying its quiet projection under `--quiet`.
+///
+/// An EMPTY `drop` list means the record has no unbounded field (a
+/// `FrameEdge`): print the record itself rather than round-tripping it through
+/// [`quiet`], so its `--quiet` output is byte-identical to the default and not
+/// merely key-equal. A `serde_json::Value` re-serializes its keys in
+/// alphabetical order, while a struct serializes in declaration order.
+fn print_record<T: serde::Serialize>(record: &T, is_quiet: bool, drop: &[&str]) {
+    if is_quiet && !drop.is_empty() {
+        print_json(&quiet(record, drop));
+    } else {
+        print_json(record);
+    }
+}
+
+/// Print one storyboard: the full record, or the record minus `description`.
+fn print_storyboard(storyboard: &Storyboard, is_quiet: bool) {
+    print_record(storyboard, is_quiet, QUIET_DROP_STORYBOARD);
+}
+
+/// Print one frame: the full record, or the record minus `body`.
+fn print_frame(frame: &Frame, is_quiet: bool) {
+    print_record(frame, is_quiet, QUIET_DROP_FRAME);
+}
+
+/// Print one edge. A `FrameEdge` has no unbounded field, so the quiet shape IS
+/// the full record; the flag is accepted for uniformity across the group.
+fn print_edge(edge: &FrameEdge, is_quiet: bool) {
+    print_record(edge, is_quiet, QUIET_DROP_FRAME_EDGE);
+}
+
+/// Print a `{storyboard, frames, edges}` view (`storyboard show`/`delete`).
+///
+/// Under `--quiet` the container KEY SET is unchanged — only the members are
+/// projected, so a client's `jq 'keys'` is identical either way. (Member and
+/// container key ORDER is alphabetical under `--quiet`, as for any
+/// `serde_json::Value`; JSON object order is not semantically meaningful and
+/// the default, non-quiet output is untouched.)
+fn print_storyboard_view(view: &StoryboardView, is_quiet: bool) {
+    if is_quiet {
+        print_json(&json!({
+            "storyboard": quiet(&view.storyboard, QUIET_DROP_STORYBOARD),
+            "frames": quiet_all(&view.frames, QUIET_DROP_FRAME),
+            "edges": quiet_all(&view.edges, QUIET_DROP_FRAME_EDGE),
+        }));
+    } else {
+        print_json(view);
+    }
+}
+
+/// Quiet projection of a slice of records, member by member.
+fn quiet_all(values: &[impl serde::Serialize], drop: &[&str]) -> Vec<serde_json::Value> {
+    values.iter().map(|v| quiet(v, drop)).collect()
 }
 
 fn print_json<T: serde::Serialize>(value: &T) {
@@ -1718,14 +1823,18 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             description,
             diagram_type,
             author,
-        } => print_json(&store.create_storyboard(
-            // clap guarantees exactly one of each positional/flag pair.
-            resolve_project(&store, &project.or(project_pos).unwrap())?,
-            &title.or(title_pos).unwrap(),
-            description.as_deref(),
-            author.as_deref(),
-            diagram_type,
-        )?),
+            quiet,
+        } => print_storyboard(
+            &store.create_storyboard(
+                // clap guarantees exactly one of each positional/flag pair.
+                resolve_project(&store, &project.or(project_pos).unwrap())?,
+                &title.or(title_pos).unwrap(),
+                description.as_deref(),
+                author.as_deref(),
+                diagram_type,
+            )?,
+            quiet,
+        ),
         StoryboardCmd::List {
             project_pos,
             project,
@@ -1733,20 +1842,28 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             let project = project.or(project_pos);
             print_json(&store.list_storyboards(resolve_project_opt(&store, project.as_deref())?)?)
         }
-        StoryboardCmd::Show { id } => print_json(&store.get_storyboard_view(id)?),
+        StoryboardCmd::Show { id, quiet } => {
+            print_storyboard_view(&store.get_storyboard_view(id)?, quiet)
+        }
         StoryboardCmd::Update {
             id,
             title,
             description,
             author,
+            quiet,
         } => {
             let patch = StoryboardPatch {
                 title,
                 description: description.map(clear_if_empty),
             };
-            print_json(&store.update_storyboard(id, &patch, author.as_deref())?);
+            print_storyboard(
+                &store.update_storyboard(id, &patch, author.as_deref())?,
+                quiet,
+            );
         }
-        StoryboardCmd::Delete { id } => print_json(&store.delete_storyboard(id)?),
+        StoryboardCmd::Delete { id, quiet } => {
+            print_storyboard_view(&store.delete_storyboard(id)?, quiet)
+        }
         StoryboardCmd::Events { id } => print_json(&store.list_storyboard_events(id)?),
         StoryboardCmd::Frame(cmd) => run_frame(&mut store, cmd)?,
         StoryboardCmd::Edge(cmd) => run_edge(&mut store, cmd)?,
@@ -1770,6 +1887,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
             task,
             shape,
             author,
+            quiet,
         } => {
             // clap guarantees exactly one of each positional/flag pair.
             let storyboard = storyboard.or(storyboard_pos).unwrap();
@@ -1785,7 +1903,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
                 author,
                 shape,
             };
-            print_json(&store.create_frame(storyboard, &new)?);
+            print_frame(&store.create_frame(storyboard, &new)?, quiet);
         }
         FrameCmd::Update {
             id,
@@ -1799,6 +1917,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
             task,
             no_task,
             author,
+            quiet,
         } => {
             let patch = FramePatch {
                 title,
@@ -1810,11 +1929,23 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
                 color: color.map(clear_if_empty),
                 task_id: if no_task { Some(None) } else { task.map(Some) },
             };
-            print_json(&store.update_frame(id, &patch, author.as_deref())?);
+            print_frame(&store.update_frame(id, &patch, author.as_deref())?, quiet);
         }
-        FrameCmd::Delete { id, author } => {
+        FrameCmd::Delete {
+            id,
+            author,
+            quiet: is_quiet,
+        } => {
             let (frame, edges) = store.delete_frame(id, author.as_deref())?;
-            print_json(&json!({"frame": frame, "edges": edges}));
+            // The container keys stay identical; only the members are projected.
+            if is_quiet {
+                print_json(&json!({
+                    "frame": quiet(&frame, QUIET_DROP_FRAME),
+                    "edges": quiet_all(&edges, QUIET_DROP_FRAME_EDGE),
+                }));
+            } else {
+                print_json(&json!({"frame": frame, "edges": edges}));
+            }
         }
     }
     Ok(())
@@ -1831,24 +1962,35 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
             to,
             label,
             author,
-        } => print_json(&store.create_edge(
-            // clap guarantees exactly one of each positional/flag pair.
-            storyboard.or(storyboard_pos).unwrap(),
-            from.or(from_pos).unwrap(),
-            to.or(to_pos).unwrap(),
-            label.as_deref(),
-            author.as_deref(),
-        )?),
-        EdgeCmd::Update { id, label, author } => {
+            quiet,
+        } => print_edge(
+            &store.create_edge(
+                // clap guarantees exactly one of each positional/flag pair.
+                storyboard.or(storyboard_pos).unwrap(),
+                from.or(from_pos).unwrap(),
+                to.or(to_pos).unwrap(),
+                label.as_deref(),
+                author.as_deref(),
+            )?,
+            quiet,
+        ),
+        EdgeCmd::Update {
+            id,
+            label,
+            author,
+            quiet,
+        } => {
             let patch = EdgePatch {
                 label: label.map(clear_if_empty),
                 waypoints: None,
                 from_anchor: None,
                 to_anchor: None,
             };
-            print_json(&store.update_edge(id, &patch, author.as_deref())?);
+            print_edge(&store.update_edge(id, &patch, author.as_deref())?, quiet);
         }
-        EdgeCmd::Delete { id, author } => print_json(&store.delete_edge(id, author.as_deref())?),
+        EdgeCmd::Delete { id, author, quiet } => {
+            print_edge(&store.delete_edge(id, author.as_deref())?, quiet)
+        }
     }
     Ok(())
 }

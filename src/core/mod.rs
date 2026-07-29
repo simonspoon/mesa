@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod attachments;
 pub mod cc;
+pub mod config;
 pub mod files;
 pub mod git;
 pub mod hooks;

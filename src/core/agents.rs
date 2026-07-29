@@ -8,11 +8,18 @@
 
 use std::process::{Command, Stdio};
 
+use crate::core::config;
 use crate::core::types::AgentSession;
 
 /// The `claude` binary to drive; `MESA_CLAUDE_BIN` overrides it for tests
 /// (pointing at a stub), mirroring `MESA_CC_*` in cc.rs/usage.rs. Public so
 /// the API's attach bridge spawns the same binary.
+///
+/// This feeds `{bin}` in the spawn command templates
+/// ([`crate::core::config`]) — which the built-in defaults use, so the env
+/// seam keeps working untouched. A user template that hardcodes a program
+/// name instead has simply opted out of it; the attach bridge, which starts
+/// no session, always uses this.
 pub fn claude_bin() -> String {
     std::env::var("MESA_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
@@ -28,6 +35,10 @@ const DEFAULT_CLAUDE_AGENT: &str = "swe";
 /// name is a hard startup failure in the claude CLI, not a warning).
 /// Read-only sessions (`claude agents --json`) and the attach bridge don't
 /// start a session, so neither takes this flag.
+///
+/// This feeds `{agent}` in the spawn command templates; empty ⇒ unavailable
+/// ⇒ the default templates' `--agent {agent}` pair drops out
+/// ([`crate::core::config::expand`]).
 pub fn claude_agent() -> Option<String> {
     match std::env::var("MESA_CLAUDE_AGENT") {
         Ok(v) if v.trim().is_empty() => None,
@@ -94,15 +105,54 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("unexpected claude agents payload: {e}"))
 }
 
-/// Starts a detached background session (`claude --bg`) in `dir` and returns
-/// its short job id. `prompt` is optional — without one the session starts
-/// idle, ready for the first message over an attach. `name`, if given, is
-/// passed as `claude`'s `-n/--name` (shown in the prompt box, `/resume`
-/// picker, and terminal title) — the todo-watcher uses this so an
-/// auto-dispatched session is identifiable at a glance instead of showing up
-/// generically. The session runs under [`claude_agent`]'s persona unless that
-/// is disabled. `claude --bg` prints a human receipt, not JSON; the id is
-/// parsed from its "backgrounded · <id>" line.
+/// Resolves the argv for one spawn `action` (`config::TODO_WATCHER`,
+/// `INBOX_WATCHER` or `AGENT_SPAWN`): the user's `~/.mesa/config.json`
+/// template if it configures that action, else the built-in default. Both go
+/// through the same expander, so a missing config file yields exactly the argv
+/// mesa hardcoded before the file existed. `{bin}`/`{agent}` are filled here,
+/// from the env seams, rather than by callers.
+fn argv_for(
+    action: &str,
+    id: Option<i64>,
+    name: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let configured = config::command_for(action)?;
+    let template = match &configured {
+        Some(t) => t.as_str(),
+        None => config::default_command(action)
+            .ok_or_else(|| format!("no default command for {action}"))?,
+    };
+    let bin = claude_bin();
+    let agent = claude_agent();
+    config::expand(
+        action,
+        template,
+        &config::Vars {
+            bin: Some(&bin),
+            agent: agent.as_deref(),
+            id,
+            name,
+            prompt,
+        },
+    )
+}
+
+/// Starts a detached background session in `dir` and returns its short job id,
+/// running the command [`argv_for`] resolves for `action` — by default
+/// `claude --bg …`, or whatever `~/.mesa/config.json` puts there.
+///
+/// `id`/`name` (the watchers) and `prompt` (the Agents surface) are the values
+/// that action's placeholders may use; what the command *does* with them —
+/// which slash command, whether to name the session at all — belongs to the
+/// template, not to this function.
+///
+/// The id is `None` when the command exits 0 without printing a
+/// `backgrounded · <id>` receipt: a replacement command is not obliged to
+/// speak `claude`'s receipt format, and the session it started is real either
+/// way (the Agents sidebar discovers it through `claude agents --json`). Only
+/// a nonzero exit is an error. Without an id, mesa can't pre-open an attach
+/// pane for that session — the one thing the receipt buys.
 ///
 /// **Stub authors:** `Command::output()` below waits for stdout/stderr EOF,
 /// not for the child to exit — so a stub `claude` whose `--bg` branch leaves
@@ -113,43 +163,35 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
 /// (mesa task 468: a 30s stub child → a 30.3s `output()`; measured against
 /// the real CLI, `--bg` returns in ~1.0s idle and ~1.0s with a prompt,
 /// because it detaches its stdio). Keep stub `--bg` branches fork-free.
-pub fn spawn_bg(dir: &str, prompt: Option<&str>, name: Option<&str>) -> Result<String, String> {
-    spawn_bg_with(&claude_bin(), claude_agent().as_deref(), dir, prompt, name)
+pub fn spawn_bg(
+    action: &str,
+    dir: &str,
+    id: Option<i64>,
+    name: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<Option<String>, String> {
+    spawn_argv(&argv_for(action, id, name, prompt)?, dir)
 }
 
-/// `agent` is threaded in rather than read from the env here for the same
-/// reason `bin` is: tests pin both without mutating process-global state.
-fn spawn_bg_with(
-    bin: &str,
-    agent: Option<&str>,
-    dir: &str,
-    prompt: Option<&str>,
-    name: Option<&str>,
-) -> Result<String, String> {
-    let mut cmd = Command::new(bin);
-    cmd.arg("--bg").current_dir(dir).stdin(Stdio::null());
-    if let Some(agent) = agent {
-        cmd.arg("--agent").arg(agent);
-    }
-    if let Some(name) = name {
-        cmd.arg("--name").arg(name);
-    }
-    if let Some(prompt) = prompt {
-        // `--` ends option parsing so a prompt beginning with `-` (a markdown
-        // bullet, or a token like `--resume`) is taken as prompt text, not
-        // parsed by claude's CLI as a flag.
-        cmd.arg("--").arg(prompt);
-    }
-    let out = cmd
+/// The argv is threaded in rather than resolved here so tests pin a whole
+/// command line without mutating process-global env state.
+fn spawn_argv(argv: &[String], dir: &str) -> Result<Option<String>, String> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "empty spawn command".to_string())?;
+    let out = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("failed to run claude: {e}"))?;
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "claude --bg failed: {}",
+            "{program} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    parse_spawn(&String::from_utf8_lossy(&out.stdout))
+    Ok(parse_spawn(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Extracts the job id from `claude --bg` output. Observed forms:
@@ -157,16 +199,15 @@ fn spawn_bg_with(
 /// `backgrounded · cf0c3945 · my-name`. The real `claude` CLI colorizes this
 /// line (unlike the plain-text test stub), so ANSI escapes are stripped
 /// first — otherwise the id token comes out wrapped in escape bytes.
-fn parse_spawn(stdout: &str) -> Result<String, String> {
+///
+/// `None` (not an error) when no such line is present — see [`spawn_bg`].
+fn parse_spawn(stdout: &str) -> Option<String> {
     let clean = strip_ansi(stdout);
-    clean
-        .lines()
-        .find_map(|line| {
-            let rest = line.trim().strip_prefix("backgrounded · ")?;
-            let id = rest.split_whitespace().next()?;
-            (!id.is_empty()).then(|| id.to_string())
-        })
-        .ok_or_else(|| format!("no job id in claude --bg output: {stdout:?}"))
+    clean.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("backgrounded · ")?;
+        let id = rest.split_whitespace().next()?;
+        (!id.is_empty()).then(|| id.to_string())
+    })
 }
 
 /// Strips ANSI CSI escape sequences (`ESC '[' <params> <final byte>`, e.g.
@@ -273,7 +314,17 @@ mod tests {
         assert_eq!(parse_spawn(idle).unwrap(), "e34b8ed9");
         let named = "backgrounded · cf0c3945 · test-bg\n";
         assert_eq!(parse_spawn(named).unwrap(), "cf0c3945");
-        assert!(parse_spawn("no receipt here").is_err());
+        // No receipt is not a failure — a configured replacement command owes
+        // mesa nothing on stdout.
+        assert_eq!(parse_spawn("no receipt here"), None);
+    }
+
+    #[test]
+    fn parse_spawn_ignores_a_receipt_like_prefix() {
+        // Guards the lenient path: "no id" must mean no id, not a truncated
+        // one lifted out of an unrelated line.
+        assert_eq!(parse_spawn("backgrounded ·\n"), None);
+        assert_eq!(parse_spawn("not backgrounded · abc\n"), None);
     }
 
     #[test]
@@ -334,6 +385,30 @@ JSON"#,
         assert_eq!(filtered, vec!["aaaaaaaa", "bbbbbbbb"]);
     }
 
+    /// Expands one action's *default* template the way `spawn_bg` would, with
+    /// `bin`/`agent` pinned instead of read from the env.
+    fn default_argv(
+        action: &str,
+        bin: &str,
+        agent: Option<&str>,
+        id: Option<i64>,
+        name: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Vec<String> {
+        config::expand(
+            action,
+            config::default_command(action).unwrap(),
+            &config::Vars {
+                bin: Some(bin),
+                agent,
+                id,
+                name,
+                prompt,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn spawn_bg_runs_in_dir_and_parses_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -341,8 +416,22 @@ JSON"#,
             dir.path(),
             r#"[ "$1" = "--bg" ] || exit 1; echo "backgrounded · deadbeef (idle — send a prompt to start)""#,
         );
-        let id = spawn_bg_with(&bin, None, dir.path().to_str().unwrap(), None, None).unwrap();
-        assert_eq!(id, "deadbeef");
+        let argv = default_argv(config::AGENT_SPAWN, &bin, None, None, None, None);
+        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(id.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn spawn_bg_tolerates_a_command_with_no_receipt() {
+        // A replacement command that starts a session its own way still
+        // succeeds; only its exit code is load-bearing.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_claude(dir.path(), r#"echo "started, no receipt for you""#);
+        let argv = vec![bin.clone()];
+        assert_eq!(spawn_argv(&argv, dir.path().to_str().unwrap()), Ok(None));
+        let failing = stub_claude(dir.path(), r#"echo "nope" >&2; exit 4"#);
+        let err = spawn_argv(&[failing], dir.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[test]
@@ -353,19 +442,93 @@ JSON"#,
         let bin = stub_claude(
             dir.path(),
             r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] &&
-              [ "$4" = "--name" ] && [ "$5" = "n" ] && [ "$6" = "--" ] && [ "$7" = "go" ] ||
+              [ "$4" = "--name" ] && [ "$5" = "n" ] && [ "$6" = "--" ] &&
+              [ "$7" = "/execute-mesa-task 9" ] ||
               { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · 5we00000 · n""#,
         );
-        let id = spawn_bg_with(
+        let argv = default_argv(
+            config::TODO_WATCHER,
             &bin,
             Some("swe"),
-            dir.path().to_str().unwrap(),
-            Some("go"),
+            Some(9),
             Some("n"),
+            None,
+        );
+        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(id.as_deref(), Some("5we00000"));
+    }
+
+    #[test]
+    fn spawn_bg_runs_a_configured_command_instead_of_claude() {
+        // The end-to-end seam: a config file with its own template, expanded
+        // and executed. `{bin}`/`{agent}` are deliberately unused here — a
+        // replacement command names its own program.
+        let _guard = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let tool = stub_claude(
+            dir.path(),
+            &format!(r#"printf '%s\n' "$@" > "{}""#, log.display()),
+        );
+        let config_file = dir.path().join("config.json");
+        std::fs::write(
+            &config_file,
+            serde_json::json!({
+                "commands": {
+                    "todo-watcher": format!("{tool} dispatch --task {{id}} --label {{name}}"),
+                }
+            })
+            .to_string(),
         )
         .unwrap();
-        assert_eq!(id, "5we00000");
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", &config_file) };
+        let spawned = spawn_bg(
+            config::TODO_WATCHER,
+            dir.path().to_str().unwrap(),
+            Some(42),
+            Some("mesa: a title with spaces"),
+            None,
+        );
+        // Untouched actions still fall through to the built-in default.
+        let fallback = argv_for(config::INBOX_WATCHER, Some(7), Some("n"), None).unwrap();
+        unsafe { std::env::remove_var("MESA_CONFIG_FILE") };
+        assert_eq!(spawned, Ok(None));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "dispatch\n--task\n42\n--label\nmesa: a title with spaces\n"
+        );
+        assert!(
+            fallback.iter().any(|a| a == "/inbox-triage 7"),
+            "{fallback:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_bg_surfaces_a_broken_config_before_running_anything() {
+        let _guard = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config.json");
+        std::fs::write(&config_file, "{ not json").unwrap();
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", &config_file) };
+        let broken = argv_for(config::TODO_WATCHER, Some(1), Some("n"), None);
+        std::fs::write(
+            &config_file,
+            r#"{"commands": {"todo-watcher": "tool {oops}"}}"#,
+        )
+        .unwrap();
+        let bad_placeholder = argv_for(config::TODO_WATCHER, Some(1), Some("n"), None);
+        unsafe { std::env::remove_var("MESA_CONFIG_FILE") };
+        assert!(
+            broken.unwrap_err().contains("malformed mesa config"),
+            "a broken config must not read as unconfigured"
+        );
+        let err = bad_placeholder.unwrap_err();
+        assert!(err.contains("{oops}"), "{err}");
     }
 
     #[test]
@@ -397,15 +560,16 @@ echo "backgrounded · 5we00000 · n""#,
 echo "backgrounded · abc00000"
 echo "prompt was: $3" >&2"#,
         );
-        let id = spawn_bg_with(
+        let argv = default_argv(
+            config::AGENT_SPAWN,
             &bin,
             None,
-            dir.path().to_str().unwrap(),
-            Some("--resume"),
             None,
-        )
-        .unwrap();
-        assert_eq!(id, "abc00000");
+            None,
+            Some("--resume"),
+        );
+        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(id.as_deref(), Some("abc00000"));
     }
 
     #[test]
@@ -417,15 +581,16 @@ echo "prompt was: $3" >&2"#,
               { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · cf0c3945 · proj: do the thing""#,
         );
-        let id = spawn_bg_with(
+        let argv = default_argv(
+            config::TODO_WATCHER,
             &bin,
             None,
-            dir.path().to_str().unwrap(),
-            Some("/execute-mesa-task 1"),
+            Some(1),
             Some("proj: do the thing"),
-        )
-        .unwrap();
-        assert_eq!(id, "cf0c3945");
+            None,
+        );
+        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(id.as_deref(), Some("cf0c3945"));
     }
 
     #[test]

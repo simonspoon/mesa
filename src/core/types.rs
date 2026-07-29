@@ -292,10 +292,16 @@ pub struct ProjectGitLog {
 
 /// Receipt for a newly started background session: the short job id usable
 /// with `claude attach/logs/stop` and the attach WebSocket.
+///
+/// `null` when the spawn command printed no `backgrounded · <id>` receipt —
+/// possible since the command is user-configurable (`core::config`), and not
+/// an error: the session started, mesa just can't pre-open an attach pane for
+/// it. Clients must treat a null id as "created, discover it in the session
+/// list", never as a failure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct AgentSpawned {
-    pub id: String,
+    pub id: Option<String>,
 }
 
 /// The captured outcome of one hook command run (see `core::hooks`). A

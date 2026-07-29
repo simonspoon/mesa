@@ -931,8 +931,11 @@ export function AgentSidebar({
       (spawned) => {
         // The newly started agent is real either way, so always insert its
         // pane — but only touch the form's own state if this is still the
-        // request that owns it.
-        setRoot((r) => addPane(r, spawned.id))
+        // request that owns it. A null id means the configured spawn command
+        // printed no job-id receipt: the session exists and the next poll
+        // lists it, there is just nothing to attach a pane to yet.
+        const spawnedId = spawned.id
+        if (spawnedId !== null) setRoot((r) => addPane(r, spawnedId))
         refetch()
         if (addRequestId.current !== requestId) return
         setAdding(false)

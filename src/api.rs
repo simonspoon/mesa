@@ -40,8 +40,8 @@ use crate::core::{
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, NextResult, Priority, ProjectAgents,
     ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store,
-    StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, files, git,
-    hooks,
+    StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files,
+    git, hooks,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -288,8 +288,16 @@ fn inbox_watcher_tick(state: &AppState) {
     };
 
     for (id, session_name) in pending {
-        let prompt = format!("/inbox-triage {id}");
-        if let Err(e) = agents::spawn_bg(&home, Some(&prompt), Some(&session_name)) {
+        // The command — including which slash command triages an item — comes
+        // from `~/.mesa/config.json`'s `inbox-watcher` entry, defaulting to
+        // `claude --bg … -- /inbox-triage <id>`.
+        if let Err(e) = agents::spawn_bg(
+            config::INBOX_WATCHER,
+            &home,
+            Some(id),
+            Some(&session_name),
+            None,
+        ) {
             eprintln!("inbox-watcher: spawn failed for inbox item {id}: {e}");
             let mut dispatched = match state.inbox_dispatched.lock() {
                 Ok(d) => d,
@@ -459,8 +467,16 @@ fn todo_watcher_tick(state: &AppState) {
         claimed
     };
     for (task_id, local_path, session_name) in claimed {
-        let prompt = format!("/execute-mesa-task {task_id}");
-        if let Err(e) = agents::spawn_bg(&local_path, Some(&prompt), Some(&session_name)) {
+        // The command — including which slash command executes a task — comes
+        // from `~/.mesa/config.json`'s `todo-watcher` entry, defaulting to
+        // `claude --bg … -- /execute-mesa-task <id>`.
+        if let Err(e) = agents::spawn_bg(
+            config::TODO_WATCHER,
+            &local_path,
+            Some(task_id),
+            Some(&session_name),
+            None,
+        ) {
             eprintln!("todo-watcher: spawn failed for task {task_id}: {e}");
             let mut store = match state.store.lock() {
                 Ok(s) => s,
@@ -2993,11 +3009,21 @@ async fn spawn_project_agent(
         });
     }
     let dir = path.clone();
-    let job =
-        tokio::task::spawn_blocking(move || agents::spawn_bg(&dir, body.prompt.as_deref(), None))
-            .await
-            .map_err(|e| agents_unavailable(format!("agent spawn panicked: {e}")))?
-            .map_err(agents_unavailable)?;
+    // `~/.mesa/config.json`'s `agent-spawn` entry, defaulting to
+    // `claude --bg … -- <prompt>`. `job` is None when that command printed no
+    // receipt — the session is still real (see `AgentSpawned`).
+    let job = tokio::task::spawn_blocking(move || {
+        agents::spawn_bg(
+            config::AGENT_SPAWN,
+            &dir,
+            None,
+            None,
+            body.prompt.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| agents_unavailable(format!("agent spawn panicked: {e}")))?
+    .map_err(agents_unavailable)?;
     // Drop the cached list so the next poll shows the new session immediately,
     // and bump the generation so a list request in flight since before this
     // spawn won't reinsert its pre-spawn snapshot over the invalidation.
@@ -4356,8 +4382,16 @@ mod tests {
     /// stub). `--agent <name>` is consumed ahead of `--name`/`--` and written
     /// to `<dir>/last-agent` — argv order matters, so a stub that parses
     /// positionally has to know about every flag `spawn_bg` may emit.
+    ///
+    /// Also pins `MESA_CONFIG_FILE` at a path that does not exist, so these
+    /// tests assert the **built-in default** spawn command and cannot be
+    /// broken by whatever the developer running them has in their own
+    /// `~/.mesa/config.json` (`core::config`). Every caller already holds
+    /// `ENV_LOCK`; the value is left set on purpose — "no config file" is the
+    /// state every other test wants too.
     fn stub_claude_bg(dir: &std::path::Path, log_path: &std::path::Path) -> String {
         use std::os::unix::fs::PermissionsExt;
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", dir.join("no-such-config.json")) };
         let path = dir.join("claude");
         std::fs::write(
             &path,

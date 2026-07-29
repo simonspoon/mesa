@@ -8,16 +8,24 @@ terminals attached to running sessions. Like the CC Dashboard it reads
 touches the mesa store only to read `local_path`. There is deliberately no
 `mesa agent` CLI: an agent in a terminal would just use `claude` directly.
 
-**Every session mesa *starts* runs under an agent persona.** `agents::spawn_bg`
-is the single spawn chokepoint (the two watchers and the POST route all go
-through it) and passes `--agent <name>`, defaulting to **`swe`** — mesa
-auto-dispatches engineering work, and the generic assistant persona is the
-wrong front door for it. `MESA_CLAUDE_AGENT` overrides the name; set it
-**empty** to drop the flag and get a plain session (an unknown agent name is a
-hard startup failure in the claude CLI, not a warning, so a machine without a
-`swe` agent needs this escape hatch). The flag is placed after `--bg` and
-before the `--` prompt separator. `claude agents --json` and the attach bridge
-don't start a session, so neither takes it.
+**The spawn command is user-configurable** — `docs/config.md`.
+`agents::spawn_bg` is the single spawn chokepoint (the two watchers and the
+POST route all go through it) and runs the template
+`~/.mesa/config.json` gives for that action; this route's key is
+**`agent-spawn`**, defaulting to `{bin} --bg --agent {agent} -- {prompt}`. The
+sections below describe that default. A replacement command owes mesa only its
+exit code; see the `POST` route below on the `id: null` case.
+
+**Every session mesa *starts* runs under an agent persona** by default:
+`--agent <name>`, **`swe`** — mesa auto-dispatches engineering work, and the
+generic assistant persona is the wrong front door for it.
+`MESA_CLAUDE_AGENT` overrides the name; set it **empty** to drop the flag and
+get a plain session (an unknown agent name is a hard startup failure in the
+claude CLI, not a warning, so a machine without a `swe` agent needs this escape
+hatch). The flag is placed after `--bg` and before the `--` prompt separator.
+`claude agents --json` and the attach bridge don't start a session, so neither
+takes it — and neither is affected by the templates, so a template pointing at
+a different tool yields sessions the sidebar can't list or attach to.
 
 - `GET /api/projects/{id}/agents` → `{path, agents}` via `claude agents
   --json` (sessions started under that folder, background and interactive),
@@ -29,9 +37,13 @@ don't start a session, so neither takes it.
   of trusting that black box. Cached 2s per folder in
   `AppState.agents_cache` (each list call costs ~0.5s of node startup; the UI
   polls every 3s). No `local_path` → `{path: null, agents: []}`, not an error.
-- `POST /api/projects/{id}/agents` (body `{prompt?}`) → runs `claude --bg` in
-  `local_path` and returns `{id}` — the short job id parsed from the
-  "backgrounded · <id>" receipt. Without a prompt the session starts idle.
+- `POST /api/projects/{id}/agents` (body `{prompt?}`) → runs the
+  `agent-spawn` command (`claude --bg` by default) in `local_path` and returns
+  `{id}` — the short job id parsed from the "backgrounded · <id>" receipt, or
+  **`null`** when the command printed no such line, which a configured
+  replacement is entitled to do. A null id is still `201`: the session exists
+  and the next list call shows it, mesa just has nothing to open an attach pane
+  with. Without a prompt the session starts idle.
   No/missing `local_path` is `validation`; a failing/missing `claude` CLI is
   **502 `unavailable`** on both endpoints. Both this route and the list route
   run their subprocess under `spawn_blocking` and hold no lock across it, so

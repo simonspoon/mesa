@@ -306,6 +306,14 @@ start locations in the global Agents sidebar.
   attach`, so it works from remote machines under `--lan`). There is
   deliberately no `mesa agent` CLI — an agent in a terminal uses `claude`
   directly.
+- **Configurable spawn commands**: the three places mesa starts an agent — the
+  todo-watcher's dispatch, the inbox-watcher's triage, and the sidebar's *add
+  agent* — each read a command template from `~/.mesa/config.json`
+  (`commands.todo-watcher`, `.inbox-watcher`, `.agent-spawn`), so you can
+  change the binary, its flags, the persona or the slash command without
+  rebuilding. Placeholders `{id}`, `{name}`, `{prompt}` (plus `{bin}`,
+  `{agent}`). Templates are argv, not shell: no config file means the built-in
+  `claude --bg --agent swe …` command, unchanged. See `docs/config.md`.
 - **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
   the database. One point so far — `task-execute`, fired by `mesa task execute
   <id>` or `POST /api/tasks/{id}/execute`, with the full task JSON on stdin and
@@ -334,6 +342,7 @@ scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
 scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`
 scripts/inbox-watcher-check.sh  # `serve --watch-inbox` triage loop against a stub `claude`
+scripts/config-check.sh     # the 3 configurable spawn commands in ~/.mesa/config.json
 scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)

@@ -3,7 +3,10 @@
 `mesa serve --watch-inbox` starts a periodic background loop that auto-triages
 the global inbox: for every pending item it starts a background `claude`
 session running `/inbox-triage <item-id>`, so items stop accumulating until a
-human gets to them. The sibling of the todo watcher (`docs/todo-watcher.md`),
+human gets to them. That command is the default of the **`inbox-watcher`** key
+in `~/.mesa/config.json` and is user-configurable, slash command included
+(`docs/config.md`); `{id}` is the item id and `{name}` the session name derived
+below. The sibling of the todo watcher (`docs/todo-watcher.md`),
 built on the same machinery, over a different queue. **Off by default**, for
 the same reason: auto-spawning agents is real API cost and real code
 execution, so it must not fire just because someone ran `mesa serve`.

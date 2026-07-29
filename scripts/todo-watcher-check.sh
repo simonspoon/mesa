@@ -14,6 +14,9 @@ MESA=target/debug/mesa
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"; [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
 export MESA_DB="$TMP/mesa.db"
+# Pin the user config away from the real ~/.mesa/config.json: this gate
+# asserts the BUILT-IN spawn command, so a configured one must not leak in.
+export MESA_CONFIG_FILE="$TMP/no-config.json"
 
 CHECKS=0
 fail() { echo "FAIL: $*" >&2; exit 1; }

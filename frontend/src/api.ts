@@ -435,7 +435,10 @@ export function listAllAgents(): Promise<AgentSession[]> {
   return request('/api/agents')
 }
 
-/** Starts a background `claude --bg` session in the project's folder. */
+/** Starts a background agent session in the project's folder, running the
+ * `agent-spawn` command from `~/.mesa/config.json` (`claude --bg …` by
+ * default). `id` is null when that command printed no job-id receipt — the
+ * session started, it just can't be attached to by id yet. */
 export function spawnProjectAgent(
   id: number,
   body: { prompt?: string } = {},

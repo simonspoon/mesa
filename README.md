@@ -126,7 +126,12 @@ mesa backup /tmp/mesa-snap.db
   inbox item `body`; an edge has no such field, so its output is unchanged.
   Composite payloads (`project delete`, `task delete`/`import`, `storyboard
   show`/`delete`, `frame delete`, `inbox assign`) keep their key structure and
-  compact their members. The flag changes stdout only — exit codes, the JSON
+  compact their members. Any quiet payload that actually drops a key is rebuilt
+  as a JSON object, so its keys come out alphabetical rather than in declaration
+  order — single records as much as composites; an edge, having nothing to drop,
+  passes through unchanged. The key set and the values are the same either way;
+  compare quiet output with `jq`, not byte-for-byte. The flag changes stdout
+  only — exit codes, the JSON
   error payloads on stderr, and every stored side effect are identical with
   and without it, and default output is byte-identical to before the flag
   existed. `mesa task update <id> --quiet` with no field flag is still a usage

@@ -103,7 +103,12 @@ The code is the source of truth. These are the invariants you must not break:
   `cli.rs::compact()`**, the same bounded object `task list` emits — do not add a
   second task projection. Composites (`project delete`, `task delete`/`import`,
   `storyboard show`/`delete`, `frame delete`, `inbox assign`) keep their key
-  structure and compact only their members. The flag changes **stdout only**:
+  structure and compact only their members. Any quiet payload that actually
+  drops a key is rebuilt as a `serde_json::Value`, so its keys come out
+  **alphabetical** rather than in struct-declaration order — single records as
+  much as composites. (An `edge` has nothing to drop, so it passes through in
+  declaration order.) The key set and the values are unchanged; compare quiet
+  output with `jq`, never byte-for-byte. The flag changes **stdout only**:
   exit codes, `print_error` stderr payloads and store side effects are identical
   with and without it, and default output stays byte-identical. `--quiet` sits
   **outside** every required `ArgGroup`, so `mesa task update <id> --quiet` with

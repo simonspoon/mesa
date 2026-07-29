@@ -17,7 +17,7 @@ use serde_json::json;
 
 use crate::core::{
     DiagramType, EdgePatch, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    NextResult, Priority, Project, ProjectPatch, Result, Status, Store, Storyboard,
+    InboxItem, NextResult, Priority, Project, ProjectPatch, Result, Status, Store, Storyboard,
     StoryboardPatch, StoryboardView, Task, TaskPatch,
 };
 
@@ -648,7 +648,7 @@ enum InboxCmd {
     /// — not tied to any project. Type the message after `add` (quoting is
     /// optional; multiple words are joined). A person routes it to a project
     /// later with `inbox assign`; naming a project in the text does nothing
-    /// automatic. Put `--author` before the message text.
+    /// automatic. Put `--author` and `--quiet` before the message text.
     #[command(after_help = "\
 EXAMPLES
   mesa inbox add the auth refactor is ready for review
@@ -660,6 +660,12 @@ EXAMPLES
         /// Free-text actor id of the sender (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// Print the item without its `body` instead of in full
+        ///
+        /// Must come BEFORE the message text: everything after `add` that is
+        /// not a leading flag is swallowed as the body.
+        #[arg(long)]
+        quiet: bool,
     },
     /// List inbox items as a bare JSON array, newest first
     List {
@@ -672,6 +678,9 @@ EXAMPLES
     Show {
         /// Inbox item id
         id: i64,
+        /// Print the item without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
     },
     /// Assign an item to a project: convert it into a backlog task there
     ///
@@ -691,11 +700,21 @@ EXAMPLES
         id: i64,
         /// Project to convert the item into a task in (id or name)
         project: String,
+        /// Print the created task in the compact `task list` shape instead of
+        /// in full (it is a task, not an inbox item)
+        #[arg(long)]
+        quiet: bool,
     },
     /// Delete an inbox item (no confirmation); echoes the destroyed item
     Delete {
         /// Inbox item id
         id: i64,
+        /// Echo the destroyed item with its `body` dropped
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -1373,7 +1392,6 @@ const QUIET_DROP_STORYBOARD: &[&str] = &["description"];
 /// Keys dropped from a `Frame` under `--quiet`.
 const QUIET_DROP_FRAME: &[&str] = &["body"];
 /// Keys dropped from an `InboxItem` under `--quiet`.
-#[allow(dead_code)]
 const QUIET_DROP_INBOX_ITEM: &[&str] = &["body"];
 /// A `FrameEdge` has no unbounded field: quiet output equals full output.
 /// The flag is still accepted on edge subcommands, for uniformity.
@@ -1445,6 +1463,14 @@ fn print_frame(frame: &Frame, is_quiet: bool) {
 /// the full record; the flag is accepted for uniformity across the group.
 fn print_edge(edge: &FrameEdge, is_quiet: bool) {
     print_record(edge, is_quiet, QUIET_DROP_FRAME_EDGE);
+}
+
+/// Print one inbox item: the full record, or the record minus `body`.
+///
+/// `inbox assign` does NOT come through here — it returns the created `Task`,
+/// so its quiet shape is the task's ([`print_task`]), not an item's.
+fn print_inbox_item(item: &InboxItem, is_quiet: bool) {
+    print_record(item, is_quiet, QUIET_DROP_INBOX_ITEM);
 }
 
 /// Print a `{storyboard, frames, edges}` view (`storyboard show`/`delete`).
@@ -2142,20 +2168,27 @@ fn run_attachment(cmd: AttachmentCmd) -> Result<()> {
 fn run_inbox(cmd: InboxCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
-        InboxCmd::Add { body, author } => {
-            print_json(&store.create_inbox_item(author.as_deref(), &body.join(" "))?)
-        }
+        InboxCmd::Add {
+            body,
+            author,
+            quiet,
+        } => print_inbox_item(
+            &store.create_inbox_item(author.as_deref(), &body.join(" "))?,
+            quiet,
+        ),
         InboxCmd::List { project } => {
             print_json(&store.list_inbox_items(resolve_project_opt(&store, project.as_deref())?)?)
         }
-        InboxCmd::Show { id } => print_json(&store.get_inbox_item(id)?),
-        InboxCmd::Assign { id, project } => {
+        InboxCmd::Show { id, quiet } => print_inbox_item(&store.get_inbox_item(id)?, quiet),
+        InboxCmd::Assign { id, project, quiet } => {
             // Assigning converts the item into a BACKLOG task in the project
             // and deletes it from the inbox; the created task is what we echo.
+            // That side effect is unchanged by --quiet, which touches stdout
+            // only.
             let project = resolve_project(&store, &project)?;
-            print_json(&store.assign_inbox_item(id, project)?);
+            print_task(&store.assign_inbox_item(id, project)?, quiet);
         }
-        InboxCmd::Delete { id } => print_json(&store.delete_inbox_item(id)?),
+        InboxCmd::Delete { id, quiet } => print_inbox_item(&store.delete_inbox_item(id)?, quiet),
     }
     Ok(())
 }

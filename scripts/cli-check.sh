@@ -718,6 +718,116 @@ ok "project error path: exit 1 and byte-identical stderr with and without --quie
 
 run 0 "$MESA" project delete "$PJQ4"
 
+# ---- --quiet on the inbox group (spec 644, M12 inbox half) ----
+# Inbox has no gate script of its own, so its assertions live here.
+# Self-contained: its own project and items, all destroyed here, so the
+# delete/backup assertions below (which assume only P and P2 exist) stay valid.
+#
+# JSON is compared with `printf '%s'` into a file, never `echo "$var"` — zsh
+# echo expands escapes and corrupts JSON carrying \n in a body.
+
+# inbox_quiet_parity <full-file> <quiet-file> — the quiet item must be EXACTLY
+# the full item minus `body`: every other key present and byte-equal.
+inbox_quiet_parity() {
+  jq -e --slurpfile q "$2" 'del(.body) == $q[0]' "$1" >/dev/null
+}
+
+run 0 "$MESA" project create "Quiet inbox" --no-git
+PIQ=$(jqs .id)
+
+# show: the reference parity case — same record read twice, so nothing volatile
+# moves between the two calls.
+run 0 "$MESA" inbox add --author agent-q "$BODY"
+IQ=$(jqs .id)
+run 0 "$MESA" inbox show "$IQ"
+printf '%s' "$STDOUT" >"$TMP/ifull.json"
+# non-quiet output is unchanged: the full 6-key inbox item
+[ "$(jqs 'keys | join(",")')" = "author,body,created_at,id,project_id,updated_at" ] ||
+  fail "inbox show (no --quiet): full key set must be unchanged"
+[ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
+run 0 "$MESA" inbox show "$IQ" --quiet
+printf '%s' "$STDOUT" >"$TMP/iquiet.json"
+[ "$(jqs 'has("body")')" = "false" ] || fail "inbox show --quiet: body must be dropped"
+inbox_quiet_parity "$TMP/ifull.json" "$TMP/iquiet.json" ||
+  fail "inbox show --quiet: must be the full item minus body"
+ok "inbox show --quiet: full item minus body, every other key equal"
+
+# `get` is an alias for `show` and carries the same flag
+run 0 "$MESA" inbox get "$IQ" --quiet
+[ "$(jqs 'has("body")')" = "false" ] || fail "inbox get --quiet: body must be dropped"
+[ "$(jqs .id)" = "$IQ" ] || fail "inbox get --quiet: id"
+ok "inbox get --quiet: same shape as show"
+
+# add: --quiet must precede the message (everything after `add` that is not a
+# leading flag is swallowed as the body by trailing_var_arg).
+run 0 "$MESA" inbox add --quiet --author agent-q "$BODY"
+printf '%s' "$STDOUT" >"$TMP/iquiet.json"
+IQ2=$(jqs .id)
+[ "$(jqs 'has("body")')" = "false" ] || fail "inbox add --quiet: body must be dropped"
+[ "$(jqs .author)" = "agent-q" ] || fail "inbox add --quiet: author"
+[ "$(jqs .project_id)" = "null" ] || fail "inbox add --quiet: lands unassigned"
+run 0 "$MESA" inbox show "$IQ2"
+printf '%s' "$STDOUT" >"$TMP/ifull.json"
+inbox_quiet_parity "$TMP/ifull.json" "$TMP/iquiet.json" ||
+  fail "inbox add --quiet: must be the full item minus body"
+ok "inbox add --quiet: item minus body, values intact"
+
+# assign returns the created TASK, so its quiet shape is the compact task —
+# not an inbox projection. The side effect (item converted and removed) is
+# unchanged by the flag.
+run 0 "$MESA" inbox assign "$IQ2" "$PIQ" --quiet
+printf '%s' "$STDOUT" >"$TMP/iquiet.json"
+IQT=$(jqs .id)
+[ "$(jqs 'has("description")')" = "false" ] || fail "inbox assign --quiet: description must be dropped"
+[ "$(jqs .status)" = "backlog" ] || fail "inbox assign --quiet: assigned items land in the backlog"
+[ "$(jqs .project_id)" = "$PIQ" ] || fail "inbox assign --quiet: project_id"
+[ "$(jqs 'has("blocked")')" = "true" ] || fail "inbox assign --quiet: blocked still present"
+run 0 "$MESA" task show "$IQT"
+printf '%s' "$STDOUT" >"$TMP/ifull.json"
+quiet_is_full_minus_bodies "$TMP/ifull.json" "$TMP/iquiet.json" ||
+  fail "inbox assign --quiet: must be the compact task (full minus the four body keys)"
+run 1 "$MESA" inbox show "$IQ2"
+[ "$(jqe .error.code)" = "not_found" ] || fail "inbox assign --quiet: item must still be consumed"
+ok "inbox assign --quiet: compact task, item still converted and removed"
+
+# delete: --quiet is an explicit opt-out of the full recovery transcript.
+run 0 "$MESA" inbox add "$BODY"
+IQ3=$(jqs .id)
+run 0 "$MESA" inbox delete "$IQ3" --quiet
+printf '%s' "$STDOUT" >"$TMP/iquiet.json"
+[ "$(jqs 'has("body")')" = "false" ] || fail "inbox delete --quiet: body must be dropped"
+[ "$(jqs .id)" = "$IQ3" ] || fail "inbox delete --quiet: destroyed item echoed"
+run 1 "$MESA" inbox show "$IQ3"
+[ "$(jqe .error.code)" = "not_found" ] || fail "inbox delete --quiet: item must still be gone"
+ok "inbox delete --quiet: destroyed item minus body, still deleted"
+
+# long form only: no -q alias
+run 2 "$MESA" inbox show "$IQ" -q
+ok "inbox show -q: exit 2 (no short alias)"
+
+# --quiet does not exist outside the 4 subcommands in scope
+run 2 "$MESA" inbox list --quiet
+ok "inbox list --quiet: exit 2 (unknown argument)"
+
+# every one of the 4 advertises the flag in --help
+for SUB in add show assign delete; do
+  run 0 "$MESA" inbox "$SUB" --help
+  grep -q -- "--quiet" <<<"$STDOUT" || fail "inbox $SUB --help: must list --quiet"
+done
+ok "inbox add/show/assign/delete --help: --quiet listed"
+
+# --quiet changes stdout only: exit code and the stderr payload are identical
+run 1 "$MESA" inbox show 999999
+printf '%s' "$STDERR" >"$TMP/ierr-full.txt"
+run 1 "$MESA" inbox show 999999 --quiet
+printf '%s' "$STDERR" >"$TMP/ierr-quiet.txt"
+cmp -s "$TMP/ierr-full.txt" "$TMP/ierr-quiet.txt" ||
+  fail "inbox show --quiet: stderr must be byte-identical on the error path"
+ok "inbox error path: exit 1 and byte-identical stderr with and without --quiet"
+
+run 0 "$MESA" inbox delete "$IQ"
+run 0 "$MESA" project delete "$PIQ"
+
 # ---- delete ----
 run 0 "$MESA" task delete "$T3"
 [ "$(jqs type)" = "array" ] || fail "task delete: bare array of destroyed records"

@@ -17,8 +17,8 @@ use serde_json::json;
 
 use crate::core::{
     DiagramType, EdgePatch, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    NextResult, Priority, ProjectPatch, Result, Status, Store, Storyboard, StoryboardPatch,
-    StoryboardView, Task, TaskPatch,
+    NextResult, Priority, Project, ProjectPatch, Result, Status, Store, Storyboard,
+    StoryboardPatch, StoryboardView, Task, TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -168,6 +168,9 @@ instead of detecting it.")]
         /// none otherwise.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Print the project without its `description` instead of in full
+        #[arg(long)]
+        quiet: bool,
     },
     /// List all projects as a bare JSON array; archived projects are omitted
     /// unless --include-archived is given
@@ -195,6 +198,9 @@ EXAMPLES
     Show {
         /// Project id
         id: i64,
+        /// Print the project without its `description` instead of in full
+        #[arg(long)]
+        quiet: bool,
     },
     /// Update fields on a project; prints the full updated project
     ///
@@ -217,6 +223,13 @@ EXAMPLES
         /// clear it
         #[arg(long, group = "fields")]
         path: Option<String>,
+        /// Print the project without its `description` instead of in full
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Delete a project AND all its tasks (no confirmation)
     ///
@@ -226,6 +239,12 @@ EXAMPLES
     Delete {
         /// Project id
         id: i64,
+        /// Echo the destroyed records with their free text dropped
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Hide a project from unscoped views; prints the full updated project
     ///
@@ -237,6 +256,9 @@ EXAMPLES
         /// Project id or name
         #[arg(value_name = "ID|NAME")]
         project: String,
+        /// Print the project without its `description` instead of in full
+        #[arg(long)]
+        quiet: bool,
     },
     /// Reverse `archive`; prints the full updated project
     ///
@@ -246,6 +268,9 @@ EXAMPLES
         /// Project id or name
         #[arg(value_name = "ID|NAME")]
         project: String,
+        /// Print the project without its `description` instead of in full
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -1342,7 +1367,6 @@ fn print_tasks(tasks: &[Task], quiet: bool) {
 // are the tripwire that keeps every list here honest.
 
 /// Keys dropped from a `Project` under `--quiet`.
-#[allow(dead_code)]
 const QUIET_DROP_PROJECT: &[&str] = &["description"];
 /// Keys dropped from a `Storyboard` under `--quiet`.
 const QUIET_DROP_STORYBOARD: &[&str] = &["description"];
@@ -1381,6 +1405,29 @@ fn print_record<T: serde::Serialize>(record: &T, is_quiet: bool, drop: &[&str]) 
         print_json(&quiet(record, drop));
     } else {
         print_json(record);
+    }
+}
+
+/// Print one project: the full record, or the record minus `description`.
+fn print_project(project: &Project, is_quiet: bool) {
+    print_record(project, is_quiet, QUIET_DROP_PROJECT);
+}
+
+/// Print the `{project, tasks}` echo of `project delete`.
+///
+/// Under `--quiet` the container KEY SET is unchanged — only the members are
+/// projected: the project loses `description`, and each cascaded task becomes
+/// the existing [`compact`] shape. (Member and container key ORDER is
+/// alphabetical under `--quiet`, as for any `serde_json::Value`; the default,
+/// non-quiet output is untouched.)
+fn print_project_delete(project: &Project, tasks: &[Task], is_quiet: bool) {
+    if is_quiet {
+        print_json(&json!({
+            "project": quiet(project, QUIET_DROP_PROJECT),
+            "tasks": tasks.iter().map(compact).collect::<Vec<_>>(),
+        }));
+    } else {
+        print_json(&json!({"project": project, "tasks": tasks}));
     }
 }
 
@@ -1501,6 +1548,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             root_commit,
             no_git,
             path,
+            quiet,
         } => {
             // An explicit --root-commit or --no-git says "I am describing
             // somewhere else", so it suppresses ALL cwd auto-detection —
@@ -1522,12 +1570,15 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 Some(dir) => Some(canonical_dir(dir)?),
                 None => auto_detect.then(|| git_toplevel(None)).flatten(),
             };
-            print_json(&store.create_project(
-                &name,
-                description.as_deref(),
-                root_commit.as_deref(),
-                local_path.as_deref(),
-            )?);
+            print_project(
+                &store.create_project(
+                    &name,
+                    description.as_deref(),
+                    root_commit.as_deref(),
+                    local_path.as_deref(),
+                )?,
+                quiet,
+            );
         }
         ProjectCmd::List { include_archived } => {
             if include_archived {
@@ -1568,13 +1619,14 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             };
             print_json(&project);
         }
-        ProjectCmd::Show { id } => print_json(&store.get_project(id)?),
+        ProjectCmd::Show { id, quiet } => print_project(&store.get_project(id)?, quiet),
         ProjectCmd::Update {
             id,
             name,
             description,
             root_commit,
             path,
+            quiet,
         } => {
             let local_path = match path {
                 None => None,
@@ -1587,19 +1639,19 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 root_commit: root_commit.map(clear_if_empty),
                 local_path,
             };
-            print_json(&store.update_project(id, &patch)?);
+            print_project(&store.update_project(id, &patch)?, quiet);
         }
-        ProjectCmd::Delete { id } => {
+        ProjectCmd::Delete { id, quiet } => {
             let (project, tasks) = store.delete_project(id)?;
-            print_json(&json!({"project": project, "tasks": tasks}));
+            print_project_delete(&project, &tasks, quiet);
         }
-        ProjectCmd::Archive { project } => {
+        ProjectCmd::Archive { project, quiet } => {
             let id = resolve_project(&store, &project)?;
-            print_json(&store.archive_project(id)?);
+            print_project(&store.archive_project(id)?, quiet);
         }
-        ProjectCmd::Unarchive { project } => {
+        ProjectCmd::Unarchive { project, quiet } => {
             let id = resolve_project(&store, &project)?;
-            print_json(&store.unarchive_project(id)?);
+            print_project(&store.unarchive_project(id)?, quiet);
         }
     }
     Ok(())

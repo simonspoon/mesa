@@ -594,6 +594,130 @@ ok "28 KB description: --quiet stdout < 1 KB, status readable; default still ful
 
 run 0 "$MESA" project delete "$PQ"
 
+# ---- --quiet on the project group (spec 644) ----
+# Self-contained: its own projects, all destroyed here, so the delete/backup
+# assertions below (which assume only P and P2 exist) stay valid.
+#
+# JSON is compared with `printf '%s'` into a file, never `echo "$var"` — zsh
+# echo expands escapes and corrupts JSON carrying \n in a description.
+
+# project_quiet_parity <full-file> <quiet-file> — the quiet project must be
+# EXACTLY the full project minus `description`: every other key present and
+# byte-equal. Fails if a key is missing, extra, or edited.
+project_quiet_parity() {
+  jq -e --slurpfile q "$2" 'del(.description) == $q[0]' "$1" >/dev/null
+}
+
+run 0 "$MESA" project create "Quiet project" --no-git --description "$BODY"
+PJQ=$(jqs .id)
+
+# show: the reference parity case — same record read twice, nothing volatile
+# moves between the two calls (Project carries no timestamp at all).
+run 0 "$MESA" project show "$PJQ"
+printf '%s' "$STDOUT" >"$TMP/pfull.json"
+# non-quiet output is unchanged: the full 6-key project object
+[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,root_commit" ] ||
+  fail "project show (no --quiet): full key set must be unchanged"
+[ "$(jqs 'has("description")')" = "true" ] || fail "project show (no --quiet): description present"
+run 0 "$MESA" project show "$PJQ" --quiet
+printf '%s' "$STDOUT" >"$TMP/pquiet.json"
+[ "$(jqs 'has("description")')" = "false" ] || fail "project show --quiet: description must be dropped"
+project_quiet_parity "$TMP/pfull.json" "$TMP/pquiet.json" ||
+  fail "project show --quiet: must be the full project minus description"
+ok "project show --quiet: full project minus description, every other key equal"
+
+# every quiet mutation prints that same shape; parity is checked against a
+# following `show` (a read), so the two captures describe the same state.
+project_quiet_mutation_ok() { # project_quiet_mutation_ok <label> <cmd...>
+  local label=$1; shift
+  run 0 "$@"
+  printf '%s' "$STDOUT" >"$TMP/pquiet.json"
+  [ "$(jqs 'has("description")')" = "false" ] || fail "$label --quiet: description must be dropped"
+  run 0 "$MESA" project show "$PJQ"
+  printf '%s' "$STDOUT" >"$TMP/pfull.json"
+  project_quiet_parity "$TMP/pfull.json" "$TMP/pquiet.json" ||
+    fail "$label --quiet: must be the full project minus description"
+}
+
+project_quiet_mutation_ok "project update" "$MESA" project update "$PJQ" --name "Quiet renamed" --quiet
+project_quiet_mutation_ok "project archive" "$MESA" project archive "$PJQ" --quiet
+[ "$(jqs .archived)" = "true" ] || fail "project archive --quiet: archived must be true"
+project_quiet_mutation_ok "project unarchive" "$MESA" project unarchive "$PJQ" --quiet
+[ "$(jqs .archived)" = "false" ] || fail "project unarchive --quiet: archived must be false"
+ok "project update/archive/unarchive --quiet: shape and values intact"
+
+run 0 "$MESA" project create "Quiet created" --no-git --description "$BODY" --quiet
+PJQ2=$(jqs .id)
+[ "$(jqs 'has("description")')" = "false" ] || fail "project create --quiet: description must be dropped"
+[ "$(jqs .name)" = "Quiet created" ] || fail "project create --quiet: name"
+[ "$(jqs .archived)" = "false" ] || fail "project create --quiet: archived"
+run 0 "$MESA" project delete "$PJQ2"
+ok "project create --quiet: project minus description, values intact"
+
+# delete: the composite keeps its {project, tasks} key structure; only the
+# members are projected. --quiet here is an explicit opt-out of the full
+# recovery transcript.
+run 0 "$MESA" task create "$PJQ" "Quiet cascade" --description "$BODY"
+run 0 "$MESA" project create "Quiet delete" --no-git --description "$BODY"
+PJQ3=$(jqs .id)
+run 0 "$MESA" task create "$PJQ3" "Quiet cascade" --description "$BODY"
+run 0 "$MESA" project delete "$PJQ3"
+printf '%s' "$STDOUT" >"$TMP/pdel-full.json"
+[ "$(jqs '.project | has("description")')" = "true" ] ||
+  fail "project delete (no --quiet): project description present"
+[ "$(jqs '.tasks[0] | has("description")')" = "true" ] ||
+  fail "project delete (no --quiet): task description present"
+run 0 "$MESA" project delete "$PJQ" --quiet
+printf '%s' "$STDOUT" >"$TMP/pdel-quiet.json"
+[ "$(jq -S 'keys' "$TMP/pdel-quiet.json")" = "$(jq -S 'keys' "$TMP/pdel-full.json")" ] ||
+  fail "project delete --quiet: container keys must match the non-quiet shape"
+[ "$(jqs '.project | has("description")')" = "false" ] ||
+  fail "project delete --quiet: project description must be dropped"
+[ "$(jqs '.project.id')" = "$PJQ" ] || fail "project delete --quiet: project echoed"
+[ "$(jqs '.tasks | length')" = "1" ] || fail "project delete --quiet: cascaded task echoed"
+[ "$(jqs 'any(.tasks[]; has("description"))')" = "false" ] ||
+  fail "project delete --quiet: task members must be compacted"
+[ "$(jqs 'all(.tasks[]; has("blocked"))')" = "true" ] ||
+  fail "project delete --quiet: blocked still present on task members"
+ok "project delete --quiet: same {project, tasks} keys, compact members"
+
+# --quiet is a modifier, NOT a field: `project update <id> --quiet` alone must
+# be a usage error, not a legal call that silently does nothing (M2).
+run 0 "$MESA" project create "Quiet usage" --no-git
+PJQ4=$(jqs .id)
+run 2 "$MESA" project update "$PJQ4" --quiet
+[ -z "$STDOUT" ] || fail "project update --quiet alone: stdout must be empty"
+[ -n "$STDERR" ] || fail "project update --quiet alone: stderr must be non-empty"
+[ "$(jqe .error.code)" = "usage" ] || fail "project update --quiet alone: error.code"
+ok "project update --quiet with no field flag: exit 2, empty stdout, code=usage"
+
+# long form only: no -q alias
+run 2 "$MESA" project show "$PJQ4" -q
+ok "project show -q: exit 2 (no short alias)"
+
+# --quiet does not exist outside the 6 subcommands in scope
+run 2 "$MESA" project list --quiet
+run 2 "$MESA" project resolve --quiet
+ok "project list/resolve --quiet: exit 2 (unknown argument)"
+
+# every one of the 6 advertises the flag in --help
+for SUB in create show update delete archive unarchive; do
+  run 0 "$MESA" project "$SUB" --help
+  grep -q -- "--quiet" <<<"$STDOUT" || fail "project $SUB --help: must list --quiet"
+done
+ok "project create/show/update/delete/archive/unarchive --help: --quiet listed"
+
+# --quiet changes stdout only: exit code and the stderr payload are identical
+run 1 "$MESA" project show 999999
+printf '%s' "$STDERR" >"$TMP/perr-full.txt"
+run 1 "$MESA" project show 999999 --quiet
+printf '%s' "$STDERR" >"$TMP/perr-quiet.txt"
+cmp -s "$TMP/perr-full.txt" "$TMP/perr-quiet.txt" ||
+  fail "project show --quiet: stderr must be byte-identical on the error path"
+ok "project error path: exit 1 and byte-identical stderr with and without --quiet"
+
+run 0 "$MESA" project delete "$PJQ4"
+
 # ---- delete ----
 run 0 "$MESA" task delete "$T3"
 [ "$(jqs type)" = "array" ] || fail "task delete: bare array of destroyed records"

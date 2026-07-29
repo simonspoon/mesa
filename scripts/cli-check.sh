@@ -303,9 +303,11 @@ ok "task create --acceptance/--artifact: stored, timestamps present"
 run 0 "$MESA" task list --project "$P3"
 [ "$(jqs "any(.[]; .id == $TA and .acceptance == \"tests pass\")")" = "true" ] ||
   fail "list: acceptance must appear in compact objects"
-[ "$(jqs 'any(.[]; has("artifact"))')" = "false" ] ||
-  fail "list: artifact must NOT appear in compact objects"
-ok "task list: acceptance present, artifact absent (compact shape)"
+[ "$(jqs "any(.[]; .id == $TA and .artifact == \"abc123\")")" = "true" ] ||
+  fail "list: artifact must appear in compact objects (bounded pointer, spec 651)"
+[ "$(jqs 'any(.[]; has("description"))')" = "false" ] ||
+  fail "list: description must NOT appear in compact objects"
+ok "task list: acceptance + artifact present, description absent (compact shape)"
 
 run 0 "$MESA" task update "$TA" --acceptance ""
 [ "$(jqs .acceptance)" = "null" ] || fail "update --acceptance \"\": must clear"
@@ -457,11 +459,13 @@ run 0 "$MESA" project delete "$PI"
 # echo expands escapes and corrupts JSON carrying \n in a description.
 
 # quiet_is_full_minus_bodies <full-file> <quiet-file> — the quiet object must be
-# EXACTLY the full object minus the four keys the compact shape drops: every
+# EXACTLY the full object minus the three keys the compact shape drops: every
 # other key present and byte-equal. Fails if a key is missing, extra, or edited.
+# `artifact` is deliberately NOT dropped — it is a bounded pointer an agent
+# writes at close-out and needs echoed back (spec 651).
 quiet_is_full_minus_bodies() {
   jq -e --slurpfile q "$2" \
-    'del(.description, .artifact, .result, .created_at) == $q[0]' "$1" >/dev/null
+    'del(.description, .result, .created_at) == $q[0]' "$1" >/dev/null
 }
 
 run 0 "$MESA" project create "Quiet" --no-git
@@ -483,8 +487,10 @@ printf '%s' "$STDOUT" >"$TMP/full.json"
 run 0 "$MESA" task show "$QT" --quiet
 printf '%s' "$STDOUT" >"$TMP/quiet.json"
 [ "$(jqs 'has("description")')" = "false" ] || fail "task show --quiet: description must be dropped"
+[ "$(jqs .artifact)" = "sha1" ] ||
+  fail "task show --quiet: artifact must be kept, with its value (spec 651)"
 quiet_is_full_minus_bodies "$TMP/full.json" "$TMP/quiet.json" ||
-  fail "task show --quiet: must be the full object minus description/artifact/result/created_at"
+  fail "task show --quiet: must be the full object minus description/result/created_at"
 ok "task show --quiet: compact shape, every other key present and equal"
 
 # every quiet mutation prints that same compact shape; parity is checked against
@@ -497,7 +503,7 @@ quiet_mutation_ok() { # quiet_mutation_ok <label> <cmd...>
   run 0 "$MESA" task show "$QT"
   printf '%s' "$STDOUT" >"$TMP/full.json"
   quiet_is_full_minus_bodies "$TMP/full.json" "$TMP/quiet.json" ||
-    fail "$label --quiet: must be the full object minus the four body keys"
+    fail "$label --quiet: must be the full object minus the three dropped keys"
 }
 
 quiet_mutation_ok "task update" "$MESA" task update "$QT" --status in_progress --quiet
@@ -785,7 +791,7 @@ IQT=$(jqs .id)
 run 0 "$MESA" task show "$IQT"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
 quiet_is_full_minus_bodies "$TMP/ifull.json" "$TMP/iquiet.json" ||
-  fail "inbox assign --quiet: must be the compact task (full minus the four body keys)"
+  fail "inbox assign --quiet: must be the compact task (full minus the three dropped keys)"
 run 1 "$MESA" inbox show "$IQ2"
 [ "$(jqe .error.code)" = "not_found" ] || fail "inbox assign --quiet: item must still be consumed"
 ok "inbox assign --quiet: compact task, item still converted and removed"

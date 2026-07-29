@@ -3,14 +3,22 @@ import type { Priority } from "./Priority";
 import type { Status } from "./Status";
 
 /**
- * Compact task object for `list` responses (Requirement 6): the full object
- * minus `description`.
+ * Compact task object for `list` responses (Requirement 6), and the `--quiet`
+ * task shape: the full object minus the unbounded free-text bodies
+ * (`description`, `result`) and `created_at`.
  */
 export type TaskSummary = { id: number, project_id: number, parent_id: number | null, title: string, status: Status, priority: Priority, tags: Array<string>, 
 /**
  * Definition-of-done, surfaced in `list` so agents see it without `show`.
  */
 acceptance: string | null, 
+/**
+ * Completion pointer (SHA / PR URL / path); see `Task::artifact`. Bounded,
+ * so it stays in the compact shape — an agent closing a task with
+ * `--artifact <sha> --quiet` gets the value it just wrote echoed back
+ * instead of a misleading `null` (spec 651).
+ */
+artifact: string | null, 
 /**
  * Manual board order (spec 328); see `Task::sort_order`.
  */

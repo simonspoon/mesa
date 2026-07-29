@@ -101,7 +101,12 @@ The code is the source of truth. These are the invariants you must not break:
   `src/cli.rs`, with a key-parity `#[test]` per record type so a new field on a
   record forces a decision). A task's quiet shape is the **existing
   `cli.rs::compact()`**, the same bounded object `task list` emits — do not add a
-  second task projection. Composites (`project delete`, `task delete`/`import`,
+  second task projection. It drops `description`, `result` and `created_at` and
+  **keeps `artifact`**: artifact is a bounded pointer (SHA/PR URL/path), and it
+  is the field an agent writes at close-out, so echoing `null` for the value
+  just stored read as "the write failed" (spec 651). `compact()` is a
+  hand-written keep-list, so a new bounded field is omitted by default — the
+  key-parity `#[test]` against `TaskSummary` is what forces the decision. Composites (`project delete`, `task delete`/`import`,
   `storyboard show`/`delete`, `frame delete`, `inbox assign`) keep their key
   structure and compact only their members. Any quiet payload that actually
   drops a key is rebuilt as a `serde_json::Value`, so its keys come out

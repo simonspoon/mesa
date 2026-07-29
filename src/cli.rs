@@ -1381,6 +1381,7 @@ fn compact(t: &Task) -> serde_json::Value {
         "priority": t.priority,
         "tags": t.tags,
         "acceptance": t.acceptance,
+        "artifact": t.artifact,
         "sort_order": t.sort_order,
         "updated_at": t.updated_at,
         "owner": t.owner,
@@ -2431,7 +2432,7 @@ mod tests {
         );
         assert_eq!(
             sorted_owned(value_keys(&compact(&task))),
-            minus(&full, &["description", "artifact", "result", "created_at"]),
+            minus(&full, &["description", "result", "created_at"]),
         );
     }
 

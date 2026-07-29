@@ -383,8 +383,9 @@ pub struct Dependency {
     pub blocked_by: i64,
 }
 
-/// Compact task object for `list` responses (Requirement 6): the full object
-/// minus `description`.
+/// Compact task object for `list` responses (Requirement 6), and the `--quiet`
+/// task shape: the full object minus the unbounded free-text bodies
+/// (`description`, `result`) and `created_at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct TaskSummary {
@@ -400,6 +401,11 @@ pub struct TaskSummary {
     pub tags: Vec<String>,
     /// Definition-of-done, surfaced in `list` so agents see it without `show`.
     pub acceptance: Option<String>,
+    /// Completion pointer (SHA / PR URL / path); see `Task::artifact`. Bounded,
+    /// so it stays in the compact shape — an agent closing a task with
+    /// `--artifact <sha> --quiet` gets the value it just wrote echoed back
+    /// instead of a misleading `null` (spec 651).
+    pub artifact: Option<String>,
     /// Manual board order (spec 328); see `Task::sort_order`.
     pub sort_order: f64,
     /// When the task row was last updated (SQLite `datetime` text, UTC); the
@@ -425,6 +431,7 @@ impl From<&Task> for TaskSummary {
             priority: t.priority,
             tags: t.tags.clone(),
             acceptance: t.acceptance.clone(),
+            artifact: t.artifact.clone(),
             sort_order: t.sort_order,
             updated_at: t.updated_at.clone(),
             owner: t.owner.clone(),

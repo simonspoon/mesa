@@ -122,7 +122,9 @@ mesa backup /tmp/mesa-snap.db
   every mutation and `show`/`get` in `project`, `task`, `storyboard` (plus
   `frame` and `edge`) and `inbox`. The quiet shape is the record minus its
   unbounded free-text fields — for a task that is exactly the `task list`
-  shape; for a project or storyboard it drops `description`, for a frame or
+  shape (it drops `description`, `result` and `created_at`, and keeps
+  `artifact`, so a `--quiet` close-out echoes the SHA you just stored); for a
+  project or storyboard it drops `description`, for a frame or
   inbox item `body`; an edge has no such field, so its output is unchanged.
   Composite payloads (`project delete`, `task delete`/`import`, `storyboard
   show`/`delete`, `frame delete`, `inbox assign`) keep their key structure and

@@ -86,10 +86,32 @@ The code is the source of truth. These are the invariants you must not break:
 
 ## Contracts that agents/clients depend on
 
-- **CLI output is JSON only** (no human/table mode). Mutations and `show` print
-  the full object; `list` prints a bare array of compact objects (no
+- **CLI output is JSON only** (no human/table mode). **By default** mutations and
+  `show` print the full object; `list` prints a bare array of compact objects (no
   `description`); `delete` echoes the full destroyed record(s); `get` is an alias
   for every `show`. Errors are `{"error": {"code", "message"}}` on stderr.
+- **`--quiet` prints the compact projection instead of the full object.** Opt-in,
+  long form only (no `-q`, no env var, no config key, never default-on), accepted
+  on every mutation and `show`/`get` across `task`, `project`, `storyboard`
+  (+ `frame`, `edge`) and `inbox` — and on nothing else (`list`, `deps`,
+  `events`, `next`, `resolve`, `execute`, `attachment`, `cc`, `backup`, `serve`
+  reject it as an unknown argument, exit 2). The quiet shape is the record minus
+  its unbounded free-text field(s), derived by removing named keys from the
+  serialized record — never a hand-written second projection (`quiet()` in
+  `src/cli.rs`, with a key-parity `#[test]` per record type so a new field on a
+  record forces a decision). A task's quiet shape is the **existing
+  `cli.rs::compact()`**, the same bounded object `task list` emits — do not add a
+  second task projection. Composites (`project delete`, `task delete`/`import`,
+  `storyboard show`/`delete`, `frame delete`, `inbox assign`) keep their key
+  structure and compact only their members. The flag changes **stdout only**:
+  exit codes, `print_error` stderr payloads and store side effects are identical
+  with and without it, and default output stays byte-identical. `--quiet` sits
+  **outside** every required `ArgGroup`, so `mesa task update <id> --quiet` with
+  no field flag is still a usage error, exit 2, empty stdout.
+- **`--quiet` on a `delete` waives the recovery-transcript safety floor.** The
+  full-record delete echo is what substitutes for the confirmation prompt mesa
+  deliberately does not have. `--quiet` opts out of it for that one call —
+  allowed because the caller asked, and it must never become a default.
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Codes: `not_found | validation | cycle | conflict | usage`, plus
   `unavailable`, scoped to surfaces depending on something outside mesa — the
@@ -128,7 +150,8 @@ The code is the source of truth. These are the invariants you must not break:
 - **Deletes cascade with no confirmation and no `--force`** (agents run
   non-interactively). The safety floor is the delete echo (recoverable
   transcript) + `mesa backup <path>` (`VACUUM INTO`, safe under WAL). Do not add
-  a confirmation prompt.
+  a confirmation prompt. `--quiet` is the one explicit, per-call way to waive the
+  echo half of that floor.
 
 ## Validation invariants (enforced in `Store`, not the schema)
 

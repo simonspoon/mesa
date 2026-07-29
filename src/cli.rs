@@ -5,6 +5,13 @@
 //!   post-mutation object, including the derived `blocked` flag.
 //! - `list` prints a bare JSON array (compact task objects, no description).
 //! - `delete` prints the full destroyed record(s).
+//! - `--quiet` (opt-in, long form only) swaps that full object for the compact
+//!   projection — the record minus its unbounded free-text fields, the same
+//!   bounded shape `task list` already emits. Accepted on every mutation and
+//!   `show`/`get` in `project`, `task`, `storyboard` (+ `frame`, `edge`) and
+//!   `inbox`; composites keep their key structure and compact their members.
+//!   Default output is unchanged. On a `delete` it waives the full echo, which
+//!   is mesa's recovery transcript.
 //! - Errors are `{"error": {"code", "message"}}` on stderr; clap usage errors
 //!   are intercepted into the same shape (exit 2). `--help` stays human text.
 
@@ -23,11 +30,23 @@ use crate::core::{
 
 const TOP_AFTER_HELP: &str = "\
 OUTPUT
-  Every command prints JSON to stdout: mutations and `show` print the full
-  object, `list` prints a bare JSON array, `delete` prints the full deleted
-  record(s) so the transcript is a recoverable record. Every task object
-  always carries a boolean `blocked` field (true if any dependency is not
-  done/cancelled).
+  Every command prints JSON to stdout: by default mutations and `show` print
+  the full object, `list` prints a bare JSON array, `delete` prints the full
+  deleted record(s) so the transcript is a recoverable record. Every task
+  object always carries a boolean `blocked` field (true if any dependency is
+  not done/cancelled).
+
+  --quiet (opt-in, long form only; no -q) prints the COMPACT projection
+  instead — the record minus its unbounded free-text fields, the same bounded
+  shape `list` already emits. Accepted on every mutation and `show`/`get` in
+  `project`, `task`, `storyboard` (+ `frame`, `edge`) and `inbox`; composite
+  payloads keep their key structure and compact their members. It changes
+  stdout only — never exit codes, stderr or stored data — and default output
+  is byte-identical to before the flag existed. On a `delete` it waives the
+  full echo, which is mesa's recovery transcript standing in for the absent
+  confirmation prompt: allowed because you asked, never a default.
+  `mesa task update <id> --quiet` with no field flag is still a usage error
+  (exit 2) — `--quiet` sits outside the required field group.
 
   Errors are JSON on stderr:
     {\"error\": {\"code\": \"not_found|cycle|validation|conflict|usage|unavailable\", \"message\": \"...\"}}
@@ -137,7 +156,8 @@ EXAMPLES
 
 #[derive(Subcommand)]
 enum ProjectCmd {
-    /// Create a project; prints the full created project
+    /// Create a project; prints the full created project (`--quiet`: without
+    /// its `description`)
     #[command(after_help = "\
 EXAMPLES
   mesa project create \"Website redesign\"
@@ -203,6 +223,7 @@ EXAMPLES
         quiet: bool,
     },
     /// Update fields on a project; prints the full updated project
+    /// (`--quiet`: without its `description`)
     ///
     /// Only the flags you pass change; at least one is required.
     /// `--description ""` clears the description.
@@ -247,6 +268,7 @@ EXAMPLES
         quiet: bool,
     },
     /// Hide a project from unscoped views; prints the full updated project
+    /// (`--quiet`: without its `description`)
     ///
     /// Archiving never deletes anything — `project show`/`update`/`delete`
     /// and every query scoped to this project's explicit id or name are
@@ -260,7 +282,8 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Reverse `archive`; prints the full updated project
+    /// Reverse `archive`; prints the full updated project (`--quiet`: without
+    /// its `description`)
     ///
     /// Idempotent: unarchiving an already-unarchived project succeeds and
     /// returns its current state.
@@ -276,7 +299,8 @@ EXAMPLES
 
 #[derive(Subcommand)]
 enum TaskCmd {
-    /// Create a task in a project; prints the full created task
+    /// Create a task in a project; prints the full created task (`--quiet`:
+    /// the compact `task list` shape)
     ///
     /// A task belongs to exactly one project, fixed at creation. A subtask
     /// (--parent) must be in the same project as its parent.
@@ -412,7 +436,8 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Update fields on a task; prints the full updated task
+    /// Update fields on a task; prints the full updated task (`--quiet`: the
+    /// compact `task list` shape)
     ///
     /// Only the flags you pass change; at least one is required.
     /// `--description ""` clears the description. `--tags` REPLACES the full
@@ -507,7 +532,11 @@ EXAMPLES
     Delete {
         /// Task id
         id: i64,
-        /// Echo the deleted tasks compactly instead of in full
+        /// Echo the deleted tasks compactly (the `task list` shape) instead of
+        /// in full
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
         #[arg(long)]
         quiet: bool,
     },
@@ -643,6 +672,7 @@ EXAMPLES
 #[derive(Subcommand)]
 enum InboxCmd {
     /// Add an item to the global inbox; prints the full created item
+    /// (`--quiet`: without its `body`)
     ///
     /// A free-text update request that lands UNASSIGNED in the one shared inbox
     /// — not tied to any project. Type the message after `add` (quoting is
@@ -873,6 +903,7 @@ EXAMPLES
 #[derive(Subcommand)]
 enum StoryboardCmd {
     /// Create a storyboard in a project; prints the full created storyboard
+    /// (`--quiet`: without its `description`)
     ///
     /// A storyboard belongs to exactly one project, fixed at creation. It is a
     /// freeform canvas of frames (cards) and the edges between them; add those
@@ -929,6 +960,7 @@ EXAMPLES
         quiet: bool,
     },
     /// Update a storyboard's title/description; prints the full storyboard
+    /// (`--quiet`: without its `description`)
     ///
     /// Only the flags you pass change; at least one is required. The project
     /// and author are immutable. `--description ""` clears the description.
@@ -990,7 +1022,8 @@ EXAMPLES
 
 #[derive(Subcommand)]
 enum FrameCmd {
-    /// Add a frame to a storyboard; prints the full created frame
+    /// Add a frame to a storyboard; prints the full created frame (`--quiet`:
+    /// without its `body`)
     ///
     /// Position (--x/--y) and size (--w/--h) are abstract canvas units the web
     /// renders as pixels. `--task` links the frame to a task in the same
@@ -1046,7 +1079,8 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Update a frame; prints the full updated frame
+    /// Update a frame; prints the full updated frame (`--quiet`: without its
+    /// `body`)
     ///
     /// Only the flags you pass change; at least one is required. The storyboard
     /// and author are immutable. `--body ""`/`--color ""` clear those fields;
@@ -1156,7 +1190,9 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Update an edge's label; prints the full updated edge
+    /// Update an edge's label; prints the full updated edge (`--quiet` is
+    /// accepted for uniformity; an edge has no unbounded field, so the output
+    /// is the same either way)
     ///
     /// `--label ""` clears the label. Endpoints are immutable (delete and
     /// re-create to re-route an edge).

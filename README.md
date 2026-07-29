@@ -75,8 +75,12 @@ MESA_DB=/tmp/test.db mesa task list
 
 ## CLI quick start
 
-Every command prints JSON to stdout. Mutations and `show` print the full object;
-`list` prints a bare JSON array; `delete` prints the full deleted record(s).
+Every command prints JSON to stdout. By default mutations and `show` print the
+full object; `list` prints a bare JSON array; `delete` prints the full deleted
+record(s). Pass `--quiet` to get the compact projection instead — the record
+minus its unbounded free-text fields, the same bounded shape `list` already
+emits — when you are driving mesa in a loop and only need the ids and status
+back.
 
 ```bash
 # Create a project and a task in it (project by id or name; positional or --project/--title)
@@ -111,8 +115,28 @@ mesa backup /tmp/mesa-snap.db
 ### Output & error contract
 
 - **stdout is JSON only.** No human/table mode. `list` omits `description`;
-  mutations and `show` print the full object, always including the derived
-  `blocked` boolean. `get` is an alias for every `show`.
+  mutations and `show` print the full object **by default**, always including
+  the derived `blocked` boolean. `get` is an alias for every `show`.
+- **`--quiet` prints the compact projection instead.** Opt-in, long form only
+  (no `-q`, no env var, no config key, never on by default), and accepted on
+  every mutation and `show`/`get` in `project`, `task`, `storyboard` (plus
+  `frame` and `edge`) and `inbox`. The quiet shape is the record minus its
+  unbounded free-text fields — for a task that is exactly the `task list`
+  shape; for a project or storyboard it drops `description`, for a frame or
+  inbox item `body`; an edge has no such field, so its output is unchanged.
+  Composite payloads (`project delete`, `task delete`/`import`, `storyboard
+  show`/`delete`, `frame delete`, `inbox assign`) keep their key structure and
+  compact their members. The flag changes stdout only — exit codes, the JSON
+  error payloads on stderr, and every stored side effect are identical with
+  and without it, and default output is byte-identical to before the flag
+  existed. `mesa task update <id> --quiet` with no field flag is still a usage
+  error, exit 2, with empty stdout: `--quiet` sits outside the required field
+  group, so a loop caller fails loudly instead of silently no-opping.
+- **`--quiet` on a `delete` is an explicit opt-out of the safety floor.**
+  Deletes cascade with no confirmation and no `--force`; the full-record echo
+  *is* mesa's recovery transcript, standing in for the prompt that isn't
+  there. `--quiet` waives it for that call — allowed because the caller asked
+  for it, never a default. Want a net → `mesa backup <path>` first.
 - **Errors are JSON on stderr:**
   ```json
   {"error": {"code": "not_found|validation|cycle|conflict|usage|unavailable", "message": "..."}}

@@ -300,6 +300,9 @@ EXAMPLES
         /// Work receipt (commit SHA / PR URL / path); free text
         #[arg(long)]
         artifact: Option<String>,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// List tasks as a bare JSON array of compact objects (no description)
     ///
@@ -369,12 +372,19 @@ EXAMPLES
 EXAMPLES
   echo '{\"project\":1,\"tasks\":[{\"ref\":\"a\",\"title\":\"design\"},\
 {\"ref\":\"b\",\"title\":\"build\",\"blocked_by\":[\"a\"]}]}' | mesa task import")]
-    Import,
+    Import {
+        /// Print the created tasks as compact objects instead of full ones
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Print one task as a full JSON object (includes description)
     #[command(visible_alias = "get")]
     Show {
         /// Task id
         id: i64,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// Update fields on a task; prints the full updated task
     ///
@@ -455,6 +465,13 @@ EXAMPLES
         /// `--append` alone is still clap's "no field given" usage error.
         #[arg(long)]
         append: bool,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Delete a task AND all its subtasks (no confirmation)
     ///
@@ -464,6 +481,9 @@ EXAMPLES
     Delete {
         /// Task id
         id: i64,
+        /// Echo the deleted tasks compactly instead of in full
+        #[arg(long)]
+        quiet: bool,
     },
     /// Claim a task for a session and move it to in_progress
     ///
@@ -494,6 +514,9 @@ EXAMPLES
         /// Take the task even if another owner holds it
         #[arg(long)]
         force: bool,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// Drop a task's claim, leaving its status unchanged
     ///
@@ -506,6 +529,9 @@ EXAMPLES
     Release {
         /// Task id
         id: i64,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// Make a task blocked by another task
     ///
@@ -522,6 +548,9 @@ EXAMPLES
         /// Task it is blocked by
         #[arg(long)]
         by: i64,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// Remove a blocked-by edge between two tasks
     ///
@@ -535,6 +564,9 @@ EXAMPLES
         /// Blocker to remove
         #[arg(long)]
         on: i64,
+        /// Print the compact task (the `task list` shape) instead of the full object
+        #[arg(long)]
+        quiet: bool,
     },
     /// Print a task's dependency edges in both directions
     ///
@@ -1223,6 +1255,28 @@ fn compact(t: &Task) -> serde_json::Value {
     })
 }
 
+/// Print one task: the full record, or its quiet shape under `--quiet`.
+///
+/// The quiet shape is the existing [`compact`] — the same bounded object
+/// `task list` already emits. There is deliberately no second task projection.
+fn print_task(task: &Task, quiet: bool) {
+    if quiet {
+        print_json(&compact(task));
+    } else {
+        print_json(task);
+    }
+}
+
+/// Print a task array (`delete` cascade, `import`), compacting the MEMBERS
+/// under `--quiet` while keeping the container shape identical.
+fn print_tasks(tasks: &[Task], quiet: bool) {
+    if quiet {
+        print_json(&tasks.iter().map(compact).collect::<Vec<_>>());
+    } else {
+        print_json(&tasks);
+    }
+}
+
 // ---- Quiet projections (`--quiet`, spec 644) ----
 //
 // The quiet shape of a record is the record minus its unbounded free-text
@@ -1463,6 +1517,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             acceptance,
             acceptance_file,
             artifact,
+            quiet,
         } => {
             // clap guarantees exactly one of each positional/flag pair.
             let project = project.or(project_pos).unwrap();
@@ -1472,17 +1527,20 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             let acceptance = resolve_field(acceptance, acceptance_file, &mut stdin_used)?;
             let tags = tags.map(parse_tags).unwrap_or_default();
             let project = resolve_project(&store, &project)?;
-            print_json(&store.create_task(
-                project,
-                &title,
-                description.as_deref(),
-                priority,
-                &tags,
-                parent,
-                acceptance.as_deref(),
-                artifact.as_deref(),
-                Some(status),
-            )?);
+            print_task(
+                &store.create_task(
+                    project,
+                    &title,
+                    description.as_deref(),
+                    priority,
+                    &tags,
+                    parent,
+                    acceptance.as_deref(),
+                    artifact.as_deref(),
+                    Some(status),
+                )?,
+                quiet,
+            );
         }
         TaskCmd::List {
             project_pos,
@@ -1524,7 +1582,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 })),
             }
         }
-        TaskCmd::Import => {
+        TaskCmd::Import { quiet } => {
             let mut input = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
             let doc: ImportDoc = match serde_json::from_str(&input) {
@@ -1536,9 +1594,9 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                     std::process::exit(2);
                 }
             };
-            print_json(&store.import_tasks(&doc)?);
+            print_tasks(&store.import_tasks(&doc)?, quiet);
         }
-        TaskCmd::Show { id } => print_json(&store.get_task(id)?),
+        TaskCmd::Show { id, quiet } => print_task(&store.get_task(id)?, quiet),
         TaskCmd::Update {
             id,
             title,
@@ -1555,6 +1613,7 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             result,
             result_file,
             append,
+            quiet,
         } => {
             let mut stdin_used = false;
             let description = resolve_field(description, description_file, &mut stdin_used)?;
@@ -1599,13 +1658,18 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 sort_order: None,
                 append,
             };
-            print_json(&store.update_task(id, &patch)?);
+            print_task(&store.update_task(id, &patch)?, quiet);
         }
-        TaskCmd::Delete { id } => print_json(&store.delete_task(id)?),
-        TaskCmd::Claim { id, owner, force } => print_json(&store.claim_task(id, &owner, force)?),
-        TaskCmd::Release { id } => print_json(&store.release_task(id)?),
-        TaskCmd::Block { id, by } => print_json(&store.add_dependency(id, by)?),
-        TaskCmd::Unblock { id, on } => print_json(&store.remove_dependency(id, on)?),
+        TaskCmd::Delete { id, quiet } => print_tasks(&store.delete_task(id)?, quiet),
+        TaskCmd::Claim {
+            id,
+            owner,
+            force,
+            quiet,
+        } => print_task(&store.claim_task(id, &owner, force)?, quiet),
+        TaskCmd::Release { id, quiet } => print_task(&store.release_task(id)?, quiet),
+        TaskCmd::Block { id, by, quiet } => print_task(&store.add_dependency(id, by)?, quiet),
+        TaskCmd::Unblock { id, on, quiet } => print_task(&store.remove_dependency(id, on)?, quiet),
         TaskCmd::Deps { id } => {
             let task = store.get_task(id)?;
             let blocked_by: Vec<_> = store.list_blockers(id)?.iter().map(compact).collect();

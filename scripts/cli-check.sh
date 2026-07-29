@@ -449,6 +449,151 @@ ok "create --path: auto-binds the --path directory's repo"
 run 0 "$MESA" project delete "$P3"
 run 0 "$MESA" project delete "$PI"
 
+# ---- --quiet on the task group (spec 644) ----
+# Self-contained: its own project, dropped at the end, so the delete/backup
+# assertions below (which assume only P and P2 exist) stay valid.
+#
+# Quiet output is compared with `printf '%s' | jq`, never `echo "$var"` — zsh
+# echo expands escapes and corrupts JSON carrying \n in a description.
+
+# quiet_is_full_minus_bodies <full-file> <quiet-file> — the quiet object must be
+# EXACTLY the full object minus the four keys the compact shape drops: every
+# other key present and byte-equal. Fails if a key is missing, extra, or edited.
+quiet_is_full_minus_bodies() {
+  jq -e --slurpfile q "$2" \
+    'del(.description, .artifact, .result, .created_at) == $q[0]' "$1" >/dev/null
+}
+
+run 0 "$MESA" project create "Quiet" --no-git
+PQ=$(jqs .id)
+
+BODY="line one
+line two"
+
+# show: the reference parity case — same record, read twice, so nothing volatile
+# moves between the two calls.
+run 0 "$MESA" task create "$PQ" "Quiet subject" --description "$BODY" \
+  --acceptance "AC" --artifact "sha1"
+QT=$(jqs .id)
+run 0 "$MESA" task show "$QT"
+printf '%s' "$STDOUT" >"$TMP/full.json"
+# non-quiet output is unchanged: the full 17-key task object
+[ "$(jqs 'keys | join(",")')" = "acceptance,artifact,blocked,claimed_at,created_at,description,id,owner,parent_id,priority,project_id,result,sort_order,status,tags,title,updated_at" ] ||
+  fail "task show (no --quiet): full key set must be unchanged"
+run 0 "$MESA" task show "$QT" --quiet
+printf '%s' "$STDOUT" >"$TMP/quiet.json"
+[ "$(jqs 'has("description")')" = "false" ] || fail "task show --quiet: description must be dropped"
+quiet_is_full_minus_bodies "$TMP/full.json" "$TMP/quiet.json" ||
+  fail "task show --quiet: must be the full object minus description/artifact/result/created_at"
+ok "task show --quiet: compact shape, every other key present and equal"
+
+# every quiet mutation prints that same compact shape; parity is checked against
+# a following `show` (a read, so updated_at cannot move between the two).
+quiet_mutation_ok() { # quiet_mutation_ok <label> <cmd...>
+  local label=$1; shift
+  run 0 "$@"
+  printf '%s' "$STDOUT" >"$TMP/quiet.json"
+  [ "$(jqs 'has("description")')" = "false" ] || fail "$label --quiet: description must be dropped"
+  run 0 "$MESA" task show "$QT"
+  printf '%s' "$STDOUT" >"$TMP/full.json"
+  quiet_is_full_minus_bodies "$TMP/full.json" "$TMP/quiet.json" ||
+    fail "$label --quiet: must be the full object minus the four body keys"
+}
+
+quiet_mutation_ok "task update" "$MESA" task update "$QT" --status in_progress --quiet
+quiet_mutation_ok "task claim" "$MESA" task claim "$QT" --owner sess-q --quiet
+quiet_mutation_ok "task release" "$MESA" task release "$QT" --quiet
+ok "task update/claim/release --quiet: compact shape, parity with show"
+
+run 0 "$MESA" task create "$PQ" "Quiet blocker" --quiet
+QB=$(jqs .id)
+[ "$(jqs 'has("description")')" = "false" ] || fail "task create --quiet: description must be dropped"
+[ "$(jqs .title)" = "Quiet blocker" ] || fail "task create --quiet: title"
+quiet_mutation_ok "task block" "$MESA" task block "$QT" --by "$QB" --quiet
+[ "$(jqs .blocked)" = "true" ] || fail "task block --quiet: blocked must be true"
+quiet_mutation_ok "task unblock" "$MESA" task unblock "$QT" --on "$QB" --quiet
+[ "$(jqs .blocked)" = "false" ] || fail "task unblock --quiet: blocked must be false"
+ok "task create/block/unblock --quiet: compact shape, values intact"
+
+# import composite: same container (a bare array), members compacted
+IMPQ="{\"project\":$PQ,\"tasks\":[{\"ref\":\"a\",\"title\":\"quiet import\",\"description\":\"an imported body\"}]}"
+run 0 bash -c "printf '%s' '$IMPQ' | $MESA task import"
+[ "$(jqs type)" = "array" ] || fail "task import (no --quiet): bare array"
+[ "$(jqs '.[0] | has("description")')" = "true" ] || fail "task import (no --quiet): description present"
+run 0 "$MESA" task delete "$(jqs '.[0].id')"
+run 0 bash -c "printf '%s' '$IMPQ' | $MESA task import --quiet"
+[ "$(jqs type)" = "array" ] || fail "task import --quiet: container stays a bare array"
+[ "$(jqs length)" = "1" ] || fail "task import --quiet: one created task"
+[ "$(jqs 'all(.[]; has("description"))')" = "false" ] || fail "task import --quiet: members compacted"
+[ "$(jqs '.[0].title')" = "quiet import" ] || fail "task import --quiet: title"
+run 0 "$MESA" task delete "$(jqs '.[0].id')" --quiet
+ok "task import --quiet: same container, compact members"
+
+# delete composite: the cascade array keeps its shape, members compacted.
+# --quiet here is an explicit opt-out of the full recovery transcript.
+run 0 "$MESA" task create "$PQ" "Quiet parent" --description "$BODY"
+QP=$(jqs .id)
+run 0 "$MESA" task create "$PQ" "Quiet child" --description "$BODY" --parent "$QP"
+run 0 "$MESA" task delete "$QP" --quiet
+[ "$(jqs type)" = "array" ] || fail "task delete --quiet: container stays a bare array"
+[ "$(jqs length)" = "2" ] || fail "task delete --quiet: task + cascaded subtask"
+[ "$(jqs '.[0].id')" = "$QP" ] || fail "task delete --quiet: deleted task first"
+[ "$(jqs 'any(.[]; has("description"))')" = "false" ] || fail "task delete --quiet: members compacted"
+[ "$(jqs 'all(.[]; has("blocked"))')" = "true" ] || fail "task delete --quiet: blocked still present"
+ok "task delete --quiet: cascade array with compact members"
+
+# --quiet is a modifier, NOT a field: `task update <id> --quiet` alone must be a
+# loud usage error, so a batch caller fails on item one instead of silently
+# no-opping every item.
+run 2 "$MESA" task update "$QT" --quiet
+[ -z "$STDOUT" ] || fail "task update --quiet alone: stdout must be empty"
+[ -n "$STDERR" ] || fail "task update --quiet alone: stderr must be non-empty"
+[ "$(jqe .error.code)" = "usage" ] || fail "task update --quiet alone: error.code"
+ok "task update --quiet with no field flag: exit 2, empty stdout, code=usage"
+
+# long form only: no -q alias
+run 2 "$MESA" task show "$QT" -q
+ok "task show -q: exit 2 (no short alias)"
+
+# --quiet does not exist outside the 9 subcommands in scope
+run 2 "$MESA" task list --quiet
+run 2 "$MESA" task next --quiet
+run 2 "$MESA" task deps "$QT" --quiet
+run 2 "$MESA" task events "$QT" --quiet
+ok "task list/next/deps/events --quiet: exit 2 (unknown argument)"
+
+# every one of the 9 advertises the flag in --help
+for SUB in create import show update delete claim release block unblock; do
+  run 0 "$MESA" task "$SUB" --help
+  grep -q -- "--quiet" <<<"$STDOUT" || fail "task $SUB --help: must list --quiet"
+done
+ok "task create/import/show/update/delete/claim/release/block/unblock --help: --quiet listed"
+
+# --quiet changes stdout only: exit code and the stderr payload are identical
+run 1 "$MESA" task show 999999
+printf '%s' "$STDERR" >"$TMP/err-full.txt"
+run 1 "$MESA" task show 999999 --quiet
+printf '%s' "$STDERR" >"$TMP/err-quiet.txt"
+cmp -s "$TMP/err-full.txt" "$TMP/err-quiet.txt" ||
+  fail "task show --quiet: stderr must be byte-identical on the error path"
+ok "error path: exit 1 and byte-identical stderr with and without --quiet"
+
+# size: the reason the flag exists (28 KB description -> < 1 KB on stdout)
+python3 -c "import sys; sys.stdout.write('x' * 28672)" >"$TMP/big.txt"
+run 0 "$MESA" task create "$PQ" "Big body" --description-file "$TMP/big.txt" --quiet
+QBIG=$(jqs .id)
+run 0 "$MESA" task update "$QBIG" --status done --quiet
+printf '%s' "$STDOUT" >"$TMP/big-quiet.json"
+[ "$(wc -c <"$TMP/big-quiet.json")" -lt 1024 ] ||
+  fail "task update --quiet on a 28 KB description: stdout must be < 1 KB"
+[ "$(jqs .status)" = "done" ] || fail "task update --quiet: | jq -r .status must print done"
+run 0 "$MESA" task update "$QBIG" --status todo
+[ "$(wc -c <<<"$STDOUT")" -gt 28672 ] ||
+  fail "task update without --quiet: must still echo the full 28 KB body"
+ok "28 KB description: --quiet stdout < 1 KB, status readable; default still full"
+
+run 0 "$MESA" project delete "$PQ"
+
 # ---- delete ----
 run 0 "$MESA" task delete "$T3"
 [ "$(jqs type)" = "array" ] || fail "task delete: bare array of destroyed records"

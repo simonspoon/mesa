@@ -1223,6 +1223,48 @@ fn compact(t: &Task) -> serde_json::Value {
     })
 }
 
+// ---- Quiet projections (`--quiet`, spec 644) ----
+//
+// The quiet shape of a record is the record minus its unbounded free-text
+// field(s). It is produced by serializing the REAL record and removing the
+// named keys — never by a `json!{}` literal that re-lists the kept fields.
+// A literal is a shadow schema: a field added to the record still compiles,
+// still passes `cargo test`, and is silently missing from CLI output (exactly
+// how `compact` below drifts). The key-parity tests at the bottom of this file
+// are the tripwire that keeps every list here honest.
+
+/// Keys dropped from a `Project` under `--quiet`.
+#[allow(dead_code)]
+const QUIET_DROP_PROJECT: &[&str] = &["description"];
+/// Keys dropped from a `Storyboard` under `--quiet`.
+#[allow(dead_code)]
+const QUIET_DROP_STORYBOARD: &[&str] = &["description"];
+/// Keys dropped from a `Frame` under `--quiet`.
+#[allow(dead_code)]
+const QUIET_DROP_FRAME: &[&str] = &["body"];
+/// Keys dropped from an `InboxItem` under `--quiet`.
+#[allow(dead_code)]
+const QUIET_DROP_INBOX_ITEM: &[&str] = &["body"];
+/// A `FrameEdge` has no unbounded field: quiet output equals full output.
+/// The flag is still accepted on edge subcommands, for uniformity.
+#[allow(dead_code)]
+const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
+
+/// Quiet projection of one record: the serialized record minus `drop`ped keys.
+///
+/// `Task` does NOT go through here — its quiet shape is the existing
+/// [`compact`], the same bounded object `task list` already emits.
+#[allow(dead_code)] // call sites land with the per-subcommand `--quiet` wiring
+fn quiet(value: &impl serde::Serialize, drop: &[&str]) -> serde_json::Value {
+    let mut value = serde_json::to_value(value).expect("json serialize");
+    if let Some(obj) = value.as_object_mut() {
+        for key in drop {
+            obj.remove(*key);
+        }
+    }
+    value
+}
+
 fn print_json<T: serde::Serialize>(value: &T) {
     println!("{}", serde_json::to_string(value).expect("json serialize"));
 }
@@ -1858,4 +1900,359 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
         InboxCmd::Delete { id } => print_json(&store.delete_inbox_item(id)?),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Key-set parity for the CLI's output projections.
+    //!
+    //! Each projection is pinned against an explicit expected key list for its
+    //! record type. That list is the tripwire: add a field to `Project`,
+    //! `Storyboard`, `Frame`, `FrameEdge`, `InboxItem` or `Task` and the
+    //! corresponding test goes red, forcing a decision about whether the new
+    //! field belongs in the quiet shape — instead of it silently appearing
+    //! (derived projections) or silently vanishing (`compact`'s literal).
+
+    use super::*;
+    use crate::core::{
+        AnchorSide, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Project, Storyboard,
+        TaskSummary, Waypoint,
+    };
+
+    /// Serialized top-level key set of any record, sorted.
+    fn keys(value: &impl serde::Serialize) -> Vec<String> {
+        serde_json::to_value(value)
+            .expect("json serialize")
+            .as_object()
+            .expect("record serializes to an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn sorted(keys: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn value_keys(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_object()
+            .expect("projection is an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// `full` minus `drop`, order-independent. Every dropped key must really
+    /// be on the record — a typo in a drop list would otherwise make the
+    /// parity assertion tautological (`quiet` no-ops on an absent key, and
+    /// the expectation here would drop nothing either).
+    fn minus(full: &[String], drop: &[&str]) -> Vec<String> {
+        for key in drop {
+            assert!(
+                full.iter().any(|k| k == key),
+                "drop list names {key}, which is not a key of this record",
+            );
+        }
+        let mut v: Vec<String> = full
+            .iter()
+            .filter(|k| !drop.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn sorted_owned(mut keys: Vec<String>) -> Vec<String> {
+        keys.sort();
+        keys
+    }
+
+    fn sample_project() -> Project {
+        Project {
+            id: 1,
+            name: "p".into(),
+            description: Some("d".into()),
+            root_commit: Some("abc".into()),
+            local_path: Some("/tmp/p".into()),
+            archived: false,
+        }
+    }
+
+    fn sample_task() -> Task {
+        Task {
+            id: 1,
+            project_id: 2,
+            parent_id: Some(3),
+            title: "t".into(),
+            description: Some("d".into()),
+            status: Status::Todo,
+            priority: Priority::Medium,
+            tags: vec!["x".into()],
+            acceptance: Some("a".into()),
+            artifact: Some("sha".into()),
+            result: Some("r".into()),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+            sort_order: 1.0,
+            owner: Some("o".into()),
+            claimed_at: Some("2026-01-03 00:00:00".into()),
+            blocked: false,
+        }
+    }
+
+    fn sample_storyboard() -> Storyboard {
+        Storyboard {
+            id: 1,
+            project_id: 2,
+            title: "s".into(),
+            description: Some("d".into()),
+            author: Some("user".into()),
+            diagram_type: DiagramType::Storyboard,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+        }
+    }
+
+    fn sample_frame() -> Frame {
+        Frame {
+            id: 1,
+            storyboard_id: 2,
+            title: "f".into(),
+            body: Some("b".into()),
+            x: 40.0,
+            y: 40.0,
+            w: 200.0,
+            h: 120.0,
+            color: Some("#00e5ff".into()),
+            task_id: Some(3),
+            author: Some("user".into()),
+            shape: Some(FrameShape::Process),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+        }
+    }
+
+    fn sample_edge() -> FrameEdge {
+        FrameEdge {
+            id: 1,
+            storyboard_id: 2,
+            from_frame: 3,
+            to_frame: 4,
+            label: Some("l".into()),
+            author: Some("user".into()),
+            created_at: "2026-01-01 00:00:00".into(),
+            waypoints: vec![Waypoint { x: 1.0, y: 2.0 }],
+            from_anchor: Some(AnchorSide::Right),
+            to_anchor: Some(AnchorSide::Left),
+        }
+    }
+
+    fn sample_inbox_item() -> InboxItem {
+        InboxItem {
+            id: 1,
+            project_id: Some(2),
+            author: Some("user".into()),
+            body: "b".into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+        }
+    }
+
+    // ---- Task: quiet shape is the existing `compact` (spec M6) ----
+
+    /// S1: `compact` is a hand-written literal mirroring `TaskSummary`; assert
+    /// the two key sets match so the drift trap M6 now depends on stays shut.
+    #[test]
+    fn compact_matches_task_summary_keys() {
+        let task = sample_task();
+        assert_eq!(
+            sorted_owned(value_keys(&compact(&task))),
+            sorted_owned(keys(&TaskSummary::from(&task))),
+        );
+    }
+
+    #[test]
+    fn task_quiet_is_full_minus_free_text() {
+        let task = sample_task();
+        let full = keys(&task);
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "project_id",
+                "parent_id",
+                "title",
+                "description",
+                "status",
+                "priority",
+                "tags",
+                "acceptance",
+                "artifact",
+                "result",
+                "created_at",
+                "updated_at",
+                "sort_order",
+                "owner",
+                "claimed_at",
+                "blocked",
+            ]),
+            "Task gained/lost a field: decide whether it belongs in `compact` \
+             (the --quiet and `task list` shape) before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&compact(&task))),
+            minus(&full, &["description", "artifact", "result", "created_at"]),
+        );
+    }
+
+    // ---- Everything else: the shared `quiet` helper ----
+
+    #[test]
+    fn project_quiet_drops_description() {
+        let full = keys(&sample_project());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "name",
+                "description",
+                "root_commit",
+                "local_path",
+                "archived",
+            ]),
+            "Project gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(&sample_project(), QUIET_DROP_PROJECT))),
+            minus(&full, QUIET_DROP_PROJECT),
+        );
+    }
+
+    #[test]
+    fn storyboard_quiet_drops_description() {
+        let full = keys(&sample_storyboard());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "project_id",
+                "title",
+                "description",
+                "author",
+                "diagram_type",
+                "created_at",
+                "updated_at",
+            ]),
+            "Storyboard gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_storyboard(),
+                QUIET_DROP_STORYBOARD
+            ))),
+            minus(&full, QUIET_DROP_STORYBOARD),
+        );
+    }
+
+    #[test]
+    fn frame_quiet_drops_body() {
+        let full = keys(&sample_frame());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "storyboard_id",
+                "title",
+                "body",
+                "x",
+                "y",
+                "w",
+                "h",
+                "color",
+                "task_id",
+                "author",
+                "shape",
+                "created_at",
+                "updated_at",
+            ]),
+            "Frame gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(&sample_frame(), QUIET_DROP_FRAME))),
+            minus(&full, QUIET_DROP_FRAME),
+        );
+    }
+
+    #[test]
+    fn frame_edge_quiet_equals_full() {
+        let full = keys(&sample_edge());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "storyboard_id",
+                "from_frame",
+                "to_frame",
+                "label",
+                "author",
+                "created_at",
+                "waypoints",
+                "from_anchor",
+                "to_anchor",
+            ]),
+            "FrameEdge gained/lost a field: it has no unbounded free text \
+             today, so --quiet == full; revisit if that changes",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(&sample_edge(), QUIET_DROP_FRAME_EDGE))),
+            minus(&full, QUIET_DROP_FRAME_EDGE),
+        );
+        // Quiet == full, values included, not just keys.
+        assert_eq!(
+            quiet(&sample_edge(), QUIET_DROP_FRAME_EDGE),
+            serde_json::to_value(sample_edge()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn inbox_item_quiet_drops_body() {
+        let full = keys(&sample_inbox_item());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "project_id",
+                "author",
+                "body",
+                "created_at",
+                "updated_at",
+            ]),
+            "InboxItem gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_inbox_item(),
+                QUIET_DROP_INBOX_ITEM
+            ))),
+            minus(&full, QUIET_DROP_INBOX_ITEM),
+        );
+    }
+
+    /// Kept values must be untouched — `quiet` removes keys, never rewrites.
+    #[test]
+    fn quiet_preserves_kept_values() {
+        let project = sample_project();
+        let projected = quiet(&project, QUIET_DROP_PROJECT);
+        let full = serde_json::to_value(&project).unwrap();
+        for key in value_keys(&projected) {
+            assert_eq!(projected[&key], full[&key], "value changed for {key}");
+        }
+    }
 }

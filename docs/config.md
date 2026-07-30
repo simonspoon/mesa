@@ -116,12 +116,57 @@ attach bridge (`claude attach <id>`), both of which use `MESA_CLAUDE_BIN`
 directly. Point a template at a different tool and its sessions will run —
 they just won't appear in, or be attachable from, the Agents sidebar.
 
+## The Settings page
+
+The same file is editable from the web UI: **Settings**, pinned to the bottom
+of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). It is a form
+over `commands` and nothing else — a text box per action, the built-in default
+shown as the box's placeholder, the action's placeholder vocabulary listed
+under it, and the argv that will actually run spelled out beneath.
+
+Two behaviors it exists to make legible, both of them the file's semantics
+rather than presentation:
+
+- **A blank box is the built-in default**, not an empty command — so *reset* is
+  literally "clear the box", and a saved blank **removes the key** rather than
+  storing `""`.
+- **A bad template is refused at save time**, with the same message the spawn
+  path would have produced later (`{tsak}`, an unbalanced quote, an unknown
+  key). Validation runs over the whole batch before anything is written, so a
+  rejected save leaves the file byte-identical.
+
+Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
+`save_commands`):
+
+- `GET` returns one row per action — `{action, value, default, placeholders}`,
+  where `value` is `null` when the action is falling back. A file that exists
+  but can't be parsed is **502 `unavailable`** here exactly as it is on a spawn:
+  the page says the config is broken rather than rendering an empty editor a
+  save would then write over the wreckage.
+- `PUT` takes `{"commands": {<action>: <template>}}` and touches **only** the
+  keys present; other keys, and any other top-level section of the file, are
+  preserved verbatim (this file is meant to grow sections mesa doesn't know
+  about). It echoes the settings re-read from disk. A rejected template is
+  **422 `validation`**; an unreadable/unwritable file is **502 `unavailable`**.
+  The write is a temp-file rename, since the config is read on every spawn with
+  no lock between the two.
+- The write is **loopback-only in both serve modes** — one notch stronger than
+  the agent routes, which `--lan` does open to LAN peers. Rewriting these
+  templates chooses the *program* mesa will execute on the next dispatch, so it
+  gets the `local_path` rule (`require_local_path_write`), not the agent one.
+  The read sits in the agents' class (`require_agent_access`).
+
+Nothing is cached: a save is live on the next dispatch, with no restart.
+
 ## Gate
 
 `scripts/config-check.sh` — all three commands driven by a configured template
 (placeholders, quoting, the drop rule), the built-in argv proven unused while
 they are set and byte-for-byte unchanged when they aren't, the `id: null`
 no-receipt path, hot reload with no restart, and the malformed /
-unsupported-placeholder failures. It writes a real `~/.mesa/config.json` under
-a throwaway `HOME` rather than using `MESA_CONFIG_FILE`, so the default path
-resolution is covered too.
+unsupported-placeholder failures — plus `GET`/`PUT /api/config`: the round
+trip, the blank-clears-the-key rule, untouched keys and unknown sections
+preserved, a just-saved template driving the very next spawn, and the 422/502
+refusals leaving the file byte-identical. It writes a real
+`~/.mesa/config.json` under a throwaway `HOME` rather than using
+`MESA_CONFIG_FILE`, so the default path resolution is covered too.

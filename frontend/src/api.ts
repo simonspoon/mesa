@@ -10,6 +10,7 @@ import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
+import type { ConfigCommand } from './types/ConfigCommand'
 import type { DiagramType } from './types/DiagramType'
 import type { DirEntry } from './types/DirEntry'
 import type { DirListing } from './types/DirListing'
@@ -666,4 +667,27 @@ export function getCcUsage(): Promise<CcUsage> {
  */
 export function restartServer(): Promise<{ restarting: boolean }> {
   return request('/api/restart', jsonInit('POST', {}))
+}
+
+/**
+ * The three agent-spawn command templates in `~/.mesa/config.json`, each with
+ * the built-in default it falls back to and the placeholders it may use
+ * (docs/config.md). 502 `unavailable` means the file itself is unreadable or
+ * malformed — a real state the Settings page shows rather than papering over.
+ */
+export function getConfig(): Promise<ConfigCommand[]> {
+  return request('/api/config')
+}
+
+/**
+ * Writes command templates and echoes the settings as re-read from disk, so
+ * the caller never has to guess what landed. Only the keys passed are touched;
+ * a blank value clears one back to its built-in default. 422 `validation` is a
+ * template the spawn path would later reject (bad placeholder, unbalanced
+ * quote) — nothing is written in that case.
+ */
+export function updateConfig(
+  commands: Record<string, string>,
+): Promise<ConfigCommand[]> {
+  return request('/api/config', jsonInit('PUT', { commands }))
 }

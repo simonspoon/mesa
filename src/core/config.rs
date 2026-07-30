@@ -32,12 +32,19 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::core::types::ConfigCommand;
+
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
 pub const TODO_WATCHER: &str = "todo-watcher";
 /// The inbox-watcher's triage command (`docs/inbox-watcher.md`).
 pub const INBOX_WATCHER: &str = "inbox-watcher";
 /// The Agents surface's "add agent" command (`docs/agents.md`).
 pub const AGENT_SPAWN: &str = "agent-spawn";
+
+/// Every configurable command, in the order the docs and the Settings page
+/// list them. The single source of truth for "which keys mesa configures" —
+/// [`default_command`] answers the same question one key at a time.
+pub const ACTIONS: [&str; 3] = [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
 /// config file existed, spelled as a template. `{bin}`/`{agent}` carry the
@@ -119,6 +126,159 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
         .filter(|s| !s.is_empty()))
 }
 
+/// Every action's current setting, for the Settings page
+/// (`GET /api/config`): the configured template (`None` = falling back), the
+/// built-in default it falls back to, and the placeholders it may use.
+///
+/// `Err` on a file that exists but can't be read or parsed — the same rule the
+/// spawn path follows, for the same reason: a broken config must never read as
+/// "unconfigured", least of all on the surface that edits it.
+pub fn settings() -> Result<Vec<ConfigCommand>, String> {
+    settings_in(&config_file())
+}
+
+fn settings_in(path: &Path) -> Result<Vec<ConfigCommand>, String> {
+    ACTIONS
+        .iter()
+        .map(|action| {
+            Ok(ConfigCommand {
+                action: (*action).to_string(),
+                value: command_in(path, action)?,
+                default: default_command(action).unwrap_or_default().to_string(),
+                placeholders: offered_placeholders(action)
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Why a [`save_commands`] call didn't happen. Split so the API can answer
+/// 422 for "your template is wrong" and 502 for "this machine's config file is
+/// unreadable" — the same split the spawn path already draws.
+#[derive(Debug, PartialEq)]
+pub enum SaveError {
+    /// An unknown key, or a template the spawn path would later reject.
+    Validation(String),
+    /// The file couldn't be read, parsed or written.
+    Unavailable(String),
+}
+
+/// Writes the `commands` entries named in `updates` into the config file.
+///
+/// - A blank value **removes** the key, which is how the Settings page says
+///   "back to the built-in default" — the same meaning blank already has on
+///   the read side ([`command_in`]).
+/// - Every template is validated *before* anything is written, so a rejected
+///   save leaves the file exactly as it was and a half-applied batch is not a
+///   reachable state.
+/// - Keys this call doesn't name, and any other top-level section of the file,
+///   are preserved verbatim — the file is documented as free to grow sections
+///   mesa doesn't know about, and an editor that silently dropped them would
+///   break that promise.
+pub fn save_commands(updates: &HashMap<String, String>) -> Result<(), SaveError> {
+    save_commands_in(&config_file(), updates)
+}
+
+fn save_commands_in(path: &Path, updates: &HashMap<String, String>) -> Result<(), SaveError> {
+    let mut actions: Vec<&String> = updates.keys().collect();
+    actions.sort();
+    for action in &actions {
+        if default_command(action).is_none() {
+            return Err(SaveError::Validation(format!(
+                "unknown command {action:?}; mesa configures {}",
+                ACTIONS.join(", ")
+            )));
+        }
+        let template = updates[*action].trim();
+        if !template.is_empty() {
+            validate(action, template).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root: serde_json::Value = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            SaveError::Unavailable(format!("malformed mesa config {}: {e}", path.display()))
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(SaveError::Unavailable(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let commands = object
+        .entry("commands")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(commands) = commands.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"commands\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for action in actions {
+        let template = updates[action].trim();
+        if template.is_empty() {
+            commands.remove(action);
+        } else {
+            commands.insert(
+                action.clone(),
+                serde_json::Value::String(template.to_string()),
+            );
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// Write via a sibling temp file + rename, so a spawn reading the config
+/// concurrently sees either the old file or the new one, never a truncated
+/// one — the file is read on **every** spawn, with no lock between us.
+fn write_atomically(path: &Path, body: &str) -> Result<(), SaveError> {
+    let unavailable =
+        |e: std::io::Error| SaveError::Unavailable(format!("cannot write {}: {e}", path.display()));
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(unavailable)?;
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, body).map_err(unavailable)?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        unavailable(e)
+    })
+}
+
+/// Rejects a template the spawn path would fail on later — an unterminated
+/// quote, a placeholder this action doesn't offer, or one that expands to an
+/// empty argv. Every value is supplied, so only template-shaped mistakes are
+/// caught here; the per-call drop rule stays [`expand`]'s business.
+///
+/// The point is *when* the failure lands: at save time, in the editor, rather
+/// than at the next dispatch, in a watcher log the user isn't reading.
+pub fn validate(action: &str, template: &str) -> Result<(), String> {
+    let vars = Vars {
+        bin: Some("claude"),
+        agent: Some("swe"),
+        id: Some(1),
+        name: Some("name"),
+        prompt: Some("prompt"),
+    };
+    expand(action, template, &vars).map(|_| ())
+}
+
 /// The values a template's placeholders may resolve to. A `None` field is
 /// "not available for this call" — see [`expand`]'s drop rule. `bin`/`agent`
 /// are filled from the env seams by `agents::argv_for`, not by callers.
@@ -155,12 +315,20 @@ impl Vars<'_> {
     }
 }
 
-fn offered_list(action: &str) -> &'static str {
+/// The placeholder names `action` offers, `{}`-delimited and in doc order.
+/// Shared by the "unsupported placeholder" error below and by [`settings`],
+/// so the Settings page can only ever advertise placeholders [`Vars::lookup`]
+/// actually accepts.
+pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
     if action == AGENT_SPAWN {
-        "{bin}, {agent}, {prompt}"
+        &["{bin}", "{agent}", "{prompt}"]
     } else {
-        "{bin}, {agent}, {id}, {name}"
+        &["{bin}", "{agent}", "{id}", "{name}"]
     }
+}
+
+fn offered_list(action: &str) -> String {
+    offered_placeholders(action).join(", ")
 }
 
 /// Expands `template` into an argv for `action`.
@@ -337,6 +505,170 @@ mod tests {
         let path = write_config(dir.path(), "not json");
         let err = command_in(&path, TODO_WATCHER).unwrap_err();
         assert!(err.contains("malformed mesa config"), "{err}");
+    }
+
+    fn update(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn settings_reports_every_action_with_its_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"commands": {"todo-watcher": "mytool run {id}"}}"#,
+        );
+        let settings = settings_in(&path).unwrap();
+        assert_eq!(settings.len(), ACTIONS.len());
+        assert_eq!(settings[0].action, TODO_WATCHER);
+        assert_eq!(settings[0].value.as_deref(), Some("mytool run {id}"));
+        assert_eq!(settings[0].default, DEFAULT_TODO_WATCHER);
+        // An unconfigured action is `None` — "falling back", not "empty".
+        assert_eq!(settings[1].action, INBOX_WATCHER);
+        assert_eq!(settings[1].value, None);
+        assert_eq!(settings[1].default, DEFAULT_INBOX_WATCHER);
+        // The placeholder vocabulary is per-action, matching `Vars::lookup`.
+        assert_eq!(
+            settings[0].placeholders,
+            ["{bin}", "{agent}", "{id}", "{name}"]
+        );
+        assert_eq!(settings[2].action, AGENT_SPAWN);
+        assert_eq!(settings[2].placeholders, ["{bin}", "{agent}", "{prompt}"]);
+    }
+
+    #[test]
+    fn settings_surfaces_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = settings_in(&path).unwrap_err();
+        assert!(err.contains("malformed mesa config"), "{err}");
+    }
+
+    #[test]
+    fn save_commands_writes_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file need not exist yet — nor its parent directory.
+        let path = dir.path().join("nested").join("config.json");
+        save_commands_in(&path, &update(&[(AGENT_SPAWN, "  mytool -- {prompt}  ")])).unwrap();
+        // Stored trimmed, and visible to the ordinary read path immediately.
+        assert_eq!(
+            command_in(&path, AGENT_SPAWN).unwrap().as_deref(),
+            Some("mytool -- {prompt}")
+        );
+        assert_eq!(command_in(&path, TODO_WATCHER).unwrap(), None);
+    }
+
+    #[test]
+    fn save_commands_preserves_untouched_keys_and_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"other": {"x": 1}, "commands": {"todo-watcher": "mytool {id}"}}"#,
+        );
+        save_commands_in(&path, &update(&[(INBOX_WATCHER, "mytool triage {id}")])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // A section mesa knows nothing about survives the edit verbatim.
+        assert_eq!(written["other"]["x"], 1);
+        assert_eq!(written["commands"]["todo-watcher"], "mytool {id}");
+        assert_eq!(written["commands"]["inbox-watcher"], "mytool triage {id}");
+    }
+
+    #[test]
+    fn save_commands_clears_a_key_on_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"commands": {"todo-watcher": "mytool {id}", "agent-spawn": "mytool"}}"#,
+        );
+        save_commands_in(&path, &update(&[(TODO_WATCHER, "   ")])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Removed, not stored blank: the default is expressed by absence.
+        assert!(written["commands"].get(TODO_WATCHER).is_none());
+        assert_eq!(written["commands"]["agent-spawn"], "mytool");
+        assert_eq!(command_in(&path, TODO_WATCHER).unwrap(), None);
+    }
+
+    #[test]
+    fn save_commands_rejects_a_bad_template_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"commands": {"todo-watcher": "mytool {id}"}}"#;
+        let path = write_config(dir.path(), before);
+        // Unsupported placeholder for this action…
+        let err =
+            save_commands_in(&path, &update(&[(TODO_WATCHER, "mytool {prompt}")])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unsupported placeholder")),
+            "{err:?}"
+        );
+        // …an unterminated quote…
+        let err = save_commands_in(&path, &update(&[(AGENT_SPAWN, "mytool \"oops")])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unterminated")),
+            "{err:?}"
+        );
+        // …and a key mesa doesn't configure.
+        let err = save_commands_in(&path, &update(&[("tsak", "mytool")])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unknown command")),
+            "{err:?}"
+        );
+        // Every rejection is total: the file is byte-identical.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn save_commands_is_all_or_nothing_across_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"commands": {}}"#;
+        let path = write_config(dir.path(), before);
+        // One good entry, one bad one — the good one must not land either.
+        let err = save_commands_in(
+            &path,
+            &update(&[(TODO_WATCHER, "mytool {id}"), (AGENT_SPAWN, "mytool {id}")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Validation(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn save_commands_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = save_commands_in(&path, &update(&[(TODO_WATCHER, "mytool {id}")])).unwrap_err();
+        // Unavailable, not validation: the user's template was fine, the file
+        // on this machine isn't — and overwriting it would destroy content.
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn saved_templates_expand_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        save_commands_in(
+            &path,
+            &update(&[(TODO_WATCHER, r#"mytool --name {name} -- "/go {id}""#)]),
+        )
+        .unwrap();
+        let template = command_in(&path, TODO_WATCHER).unwrap().unwrap();
+        let vars = Vars {
+            id: Some(7),
+            name: Some("a b"),
+            ..Vars::default()
+        };
+        assert_eq!(
+            expand(TODO_WATCHER, &template, &vars).unwrap(),
+            ["mytool", "--name", "a b", "--", "/go 7"]
+        );
     }
 
     #[test]

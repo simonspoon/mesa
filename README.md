@@ -313,7 +313,9 @@ start locations in the global Agents sidebar.
   change the binary, its flags, the persona or the slash command without
   rebuilding. Placeholders `{id}`, `{name}`, `{prompt}` (plus `{bin}`,
   `{agent}`). Templates are argv, not shell: no config file means the built-in
-  `claude --bg --agent swe …` command, unchanged. See `docs/config.md`.
+  `claude --bg --agent swe …` command, unchanged. Editable from the web UI's
+  **Settings** page (pinned to the bottom of the left nav) or by hand. See
+  `docs/config.md`.
 - **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
   the database. One point so far — `task-execute`, fired by `mesa task execute
   <id>` or `POST /api/tasks/{id}/execute`, with the full task JSON on stdin and

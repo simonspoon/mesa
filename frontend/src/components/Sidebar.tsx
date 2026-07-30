@@ -62,6 +62,11 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
  * `version` is bumped by pages after project rename/delete so the list
  * refetches (it is part of the useFetch key). The inbox count live-polls so
  * the badge of items needing triage stays current as agents send.
+ *
+ * `.nav-footer` holds the two machine-level entries — Settings and Restart
+ * server — and is **sticky to the bottom of the nav's scroll box**, not merely
+ * pushed there by `margin-top: auto` (mesa task 654): a long project list
+ * scrolls underneath it instead of carrying it out of view.
  */
 /**
  * One-line git summary under a project name: branch, a dirty marker with the
@@ -83,6 +88,7 @@ function GitLine({ git }: { git: GitStatus | undefined }) {
 export function Sidebar({
   activeProjectId,
   inboxActive,
+  settingsActive,
   terminalActive,
   ccTab,
   version,
@@ -92,6 +98,7 @@ export function Sidebar({
 }: {
   activeProjectId: number | null
   inboxActive: boolean
+  settingsActive: boolean
   terminalActive: boolean
   ccTab: CcTab | null
   version: number
@@ -338,6 +345,12 @@ export function Sidebar({
           </>
         )}
         <div className="nav-footer">
+          <a
+            className={`nav-item${settingsActive ? ' active' : ''}`}
+            href="#/settings"
+          >
+            <span className="nav-item-label">Settings</span>
+          </a>
           <ConfirmDelete
             label="Restart server"
             message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."

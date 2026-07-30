@@ -10,6 +10,7 @@ import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionGraphView } from './pages/CCSessionGraphView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
+import { SettingsView } from './pages/SettingsView'
 import { TerminalPage } from './pages/TerminalPage'
 import { isPhone, onPhoneTierChange } from './phoneTier'
 import { useSpatialNav } from './spatialNav'
@@ -139,6 +140,9 @@ function App() {
     : 0
 
   const inboxMatch = /^\/inbox$/.exec(path)
+  // Settings: global, above projects like the Inbox — the config file it edits
+  // is per-machine, not per-project.
+  const settingsMatch = /^\/settings$/.exec(path)
   // Terminal is not resolved into `page` (see below) — it's a permanent
   // sibling mount alongside `main`/`AgentSidebar` (mesa task 396,
   // .scratch/arch.md §4.3), toggled via `visibility` so panes and their
@@ -197,7 +201,10 @@ function App() {
                   : null
 
   let page
-  if (inboxMatch) {
+  if (settingsMatch) {
+    // ~/.mesa/config.json editor: no project frame, no active project.
+    page = <SettingsView />
+  } else if (inboxMatch) {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
     page = <InboxView />
@@ -364,6 +371,7 @@ function App() {
         <Sidebar
           activeProjectId={activeProjectId}
           inboxActive={inboxMatch !== null}
+          settingsActive={settingsMatch !== null}
           terminalActive={terminalActive}
           ccTab={ccTab}
           version={navVersion}

@@ -47,7 +47,7 @@ isolation.
 | `todo-watcher-check` | `serve --watch-todo` dispatch loop | `MESA_WATCH_TODO_TICK_MS` |
 | `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME` — use a throwaway) | `MESA_WATCH_INBOX_TICK_MS` |
 | `hooks-check` | `task-execute` over CLI + API | `MESA_HOOKS_FILE` |
-| `config-check` | The 3 configurable spawn commands: configured template drives each, built-in argv unchanged when absent | writes a real `~/.mesa` under a throwaway `HOME` |
+| `config-check` | The 3 configurable spawn commands: configured template drives each, built-in argv unchanged when absent, plus the Settings page's `GET`/`PUT /api/config` | writes a real `~/.mesa` under a throwaway `HOME` |
 | `cc-check` | `mesa cc` contract against a synthetic transcript tree | `MESA_CC_PROJECTS_DIR` |
 
 ## Architecture
@@ -85,10 +85,11 @@ The code is the source of truth. These are the invariants you must not break:
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `boardView`, `keyboardScope`, `layout`, `sessionGraph`,
-  `time`) — predicates that historically shipped wrong. **Logic worth testing
-  therefore belongs in one of those modules, not inline in a `.tsx`** (why
-  `isStaleWorking` was hoisted out of `AgentSidebar`). Anything needing a
-  rendered tree, real focus routing, or a trusted event stays with khora.
+  `settingsDraft`, `time`) — predicates that historically shipped wrong.
+  **Logic worth testing therefore belongs in one of those modules, not inline
+  in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).
+  Anything needing a rendered tree, real focus routing, or a trusted event
+  stays with khora.
 
 ## Contracts that agents/clients depend on
 
@@ -218,7 +219,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Todo watcher | `serve --watch-todo` auto-dispatch, off by default. "Busy" = an `in_progress` **leaf** only; an umbrella narrows the tick to its descendants | `docs/todo-watcher.md` |
 | Inbox watcher | `serve --watch-inbox` auto-triage, off by default and independent of `--watch-todo`; re-dispatch guard is an **in-memory** set, not a db write | `docs/inbox-watcher.md` |
 | Hooks | User-configured shell commands on events (`task-execute`); a nonzero exit is **data**, not a failure | `docs/hooks.md` |
-| Config | `~/.mesa/config.json`: the 3 agent-spawn command templates (todo-watcher, inbox-watcher, add-agent). **Argv, never `sh -c`** — substitution happens after tokenizing, which is what keeps an untrusted title one argument | `docs/config.md` |
+| Config | `~/.mesa/config.json`: the 3 agent-spawn command templates (todo-watcher, inbox-watcher, add-agent). **Argv, never `sh -c`** — substitution happens after tokenizing, which is what keeps an untrusted title one argument. Edited from the **Settings** page (`#/settings`, sticky at the bottom of the left nav) over `GET`/`PUT /api/config`; blank = the built-in default, and the write is loopback-only in **both** serve modes | `docs/config.md` |
 | CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files. Includes the per-session call tree | `docs/cc-dashboard.md` |
 
 ## Untrusted input

@@ -51,7 +51,11 @@ header {
   overscroll-behavior: contain;
   border-right: 1px solid var(--border);
   background: rgba(6, 10, 16, 0.6);
-  padding: 1rem;
+  /* No bottom padding: `.nav-footer` is sticky to the bottom of this scroll
+     box and supplies that gap itself as padding. Left here, it would sit
+     BELOW the sticky footer (sticky pins the margin box to the padding-box
+     edge), leaving a strip where scrolled nav content shows past it. */
+  padding: 1rem 1rem 0;
   display: flex;
   flex-direction: column;
 }
@@ -321,12 +325,32 @@ header {
   margin-top: 1rem;
 }
 
-/* Pins the restart control to the bottom of the sidebar regardless of how
-   much nav content is above it (the sidebar is a column flex container). */
+/* The machine-level controls (Settings, Restart server), pinned to the bottom
+   of the sidebar two ways at once, because they answer different questions:
+   `margin-top: auto` puts them at the bottom when the nav is SHORTER than the
+   viewport, and `position: sticky; bottom: 0` keeps them in view when it is
+   TALLER and scrolling (mesa task 654) — a long project list then runs
+   underneath them rather than carrying them off-screen.
+
+   The negative side margins + matching padding bleed the block across the
+   sidebar's own 1rem side padding, so scrolled content can't peek out beside
+   it; the sidebar drops its bottom padding for the same reason (see there).
+   The opaque background is what content hides behind — the sidebar's own is
+   translucent, so it cannot be inherited here. */
 .nav-footer {
-  margin-top: auto;
-  padding-top: 0.75rem;
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  margin: auto -1rem 0;
+  padding: 0.75rem 1rem 1rem;
   border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+/* The Settings entry sits in the footer next to Restart server; it is the same
+   `.nav-item` link as the top-level nav entries, just without their spacing. */
+.nav-footer .nav-item {
+  margin-bottom: 0.35rem;
 }
 
 .nav-footer .confirm-delete {
@@ -1356,7 +1380,7 @@ main {
   padding-left: 1.1rem;
 }
 .frame-body :where(code) {
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono);
   font-size: 0.95em;
 }
 .frame-body :where(pre) {
@@ -1397,7 +1421,7 @@ main {
    per line still reads as one line, but emphasis, `code`, and tables now
    render instead of showing their literal source. */
 .frame-entity-body {
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono);
   font-size: 0.76rem;
 }
 .frame-entity-body :where(ul, ol) {
@@ -4370,4 +4394,110 @@ button:focus-visible,
    never live in a stylesheet. This is what shows if that ever returns nothing. */
 .cc-graph-node.kind-tool {
   border-left-color: var(--border);
+}
+
+/* --- Settings page (mesa task 654) -------------------------------------- */
+
+/* A form, not a dashboard: a reading-width column so a command template — the
+   one thing on the page that is genuinely long — wraps somewhere sane. */
+.settings-page {
+  max-width: 60rem;
+  padding: 1rem;
+}
+
+.settings-page h2 {
+  margin-top: 1.5rem;
+}
+
+.settings-command {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.settings-command label {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.settings-command-title {
+  font-family: var(--font-display);
+}
+
+/* The config key itself, shown next to the human title so what the page edits
+   is never a mystery when someone opens the JSON file by hand. */
+.settings-command-key {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.settings-command-blurb {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 0.8rem;
+}
+
+/* Monospace, because it is argv — and `white-space: pre` so a run of spaces
+   inside a quoted argument stays visibly what it is. */
+.settings-command-input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.settings-command-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 0.35rem;
+}
+
+/* The placeholders this command offers — the whole accepted vocabulary, sent
+   by the server so the page can't advertise one the expander would reject. */
+.settings-placeholders {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.settings-reset {
+  flex: none;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.settings-reset:hover:not(:disabled) {
+  color: var(--cyan);
+}
+
+/* The argv that will actually run once saved — the answer to "am I looking at
+   my template or the default?", which the textarea alone cannot give. */
+.settings-effective {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-pending {
+  color: var(--amber);
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.settings-saved {
+  color: var(--cyan);
+  font-size: 0.8rem;
 }

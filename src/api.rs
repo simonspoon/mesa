@@ -743,6 +743,10 @@ fn router(state: AppState) -> Router {
         // stopping and restarting `mesa serve`). Kills every in-flight
         // connection on this process, so it shares the agents' access gate.
         .route("/api/restart", post(restart_server))
+        // The Settings page's view of `~/.mesa/config.json` — the three
+        // agent-spawn command templates. Both verbs sit in the agents'
+        // capability class (see `get_config`/`update_config`), not task CRUD.
+        .route("/api/config", get(get_config).put(update_config))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -2864,6 +2868,72 @@ fn agents_unavailable(message: String) -> ApiError {
 /// `{"restarting": true}` even though the process that sent it exits shortly
 /// after. A second concurrent call (double-click) finds the oneshot already
 /// taken and just reports the same thing — restart is idempotent.
+/// `GET /api/config` — the three spawn command templates, each with its
+/// built-in default and the placeholders it offers (`docs/config.md`).
+///
+/// Gated like the agent routes rather than like task CRUD: this reads the
+/// argv mesa will execute, and it is the read half of a write that *is* code
+/// execution. A malformed config is 502 `unavailable`, the same answer a spawn
+/// gives — the Settings page must say "your config file is broken", never
+/// render an empty editor that a save would then write over the wreckage.
+async fn get_config(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::settings() {
+        Ok(commands) => Ok(Json(commands).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigUpdate {
+    /// Only the keys present are touched; a blank value clears one back to its
+    /// built-in default. Absent keys keep whatever the file already says, so
+    /// two editors can't clobber each other's untouched rows.
+    commands: HashMap<String, String>,
+}
+
+/// `PUT /api/config` — writes command templates and echoes the new settings.
+///
+/// **Loopback-only in both modes**, one notch stronger than the agent routes:
+/// this rewrites the argv mesa itself runs on the next dispatch, so a LAN peer
+/// under `--lan` (who may spawn an agent) still must not be able to choose the
+/// *program* that spawn executes. Same rule, and the same helper, as the
+/// `local_path` write — the other "execution input, not data" field.
+async fn update_config(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ConfigUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    config::save_commands(&body.commands).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config(State(state), ConnectInfo(addr), headers).await
+}
+
 async fn restart_server(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -4140,6 +4210,50 @@ mod tests {
             headers,
             Query(FsDirsQuery {
                 path: Some(dir.path().to_str().unwrap().to_string()),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    // --- Settings: /api/config (mesa task 654) ------------------------------
+    //
+    // The round trip (read, write, validate, fall back) is covered by
+    // `core::config`'s unit tests and, over HTTP against a real `~/.mesa`, by
+    // `scripts/config-check.sh`. What can only be asserted here is the gate:
+    // both handlers must refuse before they ever touch the file, since
+    // `config_file()` resolves off HOME and these tests share one process.
+
+    #[tokio::test]
+    async fn get_config_rejects_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        assert!(!state.lan);
+        let resp = get_config(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_non_loopback_peer_under_lan_mode() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        // Host/Origin that `require_lan_page_access` would accept — a LAN peer
+        // that under `--lan` may spawn an agent still must not get to choose
+        // the program that spawn runs. Loopback-only in BOTH modes.
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let resp = update_config(
+            State(state),
+            ConnectInfo(lan_peer()),
+            headers,
+            Json(ConfigUpdate {
+                commands: HashMap::from([(
+                    config::TODO_WATCHER.to_string(),
+                    "attacker-tool".to_string(),
+                )]),
             }),
         )
         .await;

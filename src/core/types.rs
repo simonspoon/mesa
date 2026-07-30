@@ -142,6 +142,24 @@ pub struct ProjectAgents {
     pub agents: Vec<AgentSession>,
 }
 
+/// One configurable agent-spawn command as the Settings page sees it
+/// (`core::config`, `docs/config.md`). Not stored in the db — this is a view
+/// of `~/.mesa/config.json`, which is read fresh on every spawn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigCommand {
+    /// The config key: `todo-watcher`, `inbox-watcher` or `agent-spawn`.
+    pub action: String,
+    /// The configured template, or `null` when the key is absent or blank.
+    /// Null is "falling back to `default`", never "run nothing".
+    pub value: Option<String>,
+    /// The built-in template used while `value` is null.
+    pub default: String,
+    /// The `{}`-delimited placeholders this action offers. Any other one is a
+    /// save-time error, so the editor can list these as the whole vocabulary.
+    pub placeholders: Vec<String>,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

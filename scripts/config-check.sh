@@ -217,6 +217,75 @@ grep -q '{id}' <<<"$STDOUT" ||
   fail "out-of-scope placeholder: expected {id} named: $STDOUT"
 ok "placeholders are scoped per command: {id} is not offered to agent-spawn"
 
+# ---- the Settings surface: GET/PUT /api/config (mesa task 654) ----
+
+# The web UI edits this same file. What matters is that it is genuinely the
+# same file and the same rules — not a parallel store that happens to agree.
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}}
+EOF
+api GET /api/config
+[ "$CODE" = "200" ] || fail "GET /api/config: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r 'map(.action) | join(",")' <<<"$STDOUT")" = "todo-watcher,inbox-watcher,agent-spawn" ] ||
+  fail "GET /api/config must list all three actions in order: $STDOUT"
+[ "$(jq -r '.[0].value' <<<"$STDOUT")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "GET /api/config: configured value wrong: $STDOUT"
+[ "$(jq -r '.[1].value' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured action must report value: null, got $STDOUT"
+[ "$(jq -r '.[1].default' <<<"$STDOUT")" = '{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"' ] ||
+  fail "GET /api/config: built-in default wrong: $STDOUT"
+[ "$(jq -r '.[2].placeholders | join(" ")' <<<"$STDOUT")" = "{bin} {agent} {prompt}" ] ||
+  fail "GET /api/config: agent-spawn's placeholder vocabulary wrong: $STDOUT"
+ok "GET /api/config reports each command's configured value (null when unset), its built-in default and the placeholders it offers"
+
+api PUT /api/config "{\"commands\": {\"agent-spawn\": \"  $STUB_DIR/mytool from-settings --prompt {prompt}  \"}}"
+[ "$CODE" = "200" ] || fail "PUT /api/config: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "$STUB_DIR/mytool from-settings --prompt {prompt}" ] ||
+  fail "PUT must echo the stored (trimmed) value: $STDOUT"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "PUT dropped a section of the file it doesn't own: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "PUT clobbered a command it wasn't asked to touch: $(cat "$CONFIG")"
+api POST "/api/projects/$A/agents" '{"prompt":"from the settings page"}'
+[ "$CODE" = "201" ] || fail "post-PUT spawn: expected 201, got $CODE: $STDOUT"
+grep -qx "$DIR_A|from-settings|--prompt|from the settings page" "$ARGV_LOG" ||
+  fail "the spawn did not use the just-saved command: $(cat "$ARGV_LOG")"
+ok "PUT /api/config writes the same file the spawn path reads — the next spawn uses it, with no restart — and leaves untouched keys and unknown sections alone"
+
+api PUT /api/config '{"commands": {"agent-spawn": "   "}}'
+[ "$CODE" = "200" ] || fail "PUT blank: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "null" ] ||
+  fail "a blank value must clear the key, got $STDOUT"
+[ "$(jq -r '.commands | has("agent-spawn")' < "$CONFIG")" = "false" ] ||
+  fail "a blank value must remove the key, not store an empty string: $(cat "$CONFIG")"
+ok "PUT with a blank value clears one command back to its built-in default (the key is removed, never stored empty)"
+
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config '{"commands": {"todo-watcher": "mytool {prompt}"}}'
+[ "$CODE" = "422" ] || fail "bad placeholder: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "bad placeholder: expected code validation, got $STDOUT"
+grep -q "{prompt}" <<<"$STDOUT" || fail "the message must name the placeholder: $STDOUT"
+api PUT /api/config '{"commands": {"agent-spawn": "mytool \"oops"}}'
+[ "$CODE" = "422" ] || fail "unterminated quote: expected 422, got $CODE: $STDOUT"
+api PUT /api/config '{"commands": {"tsak": "mytool"}}'
+[ "$CODE" = "422" ] || fail "unknown key: expected 422, got $CODE: $STDOUT"
+grep -q "unknown command" <<<"$STDOUT" || fail "unknown key: message wrong: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT rejects a template the spawn path would later fail on (bad placeholder, unbalanced quote, unknown key) as 422 validation, writing nothing"
+
+printf '{ not json' > "$CONFIG"
+api GET /api/config
+[ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "unavailable" ] ||
+  fail "malformed config GET: expected code unavailable, got $STDOUT"
+api PUT /api/config '{"commands": {"agent-spawn": "mytool"}}'
+[ "$CODE" = "502" ] || fail "malformed config PUT: expected 502, got $CODE: $STDOUT"
+[ "$(cat "$CONFIG")" = '{ not json' ] ||
+  fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
+ok "a malformed config is 502 unavailable on both verbs, and a PUT never overwrites a file it could not read"
+
 # ---- an unconfigured command falls back to the built-in claude argv ----
 
 # `{}` (no commands at all) and a config file that never mentions this action

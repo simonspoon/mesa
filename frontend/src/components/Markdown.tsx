@@ -64,6 +64,18 @@ export function Markdown({ text, breaks }: { text: string; breaks?: boolean }) {
 }
 
 /**
+ * Reset class for the `<code>` react-markdown nests inside every fenced block
+ * (task 659). The global `code {}` chip style (background/border/padding, meant
+ * for short inline snippets) otherwise applies to it too — and because that
+ * `<code>` is inline yet spans many lines, the browser paints the chip's
+ * border/background around EVERY line box, so a block renders as a stack of
+ * boxed lines. Same trap, same cure as `.files-content-text` in the whole-file
+ * view; here it is applied to both code-block paths below. Inline code (no
+ * enclosing `pre`) never gets the class and keeps its chip.
+ */
+const CODE_TAG_CLASS = 'markdown-code-block'
+
+/**
  * Renders one fenced code block. react-markdown always wraps a block in
  * `<pre><code class="language-xxx">…</code></pre>`, so `children` here is that
  * lone `<code>` element — we read its class + text rather than re-parsing.
@@ -79,7 +91,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   if (!grammar)
     return (
       <pre>
-        <code className={className}>{source}</code>
+        <code className={`${CODE_TAG_CLASS} ${className}`.trim()}>{source}</code>
       </pre>
     )
   return (
@@ -87,6 +99,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
       language={grammar}
       style={vscDarkPlus}
       customStyle={{ margin: '0.5rem 0', borderRadius: '4px' }}
+      codeTagProps={{ className: CODE_TAG_CLASS }}
     >
       {source}
     </SyntaxHighlighter>

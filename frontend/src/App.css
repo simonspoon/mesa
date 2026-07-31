@@ -3301,6 +3301,20 @@ body.agent-sidebar-resizing {
   overflow-x: auto;
   white-space: pre-wrap;
 }
+/* The <code> react-markdown nests inside a fenced block (task 659). The global
+   `code {}` inline-chip style must be reset here for the same reason
+   .files-content-text resets it: that <code> is an inline box spanning many
+   lines, so the chip's border/background gets painted around EVERY line and the
+   block reads as a stack of boxed lines. Class-scoped (set in Markdown.tsx, on
+   both the plain and the syntax-highlighted path) rather than a descendant
+   selector, so it covers every markdown surface — Files pane, task modal,
+   storyboard cards — with one rule, and leaves inline code chips alone. */
+.markdown-code-block {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+}
 .markdown-body :where(a) {
   color: var(--cyan);
 }

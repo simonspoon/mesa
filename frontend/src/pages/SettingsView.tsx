@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { getConfig, updateConfig } from '../api'
+import { getConfig, listProjects, restartServer, updateConfig } from '../api'
+import { ConfirmDelete } from '../components/ConfirmDelete'
 import {
   changedCommands,
   draftFrom,
@@ -30,6 +31,53 @@ const COPY: Record<string, { title: string; blurb: string }> = {
     title: 'Add agent',
     blurb: "The Agents sidebar's + button runs this to start a session.",
   },
+}
+
+/**
+ * Polls the server with a cheap existing GET until it responds, for use after
+ * `restartServer()` — the old process exits and a new one has to open the
+ * store and rebind the port before anything answers again.
+ */
+async function waitForServer(timeoutMs = 15000, intervalMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    try {
+      await listProjects()
+      return
+    } catch {
+      // Still shutting down or starting back up — keep polling.
+    }
+  }
+  throw new Error(
+    'server did not come back within 15s — check the terminal mesa is running in',
+  )
+}
+
+async function handleRestart(): Promise<void> {
+  await restartServer()
+  await waitForServer()
+  window.location.reload()
+}
+
+/**
+ * The page title row: "Settings" on the left, Restart server hard right (mesa
+ * task 655 — it used to live in the sidebar footer). It renders in *every*
+ * branch below, including the unreadable-config error state: relaunching mesa
+ * is the one control that must stay reachable even when the page's own data
+ * won't load.
+ */
+function SettingsHeader() {
+  return (
+    <div className="settings-header">
+      <h1>Settings</h1>
+      <ConfirmDelete
+        label="Restart server"
+        message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."
+        onDelete={handleRestart}
+      />
+    </div>
+  )
 }
 
 /**
@@ -90,7 +138,7 @@ export function SettingsView() {
   if (error) {
     return (
       <div className="settings-page">
-        <h1>Settings</h1>
+        <SettingsHeader />
         <p className="error">{error}</p>
         <p className="muted">
           mesa found a config file it could not read. Fix{' '}
@@ -103,7 +151,7 @@ export function SettingsView() {
   if (!commands) {
     return (
       <div className="settings-page">
-        <h1>Settings</h1>
+        <SettingsHeader />
         <p className="muted">Loading…</p>
       </div>
     )
@@ -113,7 +161,7 @@ export function SettingsView() {
 
   return (
     <div className="settings-page">
-      <h1>Settings</h1>
+      <SettingsHeader />
       <p className="muted">
         Stored in <code>~/.mesa/config.json</code> and re-read on every spawn —
         a change takes effect on the next dispatch, with no server restart.

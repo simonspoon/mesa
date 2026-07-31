@@ -120,9 +120,17 @@ they just won't appear in, or be attachable from, the Agents sidebar.
 
 The same file is editable from the web UI: **Settings**, pinned to the bottom
 of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). It is a form
-over `commands` and nothing else — a text box per action, the built-in default
-shown as the box's placeholder, the action's placeholder vocabulary listed
-under it, and the argv that will actually run spelled out beneath.
+over `commands` — a text box per action, the built-in default shown as the
+box's placeholder, the action's placeholder vocabulary listed under it, and the
+argv that will actually run spelled out beneath.
+
+The page's title row also carries **Restart server** (`POST /api/restart`),
+right-aligned opposite the heading — moved here off the left nav's footer in
+mesa task 655, since relaunching the binary is the same machine-level concern
+the page already owns. It renders in all three of the page's states, including
+the unreadable-config error: a restart must stay reachable exactly when the
+page's own data won't load. Nothing about the config needs it — a save is live
+on the next dispatch — so the two never interact.
 
 Two behaviors it exists to make legible, both of them the file's semantics
 rather than presentation:

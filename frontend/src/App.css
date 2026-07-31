@@ -40,8 +40,8 @@ header {
   width: 220px;
   /* Sticky + its own scroll, decoupled from `main`'s height: with
      align-items: stretch on .shell-body, a plain min-height let the
-     sidebar stretch to match a tall project board, pushing nav-footer's
-     "Restart server" button down past the bottom of the viewport (#295). */
+     sidebar stretch to match a tall project board, pushing the nav-footer
+     down past the bottom of the viewport (#295). */
   position: sticky;
   top: 0;
   /* Fills the shell-body's definite height (no longer the old `100vh - 3rem`
@@ -325,9 +325,9 @@ header {
   margin-top: 1rem;
 }
 
-/* The machine-level controls (Settings, Restart server), pinned to the bottom
+/* The machine-level entry (Settings), pinned to the bottom
    of the sidebar two ways at once, because they answer different questions:
-   `margin-top: auto` puts them at the bottom when the nav is SHORTER than the
+   `margin-top: auto` puts it at the bottom when the nav is SHORTER than the
    viewport, and `position: sticky; bottom: 0` keeps them in view when it is
    TALLER and scrolling (mesa task 654) — a long project list then runs
    underneath them rather than carrying them off-screen.
@@ -347,14 +347,11 @@ header {
   background: var(--bg);
 }
 
-/* The Settings entry sits in the footer next to Restart server; it is the same
-   `.nav-item` link as the top-level nav entries, just without their spacing. */
+/* The Settings entry is the footer's only occupant (Restart server moved to
+   the Settings page in task 655); it is the same `.nav-item` link as the
+   top-level nav entries, just without their spacing. */
 .nav-footer .nav-item {
-  margin-bottom: 0.35rem;
-}
-
-.nav-footer .confirm-delete {
-  flex-wrap: wrap;
+  margin-bottom: 0;
 }
 
 /* `main` and `TerminalPage` occupy the same visual slot, stacked via
@@ -4403,6 +4400,26 @@ button:focus-visible,
 .settings-page {
   max-width: 60rem;
   padding: 1rem;
+}
+
+/* Title row: "Settings" left, Restart server hard right (task 655). Wraps
+   rather than overflows, because arming the button swaps it for a cascade
+   message plus confirm/cancel — three times the width of the resting state. */
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.settings-header h1 {
+  margin: 0;
+}
+
+.settings-header .confirm-delete {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .settings-page h2 {

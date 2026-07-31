@@ -4,43 +4,14 @@ import {
   listAllAgents,
   listProjects,
   listTasks,
-  restartServer,
   unarchiveProject,
 } from '../api'
 import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { isPhone } from '../phoneTier'
 import { useFetch } from '../useFetch'
-import { ConfirmDelete } from './ConfirmDelete'
 import { CreateProjectModal } from './CreateProjectModal'
 import { isRunningAgent, projectForCwd } from '../agentProject'
-
-/**
- * Polls the server with a cheap existing GET until it responds, for use after
- * `restartServer()` — the old process exits and a new one has to open the
- * store and rebind the port before anything answers again.
- */
-async function waitForServer(timeoutMs = 15000, intervalMs = 500): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
-    try {
-      await listProjects()
-      return
-    } catch {
-      // Still shutting down or starting back up — keep polling.
-    }
-  }
-  throw new Error(
-    'server did not come back within 15s — check the terminal mesa is running in',
-  )
-}
-
-async function handleRestart(): Promise<void> {
-  await restartServer()
-  await waitForServer()
-  window.location.reload()
-}
 
 // CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
 // overview (charts + KPIs); these are the table views split out beneath it.
@@ -63,10 +34,12 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
  * refetches (it is part of the useFetch key). The inbox count live-polls so
  * the badge of items needing triage stays current as agents send.
  *
- * `.nav-footer` holds the two machine-level entries — Settings and Restart
- * server — and is **sticky to the bottom of the nav's scroll box**, not merely
- * pushed there by `margin-top: auto` (mesa task 654): a long project list
- * scrolls underneath it instead of carrying it out of view.
+ * `.nav-footer` holds the machine-level entry — Settings — and is **sticky to
+ * the bottom of the nav's scroll box**, not merely pushed there by
+ * `margin-top: auto` (mesa task 654): a long project list scrolls underneath
+ * it instead of carrying it out of view. Restart server used to sit here too;
+ * it lives on the Settings page's title row now (mesa task 655), since it is
+ * the same machine-level concern the page already owns.
  */
 /**
  * One-line git summary under a project name: branch, a dirty marker with the
@@ -351,11 +324,6 @@ export function Sidebar({
           >
             <span className="nav-item-label">Settings</span>
           </a>
-          <ConfirmDelete
-            label="Restart server"
-            message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."
-            onDelete={handleRestart}
-          />
         </div>
         {creatingProject && (
           <CreateProjectModal

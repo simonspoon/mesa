@@ -68,6 +68,7 @@ fn language_of(ext: &str) -> Option<&'static str> {
         "rb" => "ruby",
         "c" | "h" => "c",
         "cpp" | "hpp" | "cc" => "cpp",
+        "cs" => "csharp",
         _ => return None,
     })
 }
@@ -773,6 +774,17 @@ mod tests {
         assert_eq!(v.content, "fn main() {}\n");
         assert!(!v.truncated);
         assert_eq!(v.language.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn read_file_tags_cs_as_csharp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("Program.cs"), "class P {}\n").unwrap();
+
+        let v = read_file(root, "Program.cs").unwrap();
+        assert!(!v.is_binary);
+        assert_eq!(v.language.as_deref(), Some("csharp"));
     }
 
     #[test]

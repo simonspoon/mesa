@@ -49,6 +49,7 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   cpp: 'cpp',
   hpp: 'cpp',
   cc: 'cpp',
+  cs: 'csharp',
 }
 
 // Language tag -> one of the theme's five neon accent hues. The Tron palette
@@ -63,6 +64,7 @@ const LANGUAGE_ACCENT: Record<string, string> = {
   go: 'cyan',
   c: 'cyan',
   cpp: 'cyan',
+  csharp: 'cyan',
   python: 'green',
   ruby: 'green',
   shell: 'green',

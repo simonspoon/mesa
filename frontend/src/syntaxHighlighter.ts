@@ -2,6 +2,7 @@ import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter'
 import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash'
 import c from 'react-syntax-highlighter/dist/esm/languages/prism/c'
 import cpp from 'react-syntax-highlighter/dist/esm/languages/prism/cpp'
+import csharp from 'react-syntax-highlighter/dist/esm/languages/prism/csharp'
 import css from 'react-syntax-highlighter/dist/esm/languages/prism/css'
 import go from 'react-syntax-highlighter/dist/esm/languages/prism/go'
 import javascript from 'react-syntax-highlighter/dist/esm/languages/prism/javascript'
@@ -27,6 +28,7 @@ import vscDarkPlus from 'react-syntax-highlighter/dist/esm/styles/prism/vsc-dark
 SyntaxHighlighter.registerLanguage('bash', bash)
 SyntaxHighlighter.registerLanguage('c', c)
 SyntaxHighlighter.registerLanguage('cpp', cpp)
+SyntaxHighlighter.registerLanguage('csharp', csharp)
 SyntaxHighlighter.registerLanguage('css', css)
 SyntaxHighlighter.registerLanguage('go', go)
 SyntaxHighlighter.registerLanguage('javascript', javascript)
@@ -79,6 +81,10 @@ const PRISM_GRAMMAR: Record<string, string> = {
   rb: 'ruby',
   c: 'c',
   cpp: 'cpp',
+  csharp: 'csharp',
+  cs: 'csharp',
+  'c#': 'csharp',
+  dotnet: 'csharp',
 }
 
 /** Resolve a free-form language token to a registered Prism grammar name, or

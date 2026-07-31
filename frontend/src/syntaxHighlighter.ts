@@ -8,6 +8,7 @@ import go from 'react-syntax-highlighter/dist/esm/languages/prism/go'
 import javascript from 'react-syntax-highlighter/dist/esm/languages/prism/javascript'
 import json from 'react-syntax-highlighter/dist/esm/languages/prism/json'
 import jsx from 'react-syntax-highlighter/dist/esm/languages/prism/jsx'
+import markdown from 'react-syntax-highlighter/dist/esm/languages/prism/markdown'
 import markup from 'react-syntax-highlighter/dist/esm/languages/prism/markup'
 import python from 'react-syntax-highlighter/dist/esm/languages/prism/python'
 import ruby from 'react-syntax-highlighter/dist/esm/languages/prism/ruby'
@@ -34,6 +35,7 @@ SyntaxHighlighter.registerLanguage('go', go)
 SyntaxHighlighter.registerLanguage('javascript', javascript)
 SyntaxHighlighter.registerLanguage('json', json)
 SyntaxHighlighter.registerLanguage('jsx', jsx)
+SyntaxHighlighter.registerLanguage('markdown', markdown)
 SyntaxHighlighter.registerLanguage('markup', markup)
 SyntaxHighlighter.registerLanguage('python', python)
 SyntaxHighlighter.registerLanguage('ruby', ruby)
@@ -62,6 +64,11 @@ const PRISM_GRAMMAR: Record<string, string> = {
   python: 'python',
   py: 'python',
   json: 'json',
+  // Only edit mode (task 658) ever reaches this entry for a .md FILE — the
+  // Files pane renders a saved .md as formatted markdown, not as code — but a
+  // ```markdown fence inside that prose resolves here too.
+  markdown: 'markdown',
+  md: 'markdown',
   yaml: 'yaml',
   yml: 'yaml',
   toml: 'toml',
@@ -92,4 +99,16 @@ const PRISM_GRAMMAR: Record<string, string> = {
 export function prismGrammar(token: string | null | undefined): string | undefined {
   if (!token) return undefined
   return PRISM_GRAMMAR[token.toLowerCase()]
+}
+
+/** The source a highlight layer must render to stay line-for-line aligned with
+ * a `<textarea>` holding `value` (task 658's editor overlay).
+ *
+ * A `<pre>` swallows exactly one trailing newline, so `"a\n"` — two lines in
+ * the textarea, the caret sitting on the empty second one — would paint as a
+ * single line and shear every subsequent scroll position. Padding one extra
+ * newline restores the line count. Only the LAST newline is swallowed, so one
+ * extra is always enough, however many blank lines trail. */
+export function highlightOverlaySource(value: string): string {
+  return value.endsWith('\n') ? `${value}\n` : value
 }

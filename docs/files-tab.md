@@ -126,7 +126,32 @@ this surface.
   saves) — the same draft/saving/error-state shape as `InlineEdit`, but
   purpose-built rather than reusing that component: `InlineEdit`'s
   click-anywhere-to-edit trigger would fight selecting/copying source code,
-  and its fixed `rows={4}` textarea doesn't fit a whole file. Save errors
+  and its fixed `rows={4}` textarea doesn't fit a whole file.
+  That textarea is syntax-highlighted while you type (task 658, `FileEditor`):
+  a `<textarea>` can only paint one colour, so the coloured copy is a
+  separate, inert layer *behind* it (`.files-editor-stack` is the sized,
+  resizable box; `.files-editor-highlight` the layer; the textarea's own text
+  is `color: transparent` with a visible `caret-color`). It runs the same
+  `prismGrammar` + PrismLight pair as the read-only `FileCode`, so edit mode
+  colours exactly what view mode does, and a language with no registered
+  grammar falls back to the plain textarea task 327 shipped. Four things keep
+  the layers aligned, each load-bearing: identical font metrics and zero
+  padding on both, `wrap="off"` on the textarea (it must never soft-wrap where
+  the `<pre>` would not), `highlightOverlaySource()` (a `<pre>` swallows one
+  trailing newline, which would otherwise shear every line below the caret —
+  the one piece of pure logic here, unit-tested in
+  `syntaxHighlighter.test.ts`), and mirroring the textarea's `scrollTop`/
+  `scrollLeft` onto the layer on every scroll event. Only the textarea is a
+  real control — the layer is `aria-hidden` and pointer-transparent, so caret,
+  selection and the accessibility tree all still come from the one element
+  holding the text; its `::selection` is overridden translucent because the
+  global opaque one would blank out the glyphs showing through from behind.
+  The highlight source is a `useDeferredValue` of the draft, so re-tokenising
+  a large file lags a frame behind the caret instead of sitting between the
+  key and the character. This is also the only caller that resolves a
+  **markdown** grammar for a whole file — a saved `.md` renders as prose (see
+  below), but editing one shows markdown source, so `markdown`/`md` map to
+  Prism's markdown grammar in the shared table. Save errors
   (e.g. a 422 if the file changed underneath into something non-editable
   since it was loaded) render inline and keep edit mode open, mirroring
   `InlineEdit`'s own error handling. Switching to a different file mid-edit

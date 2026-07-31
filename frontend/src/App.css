@@ -3183,6 +3183,75 @@ body.agent-sidebar-resizing {
   line-height: 1.4;
 }
 
+/* Syntax-highlighted edit mode (task 658): a coloured, inert copy of the
+   draft painted behind a textarea whose own text is transparent. The stack is
+   the sized, resizable box — both layers fill it absolutely, so neither one's
+   content drives its height, and only the textarea scrolls (its scroll offset
+   is mirrored onto the layer in JS). Any metric that differs between the two
+   shears the colours off the caret, so padding/font/line-height are set once
+   here and inherited by both. */
+.files-editor-stack {
+  position: relative;
+  height: 60vh;
+  min-height: 12rem;
+  resize: vertical; /* needs a non-visible overflow to take effect */
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.files-editor-stack .files-content-editor,
+.files-editor-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  font: inherit;
+  line-height: inherit;
+  tab-size: 4;
+  white-space: pre;
+}
+
+.files-editor-highlight {
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* PrismLight puts white-space/overflow inline on BOTH its <pre> and the
+   nested <code>, beating any class selector — the highlight layer scrolls as
+   one box (mirrored from the textarea), so the <pre> inside it must not
+   scroll on its own. Same !important reasoning as .files-frontmatter. */
+.files-editor-highlight pre,
+.files-editor-highlight .files-content-text {
+  overflow: visible !important;
+  white-space: pre !important;
+  font: inherit !important;
+  line-height: inherit !important;
+}
+
+.files-editor-stack .files-content-editor {
+  width: auto;
+  min-height: 0;
+  resize: none;
+  overflow: auto;
+  background: transparent;
+  /* The glyphs come from the layer behind; the caret and the selection
+     highlight are the two things a textarea alone can still draw. */
+  color: transparent;
+  caret-color: var(--text);
+}
+
+/* The global ::selection is opaque (cyan on --bg) — over transparent text it
+   would blank the selected region instead of highlighting it, since the
+   glyphs live in the layer underneath. Translucent, and keep the text
+   transparent so those glyphs still read through. */
+.files-editor-stack .files-content-editor::selection {
+  background: rgba(0, 229, 255, 0.3);
+  color: transparent;
+}
+
 .badge.files-lang-badge {
   color: inherit;
   border-color: currentColor;

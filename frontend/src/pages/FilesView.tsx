@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useDeferredValue, useRef, useState } from 'react'
 import {
   SyntaxHighlighter,
   vscDarkPlus,
+  highlightOverlaySource,
   prismGrammar,
 } from '../syntaxHighlighter'
 import { Markdown } from '../components/Markdown'
@@ -197,16 +198,12 @@ function ContentPane({
   // because history mode renders it in a narrower column beside the commit
   // list — and swaps it for a commit's diff once one is picked.
   const body = editing ? (
-    <textarea
-      autoFocus
-      className="files-content-editor"
+    <FileEditor
       value={draft}
-      spellCheck={false}
-      onChange={(e) => setDraft(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') cancelEdit()
-        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') save()
-      }}
+      language={data.language}
+      onChange={setDraft}
+      onCancel={cancelEdit}
+      onSave={save}
     />
   ) : data.is_binary ? (
     <p className="muted">Binary file — cannot display.</p>
@@ -418,6 +415,87 @@ function FileCode({
     >
       {content}
     </SyntaxHighlighter>
+  )
+}
+
+/** The edit-mode twin of `FileCode` (task 658): the same Prism colouring, but
+ * live under the caret.
+ *
+ * A `<textarea>` can only paint one colour, so the highlighted copy is a
+ * separate, inert layer *behind* a transparent-text textarea — the standard
+ * overlay editor. Everything that keeps the two aligned is load-bearing:
+ * identical font metrics and zero padding on both (`.files-editor-*` in
+ * App.css), `wrap="off"` so the textarea never soft-wraps where the `<pre>`
+ * would not, `highlightOverlaySource` for the trailing-newline mismatch, and
+ * scroll mirrored from the textarea onto the layer on every scroll event.
+ * Only the textarea is a real control: the layer is `aria-hidden` and
+ * pointer-transparent, so selection, the caret and the accessibility tree all
+ * still come from the one element that holds the text.
+ *
+ * A language we carry no grammar for falls back to the plain textarea this
+ * pane shipped with in task 327 — same rule as `FileCode`'s plain `<pre>`. */
+function FileEditor({
+  value,
+  language,
+  onChange,
+  onCancel,
+  onSave,
+}: {
+  value: string
+  language: string | null
+  onChange: (next: string) => void
+  onCancel: () => void
+  onSave: () => void
+}) {
+  const highlightRef = useRef<HTMLDivElement>(null)
+  // Re-tokenising a 256 KiB file on every keystroke would sit between the key
+  // and the caret. Deferring lets React paint the typed character first and
+  // recolour behind it, so the colours can lag a frame but the caret never
+  // does.
+  const deferred = useDeferredValue(value)
+  const prismLanguage = prismGrammar(language)
+
+  const textarea = (
+    <textarea
+      autoFocus
+      className="files-content-editor"
+      value={value}
+      spellCheck={false}
+      wrap="off"
+      onChange={(e) => onChange(e.target.value)}
+      onScroll={(e) => {
+        const layer = highlightRef.current
+        if (layer === null) return
+        layer.scrollTop = e.currentTarget.scrollTop
+        layer.scrollLeft = e.currentTarget.scrollLeft
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') onCancel()
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSave()
+      }}
+    />
+  )
+
+  if (prismLanguage === undefined) return textarea
+
+  return (
+    <div className="files-editor-stack">
+      <div className="files-editor-highlight" ref={highlightRef} aria-hidden="true">
+        <SyntaxHighlighter
+          language={prismLanguage}
+          style={vscDarkPlus}
+          customStyle={{
+            margin: 0,
+            padding: 0,
+            background: 'transparent',
+          }}
+          codeTagProps={{ className: 'files-content-text' }}
+        >
+          {highlightOverlaySource(deferred)}
+        </SyntaxHighlighter>
+      </div>
+      {textarea}
+    </div>
   )
 }
 

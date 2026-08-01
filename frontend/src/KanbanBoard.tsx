@@ -24,7 +24,7 @@ function CardBody({ task }: { task: TaskSummary }) {
     <>
       <span className="card-id muted">#{task.id}</span>
       <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
-        {task.title}
+        {task.name}
       </a>
       <div>
         <span className={`badge priority-${task.priority}`}>{task.priority}</span>

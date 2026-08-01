@@ -28,7 +28,7 @@ export function TaskModal({
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== 'Escape') return
       // Escape is layered: a text field owns it first. `InlineEdit` cancels an
-      // open title/description/tags edit on Escape but does not stop the event
+      // open description/tags edit on Escape but does not stop the event
       // (InlineEdit.tsx), and the subtask draft fields have no Escape handler
       // at all — so closing the modal unconditionally would discard an edit or
       // a typed draft along with it, on the exact flow this modal exists for.

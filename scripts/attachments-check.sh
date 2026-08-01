@@ -42,7 +42,7 @@ jqe() { jq -r "$1" <<<"$STDERR"; }
 
 run 0 "$MESA" project create "Attachments project" --no-git
 P=$(jqs .id)
-run 0 "$MESA" task create --project "$P" --title "Task with files"
+run 0 "$MESA" task create --project "$P" --description "Task with files"
 TASK=$(jqs .id)
 
 # ================= CLI =================
@@ -139,9 +139,9 @@ run 1 "$MESA" attachment delete 999999
 ok "CLI attachment delete unknown id: exit 1, code=not_found"
 
 # ---- task-delete cascade (files unlinked from disk, subtasks included) ----
-run 0 "$MESA" task create --project "$P" --title "Cascade root"
+run 0 "$MESA" task create --project "$P" --description "Cascade root"
 CROOT=$(jqs .id)
-run 0 "$MESA" task create --project "$P" --title "Cascade child" --parent "$CROOT"
+run 0 "$MESA" task create --project "$P" --description "Cascade child" --parent "$CROOT"
 CCHILD=$(jqs .id)
 
 ROOT_SRC="$TMP/root.txt"

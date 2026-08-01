@@ -461,7 +461,7 @@ fn todo_watcher_tick(state: &AppState) {
                 eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
                 continue;
             }
-            let session_name = format!("{}: {}", project.name, task.title);
+            let session_name = format!("{}: {}", project.name, task.name);
             claimed.push((task.id, local_path.to_string(), session_name));
         }
         claimed
@@ -1012,9 +1012,9 @@ async fn unarchive_project(
 #[derive(Deserialize)]
 struct TaskCreate {
     project_id: i64,
-    title: String,
-    #[serde(default)]
-    description: Option<String>,
+    /// Required since task 660 removed `title`: a task's description is its
+    /// identity, and its first line is the `name` every surface displays.
+    description: String,
     #[serde(default)]
     priority: Option<Priority>,
     #[serde(default)]
@@ -1027,8 +1027,9 @@ struct TaskCreate {
 
 #[derive(Deserialize)]
 struct TaskUpdate {
-    #[serde(default)]
-    title: Option<String>,
+    // Still a `double_option` even though a description can no longer be
+    // cleared: that is what lets an explicit `{"description": null}` be
+    // *rejected* (422 `validation`) rather than silently read as "omitted".
     #[serde(default, deserialize_with = "double_option")]
     description: Option<Option<String>>,
     #[serde(default)]
@@ -1100,8 +1101,7 @@ async fn create_task(
     let mut store = state.store.lock().unwrap();
     let task = store.create_task(
         body.project_id,
-        &body.title,
-        body.description.as_deref(),
+        &body.description,
         body.priority.unwrap_or(Priority::Medium),
         &body.tags,
         body.parent_id,
@@ -1123,9 +1123,21 @@ async fn update_task(
     body: Result<Json<TaskUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
+    // A task's description is its identity (task 660), so unlike the other
+    // free-text bodies it has no clear. Rejecting an explicit null keeps the
+    // CLI and API on one error, per "CLI and API share `core` and never
+    // diverge" — `mesa task update --description ""` fails the same way.
+    let description = match body.description {
+        Some(None) => {
+            return Err(Error::Validation(
+                "description cannot be cleared; it is the task's identity".into(),
+            )
+            .into());
+        }
+        other => other.flatten(),
+    };
     let patch = TaskPatch {
-        title: body.title,
-        description: body.description,
+        description,
         status: body.status,
         priority: body.priority,
         tags: body.tags,
@@ -4398,7 +4410,6 @@ mod tests {
             .create_task(
                 project_id,
                 "t",
-                None,
                 Priority::Medium,
                 &[],
                 None,
@@ -4417,6 +4428,35 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         json_body(resp).await
+    }
+
+    /// Task 660: a description is the task's identity, so `null` is a
+    /// rejection rather than a clear — and the same `validation` the CLI's
+    /// `--description ""` produces, so the two surfaces cannot diverge.
+    #[tokio::test]
+    async fn task_patch_rejects_clearing_the_description() {
+        let (_dir, state) = test_state();
+        let pid = new_project(&state, None);
+        let id = new_task(&state, pid);
+        let body: TaskUpdate = serde_json::from_str(r#"{"description":null}"#).unwrap();
+        let err = update_task(State(state.clone()), Path(id), Ok(Json(body)))
+            .await
+            .unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(resp).await;
+        assert_eq!(body["error"]["code"], "validation");
+        // The stored body is untouched.
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .get_task(id)
+                .unwrap()
+                .description,
+            "t"
+        );
     }
 
     /// These three were readable over the API but silently unwritable: the
@@ -4463,8 +4503,11 @@ mod tests {
         .await;
 
         // Omitted: untouched, even though the patch does change another field.
-        let body = patch_task(&state, id, r#"{"title":"renamed"}"#).await;
-        assert_eq!(body["title"], "renamed");
+        // Deliberately not `description`: this test is about the three
+        // double-option bodies, and description is neither one of them nor
+        // clearable any more.
+        let body = patch_task(&state, id, r#"{"priority":"high"}"#).await;
+        assert_eq!(body["priority"], "high");
         assert_eq!(body["acceptance"], "a");
         assert_eq!(body["artifact"], "b");
         assert_eq!(body["result"], "c");
@@ -4615,7 +4658,6 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .create_task(
                 project_id,
                 title,
-                None,
                 Priority::Medium,
                 &[],
                 Some(parent),

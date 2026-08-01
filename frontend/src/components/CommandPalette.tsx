@@ -21,7 +21,7 @@ function navigate(hash: string) {
  * Fixed top-level destinations plus, per project: "Go to <name>" (the
  * board), the git/files/terminal/dashboard/storyboards sub-views, and
  * "Create task in <name>" (which lands on the create-task route —
- * ProjectTasksPage opens the form with its title input focused).
+ * ProjectTasksPage opens the form with its description field focused).
  */
 function buildCommands(projects: Project[]): Command[] {
   const commands: Command[] = [

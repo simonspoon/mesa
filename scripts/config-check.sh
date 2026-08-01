@@ -125,7 +125,7 @@ api() { # api <method> <path> [json-body] -> STDOUT=body, CODE=status
 
 # The todo-watcher template carries a literal quoted multi-word token as well
 # as {id}/{name}: quoting is the template author's tool for "one argument with
-# spaces", and {name} (a task title, untrusted text) must land as exactly one
+# spaces", and {name} (a task name, untrusted text) must land as exactly one
 # argument without being quoted at all.
 write_config <<EOF
 {
@@ -146,7 +146,7 @@ wait_for_server
 wait_lines "$ARGV_LOG" 2
 grep -qx "$DIR_A|dispatch|one arg|--task|$TASK_A|--label|A: task a" "$ARGV_LOG" ||
   fail "todo-watcher did not run the configured command: $(cat "$ARGV_LOG")"
-ok "todo-watcher runs the configured command, in the project folder, with {id}/{name} substituted (a quoted template token stays one arg; so does a title with spaces)"
+ok "todo-watcher runs the configured command, in the project folder, with {id}/{name} substituted (a quoted template token stays one arg; so does a name with spaces)"
 
 grep -qx "$FAKE_HOME|triage|$ITEM_1" "$ARGV_LOG" ||
   fail "inbox-watcher did not run the configured command: $(cat "$ARGV_LOG")"
@@ -313,7 +313,7 @@ TASK_B=$(jqs .id)
 wait_lines "$CLAUDE_LOG" 2
 grep -qx "$DIR_B|--agent|swe|--name|B: task b|--|/execute-mesa-task $TASK_B" "$CLAUDE_LOG" ||
   fail "the built-in todo-watcher argv changed: $(cat "$CLAUDE_LOG")"
-ok "the unconfigured todo-watcher keeps its built-in \`--agent swe --name <project>: <title> -- /execute-mesa-task <id>\` argv"
+ok "the unconfigured todo-watcher keeps its built-in \`--agent swe --name <project>: <name> -- /execute-mesa-task <id>\` argv"
 
 run 0 "$MESA" inbox add "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)

@@ -349,8 +349,16 @@ pub struct Task {
     pub project_id: i64,
     #[ts(type = "number | null")]
     pub parent_id: Option<i64>,
-    pub title: String,
-    pub description: Option<String>,
+    /// Derived display label, never stored — the same posture as `blocked`:
+    /// computed on every read from `description` by [`task_name`]. This is
+    /// what the board card, the task list and every agent session name show,
+    /// so a task has exactly one identity string and it always agrees with
+    /// the body it was cut from (task 660, which removed the stored `title`).
+    pub name: String,
+    /// The task itself, in free text. Required and non-empty: since task 660
+    /// removed `title`, this *is* the task's identity — its first line is
+    /// what [`task_name`] shows.
+    pub description: String,
     pub status: Status,
     pub priority: Priority,
     pub tags: Vec<String>,
@@ -410,6 +418,10 @@ pub struct Dependency {
 /// Compact task object for `list` responses (Requirement 6), and the `--quiet`
 /// task shape: the full object minus the unbounded free-text bodies
 /// (`description`, `result`) and `created_at`.
+///
+/// It stays identifiable without `description` because `name` is a *bounded
+/// derivation* of it ([`task_name`], 50 chars) — that is what replaced the
+/// stored `title` this projection used to carry (task 660).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct TaskSummary {
@@ -419,7 +431,9 @@ pub struct TaskSummary {
     pub project_id: i64,
     #[ts(type = "number | null")]
     pub parent_id: Option<i64>,
-    pub title: String,
+    /// Derived display label; see `Task::name`. Bounded (50 chars), which is
+    /// why it survives into the compact shape while `description` does not.
+    pub name: String,
     pub status: Status,
     pub priority: Priority,
     pub tags: Vec<String>,
@@ -450,7 +464,7 @@ impl From<&Task> for TaskSummary {
             id: t.id,
             project_id: t.project_id,
             parent_id: t.parent_id,
-            title: t.title.clone(),
+            name: t.name.clone(),
             status: t.status,
             priority: t.priority,
             tags: t.tags.clone(),
@@ -462,6 +476,85 @@ impl From<&Task> for TaskSummary {
             claimed_at: t.claimed_at.clone(),
             blocked: t.blocked,
         }
+    }
+}
+
+/// How much of a description becomes a task's `name`, in `char`s (not bytes —
+/// descriptions are free text and may be non-ASCII).
+pub const TASK_NAME_CHARS: usize = 50;
+
+/// Derives a task's display label from its description: the first non-empty
+/// line, trimmed, cut to [`TASK_NAME_CHARS`] with an `…` marking the cut.
+///
+/// This is the *only* implementation of that rule — the board card, the
+/// compact `list` projection, the not-found hint and the agent session name
+/// all read the `name` it produces, so there is no second copy in TypeScript
+/// to drift (and no `.slice()` that could split a multi-byte char).
+///
+/// The `task <id>` fallback exists for a description with no non-empty line:
+/// `Store` rejects those on write, but a hand-edited db must still render,
+/// and a session name is a process argument that must never be empty.
+///
+/// The description is **untrusted data**: it reaches `claude` as a single
+/// `--name` process argument, never interpolated into a shell string.
+pub fn task_name(description: &str, id: i64) -> String {
+    let first = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.is_empty() {
+        return format!("task {id}");
+    }
+    let mut head: String = first.chars().take(TASK_NAME_CHARS).collect();
+    if first.chars().count() > TASK_NAME_CHARS {
+        head.push('…');
+    }
+    head
+}
+
+#[cfg(test)]
+mod task_name_tests {
+    use super::{TASK_NAME_CHARS, task_name};
+
+    #[test]
+    fn takes_the_first_non_empty_line_trimmed() {
+        assert_eq!(task_name("ship it\nmore body", 1), "ship it");
+        assert_eq!(task_name("\n\n   ship it   \nmore", 1), "ship it");
+        assert_eq!(task_name("ship it\r\nmore body", 1), "ship it");
+    }
+
+    #[test]
+    fn cuts_at_fifty_chars_and_marks_the_cut() {
+        let fifty = "x".repeat(TASK_NAME_CHARS);
+        assert_eq!(task_name(&fifty, 1), fifty);
+        let fifty_one = "x".repeat(TASK_NAME_CHARS + 1);
+        let cut = task_name(&fifty_one, 1);
+        assert_eq!(cut, format!("{fifty}…"));
+        // The ellipsis rides outside the 50 — the budget is chars of body.
+        assert_eq!(cut.chars().count(), TASK_NAME_CHARS + 1);
+    }
+
+    #[test]
+    fn counts_chars_not_bytes() {
+        let long = "é".repeat(TASK_NAME_CHARS + 5);
+        let cut = task_name(&long, 1);
+        assert_eq!(cut.chars().count(), TASK_NAME_CHARS + 1);
+        assert!(cut.starts_with(&"é".repeat(TASK_NAME_CHARS)));
+    }
+
+    #[test]
+    fn markdown_is_carried_through_verbatim() {
+        // Descriptions are markdown; the name is plain text taken as-is, so a
+        // heading marker shows rather than being stripped (nothing here
+        // interprets the body).
+        assert_eq!(task_name("# Refactor\n\nbody", 1), "# Refactor");
+    }
+
+    #[test]
+    fn falls_back_to_the_id_when_there_is_no_line() {
+        assert_eq!(task_name("", 7), "task 7");
+        assert_eq!(task_name("   \n\t\n", 7), "task 7");
     }
 }
 

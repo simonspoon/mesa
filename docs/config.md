@@ -33,10 +33,10 @@ anywhere on this path, unlike `hooks.json` (`docs/hooks.md`), which genuinely
 is a shell string.
 
 That is load-bearing. Both watchers pass untrusted free text as the session
-name: a task title, or an inbox item's first line. What makes that safe is
-that the text arrives as one `Command::arg`. So substitution happens **after**
+name: a task's derived name, or an inbox item's first line. What makes that
+safe is that the text arrives as one `Command::arg`. So substitution happens **after**
 tokenization: the argv length is fixed by the template alone, and no value can
-split into extra arguments or be re-read as a flag. A title of
+split into extra arguments or be re-read as a flag. A name of
 `"; rm -rf / #` is just a long, silly session name.
 
 The consequences of having no shell:
@@ -63,7 +63,7 @@ what that spawn actually knows about:
 | `{bin}` | all three | `MESA_CLAUDE_BIN`, else `claude` |
 | `{agent}` | all three | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
 | `{id}` | watchers | the task id / inbox item id |
-| `{name}` | watchers | the session name mesa derives — `<project>: <title>`, or `inbox <id>: <first body line>` (**untrusted text**) |
+| `{name}` | watchers | the session name mesa derives — `<project>: <task name>`, or `inbox <id>: <first body line>` (**untrusted text**) |
 | `{prompt}` | `agent-spawn` | the POST body's `prompt`; unavailable when omitted |
 
 Two rules cover the edges:

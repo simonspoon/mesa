@@ -64,7 +64,7 @@ pub fn run_task_execute(
     let payload = serde_json::to_string(task).map_err(|e| format!("task encode: {e}"))?;
     let env = [
         ("MESA_TASK_ID", task.id.to_string()),
-        ("MESA_TASK_TITLE", task.title.clone()),
+        ("MESA_TASK_NAME", task.name.clone()),
         ("MESA_PROJECT_ID", task.project_id.to_string()),
         // Explicit so a hook driving `mesa` itself hits the same database the
         // triggering process resolved, even under a MESA_DB override.

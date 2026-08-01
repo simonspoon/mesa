@@ -489,7 +489,7 @@ echo "backgrounded · 5we00000 · n""#,
             config::TODO_WATCHER,
             dir.path().to_str().unwrap(),
             Some(42),
-            Some("mesa: a title with spaces"),
+            Some("mesa: a name with spaces"),
             None,
         );
         // Untouched actions still fall through to the built-in default.
@@ -498,7 +498,7 @@ echo "backgrounded · 5we00000 · n""#,
         assert_eq!(spawned, Ok(None));
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "dispatch\n--task\n42\n--label\nmesa: a title with spaces\n"
+            "dispatch\n--task\n42\n--label\nmesa: a name with spaces\n"
         );
         assert!(
             fallback.iter().any(|a| a == "/inbox-triage 7"),

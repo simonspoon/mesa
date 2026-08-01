@@ -38,7 +38,7 @@ claims a task or dispatches `/execute-mesa-task`.
   60 **chars** (not bytes — bodies are free text and may be non-ASCII). It
   reaches `claude` as `-n/--name`, so an auto-dispatched triage session is
   identifiable in the prompt box, `/resume` picker, terminal title and Agents
-  sidebar — same rationale as the todo watcher's `<project>: <title>`.
+  sidebar — same rationale as the todo watcher's `<project>: <name>`.
 - Two-phase, like `todo_watcher_tick` and `spawn_project_agent`: the store
   lock is dropped before the blocking `claude --bg` shell-outs. Holding it
   across a spawn freezes every other API request for the duration of each

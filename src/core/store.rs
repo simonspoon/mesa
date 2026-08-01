@@ -8,6 +8,7 @@ use super::attachments;
 use super::types::{
     AnchorSide, Attachment, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Priority,
     Project, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskEvent, Waypoint,
+    task_name,
 };
 
 #[derive(Debug)]
@@ -325,10 +326,28 @@ const MIGRATIONS: &[&str] = &[
     // over 3.5k transcripts) and additive-only — `cc_files` holds cursors,
     // not data.
     "DELETE FROM cc_files;",
+    // Task 660: `tasks.title` is gone — a task's `description` is its whole
+    // identity, and the display label is derived from the description's first
+    // line on every read (`types::task_name`), never stored.
+    //
+    // Backfill BEFORE the drop, in one batch, so no title is lost: the old
+    // title becomes the description's first line. The blank-line join matches
+    // `append_text`'s convention (spec 612), so a backfilled body reads the
+    // same as one an agent appended to. The three cases are distinct on
+    // purpose — a bare concatenation would leave a leading blank line on the
+    // ~half of rows that never had a description.
+    "
+    UPDATE tasks SET description = CASE
+        WHEN description IS NULL OR trim(description) = '' THEN title
+        WHEN trim(title) = '' THEN description
+        ELSE title || char(10) || char(10) || description
+    END;
+    ALTER TABLE tasks DROP COLUMN title;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
-const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.title, t.description, \
+const TASK_COLUMNS: &str = "t.id, t.project_id, t.parent_id, t.description, \
      t.status, t.priority, t.tags, \
      t.acceptance, t.artifact, t.result, t.created_at, t.updated_at, t.sort_order, \
      t.owner, t.claimed_at, \
@@ -346,27 +365,34 @@ const BLOCKED_EXPR: &str = "EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON 
 const PRIORITY_RANK: &str = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END";
 
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
-    let status: String = row.get(5)?;
-    let priority: String = row.get(6)?;
-    let tags: String = row.get(7)?;
+    let id: i64 = row.get(0)?;
+    // The column is still SQL-nullable (dropping `title` in migration 28 did
+    // not rebuild the table), while the domain type is not: `Store` rejects an
+    // empty description on write, so a NULL here can only come from a
+    // hand-edited db and must render rather than panic.
+    let description: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+    let status: String = row.get(4)?;
+    let priority: String = row.get(5)?;
+    let tags: String = row.get(6)?;
     Ok(Task {
-        id: row.get(0)?,
+        id,
         project_id: row.get(1)?,
         parent_id: row.get(2)?,
-        title: row.get(3)?,
-        description: row.get(4)?,
+        // Derived on every read, exactly like `blocked` below.
+        name: task_name(&description, id),
+        description,
         status: Status::parse(&status).expect("invalid status in db"),
         priority: Priority::parse(&priority).expect("invalid priority in db"),
         tags: serde_json::from_str(&tags).expect("invalid tags json in db"),
-        acceptance: row.get(8)?,
-        artifact: row.get(9)?,
-        result: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
-        sort_order: row.get(13)?,
-        owner: row.get(14)?,
-        claimed_at: row.get(15)?,
-        blocked: row.get(16)?,
+        acceptance: row.get(7)?,
+        artifact: row.get(8)?,
+        result: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        sort_order: row.get(12)?,
+        owner: row.get(13)?,
+        claimed_at: row.get(14)?,
+        blocked: row.get(15)?,
     })
 }
 
@@ -427,30 +453,6 @@ fn row_to_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
         author: row.get(5)?,
         created_at: row.get(6)?,
     })
-}
-
-/// Splits an inbox item's free-text body into a `(title, description)` pair for
-/// the task it converts into. The title is the first non-empty line, trimmed and
-/// truncated to 120 chars (an ellipsis marks a cut); the description is the full
-/// body verbatim, kept only when it carries more than the title (multi-line or
-/// truncated) so a one-line item doesn't duplicate itself.
-fn inbox_body_to_task(body: &str) -> (String, Option<String>) {
-    let first = body
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let title: String = if first.chars().count() > 120 {
-        first.chars().take(119).collect::<String>() + "…"
-    } else {
-        first.to_string()
-    };
-    let description = if body.trim() == title {
-        None
-    } else {
-        Some(body.to_string())
-    };
-    (title, description)
 }
 
 fn row_to_storyboard(row: &rusqlite::Row<'_>) -> rusqlite::Result<Storyboard> {
@@ -650,9 +652,10 @@ pub struct ProjectPatch {
 /// A task's project is immutable: there is deliberately no `project_id` field.
 #[derive(Debug, Default, Clone)]
 pub struct TaskPatch {
-    pub title: Option<String>,
-    /// `Some(None)` clears the description.
-    pub description: Option<Option<String>>,
+    /// Replace-only: a task's description is its identity (task 660), so
+    /// unlike the other free-text bodies there is no `Some(None)` clear —
+    /// an empty replacement is a `validation` error, not an erasure.
+    pub description: Option<String>,
     pub status: Option<Status>,
     pub priority: Option<Priority>,
     /// Replaces the full tag set.
@@ -673,7 +676,9 @@ pub struct TaskPatch {
     /// value instead of replacing it, so a caller can annotate a batch of
     /// tasks without round-tripping every body through its own context.
     /// Every other field is unaffected. `Some(None)` (clear) is meaningless
-    /// under append and is rejected by the caller, not here.
+    /// under append and is rejected by the caller, not here. Appending to a
+    /// description leaves its first line — and therefore the task's `name` —
+    /// untouched, which is what makes it safe on the identity field.
     pub append: bool,
 }
 
@@ -771,9 +776,8 @@ pub enum NextResult {
 pub struct ImportTask {
     #[serde(rename = "ref")]
     pub ref_: String,
-    pub title: String,
-    #[serde(default)]
-    pub description: Option<String>,
+    /// The task itself; required, since task 660 made it the identity field.
+    pub description: String,
     #[serde(default)]
     pub acceptance: Option<String>,
     #[serde(default)]
@@ -1176,8 +1180,7 @@ impl Store {
     pub fn create_task(
         &mut self,
         project_id: i64,
-        title: &str,
-        description: Option<&str>,
+        description: &str,
         priority: Priority,
         tags: &[String],
         parent_id: Option<i64>,
@@ -1185,6 +1188,11 @@ impl Store {
         artifact: Option<&str>,
         status: Option<Status>,
     ) -> Result<Task> {
+        // A task's description is its identity (task 660) — an empty one would
+        // leave the row with nothing to show but its id.
+        if description.trim().is_empty() {
+            return Err(Error::Validation("description must not be empty".into()));
+        }
         let project_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
             [project_id],
@@ -1207,13 +1215,12 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO tasks \
-             (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
+             (project_id, parent_id, description, priority, tags, acceptance, artifact, \
               status, sort_order, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))",
             (
                 project_id,
                 parent_id,
-                title,
                 description,
                 priority.as_str(),
                 tags_json,
@@ -1255,21 +1262,21 @@ impl Store {
     /// typo'd id self-corrects instead of dead-ending.
     fn task_not_found_message(&self, id: i64) -> String {
         let nearest = self.conn.query_row(
-            "SELECT id, title FROM tasks ORDER BY ABS(id - ?1), id LIMIT 1",
+            "SELECT id, description FROM tasks ORDER BY ABS(id - ?1), id LIMIT 1",
             [id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            },
         );
         match nearest {
-            Ok((near_id, title)) => {
-                let short: String = title.chars().take(60).collect();
-                let ellipsis = if title.chars().count() > 60 {
-                    "…"
-                } else {
-                    ""
-                };
-                format!(
-                    "task {id} not found; nearest existing task is {near_id} \"{short}{ellipsis}\""
-                )
+            // One truncation rule for the whole codebase — the same `name` the
+            // board and `task list` show (task 660).
+            Ok((near_id, description)) => {
+                let short = task_name(&description, near_id);
+                format!("task {id} not found; nearest existing task is {near_id} \"{short}\"")
             }
             Err(_) => format!("task {id} not found; no tasks exist yet"),
         }
@@ -1291,15 +1298,13 @@ impl Store {
     pub fn update_task(&mut self, id: i64, patch: &TaskPatch) -> Result<Task> {
         let mut task = self.get_task(id)?;
         let old_status = task.status;
-        if let Some(title) = &patch.title {
-            task.title = title.clone();
-        }
         if let Some(description) = &patch.description {
             task.description = if patch.append {
-                description
-                    .as_deref()
-                    .map(|added| append_text(task.description.as_deref(), added))
+                append_text(Some(task.description.as_str()), description)
             } else {
+                if description.trim().is_empty() {
+                    return Err(Error::Validation("description must not be empty".into()));
+                }
                 description.clone()
             };
         }
@@ -1359,12 +1364,11 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE tasks SET title = ?1, description = ?2, status = ?3, priority = ?4, \
-             tags = ?5, parent_id = ?6, acceptance = ?7, artifact = ?8, result = ?9, \
-             sort_order = ?10, owner = ?12, claimed_at = ?13, \
-             updated_at = datetime('now') WHERE id = ?11",
+            "UPDATE tasks SET description = ?1, status = ?2, priority = ?3, \
+             tags = ?4, parent_id = ?5, acceptance = ?6, artifact = ?7, result = ?8, \
+             sort_order = ?9, owner = ?11, claimed_at = ?12, \
+             updated_at = datetime('now') WHERE id = ?10",
             (
-                &task.title,
                 &task.description,
                 task.status.as_str(),
                 task.priority.as_str(),
@@ -1565,11 +1569,10 @@ impl Store {
             let tags_json = serde_json::to_string(&tags).expect("tags serialize");
             tx.execute(
                 "INSERT INTO tasks \
-                 (project_id, title, description, priority, tags, acceptance, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+                 (project_id, description, priority, tags, acceptance, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))",
                 (
                     doc.project,
-                    &t.title,
                     &t.description,
                     priority.as_str(),
                     tags_json,
@@ -2525,11 +2528,12 @@ impl Store {
 
     /// Routes an inbox item to a project by **converting it into a backlog
     /// task** in that project and then deleting the item — it "moves" out of
-    /// the inbox onto the board, pending triage. The task's title is the item's
-    /// body (first non-empty line, trimmed, truncated to 120 chars), its
-    /// description the full body verbatim — except when the whole body trims to
-    /// exactly that title, where the description is `None` instead of a copy of
-    /// it; priority defaults to medium. Returns the created `Task`. Assigning to an
+    /// the inbox onto the board, pending triage. The task's description is the
+    /// item's body **verbatim** — since task 660 a task has no title to derive,
+    /// and the board label comes from the body's first line for free
+    /// (`types::task_name`, 50 chars — deliberately not the same width as the
+    /// inbox watcher's own 60-char session name, which has its own fallback);
+    /// priority defaults to medium. Returns the created `Task`. Assigning to an
     /// unknown project is a `validation` error, mirroring a task's `--project`.
     /// Atomic: the task insert (with its creation event) and the inbox delete
     /// happen in one transaction, so a triaged item never vanishes without a
@@ -2544,7 +2548,6 @@ impl Store {
         if !project_exists {
             return Err(Error::Validation(format!("project {project_id} not found")));
         }
-        let (title, description) = inbox_body_to_task(&item.body);
         let tx = self.conn.transaction()?;
         // Claim the item by deleting it FIRST, inside the transaction: if a
         // concurrent assign already converted it, this affects 0 rows and we
@@ -2556,13 +2559,12 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO tasks \
-             (project_id, parent_id, title, description, priority, tags, acceptance, artifact, \
+             (project_id, parent_id, description, priority, tags, acceptance, artifact, \
               status, created_at, updated_at) \
-             VALUES (?1, NULL, ?2, ?3, ?4, '[]', NULL, NULL, ?5, datetime('now'), datetime('now'))",
+             VALUES (?1, NULL, ?2, ?3, '[]', NULL, NULL, ?4, datetime('now'), datetime('now'))",
             (
                 project_id,
-                &title,
-                description.as_deref(),
+                &item.body,
                 Priority::Medium.as_str(),
                 Status::Backlog.as_str(),
             ),
@@ -3096,12 +3098,11 @@ mod tests {
         unsafe { std::env::remove_var("MESA_DB") };
     }
 
-    fn add_task(store: &mut Store, project_id: i64, title: &str) -> Task {
+    fn add_task(store: &mut Store, project_id: i64, description: &str) -> Task {
         store
             .create_task(
                 project_id,
-                title,
-                None,
+                description,
                 Priority::Medium,
                 &[],
                 None,
@@ -3351,8 +3352,7 @@ mod tests {
         let t = store
             .create_task(
                 p.id,
-                "write tests",
-                Some("cover everything"),
+                "write tests\n\ncover everything",
                 Priority::High,
                 &["rust".into(), "tdd".into()],
                 None,
@@ -3361,8 +3361,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(t.title, "write tests");
-        assert_eq!(t.description.as_deref(), Some("cover everything"));
+        // `name` is derived from the description's first line, never stored.
+        assert_eq!(t.name, "write tests");
+        assert_eq!(t.description, "write tests\n\ncover everything");
         assert_eq!(t.status, Status::Todo);
         assert_eq!(t.priority, Priority::High);
         assert_eq!(t.tags, vec!["rust", "tdd"]);
@@ -3372,13 +3373,12 @@ mod tests {
         assert_eq!(store.get_task(t.id).unwrap(), t);
         assert_eq!(store.list_tasks(None).unwrap(), vec![t.clone()]);
 
-        // --tags replaces the full set; description clears; status/priority change.
+        // --tags replaces the full set; description/status/priority change.
         let updated = store
             .update_task(
                 t.id,
                 &TaskPatch {
-                    title: Some("write more tests".into()),
-                    description: Some(None),
+                    description: Some("write more tests".into()),
                     status: Some(Status::InProgress),
                     priority: Some(Priority::Low),
                     tags: Some(vec!["qa".into()]),
@@ -3391,8 +3391,9 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(updated.title, "write more tests");
-        assert_eq!(updated.description, None);
+        assert_eq!(updated.description, "write more tests");
+        // The derived name follows the body it was cut from.
+        assert_eq!(updated.name, "write more tests");
         assert_eq!(updated.status, Status::InProgress);
         assert_eq!(updated.priority, Priority::Low);
         assert_eq!(updated.tags, vec!["qa"]);
@@ -3575,7 +3576,7 @@ mod tests {
             .update_task(
                 t.id,
                 &TaskPatch {
-                    title: Some("work, renamed".into()),
+                    description: Some("work, renamed".into()),
                     ..Default::default()
                 },
             )
@@ -3646,7 +3647,7 @@ mod tests {
                 &TaskPatch {
                     // A trailing newline is what a `--description-file` body
                     // normally ends with; it must not double the blank line.
-                    description: Some(Some("Story body.\n".into())),
+                    description: Some("Story body.\n".into()),
                     acceptance: Some(Some("Ships.".into())),
                     ..Default::default()
                 },
@@ -3658,27 +3659,31 @@ mod tests {
             .update_task(
                 t.id,
                 &TaskPatch {
-                    description: Some(Some("DESIGN CONTRACT: see task 605".into())),
+                    description: Some("DESIGN CONTRACT: see task 605".into()),
                     acceptance: Some(Some("...and is documented.".into())),
                     // An absent body: the appended text becomes the whole value.
                     result: Some(Some("first note".into())),
-                    title: Some("renamed".into()),
+                    priority: Some(Priority::High),
                     append: true,
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            annotated.description.as_deref(),
-            Some("Story body.\n\nDESIGN CONTRACT: see task 605")
+            annotated.description,
+            "Story body.\n\nDESIGN CONTRACT: see task 605"
         );
+        // Appending to the identity field leaves the first line — and so the
+        // derived name — exactly where it was.
+        assert_eq!(annotated.name, "Story body.");
         assert_eq!(
             annotated.acceptance.as_deref(),
             Some("Ships.\n\n...and is documented.")
         );
         assert_eq!(annotated.result.as_deref(), Some("first note"));
         assert_eq!(
-            annotated.title, "renamed",
+            annotated.priority,
+            Priority::High,
             "append must not leak into non-text fields"
         );
         assert_eq!(
@@ -3734,35 +3739,53 @@ mod tests {
             other => panic!("expected NotFound, got {other:?}"),
         }
 
-        // Long titles are truncated in the lead.
-        let long_title = "x".repeat(200);
-        let t3 = add_task(&mut store, p.id, &long_title);
+        // Long descriptions are truncated in the lead, by the same 50-char
+        // `task_name` rule the board and `task list` use.
+        let long_description = "x".repeat(200);
+        let t3 = add_task(&mut store, p.id, &long_description);
         let err = store.get_task(t3.id + 1).unwrap_err();
         match &err {
             Error::NotFound(m) => {
-                assert!(m.contains(&"x".repeat(60)));
-                assert!(!m.contains(&"x".repeat(61)));
+                assert!(m.contains(&"x".repeat(50)));
+                assert!(!m.contains(&"x".repeat(51)));
                 assert!(m.contains('…'));
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
+    /// Task 660: a description is a task's identity, so it may be neither
+    /// created empty nor emptied later — there is no clear, only a replace.
+    #[test]
+    fn description_must_not_be_empty_on_create_or_update() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        for blank in ["", "   \n\t "] {
+            let err = store
+                .create_task(p.id, blank, Priority::Medium, &[], None, None, None, None)
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "create({blank:?})");
+        }
+        let t = add_task(&mut store, p.id, "real work");
+        let err = store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    description: Some("  ".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        // The stored body is untouched by the rejected write.
+        assert_eq!(store.get_task(t.id).unwrap().description, "real work");
+    }
+
     #[test]
     fn create_task_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let err = store
-            .create_task(
-                999,
-                "orphan",
-                None,
-                Priority::Medium,
-                &[],
-                None,
-                None,
-                None,
-                None,
-            )
+            .create_task(999, "orphan", Priority::Medium, &[], None, None, None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
@@ -3776,7 +3799,6 @@ mod tests {
             .create_task(
                 p.id,
                 "in flight",
-                None,
                 Priority::Medium,
                 &[],
                 None,
@@ -3795,17 +3817,7 @@ mod tests {
 
         // None preserves the schema default (todo).
         let d = store
-            .create_task(
-                p.id,
-                "later",
-                None,
-                Priority::Medium,
-                &[],
-                None,
-                None,
-                None,
-                None,
-            )
+            .create_task(p.id, "later", Priority::Medium, &[], None, None, None, None)
             .unwrap();
         assert_eq!(d.status, Status::Todo);
     }
@@ -3823,7 +3835,6 @@ mod tests {
             .create_task(
                 p2.id,
                 "sub",
-                None,
                 Priority::Medium,
                 &[],
                 Some(t1.id),
@@ -3851,7 +3862,6 @@ mod tests {
             .create_task(
                 p1.id,
                 "sub",
-                None,
                 Priority::Medium,
                 &[],
                 Some(t1.id),
@@ -3882,7 +3892,6 @@ mod tests {
             .create_task(
                 p.id,
                 "child",
-                None,
                 Priority::Medium,
                 &[],
                 Some(root.id),
@@ -3895,7 +3904,6 @@ mod tests {
             .create_task(
                 p.id,
                 "grandchild",
-                None,
                 Priority::Medium,
                 &[],
                 Some(child.id),
@@ -3913,7 +3921,7 @@ mod tests {
         assert_eq!(deleted[0].id, root.id); // the task itself first
         let ids: HashSet<i64> = deleted.iter().map(|t| t.id).collect();
         assert_eq!(ids, HashSet::from([root.id, child.id, grandchild.id]));
-        assert_eq!(deleted[0].title, "root");
+        assert_eq!(deleted[0].name, "root");
 
         assert!(matches!(store.get_task(child.id), Err(Error::NotFound(_))));
         assert!(matches!(
@@ -4027,7 +4035,6 @@ mod tests {
             .create_task(
                 p.id,
                 "child",
-                None,
                 Priority::Medium,
                 &[],
                 Some(root.id),
@@ -4081,7 +4088,6 @@ mod tests {
             .create_task(
                 p.id,
                 "two",
-                None,
                 Priority::Medium,
                 &[],
                 Some(t1.id),
@@ -4098,8 +4104,8 @@ mod tests {
         assert_eq!(project.description.as_deref(), Some("desc"));
         let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![t1.id, t2.id]);
-        assert_eq!(tasks[0].title, "one");
-        assert_eq!(tasks[1].title, "two");
+        assert_eq!(tasks[0].name, "one");
+        assert_eq!(tasks[1].name, "two");
 
         assert!(matches!(store.get_project(p.id), Err(Error::NotFound(_))));
         assert!(matches!(store.get_task(t1.id), Err(Error::NotFound(_))));
@@ -4336,7 +4342,7 @@ mod tests {
             .update_task(
                 t.id,
                 &TaskPatch {
-                    title: Some("renamed".into()),
+                    description: Some("renamed".into()),
                     ..Default::default()
                 },
             )
@@ -4371,14 +4377,13 @@ mod tests {
     fn create_with_priority(
         store: &mut Store,
         project_id: i64,
-        title: &str,
+        description: &str,
         priority: Priority,
     ) -> Task {
         store
             .create_task(
                 project_id,
-                title,
-                None,
+                description,
                 priority,
                 &[],
                 None,
@@ -4433,7 +4438,7 @@ mod tests {
             .unwrap();
         // Actionable now: only "med" (high done, high2 blocked, blocker in_progress).
         match store.next_task(None).unwrap() {
-            NextResult::Task(t) => assert_eq!(t.title, "med"),
+            NextResult::Task(t) => assert_eq!(t.name, "med"),
             NextResult::None { .. } => panic!("expected a task"),
         }
     }
@@ -4444,17 +4449,7 @@ mod tests {
         let p = store.create_project("p", None, None, None).unwrap();
         let sub = |store: &mut Store, parent: i64, title: &str, priority: Priority| -> Task {
             store
-                .create_task(
-                    p.id,
-                    title,
-                    None,
-                    priority,
-                    &[],
-                    Some(parent),
-                    None,
-                    None,
-                    None,
-                )
+                .create_task(p.id, title, priority, &[], Some(parent), None, None, None)
                 .unwrap()
         };
 
@@ -4564,7 +4559,6 @@ mod tests {
             .create_task(
                 p.id,
                 "shelved",
-                None,
                 Priority::High,
                 &[],
                 None,
@@ -4595,7 +4589,6 @@ mod tests {
             .create_task(
                 p.id,
                 "backlog_blocker",
-                None,
                 Priority::High,
                 &[],
                 None,
@@ -4777,11 +4770,10 @@ mod tests {
         assert_eq!(store.list_storyboards(Some(p2.id)).unwrap(), vec![sb2]);
     }
 
-    fn import_task(ref_: &str, title: &str) -> ImportTask {
+    fn import_task(ref_: &str, description: &str) -> ImportTask {
         ImportTask {
             ref_: ref_.into(),
-            title: title.into(),
-            description: None,
+            description: description.into(),
             acceptance: None,
             priority: None,
             tags: None,
@@ -4817,10 +4809,10 @@ mod tests {
         let created = store.import_tasks(&doc).unwrap();
         assert_eq!(created.len(), 3);
 
-        let by_title = |t: &str| created.iter().find(|x| x.title == t).unwrap().clone();
-        let a = by_title("design");
-        let b = by_title("build");
-        let c = by_title("spike");
+        let by_name = |t: &str| created.iter().find(|x| x.name == t).unwrap().clone();
+        let a = by_name("design");
+        let b = by_name("build");
+        let c = by_name("spike");
 
         assert_eq!(a.acceptance.as_deref(), Some("done when shipped"));
         assert_eq!(a.tags, vec!["root"]);
@@ -5148,16 +5140,27 @@ mod tests {
     fn migration_backfills_diagram_type_and_leaves_shape_null_on_pre_357_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre-357.db");
+        // Index 16, not `MIGRATIONS.len() - 1`: the positional form silently
+        // re-aims at whatever shipped last (see `CURSOR_RESET` above), which
+        // would make this assert that some unrelated migration backfills
+        // diagram_type. The subject is migration 18 — index 17 — so the db is
+        // built from everything *before* it.
+        const DIAGRAM_TYPE: usize = 17;
+        assert!(
+            MIGRATIONS[DIAGRAM_TYPE].contains("ADD COLUMN diagram_type"),
+            "migration {DIAGRAM_TYPE} is no longer the diagram_type migration — \
+             a shipped migration was edited or reordered, which is never allowed"
+        );
         // Build a db at the version just before the diagram_type/shape
         // migration, with a pre-feature storyboard and frame (spec 355 Must
         // #1/#6: existing rows must read back as diagram_type=storyboard,
         // shape=null, with no explicit backfill statement).
         {
             let conn = Connection::open(&path).unwrap();
-            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            for sql in &MIGRATIONS[..DIAGRAM_TYPE] {
                 conn.execute_batch(sql).unwrap();
             }
-            conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            conn.pragma_update(None, "user_version", DIAGRAM_TYPE as i64)
                 .unwrap();
             conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
                 .unwrap();
@@ -5805,7 +5808,9 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None).unwrap();
 
-        // A multi-line item: title is the first line, description the full body.
+        // The description is the item's body verbatim; the name is its first
+        // line (task 660 — an assigned item keeps every character it arrived
+        // with, and the board label falls out of the body for free).
         let item = store
             .create_inbox_item(Some("agent-7"), "ship the auth fix\nmore detail here")
             .unwrap();
@@ -5814,11 +5819,8 @@ mod tests {
         assert_eq!(task.project_id, p.id);
         assert_eq!(task.status, Status::Backlog);
         assert_eq!(task.priority, Priority::Medium);
-        assert_eq!(task.title, "ship the auth fix");
-        assert_eq!(
-            task.description.as_deref(),
-            Some("ship the auth fix\nmore detail here")
-        );
+        assert_eq!(task.description, "ship the auth fix\nmore detail here");
+        assert_eq!(task.name, "ship the auth fix");
 
         // The item has moved out of the inbox entirely.
         assert!(matches!(
@@ -5827,11 +5829,11 @@ mod tests {
         ));
         assert!(store.list_inbox_items(None).unwrap().is_empty());
 
-        // A single-line item yields a task with no separate description.
+        // A single-line item: body and name coincide, no duplication to avoid.
         let single = store.create_inbox_item(None, "quick note").unwrap();
         let t2 = store.assign_inbox_item(single.id, p.id).unwrap();
-        assert_eq!(t2.title, "quick note");
-        assert_eq!(t2.description, None);
+        assert_eq!(t2.description, "quick note");
+        assert_eq!(t2.name, "quick note");
     }
 
     #[test]
@@ -5931,17 +5933,91 @@ mod tests {
         }
     }
 
+    /// Task 660: the `title` column is gone and no title may be lost — the old
+    /// value becomes the description's first line, which is exactly what the
+    /// derived `name` reads. Covers the three backfill cases the migration
+    /// distinguishes (no description, empty title, both present).
+    #[test]
+    fn migration_folds_the_old_title_into_the_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-660.db");
+        const TITLE_FOLD: usize = 25;
+        assert!(
+            MIGRATIONS[TITLE_FOLD].contains("ALTER TABLE tasks DROP COLUMN title"),
+            "migration {TITLE_FOLD} is no longer the title fold — a shipped \
+             migration was edited or reordered, which is never allowed"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..TITLE_FOLD] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", TITLE_FOLD as i64)
+                .unwrap();
+            conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
+                .unwrap();
+            for (title, description) in [
+                ("title only", None),
+                ("both", Some("the body")),
+                ("", Some("body, no title")),
+                ("blank description", Some("   ")),
+            ] {
+                conn.execute(
+                    "INSERT INTO tasks (project_id, title, description, created_at, updated_at) \
+                     VALUES (1, ?1, ?2, datetime('now'), datetime('now'))",
+                    rusqlite::params![title, description],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(&path).unwrap();
+        let tasks = store.list_tasks(None).unwrap();
+        let bodies: Vec<&str> = tasks.iter().map(|t| t.description.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec![
+                "title only",
+                "both\n\nthe body",
+                "body, no title",
+                "blank description",
+            ],
+            "no title may be lost, and no row may gain a leading blank line"
+        );
+        // The label every surface shows comes back out of the folded body.
+        assert_eq!(tasks[1].name, "both");
+        // The column itself is gone.
+        let schema: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!schema.contains("title"), "tasks.title survived: {schema}");
+    }
+
     #[test]
     fn cc_migration_applies_on_existing_pre_cc_db() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre-cc.db");
+        // Pinned by index for the same reason as `CURSOR_RESET` above: the
+        // subject is migration 12 (index 11), the one that creates the cc
+        // tables, not "whatever shipped most recently".
+        const CC_TABLES: usize = 11;
+        assert!(
+            MIGRATIONS[CC_TABLES].contains("CREATE TABLE cc_sessions"),
+            "migration {CC_TABLES} is no longer the cc-tables migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
         // Build a db at the version just before the cc migration, with data.
         {
             let conn = Connection::open(&path).unwrap();
-            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            for sql in &MIGRATIONS[..CC_TABLES] {
                 conn.execute_batch(sql).unwrap();
             }
-            conn.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64)
+            conn.pragma_update(None, "user_version", CC_TABLES as i64)
                 .unwrap();
             conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
                 .unwrap();

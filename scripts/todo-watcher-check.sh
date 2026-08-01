@@ -158,7 +158,7 @@ LINE=$(head -1 "$BG_LOG")
 [ "$LINE" = "$DIR_A|A: task a|/execute-mesa-task $TASK_A" ] ||
   fail "expected '$DIR_A|A: task a|/execute-mesa-task $TASK_A', got '$LINE'"
 [ "$(task_status "$TASK_A")" = "in_progress" ] || fail "dispatched task must be claimed in_progress"
-ok "watch_todo on: dispatches next actionable task, prompt is /execute-mesa-task <id>, session named '<project>: <title>', claims in_progress"
+ok "watch_todo on: dispatches next actionable task, prompt is /execute-mesa-task <id>, session named '<project>: <name>', claims in_progress"
 
 # Auto-dispatched sessions run under an agent persona (default `swe`) — the
 # stub records whatever `--agent` value arrived ahead of --name/--.

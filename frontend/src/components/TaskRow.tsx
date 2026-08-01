@@ -10,7 +10,7 @@ export function TaskRow({
   return (
     <li className={depth > 0 ? 'subtask-row' : undefined}>
       <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
-        {task.title}
+        {task.name}
       </a>{' '}
       <span className={`badge status-${task.status}`}>{task.status}</span>{' '}
       <span className={`badge priority-${task.priority}`}>{task.priority}</span>

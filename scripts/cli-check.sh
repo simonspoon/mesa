@@ -44,7 +44,7 @@ ok "project create returns full object, exit 0"
 run 0 "$MESA" project create "Other" --no-git
 P2=$(jqs .id)
 
-run 0 "$MESA" task create --project "$P" --title "Design layout" --priority high --tags design,web
+run 0 "$MESA" task create --project "$P" --description "Design layout" --priority high --tags design,web
 T1=$(jqs .id)
 [ "$(jqs .blocked)" = "false" ] || fail "task create: blocked must be present and false"
 [ "$(jqs .status)" = "todo" ] || fail "task create: default status"
@@ -52,34 +52,57 @@ T1=$(jqs .id)
 [ "$(jqs '.tags == ["design","web"]')" = "true" ] || fail "task create: tags"
 ok "task create returns full object with blocked present"
 
-run 0 "$MESA" task create --project "$P" --title "Write copy" --description "homepage" --tag draft
+run 0 "$MESA" task create --project "$P" --description "Write copy" --tag draft
 [ "$(jqs '.tags == ["draft"]')" = "true" ] || fail "task create --tag is an alias for --tags"
 T2=$(jqs .id)
-run 0 "$MESA" task create --project "$P" --title "Ship it"
+run 0 "$MESA" task create --project "$P" --description "Ship it"
 T3=$(jqs .id)
-run 0 "$MESA" task create --project "$P" --title "Ship subtask" --parent "$T3"
+run 0 "$MESA" task create --project "$P" --description "Ship subtask" --parent "$T3"
 T4=$(jqs .id)
 [ "$(jqs .parent_id)" = "$T3" ] || fail "task create: parent_id"
-run 0 "$MESA" task create --project "$P2" --title "Unrelated"
+run 0 "$MESA" task create --project "$P2" --description "Unrelated"
 T5=$(jqs .id)
 ok "task create: subtask and second project"
 
-# positional form: task create <PROJECT> <TITLE> ≡ --project/--title
+# positional form: task create <PROJECT> <DESCRIPTION> ≡ --project/--description
 run 0 "$MESA" task create "$P" "Positional form" --priority low
-[ "$(jqs .title)" = "Positional form" ] || fail "task create positional: title"
+[ "$(jqs .description)" = "Positional form" ] || fail "task create positional: description"
+[ "$(jqs .name)" = "Positional form" ] || fail "task create positional: derived name"
 [ "$(jqs .project_id)" = "$P" ] || fail "task create positional: project_id"
 run 0 "$MESA" task delete "$(jqs .id)"
-run 0 "$MESA" task create "$P" --title "Mixed form"
-[ "$(jqs .title)" = "Mixed form" ] || fail "task create mixed: title"
+run 0 "$MESA" task create "$P" --description "Mixed form"
+[ "$(jqs .description)" = "Mixed form" ] || fail "task create mixed: description"
 run 0 "$MESA" task delete "$(jqs .id)"
-run 2 "$MESA" task create "$P" "twice" --title "conflict"
-[ "$(jqe .error.code)" = "usage" ] || fail "positional+flag title: code=usage"
+run 2 "$MESA" task create "$P" "twice" --description "conflict"
+[ "$(jqe .error.code)" = "usage" ] || fail "positional+flag description: code=usage"
 run 2 "$MESA" task create "$P"
-[ "$(jqe .error.code)" = "usage" ] || fail "missing title: code=usage"
-ok "task create: positional/mixed forms; both-or-neither is usage"
+[ "$(jqe .error.code)" = "usage" ] || fail "missing description: code=usage"
+# the third form: a body from a file (or stdin) satisfies the same requirement
+run 0 bash -c "printf 'From a file\n\nwith a body' | $MESA task create '$P' --description-file -"
+[ "$(jqs .name)" = "From a file" ] || fail "task create --description-file: derived name"
+run 0 "$MESA" task delete "$(jqs .id)"
+run 2 "$MESA" task create "$P" "twice" --description-file -
+[ "$(jqe .error.code)" = "usage" ] || fail "positional+--description-file: code=usage"
+ok "task create: positional/flag/file forms; more than one is usage"
+
+# the derived name: first line only, cut to 50 chars with an ellipsis marking
+# the cut. Never stored — it always follows the body it was cut from.
+LONGLINE=$(printf 'y%.0s' $(seq 1 60))
+run 0 "$MESA" task create "$P" "$LONGLINE"
+TLONG=$(jqs .id)
+[ "$(jqs .name)" = "$(printf 'y%.0s' $(seq 1 50))…" ] || fail "task create: name cut at 50 chars"
+[ "$(jqs .description)" = "$LONGLINE" ] || fail "task create: description kept in full"
+run 0 "$MESA" task update "$TLONG" --description "renamed by the body"
+[ "$(jqs .name)" = "renamed by the body" ] || fail "task update: name follows the description"
+run 0 "$MESA" task update "$TLONG" --append --description "a later note"
+[ "$(jqs .name)" = "renamed by the body" ] || fail "append must not move the name"
+run 1 "$MESA" task update "$TLONG" --description ""
+[ "$(jqe .error.code)" = "validation" ] || fail "empty description: code=validation"
+run 0 "$MESA" task delete "$TLONG"
+ok "task name: first line cut to 50 chars, derived on read, never emptiable"
 
 # validation: unknown project
-run 1 "$MESA" task create --project 9999 --title "orphan"
+run 1 "$MESA" task create --project 9999 --description "orphan"
 [ "$(jqe .error.code)" = "validation" ] || fail "unknown project: error.code"
 jqe .error.message | grep -q 9999 || fail "unknown project: message names the id"
 ok "create with unknown project: exit 1, code=validation"
@@ -112,12 +135,13 @@ run 0 "$MESA" task list --status todo
 ok "task list --status filter"
 
 # ---- update ----
-run 0 "$MESA" task update "$T2" --status in_progress --description "" --tags copy
+run 0 "$MESA" task update "$T2" --status in_progress --description "Rewrite copy" --tags copy
 [ "$(jqs .status)" = "in_progress" ] || fail "update: status"
-[ "$(jqs .description)" = "null" ] || fail "update: --description \"\" must clear"
+[ "$(jqs .description)" = "Rewrite copy" ] || fail "update: --description must replace the body"
+[ "$(jqs .name)" = "Rewrite copy" ] || fail "update: name follows the new body"
 [ "$(jqs '.tags == ["copy"]')" = "true" ] || fail "update: --tags must replace the full set"
 [ "$(jqs .blocked)" = "false" ] || fail "update: blocked present"
-ok "task update: full object, description cleared, tags replaced"
+ok "task update: full object, description replaced, tags replaced"
 
 # --tag is an alias for --tags on update (and --tags for --tag on list, above)
 run 0 "$MESA" task update "$T2" --tag copy,urgent
@@ -261,7 +285,7 @@ ok "unblock non-existent edge: exit 1, code=not_found"
 
 # ---- show / not_found / usage ----
 run 0 "$MESA" task show "$T2"
-[ "$(jqs .description)" = "null" ] || fail "show: full object includes description field"
+[ "$(jqs .description)" = "Rewrite copy" ] || fail "show: full object includes description field"
 [ "$(jqs .blocked)" != "null" ] || fail "show: blocked never null"
 ok "task show: full object, blocked never null"
 
@@ -291,7 +315,7 @@ ok "--help: human text with untrusted-data warning, exit 0"
 # Use a dedicated project so existing cascade-count assertions below stay valid.
 run 0 "$MESA" project create "Trust trail" --no-git
 P3=$(jqs .id)
-run 0 "$MESA" task create --project "$P3" --title "Acceptance task" \
+run 0 "$MESA" task create --project "$P3" --description "Acceptance task" \
   --acceptance "tests pass" --artifact "abc123"
 TA=$(jqs .id)
 [ "$(jqs .acceptance)" = "tests pass" ] || fail "create --acceptance: not stored"
@@ -332,9 +356,9 @@ ok "task update --result \"\": clears the field"
 run 0 "$MESA" project create "Import graph" --no-git
 PI=$(jqs .id)
 GRAPH="{\"project\":$PI,\"tasks\":[\
-{\"ref\":\"a\",\"title\":\"design\",\"priority\":\"high\",\"acceptance\":\"AC-a\"},\
-{\"ref\":\"b\",\"title\":\"build\",\"blocked_by\":[\"a\"]},\
-{\"ref\":\"c\",\"title\":\"sub\",\"parent\":\"a\"}]}"
+{\"ref\":\"a\",\"description\":\"design\",\"priority\":\"high\",\"acceptance\":\"AC-a\"},\
+{\"ref\":\"b\",\"description\":\"build\",\"blocked_by\":[\"a\"]},\
+{\"ref\":\"c\",\"description\":\"sub\",\"parent\":\"a\"}]}"
 STDOUT=$(echo "$GRAPH" | "$MESA" task import); CODE=$?
 [ "$CODE" -eq 0 ] || fail "import: exit 0 expected, got $CODE"
 [ "$(jqs type)" = "array" ] || fail "import: prints a bare array"
@@ -347,8 +371,8 @@ ok "task import: 3-task graph created atomically, deps + parent wired"
 # in-graph cycle is rejected and creates nothing
 BEFORE=$("$MESA" task list --project "$PI" | jq length)
 CYCLE="{\"project\":$PI,\"tasks\":[\
-{\"ref\":\"x\",\"title\":\"X\",\"blocked_by\":[\"y\"]},\
-{\"ref\":\"y\",\"title\":\"Y\",\"blocked_by\":[\"x\"]}]}"
+{\"ref\":\"x\",\"description\":\"X\",\"blocked_by\":[\"y\"]},\
+{\"ref\":\"y\",\"description\":\"Y\",\"blocked_by\":[\"x\"]}]}"
 set +e
 STDOUT=$(echo "$CYCLE" | "$MESA" task import 2>"$TMP/stderr"); CODE=$?
 set -e
@@ -474,15 +498,19 @@ PQ=$(jqs .id)
 BODY="line one
 line two"
 
+# `<subject>\n\n<body>`: the post-660 task shape — a first line that becomes
+# the name, then the body the compact projection drops.
+body_with() { printf '%s\n\n%s' "$1" "$BODY"; }
+
 # show: the reference parity case — same record, read twice, so nothing volatile
 # moves between the two calls.
-run 0 "$MESA" task create "$PQ" "Quiet subject" --description "$BODY" \
+run 0 "$MESA" task create "$PQ" --description "$(body_with 'Quiet subject')" \
   --acceptance "AC" --artifact "sha1"
 QT=$(jqs .id)
 run 0 "$MESA" task show "$QT"
 printf '%s' "$STDOUT" >"$TMP/full.json"
 # non-quiet output is unchanged: the full 17-key task object
-[ "$(jqs 'keys | join(",")')" = "acceptance,artifact,blocked,claimed_at,created_at,description,id,owner,parent_id,priority,project_id,result,sort_order,status,tags,title,updated_at" ] ||
+[ "$(jqs 'keys | join(",")')" = "acceptance,artifact,blocked,claimed_at,created_at,description,id,name,owner,parent_id,priority,project_id,result,sort_order,status,tags,updated_at" ] ||
   fail "task show (no --quiet): full key set must be unchanged"
 run 0 "$MESA" task show "$QT" --quiet
 printf '%s' "$STDOUT" >"$TMP/quiet.json"
@@ -514,7 +542,7 @@ ok "task update/claim/release --quiet: compact shape, parity with show"
 run 0 "$MESA" task create "$PQ" "Quiet blocker" --quiet
 QB=$(jqs .id)
 [ "$(jqs 'has("description")')" = "false" ] || fail "task create --quiet: description must be dropped"
-[ "$(jqs .title)" = "Quiet blocker" ] || fail "task create --quiet: title"
+[ "$(jqs .name)" = "Quiet blocker" ] || fail "task create --quiet: name"
 quiet_mutation_ok "task block" "$MESA" task block "$QT" --by "$QB" --quiet
 [ "$(jqs .blocked)" = "true" ] || fail "task block --quiet: blocked must be true"
 quiet_mutation_ok "task unblock" "$MESA" task unblock "$QT" --on "$QB" --quiet
@@ -522,7 +550,7 @@ quiet_mutation_ok "task unblock" "$MESA" task unblock "$QT" --on "$QB" --quiet
 ok "task create/block/unblock --quiet: compact shape, values intact"
 
 # import composite: same container (a bare array), members compacted
-IMPQ="{\"project\":$PQ,\"tasks\":[{\"ref\":\"a\",\"title\":\"quiet import\",\"description\":\"an imported body\"}]}"
+IMPQ="{\"project\":$PQ,\"tasks\":[{\"ref\":\"a\",\"description\":\"quiet import\\nan imported body\"}]}"
 run 0 bash -c "printf '%s' '$IMPQ' | $MESA task import"
 [ "$(jqs type)" = "array" ] || fail "task import (no --quiet): bare array"
 [ "$(jqs '.[0] | has("description")')" = "true" ] || fail "task import (no --quiet): description present"
@@ -531,15 +559,15 @@ run 0 bash -c "printf '%s' '$IMPQ' | $MESA task import --quiet"
 [ "$(jqs type)" = "array" ] || fail "task import --quiet: container stays a bare array"
 [ "$(jqs length)" = "1" ] || fail "task import --quiet: one created task"
 [ "$(jqs 'all(.[]; has("description"))')" = "false" ] || fail "task import --quiet: members compacted"
-[ "$(jqs '.[0].title')" = "quiet import" ] || fail "task import --quiet: title"
+[ "$(jqs '.[0].name')" = "quiet import" ] || fail "task import --quiet: name"
 run 0 "$MESA" task delete "$(jqs '.[0].id')" --quiet
 ok "task import --quiet: same container, compact members"
 
 # delete composite: the cascade array keeps its shape, members compacted.
 # --quiet here is an explicit opt-out of the full recovery transcript.
-run 0 "$MESA" task create "$PQ" "Quiet parent" --description "$BODY"
+run 0 "$MESA" task create "$PQ" --description "$(body_with 'Quiet parent')"
 QP=$(jqs .id)
-run 0 "$MESA" task create "$PQ" "Quiet child" --description "$BODY" --parent "$QP"
+run 0 "$MESA" task create "$PQ" --description "$(body_with 'Quiet child')" --parent "$QP"
 run 0 "$MESA" task delete "$QP" --quiet
 [ "$(jqs type)" = "array" ] || fail "task delete --quiet: container stays a bare array"
 [ "$(jqs length)" = "2" ] || fail "task delete --quiet: task + cascaded subtask"
@@ -586,7 +614,7 @@ ok "error path: exit 1 and byte-identical stderr with and without --quiet"
 
 # size: the reason the flag exists (28 KB description -> < 1 KB on stdout)
 python3 -c "import sys; sys.stdout.write('x' * 28672)" >"$TMP/big.txt"
-run 0 "$MESA" task create "$PQ" "Big body" --description-file "$TMP/big.txt" --quiet
+run 0 "$MESA" task create "$PQ" --description-file "$TMP/big.txt" --quiet
 QBIG=$(jqs .id)
 run 0 "$MESA" task update "$QBIG" --status done --quiet
 printf '%s' "$STDOUT" >"$TMP/big-quiet.json"
@@ -663,10 +691,10 @@ ok "project create --quiet: project minus description, values intact"
 # delete: the composite keeps its {project, tasks} key structure; only the
 # members are projected. --quiet here is an explicit opt-out of the full
 # recovery transcript.
-run 0 "$MESA" task create "$PJQ" "Quiet cascade" --description "$BODY"
+run 0 "$MESA" task create "$PJQ" --description "$(body_with 'Quiet cascade')"
 run 0 "$MESA" project create "Quiet delete" --no-git --description "$BODY"
 PJQ3=$(jqs .id)
-run 0 "$MESA" task create "$PJQ3" "Quiet cascade" --description "$BODY"
+run 0 "$MESA" task create "$PJQ3" --description "$(body_with 'Quiet cascade')"
 run 0 "$MESA" project delete "$PJQ3"
 printf '%s' "$STDOUT" >"$TMP/pdel-full.json"
 [ "$(jqs '.project | has("description")')" = "true" ] ||

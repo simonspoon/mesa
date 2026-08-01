@@ -40,9 +40,9 @@ run 0 "$MESA" project create "Board project" --no-git
 P=$(jqs .id)
 run 0 "$MESA" project create "Other project" --no-git
 P2=$(jqs .id)
-run 0 "$MESA" task create --project "$P" --title "Linked task"
+run 0 "$MESA" task create --project "$P" --description "Linked task"
 TASK=$(jqs .id)
-run 0 "$MESA" task create --project "$P2" --title "Foreign task"
+run 0 "$MESA" task create --project "$P2" --description "Foreign task"
 FTASK=$(jqs .id)
 
 # ---- storyboard create ----

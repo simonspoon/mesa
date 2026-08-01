@@ -24,7 +24,7 @@ because someone ran `mesa serve`.
   `Store::next_task` for that project and, on an
   actionable task, immediately flips that task to `in_progress` itself —
   *before* spawning — then calls `agents::spawn_bg` for the **`todo-watcher`**
-  command, with the task id and the session name `<project name>: <task title>`
+  command, with the task id and the session name `<project name>: <task name>`
   as its `{id}`/`{name}`. **The command line itself — including which slash
   command runs — is user-configurable** in `~/.mesa/config.json`
   (`docs/config.md`); its default is

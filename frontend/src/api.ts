@@ -157,8 +157,9 @@ export interface ProjectPatch {
 
 export interface TaskCreate {
   project_id: number
-  title: string
-  description?: string
+  /** Required: a task's description is its identity, and its first line is
+   *  the `name` every surface renders. */
+  description: string
   status?: Status
   priority?: Priority
   tags?: string[]
@@ -166,13 +167,14 @@ export interface TaskCreate {
 }
 
 export interface TaskPatch {
-  title?: string
-  description?: string | null
+  /** Replace-only: the description is the task's identity, so there is no
+   *  `null` clear — the server answers one with a 422. */
+  description?: string
   status?: Status
   priority?: Priority
   tags?: string[]
   // Long-text fields; `null` clears, omitting leaves the stored value alone
-  // (the server's `double_option`, same as `description`).
+  // (the server's `double_option`).
   acceptance?: string | null
   artifact?: string | null
   result?: string | null

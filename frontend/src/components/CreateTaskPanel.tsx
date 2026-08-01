@@ -44,7 +44,6 @@ export function CreateTaskPanel({
   onClose: () => void
   onCreated: () => void
 }) {
-  const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [priority, setPriority] = useState<Priority>('medium')
   const [tags, setTags] = useState('')
@@ -71,8 +70,7 @@ export function CreateTaskPanel({
       if (taskId === null) {
         const task = await createTask({
           project_id: projectId,
-          title,
-          description: description === '' ? undefined : description,
+          description,
           priority,
           tags: parseTags(tags),
           ...(status ? { status } : {}),
@@ -130,19 +128,15 @@ export function CreateTaskPanel({
           submit()
         }}
       >
-        <input
-          type="text"
-          value={title}
-          placeholder="title"
-          required
-          autoFocus
-          disabled={createdTaskId !== null}
-          onChange={(e) => setTitle(e.target.value)}
-        />
+        {/* The one identity field (task 660). It keeps the autoFocus the
+            title input used to hold: the `a` shortcut and the command
+            palette both open this form expecting a focused first field. */}
         <textarea
           value={description}
-          placeholder="description (optional)"
+          placeholder="what the task is — the first line becomes its name"
           rows={4}
+          required
+          autoFocus
           disabled={createdTaskId !== null}
           onChange={(e) => setDescription(e.target.value)}
         />
@@ -192,7 +186,7 @@ export function CreateTaskPanel({
           {createdTaskId === null && (
             <button
               type="button"
-              disabled={submitting || title.trim() === ''}
+              disabled={submitting || description.trim() === ''}
               onClick={() => submit('todo')}
             >
               create + move to todo

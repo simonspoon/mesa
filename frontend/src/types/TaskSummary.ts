@@ -6,8 +6,17 @@ import type { Status } from "./Status";
  * Compact task object for `list` responses (Requirement 6), and the `--quiet`
  * task shape: the full object minus the unbounded free-text bodies
  * (`description`, `result`) and `created_at`.
+ *
+ * It stays identifiable without `description` because `name` is a *bounded
+ * derivation* of it ([`task_name`], 50 chars) — that is what replaced the
+ * stored `title` this projection used to carry (task 660).
  */
-export type TaskSummary = { id: number, project_id: number, parent_id: number | null, title: string, status: Status, priority: Priority, tags: Array<string>, 
+export type TaskSummary = { id: number, project_id: number, parent_id: number | null, 
+/**
+ * Derived display label; see `Task::name`. Bounded (50 chars), which is
+ * why it survives into the compact shape while `description` does not.
+ */
+name: string, status: Status, priority: Priority, tags: Array<string>, 
 /**
  * Definition-of-done, surfaced in `list` so agents see it without `show`.
  */

@@ -103,7 +103,7 @@ ok "Host allowlist: a foreign Host is 403 validation, even on a GET"
 # A mutating request with a bogus Host must die on the Host check, not reach
 # the handler — assert with an otherwise-valid create.
 raw POST "/api/tasks" -H "Host: evil.example" -H 'Content-Type: application/json' \
-  -d "{\"project_id\":$PROJ,\"title\":\"must not exist\"}"
+  -d "{\"project_id\":$PROJ,\"description\":\"must not exist\"}"
 [ "$STATUS" = "403" ] || fail "bogus Host on POST: expected 403, got $STATUS ($BODY)"
 ok "Host allowlist: rejects a well-formed mutating request before the handler"
 
@@ -134,26 +134,26 @@ ok "Content-Type gate: a mutating request with no Content-Type is 415 validation
 
 # curl's default for -d is application/x-www-form-urlencoded: the exact
 # cross-site form post the gate exists to reject.
-raw POST "/api/tasks" -d "project_id=$PROJ&title=form+post"
+raw POST "/api/tasks" -d "project_id=$PROJ&description=form+post"
 [ "$STATUS" = "415" ] || fail "form-encoded POST: expected 415, got $STATUS"
 ok "Content-Type gate: a form-encoded POST is 415 (the CSRF shape)"
 
 raw POST "/api/tasks" -H 'Content-Type: text/plain' \
-  -d "{\"project_id\":$PROJ,\"title\":\"text/plain\"}"
+  -d "{\"project_id\":$PROJ,\"description\":\"text/plain\"}"
 [ "$STATUS" = "415" ] || fail "text/plain POST: expected 415, got $STATUS"
 ok "Content-Type gate: text/plain is 415"
 
 # The gate compares the media type only, so a charset parameter is accepted —
 # browsers and fetch() both send one.
 raw POST "/api/tasks" -H 'Content-Type: application/json; charset=utf-8' \
-  -d "{\"project_id\":$PROJ,\"title\":\"charset param\"}"
+  -d "{\"project_id\":$PROJ,\"description\":\"charset param\"}"
 [ "$STATUS" = "201" ] || fail "application/json; charset=utf-8: expected 201, got $STATUS ($BODY)"
 CHARSET_TASK=$(jqb .id)
 ok "Content-Type gate: application/json; charset=utf-8 is accepted (param ignored)"
 
 # Case-insensitive media type.
 raw POST "/api/tasks" -H 'Content-Type: APPLICATION/JSON' \
-  -d "{\"project_id\":$PROJ,\"title\":\"uppercase ct\"}"
+  -d "{\"project_id\":$PROJ,\"description\":\"uppercase ct\"}"
 [ "$STATUS" = "201" ] || fail "APPLICATION/JSON: expected 201, got $STATUS ($BODY)"
 UPPER_TASK=$(jqb .id)
 ok "Content-Type gate: the media type is matched case-insensitively"
@@ -179,11 +179,12 @@ api 200 DELETE "/api/tasks/$UPPER_TASK"
 # =====================================================================
 
 api 201 POST "/api/tasks" \
-  "{\"project_id\":$PROJ,\"title\":\"Root task\",\"description\":\"body text\",\"priority\":\"high\",\"tags\":[\"api\"]}"
+  "{\"project_id\":$PROJ,\"description\":\"Root task\\nbody text\",\"priority\":\"high\",\"tags\":[\"api\"]}"
 T1=$(jqb .id)
 [ "$(jqb .project_id)" = "$PROJ" ] || fail "POST /api/tasks: project_id"
-[ "$(jqb .title)" = "Root task" ] || fail "POST /api/tasks: title"
-[ "$(jqb .description)" = "body text" ] || fail "POST /api/tasks: description"
+[ "$(jqb .description)" = "Root task
+body text" ] || fail "POST /api/tasks: description"
+[ "$(jqb .name)" = "Root task" ] || fail "POST /api/tasks: name derived from the first line"
 [ "$(jqb .status)" = "backlog" ] || fail "POST /api/tasks: default status is backlog, not todo"
 [ "$(jqb .priority)" = "high" ] || fail "POST /api/tasks: priority"
 [ "$(jqb '.tags | join(",")')" = "api" ] || fail "POST /api/tasks: tags"
@@ -194,7 +195,7 @@ ok "POST /api/tasks: 201 + full Task JSON"
 
 # A missing required field is a contract-shaped 422, not axum's plain-text 400.
 api 422 POST "/api/tasks" "{\"project_id\":$PROJ}"
-[ "$(jqb .error.code)" = "validation" ] || fail "POST missing title: error.code"
+[ "$(jqb .error.code)" = "validation" ] || fail "POST missing description: error.code"
 ok "POST /api/tasks missing a required field: 422 validation in the error shape"
 
 api 422 POST "/api/tasks" "not json at all"
@@ -205,14 +206,15 @@ ok "POST /api/tasks with a malformed body: 422 validation, not a plain-text 400"
 # `Error::Validation` (422) in `Store::create_task`, while an unknown *task* on
 # show/update/delete/claim is `not_found` (404). Both shapes are load-bearing
 # for callers; this asserts the one that actually ships.
-api 422 POST "/api/tasks" '{"project_id":999999,"title":"orphan"}'
+api 422 POST "/api/tasks" '{"project_id":999999,"description":"orphan"}'
 [ "$(jqb .error.code)" = "validation" ] || fail "POST unknown project: error.code"
 ok "POST /api/tasks unknown project: 422 validation (not 404 — see Store::create_task)"
 
 # ---- show ----
 api 200 GET "/api/tasks/$T1"
 [ "$(jqb .id)" = "$T1" ] || fail "GET /api/tasks/{id}: id"
-[ "$(jqb .description)" = "body text" ] || fail "GET /api/tasks/{id}: carries description"
+[ "$(jqb .description)" = "Root task
+body text" ] || fail "GET /api/tasks/{id}: carries description"
 ok "GET /api/tasks/{id}: full Task JSON including description"
 
 api 404 GET "/api/tasks/999999"
@@ -230,18 +232,32 @@ api 200 GET "/api/tasks?project=$PROJ"
 ok "GET /api/tasks: bare array of TaskSummary (no description; owner/claimed_at/blocked present)"
 
 # ---- update ----
-api 200 PATCH "/api/tasks/$T1" '{"title":"Root task renamed","priority":"low"}'
-[ "$(jqb .title)" = "Root task renamed" ] || fail "PATCH: title"
+api 200 PATCH "/api/tasks/$T1" '{"acceptance":"ships","priority":"low"}'
+[ "$(jqb .acceptance)" = "ships" ] || fail "PATCH: acceptance"
 [ "$(jqb .priority)" = "low" ] || fail "PATCH: priority"
-[ "$(jqb .description)" = "body text" ] || fail "PATCH: untouched fields survive"
+[ "$(jqb .description)" = "Root task
+body text" ] || fail "PATCH: untouched fields survive"
 ok "PATCH /api/tasks/{id}: 200 + full Task, partial update leaves other fields"
 
 # `null` clears an optional long-text field; an absent key leaves it alone.
-api 200 PATCH "/api/tasks/$T1" '{"description":null}'
-[ "$(jqb .description)" = "null" ] || fail "PATCH description:null: must clear"
+api 200 PATCH "/api/tasks/$T1" '{"acceptance":null}'
+[ "$(jqb .acceptance)" = "null" ] || fail "PATCH acceptance:null: must clear"
 ok "PATCH /api/tasks/{id}: explicit null clears an optional field"
 
-api 404 PATCH "/api/tasks/999999" '{"title":"nope"}'
+# ...but the description is the task's identity, so it is the one body that
+# cannot be cleared — `null` is a 422, not an erasure (task 660). The CLI's
+# `--description ""` fails the same way; that pairing is the contract.
+api 422 PATCH "/api/tasks/$T1" '{"description":null}'
+[ "$(jqb .error.code)" = "validation" ] || fail "PATCH description:null: error.code"
+api 200 GET "/api/tasks/$T1"
+[ "$(jqb .description)" = "Root task
+body text" ] || fail "PATCH description:null: body must survive the rejection"
+# A replacement moves the derived name with it.
+api 200 PATCH "/api/tasks/$T1" '{"description":"Root task renamed\nbody text"}'
+[ "$(jqb .name)" = "Root task renamed" ] || fail "PATCH description: name follows the body"
+ok "PATCH /api/tasks/{id}: description cannot be cleared (422), only replaced"
+
+api 404 PATCH "/api/tasks/999999" '{"priority":"low"}'
 [ "$(jqb .error.code)" = "not_found" ] || fail "PATCH unknown task: error.code"
 ok "PATCH /api/tasks/{id} unknown id: 404 not_found"
 
@@ -252,7 +268,7 @@ api 200 PATCH "/api/tasks/$T1" "{\"project_id\":$OTHER}"
 ok "PATCH /api/tasks/{id}: an unknown project_id key cannot move the task"
 
 # ---- dependencies / derived blocked ----
-api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"title\":\"Blocker\"}"
+api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"description\":\"Blocker\"}"
 T2=$(jqb .id)
 
 api 200 POST "/api/tasks/$T1/block" "{\"on\":$T2}"
@@ -326,7 +342,7 @@ ok "POST .../claim by a rival owner: 409 conflict naming the current holder"
 # `claimed_at` must move ONLY on claim/renew. Timestamps are second-grained
 # SQLite `datetime('now')`, so a real sleep is required to tell them apart.
 sleep 2
-api 200 PATCH "/api/tasks/$T1" '{"title":"Root task touched"}'
+api 200 PATCH "/api/tasks/$T1" '{"description":"Root task touched\nbody text"}'
 [ "$(jqb .claimed_at)" = "$CLAIMED_AT" ] ||
   fail "an ordinary update must not restamp claimed_at (was $CLAIMED_AT, now $(jqb .claimed_at))"
 [ "$(jqb .updated_at)" != "$CLAIMED_AT" ] ||
@@ -390,7 +406,7 @@ ok "PATCH status out of in_progress: the claim is cleared"
 # 4. Archived-project scoping over HTTP
 # =====================================================================
 
-api 201 POST "/api/tasks" "{\"project_id\":$OTHER,\"title\":\"Task in a soon-archived project\"}"
+api 201 POST "/api/tasks" "{\"project_id\":$OTHER,\"description\":\"Task in a soon-archived project\"}"
 T3=$(jqb .id)
 
 api 200 POST "/api/projects/$OTHER/archive"
@@ -423,9 +439,9 @@ api 200 GET "/api/tasks"
 ok "POST /api/projects/{id}/unarchive: 200, tasks return to unscoped reads"
 
 # ---- delete echoes the destroyed records, subtasks included ----
-api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"title\":\"Cascade parent\"}"
+api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"description\":\"Cascade parent\"}"
 CP=$(jqb .id)
-api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"title\":\"Cascade child\",\"parent_id\":$CP}"
+api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"description\":\"Cascade child\",\"parent_id\":$CP}"
 CC=$(jqb .id)
 
 api 200 DELETE "/api/tasks/$CP"
@@ -472,13 +488,13 @@ raw GET "/api/projects" -H "Host: evil.example"
 [ "$STATUS" = "200" ] || fail "LAN mode: a foreign Host must be allowed, got $STATUS"
 ok "--lan: the Host allowlist is skipped (opt-in LAN trust)"
 
-raw POST "/api/tasks" -H "Host: evil.example" -d "project_id=$PROJ&title=form+post"
+raw POST "/api/tasks" -H "Host: evil.example" -d "project_id=$PROJ&description=form+post"
 [ "$STATUS" = "415" ] || fail "LAN mode: form-encoded POST must still be 415, got $STATUS"
 [ "$(jqb .error.code)" = "validation" ] || fail "LAN mode 415: error.code"
 ok "--lan: the Content-Type gate still rejects a form-encoded POST (415)"
 
 raw POST "/api/tasks" -H "Host: evil.example" -H 'Content-Type: application/json' \
-  -d "{\"project_id\":$PROJ,\"title\":\"lan create\"}"
+  -d "{\"project_id\":$PROJ,\"description\":\"lan create\"}"
 [ "$STATUS" = "201" ] || fail "LAN mode: a JSON POST from any Host must work, got $STATUS ($BODY)"
 ok "--lan: a JSON mutating request from any Host is accepted"
 

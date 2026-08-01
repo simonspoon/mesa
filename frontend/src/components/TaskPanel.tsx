@@ -33,7 +33,6 @@ function CreateSubtaskForm({
   parentId: number
   onCreated: () => void
 }) {
-  const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [error, setError] = useState<string | null>(null)
 
@@ -41,16 +40,13 @@ function CreateSubtaskForm({
     e.preventDefault()
     createTask({
       project_id: projectId,
-      title,
+      description,
       parent_id: parentId,
       // Subtasks stay 'todo' by default — only the top-level Add Task button
       // and INBOX triage default to 'backlog'.
       status: 'todo',
-      // Omit when empty, matching CreateTaskPanel.
-      ...(description === '' ? {} : { description }),
     }).then(
       () => {
-        setTitle('')
         setDescription('')
         setError(null)
         onCreated()
@@ -63,16 +59,10 @@ function CreateSubtaskForm({
 
   return (
     <form className="create-form" onSubmit={submit}>
-      <input
-        type="text"
-        value={title}
-        placeholder="new subtask title"
-        required
-        onChange={(e) => setTitle(e.target.value)}
-      />
       <textarea
         value={description}
-        placeholder="description (optional)"
+        placeholder="what the subtask is — the first line becomes its name"
+        required
         onChange={(e) => setDescription(e.target.value)}
       />
       <button type="submit">add subtask</button>
@@ -250,12 +240,11 @@ export function TaskPanel({
   return (
     <>
       {head}
+      {/* The name is derived from the description's first line and is not
+          separately editable — editing the description below is the one write
+          path for it (task 660). */}
       <h1>
-        #{task.id}{' '}
-        <InlineEdit
-          value={task.title}
-          onSave={(title) => updateTask(taskId, { title }).then(changed)}
-        />
+        #{task.id} {task.name}
       </h1>
       <p className="task-controls">
         <select
@@ -322,15 +311,11 @@ export function TaskPanel({
           block elements a <p> cannot legally contain (see InlineEdit). */}
       <div className="description">
         <InlineEdit
-          value={task.description ?? ''}
+          value={task.description}
           multiline
           markdown
-          placeholder="no description — click to add"
-          onSave={(d) =>
-            updateTask(taskId, { description: d === '' ? null : d }).then(
-              changed,
-            )
-          }
+          placeholder="click to edit"
+          onSave={(d) => updateTask(taskId, { description: d }).then(changed)}
         />
       </div>
 
@@ -412,7 +397,7 @@ export function TaskPanel({
           {blockers.map((b) => (
             <li key={b.id}>
               <a href={`#/projects/${b.project_id}/tasks/${b.id}`}>
-                #{b.id} {b.title}
+                #{b.id} {b.name}
               </a>{' '}
               <span className={`badge status-${b.status}`}>{b.status}</span>
             </li>

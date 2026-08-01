@@ -20,5 +20,5 @@ pub use types::{
     FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
     GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, Priority, Project,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, Status,
-    Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary, Waypoint,
+    Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary, Waypoint, task_name,
 };

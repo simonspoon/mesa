@@ -727,7 +727,7 @@ main {
   padding: 0.5rem;
   min-height: 8rem;
   /* Grid items default to min-width: auto, which lets a long unbroken
-     title (or id) grow the track past its 1fr share instead of wrapping —
+     name (or id) grow the track past its 1fr share instead of wrapping —
      that's what actually breaks equal column widths (task 378). */
   min-width: 0;
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
@@ -769,7 +769,7 @@ main {
   overflow-wrap: anywhere;
 }
 
-/* Small id label, top-left of a Board card; subordinate to the title. */
+/* Small id label, top-left of a Board card; subordinate to the name. */
 .kanban-card .card-id {
   display: block;
   font-size: 0.7rem;
@@ -832,7 +832,7 @@ main {
   width: 100%;
 }
 
-/* Inputs inherit the surrounding font so a title edits at h1 size. */
+/* Inputs inherit the surrounding font so a body edits at its display size. */
 .inline-edit.editing input,
 .inline-edit.editing textarea {
   font: inherit;

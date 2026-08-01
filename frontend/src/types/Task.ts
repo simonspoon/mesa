@@ -2,7 +2,21 @@
 import type { Priority } from "./Priority";
 import type { Status } from "./Status";
 
-export type Task = { id: number, project_id: number, parent_id: number | null, title: string, description: string | null, status: Status, priority: Priority, tags: Array<string>, 
+export type Task = { id: number, project_id: number, parent_id: number | null, 
+/**
+ * Derived display label, never stored — the same posture as `blocked`:
+ * computed on every read from `description` by [`task_name`]. This is
+ * what the board card, the task list and every agent session name show,
+ * so a task has exactly one identity string and it always agrees with
+ * the body it was cut from (task 660, which removed the stored `title`).
+ */
+name: string, 
+/**
+ * The task itself, in free text. Required and non-empty: since task 660
+ * removed `title`, this *is* the task's identity — its first line is
+ * what [`task_name`] shows.
+ */
+description: string, status: Status, priority: Priority, tags: Array<string>, 
 /**
  * Definition-of-done for this task; free text, unstructured.
  */

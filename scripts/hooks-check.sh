@@ -42,7 +42,7 @@ run 0 "$MESA" project create "Hooked" --no-git
 P=$(jqs .id)
 run 0 "$MESA" project update "$P" --path "$WORKDIR"
 ANCHOR=$(jqs .local_path)
-run 0 "$MESA" task create --project "$P" --title "Wire the hooks"
+run 0 "$MESA" task create --project "$P" --description "Wire the hooks"
 T=$(jqs .id)
 
 # ---- CLI: unconfigured, then a full run ----
@@ -60,7 +60,7 @@ ok "execute with a malformed hooks file: exit 1 validation"
 # The hook proves every contract leg at once: cwd = local_path, env vars set,
 # task JSON on stdin, stdout/stderr captured, nonzero exit reported as data.
 cat > "$MESA_HOOKS_FILE" <<'EOF'
-{"task-execute": "pwd; echo \"id=$MESA_TASK_ID project=$MESA_PROJECT_ID hook=$MESA_HOOK title=$MESA_TASK_TITLE\"; cat; echo boom >&2; exit 3"}
+{"task-execute": "pwd; echo \"id=$MESA_TASK_ID project=$MESA_PROJECT_ID hook=$MESA_HOOK name=$MESA_TASK_NAME\"; cat; echo boom >&2; exit 3"}
 EOF
 
 run 0 "$MESA" task execute "$T"
@@ -69,9 +69,9 @@ run 0 "$MESA" task execute "$T"
 [ "$(jqs .stderr)" = "boom" ] || fail "CLI: stderr captured"
 STDOUT_FIELD=$(jqs .stdout)
 head -1 <<<"$STDOUT_FIELD" | grep -qx "$ANCHOR" || fail "CLI: hook ran in local_path (got $(head -1 <<<"$STDOUT_FIELD"))"
-grep -q "id=$T project=$P hook=task-execute title=Wire the hooks" <<<"$STDOUT_FIELD" ||
+grep -q "id=$T project=$P hook=task-execute name=Wire the hooks" <<<"$STDOUT_FIELD" ||
   fail "CLI: env vars delivered"
-grep -q "\"title\":\"Wire the hooks\"" <<<"$STDOUT_FIELD" || fail "CLI: task JSON on stdin"
+grep -q "\"description\":\"Wire the hooks\"" <<<"$STDOUT_FIELD" || fail "CLI: task JSON on stdin"
 ok "CLI execute: cwd/env/stdin/output/exit contract"
 
 run 1 "$MESA" task execute 99999

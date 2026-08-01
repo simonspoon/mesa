@@ -18,7 +18,7 @@
 //!
 //! A template is **argv, not a shell command** — tokenized here and handed to
 //! `Command` directly, with no `sh -c` anywhere. That is load-bearing, not
-//! stylistic: the watchers pass a task title / inbox body (untrusted free
+//! stylistic: the watchers pass a task name / inbox body (untrusted free
 //! text) as the session `--name`, and what makes that safe is that it reaches
 //! the agent as one `Command::arg`. Placeholders are substituted *after*
 //! tokenization, so a value can never split into extra argv entries or be
@@ -337,7 +337,7 @@ fn offered_list(action: &str) -> String {
 /// 1. [`tokenize`] splits the template on whitespace, honoring quotes, so the
 ///    token count is fixed by the *template* alone.
 /// 2. Each token's `{placeholder}`s are replaced in place. A substituted value
-///    is never re-split or re-quoted, so untrusted text (a task title, an
+///    is never re-split or re-quoted, so untrusted text (a task name, an
 ///    inbox body) lands as exactly one argv entry.
 ///
 /// A token holding a placeholder that has no value is **dropped**, along with
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn untrusted_values_stay_one_argv_token() {
-        // The whole point of substituting after tokenizing: a title full of
+        // The whole point of substituting after tokenizing: a name full of
         // spaces, quotes and shell metacharacters is one argument, and the
         // argv length is fixed by the template.
         let hostile = r#"drop "; rm -rf / #' --dangerously-skip-permissions"#;

@@ -20,7 +20,7 @@ function fromLink(e: React.SyntheticEvent): boolean {
  * Click-to-edit text field: renders the value (or a muted placeholder),
  * clicking switches to an input/textarea with save/cancel. Enter saves
  * (single-line only), Escape cancels. Save errors (e.g. the API's 422 on
- * an empty title) render inline and keep edit mode open, so the previous
+ * an emptied description) render inline and keep edit mode open, so the previous
  * value survives a cancel.
  *
  * `markdown` renders the *display* value through `Markdown` (the edit field

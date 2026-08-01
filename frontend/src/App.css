@@ -1823,6 +1823,25 @@ main {
   }
 }
 
+/* The marker is a decoration, not information the user can't get elsewhere —
+   so with reduced motion requested the dot stays (same color, same tooltip)
+   and only the pulse goes. Scoped to `.live-dot` rather than a blanket
+   `* { animation: none }` so nothing else silently loses motion. */
+@media (prefers-reduced-motion: reduce) {
+  .live-dot.on,
+  .live-dot.idle.on {
+    animation: none;
+  }
+}
+
+/* Live-agent marker on a Board card (mesa task 663) — the same `.live-dot` as
+   the CC dashboard's, sat on the card's badge row, so it needs the baseline
+   alignment inline-block badges get for free. */
+.kanban-card .card-live-dot {
+  vertical-align: middle;
+  margin-bottom: 2px;
+}
+
 .cc-live-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

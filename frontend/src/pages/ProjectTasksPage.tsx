@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   archiveProject,
   getProject,
+  listAllAgents,
   listTasks,
   unarchiveProject,
   updateProject,
@@ -111,6 +112,11 @@ export function ProjectTasksPage({
     setCreating(createTask)
   }
 
+  // The Board is the default view — every other tab is URL-driven. Named
+  // once because both the 'a' shortcut and the agents poll below are scoped
+  // to it.
+  const onBoard = !storyboards && !git && !files && !terminal && !dashboard
+
   const {
     data: project,
     error: projectError,
@@ -125,6 +131,16 @@ export function ProjectTasksPage({
     // dropped in useFetch, so an unchanged view never re-renders.
     { pollMs: 3000 },
   )
+  // Live-agent markers on the cards (mesa task 663). Purely decorative: the
+  // same `listAllAgents()` feed and 3s interval the Agents sidebar polls, so
+  // it rides the server's existing 2s cache rather than adding `claude agents
+  // --json` cost, and it only polls while the Board is the visible view. Its
+  // `error` is deliberately unread and never surfaced — `/api/agents` is
+  // gated and 502s `unavailable` with no `claude` binary, and the board must
+  // render byte-identically in that case (and before the first poll lands).
+  const { data: sessions } = useFetch(() => listAllAgents(), 'board-agents', {
+    pollMs: onBoard ? 3000 : undefined,
+  })
   // Storyboards, Git, Files, Terminal, and Dashboard are their own views
   // with their own fetches/error handling, so a failed task fetch must not
   // block them; only surface it on the Board view.
@@ -136,10 +152,7 @@ export function ProjectTasksPage({
   // is inert on non-Board pages). Called unconditionally, ahead of the
   // early error return, per the rules of hooks; `active` gates the listener
   // itself, not this call.
-  useCreateTaskShortcut(
-    !storyboards && !git && !files && !terminal && !dashboard,
-    projectId,
-  )
+  useCreateTaskShortcut(onBoard, projectId)
 
   // Archiving hides the project (reversible), never deletes — spec req 12 /
   // Won't list: no confirmation prompt, no "this deletes N tasks" copy.
@@ -371,7 +384,12 @@ export function ProjectTasksPage({
         ) : !tasks ? (
           <p className="muted">Loading…</p>
         ) : (
-          <KanbanBoard tasks={tasks} onMoved={onTasksChanged} />
+          <KanbanBoard
+            tasks={tasks}
+            onMoved={onTasksChanged}
+            projectName={project?.name ?? null}
+            sessions={sessions}
+          />
         )}
 
         {/* Retirement action tucked away, de-emphasized (spec S8): rarely

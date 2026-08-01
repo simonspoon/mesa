@@ -412,3 +412,45 @@ already use.
   would leave it that way indefinitely. `addPane` rebuilds the grid with the
   new id appended, which is also what makes a `+ agent` pane appear tiled
   immediately instead of on the next poll.
+
+## Live-agent marker on Board cards
+
+A kanban card pulses while a live Claude Code session looks like it is working
+on that task (mesa task 663) — so the Board shows *live activity*, not just
+stored status. The signal is the same `listAllAgents()` feed the sidebar polls
+(3s, riding the server's existing 2s cache — an open board adds no extra
+`claude agents --json` cost), passed down from `ProjectTasksPage` into
+`KanbanBoard` and matched per card by `liveAgentCount()` in
+`frontend/src/boardView.ts`.
+
+Deliberately **not** a stored status: `in_progress` is already conveyed by the
+column, it goes stale when an agent crashes, and it misses `refine` entirely —
+refine-watcher dispatch is not a status claim (`docs/refine-watcher.md`). So
+the marker fires in every column, and an `in_progress` row whose agent is gone
+does not animate.
+
+- **Match rule:** a session belongs to a task when its `name` is exactly
+  `"{project.name}: {task.name}"` — the string both watchers spawn with
+  (`src/api.rs`). The frontend holds both halves and reconstructs it.
+- **Liveness** is the existing `isRunningAgent()` (`agentProject.ts`), the same
+  predicate the sidebar's bucketing uses — `done`/`failed`/`stopped`, `pid:
+  null` and the stale `idle`+`working` case (task 571) all leave a card
+  unanimated. There is no second liveness predicate.
+- **Best-effort by construction**, and it must always degrade to *no
+  animation*: sidebar `+ agent` sessions carry no `--name`
+  (`DEFAULT_AGENT_SPAWN` has no `{name}`) and never match; a replaced
+  `todo-watcher`/`refine-watcher` template without `{name}` loses the marker
+  and nothing else; editing a task's `description` after dispatch changes the
+  derived `name` and lapses the match; and two tasks in one project sharing
+  their first 50 chars both animate. There is no task↔session column,
+  migration or route to firm this up — it is a decoration.
+- **Degradation:** `/api/agents` is gated and returns 502 `unavailable` with no
+  `claude` binary. That error is never read or surfaced; before the first poll
+  lands, and on any failure, the board renders exactly as it did before this
+  feature — no marker, no banner, no console noise.
+- Rendering: a `.live-dot.on` (the existing CC-dashboard live language) in
+  `CardBody`, so the `DragOverlay` copy carries it too; tooltip `N agent(s)
+  working`. Under `@media (prefers-reduced-motion: reduce)` the dot stays and
+  only the pulse stops.
+- Covered by vitest (`boardView.test.ts`) plus live QA; no CLI/API/db surface
+  changed, so no `scripts/*-check.sh` gate moves.

@@ -13,13 +13,15 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { updateTaskPosition } from './api'
+import { liveAgentCount } from './boardView'
 import { formatTimestamp, timeAgo } from './time'
+import type { AgentSession } from './types/AgentSession'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
 const COLUMNS: Status[] = ['backlog', 'refine', 'todo', 'in_progress', 'done']
 
-function CardBody({ task }: { task: TaskSummary }) {
+function CardBody({ task, liveAgents }: { task: TaskSummary; liveAgents: number }) {
   return (
     <>
       <span className="card-id muted">#{task.id}</span>
@@ -49,12 +51,32 @@ function CardBody({ task }: { task: TaskSummary }) {
             held {task.owner}
           </span>
         )}
+        {/* Live-agent marker (mesa task 663): a *running* Claude Code session
+            whose name matches this project+task, not a stored status — so it
+            fires in every column, `refine` included, and an `in_progress` row
+            whose agent crashed stops pulsing. Best-effort by construction; see
+            `liveAgentCount`. It lives in `CardBody` so the DragOverlay copy
+            carries it too. */}
+        {liveAgents > 0 && (
+          <span
+            className="live-dot on card-live-dot"
+            title={`${liveAgents} agent${liveAgents === 1 ? '' : 's'} working`}
+          />
+        )}
       </div>
     </>
   )
 }
 
-function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
+function Card({
+  task,
+  depth = 0,
+  liveAgents,
+}: {
+  task: TaskSummary
+  depth?: number
+  liveAgents: number
+}) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
   })
@@ -78,7 +100,7 @@ function Card({ task, depth = 0 }: { task: TaskSummary; depth?: number }) {
       // task detail on Enter natively.
       tabIndex={-1}
     >
-      <CardBody task={task} />
+      <CardBody task={task} liveAgents={liveAgents} />
     </li>
   )
 }
@@ -122,7 +144,17 @@ function nestColumn(
   return out
 }
 
-function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
+function Column({
+  status,
+  tasks,
+  projectName,
+  sessions,
+}: {
+  status: Status
+  tasks: TaskSummary[]
+  projectName: string | null
+  sessions: AgentSession[] | null
+}) {
   const { setNodeRef, isOver } = useDroppable({ id: status })
   const ordered = nestColumn(orderColumn(status, tasks))
   return (
@@ -136,7 +168,12 @@ function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
       >
         <ul>
           {ordered.map(({ task, depth }) => (
-            <Card key={task.id} task={task} depth={depth} />
+            <Card
+              key={task.id}
+              task={task}
+              depth={depth}
+              liveAgents={liveAgentCount(task, projectName, sessions)}
+            />
           ))}
         </ul>
       </SortableContext>
@@ -154,9 +191,18 @@ function Column({ status, tasks }: { status: Status; tasks: TaskSummary[] }) {
 export function KanbanBoard({
   tasks,
   onMoved,
+  projectName,
+  sessions,
 }: {
   tasks: TaskSummary[]
   onMoved: () => void
+  // The two halves of the live-agent marker (mesa task 663). Both are
+  // nullable and purely decorative: the board renders identically when the
+  // project hasn't loaded or `/api/agents` is unavailable (it is gated, and
+  // 502s `unavailable` with no `claude` binary), so nothing here may become
+  // a render dependency.
+  projectName: string | null
+  sessions: AgentSession[] | null
 }) {
   const [error, setError] = useState<string | null>(null)
   const [activeId, setActiveId] = useState<number | null>(null)
@@ -245,6 +291,8 @@ export function KanbanBoard({
               key={status}
               status={status}
               tasks={tasks.filter((t) => t.status === status)}
+              projectName={projectName}
+              sessions={sessions}
             />
           ))}
         </div>
@@ -261,7 +309,10 @@ export function KanbanBoard({
                 activeTask.parent_id !== null ? ' subtask-card' : ''
               }`}
             >
-              <CardBody task={activeTask} />
+              <CardBody
+                task={activeTask}
+                liveAgents={liveAgentCount(activeTask, projectName, sessions)}
+              />
             </div>
           ) : null}
         </DragOverlay>

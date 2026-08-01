@@ -1688,6 +1688,30 @@ impl Store {
         })
     }
 
+    /// Every task sitting in the `refine` column, in the same
+    /// priority-then-id order [`Store::next_task`] dispatches in, and with the
+    /// same archived-project rule (excluded when unscoped, honored when the
+    /// caller names a project).
+    ///
+    /// Unlike `next_task` this does **not** filter on `blocked`: refinement
+    /// rewrites a task's description and acceptance, which is text work a
+    /// blocker doesn't gate — the point of the column is to get the wording
+    /// right *before* the work is up. The refine-watcher
+    /// (`docs/refine-watcher.md`) is the only caller; it takes the head of
+    /// each project's list per tick.
+    pub fn list_refine_tasks(&self, project: Option<i64>) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
+             WHERE t.status = 'refine' \
+             AND (?1 IS NULL OR t.project_id = ?1) \
+             AND (?1 IS NOT NULL OR p.archived = 0) \
+             ORDER BY {PRIORITY_RANK}, t.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([project], row_to_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Selects the next actionable task from among the **descendants** of
     /// `parents` (their subtasks, at any depth) — the same `todo`-and-not-
     /// blocked rule and the same priority-then-id ordering as
@@ -4606,6 +4630,135 @@ mod tests {
             NextResult::Task(t) => assert_eq!(t.id, plain_todo.id),
             NextResult::None { .. } => panic!("expected the plain todo task"),
         }
+    }
+
+    #[test]
+    fn refine_tasks_are_listed_by_rank_and_never_dispatched_as_todo() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None).unwrap();
+        let refine = |store: &mut Store, name: &str, priority: Priority| {
+            store
+                .create_task(
+                    p.id,
+                    name,
+                    priority,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    Some(Status::Refine),
+                )
+                .unwrap()
+        };
+        let low = refine(&mut store, "low", Priority::Low);
+        let high = refine(&mut store, "high", Priority::High);
+
+        // Refine is *before* todo: `next_task` only ever picks `todo`, so a
+        // refine task is invisible to the todo-watcher on both paths and
+        // counts in none of the None-result buckets.
+        match store.next_task(None).unwrap() {
+            NextResult::Task(_) => panic!("refine task must not be picked as next"),
+            NextResult::None {
+                blocked,
+                in_progress,
+                todo,
+            } => {
+                assert_eq!((blocked, in_progress, todo), (0, 0, 0));
+            }
+        }
+
+        // The refine-watcher's own pick: priority then id, same as next_task.
+        let listed = store.list_refine_tasks(Some(p.id)).unwrap();
+        assert_eq!(
+            listed.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [high.id, low.id]
+        );
+
+        // A blocker does not hide a task from refinement — clarifying the
+        // wording is exactly what you do while the work is still gated.
+        let blocker = add_task(&mut store, p.id, "blocker");
+        store.add_dependency(low.id, blocker.id).unwrap();
+        let listed = store.list_refine_tasks(Some(p.id)).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|t| t.id == low.id && t.blocked));
+
+        // Moving one on to `todo` empties it out of the column and hands it
+        // to the todo-watcher — the whole point of the refine pass.
+        store
+            .update_task(
+                high.id,
+                &TaskPatch {
+                    status: Some(Status::Todo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_refine_tasks(Some(p.id))
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            [low.id]
+        );
+        match store.next_task(Some(p.id)).unwrap() {
+            NextResult::Task(t) => assert_eq!(t.id, high.id),
+            NextResult::None { .. } => panic!("the refined task should now be actionable"),
+        }
+    }
+
+    #[test]
+    fn list_refine_tasks_unscoped_excludes_archived_project() {
+        let (mut store, _dir) = temp_store();
+        let archived = store.create_project("archived", None, None, None).unwrap();
+        let live = store.create_project("live", None, None, None).unwrap();
+        let hidden = store
+            .create_task(
+                archived.id,
+                "hidden",
+                Priority::High,
+                &[],
+                None,
+                None,
+                None,
+                Some(Status::Refine),
+            )
+            .unwrap();
+        let shown = store
+            .create_task(
+                live.id,
+                "shown",
+                Priority::Low,
+                &[],
+                None,
+                None,
+                None,
+                Some(Status::Refine),
+            )
+            .unwrap();
+        store.archive_project(archived.id).unwrap();
+        // Unscoped: archived is invisible, so the refine-watcher never
+        // dispatches onto it (the todo-watcher's rule, same reason).
+        assert_eq!(
+            store
+                .list_refine_tasks(None)
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            [shown.id]
+        );
+        // Scoped to it by id, the read is unchanged — the archiving rule.
+        assert_eq!(
+            store
+                .list_refine_tasks(Some(archived.id))
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            [hidden.id]
+        );
     }
 
     #[test]

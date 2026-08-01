@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Config gate: proves the three spawn commands in ~/.mesa/config.json actually
+# Config gate: proves the four spawn commands in ~/.mesa/config.json actually
 # replace the built-in `claude --bg …` argv — for the todo-watcher, the
-# inbox-watcher and the Agents surface's spawn route — and that a missing or
-# broken config behaves the way docs/config.md says.
+# refine-watcher, the inbox-watcher and the Agents surface's spawn route — and
+# that a missing or broken config behaves the way docs/config.md says.
 #
 # The config file is read at its REAL default location, so HOME is pointed at
 # a throwaway dir (MESA_CONFIG_FILE, the unit tests' seam, would sidestep the
@@ -94,9 +94,11 @@ A=$(jqs .id)
 run 0 "$MESA" project update "$A" --path "$DIR_A"
 run 0 "$MESA" task create "$A" "task a"
 TASK_A=$(jqs .id)
+run 0 "$MESA" task create "$A" "task a-refine" --status refine
+TASK_A_REFINE=$(jqs .id)
 run 0 "$MESA" inbox add "khora: eval errors on undefined"
 ITEM_1=$(jqs .id)
-ok "fixtures: project A at a real path with one todo task, one pending inbox item"
+ok "fixtures: project A at a real path with one todo task, one refine task, one pending inbox item"
 
 PORT=17785
 wait_for_server() {
@@ -131,6 +133,7 @@ write_config <<EOF
 {
   "commands": {
     "todo-watcher": "$STUB_DIR/mytool dispatch 'one arg' --task {id} --label {name}",
+    "refine-watcher": "$STUB_DIR/mytool refine {id} --label {name}",
     "inbox-watcher": "$STUB_DIR/mytool triage {id}",
     "agent-spawn": "$STUB_DIR/mytool-receipt start --prompt {prompt}"
   }
@@ -138,15 +141,19 @@ write_config <<EOF
 EOF
 
 HOME="$FAKE_HOME" MESA_CLAUDE_BIN="$STUB_DIR/claude" \
-  MESA_WATCH_TODO_TICK_MS=150 MESA_WATCH_INBOX_TICK_MS=150 \
-  "$MESA" serve --port "$PORT" --watch-todo --watch-inbox >/dev/null 2>&1 &
+  MESA_WATCH_TODO_TICK_MS=150 MESA_WATCH_INBOX_TICK_MS=150 MESA_WATCH_REFINE_TICK_MS=150 \
+  "$MESA" serve --port "$PORT" --watch-todo --watch-refine --watch-inbox >/dev/null 2>&1 &
 SERVER_PID=$!
 wait_for_server
 
-wait_lines "$ARGV_LOG" 2
+wait_lines "$ARGV_LOG" 3
 grep -qx "$DIR_A|dispatch|one arg|--task|$TASK_A|--label|A: task a" "$ARGV_LOG" ||
   fail "todo-watcher did not run the configured command: $(cat "$ARGV_LOG")"
 ok "todo-watcher runs the configured command, in the project folder, with {id}/{name} substituted (a quoted template token stays one arg; so does a name with spaces)"
+
+grep -qx "$DIR_A|refine|$TASK_A_REFINE|--label|A: task a-refine" "$ARGV_LOG" ||
+  fail "refine-watcher did not run the configured command: $(cat "$ARGV_LOG")"
+ok "refine-watcher runs the configured command, in the project folder, with {id}/{name} substituted"
 
 grep -qx "$FAKE_HOME|triage|$ITEM_1" "$ARGV_LOG" ||
   fail "inbox-watcher did not run the configured command: $(cat "$ARGV_LOG")"
@@ -172,7 +179,7 @@ ok "an absent value drops its token and the preceding flag (\`--prompt {prompt}\
 
 [ ! -s "$CLAUDE_LOG" ] ||
   fail "the built-in claude command ran anyway: $(cat "$CLAUDE_LOG")"
-ok "with all three commands configured, the built-in \`claude\` argv is never used"
+ok "with all four commands configured, the built-in \`claude\` argv is never used"
 
 # ---- a command that prints no receipt: created, with a null id ----
 
@@ -226,21 +233,21 @@ write_config <<EOF
 EOF
 api GET /api/config
 [ "$CODE" = "200" ] || fail "GET /api/config: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r 'map(.action) | join(",")' <<<"$STDOUT")" = "todo-watcher,inbox-watcher,agent-spawn" ] ||
-  fail "GET /api/config must list all three actions in order: $STDOUT"
+[ "$(jq -r 'map(.action) | join(",")' <<<"$STDOUT")" = "todo-watcher,refine-watcher,inbox-watcher,agent-spawn" ] ||
+  fail "GET /api/config must list all four actions in order: $STDOUT"
 [ "$(jq -r '.[0].value' <<<"$STDOUT")" = "$STUB_DIR/mytool dispatch {id}" ] ||
   fail "GET /api/config: configured value wrong: $STDOUT"
 [ "$(jq -r '.[1].value' <<<"$STDOUT")" = "null" ] ||
   fail "an unconfigured action must report value: null, got $STDOUT"
-[ "$(jq -r '.[1].default' <<<"$STDOUT")" = '{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"' ] ||
+[ "$(jq -r '.[2].default' <<<"$STDOUT")" = '{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"' ] ||
   fail "GET /api/config: built-in default wrong: $STDOUT"
-[ "$(jq -r '.[2].placeholders | join(" ")' <<<"$STDOUT")" = "{bin} {agent} {prompt}" ] ||
+[ "$(jq -r '.[3].placeholders | join(" ")' <<<"$STDOUT")" = "{bin} {agent} {prompt}" ] ||
   fail "GET /api/config: agent-spawn's placeholder vocabulary wrong: $STDOUT"
 ok "GET /api/config reports each command's configured value (null when unset), its built-in default and the placeholders it offers"
 
 api PUT /api/config "{\"commands\": {\"agent-spawn\": \"  $STUB_DIR/mytool from-settings --prompt {prompt}  \"}}"
 [ "$CODE" = "200" ] || fail "PUT /api/config: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "$STUB_DIR/mytool from-settings --prompt {prompt}" ] ||
+[ "$(jq -r '.[3].value' <<<"$STDOUT")" = "$STUB_DIR/mytool from-settings --prompt {prompt}" ] ||
   fail "PUT must echo the stored (trimmed) value: $STDOUT"
 [ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
   fail "PUT dropped a section of the file it doesn't own: $(cat "$CONFIG")"
@@ -254,7 +261,7 @@ ok "PUT /api/config writes the same file the spawn path reads — the next spawn
 
 api PUT /api/config '{"commands": {"agent-spawn": "   "}}'
 [ "$CODE" = "200" ] || fail "PUT blank: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "null" ] ||
+[ "$(jq -r '.[3].value' <<<"$STDOUT")" = "null" ] ||
   fail "a blank value must clear the key, got $STDOUT"
 [ "$(jq -r '.commands | has("agent-spawn")' < "$CONFIG")" = "false" ] ||
   fail "a blank value must remove the key, not store an empty string: $(cat "$CONFIG")"
@@ -321,6 +328,17 @@ wait_lines "$CLAUDE_LOG" 3
 grep -qx "$FAKE_HOME|--agent|swe|--name|inbox $ITEM_2: loki: find exits 0 on no match|--|/inbox-triage $ITEM_2" "$CLAUDE_LOG" ||
   fail "the built-in inbox-watcher argv changed: $(cat "$CLAUDE_LOG")"
 ok "the unconfigured inbox-watcher keeps its built-in \`--name inbox <id>: <body> -- /inbox-triage <id>\` argv"
+
+# The refine-watcher's built-in default is a prose prompt rather than a slash
+# command, so the assertion is that it arrives as ONE argument carrying {id}.
+run 0 "$MESA" task create "$B" "task b-refine" --status refine
+TASK_B_REFINE=$(jqs .id)
+wait_lines "$CLAUDE_LOG" 4
+grep -q "^$DIR_B|--agent|swe|--name|B: task b-refine|--|First use .mesa. to get the task info from id $TASK_B_REFINE\." "$CLAUDE_LOG" ||
+  fail "the built-in refine-watcher argv changed: $(cat "$CLAUDE_LOG")"
+grep -q "id $TASK_B_REFINE.*description and acceptance.*'todo'" "$CLAUDE_LOG" ||
+  fail "the built-in refinement prompt must stay one argument end to end: $(cat "$CLAUDE_LOG")"
+ok "the unconfigured refine-watcher keeps its built-in \`--name <project>: <name> -- <refinement prompt with {id}>\` argv, prompt intact as one argument"
 
 # ---- MESA_CLAUDE_AGENT still disables --agent through the default template ----
 

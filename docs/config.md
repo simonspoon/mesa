@@ -1,21 +1,23 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly three places. Each one's command line
+mesa starts a coding agent from exactly four places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
 persona and the slash command can all change without rebuilding mesa:
 
 | Key | Used by | Built-in default |
 | --- | --- | --- |
 | `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}"` |
+| `refine-watcher` | `serve --watch-refine` refinement pass (`docs/refine-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "First use \`mesa\` to get the task info from id {id}. …"` |
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"` |
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `{bin} --bg --agent {agent} -- {prompt}` |
 
 ```json
 {
   "commands": {
-    "todo-watcher":  "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
-    "inbox-watcher": "codex exec --cd . \"triage mesa inbox item {id}\"",
-    "agent-spawn":   "claude --bg -- {prompt}"
+    "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
+    "refine-watcher": "claude --bg --agent planner --name {name} -- \"/refine-mesa-task {id}\"",
+    "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
+    "agent-spawn":    "claude --bg -- {prompt}"
   }
 }
 ```
@@ -32,7 +34,7 @@ A template is **tokenized and executed directly** — there is no `sh -c`
 anywhere on this path, unlike `hooks.json` (`docs/hooks.md`), which genuinely
 is a shell string.
 
-That is load-bearing. Both watchers pass untrusted free text as the session
+That is load-bearing. Every watcher passes untrusted free text as the session
 name: a task's derived name, or an inbox item's first line. What makes that
 safe is that the text arrives as one `Command::arg`. So substitution happens **after**
 tokenization: the argv length is fixed by the template alone, and no value can
@@ -44,9 +46,12 @@ The consequences of having no shell:
 - `|`, `>`, `&&`, `$VAR`, `~` are ordinary characters. No pipes, no
   redirection, no environment expansion, no globbing. Write absolute paths.
 - Quote an argument that contains spaces: `'…'` (literal) or `"…"`
-  (backslash-escapable). **The prompt in the two watcher defaults is quoted for
-  exactly this reason** — `-- "/execute-mesa-task {id}"` is one argument;
-  unquoted, it would be two and the id would be lost.
+  (backslash-escapable). **The prompt in all three watcher defaults is quoted
+  for exactly this reason** — `-- "/execute-mesa-task {id}"` is one argument;
+  unquoted, it would be two and the id would be lost. The refine-watcher's
+  default is a whole *sentence* of prompt inside those quotes; it is one argv
+  entry for the same reason, and nothing about it is re-split after `{id}` is
+  substituted.
 - An unterminated quote or a trailing backslash is an error, not a
   silently-mangled argv.
 - Need a shell? Name one: `sh -c "…"` as the template. That is your choice to
@@ -60,10 +65,10 @@ what that spawn actually knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{bin}` | all three | `MESA_CLAUDE_BIN`, else `claude` |
-| `{agent}` | all three | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
+| `{bin}` | all four | `MESA_CLAUDE_BIN`, else `claude` |
+| `{agent}` | all four | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
 | `{id}` | watchers | the task id / inbox item id |
-| `{name}` | watchers | the session name mesa derives — `<project>: <task name>`, or `inbox <id>: <first body line>` (**untrusted text**) |
+| `{name}` | watchers | the session name mesa derives — `<project>: <task name>` (todo- and refine-watcher), or `inbox <id>: <first body line>` (**untrusted text**) |
 | `{prompt}` | `agent-spawn` | the POST body's `prompt`; unavailable when omitted |
 
 Two rules cover the edges:
@@ -101,7 +106,8 @@ larger token (`--name mesa-{id}`).
 ## What a replacement command owes mesa
 
 Only its **exit code**. Nonzero is a failed spawn (the todo-watcher reverts the
-task to `todo`, the inbox-watcher un-claims the item so a later tick retries).
+task to `todo`; the refine- and inbox-watchers drop the id from their
+in-memory dispatched set, so a later tick retries).
 
 Printing `backgrounded · <id>` is optional. mesa parses that line when it is
 there and `POST /api/projects/{id}/agents` returns the id; with no such line
@@ -168,7 +174,7 @@ Nothing is cached: a save is live on the next dispatch, with no restart.
 
 ## Gate
 
-`scripts/config-check.sh` — all three commands driven by a configured template
+`scripts/config-check.sh` — all four commands driven by a configured template
 (placeholders, quoting, the drop rule), the built-in argv proven unused while
 they are set and byte-for-byte unchanged when they aren't, the `id: null`
 no-receipt path, hot reload with no restart, and the malformed /

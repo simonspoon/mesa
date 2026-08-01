@@ -17,7 +17,7 @@ import { formatTimestamp, timeAgo } from './time'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
-const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done']
+const COLUMNS: Status[] = ['backlog', 'refine', 'todo', 'in_progress', 'done']
 
 function CardBody({ task }: { task: TaskSummary }) {
   return (

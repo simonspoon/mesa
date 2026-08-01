@@ -580,6 +580,13 @@ main {
   margin-right: 0.25rem;
 }
 
+/* `refine` sits before `todo`: work that is queued but still being worded,
+   so it reads as a cooler, quieter cousin of the cyan todo badge. */
+.badge.status-refine {
+  color: var(--violet);
+  border-color: rgba(168, 107, 255, 0.5);
+}
+
 .badge.status-todo {
   color: var(--cyan);
   border-color: var(--cyan-dim);
@@ -716,7 +723,9 @@ main {
 
 .kanban {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* One track per COLUMNS entry in KanbanBoard.tsx: backlog · refine · todo ·
+     in_progress · done (mesa task 661). */
+  grid-template-columns: repeat(5, 1fr);
   gap: 0.75rem;
 }
 

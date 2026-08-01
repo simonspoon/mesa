@@ -217,7 +217,7 @@ UI does not live-sync; it refetches on window focus.
   worktrees, unique per project) and record a **local path** (the last-known
   working folder on this machine, which anchors the git and agents views).
 - **Task** — belongs to exactly one project; has a status
-  (`todo | in_progress | done | cancelled`), a priority (`low | medium | high`),
+  (`backlog | refine | todo | in_progress | done | cancelled`), a priority (`low | medium | high`),
   tags, an optional `acceptance` (definition-of-done), `artifact` (work
   receipt), and `result` (free-text final summary written when the work is
   done), and may be a subtask of another task in the same project. The three
@@ -257,6 +257,12 @@ UI does not live-sync; it refetches on window focus.
   `mesa inbox {add,list,show,assign,delete}`. `mesa serve --watch-inbox`
   triages the whole inbox for you, spawning a Claude Code agent per pending
   item; off by default.
+- **Refine column** — the board column *before* `todo`, for a task whose
+  description isn't sharp enough to hand out yet. `mesa serve --watch-refine`
+  empties it for you: one agent per project per tick clarifies a task,
+  rewrites its `description`/`acceptance` and moves it to `todo`. Off by
+  default, and independent of `--watch-todo` — the two read disjoint columns.
+  See `docs/refine-watcher.md`.
 
 ## Storyboards
 
@@ -307,10 +313,11 @@ start locations in the global Agents sidebar.
   attach`, so it works from remote machines under `--lan`). There is
   deliberately no `mesa agent` CLI — an agent in a terminal uses `claude`
   directly.
-- **Configurable spawn commands**: the three places mesa starts an agent — the
-  todo-watcher's dispatch, the inbox-watcher's triage, and the sidebar's *add
-  agent* — each read a command template from `~/.mesa/config.json`
-  (`commands.todo-watcher`, `.inbox-watcher`, `.agent-spawn`), so you can
+- **Configurable spawn commands**: the four places mesa starts an agent — the
+  todo-watcher's dispatch, the refine-watcher's refinement pass, the
+  inbox-watcher's triage, and the sidebar's *add agent* — each read a command
+  template from `~/.mesa/config.json` (`commands.todo-watcher`,
+  `.refine-watcher`, `.inbox-watcher`, `.agent-spawn`), so you can
   change the binary, its flags, the persona or the slash command without
   rebuilding. Placeholders `{id}`, `{name}`, `{prompt}` (plus `{bin}`,
   `{agent}`). Templates are argv, not shell: no config file means the built-in
@@ -344,8 +351,9 @@ scripts/attachments-check.sh    # attachment contract over CLI + API, including 
 scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
 scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`
+scripts/refine-watcher-check.sh # `serve --watch-refine` refinement loop against a stub `claude`
 scripts/inbox-watcher-check.sh  # `serve --watch-inbox` triage loop against a stub `claude`
-scripts/config-check.sh     # the 3 configurable spawn commands in ~/.mesa/config.json
+scripts/config-check.sh     # the 4 configurable spawn commands in ~/.mesa/config.json
 scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)

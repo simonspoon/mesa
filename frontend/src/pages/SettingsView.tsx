@@ -23,6 +23,11 @@ const COPY: Record<string, { title: string; blurb: string }> = {
     blurb:
       '`serve --watch-todo` runs this to pick up the next unblocked task in a project.',
   },
+  'refine-watcher': {
+    title: 'Refine watcher',
+    blurb:
+      '`serve --watch-refine` runs this to sharpen a task sitting in the refine column and move it on to todo.',
+  },
   'inbox-watcher': {
     title: 'Inbox watcher',
     blurb: '`serve --watch-inbox` runs this to triage a new inbox item.',

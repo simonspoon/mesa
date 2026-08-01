@@ -108,6 +108,12 @@ because someone ran `mesa serve`.
   before finishing, its task stays `in_progress` and that project goes quiet
   until someone intervenes; the watcher does not detect or recover from a
   dead agent.
+- **`refine` is invisible here too, and that is the whole point of the
+  column.** Both picks filter `status = 'todo'`, so a task parked in `refine`
+  (`docs/refine-watcher.md`) is no more actionable than a `backlog` one. The
+  two watchers therefore never contend: `--watch-refine` empties the refine
+  column by moving tasks to `todo`, at which point this watcher may dispatch
+  them as ordinary work.
 - The tick cadence is a fixed internal constant (`WATCH_TODO_TICK`, 60s), not
   user-configurable. `MESA_WATCH_TODO_TICK_MS` overrides it, a test-only seam
   (mirrors `MESA_CLAUDE_BIN`) so `scripts/todo-watcher-check.sh` isn't stuck

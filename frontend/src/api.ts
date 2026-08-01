@@ -672,7 +672,7 @@ export function restartServer(): Promise<{ restarting: boolean }> {
 }
 
 /**
- * The three agent-spawn command templates in `~/.mesa/config.json`, each with
+ * The four agent-spawn command templates in `~/.mesa/config.json`, each with
  * the built-in default it falls back to and the placeholders it may use
  * (docs/config.md). 502 `unavailable` means the file itself is unreadable or
  * malformed — a real state the Settings page shows rather than papering over.

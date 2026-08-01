@@ -21,7 +21,7 @@ import { ConfirmDelete } from './ConfirmDelete'
 import { InlineEdit } from './InlineEdit'
 import { TaskRow } from './TaskRow'
 
-const STATUSES: Status[] = ['backlog', 'todo', 'in_progress', 'done', 'cancelled']
+const STATUSES: Status[] = ['backlog', 'refine', 'todo', 'in_progress', 'done', 'cancelled']
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 
 function CreateSubtaskForm({

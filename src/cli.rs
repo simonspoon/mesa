@@ -129,6 +129,15 @@ enum Command {
         /// action.
         #[arg(long, default_value_t = false)]
         watch_todo: bool,
+        /// Periodically auto-start a background `claude` agent on one task per
+        /// project sitting in the `refine` column, to clarify its description
+        /// and acceptance and move it on to `todo`. Off by default: this
+        /// spawns real agents (API cost, code execution) with no user request
+        /// behind it. Independent of --watch-todo (refine and todo are
+        /// disjoint statuses). Preserved across the web UI's Restart Server
+        /// action.
+        #[arg(long, default_value_t = false)]
+        watch_refine: bool,
         /// Periodically auto-start a background `claude` agent to triage each
         /// pending item in the global inbox (prompt: `/inbox-triage <id>`, cwd
         /// `$HOME` — an inbox item belongs to no project). Off by default:
@@ -341,7 +350,7 @@ EXAMPLES
         /// Priority: low|medium|high
         #[arg(long, value_parser = parse_priority, default_value = "medium")]
         priority: Priority,
-        /// Initial status: backlog|todo|in_progress|done|cancelled (default todo)
+        /// Initial status: backlog|refine|todo|in_progress|done|cancelled (default todo)
         #[arg(long, value_parser = parse_status, default_value = "todo")]
         status: Status,
         /// Comma-separated tags, e.g. --tags writing,web (alias --tag)
@@ -381,7 +390,7 @@ EXAMPLES
         /// Only tasks in this project (id or name); flag form of [PROJECT]
         #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
-        /// Only tasks with this status: backlog|todo|in_progress|done|cancelled
+        /// Only tasks with this status: backlog|refine|todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
         /// Only tasks carrying this tag (alias --tags; still a single tag)
@@ -481,7 +490,7 @@ EXAMPLES
             conflicts_with = "description"
         )]
         description_file: Option<String>,
-        /// New status: backlog|todo|in_progress|done|cancelled
+        /// New status: backlog|refine|todo|in_progress|done|cancelled
         #[arg(long, value_parser = parse_status, group = "fields")]
         status: Option<Status>,
         /// New priority: low|medium|high
@@ -1235,8 +1244,9 @@ EXAMPLES
 }
 
 fn parse_status(s: &str) -> std::result::Result<Status, String> {
-    Status::parse(s)
-        .ok_or_else(|| format!("'{s}' is not one of backlog|todo|in_progress|done|cancelled"))
+    Status::parse(s).ok_or_else(|| {
+        format!("'{s}' is not one of backlog|refine|todo|in_progress|done|cancelled")
+    })
 }
 
 fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
@@ -1597,8 +1607,9 @@ fn execute(command: Command) -> Result<()> {
             port,
             lan,
             watch_todo,
+            watch_refine,
             watch_inbox,
-        } => crate::api::serve(port, lan, watch_todo, watch_inbox),
+        } => crate::api::serve(port, lan, watch_todo, watch_refine, watch_inbox),
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;

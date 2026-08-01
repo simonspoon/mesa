@@ -164,6 +164,18 @@ struct AppState {
     /// direction (a duplicate triage of an item is cheap; a permanently
     /// skipped item is not) — see `docs/inbox-watcher.md`.
     inbox_dispatched: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// Task ids the refine-watcher (`watch_refine`) has already dispatched a
+    /// refinement agent for. In memory for the same reason as
+    /// [`AppState::inbox_dispatched`], not the same reason: a refine task
+    /// *has* a status column, but the claim the todo-watcher makes
+    /// (`in_progress`) would be a lie here — nobody is executing the task, and
+    /// it would make the project read as busy to the todo-watcher. The refine
+    /// agent's own move to `todo` is what ends the dispatch; until then this
+    /// set is what stops a re-dispatch every tick. Pruned each tick to the ids
+    /// still sitting in `refine`, so it can't grow unboundedly — and
+    /// deliberately not persisted, so a restart re-refines whatever is still
+    /// in the column (the recoverable direction, `docs/refine-watcher.md`).
+    refine_dispatched: Arc<Mutex<std::collections::HashSet<i64>>>,
 }
 
 /// How often the todo-watcher (`watch_todo`) checks every project for
@@ -192,6 +204,19 @@ fn watch_inbox_tick() -> Duration {
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_INBOX_TICK)
+}
+
+/// How often the refine-watcher (`watch_refine`) checks every project for a
+/// task sitting in the `refine` column. Same fixed-cadence rationale as
+/// [`WATCH_TODO_TICK`]; `MESA_WATCH_REFINE_TICK_MS` is the matching test seam.
+const WATCH_REFINE_TICK: Duration = Duration::from_secs(60);
+
+fn watch_refine_tick() -> Duration {
+    std::env::var("MESA_WATCH_REFINE_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_REFINE_TICK)
 }
 
 /// How much of an inbox body goes into an auto-dispatched session's name,
@@ -491,15 +516,127 @@ fn todo_watcher_tick(state: &AppState) {
     }
 }
 
+/// One refine-watcher pass: for every project with a live `local_path`,
+/// dispatch a background `claude` agent on the top-ranked task sitting in the
+/// `refine` column that this process has not already dispatched for.
+///
+/// Refine sits **before** `todo` on the board: a task lands there when its
+/// description still needs sharpening, and the agent's job is to read it,
+/// rewrite `description`/`acceptance`, and move it to `todo` — at which point
+/// the todo-watcher may pick it up as ordinary work. The two watchers are
+/// independent flags over disjoint statuses and never contend: `next_task`
+/// and `next_subtask` both filter `status = 'todo'`, so a refine task is
+/// invisible to the todo-watcher, and this tick only ever reads `refine`.
+///
+/// Three deliberate differences from [`todo_watcher_tick`]:
+/// - **No status claim.** There is no intermediate status to flip to, and
+///   `in_progress` would be a lie that also wedges the todo-watcher (a
+///   non-umbrella `in_progress` leaf marks its whole project busy). The
+///   in-memory `refine_dispatched` set is the claim instead, exactly as the
+///   inbox-watcher does it, with the same restart behavior: a re-dispatch is
+///   cheap, a permanently skipped task is not.
+/// - **A busy project is not skipped.** Refinement is text work on a task
+///   nobody is executing; parking it behind whatever the todo-watcher is
+///   running would leave the column stuck for hours.
+/// - **One dispatch per project per tick.** A backlog of forty refine tasks
+///   must not become forty concurrent agents in one working folder, so the
+///   column drains over consecutive ticks. `list_refine_tasks` hands them over
+///   in priority-then-id order, the same rank the todo-watcher dispatches in.
+///
+/// Two-phase, like every other spawn site here: the store lock is dropped
+/// before the blocking `claude --bg` shell-outs.
+fn refine_watcher_tick(state: &AppState) {
+    let candidates: Vec<(i64, String, String)> = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        let projects = match store.list_projects() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("refine-watcher: list_projects failed: {e}");
+                return;
+            }
+        };
+        let tasks = match store.list_refine_tasks(None) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("refine-watcher: list_refine_tasks failed: {e}");
+                return;
+            }
+        };
+        let mut dispatched = match state.refine_dispatched.lock() {
+            Ok(d) => d,
+            Err(e) => e.into_inner(),
+        };
+        // A task that left the column (refined, or moved by hand) drops out of
+        // the set, so it can be refined again if it ever comes back.
+        let present: std::collections::HashSet<i64> = tasks.iter().map(|t| t.id).collect();
+        dispatched.retain(|id| present.contains(id));
+
+        let mut picked = Vec::new();
+        for project in projects {
+            let Some(local_path) = project.local_path.as_deref() else {
+                continue;
+            };
+            if !std::path::Path::new(local_path).is_dir() {
+                continue;
+            }
+            // `list_refine_tasks` is already in priority-then-id order, so the
+            // first undispatched task of this project is this tick's pick.
+            let Some(task) = tasks
+                .iter()
+                .find(|t| t.project_id == project.id && !dispatched.contains(&t.id))
+            else {
+                continue;
+            };
+            dispatched.insert(task.id);
+            picked.push((
+                task.id,
+                local_path.to_string(),
+                format!("{}: {}", project.name, task.name),
+            ));
+        }
+        picked
+    };
+    for (task_id, local_path, session_name) in candidates {
+        // The command — including the whole refinement prompt — comes from
+        // `~/.mesa/config.json`'s `refine-watcher` entry (`docs/config.md`).
+        if let Err(e) = agents::spawn_bg(
+            config::REFINE_WATCHER,
+            &local_path,
+            Some(task_id),
+            Some(&session_name),
+            None,
+        ) {
+            eprintln!("refine-watcher: spawn failed for task {task_id}: {e}");
+            // Release the claim so a transient `claude` failure retries next
+            // tick — the mirror of the todo-watcher's revert-to-`todo`.
+            let mut dispatched = match state.refine_dispatched.lock() {
+                Ok(d) => d,
+                Err(e) => e.into_inner(),
+            };
+            dispatched.remove(&task_id);
+        }
+    }
+}
+
 /// Opens the default store and serves the API, blocking until the process is
 /// killed. Binds 127.0.0.1 by default; with `lan`, binds 0.0.0.0 so other
 /// devices on the local network can reach it (no auth — see `serve --help`).
-/// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`])
+/// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`]),
+/// `watch_refine` the periodic refine-watcher (see [`refine_watcher_tick`])
 /// and `watch_inbox` the periodic inbox-watcher (see [`inbox_watcher_tick`]);
-/// both off by default, both propagated across the web UI's Restart Server
-/// action. They are independent flags over independent queues — neither
-/// implies the other.
-pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate::core::Result<()> {
+/// all off by default, all propagated across the web UI's Restart Server
+/// action. They are independent flags over independent queues — none implies
+/// another.
+pub fn serve(
+    port: u16,
+    lan: bool,
+    watch_todo: bool,
+    watch_refine: bool,
+    watch_inbox: bool,
+) -> crate::core::Result<()> {
     let store = Store::open_default()?;
     let restart_requested = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -524,6 +661,7 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate
         restart_requested: restart_requested.clone(),
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
         inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        refine_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -538,6 +676,17 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate
                     ticker.tick().await;
                     let state = watch_state.clone();
                     let _ = tokio::task::spawn_blocking(move || todo_watcher_tick(&state)).await;
+                }
+            });
+        }
+        if watch_refine {
+            let watch_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(watch_refine_tick());
+                loop {
+                    ticker.tick().await;
+                    let state = watch_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || refine_watcher_tick(&state)).await;
                 }
             });
         }
@@ -580,6 +729,9 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate
         }
         if watch_todo {
             args.push("--watch-todo".to_string());
+        }
+        if watch_refine {
+            args.push("--watch-refine".to_string());
         }
         if watch_inbox {
             args.push("--watch-inbox".to_string());
@@ -3747,6 +3899,7 @@ mod tests {
             restart_requested: Arc::new(AtomicBool::new(false)),
             shutdown_tx: Arc::new(Mutex::new(None)),
             inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            refine_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
         (dir, state)
     }
@@ -4911,6 +5064,135 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             2,
             "an epic holding its own claim parks the project: {log:?}"
         );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    // --- refine watcher (mesa task 661) -----------------------------------
+
+    fn new_refine_task(state: &AppState, project_id: i64, description: &str) -> i64 {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_task(
+                project_id,
+                description,
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                Some(Status::Refine),
+            )
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn refine_watcher_tick_drips_one_per_project_and_never_repeats() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        // A project with no local_path is skipped, like the todo-watcher's.
+        let pathless = new_project(&state, None);
+        new_refine_task(&state, pathless, "nowhere to run");
+
+        let first = new_refine_task(&state, project, "vague one");
+        let second = new_refine_task(&state, project, "vague two");
+        // Plain todo work is not this watcher's business at all.
+        let todo = new_task(&state, project);
+
+        let lines = || {
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+
+        refine_watcher_tick(&state);
+        assert_eq!(lines(), 1, "one dispatch per project per tick: {:?}", log());
+        assert!(
+            log().contains(&format!("id {first}")),
+            "the head of the column goes first: {:?}",
+            log()
+        );
+        // Dispatch is not a status claim: the task stays in `refine` until
+        // the agent itself moves it on, and the project never reads as busy.
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(first), Status::Refine);
+
+        // Next tick: the already-dispatched task is skipped, the next one in
+        // rank goes out. The column drains rather than stampeding.
+        refine_watcher_tick(&state);
+        assert_eq!(lines(), 2, "{:?}", log());
+        assert!(log().contains(&format!("id {second}")), "{:?}", log());
+
+        // Nothing left undispatched — and no dispatch onto the todo task or
+        // the path-less project, on this tick or any earlier one.
+        refine_watcher_tick(&state);
+        assert_eq!(lines(), 2, "{:?}", log());
+        assert!(!log().contains(&format!("id {todo}")), "{:?}", log());
+
+        // The agent's own move to `todo` is what ends refinement: the task
+        // leaves the column, and the todo-watcher can now pick it up.
+        set_status(&state, first, Status::Todo);
+        refine_watcher_tick(&state);
+        assert_eq!(lines(), 2, "a refined task is not re-refined: {:?}", log());
+
+        // …and if it comes back for another pass, it is dispatched again —
+        // the dedup set tracks the column, not the task's whole life.
+        set_status(&state, first, Status::Refine);
+        refine_watcher_tick(&state);
+        assert_eq!(lines(), 3, "{:?}", log());
+        assert!(log().contains(&format!("id {first}")), "{:?}", log());
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn refine_watcher_tick_retries_after_a_spawn_failure() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // Arm the stub's failure switch: `claude` exits nonzero.
+        std::fs::write(stub_dir.path().join("fail"), "").unwrap();
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let task = new_refine_task(&state, project, "vague");
+
+        refine_watcher_tick(&state);
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap_or_default(),
+            "",
+            "the stub failed before logging"
+        );
+        // The claim is released, so the task is not silently stranded in the
+        // column forever — the mirror of the todo-watcher's revert-to-`todo`.
+        std::fs::remove_file(stub_dir.path().join("fail")).unwrap();
+        refine_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 1, "retried next tick: {log:?}");
+        assert!(log.contains(&format!("id {task}")), "{log:?}");
 
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
     }

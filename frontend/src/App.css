@@ -759,6 +759,19 @@ main {
   padding: 0;
 }
 
+/* The `done` column's "load more" control (mesa task 664). It sits below the
+   sortable <ul>, deliberately outside it — full width so it reads as a footer
+   for the column rather than a card. */
+.kanban-load-more {
+  width: 100%;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.kanban-load-more:hover:not(:disabled) {
+  color: var(--cyan);
+}
+
 .kanban-card {
   background: var(--panel-raised);
   border: 1px solid var(--border-bright);

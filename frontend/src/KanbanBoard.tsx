@@ -13,7 +13,7 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { updateTaskPosition } from './api'
-import { liveAgentCount } from './boardView'
+import { capColumn, liveAgentCount, DONE_INITIAL, DONE_PAGE } from './boardView'
 import { formatTimestamp, timeAgo } from './time'
 import type { AgentSession } from './types/AgentSession'
 import type { Status } from './types/Status'
@@ -149,17 +149,26 @@ function Column({
   tasks,
   projectName,
   sessions,
+  shown,
+  onShowMore,
 }: {
   status: Status
   tasks: TaskSummary[]
   projectName: string | null
   sessions: AgentSession[] | null
+  shown: number
+  onShowMore: () => void
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: status })
-  const ordered = nestColumn(orderColumn(status, tasks))
+  // Cap between the sort and the nesting, so the `done` slice is the 20 (then
+  // 70, …) most recently completed rows — see `capColumn`.
+  const { visible, hidden } = capColumn(status, orderColumn(status, tasks), shown)
+  const ordered = nestColumn(visible)
   return (
     <div ref={setNodeRef} className={`kanban-column${isOver ? ' over' : ''}`}>
       <h2>
+        {/* The *total*, not the shown count: a capped column must not read as
+            missing data. */}
         {status} <span className="muted">{tasks.length}</span>
       </h2>
       <SortableContext
@@ -177,6 +186,13 @@ function Column({
           ))}
         </ul>
       </SortableContext>
+      {/* Deliberately outside the SortableContext <ul>: it is not a card, not
+          draggable and not a drop target. */}
+      {hidden > 0 && (
+        <button type="button" className="kanban-load-more" onClick={onShowMore}>
+          Load {Math.min(hidden, DONE_PAGE)} more ({hidden} hidden)
+        </button>
+      )}
     </div>
   )
 }
@@ -206,6 +222,12 @@ export function KanbanBoard({
 }) {
   const [error, setError] = useState<string | null>(null)
   const [activeId, setActiveId] = useState<number | null>(null)
+  // How many `done` cards to render (mesa task 664). Component state, not
+  // derived from `tasks`, so an expansion survives the board's ordinary
+  // refetches — `onMoved` and the window-focus refetch both hand down a fresh
+  // array, and expanding to 120 then dragging a card must not snap back to 20.
+  // It resets when the board unmounts, i.e. on navigating away.
+  const [shownDone, setShownDone] = useState(DONE_INITIAL)
   // Mouse and touch get *different* activation gestures, which is why this is
   // MouseSensor + TouchSensor rather than the one PointerSensor that covers
   // both (mesa task 555).
@@ -293,6 +315,8 @@ export function KanbanBoard({
               tasks={tasks.filter((t) => t.status === status)}
               projectName={projectName}
               sessions={sessions}
+              shown={shownDone}
+              onShowMore={() => setShownDone((n) => n + DONE_PAGE)}
             />
           ))}
         </div>

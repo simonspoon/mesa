@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { liveAgentCount, loadBoardView, saveBoardView } from './boardView'
+import {
+  capColumn,
+  liveAgentCount,
+  loadBoardView,
+  saveBoardView,
+  DONE_INITIAL,
+  DONE_PAGE,
+} from './boardView'
 import type { AgentSession } from './types/AgentSession'
 
 function session(over: Partial<AgentSession> = {}): AgentSession {
@@ -17,6 +24,49 @@ function session(over: Partial<AgentSession> = {}): AgentSession {
     ...over,
   }
 }
+
+describe('capColumn', () => {
+  const rows = (n: number) => Array.from({ length: n }, (_, i) => i)
+
+  it('leaves a done column shorter than the cap alone, with no button', () => {
+    const { visible, hidden } = capColumn('done', rows(7), DONE_INITIAL)
+    expect(visible).toHaveLength(7)
+    expect(hidden).toBe(0)
+  })
+
+  it('leaves a done column of exactly the cap alone, with no button', () => {
+    const { visible, hidden } = capColumn('done', rows(DONE_INITIAL), DONE_INITIAL)
+    expect(visible).toHaveLength(DONE_INITIAL)
+    expect(hidden).toBe(0)
+  })
+
+  it('keeps the first `shown` rows and reports the rest as hidden', () => {
+    const { visible, hidden } = capColumn('done', rows(266), DONE_INITIAL)
+    expect(visible).toEqual(rows(DONE_INITIAL))
+    expect(hidden).toBe(246)
+  })
+
+  it('reports a partial final page', () => {
+    // 266 done, expanded four times: 20 → 70 → 120 → 170 → 220.
+    const { visible, hidden } = capColumn('done', rows(266), DONE_INITIAL + 4 * DONE_PAGE)
+    expect(visible).toHaveLength(220)
+    expect(hidden).toBe(46)
+  })
+
+  it('shows everything once `shown` passes the total', () => {
+    const { visible, hidden } = capColumn('done', rows(266), 300)
+    expect(visible).toHaveLength(266)
+    expect(hidden).toBe(0)
+  })
+
+  it('returns every other column uncapped', () => {
+    for (const status of ['backlog', 'refine', 'todo', 'in_progress']) {
+      const { visible, hidden } = capColumn(status, rows(266), DONE_INITIAL)
+      expect(visible).toHaveLength(266)
+      expect(hidden).toBe(0)
+    }
+  })
+})
 
 describe('liveAgentCount', () => {
   const task = { name: 'Animate a task card' }

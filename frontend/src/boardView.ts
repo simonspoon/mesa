@@ -37,6 +37,34 @@ export function liveAgentCount(
   return sessions.filter((s) => s.name === wanted && isRunningAgent(s)).length
 }
 
+/** How many `done` cards the Board renders before the first "load more"
+ *  (mesa task 664), and how many each click adds. */
+export const DONE_INITIAL = 20
+export const DONE_PAGE = 50
+
+/** Render cap for the Board's `done` column — a *view* limit only: the
+ *  fetch (`GET /api/tasks?project=<id>`) still returns every task and the
+ *  column header still reports the full total, so a truncated column never
+ *  reads as missing data.
+ *
+ *  Only `done` is capped; the four working columns are returned untouched.
+ *  Callers apply this **after** the recency sort and **before** nesting, so
+ *  "the last 20" is a literal count of the 20 most recently completed rows —
+ *  a subtask whose parent falls outside the cut simply renders at top level,
+ *  which `nestColumn` already handles.
+ *
+ *  `hidden` is what the button's label reports; 0 means no button. */
+export function capColumn<T>(
+  status: string,
+  tasks: T[],
+  shown: number,
+): { visible: T[]; hidden: number } {
+  if (status !== 'done' || tasks.length <= shown) {
+    return { visible: tasks, hidden: 0 }
+  }
+  return { visible: tasks.slice(0, shown), hidden: tasks.length - shown }
+}
+
 // Per-board canvas view state (pan + zoom), persisted browser-local so each
 // storyboard reopens at the pan/zoom the user left it. This lives only on the
 // user's machine (localStorage), keyed by board id — never on the board/server

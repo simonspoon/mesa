@@ -32,8 +32,9 @@ function readFileAsBase64(file: File): Promise<string> {
  * submitting again retries just those, instead of creating a duplicate task.
  *
  * The primary submit button omits `status`, so the API defaults new tasks to
- * `backlog` (spec 302). The secondary "create + move to todo" button passes
- * `status: 'todo'` explicitly, a fast path around that triage step.
+ * `backlog` (spec 302). The secondary "create + move to refine" button passes
+ * `status: 'refine'` explicitly, a fast path around that triage step that
+ * hands the rough description straight to the refine watcher (task 661).
  */
 export function CreateTaskPanel({
   projectId,
@@ -187,9 +188,9 @@ export function CreateTaskPanel({
             <button
               type="button"
               disabled={submitting || description.trim() === ''}
-              onClick={() => submit('todo')}
+              onClick={() => submit('refine')}
             >
-              create + move to todo
+              create + move to refine
             </button>
           )}
         </div>

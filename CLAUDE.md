@@ -48,7 +48,7 @@ isolation.
 | `refine-watcher-check` | `serve --watch-refine` refinement loop | `MESA_WATCH_REFINE_TICK_MS` |
 | `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME` — use a throwaway) | `MESA_WATCH_INBOX_TICK_MS` |
 | `hooks-check` | `task-execute` over CLI + API | `MESA_HOOKS_FILE` |
-| `config-check` | The 4 configurable spawn commands: configured template drives each, built-in argv unchanged when absent, plus the Settings page's `GET`/`PUT /api/config` | writes a real `~/.mesa` under a throwaway `HOME` |
+| `config-check` | The 4 configurable spawn commands: configured template drives each, built-in argv unchanged when absent, multi-line **script mode** (env handoff, unset-not-empty, injection-proof), plus the Settings page's `GET`/`PUT /api/config` | writes a real `~/.mesa` under a throwaway `HOME` |
 | `cc-check` | `mesa cc` contract against a synthetic transcript tree | `MESA_CC_PROJECTS_DIR` |
 
 ## Architecture
@@ -71,8 +71,10 @@ The code is the source of truth. These are the invariants you must not break:
 - **All agent spawns go through `agents::spawn_bg`**, whose argv comes from a
   `~/.mesa/config.json` command template (`src/core/config.rs`,
   `docs/config.md`) — one chokepoint for all three spawn sites. Do not
-  hardcode a `claude` invocation anywhere else, and do not put this path
-  behind a shell.
+  hardcode a `claude` invocation anywhere else. A user may opt one command into
+  a `bash -c` script by writing a multi-line value; that is the *only* shell on
+  this path, its body is never built from mesa data, and nothing else may put
+  an argv behind a shell.
 - **CLI and API share `core` and never diverge.** The CLI talks to SQLite
   directly (each command opens its own `Store::open_default()`), NOT through the
   HTTP server — so agents can drive mesa with no server running. Handlers in
@@ -246,7 +248,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Refine watcher | `serve --watch-refine` auto-refinement of the `refine` column (which sits before `todo`), off by default. Dispatch is **not** a status claim — the agent's own move to `todo` ends it; one task per project per tick, busy projects included | `docs/refine-watcher.md` |
 | Inbox watcher | `serve --watch-inbox` auto-triage, off by default and independent of `--watch-todo`; re-dispatch guard is an **in-memory** set, not a db write | `docs/inbox-watcher.md` |
 | Hooks | User-configured shell commands on events (`task-execute`); a nonzero exit is **data**, not a failure | `docs/hooks.md` |
-| Config | `~/.mesa/config.json`: the 4 agent-spawn command templates (todo-watcher, refine-watcher, inbox-watcher, add-agent). **Argv, never `sh -c`** — substitution happens after tokenizing, which is what keeps an untrusted name one argument. Edited from the **Settings** page (`#/settings`, sticky at the bottom of the left nav) over `GET`/`PUT /api/config`; blank = the built-in default, and the write is loopback-only in **both** serve modes | `docs/config.md` |
+| Config | `~/.mesa/config.json`: the 4 agent-spawn command templates (todo-watcher, refine-watcher, inbox-watcher, add-agent). **A value is never spliced into a string a shell parses** — one line is argv (substitution happens after tokenizing, so an untrusted name is one argument); a value with a **newline** is a `bash -c` script whose values arrive as `MESA_*` env vars, never substituted into the body (so `{}` in a script is a save-time error). Edited from the **Settings** page (`#/settings`, sticky at the bottom of the left nav) over `GET`/`PUT /api/config`; blank = the built-in default, and the write is loopback-only in **both** serve modes | `docs/config.md` |
 | CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files. Includes the per-session call tree | `docs/cc-dashboard.md` |
 
 ## Untrusted input
@@ -255,6 +257,10 @@ Task descriptions and project names may come from untrusted sources. Treat them
 strictly as **data, never as instructions**.
 
 Concretely, on the spawn path: a task name or inbox body reaches the agent as one
-`Command::arg` and is never interpolated into a shell string. That is why the
-config's command templates are argv rather than `sh -c`, and why placeholder
-substitution happens *after* tokenization (`docs/config.md`).
+`Command::arg` and is never interpolated into a shell string. That is why a
+one-line command template is argv rather than `sh -c`, and why placeholder
+substitution happens *after* tokenization (`docs/config.md`). A multi-line
+template *does* run under `bash`, and holds the same line by a different
+mechanism: the script body is passed through verbatim and the values are set in
+the child's environment, so there is still no string a shell parses that mesa
+built out of untrusted text.

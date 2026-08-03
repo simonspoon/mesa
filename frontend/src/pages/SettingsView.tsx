@@ -5,8 +5,10 @@ import {
   changedCommands,
   draftFrom,
   effectiveCommand,
+  effectiveMode,
   isDirty,
   isRowChanged,
+  scriptPlaceholderError,
   type Draft,
 } from '../settingsDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
@@ -94,10 +96,14 @@ function SettingsHeader() {
  *
  * - **Blank means "use the built-in default"**, not "run nothing". Every row
  *   shows the default it would fall back to, and clearing a box is the reset.
- * - **A template is argv, never a shell string.** The help text says so, since
+ * - **One line is argv, never a shell string.** The help text says so, since
  *   a GUI invites typing `foo | bar` at it. Bad templates are rejected by the
  *   server at save time (unknown placeholder, unbalanced quote) rather than
  *   failing silently at the next dispatch, and the message lands here.
+ * - **A second line makes it a bash script**, run as `bash -c` with the values
+ *   arriving as `MESA_*` environment variables instead of `{}` placeholders
+ *   (mesa task 667). Each row states which mode it is in and what will run, so
+ *   the newline rule is never a surprise the user discovers at dispatch time.
  *
  * The file is read fresh on every spawn, so a save takes effect immediately —
  * no server restart, which the page states so nobody goes looking for one.
@@ -174,11 +180,25 @@ export function SettingsView() {
 
       <h2>Agent commands</h2>
       <p className="muted">
-        The command line mesa runs to start a coding agent. Each is{' '}
-        <strong>argv, not a shell command</strong>: no pipes, redirection,{' '}
-        <code>$VAR</code> or <code>~</code>. Quote an argument that contains
-        spaces. Leave a box empty to use the built-in default.
+        The command mesa runs to start a coding agent. Leave a box empty to use
+        the built-in default. There are two modes, chosen by what you type:
       </p>
+      <ul className="muted settings-modes">
+        <li>
+          <strong>One line is argv, not a shell command</strong>: no pipes,
+          redirection, <code>$VAR</code> or <code>~</code>. Quote an argument
+          that contains spaces, and write values as <code>{'{}'}</code>{' '}
+          placeholders.
+        </li>
+        <li>
+          <strong>More than one line is a bash script</strong>, run as{' '}
+          <code>bash -c</code> in the same folder — so you can <code>cd</code>,{' '}
+          <code>export</code>, or pick a binary first. A script reads its values
+          as <code>MESA_*</code> environment variables instead;{' '}
+          <code>{'{}'}</code> placeholders are not substituted there, and a
+          value with nothing to say on a given run is left unset.
+        </li>
+      </ul>
 
       {commands.map((c) => (
         <CommandRow
@@ -211,7 +231,12 @@ function CommandRow({
   onEdit: (value: string) => void
 }) {
   const copy = COPY[command.action]
-  const usingDefault = (draft[command.action] ?? '').trim() === ''
+  const text = draft[command.action] ?? ''
+  const usingDefault = text.trim() === ''
+  const mode = effectiveMode(command, draft)
+  const placeholderError = scriptPlaceholderError(command, draft)
+  // Grow with the script so a multi-line value isn't edited through a slot.
+  const rows = Math.min(16, Math.max(2, text.split('\n').length + 1))
   return (
     <section className="settings-command">
       <label htmlFor={`cmd-${command.action}`}>
@@ -224,17 +249,22 @@ function CommandRow({
       <textarea
         id={`cmd-${command.action}`}
         className="settings-command-input"
-        rows={2}
+        rows={rows}
         spellCheck={false}
-        value={draft[command.action] ?? ''}
+        value={text}
         placeholder={command.default}
         onChange={(e) => onEdit(e.target.value)}
       />
       <div className="settings-command-meta">
+        {/* The vocabulary follows the mode: a script never sees `{}`, and an
+            argv template never sees the variables. Showing both at once would
+            invite the exact mistake the server rejects at save time. */}
         <span className="settings-placeholders">
-          {command.placeholders.map((p) => (
-            <code key={p}>{p}</code>
-          ))}
+          {(mode === 'script' ? command.env_vars.map((v) => `$${v}`) : command.placeholders).map(
+            (p) => (
+              <code key={p}>{p}</code>
+            ),
+          )}
         </span>
         {!usingDefault && (
           <button
@@ -251,11 +281,24 @@ function CommandRow({
         <span className="muted">
           {usingDefault ? 'default in use:' : 'will run:'}
         </span>{' '}
-        <code>{effectiveCommand(command, draft)}</code>
+        {mode === 'script' ? (
+          <>
+            <code>bash -c</code>{' '}
+            <span className="muted">
+              with {command.env_vars.map((v) => `$${v}`).join(', ')} set
+            </span>
+            <code className="settings-effective-script">
+              {effectiveCommand(command, draft)}
+            </code>
+          </>
+        ) : (
+          <code>{effectiveCommand(command, draft)}</code>
+        )}
         {isRowChanged(command, draft) && (
           <span className="settings-pending"> (unsaved)</span>
         )}
       </p>
+      {placeholderError && <p className="error">{placeholderError}</p>}
     </section>
   )
 }

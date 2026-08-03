@@ -28,11 +28,17 @@ file itself instead of a directory — both are accepted, since "a config in
 `~/.mesa`" reads either way and a user who wrote one file shouldn't get a
 silent no-op.
 
+A value has **two modes**, chosen by the value itself: one line is an argv
+template (below), more than one is a bash script
+([Script mode](#script-mode)). There is no mode key and nothing to migrate —
+every template that exists today is one line and behaves byte-for-byte as it
+always has.
+
 ## Argv, not a shell
 
-A template is **tokenized and executed directly** — there is no `sh -c`
-anywhere on this path, unlike `hooks.json` (`docs/hooks.md`), which genuinely
-is a shell string.
+A single-line template is **tokenized and executed directly** — there is no
+`sh -c` anywhere on this path, unlike `hooks.json` (`docs/hooks.md`), which
+genuinely is a shell string.
 
 That is load-bearing. Every watcher passes untrusted free text as the session
 name: a task's derived name, or an inbox item's first line. What makes that
@@ -40,6 +46,12 @@ safe is that the text arrives as one `Command::arg`. So substitution happens **a
 tokenization: the argv length is fixed by the template alone, and no value can
 split into extra arguments or be re-read as a flag. A name of
 `"; rm -rf / #` is just a long, silly session name.
+
+Script mode does **not** weaken this. It runs `bash`, but no mesa value is ever
+spliced into the script text: the body reaches `bash -c` verbatim and the values
+arrive out-of-band, in the child's environment. The invariant was never "mesa
+runs no shell" — it is **mesa never interpolates a value into a string a shell
+parses**, and both modes hold it.
 
 The consequences of having no shell:
 
@@ -54,9 +66,9 @@ The consequences of having no shell:
   substituted.
 - An unterminated quote or a trailing backslash is an error, not a
   silently-mangled argv.
-- Need a shell? Name one: `sh -c "…"` as the template. That is your choice to
-  make explicitly, and then the quoting of untrusted values is yours to get
-  right.
+- Need a shell? Write a second line — see script mode below. (`sh -c "…"` as a
+  one-line template also works, but then the quoting of untrusted values is
+  yours to get right; script mode hands them to you already safe.)
 
 ## Placeholders
 
@@ -87,6 +99,93 @@ Two rules cover the edges:
 
 A `{` that opens nothing is a literal brace, and a placeholder may sit inside a
 larger token (`--name mesa-{id}`).
+
+## Script mode
+
+**A value whose trimmed text contains a newline is a bash script**, run as
+`bash -c <script>` from the same folder the argv would have run in. That is the
+whole switch: no new key, no flag. Surrounding blank lines are whitespace and
+do not by themselves make a value a script.
+
+It exists because a single program call cannot `cd`, export an env var, pick a
+binary conditionally, or run a setup step first.
+
+```json
+{
+  "commands": {
+    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/$MESA_ID\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec \"$MESA_BIN\" --bg --agent swe --name \"$MESA_NAME\" -- \"/execute-mesa-task $MESA_ID\""
+  }
+}
+```
+
+More legibly, that value is:
+
+```bash
+set -euo pipefail
+cd "$HOME/src/checkouts/$MESA_ID" 2>/dev/null || cd "$HOME/src"
+export CLAUDE_PROJECT=mesa
+exec "$MESA_BIN" --bg --agent swe --name "$MESA_NAME" -- "/execute-mesa-task $MESA_ID"
+```
+
+### Values arrive as environment variables
+
+**Nothing is substituted into a script.** The body goes to `bash` verbatim and
+the values are set on the child process instead — which is what keeps untrusted
+free text out of shell parsing in this mode too. Each placeholder has one
+variable, offered on exactly the commands its `{}` twin is:
+
+| Placeholder | Variable | Where |
+| --- | --- | --- |
+| `{bin}` | `MESA_BIN` | all four |
+| `{agent}` | `MESA_AGENT` | all four |
+| `{id}` | `MESA_ID` | watchers |
+| `{name}` | `MESA_NAME` | watchers |
+| `{prompt}` | `MESA_PROMPT` | `agent-spawn` |
+
+Two rules mirror the argv ones:
+
+- **A variable this command doesn't offer is not set** — a watcher script never
+  sees `MESA_PROMPT`, an `agent-spawn` script never sees `MESA_ID`/`MESA_NAME`.
+  mesa explicitly *removes* all five before setting the ones that apply, so a
+  variable can't leak in from the environment `mesa serve` was started with.
+- **A value with nothing to say on this call leaves its variable unset**, not
+  empty — the analogue of the drop rule. `MESA_CLAUDE_AGENT=""` means no
+  `MESA_AGENT`; a promptless `POST /api/projects/{id}/agents` means no
+  `MESA_PROMPT`. So `set -u` fires and `${MESA_PROMPT:-}` reads as "no prompt"
+  rather than "empty prompt".
+
+Quote your uses (`"$MESA_NAME"`), as in any bash script — a task name has
+spaces in it.
+
+### `{placeholder}` in a script is an error
+
+`{}` syntax is meaningless in script mode and would collide with `${VAR}`
+besides, so a script containing one is **refused at save time**, with a message
+naming the variable to use instead. It is neither silently expanded nor
+silently ignored. `PUT /api/config` answers 422 `validation` and the file is
+left byte-identical.
+
+Only the five known names count, and only when the `{` isn't preceded by `$` —
+a script's own `${MESA_NAME}`, `cp a{,.bak}` brace expansion and `{ …; }`
+grouping are left alone.
+
+### Also refused at save time
+
+- An **empty** script, exactly as an empty template is. (Blank still *clears*
+  the key back to the built-in default — that is the same rule in both modes,
+  and it wins: a whitespace-only value is a reset, not an error.)
+- A **bash syntax error**, checked with `bash -n` — which parses and executes
+  nothing. A machine with no `bash` on PATH skips the check rather than failing
+  the save; mesa can't prove a script is wrong there, and such a machine can't
+  run it either.
+
+### What is unchanged
+
+Everything on the far side of the spawn. A script is read fresh on every spawn
+(no caching, no restart), only its **exit code** matters, and a
+`backgrounded · <id>` line on stdout is still parsed as the optional receipt —
+see "What a replacement command owes mesa" below. The watchers' revert/retry
+paths don't know which mode ran.
 
 ## Resolution and failure
 
@@ -146,14 +245,23 @@ rather than presentation:
   storing `""`.
 - **A bad template is refused at save time**, with the same message the spawn
   path would have produced later (`{tsak}`, an unbalanced quote, an unknown
-  key). Validation runs over the whole batch before anything is written, so a
-  rejected save leaves the file byte-identical.
+  key; in script mode a `{placeholder}` or a bash syntax error). Validation runs
+  over the whole batch before anything is written, so a rejected save leaves the
+  file byte-identical.
+- **The mode is visible while typing.** Each row's "will run" line switches to
+  `bash -c` plus the variables that will be set the moment the box holds a
+  second line, and the vocabulary listed under the box switches with it —
+  `{}` placeholders in argv mode, `$MESA_*` in script mode, never both, since
+  showing both invites the mistake the server rejects. A `{placeholder}` typed
+  into a script is named inline, before the save.
 
 Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
 `save_commands`):
 
-- `GET` returns one row per action — `{action, value, default, placeholders}`,
-  where `value` is `null` when the action is falling back. A file that exists
+- `GET` returns one row per action —
+  `{action, value, default, placeholders, env_vars}`, where `value` is `null`
+  when the action is falling back and the two vocabularies line up one-for-one
+  (`{id}` ↔ `MESA_ID`), so the editor can name whichever mode applies. A file that exists
   but can't be parsed is **502 `unavailable`** here exactly as it is on a spawn:
   the page says the config is broken rather than rendering an empty editor a
   save would then write over the wreckage.
@@ -181,6 +289,9 @@ no-receipt path, hot reload with no restart, and the malformed /
 unsupported-placeholder failures — plus `GET`/`PUT /api/config`: the round
 trip, the blank-clears-the-key rule, untouched keys and unknown sections
 preserved, a just-saved template driving the very next spawn, and the 422/502
-refusals leaving the file byte-identical. It writes a real
+refusals leaving the file byte-identical — and, for script mode, a script
+driving each of the four actions, the per-action variables present/absent, the
+unset-not-empty rule, a hostile `{name}` proven not to reach a shell, and the
+422s for `{}`-in-a-script and a bash syntax error. It writes a real
 `~/.mesa/config.json` under a throwaway `HOME` rather than using
 `MESA_CONFIG_FILE`, so the default path resolution is covered too.

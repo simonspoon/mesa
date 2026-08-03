@@ -18,19 +18,34 @@
 //! }
 //! ```
 //!
-//! A template is **argv, not a shell command** — tokenized here and handed to
-//! `Command` directly, with no `sh -c` anywhere. That is load-bearing, not
-//! stylistic: the watchers pass a task name / inbox body (untrusted free
-//! text) as the session `--name`, and what makes that safe is that it reaches
-//! the agent as one `Command::arg`. Placeholders are substituted *after*
-//! tokenization, so a value can never split into extra argv entries or be
-//! reinterpreted as flags — see [`expand`].
+//! A single-line template is **argv, not a shell command** — tokenized here
+//! and handed to `Command` directly, with no `sh -c` anywhere. That is
+//! load-bearing, not stylistic: the watchers pass a task name / inbox body
+//! (untrusted free text) as the session `--name`, and what makes that safe is
+//! that it reaches the agent as one `Command::arg`. Placeholders are
+//! substituted *after* tokenization, so a value can never split into extra
+//! argv entries or be reinterpreted as flags — see [`expand`].
 //!
-//! Unlike `hooks.json` (a genuine `sh -c` string, [`crate::core::hooks`]) this
-//! file only ever names a program and its arguments.
+//! ## Script mode
+//!
+//! A value whose trimmed text contains a **newline** is instead a bash script,
+//! run as `bash -c <script>` ([`is_script`], [`resolve`]). That buys a `cd`, an
+//! `export`, a conditional binary — the things a single program call can't do.
+//!
+//! The safety property survives intact, by a different mechanism: a script's
+//! values arrive as **environment variables** (`MESA_ID`, `MESA_NAME`, …) set
+//! on the child, never as text spliced into the script body, which reaches
+//! `bash` verbatim. So untrusted free text is still never parsed by a shell.
+//! `{}` syntax would be both meaningless and confusable with `${VAR}` there, so
+//! a `{placeholder}` inside a script is a save-time error naming the variable
+//! to use instead.
+//!
+//! Unlike `hooks.json` (a genuine `sh -c` string, [`crate::core::hooks`]) no
+//! value mesa holds is ever interpolated into a string a shell parses.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
@@ -163,6 +178,10 @@ fn settings_in(path: &Path) -> Result<Vec<ConfigCommand>, String> {
                     .iter()
                     .map(|p| (*p).to_string())
                     .collect(),
+                env_vars: offered_env_vars(action)
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect(),
             })
         })
         .collect()
@@ -277,12 +296,19 @@ fn write_atomically(path: &Path, body: &str) -> Result<(), SaveError> {
 
 /// Rejects a template the spawn path would fail on later — an unterminated
 /// quote, a placeholder this action doesn't offer, or one that expands to an
-/// empty argv. Every value is supplied, so only template-shaped mistakes are
-/// caught here; the per-call drop rule stays [`expand`]'s business.
+/// empty argv; in script mode, a `{placeholder}` (which a script never gets)
+/// or a bash syntax error. Every value is supplied, so only template-shaped
+/// mistakes are caught here; the per-call drop rule stays [`expand`]'s
+/// business.
 ///
 /// The point is *when* the failure lands: at save time, in the editor, rather
 /// than at the next dispatch, in a watcher log the user isn't reading.
 pub fn validate(action: &str, template: &str) -> Result<(), String> {
+    if is_script(template) {
+        let script = template.trim();
+        check_script(action, script)?;
+        return bash_syntax_check(action, script);
+    }
     let vars = Vars {
         bin: Some("claude"),
         agent: Some("swe"),
@@ -291,6 +317,181 @@ pub fn validate(action: &str, template: &str) -> Result<(), String> {
         prompt: Some("prompt"),
     };
     expand(action, template, &vars).map(|_| ())
+}
+
+/// True when this value is a **script** rather than an argv template: its
+/// trimmed text spans more than one line.
+///
+/// Mode is chosen by the value, not by a second config key — a JSON string
+/// already carries `\n` and the Settings box is already a `<textarea>`, so
+/// there is nothing to migrate and every existing (single-line) template keeps
+/// its exact behavior. Trimming first is deliberate: surrounding blank lines
+/// are whitespace, and whitespace alone must not silently switch modes.
+pub fn is_script(template: &str) -> bool {
+    template.trim().contains('\n')
+}
+
+/// How a resolved command will actually be run — the two modes, decided by
+/// [`is_script`] and produced by [`resolve`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Spawn {
+    /// A tokenized argv, run directly with no shell (the original mode).
+    Argv(Vec<String>),
+    /// A bash script, run as `bash -c <script>` with `env` set on the child.
+    /// The script text is passed through verbatim — nothing is substituted
+    /// into it, which is what keeps untrusted values out of shell parsing.
+    Script {
+        script: String,
+        env: Vec<(String, String)>,
+    },
+}
+
+/// Resolves one action's configured (or default) `template` into the thing to
+/// run. The mode split lives here so both surfaces — the spawn path and the
+/// Settings preview — can never disagree about which one applies.
+pub fn resolve(action: &str, template: &str, vars: &Vars) -> Result<Spawn, String> {
+    if is_script(template) {
+        let script = template.trim();
+        check_script(action, script)?;
+        return Ok(Spawn::Script {
+            script: script.to_string(),
+            env: script_env(action, vars),
+        });
+    }
+    Ok(Spawn::Argv(expand(action, template, vars)?))
+}
+
+/// Every placeholder name, paired with the environment variable a script reads
+/// instead. The one mapping, shared by the env handoff, the save-time error and
+/// the vocabulary the Settings page advertises.
+const PLACEHOLDER_ENV: [(&str, &str); 5] = [
+    ("bin", "MESA_BIN"),
+    ("agent", "MESA_AGENT"),
+    ("id", "MESA_ID"),
+    ("name", "MESA_NAME"),
+    ("prompt", "MESA_PROMPT"),
+];
+
+/// The environment variable names `action` offers a script, in the same order
+/// [`offered_placeholders`] lists their `{}` twins. Public so the Settings page
+/// can only ever advertise variables the handoff actually sets.
+pub fn offered_env_vars(action: &str) -> &'static [&'static str] {
+    if action == AGENT_SPAWN {
+        &["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"]
+    } else {
+        &["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"]
+    }
+}
+
+/// Every variable script mode ever sets, offered or not — the list
+/// [`crate::core::agents`] explicitly *removes* from the child before setting
+/// the ones that apply, so "not offered" and "no value on this call" are both
+/// genuinely **unset** rather than inherited from mesa's own environment.
+pub const ALL_ENV_VARS: [&str; 5] = [
+    "MESA_BIN",
+    "MESA_AGENT",
+    "MESA_ID",
+    "MESA_NAME",
+    "MESA_PROMPT",
+];
+
+/// The variables to set for one script call: the action's own vocabulary,
+/// minus any value that is absent on this call.
+///
+/// That omission is the script-mode analogue of [`expand`]'s drop rule — an
+/// absent value leaves its variable **unset**, never set to `""`, so `set -u`
+/// fires and `${MESA_PROMPT:-}` reads as "no prompt" rather than "empty
+/// prompt".
+pub fn script_env(action: &str, vars: &Vars) -> Vec<(String, String)> {
+    PLACEHOLDER_ENV
+        .iter()
+        .filter_map(|(key, var)| {
+            let value = vars.lookup(key, action).ok()??;
+            Some(((*var).to_string(), value))
+        })
+        .collect()
+}
+
+/// Rejects a script the spawn path would refuse later: an empty body, or a
+/// `{placeholder}` that script mode does not substitute. Runs on **both** the
+/// save path and the spawn path, so a config file edited by hand fails the same
+/// way the editor would have failed it.
+fn check_script(action: &str, script: &str) -> Result<(), String> {
+    if script.is_empty() {
+        return Err(format!("the {action} command is empty"));
+    }
+    if let Some(key) = find_placeholder(script) {
+        let var = PLACEHOLDER_ENV
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+            .unwrap_or_default();
+        if !offered_env_vars(action).contains(&var) {
+            return Err(format!(
+                "unsupported placeholder {{{key}}} in the {action} command; \
+                 {action} offers {}",
+                offered_list(action)
+            ));
+        }
+        return Err(format!(
+            "the {action} command is a multi-line script, so {{{key}}} is not \
+             substituted; use the ${var} environment variable instead"
+        ));
+    }
+    Ok(())
+}
+
+/// The first `{placeholder}` in a script, if any. Only the five known names
+/// count, and only when the `{` is not preceded by `$` — so a script's own
+/// `${MESA_NAME}`, `{a,b}` brace expansion and `{ …; }` grouping are left
+/// alone, and the error only ever fires on the mistake it exists to name.
+fn find_placeholder(script: &str) -> Option<&str> {
+    let bytes = script.as_bytes();
+    for (open, _) in script.match_indices('{') {
+        if open > 0 && bytes[open - 1] == b'$' {
+            continue;
+        }
+        let rest = &script[open + 1..];
+        let close = match rest.find('}') {
+            Some(c) => c,
+            None => continue,
+        };
+        let key = &rest[..close];
+        if PLACEHOLDER_ENV.iter().any(|(k, _)| *k == key) {
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// Parses the script with `bash -n` — a syntax check that executes nothing —
+/// so an unbalanced `fi` lands in the editor rather than in a watcher log.
+///
+/// A machine with no `bash` on PATH skips the check rather than failing the
+/// save: mesa can't prove the script is wrong there, and refusing to store a
+/// value it merely can't inspect would be the worse answer. (Such a machine
+/// can't run the script either — that failure belongs at dispatch.)
+fn bash_syntax_check(action: &str, script: &str) -> Result<(), String> {
+    let out = Command::new("bash")
+        .arg("-n")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .output();
+    let Ok(out) = out else { return Ok(()) };
+    if out.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&out.stderr);
+    let detail = detail.trim();
+    Err(format!(
+        "the {action} command is not valid bash: {}",
+        if detail.is_empty() {
+            "syntax error"
+        } else {
+            detail
+        }
+    ))
 }
 
 /// The values a template's placeholders may resolve to. A `None` field is
@@ -903,6 +1104,163 @@ mod tests {
                 .unwrap_err()
                 .contains("double quote")
         );
+    }
+
+    // ---- script mode (mesa task 667) ------------------------------------
+
+    #[test]
+    fn is_script_is_decided_by_a_newline_in_the_trimmed_value() {
+        assert!(!is_script(DEFAULT_TODO_WATCHER));
+        assert!(!is_script("mytool run {id}"));
+        // Surrounding blank lines are whitespace, not a second line.
+        assert!(!is_script("\n\n  mytool run {id}  \n\n"));
+        assert!(is_script("cd /repo\nmytool run"));
+        assert!(is_script("mytool \\\n  run"));
+    }
+
+    #[test]
+    fn resolve_returns_argv_for_a_single_line_and_a_script_for_many() {
+        let vars = Vars {
+            bin: Some("claude"),
+            agent: Some("swe"),
+            id: Some(7),
+            name: Some("n"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(TODO_WATCHER, "{bin} run {id}", &vars).unwrap(),
+            Spawn::Argv(vec!["claude".into(), "run".into(), "7".into()])
+        );
+        // The stored body is trimmed, and the env is the action's vocabulary
+        // minus what has no value on this call.
+        assert_eq!(
+            resolve(TODO_WATCHER, "\n cd /repo\n exec claude \n", &vars).unwrap(),
+            Spawn::Script {
+                script: "cd /repo\n exec claude".to_string(),
+                env: vec![
+                    ("MESA_BIN".to_string(), "claude".to_string()),
+                    ("MESA_AGENT".to_string(), "swe".to_string()),
+                    ("MESA_ID".to_string(), "7".to_string()),
+                    ("MESA_NAME".to_string(), "n".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn script_env_is_scoped_per_action_and_omits_absent_values() {
+        // agent-spawn gets a prompt and never an id/name…
+        let spawn = Vars {
+            bin: Some("claude"),
+            id: Some(7),
+            name: Some("n"),
+            prompt: Some("p"),
+            ..Default::default()
+        };
+        assert_eq!(
+            script_env(AGENT_SPAWN, &spawn),
+            [
+                ("MESA_BIN".to_string(), "claude".to_string()),
+                ("MESA_PROMPT".to_string(), "p".to_string()),
+            ]
+        );
+        // …and an absent value is omitted entirely rather than set empty —
+        // the script-mode analogue of the argv drop rule.
+        let bare = Vars {
+            bin: Some("claude"),
+            ..Default::default()
+        };
+        assert_eq!(
+            script_env(TODO_WATCHER, &bare),
+            [("MESA_BIN".to_string(), "claude".to_string())]
+        );
+        assert_eq!(script_env(AGENT_SPAWN, &bare).len(), 1);
+    }
+
+    #[test]
+    fn a_placeholder_in_a_script_is_an_error_naming_its_env_var() {
+        let err = validate(TODO_WATCHER, "cd /repo\nclaude --name {name}").unwrap_err();
+        assert!(err.contains("{name}"), "{err}");
+        assert!(err.contains("$MESA_NAME"), "{err}");
+        // A placeholder this action doesn't offer keeps the existing message,
+        // because the fix is not "use the variable" — there isn't one.
+        let err = validate(TODO_WATCHER, "cd /repo\nclaude -- {prompt}").unwrap_err();
+        assert!(err.contains("unsupported placeholder"), "{err}");
+        // The spawn path refuses it too, not just the editor.
+        let err = resolve(
+            AGENT_SPAWN,
+            "cd /repo\nclaude -- {prompt}",
+            &Vars::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("$MESA_PROMPT"), "{err}");
+    }
+
+    #[test]
+    fn a_scripts_own_shell_syntax_is_not_mistaken_for_a_placeholder() {
+        // `${VAR}`, brace expansion and `{ …; }` grouping all contain braces;
+        // only a bare, known placeholder name is the mistake being named.
+        for script in [
+            "cd /repo\nexec \"$MESA_BIN\" --name \"${MESA_NAME}\"",
+            "cd /repo\ncp a.txt{,.bak}\n{ echo one; echo two; }",
+            "cd /repo\necho \"{id: 1}\" | tee out.json",
+        ] {
+            assert_eq!(validate(TODO_WATCHER, script), Ok(()), "{script}");
+        }
+    }
+
+    #[test]
+    fn a_script_with_a_bash_syntax_error_is_refused_at_save_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let err = save_commands_in(
+            &path,
+            &update(&[(TODO_WATCHER, "cd /repo\nif true; then\necho stuck")]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("not valid bash")),
+            "{err:?}"
+        );
+        assert!(!path.exists(), "a rejected save must write nothing");
+        // A well-formed script round-trips and stays a script on the way back.
+        let script = "cd /repo\nexec \"$MESA_BIN\" --bg -- \"work on $MESA_ID\"";
+        save_commands_in(&path, &update(&[(TODO_WATCHER, script)])).unwrap();
+        let stored = command_in(&path, TODO_WATCHER).unwrap().unwrap();
+        assert_eq!(stored, script);
+        assert!(is_script(&stored));
+    }
+
+    #[test]
+    fn a_blank_value_still_clears_the_key_in_either_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"commands": {"todo-watcher": "cd /repo\nexec claude"}}"#,
+        );
+        save_commands_in(&path, &update(&[(TODO_WATCHER, "\n  \n")])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written["commands"].get(TODO_WATCHER).is_none());
+    }
+
+    #[test]
+    fn settings_reports_the_script_mode_vocabulary_beside_the_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"commands": {}}"#);
+        let settings = settings_in(&path).unwrap();
+        assert_eq!(
+            settings[0].env_vars,
+            ["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"]
+        );
+        assert_eq!(
+            settings[3].env_vars,
+            ["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"]
+        );
+        // The two vocabularies line up one-for-one, in the same order.
+        for row in &settings {
+            assert_eq!(row.placeholders.len(), row.env_vars.len(), "{}", row.action);
+        }
     }
 
     #[test]

@@ -10,6 +10,12 @@ import type { ConfigCommand } from './types/ConfigCommand'
  * configured, run the built-in default". Get that wrong and the page either
  * reports a pristine form as dirty forever, or sends a no-op save that rewrites
  * the file for nothing.
+ *
+ * The second thing modelled here is the server's **mode rule** (mesa task 667,
+ * `config::is_script`): a value with a newline in it is a bash script rather
+ * than an argv template, which changes both what will actually run and which
+ * vocabulary applies. The page has to say so *while typing*, before a save,
+ * so the rule is mirrored here rather than waiting for a round trip.
  */
 
 /** One textarea's text per action. Blank = "fall back to the default". */
@@ -26,6 +32,60 @@ export function draftFrom(commands: ConfigCommand[]): Draft {
 export function effectiveCommand(command: ConfigCommand, draft: Draft): string {
   const drafted = (draft[command.action] ?? '').trim()
   return drafted === '' ? command.default : drafted
+}
+
+/**
+ * True when this value runs as a `bash -c` script rather than as an argv
+ * template. Mirrors `config::is_script`: trim first, then look for a newline,
+ * so surrounding blank lines don't silently switch modes.
+ */
+export function isScript(value: string): boolean {
+  return value.trim().includes('\n')
+}
+
+/** Which mode this row will actually run in, drafted value or default. */
+export function effectiveMode(
+  command: ConfigCommand,
+  draft: Draft,
+): 'argv' | 'script' {
+  return isScript(effectiveCommand(command, draft)) ? 'script' : 'argv'
+}
+
+/** Every placeholder mesa knows, paired with the variable a script reads. */
+const PLACEHOLDER_ENV: Record<string, string> = {
+  '{bin}': 'MESA_BIN',
+  '{agent}': 'MESA_AGENT',
+  '{id}': 'MESA_ID',
+  '{name}': 'MESA_NAME',
+  '{prompt}': 'MESA_PROMPT',
+}
+
+/**
+ * The save-time error this row would earn for using `{}` syntax in a script,
+ * or `null` if it wouldn't — the client-side twin of `config::check_script`,
+ * so the mistake is named as it is typed rather than only after a failed PUT.
+ *
+ * A `{` preceded by `$` is skipped, exactly as the server skips it: a script's
+ * own `${MESA_NAME}` is correct usage, not the mistake being named.
+ */
+export function scriptPlaceholderError(
+  command: ConfigCommand,
+  draft: Draft,
+): string | null {
+  const value = effectiveCommand(command, draft)
+  if (!isScript(value)) return null
+  for (const [placeholder, variable] of Object.entries(PLACEHOLDER_ENV)) {
+    let at = value.indexOf(placeholder)
+    while (at !== -1) {
+      if (at === 0 || value[at - 1] !== '$') {
+        return command.env_vars.includes(variable)
+          ? `${placeholder} is not substituted in a script — use $${variable} instead`
+          : `${placeholder} is not offered to ${command.action}`
+      }
+      at = value.indexOf(placeholder, at + 1)
+    }
+  }
+  return null
 }
 
 /** True when this row's text differs from what the server last reported. */

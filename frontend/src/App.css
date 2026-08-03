@@ -4633,6 +4633,18 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* The two modes, spelled out once above the rows: one line is argv, more than
+   one is a bash script (mesa task 667). */
+.settings-modes {
+  margin: 0.25rem 0 1rem;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
+.settings-modes li + li {
+  margin-top: 0.35rem;
+}
+
 /* Monospace, because it is argv — and `white-space: pre` so a run of spaces
    inside a quoted argument stays visibly what it is. */
 .settings-command-input {
@@ -4679,6 +4691,14 @@ button:focus-visible,
   margin: 0.5rem 0 0;
   font-size: 0.75rem;
   overflow-wrap: anywhere;
+}
+
+/* A script preview is the body itself, so it keeps its own line breaks —
+   unlike the argv preview, which is one line by definition. */
+.settings-effective-script {
+  display: block;
+  margin-top: 0.25rem;
+  white-space: pre-wrap;
 }
 
 .settings-pending {

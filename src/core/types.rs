@@ -168,7 +168,13 @@ pub struct ConfigCommand {
     pub default: String,
     /// The `{}`-delimited placeholders this action offers. Any other one is a
     /// save-time error, so the editor can list these as the whole vocabulary.
+    /// Substituted in single-line (argv) mode only.
     pub placeholders: Vec<String>,
+    /// The environment variables this action sets when the value is a
+    /// **multi-line script** (`bash -c`), positionally matching
+    /// `placeholders` — a script reads `$MESA_NAME`, never `{name}`. A
+    /// variable with no value on a given call is left unset.
+    pub env_vars: Vec<String>,
 }
 
 /// Working-tree git status of one repo folder (see `core::git`). Decorative

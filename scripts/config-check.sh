@@ -282,6 +282,123 @@ grep -q "unknown command" <<<"$STDOUT" || fail "unknown key: message wrong: $STD
   fail "a rejected PUT must not touch the file: $(cat "$CONFIG")"
 ok "PUT rejects a template the spawn path would later fail on (bad placeholder, unbalanced quote, unknown key) as 422 validation, writing nothing"
 
+# ---- script mode: a multi-line value runs as bash -c (mesa task 667) ----
+
+# The mode is chosen by the value: a newline makes it a script. Values arrive
+# as MESA_* environment variables, never substituted into the body — which is
+# what keeps untrusted free text out of shell parsing in this mode too.
+SCRIPT_LOG="$TMP/script.log"
+: > "$SCRIPT_LOG"
+
+# Every script logs `<action>|<cwd>|<vars…>`, reading each variable with
+# `${X:-<unset>}` so "unset" and "empty" are distinguishable in the log.
+watcher_script() { # watcher_script <action>
+  printf 'set -u\nprintf "%%s|%%s|%%s|%%s|%%s|%%s\\n" "%s" "$(pwd)" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" "${MESA_AGENT:-<unset>}" "${MESA_PROMPT:-<unset>}" >> "%s"\necho "backgrounded · 5c81aaaa"' "$1" "$SCRIPT_LOG"
+}
+SPAWN_SCRIPT=$(printf 'set -u\ncd "$(pwd)"\nexport PICKED=yes\nprintf "%%s|%%s|%%s|%%s|%%s\\n" "agent-spawn" "$PICKED" "${MESA_PROMPT:-<unset>}" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" >> "%s"\necho "backgrounded · 5c81bbbb"' "$SCRIPT_LOG")
+
+jq -n \
+  --arg todo "$(watcher_script todo-watcher)" \
+  --arg refine "$(watcher_script refine-watcher)" \
+  --arg inbox "$(watcher_script inbox-watcher)" \
+  --arg spawn "$SPAWN_SCRIPT" \
+  '{commands: {"todo-watcher": $todo, "refine-watcher": $refine, "inbox-watcher": $inbox, "agent-spawn": $spawn}}' \
+  > "$CONFIG"
+
+# A fresh project, so the todo-watcher's one-agent-per-project cap doesn't
+# hide the dispatch, and a task name that is a shell-injection attempt.
+mkdir -p "$TMP/projC"
+DIR_C=$(cd "$TMP/projC" && pwd -P)
+run 0 "$MESA" project create "C" --no-git
+C=$(jqs .id)
+run 0 "$MESA" project update "$C" --path "$DIR_C"
+# Short enough that the derived task name is the description verbatim (the
+# 50-char cut would otherwise elide the payload), and relative so the file it
+# would create lands in the script's own cwd.
+PWNED="$DIR_C/pwned"
+HOSTILE='"; touch pwned #'
+run 0 "$MESA" task create "$C" "$HOSTILE"
+TASK_C=$(jqs .id)
+run 0 "$MESA" task create "$C" "task c-refine" --status refine
+TASK_C_REFINE=$(jqs .id)
+run 0 "$MESA" inbox add "script-mode triage"
+ITEM_3=$(jqs .id)
+
+wait_lines "$SCRIPT_LOG" 3
+grep -Fqx "todo-watcher|$DIR_C|$TASK_C|C: $HOSTILE|swe|<unset>" "$SCRIPT_LOG" ||
+  fail "todo-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
+ok "a multi-line todo-watcher runs as bash -c in the project folder, with MESA_ID/MESA_NAME set and MESA_PROMPT (not offered) unset"
+
+[ ! -e "$PWNED" ] ||
+  fail "an untrusted task name was parsed as shell syntax — script mode leaks"
+ok "a task name of \`\"; touch <file> #\` round-trips as one string: the body reaches bash verbatim, values arrive out-of-band"
+
+grep -Fqx "refine-watcher|$DIR_C|$TASK_C_REFINE|C: task c-refine|swe|<unset>" "$SCRIPT_LOG" ||
+  fail "refine-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
+grep -Fqx "inbox-watcher|$FAKE_HOME|$ITEM_3|inbox $ITEM_3: script-mode triage|swe|<unset>" "$SCRIPT_LOG" ||
+  fail "inbox-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
+ok "the refine- and inbox-watchers take a script too, each in its own cwd"
+
+api POST "/api/projects/$C/agents" '{"prompt":"from a script"}'
+[ "$CODE" = "201" ] || fail "script spawn: expected 201, got $CODE: $STDOUT"
+[ "$(jq -r .id <<<"$STDOUT")" = "5c81bbbb" ] ||
+  fail "a script's \`backgrounded · <id>\` receipt must be parsed as usual: $STDOUT"
+grep -Fqx "agent-spawn|yes|from a script|<unset>|<unset>" "$SCRIPT_LOG" ||
+  fail "agent-spawn script mode wrong: $(cat "$SCRIPT_LOG")"
+ok "agent-spawn takes a script (cd/export work), its receipt is parsed as usual, and MESA_ID/MESA_NAME are unset for it"
+
+api POST "/api/projects/$C/agents" '{}'
+[ "$CODE" = "201" ] || fail "promptless script spawn: expected 201, got $CODE: $STDOUT"
+grep -Fqx "agent-spawn|yes|<unset>|<unset>|<unset>" "$SCRIPT_LOG" ||
+  fail "an absent prompt must leave MESA_PROMPT UNSET, not empty: $(cat "$SCRIPT_LOG")"
+ok "a value absent on this call leaves its variable unset, not empty (the script-mode drop rule, under \`set -u\`)"
+
+[ ! -s "$CLAUDE_LOG" ] ||
+  fail "the built-in claude command ran during script mode: $(cat "$CLAUDE_LOG")"
+ok "with all four commands configured as scripts, the built-in \`claude\` argv is still never used"
+
+# A script that exits nonzero is a failed spawn, exactly as an argv is.
+write_config <<'EOF'
+{"commands": {"agent-spawn": "echo nope >&2\nexit 4"}}
+EOF
+api POST "/api/projects/$C/agents" '{}'
+[ "$CODE" = "502" ] || fail "failing script: expected 502, got $CODE: $STDOUT"
+grep -q "nope" <<<"$STDOUT" || fail "a failing script must surface its stderr: $STDOUT"
+ok "a script's exit code is the whole contract: nonzero is a failed spawn, stderr and all"
+
+# ---- script-mode validation is a save-time 422, writing nothing ----
+
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nclaude --name {name}"}}'
+[ "$CODE" = "422" ] || fail "{} in a script: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "{} in a script: expected code validation, got $STDOUT"
+grep -q "MESA_NAME" <<<"$STDOUT" ||
+  fail "the message must name the env var to use instead: $STDOUT"
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nif true; then\necho stuck"}}'
+[ "$CODE" = "422" ] || fail "bash syntax error: expected 422, got $CODE: $STDOUT"
+grep -q "not valid bash" <<<"$STDOUT" ||
+  fail "a bash syntax error must say so: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected script PUT must not touch the file: $(cat "$CONFIG")"
+ok "a script with a {placeholder} or a bash syntax error is 422 validation at save time, leaving the file byte-identical"
+
+# A valid script round-trips through the editor and drives the next spawn.
+api PUT /api/config "$(jq -n --arg s "$SPAWN_SCRIPT" '{commands: {"agent-spawn": $s}}')"
+[ "$CODE" = "200" ] || fail "PUT a script: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.[3].value' <<<"$STDOUT")" = "$SPAWN_SCRIPT" ] ||
+  fail "PUT must echo the stored script verbatim: $STDOUT"
+[ "$(jq -r '.[3].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_BIN MESA_AGENT MESA_PROMPT" ] ||
+  fail "GET/PUT must report agent-spawn's script-mode vocabulary: $STDOUT"
+[ "$(jq -r '.[0].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_BIN MESA_AGENT MESA_ID MESA_NAME" ] ||
+  fail "GET/PUT must report the watchers' script-mode vocabulary: $STDOUT"
+: > "$SCRIPT_LOG"
+api POST "/api/projects/$C/agents" '{"prompt":"saved from settings"}'
+[ "$CODE" = "201" ] || fail "post-PUT script spawn: expected 201, got $CODE: $STDOUT"
+grep -Fqx "agent-spawn|yes|saved from settings|<unset>|<unset>" "$SCRIPT_LOG" ||
+  fail "the just-saved script did not drive the next spawn: $(cat "$SCRIPT_LOG")"
+ok "a script saved over PUT /api/config round-trips verbatim, reports its MESA_* vocabulary, and drives the very next spawn"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"

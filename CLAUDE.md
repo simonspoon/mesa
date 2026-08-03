@@ -260,7 +260,7 @@ The code is the source of truth. These are the invariants you must not break:
 | --- | --- | --- |
 | Attachments | Files/images on a task, stored outside the DB; 25 MiB cap, base64-in-JSON upload to stay inside the CSRF gate | `docs/attachments.md` |
 | Git tab | Read-only working-tree + history per project; external `git` shell-outs only | `docs/git-tab.md` |
-| Files tab | Project file browser + editor; `safe_path()` is the sole traversal chokepoint, the one write route is code-execution-gated | `docs/files-tab.md` |
+| Files tab | Project file browser + editor; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
 | Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |
 | Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE` | `docs/inbox.md` |

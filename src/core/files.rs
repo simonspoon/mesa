@@ -3,10 +3,11 @@
 //! cross-area contract). Like `core::git`/`core::agents`, this module touches
 //! EXTERNAL filesystem state only — `std::fs`, no `Store` dependency beyond
 //! whatever `local_path` string its caller (279's API layer) already
-//! resolved. Two writes live here, both narrow: `write_file` (task 327)
-//! overwrites an existing text file's content in place, and `create_dir`
-//! (task 489) makes one empty directory for the folder picker. Nothing in
-//! this module deletes or renames anything.
+//! resolved. Three writes live here, all narrow: `write_file` (task 327)
+//! overwrites an existing text file's content in place, `create_dir`
+//! (task 489) makes one empty directory for the folder picker, and
+//! `create_file` (task 672) makes one empty file inside a project's tree.
+//! Nothing in this module deletes or renames anything.
 
 use std::fs;
 use std::io::Read;
@@ -392,6 +393,79 @@ pub fn write_file(root: &str, rel: &str, content: &str) -> Result<(), WriteFileE
     // used identically by every reader/writer.
     let path = safe_path(root, rel).ok_or(WriteFileError::NotFound)?;
     fs::write(&path, content).map_err(|_| WriteFileError::NotFound)
+}
+
+/// Why [`create_file`] rejected the request, the same three-way split
+/// [`CreateDirError`] uses (and mapped to the same 404/422/409 at the API
+/// layer):
+///   - `NotFound`: the PARENT directory doesn't resolve through [`safe_path`]
+///     (traversal, absolute-path smuggling, symlink escape, nonexistent), is
+///     not a directory, or the `fs::write` itself failed.
+///   - `Validation(reason)`: the final component isn't a usable single file
+///     name.
+///   - `Conflict`: something already occupies the target path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateFileError {
+    NotFound,
+    Validation(&'static str),
+    Conflict,
+}
+
+/// Creates ONE empty file at `rel` underneath `root` (task 672) — the Files
+/// tab's only create, and the only write in this module that brings a new
+/// path into existence.
+///
+/// The load-bearing detail is *what* is resolved: [`safe_path`] canonicalizes
+/// its candidate, so a not-yet-existing path always collapses to `None` — the
+/// new file itself can never be resolved through it. So the PARENT is
+/// resolved instead, exactly as [`create_dir`] splits parent from name, and
+/// the final component is then held inside that parent by the same
+/// single-component rules `create_dir` applies (no separator, no NUL, not
+/// `.`/`..`), which is what makes `parent.join(name)` provably stay put. That
+/// keeps `safe_path` the module's sole request-path-to-fs-path chokepoint —
+/// no second containment rule here, and no relaxation of `safe_path` itself
+/// (whose rejection of nonexistent paths is exactly what
+/// `read_file`/`write_file`/`tree_level` rely on).
+///
+/// The file is created EMPTY, never from a caller-supplied body: content
+/// arrives afterwards through the existing [`write_file`] edit path, so there
+/// is no second content cap, binary sniff or truncation rule to keep in sync.
+pub fn create_file(root: &str, rel: &str) -> Result<(), CreateFileError> {
+    let (parent_rel, name) = match rel.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", rel),
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CreateFileError::Validation("file name cannot be empty"));
+    }
+    if name == "." || name == ".." {
+        return Err(CreateFileError::Validation("file name cannot be . or .."));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(CreateFileError::Validation(
+            "file name must be a single name, not a path",
+        ));
+    }
+    let anchor = if parent_rel.is_empty() {
+        "."
+    } else {
+        parent_rel
+    };
+    let parent = safe_path(root, anchor).ok_or(CreateFileError::NotFound)?;
+    if !parent.is_dir() {
+        return Err(CreateFileError::NotFound);
+    }
+    let target = parent.join(name);
+    // `symlink_metadata`, not `exists()`: a dangling symlink is still a name
+    // taken — `create_dir`'s rule, for the same reason.
+    if target.symlink_metadata().is_ok() {
+        return Err(CreateFileError::Conflict);
+    }
+    fs::write(&target, "").map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => CreateFileError::Conflict,
+        _ => CreateFileError::NotFound,
+    })
 }
 
 /// NUL-byte sniff over the first 8 KiB — the standard cheap binary-file
@@ -955,6 +1029,135 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("small.txt")).unwrap(),
             "hi"
+        );
+    }
+
+    // --- create_file --------------------------------------------------------
+
+    #[test]
+    fn create_file_makes_an_empty_file_at_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        assert_eq!(create_file(root, "notes.md"), Ok(()));
+        assert_eq!(fs::read_to_string(dir.path().join("notes.md")).unwrap(), "");
+    }
+
+    #[test]
+    fn create_file_makes_an_empty_file_inside_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("src/core")).unwrap();
+
+        assert_eq!(create_file(root, "src/core/new.rs"), Ok(()));
+        assert!(dir.path().join("src/core/new.rs").is_file());
+    }
+
+    #[test]
+    fn create_file_reads_back_through_read_file_as_empty_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        create_file(root, "fresh.rs").unwrap();
+        let view = read_file(root, "fresh.rs").unwrap();
+        assert_eq!(view.content, "");
+        assert!(!view.is_binary);
+        assert!(!view.truncated);
+        assert_eq!(view.language.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn create_file_not_found_for_traversal_and_absolute_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.to_str().unwrap();
+
+        assert_eq!(
+            create_file(root, "../escape.txt"),
+            Err(CreateFileError::NotFound)
+        );
+        assert_eq!(
+            create_file(root, "/tmp/mesa-create-file-escape.txt"),
+            Err(CreateFileError::NotFound)
+        );
+        assert_eq!(
+            create_file(root, "a/../../x"),
+            Err(CreateFileError::NotFound)
+        );
+        assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn create_file_not_found_when_the_parent_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("README.md"), "hi").unwrap();
+
+        assert_eq!(
+            create_file(root, "README.md/x.txt"),
+            Err(CreateFileError::NotFound)
+        );
+    }
+
+    #[test]
+    fn create_file_rejects_empty_dot_and_path_shaped_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        assert_eq!(
+            create_file(root, ""),
+            Err(CreateFileError::Validation("file name cannot be empty"))
+        );
+        assert_eq!(
+            create_file(root, "   "),
+            Err(CreateFileError::Validation("file name cannot be empty"))
+        );
+        // A trailing slash leaves nothing for the final component.
+        assert_eq!(
+            create_file(root, "sub/"),
+            Err(CreateFileError::Validation("file name cannot be empty"))
+        );
+        assert_eq!(
+            create_file(root, "."),
+            Err(CreateFileError::Validation("file name cannot be . or .."))
+        );
+        assert_eq!(
+            create_file(root, ".."),
+            Err(CreateFileError::Validation("file name cannot be . or .."))
+        );
+        // A separator surviving into the final component — `/` is consumed by
+        // the parent split, so this is the backslash half of the same rule.
+        assert_eq!(
+            create_file(root, "a\\b"),
+            Err(CreateFileError::Validation(
+                "file name must be a single name, not a path"
+            ))
+        );
+        assert_eq!(
+            create_file(root, "x\0y"),
+            Err(CreateFileError::Validation(
+                "file name must be a single name, not a path"
+            ))
+        );
+    }
+
+    #[test]
+    fn create_file_conflicts_on_an_existing_file_or_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("taken.txt"), "keep me").unwrap();
+        fs::create_dir_all(dir.path().join("adir")).unwrap();
+
+        assert_eq!(
+            create_file(root, "taken.txt"),
+            Err(CreateFileError::Conflict)
+        );
+        assert_eq!(create_file(root, "adir"), Err(CreateFileError::Conflict));
+        // The existing file's content is untouched — a create is never a write.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("taken.txt")).unwrap(),
+            "keep me"
         );
     }
 }

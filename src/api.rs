@@ -867,7 +867,9 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/files", get(get_project_files))
         .route(
             "/api/projects/{id}/files/content",
-            get(get_project_files_content).patch(update_project_files_content),
+            get(get_project_files_content)
+                .patch(update_project_files_content)
+                .post(create_project_file),
         )
         // New-project folder picker: unscoped (not one project's local_path)
         // server-side directory listing, plus creating one folder to pick.
@@ -2670,6 +2672,92 @@ async fn update_project_files_content(
 }
 
 #[derive(Deserialize)]
+struct FilesContentCreate {
+    path: String,
+}
+
+/// Files tab create-a-file (task 672) — the surface's second write route, and
+/// the only one that brings a new path into existence. Body carries `path`
+/// and nothing else: the new file is always EMPTY, and content arrives
+/// afterwards through the PATCH above, so there is no `content` field to
+/// validate a second time.
+///
+/// Gated by [`require_agent_access`] — the SAME gate as the PATCH beside it,
+/// for the same reason: bytes written under a project's `local_path` are
+/// code-execution-adjacent, and a peer who can already overwrite a file in
+/// that folder gains nothing new by being able to add one. Not the plain read
+/// guard, and not the stricter loopback-only `require_local_path_write` the
+/// unscoped `/api/fs/dirs` uses. Being a mutation with a JSON body, it also
+/// sits inside the global Content-Type/CSRF gate.
+///
+/// `core::files::create_file`'s errors map exactly like `create_fs_dir`'s:
+/// `NotFound` → 404 (the parent doesn't resolve, isn't a directory, or the
+/// write failed), `Validation` → 422 (unusable file name), `Conflict` → 409
+/// (the name is taken). No `local_path` / dead folder is 404 too, matching its
+/// neighbours.
+///
+/// The `files_tree_cache` entry for the new file's own directory is evicted
+/// before responding: that cache has a 5s TTL, and the client refetches the
+/// level immediately, so leaving it in place would show a tree that doesn't
+/// contain the file that was just created. On success the fresh
+/// `FileContentView` is echoed, like every other mutation in this API.
+async fn create_project_file(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<FilesContentCreate>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {}", body.path),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let rel = body.path.clone();
+    let create_root = root.clone();
+    let create_rel = rel.clone();
+    let created =
+        tokio::task::spawn_blocking(move || files::create_file(&create_root, &create_rel))
+            .await
+            .unwrap_or(Err(files::CreateFileError::NotFound));
+    if let Err(err) = created {
+        return match err {
+            files::CreateFileError::NotFound => Err(not_found()),
+            files::CreateFileError::Validation(message) => Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: message.into(),
+            }),
+            files::CreateFileError::Conflict => Err(ApiError {
+                status: StatusCode::CONFLICT,
+                code: "conflict",
+                message: format!("already exists: {}", body.path),
+            }),
+        };
+    }
+    // The key `get_project_files` caches under: `""` is the root level, else
+    // the parent's own relative path.
+    let rel_key = match rel.rsplit_once('/') {
+        Some((parent, _)) => parent.to_string(),
+        None => String::new(),
+    };
+    state
+        .files_tree_cache
+        .lock()
+        .unwrap()
+        .remove(&(root.clone(), rel_key));
+    let view = tokio::task::spawn_blocking(move || files::read_file(&root, &rel))
+        .await
+        .unwrap_or(None);
+    view.map(|v| Json(v).into_response()).ok_or_else(not_found)
+}
+
+#[derive(Deserialize)]
 struct FsDirsQuery {
     path: Option<String>,
 }
@@ -4275,6 +4363,180 @@ mod tests {
             Json(FilesContentUpdate {
                 path: "a.txt".to_string(),
                 content: "x".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Files tab: POST /files/content (mesa task 672) ---------------------
+
+    #[tokio::test]
+    async fn create_project_file_makes_an_empty_file_and_echoes_its_view() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = create_project_file(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentCreate {
+                path: "src/new.rs".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], "src/new.rs");
+        assert_eq!(body["content"], "");
+        assert_eq!(body["language"], "rust");
+        assert_eq!(body["is_binary"], false);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/new.rs")).unwrap(),
+            ""
+        );
+    }
+
+    /// The 5s tree cache must not outlive the create — a client refetching the
+    /// level it just created into has to see the new file, not a stale entry.
+    #[tokio::test]
+    async fn create_project_file_evicts_the_tree_cache_for_its_directory() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        // Warm both levels through the read route.
+        for level in [None, Some("src".to_string())] {
+            get_project_files(
+                State(state.clone()),
+                Path(id),
+                Query(FilesTreeQuery { path: level }),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(state.files_tree_cache.lock().unwrap().len(), 2);
+
+        create_project_file(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentCreate {
+                path: "src/new.rs".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Only the created file's own directory is evicted; the root entry
+        // stays (nothing about it changed).
+        {
+            let cache = state.files_tree_cache.lock().unwrap();
+            assert!(!cache.contains_key(&(root_str.clone(), "src".to_string())));
+            assert!(cache.contains_key(&(root_str, String::new())));
+        }
+
+        let resp = get_project_files(
+            State(state),
+            Path(id),
+            Query(FilesTreeQuery {
+                path: Some("src".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = json_body(resp).await;
+        let names: Vec<&str> = body["tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["new.rs"]);
+    }
+
+    #[tokio::test]
+    async fn create_project_file_maps_not_found_validation_and_conflict() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("taken.txt"), "keep me").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for (bad_path, expect_status, expect_code) in [
+            ("../escape.txt", StatusCode::NOT_FOUND, "not_found"),
+            ("gone/x.txt", StatusCode::NOT_FOUND, "not_found"),
+            ("taken.txt/x.txt", StatusCode::NOT_FOUND, "not_found"),
+            ("", StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            ("..", StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            ("taken.txt", StatusCode::CONFLICT, "conflict"),
+        ] {
+            let err = create_project_file(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(id),
+                Json(FilesContentCreate {
+                    path: bad_path.to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, expect_status, "path {bad_path:?}");
+            assert_eq!(err.code, expect_code, "path {bad_path:?}");
+        }
+        assert!(!dir.path().join("escape.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("taken.txt")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_project_file_rejects_non_loopback_peer_in_default_mode() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = create_project_file(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentCreate {
+                path: "pwned.sh".to_string(),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+        assert!(
+            !root.join("pwned.sh").exists(),
+            "rejected create must never touch disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_project_file_no_local_path_is_not_found() {
+        let (_dir, state) = test_state();
+        let id = new_project(&state, None);
+        let resp = create_project_file(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesContentCreate {
+                path: "a.txt".to_string(),
             }),
         )
         .await;

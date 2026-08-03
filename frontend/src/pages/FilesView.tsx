@@ -36,8 +36,10 @@ import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
+import { newFilePath } from '../newFile'
 import {
   ApiError,
+  createProjectFile,
   getProjectFiles,
   getProjectFilesContent,
   getProjectGitCommitDiff,
@@ -585,6 +587,93 @@ type DirState =
   | 'error'
   | { entries: FileTreeEntry[]; truncated: boolean }
 
+/** The create-a-file affordance's whole state, threaded through the tree as
+ * one object rather than five props (mesa task 672). `parent` is the directory
+ * whose naming row is open — `''` for the project root, `null` for none, and
+ * at most one at a time, which is why this is a single field and not a set.
+ * The naming *decision* isn't here: it is `newFile.ts`. */
+interface TreeCreate {
+  parent: string | null
+  error: string | null
+  busy: boolean
+  onStart: (parent: string) => void
+  onSubmit: (name: string) => void
+  onCancel: () => void
+}
+
+/** The `+` that opens a naming row, on a directory row and on the tree pane's
+ * own header (the project root). The row it sits on toggles the directory on
+ * click, so this must stop the event from reaching it. */
+function NewFileButton({
+  parent,
+  label,
+  create,
+}: {
+  parent: string
+  label: string
+  create: TreeCreate
+}) {
+  return (
+    <button
+      type="button"
+      className="files-tree-add"
+      aria-label={label}
+      title={label}
+      onClick={(e) => {
+        e.stopPropagation()
+        create.onStart(parent)
+      }}
+    >
+      +
+    </button>
+  )
+}
+
+/** The inline naming row: one autofocused input, Enter to create, Escape or
+ * blur to cancel. The typed name is local — nothing above needs a keystroke,
+ * only the submitted name — while the error below it comes from the parent,
+ * since it can be either `newFile.ts`'s reason (no request made) or the
+ * server's own 409/422/404, rendered the same way for both. */
+function NewFileRow({ depth, create }: { depth: number; create: TreeCreate }) {
+  const [name, setName] = useState('')
+  const indent = { paddingLeft: `${depth * 1.1 + 0.5}rem` }
+  return (
+    <>
+      <li className="files-tree-new" style={indent}>
+        <input
+          autoFocus
+          className="files-tree-new-input"
+          value={name}
+          placeholder="new-file.ts"
+          spellCheck={false}
+          aria-label="New file name"
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              create.onSubmit(name)
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              create.onCancel()
+            }
+          }}
+          // Deliberately never `disabled` while a create is in flight: the
+          // browser blurs a control it disables, and blur cancels — so
+          // disabling would close the row mid-request. `busy` is enforced in
+          // the submit handler instead.
+          onBlur={create.onCancel}
+        />
+      </li>
+      {create.error !== null && (
+        <li className="files-tree-note error" style={indent}>
+          {create.error}
+        </li>
+      )}
+    </>
+  )
+}
+
 /** One tree row (directory or file), recursing into an expanded directory's
  * children via the shared `childrenCache` (fetched lazily on first expand,
  * not carried on the entry itself — the tree endpoint returns one level per
@@ -598,6 +687,7 @@ function TreeNode({
   childrenCache,
   selectedPath,
   onSelectFile,
+  create,
 }: {
   entry: FileTreeEntry
   depth: number
@@ -606,6 +696,7 @@ function TreeNode({
   childrenCache: Map<string, DirState>
   selectedPath: string | null
   onSelectFile: (path: string) => void
+  create: TreeCreate
 }) {
   const indent = { paddingLeft: `${depth * 1.1 + 0.5}rem` }
   if (entry.is_dir) {
@@ -622,7 +713,18 @@ function TreeNode({
             {isOpen ? '▾' : '▸'}
           </span>
           {entry.name}
+          <NewFileButton
+            parent={entry.path}
+            label={`New file in ${entry.path}`}
+            create={create}
+          />
         </li>
+        {/* First row of this directory's children — above the loading note as
+            much as above the entries, so it never jumps once the level
+            lands. */}
+        {create.parent === entry.path && (
+          <NewFileRow depth={depth + 1} create={create} />
+        )}
         {isOpen && state === 'loading' && (
           <li className="files-tree-note muted" style={indent}>
             Loading…
@@ -647,6 +749,7 @@ function TreeNode({
               childrenCache={childrenCache}
               selectedPath={selectedPath}
               onSelectFile={onSelectFile}
+              create={create}
             />
           ))}
         {isOpen &&
@@ -946,7 +1049,7 @@ function FilePane({
  * with the same lifetime `selectedPath` had, reset on project change.
  */
 export function FilesView({ projectId }: { projectId: number }) {
-  const { data, error } = useFetch(
+  const { data, error, refetch } = useFetch(
     () => getProjectFiles(projectId),
     `files-${projectId}`,
   )
@@ -982,6 +1085,12 @@ export function FilesView({ projectId }: { projectId: number }) {
   // `matchMedia` for the component to keep in sync (same rule the phone tab
   // bar follows, App.css).
   const [treeOpen, setTreeOpen] = useState(true)
+  // The open naming row (mesa task 672), if any: the directory it belongs to
+  // (`''` = the project root), the message under it, and whether its create is
+  // in flight. One row at a time, so one slot, not a map.
+  const [newFileParent, setNewFileParent] = useState<string | null>(null)
+  const [newFileError, setNewFileError] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
   // The wide-tier tree pane's own width and collapse (mesa task 671), both
   // persisted globally for the Files tab (`filesTreeWidth.ts`). Deliberately
   // independent of `treeOpen` above: that one is the phone tier's control and
@@ -1087,6 +1196,8 @@ export function FilesView({ projectId }: { projectId: number }) {
     setExpanded(new Set())
     setChildrenCache(new Map())
     setTreeOpen(true)
+    setNewFileParent(null)
+    setNewFileError(null)
   }
 
   /**
@@ -1123,8 +1234,10 @@ export function FilesView({ projectId }: { projectId: number }) {
     }))
   }
 
-  function ensureChildren(path: string) {
-    if (childrenCache.has(path)) return // loaded or already loading
+  /** Fetches one directory level and installs it in the cache, replacing
+   *  whatever was there — the "drop the entry and re-fetch" half of a create,
+   *  and the fetch half of `ensureChildren`'s first expand. */
+  function loadDir(path: string) {
     setChildrenCache((prev) => new Map(prev).set(path, 'loading'))
     getProjectFiles(projectId, path).then(
       (res) => {
@@ -1141,6 +1254,11 @@ export function FilesView({ projectId }: { projectId: number }) {
     )
   }
 
+  function ensureChildren(path: string) {
+    if (childrenCache.has(path)) return // loaded or already loading
+    loadDir(path)
+  }
+
   function toggle(entry: FileTreeEntry) {
     const opening = !expanded.has(entry.path)
     setExpanded((prev) => {
@@ -1150,6 +1268,64 @@ export function FilesView({ projectId }: { projectId: number }) {
       return next
     })
     if (opening) ensureChildren(entry.path)
+  }
+
+  /** Opens the naming row under `parent` (`''` = the project root), expanding
+   *  that directory first so the row has somewhere to appear. */
+  function startCreate(parent: string) {
+    setNewFileError(null)
+    setNewFileParent(parent)
+    if (parent === '') return
+    setExpanded((prev) => new Set(prev).add(parent))
+    ensureChildren(parent)
+  }
+
+  /** Enter on the naming row. The client-side name rules run first
+   *  (`newFile.ts`) so an obviously bad name is an instant message rather than
+   *  a round trip; the server re-validates everything regardless, and its own
+   *  409/422/404 lands in the same place. */
+  async function submitCreate(name: string) {
+    if (newFileParent === null || creating) return
+    const parent = newFileParent
+    const decided = newFilePath(parent, name)
+    if (!decided.ok) {
+      setNewFileError(decided.reason)
+      return
+    }
+    setCreating(true)
+    setNewFileError(null)
+    try {
+      await createProjectFile(projectId, decided.path)
+      setNewFileParent(null)
+      // The server already evicted its own tree cache for this level, so a
+      // re-fetch now sees the new file. The root level is the tab's own
+      // loader; anything deeper is the per-directory cache.
+      if (parent === '') refetch()
+      else loadDir(parent)
+      commit((prev) => openFile(prev, decided.path))
+      // Same reason the tree closes when a file is picked: on the phone tier
+      // a full column of rows would push the file below the fold. Inert above
+      // 600px.
+      setTreeOpen(false)
+    } catch (e) {
+      setNewFileError(
+        e instanceof ApiError ? e.message : 'Failed to create file.',
+      )
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const create: TreeCreate = {
+    parent: newFileParent,
+    error: newFileError,
+    busy: creating,
+    onStart: startCreate,
+    onSubmit: submitCreate,
+    onCancel: () => {
+      setNewFileParent(null)
+      setNewFileError(null)
+    },
   }
 
   // Same `dragenter`-as-well-as-`dragover` rule as the strips above.
@@ -1225,45 +1401,57 @@ export function FilesView({ projectId }: { projectId: number }) {
           This folder is larger than what's shown here — the tree was capped.
         </p>
       )}
-      {data.tree.length === 0 ? (
-        <p className="muted">This folder is empty.</p>
-      ) : (
-        <div className="files-layout">
-          {/* Phone-tier affordance for the collapse above; hidden by CSS at
-              every wider tier, where the tree never leaves. Rendered before
-              the tree so it stays put as the tree comes and goes, and so the
-              two read as one control in the tab order. */}
-          <button
-            type="button"
-            className="files-tree-phone-toggle"
-            aria-expanded={treeOpen}
-            onClick={() => setTreeOpen((open) => !open)}
-          >
-            {treeOpen ? '▾' : '▸'} file tree
-            {!treeOpen && selectedPath !== null && (
-              <span className="files-tree-phone-crumb"> — {selectedPath}</span>
-            )}
-          </button>
-          {/* The tree pane (mesa task 671): the sized, collapsible box the
-              tree scrolls inside. The width is applied as a custom property,
-              never an inline `width` — the ≤860px tier stacks the panes into
-              a column and relaxes the tree to `width: auto`, and an inline
-              width would beat that rule and hand a 390px screen a drag-width
-              tree. The collapse is CSS-only for the same reason: the rail and
-              the tree are both always rendered, and only the wide tier has a
-              rule that hides either, so the flag cannot leak downward. */}
-          <div
-            className={`files-tree-pane${treeCollapsed ? ' collapsed' : ''}${
-              treeResizing ? ' resizing' : ''
-            }${treeOpen ? '' : ' files-tree-collapsed'}`}
-            ref={treeRef}
-            style={{ '--files-tree-width': `${treeWidth}px` } as CSSProperties}
-          >
+      {/* An empty root is a row inside the tree, not a placeholder instead of
+          it (task 672): the layout has to render for the root's own `+` to
+          exist, and creating the first file in an empty project is exactly
+          when it is wanted. */}
+      <div className="files-layout">
+        {/* Phone-tier affordance for the collapse above; hidden by CSS at
+            every wider tier, where the tree never leaves. Rendered before
+            the tree so it stays put as the tree comes and goes, and so the
+            two read as one control in the tab order. */}
+        <button
+          type="button"
+          className="files-tree-phone-toggle"
+          aria-expanded={treeOpen}
+          onClick={() => setTreeOpen((open) => !open)}
+        >
+          {treeOpen ? '▾' : '▸'} file tree
+          {!treeOpen && selectedPath !== null && (
+            <span className="files-tree-phone-crumb"> — {selectedPath}</span>
+          )}
+        </button>
+        {/* The tree pane (mesa task 671): the sized, collapsible box the
+            tree scrolls inside. The width is applied as a custom property,
+            never an inline `width` — the ≤860px tier stacks the panes into
+            a column and relaxes the tree to `width: auto`, and an inline
+            width would beat that rule and hand a 390px screen a drag-width
+            tree. The collapse is CSS-only for the same reason: the rail and
+            the tree are both always rendered, and only the wide tier has a
+            rule that hides either, so the flag cannot leak downward. */}
+        <div
+          className={`files-tree-pane${treeCollapsed ? ' collapsed' : ''}${
+            treeResizing ? ' resizing' : ''
+          }${treeOpen ? '' : ' files-tree-collapsed'}`}
+          ref={treeRef}
+          style={{ '--files-tree-width': `${treeWidth}px` } as CSSProperties}
+        >
+          {/* Header rail above the tree: the root's own `+` beside the
+              collapse toggle, since the root has no row of its own to hang
+              one on. */}
+          <div className="files-tree-head">
+            <NewFileButton
+              parent=""
+              label="New file in the project root"
+              create={create}
+            />
             <button
               type="button"
               className="files-tree-collapse-toggle"
               aria-expanded={!treeCollapsed}
-              aria-label={treeCollapsed ? 'Expand file tree' : 'Collapse file tree'}
+              aria-label={
+                treeCollapsed ? 'Expand file tree' : 'Collapse file tree'
+              }
               title={treeCollapsed ? 'Expand file tree' : 'Collapse file tree'}
               // Written straight through rather than from a `[treeCollapsed]`
               // effect: an updater with a localStorage write inside it isn't
@@ -1275,103 +1463,108 @@ export function FilesView({ projectId }: { projectId: number }) {
             >
               {treeCollapsed ? '»' : '«'}
             </button>
-            <ul className="files-tree">
-              {data.tree.map((entry) => (
-                <TreeNode
-                  key={entry.path}
-                  entry={entry}
-                  depth={0}
-                  expanded={expanded}
-                  onToggle={toggle}
-                  childrenCache={childrenCache}
-                  selectedPath={selectedPath}
-                  onSelectFile={(path) => {
-                    // Opens into the focused pane and activates it — or just
-                    // activates the tab already holding it, wherever that is.
-                    commit((prev) => openFile(prev, path))
-                    // Opening a file closes the tree, which is what makes the
-                    // phone tier's stacked layout usable: the tree is a full
-                    // column of rows, so leaving it up pushes the file itself
-                    // below the fold (measured at 390x844: the content pane's
-                    // top sat at 643px of an 844px viewport). Inert above
-                    // 600px, per `treeOpen` above.
-                    setTreeOpen(false)
-                  }}
-                />
-              ))}
-            </ul>
-            {/* Drag handle on the pane's own right edge — absolutely
-                positioned so the tree's `overflow-y: auto` can't scroll it
-                away, straddling the border so it's grabbable from either
-                side (the agent rail's trick). Hidden along with the tree
-                while collapsed, and by CSS at every tier that stacks. */}
-            <div
-              className="files-tree-resize-handle"
-              onMouseDown={(e) => {
-                e.preventDefault()
-                setTreeResizing(true)
-              }}
-              onDoubleClick={() => {
-                setTreeWidth(DEFAULT_FILES_TREE_WIDTH)
-                clearFilesTreeWidth()
-              }}
-            />
           </div>
-          <div className="files-panes" ref={panesRef}>
-            <FilePane
-              {...paneProps('left')}
-              style={split ? { flex: `0 0 calc(${tabs.ratio * 100}% - 0.25rem)` } : undefined}
-            />
-            {split && (
-              <>
-                {/* Pointer events, not HTML5 drag: a divider is a continuous
-                    resize, and a drag image following the cursor would be
-                    nonsense. Capture keeps the drag alive over the panes'
-                    own iframes/textareas. */}
-                <div
-                  className="files-pane-divider"
-                  role="separator"
-                  aria-orientation="vertical"
-                  onPointerDown={(e) => {
-                    e.currentTarget.setPointerCapture(e.pointerId)
-                  }}
-                  onPointerMove={(e) => {
-                    if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
-                    const box = panesRef.current?.getBoundingClientRect()
-                    if (box === undefined || box.width === 0) return
-                    const ratio = (e.clientX - box.left) / box.width
-                    commit((prev) => setRatio(prev, ratio))
-                  }}
-                  onPointerUp={(e) => {
-                    e.currentTarget.releasePointerCapture(e.pointerId)
-                  }}
-                />
-                <FilePane {...paneProps('right')} style={{ flex: '1 1 0' }} />
-              </>
-            )}
-            {/* Drag a tab onto the right edge to open the split. Rendered
-                only mid-drag, so it never eats a click, and never at the
-                narrow tier, where there is no split to enter. */}
-            {!split && !narrow && dragActive && (
-              <div
-                className={`files-split-drop${edgeArmed ? ' armed' : ''}`}
-                onDragEnter={armEdge}
-                onDragOver={armEdge}
-                onDragLeave={() => setEdgeArmed(false)}
-                onDrop={(e) => {
-                  if (dragging === null) return
-                  e.preventDefault()
-                  const from = dragging
-                  commit((prev) => splitWithTab(prev, from))
-                  endDrag()
+          <ul className="files-tree">
+            {create.parent === '' && <NewFileRow depth={0} create={create} />}
+            {data.tree.map((entry) => (
+              <TreeNode
+                key={entry.path}
+                entry={entry}
+                depth={0}
+                expanded={expanded}
+                onToggle={toggle}
+                childrenCache={childrenCache}
+                selectedPath={selectedPath}
+                onSelectFile={(path) => {
+                  // Opens into the focused pane and activates it — or just
+                  // activates the tab already holding it, wherever that is.
+                  commit((prev) => openFile(prev, path))
+                  // Opening a file closes the tree, which is what makes the
+                  // phone tier's stacked layout usable: the tree is a full
+                  // column of rows, so leaving it up pushes the file itself
+                  // below the fold (measured at 390x844: the content pane's
+                  // top sat at 643px of an 844px viewport). Inert above
+                  // 600px, per `treeOpen` above.
+                  setTreeOpen(false)
                 }}
-              >
-                <span>Split</span>
-              </div>
+                create={create}
+              />
+            ))}
+            {data.tree.length === 0 && (
+              <li className="files-tree-note muted">This folder is empty.</li>
             )}
-          </div>
+          </ul>
+          {/* Drag handle on the pane's own right edge — absolutely
+              positioned so the tree's `overflow-y: auto` can't scroll it
+              away, straddling the border so it's grabbable from either
+              side (the agent rail's trick). Hidden along with the tree
+              while collapsed, and by CSS at every tier that stacks. */}
+          <div
+            className="files-tree-resize-handle"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              setTreeResizing(true)
+            }}
+            onDoubleClick={() => {
+              setTreeWidth(DEFAULT_FILES_TREE_WIDTH)
+              clearFilesTreeWidth()
+            }}
+          />
         </div>
-      )}
+        <div className="files-panes" ref={panesRef}>
+          <FilePane
+            {...paneProps('left')}
+            style={split ? { flex: `0 0 calc(${tabs.ratio * 100}% - 0.25rem)` } : undefined}
+          />
+          {split && (
+            <>
+              {/* Pointer events, not HTML5 drag: a divider is a continuous
+                  resize, and a drag image following the cursor would be
+                  nonsense. Capture keeps the drag alive over the panes'
+                  own iframes/textareas. */}
+              <div
+                className="files-pane-divider"
+                role="separator"
+                aria-orientation="vertical"
+                onPointerDown={(e) => {
+                  e.currentTarget.setPointerCapture(e.pointerId)
+                }}
+                onPointerMove={(e) => {
+                  if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
+                  const box = panesRef.current?.getBoundingClientRect()
+                  if (box === undefined || box.width === 0) return
+                  const ratio = (e.clientX - box.left) / box.width
+                  commit((prev) => setRatio(prev, ratio))
+                }}
+                onPointerUp={(e) => {
+                  e.currentTarget.releasePointerCapture(e.pointerId)
+                }}
+              />
+              <FilePane {...paneProps('right')} style={{ flex: '1 1 0' }} />
+            </>
+          )}
+          {/* Drag a tab onto the right edge to open the split. Rendered
+              only mid-drag, so it never eats a click, and never at the
+              narrow tier, where there is no split to enter. */}
+          {!split && !narrow && dragActive && (
+            <div
+              className={`files-split-drop${edgeArmed ? ' armed' : ''}`}
+              onDragEnter={armEdge}
+              onDragOver={armEdge}
+              onDragLeave={() => setEdgeArmed(false)}
+              onDrop={(e) => {
+                if (dragging === null) return
+                e.preventDefault()
+                const from = dragging
+                commit((prev) => splitWithTab(prev, from))
+                endDrag()
+              }}
+            >
+              <span>Split</span>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

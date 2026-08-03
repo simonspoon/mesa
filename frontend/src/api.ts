@@ -437,6 +437,29 @@ export function updateProjectFilesContent(
   )
 }
 
+/**
+ * Creates one EMPTY file at `path`, relative to the project's local_path
+ * (mesa task 672). No content rides along — the file starts empty and is
+ * filled in through `updateProjectFilesContent` above, which keeps a single
+ * place where content is capped and binary-checked.
+ *
+ * A parent directory that doesn't resolve (traversal, absolute path, missing,
+ * or itself a file) 404s; a final component that isn't a usable single file
+ * name (empty, `.`/`..`, containing a separator) 422s; a name already taken on
+ * disk — file, directory or dangling symlink — 409s. Returns the freshly read
+ * `FileContentView` of the new file, so it can be opened without a second
+ * request.
+ */
+export function createProjectFile(
+  id: number,
+  path: string,
+): Promise<FileContentView> {
+  return request(
+    `/api/projects/${id}/files/content`,
+    jsonInit('POST', { path }),
+  )
+}
+
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----
 
 /** Every live Claude Code session on the machine (no folder filter) — backs

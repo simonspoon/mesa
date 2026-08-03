@@ -5,16 +5,21 @@ the file tree of the project's `local_path`, reads individual file contents,
 and (task 327) can edit and save a text file's content back to disk —
 `local_path`-anchored like the Git tab (touches the store only to read
 `local_path`, no CLI: an agent in a terminal edits files directly). Browsing
-(the tree, reading content) stays read-only; the one write is overwriting an
-existing text file's full content — no create, delete, or rename anywhere in
-this surface.
+(the tree, reading content) stays read-only; there are exactly two writes —
+overwriting an existing text file's full content, and creating one new empty
+file from the tree (task 672) — and no delete, rename or move anywhere in
+this surface. Creating a *folder* is not here either: the new-project picker's
+`POST /api/fs/dirs` remains the only folder create, on its own stricter gate
+(`docs/fs-browse.md`).
 
 - `pub fn safe_path(root: &str, rel: &str) -> Option<PathBuf>`
   (`src/core/files.rs`) is the sole traversal-defense chokepoint: canonicalizes
   both `root` and `root.join(rel)` (resolving `.`/`..` **and** symlinks) and
   requires the result to be `root` itself or a descendant — rejects
   `../` traversal, absolute-path smuggling, symlink escapes, and nonexistent
-  paths in one check. `read_file` and `write_file` are its only callers.
+  paths in one check. `read_file`, `write_file`, `tree_level` and
+  `create_file` are its only callers — and `create_file` is the one that
+  resolves something other than the request path itself (see below).
 - `pub fn tree_level(root: &str, rel: &str) -> Option<(Vec<FileTreeEntry>, bool)>`
   (mesa task 410) lists ONE directory level — `root` itself when `rel` is
   `""`, else the subdirectory `rel` resolves to underneath `root`, resolved
@@ -52,6 +57,31 @@ this surface.
   `read_file` itself collapses to `None` (traversal, absolute path,
   unlisted/nonexistent path, a directory) — plus an `fs::write` I/O failure —
   collapses the same way here, to `WriteFileError::NotFound`.
+- `pub fn create_file(root: &str, rel: &str) -> Result<(), CreateFileError>`
+  (task 672) creates ONE empty file at `rel` — the only write in the module
+  that brings a new path into existence.
+
+  **It resolves the PARENT through `safe_path`, never the new file itself,**
+  and that is the whole design: `safe_path` canonicalizes its candidate, so a
+  path that does not exist yet always errors out to `None` — the target could
+  never be resolved through it. Relaxing `safe_path` to tolerate a
+  nonexistent path was the alternative and is not available: that rejection
+  is exactly what `read_file`/`write_file`/`tree_level` rely on. So `rel` is
+  split on its last `/` into `(parent_rel, name)` (an empty `parent_rel`
+  meaning the project root, anchored as `"."`), the parent is resolved with
+  `safe_path` and required to be a directory, and the final component is held
+  inside it by the SAME single-component rules `create_dir` applies — trim,
+  no empty, not `.`/`..`, no `/`, `\` or NUL — which is what makes
+  `parent.join(name)` provably stay inside `parent`. One chokepoint, one
+  containment rule, no second path-resolution model.
+
+  An existing target is `Conflict`, tested with `symlink_metadata()` rather
+  than `exists()` (a dangling symlink is a name taken — `create_dir`'s rule).
+  The file is created with `fs::write(target, "")` — always EMPTY, never
+  `create_dir_all`, never a caller-supplied body: content arrives afterwards
+  through `write_file`, so there is no second content cap, binary sniff or
+  truncation rule to keep in sync. An I/O failure is `NotFound`,
+  `AlreadyExists` is `Conflict`, mirroring `create_dir`.
 - `GET /api/projects/{id}/files[?path=<rel>]` → `ProjectFileTree` via
   `files::tree_level` — one directory level per call (mesa task 410). `path`
   omitted lists `local_path` itself (the root level); `path` given lists that
@@ -89,6 +119,26 @@ this surface.
   `--lan` a peer who can already spawn an agent or run a hook in this folder
   gains nothing new here, so reusing that gate is the coherent choice, not a
   looser one.
+- `POST /api/projects/{id}/files/content` (task 672; the same path as the GET
+  and PATCH above, body `{path}` and nothing else — the new file is always
+  empty, so there is no `content` field to cap or sniff a second time) →
+  `files::create_file`, echoing the freshly read `FileContentView` for the new
+  path on success, like every other mutation here. Gated by
+  `require_agent_access` — the **same** gate as the PATCH, for the same
+  reason: the bytes are written under `local_path`, and a peer who can already
+  overwrite a file in that folder gains nothing new from being able to add
+  one. Error mapping matches `create_fs_dir`'s: `NotFound` → 404 `not_found`
+  (parent doesn't resolve, isn't a directory, or the write failed — plus the
+  no-`local_path`/dead-folder rung its neighbours share), `Validation(reason)`
+  → 422 `validation`, `Conflict` → 409 `conflict`.
+
+  The handler **evicts the `files_tree_cache` entry for the created file's
+  own directory** — key `(local_path, rel_key)`, where `rel_key` is the
+  parent's relative path and `""` is the root — before responding. That is a
+  requirement, not a nicety: the cache has a 5s TTL and the client refetches
+  that level immediately, so leaving the entry in place would show a tree that
+  does not contain the file just created. Only that one key is dropped;
+  nothing about any other level changed.
 - The tab reads one route it does not own: `GET
   /api/projects/{id}/git/file-log?path=<rel>` (mesa task 542) backs the
   per-file History pane below. It is documented with the other git reads in
@@ -100,7 +150,9 @@ this surface.
   new diff endpoint exists for this feature.
 - Tree listing and content reads stay standard-guard-only, like the Git tab —
   no agent-style gate (browsing executes nothing) and no Content-Type gate
-  (GET-only). The write above is the one exception, gated as just described.
+  (GET-only). The two writes above are the exception: both are gated by
+  `require_agent_access` and both, being mutations with JSON bodies, sit
+  inside the global Content-Type/CSRF gate.
 - Web UI: `FilesView` (`frontend/src/pages/FilesView.tsx`) under the project
   tabs — a left-hand expandable file tree (`.files-tree`, directories
   toggled open/closed in local component state, no deep-linking) and a
@@ -313,9 +365,11 @@ twice.
   the editor's existing Escape-cancels / Cmd-Ctrl+Enter-saves bindings are
   unchanged.
 
-Non-goals, deliberately: no new file operations (still no create, delete or
-rename), no recursive or stacked splits, no third pane, and nothing about
-`SideBySideDiff`, the markdown path or `syntaxHighlighter.ts` changed.
+Non-goals of *that* task, deliberately: no new file operations, no recursive
+or stacked splits, no third pane, and nothing about `SideBySideDiff`, the
+markdown path or `syntaxHighlighter.ts` changed. (Task 672 later added exactly
+one file operation — create — described in its own section below; delete,
+rename and move remain non-goals.)
 
 ## Tree pane: drag-resize and collapse (task 671)
 
@@ -380,3 +434,56 @@ Two things about the layout are load-bearing:
 
 Scope is the tree pane only: the `files-panes` split ratio divider (task 670),
 `FileHistoryPane` and the editor stack are unchanged.
+
+## Creating a file from the tree (task 672)
+
+The surface's one create. Scope is deliberately a *file*: no delete, rename,
+move or duplicate, no folder create (that stays `POST /api/fs/dirs` in the
+new-project picker, on its own stricter loopback-only gate), and no implicit
+intermediate directories — `create_file` is one `fs::write`, never
+`create_dir_all`.
+
+- **The affordance.** A `+` on every directory row (`.files-tree-add`), and one
+  for the project root in the tree pane's header rail (`.files-tree-head`,
+  beside the collapse toggle — the root has no row of its own to hang it on).
+  Revealed on hover and on `:focus-visible`, so it stays reachable by Tab
+  without adding permanent noise to a column of paths, and always visible under
+  `@media (hover: none)`, where there is no hover to reveal it with. A
+  directory row's own `onClick` toggles that directory, so the button
+  `stopPropagation()`s.
+- **The naming row.** Clicking `+` opens an inline `<li>` with an autofocused
+  input as the first child of that directory (root creates go at the top of
+  `.files-tree`), expanding the directory first so the row has somewhere to
+  appear. Enter submits, Escape cancels, blur cancels; at most one row is open
+  at a time, which is why `FilesView` holds a single `newFileParent: string |
+  null` (`''` = root) rather than a set. The input is never `disabled` while
+  the create is in flight — a browser blurs a control it disables, and blur
+  cancels — so "busy" is enforced in the submit handler instead.
+- **The naming rules are a pure module**, `frontend/src/newFile.ts` with
+  `newFile.test.ts` (CLAUDE.md's frontend-test invariant: logic worth testing
+  lives in a module, not inline in a `.tsx` — the rule that produced
+  `navOrder.ts` and `fileTabs.ts`). `newFilePath(parent, name)` trims and
+  answers either the relative path to POST or a rejection reason, applying the
+  client-side twin of the server's single-component checks (empty, `.`/`..`,
+  any `/`, `\` or NUL). The server stays authoritative: this copy exists to
+  turn an obviously bad name into an instant inline message instead of a round
+  trip, never to be the boundary. A rejected name fires no request; a server
+  409/422/404 renders in the same place and keeps the row open, the same shape
+  as the editor's inline `saveError`.
+- **After a create.** The target directory is expanded, its `childrenCache`
+  entry replaced by a fresh `getProjectFiles(projectId, dir)` (root creates
+  re-fetch the root through the tab's own loader) — which sees the new file
+  because the handler already evicted the server's 5s tree-cache entry for that
+  level — and the new file is opened in the focused pane through `fileTabs.ts`'s
+  `openFile` via the existing `commit()`, never a hand-rolled `TabsState`
+  transition. The file is empty and non-binary, so the existing **Edit** button
+  works on it unchanged; that is how content gets in.
+- **An empty project root now renders the tree pane** with a
+  `This folder is empty.` row inside `.files-tree`, instead of replacing the
+  whole layout with a placeholder. The layout has to exist for the root's `+`
+  to exist, and an empty project is precisely when creating the first file is
+  wanted.
+- **No new keyboard surface** (`docs/keyboard.md`): the `+` and the input are
+  ordinary focusable controls, no global single-key shortcut. The naming row
+  lives inside `.files-tree-pane`, so the pane's width/collapse (task 671) and
+  the phone tier's stack (task 559) apply to it unchanged.

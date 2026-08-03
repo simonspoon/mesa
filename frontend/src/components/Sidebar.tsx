@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import {
   getGitStatus,
   listAllAgents,
@@ -12,6 +12,19 @@ import { isPhone } from '../phoneTier'
 import { useFetch } from '../useFetch'
 import { CreateProjectModal } from './CreateProjectModal'
 import { isRunningAgent, projectForCwd } from '../agentProject'
+import {
+  clampNavWidth,
+  clearNavWidth,
+  DEFAULT_NAV_WIDTH,
+  loadNavWidth,
+  saveNavWidth,
+} from '../navWidth'
+
+// `main`'s own floor, mirroring MIN_MAIN_WIDTH in AgentSidebar.tsx: dragging
+// the nav wide can never squeeze the content area to nothing. Measured live
+// off `main`'s rect each move rather than assumed from the viewport, so it
+// accounts for whatever the agent sidebar is currently taking.
+const MIN_MAIN_WIDTH = 320
 
 // CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
 // overview (charts + KPIs); these are the table views split out beneath it.
@@ -141,6 +154,68 @@ export function Sidebar({
   const [archivedCollapsed, setArchivedCollapsed] = useState(true)
   const [unarchiveError, setUnarchiveError] = useState<string | null>(null)
 
+  // Drag-resize (mesa task 665), the mirror of the agent sidebar's own. The
+  // width is applied as a custom property, never an inline `width`: at the
+  // phone tier the expanded nav is a fixed-width overlay drawer, and an
+  // inline width would beat that rule and hand a 390px screen a drag-width
+  // drawer. Clamp bounds live in `navWidth.ts`; only the live ceiling is
+  // measured here.
+  const navRef = useRef<HTMLElement>(null)
+  const [navWidth, setNavWidth] = useState(loadNavWidth)
+  const [resizing, setResizing] = useState(false)
+
+  // A stored width is loaded unclamped (navWidth.ts can't see the window), so
+  // pull it into range once mounted and on every window resize — the state
+  // must never *hold* an out-of-range value, not merely render as one.
+  useEffect(() => {
+    const clampToLayout = () => {
+      const navLeft = navRef.current?.getBoundingClientRect().left
+      const mainRight = document.querySelector('main')?.getBoundingClientRect().right
+      if (navLeft === undefined || mainRight === undefined) return
+      setNavWidth((w) => clampNavWidth(w, mainRight - navLeft - MIN_MAIN_WIDTH))
+    }
+    clampToLayout()
+    window.addEventListener('resize', clampToLayout)
+    return () => window.removeEventListener('resize', clampToLayout)
+  }, [collapsed])
+
+  // Listeners go on `document`, not the handle, so the drag keeps tracking
+  // when the pointer outruns it. New width is the pointer's distance from the
+  // nav's own left edge; the ceiling keeps `main` at least MIN_MAIN_WIDTH
+  // wide. The <body> class matches `body.agent-sidebar-resizing` so a sweep
+  // across the page doesn't select text under it.
+  useEffect(() => {
+    if (!resizing) return
+    // The listeners live for the whole drag, so they'd close over the
+    // `navWidth` this effect started with. `latest` carries the value forward
+    // for `onUp` to persist without re-subscribing on every move. It stays
+    // null until the pointer actually moves, so a press-and-release that
+    // never dragged writes nothing.
+    let latest: number | null = null
+    const onMove = (e: MouseEvent) => {
+      const navLeft = navRef.current?.getBoundingClientRect().left ?? 0
+      const mainRight = document.querySelector('main')?.getBoundingClientRect().right
+      if (mainRight === undefined) return
+      latest = clampNavWidth(e.clientX - navLeft, mainRight - navLeft - MIN_MAIN_WIDTH)
+      setNavWidth(latest)
+    }
+    // Persist on drag end only: once per drag, not once a frame. Written here
+    // rather than from a `[navWidth]` effect so the double-click reset's
+    // `clearNavWidth()` isn't immediately undone by a re-save of the default.
+    const onUp = () => {
+      setResizing(false)
+      if (latest !== null) saveNavWidth(latest)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.classList.add('nav-resizing')
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('nav-resizing')
+    }
+  }, [resizing])
+
   // On phones the expanded sidebar is an overlay drawer; close it once the
   // user has picked a destination so it doesn't sit over the new page.
   useEffect(() => {
@@ -196,7 +271,11 @@ export function Sidebar({
         aria-hidden="true"
         onClick={() => setCollapsed(true)}
       />
-      <nav className="sidebar">
+      <nav
+        className="sidebar"
+        ref={navRef}
+        style={{ '--nav-width': `${navWidth}px` } as CSSProperties}
+      >
         <button
           type="button"
           className="sidebar-toggle"
@@ -335,6 +414,24 @@ export function Sidebar({
           />
         )}
       </nav>
+      {/* Drag handle, a *sibling* flex item of `.shell-body` rather than a
+          child of the nav (mesa task 665). The nav is a scroll box
+          (`overflow-y: auto`), unlike `.agent-sidebar` — an absolutely
+          positioned child would be clipped by it and would scroll away with
+          the project list. A zero-width flex item stretched by
+          `align-items: stretch`, with its hit area widened by negative
+          margins, is full-height and clip-free. */}
+      <div
+        className={`nav-resize-handle${resizing ? ' resizing' : ''}`}
+        onMouseDown={(e) => {
+          e.preventDefault()
+          setResizing(true)
+        }}
+        onDoubleClick={() => {
+          setNavWidth(DEFAULT_NAV_WIDTH)
+          clearNavWidth()
+        }}
+      />
     </>
   )
 }

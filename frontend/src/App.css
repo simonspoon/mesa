@@ -37,7 +37,11 @@ header {
 
 .sidebar {
   flex: none;
-  width: 220px;
+  /* Drag-resizable (mesa task 665): the width comes from a custom property
+     set inline by Sidebar.tsx, never an inline `width` — the phone tier's
+     drawer rule below has to be able to win. 220px is both the default and
+     the fallback painted before any stored width is applied. */
+  width: var(--nav-width, 220px);
   /* Sticky + its own scroll, decoupled from `main`'s height: with
      align-items: stretch on .shell-body, a plain min-height let the
      sidebar stretch to match a tall project board, pushing the nav-footer
@@ -60,10 +64,32 @@ header {
   flex-direction: column;
 }
 
-/* Collapsed sidebar: shrink to just the re-expand handle. */
+/* Collapsed sidebar: shrink to just the re-expand handle. Wins over the
+   custom property above, so a dragged width is remembered but not applied
+   while collapsed. */
 .sidebar.collapsed {
   width: auto;
   padding: 0.5rem 0.35rem;
+}
+
+/* Nav drag handle (mesa task 665). A zero-width flex item between the nav and
+   `.main-slot`, stretched full-height by `.shell-body`'s `align-items:
+   stretch`; the grabbable strip is the negative margins, so it straddles the
+   nav's border without stealing layout space from either side. Rendered only
+   when the nav is expanded, so there is no collapsed-state rule to write. */
+.nav-resize-handle {
+  flex: none;
+  width: 6px;
+  /* Negative margins pull the 6px strip back to a net-zero contribution to
+     the flex row, so adding it neither shifts `main` nor eats nav width. */
+  margin: 0 -3px;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.nav-resize-handle:hover,
+.nav-resize-handle.resizing {
+  background-color: var(--cyan-dim, rgba(0, 229, 255, 0.3));
 }
 
 /* Collapse/expand handle: chromeless, right-aligned above the nav entries. */
@@ -2334,7 +2360,8 @@ main {
 
 /* Set on <body> for the duration of a resize drag so text elsewhere on the
    page doesn't get selected as the pointer sweeps across it. */
-body.agent-sidebar-resizing {
+body.agent-sidebar-resizing,
+body.nav-resizing {
   user-select: none;
   cursor: col-resize;
 }
@@ -3775,6 +3802,12 @@ body.agent-sidebar-resizing {
      any terminal attached inside it. Sizing off `--phone-shell-height`
      instead keeps the drawer inside the visible area. Identical to `100dvh -
      reserve` whenever no keyboard is up. */
+  /* No resize on this tier: the expanded nav is a fixed-position overlay
+     drawer at a fixed width, so there is nothing on the flex row to drag. */
+  .nav-resize-handle {
+    display: none;
+  }
+
   .sidebar:not(.collapsed) {
     position: fixed;
     top: 0;

@@ -316,3 +316,67 @@ twice.
 Non-goals, deliberately: no new file operations (still no create, delete or
 rename), no recursive or stacked splits, no third pane, and nothing about
 `SideBySideDiff`, the markdown path or `syntaxHighlighter.ts` changed.
+
+## Tree pane: drag-resize and collapse (task 671)
+
+The tree half is a resizable, collapsible pane, the way the left nav (task 665)
+and the agent sidebar's list rail (task 414) already are — before this it was a
+hard-coded `width: 19rem`, too narrow for a deep tree and unshrinkable when you
+only wanted the editor. Frontend-only: no route, no `Store` write, no new type.
+
+- **Drag-resize.** A 6px `col-resize` handle on the pane's *right* edge — this
+  is the left pane, so the mirror of the nav's and the agent rail's left-edge
+  handles. It is absolutely positioned against `.files-tree-pane` rather than
+  living in the tree, because the tree is a scroll box that would clip it and
+  scroll it away. Listeners go on `document`, not the handle, so the drag keeps
+  tracking when the pointer outruns it; `document.body` carries a
+  `files-tree-resizing` class for the length of the drag (joining
+  `body.nav-resizing` on one rule) so a sweep doesn't select text under it. The
+  width is persisted **once, on drag end** — not once a frame. Double-clicking
+  the handle resets to the default by *clearing* the stored key rather than
+  storing the default, the nav's rule: a later change to the default should be
+  picked up, not pinned by a leftover entry.
+- **Collapse.** A `«`/`»` toggle in the pane's top-right shrinks it to a narrow
+  rail carrying the expander; `.files-panes` is `flex: 1`, so the content half
+  simply takes the freed width and keeps rendering its open tabs untouched.
+  Same shape as `.sidebar.collapsed` and `.agent-sidebar-list-rail.collapsed`.
+
+**State lives in `frontend/src/filesTreeWidth.ts`**, unit-tested in
+`filesTreeWidth.test.ts` (CLAUDE.md's frontend-test invariant: testable logic
+belongs in a pure module, not inline in a `.tsx`). It holds
+`DEFAULT_FILES_TREE_WIDTH` (304 — the px twin of the old `19rem`, and the CSS
+fallback must move with it), `MIN_FILES_TREE_WIDTH` (160, below which rows clip;
+the collapse toggle, not the drag, is how you get smaller),
+`clampFilesTreeWidth(width, max)` — `max` measured live off the layout by the
+caller (`.files-panes`' right edge minus the content half's own 320px floor), so
+it is not a constant in the module — plus `load`/`save`/`clear` and the
+collapsed flag. Every path out of the module returns an in-range value or the
+default: a stored value is as untrusted as a mid-drag pointer position, and the
+component clamps again on mount and on every window resize, so the state never
+*holds* an out-of-range width, it does not merely render one.
+
+Both preferences are **localStorage**, machine-local, and **one global setting
+for the Files tab across every project** — not per-project, not a store column,
+no route, no place in a backup. Same posture as `navWidth`/`navCollapse`/
+`lastFolder`. (They are therefore not reset by the project-change reset that
+clears tabs, `expanded` and `childrenCache`.)
+
+Two things about the layout are load-bearing:
+
+- **The width is a CSS custom property (`--files-tree-width`) on the pane,
+  never an inline `width`.** At ≤860px the panes stack and the pane relaxes to
+  `width: auto`; an inline width would beat that rule and hand a 390px screen a
+  drag-width tree — exactly the trap `navWidth` documents.
+- **The collapse is CSS-only, and every rule for it lives in one
+  `@media (min-width: 861px)` block.** The rail and the tree are both always
+  rendered; below the wide tier there is simply no rule to hide either, so the
+  collapsed flag cannot leak into the stacked layout. That is what keeps it
+  independent of the phone tier's `treeOpen` (task 559), which collapses the
+  tree behind a breadcrumb toggle at ≤600px and is inert above it: neither flag
+  reads the other, and no new `matchMedia` was introduced — the breakpoint stays
+  in CSS alone (`docs/mobile.md`). `treeOpen`'s own hide rule moved from the
+  `<ul>` to the pane, so a phone-tier collapse takes the wide tier's toggle with
+  it instead of leaving a lone `«` above the file.
+
+Scope is the tree pane only: the `files-panes` split ratio divider (task 670),
+`FileHistoryPane` and the editor stack are unchanged.

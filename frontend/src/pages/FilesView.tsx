@@ -23,6 +23,15 @@ import {
   type TabSource,
   type TabsState,
 } from '../fileTabs'
+import {
+  clampFilesTreeWidth,
+  clearFilesTreeWidth,
+  DEFAULT_FILES_TREE_WIDTH,
+  loadFilesTreeCollapsed,
+  loadFilesTreeWidth,
+  saveFilesTreeCollapsed,
+  saveFilesTreeWidth,
+} from '../filesTreeWidth'
 import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
@@ -38,6 +47,29 @@ import {
 import type { FileTreeEntry } from '../types/FileTreeEntry'
 import type { GitCommit } from '../types/GitCommit'
 import { useFetch } from '../useFetch'
+
+/** The content half's own floor, the twin of `MIN_MAIN_WIDTH` in Sidebar.tsx /
+ * AgentSidebar.tsx: dragging the tree wider may never squeeze the file it
+ * exists to open down to a strip. */
+const MIN_FILES_CONTENT_WIDTH = 320
+
+/** The widest the tree pane may be right now, or null while either half is
+ * unmounted (the tab is still loading) and there is nothing to measure.
+ *
+ * `.files-layout` puts a gap between the two, so the room the tree can take is
+ * the distance to the panes' right edge *minus that gap* — measured, not
+ * assumed, since it is a `rem` in App.css — minus the content half's own
+ * floor. Left out, the ceiling hands the content a pane one gap under its
+ * floor. */
+function maxTreeWidth(
+  tree: HTMLElement | null,
+  panes: HTMLElement | null,
+): number | null {
+  if (tree === null || panes === null) return null
+  const t = tree.getBoundingClientRect()
+  const p = panes.getBoundingClientRect()
+  return p.right - t.left - (p.left - t.right) - MIN_FILES_CONTENT_WIDTH
+}
 
 // Extension -> language tag, a client-side copy of core::files::language_of's
 // table (arch.md §4 / src/core/files.rs). The TREE endpoint carries no
@@ -950,6 +982,16 @@ export function FilesView({ projectId }: { projectId: number }) {
   // `matchMedia` for the component to keep in sync (same rule the phone tab
   // bar follows, App.css).
   const [treeOpen, setTreeOpen] = useState(true)
+  // The wide-tier tree pane's own width and collapse (mesa task 671), both
+  // persisted globally for the Files tab (`filesTreeWidth.ts`). Deliberately
+  // independent of `treeOpen` above: that one is the phone tier's control and
+  // is inert above 600px, these two are the wide tier's and are made inert at
+  // and below 860px by CSS alone — neither flag ever reads the other, and no
+  // second `matchMedia` is introduced (`docs/mobile.md`).
+  const [treeWidth, setTreeWidth] = useState(loadFilesTreeWidth)
+  const [treeCollapsed, setTreeCollapsed] = useState(loadFilesTreeCollapsed)
+  const [treeResizing, setTreeResizing] = useState(false)
+  const treeRef = useRef<HTMLDivElement>(null)
   // Whether a tab drag is in flight at all — what arms the right-edge split
   // zone. Distinct from `mark`, which is only set while the pointer is over a
   // strip: leaving the strip for the edge clears the indicator but must not
@@ -979,6 +1021,61 @@ export function FilesView({ projectId }: { projectId: number }) {
       }),
     [],
   )
+  // A stored width is loaded unclamped (`filesTreeWidth.ts` can't see the
+  // layout), so pull it into range once the tree is mounted and on every
+  // window resize — the state must never *hold* an out-of-range value, not
+  // merely render as one. `data` is a dependency because the tree only exists
+  // once the fetch has landed; until then there is nothing to measure against.
+  useEffect(() => {
+    const clampToLayout = () => {
+      const max = maxTreeWidth(treeRef.current, panesRef.current)
+      if (max === null) return
+      setTreeWidth((w) => clampFilesTreeWidth(w, max))
+    }
+    clampToLayout()
+    window.addEventListener('resize', clampToLayout)
+    return () => window.removeEventListener('resize', clampToLayout)
+  }, [treeCollapsed, data])
+
+  // Listeners go on `document`, not the handle, so the drag keeps tracking
+  // when the pointer outruns it. The new width is the pointer's distance from
+  // the tree's own left edge (the handle is on its *right* edge — this is the
+  // left pane, the mirror of the nav's and the agent rail's). The <body> class
+  // matches `body.nav-resizing` so a sweep across the page doesn't select text
+  // under it.
+  useEffect(() => {
+    if (!treeResizing) return
+    // The listeners live for the whole drag, so they'd close over the
+    // `treeWidth` this effect started with. `latest` carries the value forward
+    // for `onUp` to persist without re-subscribing on every move. It stays
+    // null until the pointer actually moves, so a press-and-release that never
+    // dragged writes nothing.
+    let latest: number | null = null
+    const onMove = (e: MouseEvent) => {
+      const treeLeft = treeRef.current?.getBoundingClientRect().left
+      const max = maxTreeWidth(treeRef.current, panesRef.current)
+      if (treeLeft === undefined || max === null) return
+      latest = clampFilesTreeWidth(e.clientX - treeLeft, max)
+      setTreeWidth(latest)
+    }
+    // Persist on drag end only: once per drag, not once a frame. Written here
+    // rather than from a `[treeWidth]` effect so the double-click reset's
+    // `clearFilesTreeWidth()` isn't immediately undone by a re-save of the
+    // default.
+    const onUp = () => {
+      setTreeResizing(false)
+      if (latest !== null) saveFilesTreeWidth(latest)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.classList.add('files-tree-resizing')
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('files-tree-resizing')
+    }
+  }, [treeResizing])
+
   // Reset on project change (render-time, off the changed prop — same
   // pattern as GitView/HistoryPane): this component isn't remounted when the
   // route moves between projects, so a stale selection from project A must
@@ -1147,31 +1244,79 @@ export function FilesView({ projectId }: { projectId: number }) {
               <span className="files-tree-phone-crumb"> — {selectedPath}</span>
             )}
           </button>
-          <ul className={`files-tree${treeOpen ? '' : ' files-tree-collapsed'}`}>
-            {data.tree.map((entry) => (
-              <TreeNode
-                key={entry.path}
-                entry={entry}
-                depth={0}
-                expanded={expanded}
-                onToggle={toggle}
-                childrenCache={childrenCache}
-                selectedPath={selectedPath}
-                onSelectFile={(path) => {
-                  // Opens into the focused pane and activates it — or just
-                  // activates the tab already holding it, wherever that is.
-                  commit((prev) => openFile(prev, path))
-                  // Opening a file closes the tree, which is what makes the
-                  // phone tier's stacked layout usable: the tree is a full
-                  // column of rows, so leaving it up pushes the file itself
-                  // below the fold (measured at 390x844: the content pane's
-                  // top sat at 643px of an 844px viewport). Inert above
-                  // 600px, per `treeOpen` above.
-                  setTreeOpen(false)
-                }}
-              />
-            ))}
-          </ul>
+          {/* The tree pane (mesa task 671): the sized, collapsible box the
+              tree scrolls inside. The width is applied as a custom property,
+              never an inline `width` — the ≤860px tier stacks the panes into
+              a column and relaxes the tree to `width: auto`, and an inline
+              width would beat that rule and hand a 390px screen a drag-width
+              tree. The collapse is CSS-only for the same reason: the rail and
+              the tree are both always rendered, and only the wide tier has a
+              rule that hides either, so the flag cannot leak downward. */}
+          <div
+            className={`files-tree-pane${treeCollapsed ? ' collapsed' : ''}${
+              treeResizing ? ' resizing' : ''
+            }${treeOpen ? '' : ' files-tree-collapsed'}`}
+            ref={treeRef}
+            style={{ '--files-tree-width': `${treeWidth}px` } as CSSProperties}
+          >
+            <button
+              type="button"
+              className="files-tree-collapse-toggle"
+              aria-expanded={!treeCollapsed}
+              aria-label={treeCollapsed ? 'Expand file tree' : 'Collapse file tree'}
+              title={treeCollapsed ? 'Expand file tree' : 'Collapse file tree'}
+              // Written straight through rather than from a `[treeCollapsed]`
+              // effect: an updater with a localStorage write inside it isn't
+              // pure, and an effect would also re-save on mount.
+              onClick={() => {
+                setTreeCollapsed(!treeCollapsed)
+                saveFilesTreeCollapsed(!treeCollapsed)
+              }}
+            >
+              {treeCollapsed ? '»' : '«'}
+            </button>
+            <ul className="files-tree">
+              {data.tree.map((entry) => (
+                <TreeNode
+                  key={entry.path}
+                  entry={entry}
+                  depth={0}
+                  expanded={expanded}
+                  onToggle={toggle}
+                  childrenCache={childrenCache}
+                  selectedPath={selectedPath}
+                  onSelectFile={(path) => {
+                    // Opens into the focused pane and activates it — or just
+                    // activates the tab already holding it, wherever that is.
+                    commit((prev) => openFile(prev, path))
+                    // Opening a file closes the tree, which is what makes the
+                    // phone tier's stacked layout usable: the tree is a full
+                    // column of rows, so leaving it up pushes the file itself
+                    // below the fold (measured at 390x844: the content pane's
+                    // top sat at 643px of an 844px viewport). Inert above
+                    // 600px, per `treeOpen` above.
+                    setTreeOpen(false)
+                  }}
+                />
+              ))}
+            </ul>
+            {/* Drag handle on the pane's own right edge — absolutely
+                positioned so the tree's `overflow-y: auto` can't scroll it
+                away, straddling the border so it's grabbable from either
+                side (the agent rail's trick). Hidden along with the tree
+                while collapsed, and by CSS at every tier that stacks. */}
+            <div
+              className="files-tree-resize-handle"
+              onMouseDown={(e) => {
+                e.preventDefault()
+                setTreeResizing(true)
+              }}
+              onDoubleClick={() => {
+                setTreeWidth(DEFAULT_FILES_TREE_WIDTH)
+                clearFilesTreeWidth()
+              }}
+            />
+          </div>
           <div className="files-panes" ref={panesRef}>
             <FilePane
               {...paneProps('left')}

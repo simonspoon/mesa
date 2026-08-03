@@ -2489,7 +2489,8 @@ main {
 /* Set on <body> for the duration of a resize drag so text elsewhere on the
    page doesn't get selected as the pointer sweeps across it. */
 body.agent-sidebar-resizing,
-body.nav-resizing {
+body.nav-resizing,
+body.files-tree-resizing {
   user-select: none;
   cursor: col-resize;
 }
@@ -3163,9 +3164,25 @@ body.nav-resizing {
   min-height: var(--tab-viewport-min);
 }
 
-.files-tree {
+/* The tree pane (mesa task 671): the sized box the tree scrolls inside, and
+   the anchor for its drag handle. The width comes from a custom property set
+   inline by FilesView, never an inline `width` — the ≤860px tier stacks this
+   column and relaxes the pane to `width: auto`, and an inline width would beat
+   that rule and hand a 390px screen a drag-width tree (the trap `navWidth`
+   documents). 304px is both the default and the fallback painted before any
+   stored width is applied; it must move with DEFAULT_FILES_TREE_WIDTH. */
+.files-tree-pane {
+  position: relative; /* anchors the resize handle below */
   flex: none;
-  width: 19rem;
+  width: var(--files-tree-width, 304px);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.files-tree {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   list-style: none;
   margin: 0;
@@ -3173,6 +3190,76 @@ body.nav-resizing {
   border: 1px solid var(--border);
   background: var(--panel);
 }
+
+/* Collapse and drag are the WIDE tier's controls, so every rule for them lives
+   inside this one min-width block. Below it the pane is a stacked row rather
+   than a column beside the file, `.files-tree-phone-toggle` is the control
+   that applies, and neither a stored width nor the collapsed flag has any rule
+   to act through — that is how the two collapses stay independent without a
+   second `matchMedia` (mesa task 671, `docs/mobile.md`). */
+@media (min-width: 861px) {
+  /* Collapsed: shrink to just the re-expand rail. Wins over the custom
+     property above, so a dragged width is remembered but not applied while
+     collapsed — `.sidebar.collapsed`'s rule, and the content half takes the
+     freed space because `.files-panes` is `flex: 1`. */
+  .files-tree-pane.collapsed {
+    width: auto;
+  }
+
+  .files-tree-pane.collapsed .files-tree,
+  .files-tree-pane.collapsed .files-tree-resize-handle {
+    display: none;
+  }
+
+  /* Collapse/expand handle: chromeless, right-aligned above the tree —
+     `.sidebar-toggle`'s shape, and centred once it is the rail's only
+     occupant. */
+  .files-tree-collapse-toggle {
+    align-self: flex-end;
+    width: auto;
+    padding: 0.1rem 0.4rem;
+    border: none;
+    border-radius: 0;
+    clip-path: none;
+    background: none;
+    box-shadow: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+  }
+
+  .files-tree-pane.collapsed .files-tree-collapse-toggle {
+    align-self: center;
+  }
+
+  .files-tree-collapse-toggle:hover {
+    background: none;
+    box-shadow: none;
+    color: var(--cyan);
+  }
+
+  /* Drag handle on the pane's right edge — it is the LEFT pane, so the mirror
+     of the nav's and the agent rail's left-edge handles. Absolutely
+     positioned, since the tree itself is a scroll box that would clip it and
+     scroll it away; the negative offset straddles the border so it is
+     grabbable from either side. */
+  .files-tree-resize-handle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: -3px;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 1;
+  }
+
+  .files-tree-resize-handle:hover,
+  .files-tree-pane.resizing .files-tree-resize-handle {
+    background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
+  }
+}
+
 
 /* Phone-tier tree collapse (mesa task 559). Off by default and switched on
    inside the ≤600px block — the same "the breakpoint lives in CSS alone"
@@ -3811,8 +3898,24 @@ body.nav-resizing {
     min-height: 0;
   }
 
-  .files-tree {
+  /* The width now belongs to the pane (mesa task 671), so this is the rule a
+     stored drag width must lose to — hence the custom property rather than an
+     inline `width`, which would have won. The wide tier's collapse rail and
+     drag handle simply have no rules down here (they live in a `min-width`
+     block), so the collapsed flag cannot reach this layout either. */
+  .files-tree-pane {
     width: auto;
+  }
+
+  /* Both wide-tier affordances are inert here: the panes are stacked, so
+     there is no width to drag and nothing a rail would buy back —
+     `.files-tree-phone-toggle` is the control that applies at this tier. */
+  .files-tree-collapse-toggle,
+  .files-tree-resize-handle {
+    display: none;
+  }
+
+  .files-tree {
     overflow-y: visible;
   }
 
@@ -4514,7 +4617,10 @@ body.nav-resizing {
     color: var(--muted);
   }
 
-  .files-tree.files-tree-collapsed {
+  /* The whole pane, not just the <ul>: since task 671 the pane also carries
+     the wide tier's collapse toggle, and a lone `«` floating above the
+     content is not what "hide the tree" means. */
+  .files-tree-pane.files-tree-collapsed {
     display: none;
   }
 

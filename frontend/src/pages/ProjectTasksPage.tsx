@@ -421,7 +421,10 @@ export function ProjectTasksPage({
         {/* Parent project (task 668): the UI half of a field that would
             otherwise be CLI-only. Eligible parents exclude this project and
             everything under it — `Store` would answer a cycle with a 409, but
-            an option that can only fail is not a choice worth offering. */}
+            an option that can only fail is not a choice worth offering.
+            Task 669 gave the nav a drag that reparents too (drop into the
+            middle of a row); this picker stays as the explicit, list-shaped
+            way to do the same thing — the two write the same field. */}
         {project && allProjects && (
           <p className="project-parent">
             <label>

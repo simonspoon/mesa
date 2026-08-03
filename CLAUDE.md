@@ -225,7 +225,15 @@ The code is the source of truth. These are the invariants you must not break:
   self-parenting and any cycle (`cycle`) and an unknown parent (`validation`),
   mirroring a task's parent. `list_projects` still returns **one flat array**
   in `sort_order` — the tree is assembled client-side (`projectTree.ts`), so
-  order stays server-side and a drag still reorders **within siblings only**.
+  order stays server-side. A nav drag writes this field too (task 669): where
+  in the hovered row the drop lands is the intent signal — the top/bottom
+  **quarter** means *sibling* of that row (so an edge drop onto a top-level
+  row is how a child is pulled back out), the middle **half** means *child*
+  of it, appended last. Either way it is **one** `PATCH /api/projects/{id}`
+  carrying `parent_id` and `sort_order` together, no other row renumbered;
+  the decision is one pure function (`navOrder.ts::dropIntentFor`) that
+  answers `null` — no request — for a drop onto itself, onto its own
+  descendant, or back where it already is.
   The FK is `ON DELETE CASCADE`: deleting a project destroys its whole subtree,
   and the delete echo grows a `subprojects` key so the recovery transcript
   still carries every destroyed row.

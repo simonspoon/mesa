@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import {
+  closestCenter,
   DndContext,
   MouseSensor,
-  TouchSensor,
+  pointerWithin,
   useSensor,
   useSensors,
+  TouchSensor,
+  type ClientRect,
+  type CollisionDetection,
   type DragEndEvent,
+  type DragMoveEvent,
 } from '@dnd-kit/core'
-import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { SortableContext, useSortable, type SortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import {
   getGitStatus,
@@ -17,7 +22,7 @@ import {
   unarchiveProject,
   updateProject,
 } from '../api'
-import { sortOrderForDrop } from '../navOrder'
+import { dropIntentFor, zoneForOffset, type DropIntent, type DropZone } from '../navOrder'
 import {
   expandAncestors,
   loadCollapsed,
@@ -108,20 +113,68 @@ function GitLine({ git }: { git: GitStatus | undefined }) {
 }
 
 /**
+ * The rows under the pointer stay exactly where they are while a project is
+ * dragged (mesa task 669) — `verticalListSortingStrategy`'s shove-the-others-
+ * aside preview is gone.
+ *
+ * That preview answers "which gap am I falling into", which was the only
+ * question a drag could ask while it reordered siblings only. A drag can now
+ * also nest, and the two questions have one answer each: the `drop-*` hint on
+ * the hovered row. A list that also slid rows around would be a second,
+ * sometimes contradicting, story about the same gesture — it cannot show
+ * "becomes a child of this row" at all.
+ */
+const noDisplacement: SortingStrategy = () => null
+
+/** The pointer's current Y, reconstructed from where the drag started plus
+ *  how far it has moved — dnd-kit hands the move/end events a delta, not a
+ *  position, and both mouse and touch starts have to work. `null` when the
+ *  activator was neither (a synthetic event in a test, say). */
+function pointerY(activatorEvent: Event, deltaY: number): number | null {
+  if ('touches' in activatorEvent) {
+    const touch = (activatorEvent as TouchEvent).touches[0]
+    return touch ? touch.clientY + deltaY : null
+  }
+  const mouse = activatorEvent as MouseEvent
+  return typeof mouse.clientY === 'number' ? mouse.clientY + deltaY : null
+}
+
+/** Where in the hovered row the drop is landing (task 669). Falls back to the
+ *  dragged row's own centre when the pointer can't be reconstructed, so a drop
+ *  always resolves to *some* zone rather than silently doing nothing. */
+function zoneFor(event: DragMoveEvent | DragEndEvent, over: ClientRect): DropZone {
+  const y =
+    pointerY(event.activatorEvent, event.delta.y) ??
+    (event.active.rect.current.translated
+      ? event.active.rect.current.translated.top +
+        event.active.rect.current.translated.height / 2
+      : null)
+  if (y === null) return 'into'
+  return zoneForOffset(y - over.top, over.height)
+}
+
+/**
  * One draggable project row in the active list (mesa task 666).
  *
  * The drag listeners go on the `<li>`, not on a separate grip, so the whole
  * row is the handle — the same shape as a board card, and the reason the
  * sensors below carry activation thresholds: a plain click has to reach the
  * `<a>` inside and navigate.
+ *
+ * `hint` is the live drop feedback (task 669): an insertion line above or
+ * below the row for a sibling drop, the row itself outlined for a nest-into.
+ * It is only ever set on a drop that would actually write, so "nothing lights
+ * up" is the readout for an impossible or no-op drop.
  */
 function SortableProject({
   id,
   depth,
+  hint,
   children,
 }: {
   id: number
   depth: number
+  hint: DropZone | null
   children: ReactNode
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
@@ -139,7 +192,9 @@ function SortableProject({
           '--nav-depth': depth,
         } as CSSProperties
       }
-      className={`nav-project-row${isDragging ? ' dragging' : ''}`}
+      className={`nav-project-row${isDragging ? ' dragging' : ''}${
+        hint ? ` drop-${hint}` : ''
+      }`}
       {...listeners}
       {...attributes}
       // Same reasoning as the board's cards: dnd-kit's `attributes` add
@@ -301,20 +356,62 @@ export function Sidebar({
     useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
   )
 
-  // One drag = one PATCH of the dragged project's `sort_order`; the rows it
-  // moved past keep the values they had. `projects` is already in server
-  // order (`ORDER BY sort_order, id`), which is what `sortOrderForDrop`
-  // expects, and a null result means the drop was a no-op — no request.
-  function handleDragEnd(event: DragEndEvent) {
+  // The pointer has to land on a ROW for the zone math to mean anything, so
+  // resolve the collision by pointer position first; `closestCenter` only
+  // catches the pointer straying into a gap between rows.
+  const collisionDetection: CollisionDetection = (args) => {
+    const under = pointerWithin(args)
+    return under.length > 0 ? under : closestCenter(args)
+  }
+
+  // The drop the pointer is currently over, already validated: `null` when
+  // the drop would write nothing (onto itself, into its own descendant, or
+  // back where it started), which is also what suppresses the hint.
+  function resolveDrop(
+    event: DragMoveEvent | DragEndEvent,
+  ): { id: number; overId: number; zone: DropZone; intent: DropIntent } | null {
     const { active, over } = event
-    if (!over || !projects) return
+    if (!over || !projects) return null
     const id = Number(active.id)
-    // `sortOrderForDrop` scopes itself to the dragged row's own siblings
-    // (task 668) and answers null for a drop under a different parent, so the
-    // whole visible list is the right thing to hand it.
-    const sortOrder = sortOrderForDrop(projects, id, Number(over.id))
-    if (sortOrder === null) return
-    updateProject(id, { sort_order: sortOrder }).then(
+    const overId = Number(over.id)
+    const zone = zoneFor(event, over.rect)
+    // `projects` is already in server order (`ORDER BY sort_order, id`), which
+    // is what `dropIntentFor` expects; all the drop math and the cycle check
+    // live there, where vitest can reach them (task 669).
+    const intent = dropIntentFor(projects, id, overId, zone)
+    return intent === null ? null : { id, overId, zone, intent }
+  }
+
+  // Live feedback while dragging: which row, and which of its three bands.
+  const [dropHint, setDropHint] = useState<{ id: number; zone: DropZone } | null>(null)
+
+  function handleDragMove(event: DragMoveEvent) {
+    const drop = resolveDrop(event)
+    setDropHint((h) => {
+      if (!drop) return h === null ? h : null
+      return h?.id === drop.overId && h.zone === drop.zone ? h : { id: drop.overId, zone: drop.zone }
+    })
+  }
+
+  // One drag = one PATCH carrying `parent_id` and `sort_order` together; no
+  // other row is renumbered, and a null resolution means no request at all.
+  function handleDragEnd(event: DragEndEvent) {
+    setDropHint(null)
+    const drop = resolveDrop(event)
+    if (!drop) return
+    // Nesting into a collapsed subtree would otherwise drop the row somewhere
+    // invisible, so reveal the target before the list comes back.
+    if (drop.zone === 'into') {
+      setCollapsedIds((c) => {
+        const next = expandAncestors(c, [drop.overId])
+        if (next !== c) saveCollapsed(next)
+        return next
+      })
+    }
+    updateProject(drop.id, {
+      parent_id: drop.intent.parent_id,
+      sort_order: drop.intent.sort_order,
+    }).then(
       () => {
         setReorderError(null)
         refetch()
@@ -503,10 +600,16 @@ export function Sidebar({
               // the archived group below renders in the same order but is
               // deliberately not sortable, so a drag can never carry a row
               // across the archive boundary and quietly mean "unarchive".
-              <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+              <DndContext
+                sensors={sensors}
+                collisionDetection={collisionDetection}
+                onDragMove={handleDragMove}
+                onDragEnd={handleDragEnd}
+                onDragCancel={() => setDropHint(null)}
+              >
                 <SortableContext
                   items={rows.map((r) => r.project.id)}
-                  strategy={verticalListSortingStrategy}
+                  strategy={noDisplacement}
                 >
                   <ul className="nav-projects">
                     {rows.map(({ project: p, depth }) => {
@@ -515,7 +618,12 @@ export function Sidebar({
                       const collapsed = collapsedIds.has(p.id)
                       const todo = todoCountFor(projects, todoCounts, p.id, collapsed)
                       return (
-                        <SortableProject key={p.id} id={p.id} depth={depth}>
+                        <SortableProject
+                          key={p.id}
+                          id={p.id}
+                          depth={depth}
+                          hint={dropHint?.id === p.id ? dropHint.zone : null}
+                        >
                           {hasChildren(projects, p.id) ? (
                             <button
                               type="button"

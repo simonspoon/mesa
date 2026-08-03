@@ -313,6 +313,55 @@ button.nav-subtree-caret:hover:not(:disabled) {
   cursor: grabbing;
 }
 
+/* Live drop feedback (mesa task 669). One drag now expresses two operations,
+   so the two outcomes must be distinguishable BEFORE the release: an
+   insertion line at the row's edge means "sibling of this row, before/after
+   it"; the row itself lit means "nest inside it". Only a drop that would
+   actually write gets a hint, so no feedback at all is the readout for an
+   impossible (cycle) or no-op drop. */
+/* The hinted row paints ABOVE the row being dragged: the dragged one follows
+   the pointer and therefore sits right on top of its own target, which would
+   otherwise swallow the very feedback the drop depends on. */
+.nav-project-row.drop-before,
+.nav-project-row.drop-after,
+.nav-project-row.drop-into {
+  position: relative;
+  z-index: 1;
+}
+
+.nav-project-row.dragging {
+  position: relative;
+  z-index: 0;
+}
+
+.nav-project-row.drop-before::after,
+.nav-project-row.drop-after::after {
+  content: '';
+  position: absolute;
+  /* Starts at the row's own indent, so the line shows which LEVEL the row
+     would land at, not merely where in the list. */
+  left: calc(var(--nav-depth, 0) * 0.75rem);
+  right: 0;
+  height: 2px;
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-dim);
+  pointer-events: none;
+}
+
+.nav-project-row.drop-before::after {
+  top: -1px;
+}
+
+.nav-project-row.drop-after::after {
+  bottom: -1px;
+}
+
+.nav-project-row.drop-into {
+  outline: 1px solid var(--magenta);
+  outline-offset: -1px;
+  background: rgba(255, 43, 214, 0.12);
+}
+
 /* Git status under the project name: quiet telemetry, not a call to action. */
 .nav-git {
   flex-basis: 100%;

@@ -11,6 +11,7 @@ function project(id: number, local_path: string | null): Project {
     root_commit: null,
     local_path,
     archived: false,
+    sort_order: id,
   }
 }
 

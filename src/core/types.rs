@@ -103,6 +103,15 @@ pub struct Project {
     /// renumbering the list, so one drag is one write. Backfilled from `id`,
     /// so an un-dragged install is still in creation order.
     pub sort_order: f64,
+    /// Parent project (task 668), or `null` at top level. A pure **grouping**
+    /// relation: the left nav renders the result as a tree, and nothing rolls
+    /// up — a child keeps its own tasks, storyboards, `root_commit` and
+    /// `local_path`. Arbitrary depth; `Store` rejects self-parenting and any
+    /// cycle. The one place it changes behaviour beyond display is visibility:
+    /// an unscoped read hides a project iff it is archived **or any ancestor
+    /// is** (`docs/archiving.md`).
+    #[ts(type = "number | null")]
+    pub parent_id: Option<i64>,
 }
 
 /// One live Claude Code session as reported by `claude agents --json`.

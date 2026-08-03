@@ -1036,6 +1036,11 @@ struct ProjectCreate {
     /// where the project lives, the API only records it.
     #[serde(default)]
     local_path: Option<String>,
+    /// Optional parent project (task 668); absent or `null` = top level.
+    /// A missing parent is a 422 `validation`, self-parenting/a loop a 409
+    /// `cycle` — no new error codes.
+    #[serde(default)]
+    parent_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1054,6 +1059,11 @@ struct ProjectUpdate {
     /// from serde rather than a silent no-op.
     #[serde(default)]
     sort_order: Option<f64>,
+    /// Parent project (task 668). A double option, like the other clearable
+    /// bindings above: absent leaves it alone, an explicit `null` detaches the
+    /// project to top level.
+    #[serde(default, deserialize_with = "double_option")]
+    parent_id: Option<Option<i64>>,
 }
 
 #[derive(Deserialize)]
@@ -1100,6 +1110,7 @@ async fn create_project(
         body.description.as_deref(),
         body.root_commit.as_deref(),
         body.local_path.as_deref(),
+        body.parent_id,
     )?;
     Ok((StatusCode::CREATED, Json(project)).into_response())
 }
@@ -1139,6 +1150,7 @@ async fn update_project(
         root_commit: body.root_commit,
         local_path: body.local_path,
         sort_order: body.sort_order,
+        parent_id: body.parent_id,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_project(id, &patch)?).into_response())
@@ -1146,8 +1158,15 @@ async fn update_project(
 
 async fn delete_project(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
-    let (project, tasks) = store.delete_project(id)?;
-    Ok(Json(json!({"project": project, "tasks": tasks})).into_response())
+    // The echo carries the whole destroyed subtree (task 668): `subprojects`
+    // is the descendant projects the FK cascade took with this one, `[]` for a
+    // leaf. It is the recovery transcript, so nothing destroyed may be absent
+    // from it.
+    let (project, subprojects, tasks) = store.delete_project(id)?;
+    Ok(
+        Json(json!({"project": project, "subprojects": subprojects, "tasks": tasks}))
+            .into_response(),
+    )
 }
 
 async fn archive_project(
@@ -3916,7 +3935,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .create_project("proj", None, None, local_path)
+            .create_project("proj", None, None, local_path, None)
             .unwrap()
             .id
     }

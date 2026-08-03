@@ -93,8 +93,9 @@ The code is the source of truth. These are the invariants you must not break:
 - **Frontend unit tests cover the pure logic modules, not components.** vitest
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
-  (`agentProject`, `boardView`, `keyboardScope`, `layout`, `navOrder`,
-  `navWidth`, `sessionGraph`, `settingsDraft`, `syntaxHighlighter`, `time`) — predicates that historically
+  (`agentProject`, `boardView`, `keyboardScope`, `layout`, `navCollapse`,
+  `navOrder`, `navWidth`, `projectTree`, `sessionGraph`, `settingsDraft`,
+  `syntaxHighlighter`, `time`) — predicates that historically
   shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
   in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).
@@ -147,7 +148,8 @@ The code is the source of truth. These are the invariants you must not break:
   `unavailable`, scoped to surfaces depending on something outside mesa — the
   live `cc usage` endpoint and the agents endpoints.
 - **Every CLI project argument takes an id or a name** (task/storyboard
-  create+list, task next, inbox list/assign): a non-numeric value resolves via
+  create+list, task next, inbox list/assign, `project update` and its
+  `--parent`): a non-numeric value resolves via
   `Store::find_project_by_name` — case-insensitive exact match; unknown name is
   `not_found` with a hint, duplicated name is `conflict` listing candidate ids.
 - **Create subcommands take required args positionally or as flags** —
@@ -216,9 +218,23 @@ The code is the source of truth. These are the invariants you must not break:
   anchor. Anchors the Agents surface; the UI sidebar decorates each project with
   its git status (`GET /api/git-status`, 5s cache, omits projects with no live
   repo).
-- A project may be **`archived`** — `docs/archiving.md`. One rule: archiving
-  hides a project (and its tasks/storyboards) from **unscoped** reads only;
-  every read scoped to an explicit project id/name is byte-identical to before.
+- A project may name another project as its **`parent_id`** (task 668) — a
+  pure *grouping* relation, arbitrary depth, `NULL` = top level. Nothing rolls
+  up: a child keeps its own tasks, storyboards, `root_commit` and `local_path`,
+  and nothing of its appears on the parent's board. `Store` rejects
+  self-parenting and any cycle (`cycle`) and an unknown parent (`validation`),
+  mirroring a task's parent. `list_projects` still returns **one flat array**
+  in `sort_order` — the tree is assembled client-side (`projectTree.ts`), so
+  order stays server-side and a drag still reorders **within siblings only**.
+  The FK is `ON DELETE CASCADE`: deleting a project destroys its whole subtree,
+  and the delete echo grows a `subprojects` key so the recovery transcript
+  still carries every destroyed row.
+- A project may be **`archived`** — `docs/archiving.md`. Two rules: a project
+  is hidden from **unscoped** reads iff it is archived **or any ancestor is**
+  (derived on every read by one shared recursive-CTE predicate, never stored on
+  the descendants' rows — archiving a parent writes only the parent); and every
+  read scoped to an explicit project id/name is byte-identical to before,
+  including a live child of an archived parent.
 - A project carries a **`sort_order`** (REAL, NOT NULL) — the project-level
   twin of `Task::sort_order`, and the single source of list order:
   `Store::list_projects` is `ORDER BY sort_order, id`, so `mesa project list`,

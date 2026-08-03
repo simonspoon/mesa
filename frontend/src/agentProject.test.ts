@@ -12,6 +12,7 @@ function project(id: number, local_path: string | null): Project {
     local_path,
     archived: false,
     sort_order: id,
+    parent_id: null,
   }
 }
 

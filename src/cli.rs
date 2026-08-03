@@ -197,6 +197,10 @@ instead of detecting it.")]
         /// none otherwise.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Nest the new project under this parent project (id or name);
+        /// omit for a top-level project
+        #[arg(long, value_name = "ID|NAME")]
+        parent: Option<String>,
         /// Print the project without its `description` instead of in full
         #[arg(long)]
         quiet: bool,
@@ -238,8 +242,9 @@ EXAMPLES
     /// `--description ""` clears the description.
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
-        /// Project id
-        id: i64,
+        /// Project id or name
+        #[arg(value_name = "ID|NAME")]
+        project: String,
         /// New project name
         #[arg(long, group = "fields")]
         name: Option<String>,
@@ -258,6 +263,10 @@ EXAMPLES
         /// renumbering anything else (the sidebar's drag writes exactly this)
         #[arg(long, group = "fields")]
         sort_order: Option<f64>,
+        /// Nest this project under a parent project (id or name); pass "" to
+        /// move it back to the top level
+        #[arg(long, group = "fields", value_name = "ID|NAME")]
+        parent: Option<String>,
         /// Print the project without its `description` instead of in full
         ///
         /// Deliberately outside the `fields` group: it is a modifier, so
@@ -1489,21 +1498,35 @@ fn print_project(project: &Project, is_quiet: bool) {
     print_record(project, is_quiet, QUIET_DROP_PROJECT);
 }
 
-/// Print the `{project, tasks}` echo of `project delete`.
+/// Print the `{project, subprojects, tasks}` echo of `project delete`.
+///
+/// `subprojects` is the destroyed subtree (task 668) — the descendant projects
+/// the cascade took with this one, `[]` for a leaf — so the echo still carries
+/// every destroyed row, which is what makes it the recovery transcript that
+/// stands in for a confirmation prompt.
 ///
 /// Under `--quiet` the container KEY SET is unchanged — only the members are
-/// projected: the project loses `description`, and each cascaded task becomes
+/// projected: each project loses `description`, and each cascaded task becomes
 /// the existing [`compact`] shape. (Member and container key ORDER is
 /// alphabetical under `--quiet`, as for any `serde_json::Value`; the default,
 /// non-quiet output is untouched.)
-fn print_project_delete(project: &Project, tasks: &[Task], is_quiet: bool) {
+fn print_project_delete(
+    project: &Project,
+    subprojects: &[Project],
+    tasks: &[Task],
+    is_quiet: bool,
+) {
     if is_quiet {
         print_json(&json!({
             "project": quiet(project, QUIET_DROP_PROJECT),
+            "subprojects": subprojects
+                .iter()
+                .map(|p| quiet(p, QUIET_DROP_PROJECT))
+                .collect::<Vec<_>>(),
             "tasks": tasks.iter().map(compact).collect::<Vec<_>>(),
         }));
     } else {
-        print_json(&json!({"project": project, "tasks": tasks}));
+        print_json(&json!({"project": project, "subprojects": subprojects, "tasks": tasks}));
     }
 }
 
@@ -1633,6 +1656,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             root_commit,
             no_git,
             path,
+            parent,
             quiet,
         } => {
             // An explicit --root-commit or --no-git says "I am describing
@@ -1655,12 +1679,17 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 Some(dir) => Some(canonical_dir(dir)?),
                 None => auto_detect.then(|| git_toplevel(None)).flatten(),
             };
+            // --parent takes an id or a name, like every other project
+            // argument; an unknown name is `not_found`, a duplicated one
+            // `conflict`, both from the shared resolver.
+            let parent_id = resolve_project_opt(&store, parent.as_deref())?;
             print_project(
                 &store.create_project(
                     &name,
                     description.as_deref(),
                     root_commit.as_deref(),
                     local_path.as_deref(),
+                    parent_id,
                 )?,
                 quiet,
             );
@@ -1706,18 +1735,28 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
         }
         ProjectCmd::Show { id, quiet } => print_project(&store.get_project(id)?, quiet),
         ProjectCmd::Update {
-            id,
+            project,
             name,
             description,
             root_commit,
             path,
             sort_order,
+            parent,
             quiet,
         } => {
+            let id = resolve_project(&store, &project)?;
             let local_path = match path {
                 None => None,
                 Some(p) if p.is_empty() => Some(None),
                 Some(p) => Some(Some(canonical_dir(Path::new(&p))?)),
+            };
+            // `--parent ""` detaches to top level, the same "empty clears it"
+            // shape as `--path ""` / `--root-commit ""`; any other value is an
+            // id or a name to resolve.
+            let parent_id = match parent.as_deref() {
+                None => None,
+                Some("") => Some(None),
+                Some(p) => Some(Some(resolve_project(&store, p)?)),
             };
             let patch = ProjectPatch {
                 name,
@@ -1725,12 +1764,13 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 root_commit: root_commit.map(clear_if_empty),
                 local_path,
                 sort_order,
+                parent_id,
             };
             print_project(&store.update_project(id, &patch)?, quiet);
         }
         ProjectCmd::Delete { id, quiet } => {
-            let (project, tasks) = store.delete_project(id)?;
-            print_project_delete(&project, &tasks, quiet);
+            let (project, subprojects, tasks) = store.delete_project(id)?;
+            print_project_delete(&project, &subprojects, &tasks, quiet);
         }
         ProjectCmd::Archive { project, quiet } => {
             let id = resolve_project(&store, &project)?;
@@ -2335,6 +2375,7 @@ mod tests {
             local_path: Some("/tmp/p".into()),
             archived: false,
             sort_order: 3.5,
+            parent_id: Some(7),
         }
     }
 
@@ -2480,6 +2521,10 @@ mod tests {
                 "local_path",
                 "archived",
                 "sort_order",
+                // Task 668. Kept in the quiet shape: a parent id is a bounded
+                // pointer, and it is what makes a quiet project row placeable
+                // in the tree at all.
+                "parent_id",
             ]),
             "Project gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

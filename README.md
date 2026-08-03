@@ -289,6 +289,20 @@ agent drives from the CLI.
 
 ## Projects & git repos
 
+Projects nest: a project may name another as its **parent**, and the web UI's
+left nav renders the result as a collapsible tree.
+
+```bash
+mesa project create "API v2" --parent "Platform"   # id or name
+mesa project update "API v2" --parent ""           # back to top level
+```
+
+Nesting is grouping only — a child keeps its own tasks, storyboards, repo
+binding and board; nothing rolls up onto the parent. What it *does* change is
+two whole-tree behaviours: archiving a project hides its descendants from
+unscoped reads too (their own `archived` flag is untouched), and deleting one
+destroys its whole subtree, echoing every destroyed project and task.
+
 `project create` auto-binds the current directory's repo (or `--path <dir>`'s)
 to the new project via its root-commit hash; a commit binds to at most one
 project. Later, from any clone or worktree of that source:

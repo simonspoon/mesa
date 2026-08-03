@@ -3,10 +3,12 @@ import {
   archiveProject,
   getProject,
   listAllAgents,
+  listProjects,
   listTasks,
   unarchiveProject,
   updateProject,
 } from '../api'
+import { descendantIds } from '../projectTree'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskModal } from '../components/TaskModal'
@@ -131,6 +133,14 @@ export function ProjectTasksPage({
     // dropped in useFetch, so an unchanged view never re-renders.
     { pollMs: 3000 },
   )
+  // Every project, for the parent picker below (task 668). Archived ones
+  // included: nesting under an archived project is legal (it just inherits
+  // being hidden), and omitting them would silently drop the CURRENT parent
+  // out of the list the picker renders.
+  const { data: allProjects, refetch: refetchAllProjects } = useFetch(
+    () => listProjects(true),
+    'projects-picker',
+  )
   // Live-agent markers on the cards (mesa task 663). Purely decorative: the
   // same `listAllAgents()` feed and 3s interval the Agents sidebar polls, so
   // it rides the server's existing 2s cache rather than adding `claude agents
@@ -162,6 +172,10 @@ export function ProjectTasksPage({
   // already in (task 509).
   const [archiving, setArchiving] = useState(false)
   const [archiveError, setArchiveError] = useState<string | null>(null)
+  // Reparenting (task 668) — its own in-flight/error pair, since it sits in
+  // the same footer row as archive but is an ordinary, non-retiring edit.
+  const [reparenting, setReparenting] = useState(false)
+  const [parentError, setParentError] = useState<string | null>(null)
 
   if (error) return <p className="error">{error}</p>
 
@@ -404,6 +418,52 @@ export function ProjectTasksPage({
             on `archived`, and offering "archive project" for a moment on a
             project that is already archived is the very confusion task 509
             reports. */}
+        {/* Parent project (task 668): the UI half of a field that would
+            otherwise be CLI-only. Eligible parents exclude this project and
+            everything under it — `Store` would answer a cycle with a 409, but
+            an option that can only fail is not a choice worth offering. */}
+        {project && allProjects && (
+          <p className="project-parent">
+            <label>
+              parent project{' '}
+              <select
+                value={project.parent_id ?? ''}
+                disabled={reparenting}
+                onChange={(e) => {
+                  const value = e.target.value === '' ? null : Number(e.target.value)
+                  setReparenting(true)
+                  setParentError(null)
+                  updateProject(projectId, { parent_id: value })
+                    .then(() => {
+                      setReparenting(false)
+                      refetchProject()
+                      refetchAllProjects()
+                      // The nav is a tree of this field; it has to redraw.
+                      onProjectsChanged()
+                    })
+                    .catch((err: unknown) => {
+                      setReparenting(false)
+                      setParentError(err instanceof Error ? err.message : String(err))
+                    })
+                }}
+              >
+                <option value="">— top level —</option>
+                {allProjects
+                  .filter(
+                    (p) =>
+                      p.id !== projectId &&
+                      !descendantIds(allProjects, projectId).includes(p.id),
+                  )
+                  .map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+            {parentError && <span className="error">{parentError}</span>}
+          </p>
+        )}
         {project && (
           <p className="project-danger">
             {project.archived ? (

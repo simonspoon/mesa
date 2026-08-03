@@ -674,8 +674,8 @@ PJQ=$(jqs .id)
 # moves between the two calls (Project carries no timestamp at all).
 run 0 "$MESA" project show "$PJQ"
 printf '%s' "$STDOUT" >"$TMP/pfull.json"
-# non-quiet output is unchanged: the full 7-key project object
-[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,root_commit,sort_order" ] ||
+# non-quiet output is unchanged: the full 8-key project object
+[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,parent_id,root_commit,sort_order" ] ||
   fail "project show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("description")')" = "true" ] || fail "project show (no --quiet): description present"
 run 0 "$MESA" project show "$PJQ" --quiet
@@ -886,6 +886,103 @@ ok "inbox error path: exit 1 and byte-identical stderr with and without --quiet"
 
 run 0 "$MESA" inbox delete "$IQ"
 run 0 "$MESA" project delete "$PIQ"
+
+# ---- subprojects: parent_id, archive cascade, subtree delete (task 668) ----
+run 0 "$MESA" project create "Parent" --no-git
+SP=$(jqs .id)
+[ "$(jqs .parent_id)" = "null" ] || fail "project create: default parent_id must be null"
+
+# --parent takes an id...
+run 0 "$MESA" project create "Child" --no-git --parent "$SP"
+SC=$(jqs .id)
+[ "$(jqs .parent_id)" = "$SP" ] || fail "project create --parent <id>: parent_id"
+# ...or a name.
+run 0 "$MESA" project create "Grandchild" --no-git --parent "Child"
+SG=$(jqs .id)
+[ "$(jqs .parent_id)" = "$SC" ] || fail "project create --parent <name>: parent_id"
+ok "project create --parent: accepts an id or a name, nests 3 deep"
+
+# `list` carries parent_id, and the array stays flat and in sort_order.
+run 0 "$MESA" project list
+[ "$(jqs 'map(select(.id == '"$SG"')) | .[0].parent_id')" = "$SC" ] ||
+  fail "project list: rows must carry parent_id"
+[ "$(jqs 'map(select(.id == '"$SP"' or .id == '"$SC"' or .id == '"$SG"')) | map(.id) | join(",")')" = "$SP,$SC,$SG" ] ||
+  fail "project list: a new child must sort last among its siblings"
+ok "project list: flat array carrying parent_id, child sorts last"
+
+# reparent by name, then detach with the empty string
+run 0 "$MESA" project update "$SG" --parent "Parent"
+[ "$(jqs .parent_id)" = "$SP" ] || fail "project update --parent: reparent"
+run 0 "$MESA" project update "Grandchild" --parent ""
+[ "$(jqs .parent_id)" = "null" ] || fail 'project update --parent "": must detach'
+run 0 "$MESA" project update "$SG" --parent "$SC"
+ok "project update --parent: reparents by name and detaches on \"\""
+
+# cycles are `cycle` (exit 1), an unknown parent `validation`, an ambiguous or
+# missing name resolves through the shared project resolver.
+run 1 "$MESA" project update "$SP" --parent "$SP"
+[ "$(jqe .error.code)" = "cycle" ] || fail "self-parent: error.code must be cycle"
+run 1 "$MESA" project update "$SP" --parent "$SG"
+[ "$(jqe .error.code)" = "cycle" ] || fail "deep cycle: error.code must be cycle"
+run 1 "$MESA" project update "$SP" --parent 999999
+[ "$(jqe .error.code)" = "validation" ] || fail "unknown parent id: error.code"
+run 1 "$MESA" project create "Orphan" --no-git --parent "no such project"
+[ "$(jqe .error.code)" = "not_found" ] || fail "unknown parent name: error.code"
+ok "project --parent: cycle/validation/not_found, exit 1"
+
+# `parent_id` is bounded, so --quiet keeps it (only free text is dropped).
+run 0 "$MESA" project show "$SC" --quiet
+[ "$(jqs .parent_id)" = "$SP" ] || fail "project show --quiet: must keep parent_id"
+[ "$(jqs 'has("description")')" = "false" ] || fail "project show --quiet: description dropped"
+ok "project --quiet: keeps parent_id, drops description"
+
+# archiving the parent hides the WHOLE subtree from unscoped reads...
+run 0 "$MESA" task create "$SG" "grandchild work"
+SGT=$(jqs .id)
+run 0 "$MESA" project archive "$SP"
+run 0 "$MESA" project list
+[ "$(jqs "any(.[]; .id == $SC or .id == $SG)")" = "false" ] ||
+  fail "archive cascade: descendants must vanish from project list"
+run 0 "$MESA" task list
+[ "$(jqs "any(.[]; .id == $SGT)")" = "false" ] ||
+  fail "archive cascade: a descendant's tasks must vanish from unscoped task list"
+# ...without writing a single descendant row...
+run 0 "$MESA" project show "$SG"
+[ "$(jqs .archived)" = "false" ] ||
+  fail "archive cascade: a descendant's own archived flag must stay false"
+# ...and every scoped read is unaffected.
+run 0 "$MESA" task list --project "$SG"
+[ "$(jqs 'length')" = "1" ] || fail "archive cascade: scoped read must be unaffected"
+run 0 "$MESA" project list --include-archived
+[ "$(jqs "any(.[]; .id == $SG)")" = "true" ] ||
+  fail "archive cascade: --include-archived must still return everything"
+run 0 "$MESA" project unarchive "$SP"
+run 0 "$MESA" project list
+[ "$(jqs "any(.[]; .id == $SG)")" = "true" ] ||
+  fail "unarchive: one call must restore the subtree"
+ok "archive cascades to descendants for unscoped reads only, no per-child write"
+
+# deleting the parent destroys the subtree, and the echo carries every row
+run 0 "$MESA" project delete "$SP"
+[ "$(jqs .project.id)" = "$SP" ] || fail "subtree delete: root echoed"
+[ "$(jqs '.subprojects | map(.id) | join(",")')" = "$SC,$SG" ] ||
+  fail "subtree delete: subprojects echoed depth-first"
+[ "$(jqs "any(.tasks[]; .id == $SGT)")" = "true" ] ||
+  fail "subtree delete: a descendant's tasks must be echoed"
+run 1 "$MESA" project show "$SG"
+[ "$(jqe .error.code)" = "not_found" ] || fail "subtree delete: descendant must be gone"
+ok "project delete: cascades the subtree and echoes every destroyed row"
+
+# a leaf delete is unchanged apart from an empty `subprojects`
+run 0 "$MESA" project create "Leaf" --no-git
+SL=$(jqs .id)
+run 0 "$MESA" project delete "$SL" --quiet
+[ "$(jqs '.subprojects | length')" = "0" ] || fail "leaf delete: subprojects must be []"
+[ "$(jqs 'has("project") and has("subprojects") and has("tasks")')" = "true" ] ||
+  fail "delete --quiet: composite key structure must be unchanged"
+[ "$(jqs '.project | has("description")')" = "false" ] ||
+  fail "delete --quiet: members must be compacted"
+ok "project delete --quiet: same keys, compacted members, empty subprojects on a leaf"
 
 # ---- delete ----
 run 0 "$MESA" task delete "$T3"

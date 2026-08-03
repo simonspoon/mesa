@@ -359,6 +359,18 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE projects ADD COLUMN sort_order REAL NOT NULL DEFAULT 0;
     UPDATE projects SET sort_order = id;
     ",
+    // Task 668: a project may name another project as its parent — a pure
+    // grouping relation (the nav renders a tree), never a roll-up: a child
+    // keeps its own tasks, storyboards, `root_commit` and `local_path`.
+    // NULL = top level, which is what every existing row upgrades to.
+    //
+    // `ON DELETE CASCADE` is what makes deleting a project destroy its whole
+    // subtree, and it is the DB's job rather than a recursive Rust delete
+    // because FK enforcement is already on (`PRAGMA foreign_keys` in
+    // `Store::open`) — the same division of labour tasks/storyboards already
+    // rely on. Cycle rejection is *not* the schema's job: like a task's
+    // parent, it is validated in `Store` (see `check_project_parent`).
+    "ALTER TABLE projects ADD COLUMN parent_id INTEGER REFERENCES projects(id) ON DELETE CASCADE;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -424,7 +436,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
 }
 
 const PROJECT_COLUMNS: &str =
-    "id, name, description, root_commit, local_path, archived, sort_order";
+    "id, name, description, root_commit, local_path, archived, sort_order, parent_id";
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -435,8 +447,30 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         local_path: row.get(4)?,
         archived: row.get(5)?,
         sort_order: row.get(6)?,
+        parent_id: row.get(7)?,
     })
 }
+
+/// The set of projects hidden from **unscoped** reads (task 668): a project is
+/// hidden iff it is archived **or any ancestor is**. The `archived` flag stays
+/// strictly per-row — archiving a parent never writes its children — so
+/// effective visibility is derived on every read, exactly as `blocked` is.
+///
+/// Prefix for a query that then filters on [`NOT_HIDDEN_PROJECT`]; defined
+/// once and shared by every unscoped site (`list_projects`, `list_tasks`,
+/// `next_task`, `list_refine_tasks`, `list_storyboards`) so they cannot drift
+/// apart on what "archived" means. `UNION` (not `UNION ALL`) so a malformed
+/// parent cycle terminates instead of recursing forever — the same guard
+/// `next_subtask` uses on the task tree.
+const HIDDEN_PROJECTS_CTE: &str = "WITH RECURSIVE hidden_projects(id) AS ( \
+     SELECT id FROM projects WHERE archived = 1 \
+     UNION \
+     SELECT c.id FROM projects c JOIN hidden_projects h ON c.parent_id = h.id \
+ ) ";
+
+/// The predicate half of [`HIDDEN_PROJECTS_CTE`]. Expects the `projects` table
+/// aliased as `p`, which every unscoped query here already does.
+const NOT_HIDDEN_PROJECT: &str = "p.id NOT IN (SELECT id FROM hidden_projects)";
 
 const STORYBOARD_COLUMNS: &str =
     "id, project_id, title, description, author, diagram_type, created_at, updated_at";
@@ -667,6 +701,11 @@ pub struct ProjectPatch {
     /// computes the fractional value from the drop position, `Store` just
     /// persists it. Same division of labour as `TaskPatch::sort_order`.
     pub sort_order: Option<f64>,
+    /// `Some(None)` detaches the project to top level (task 668) — the same
+    /// double-Option shape `TaskPatch::parent_id` uses. Reparenting touches
+    /// nothing else: `sort_order`, `archived`, `root_commit` and `local_path`
+    /// are unchanged by it.
+    pub parent_id: Option<Option<i64>>,
 }
 
 /// Fields to change on a task; `None` means leave unchanged.
@@ -1002,9 +1041,15 @@ impl Store {
         description: Option<&str>,
         root_commit: Option<&str>,
         local_path: Option<&str>,
+        parent_id: Option<i64>,
     ) -> Result<Project> {
         if let Some(hash) = root_commit {
             self.ensure_commit_free(hash, None)?;
+        }
+        // A brand-new project has no id yet, so it cannot be part of a cycle;
+        // the parent only has to exist.
+        if let Some(parent) = parent_id {
+            self.check_project_parent(parent, None)?;
         }
         // Sort last, by the same next-value rule `create_task` uses: one past
         // the current maximum rather than a count or a rowid, so a new project
@@ -1017,9 +1062,16 @@ impl Store {
         )?;
         self.conn
             .execute(
-                "INSERT INTO projects (name, description, root_commit, local_path, sort_order) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                (name, description, root_commit, local_path, next_sort_order),
+                "INSERT INTO projects (name, description, root_commit, local_path, sort_order, \
+                 parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    name,
+                    description,
+                    root_commit,
+                    local_path,
+                    next_sort_order,
+                    parent_id,
+                ),
             )
             .map_err(|e| match root_commit {
                 Some(hash) => Self::map_commit_conflict(e, hash),
@@ -1043,22 +1095,29 @@ impl Store {
             })
     }
 
+    /// Every project visible to an unscoped read: neither archived nor
+    /// descended from an archived project (task 668).
+    ///
+    /// One FLAT array, in `sort_order` order — the tree is assembled by the
+    /// caller from `parent_id`, so `mesa project list`, `GET /api/projects`
+    /// and the left nav still cannot disagree about sibling order.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        self.list_projects_where("WHERE archived = 0")
+        self.list_projects_where(&format!("WHERE {NOT_HIDDEN_PROJECT}"), HIDDEN_PROJECTS_CTE)
     }
 
-    /// All projects, archived and unarchived, same order as `list_projects`.
+    /// All projects, archived (or under an archived parent) and not, same
+    /// order as `list_projects`.
     pub fn list_projects_all(&self) -> Result<Vec<Project>> {
-        self.list_projects_where("")
+        self.list_projects_where("", "")
     }
 
     /// Manual order first, id as the tiebreak (task 666): the migration
     /// backfills `sort_order = id`, so rows nobody has dragged stay in
     /// creation order, and the tiebreak keeps that stable even if two rows
     /// ever land on the same fractional value.
-    fn list_projects_where(&self, clause: &str) -> Result<Vec<Project>> {
+    fn list_projects_where(&self, clause: &str, cte: &str) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {PROJECT_COLUMNS} FROM projects {clause} ORDER BY sort_order, id"
+            "{cte}SELECT {PROJECT_COLUMNS} FROM projects p {clause} ORDER BY sort_order, id"
         ))?;
         let rows = stmt.query_map([], row_to_project)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1158,16 +1217,23 @@ impl Store {
         if let Some(sort_order) = patch.sort_order {
             project.sort_order = sort_order;
         }
+        if let Some(parent_id) = patch.parent_id {
+            if let Some(parent) = parent_id {
+                self.check_project_parent(parent, Some(id))?;
+            }
+            project.parent_id = parent_id;
+        }
         self.conn
             .execute(
                 "UPDATE projects SET name = ?1, description = ?2, root_commit = ?3, \
-                 local_path = ?4, sort_order = ?5 WHERE id = ?6",
+                 local_path = ?4, sort_order = ?5, parent_id = ?6 WHERE id = ?7",
                 (
                     &project.name,
                     &project.description,
                     &project.root_commit,
                     &project.local_path,
                     project.sort_order,
+                    project.parent_id,
                     id,
                 ),
             )
@@ -1196,20 +1262,91 @@ impl Store {
         self.get_project(id)
     }
 
-    /// Deletes the project and all its tasks; returns the destroyed records.
-    pub fn delete_project(&mut self, id: i64) -> Result<(Project, Vec<Task>)> {
+    /// Validates a candidate `parent` for a project: it must exist, and — when
+    /// the child already has an id (`child`, `None` on create) — the edge must
+    /// not close a cycle. Mirrors the task-parent rules, with the same split
+    /// of error kinds: a missing parent is `validation` (a bad reference),
+    /// while self-parenting or a loop is `cycle`.
+    fn check_project_parent(&self, parent: i64, child: Option<i64>) -> Result<()> {
+        if Some(parent) == child {
+            let child = child.unwrap();
+            return Err(Error::Cycle(format!(
+                "project {child} cannot be its own parent"
+            )));
+        }
+        if let Err(Error::NotFound(_)) = self.get_project(parent) {
+            return Err(Error::Validation(format!(
+                "parent project {parent} not found"
+            )));
+        }
+        if let Some(child) = child
+            && self.project_descendant_ids(child)?.contains(&parent)
+        {
+            return Err(Error::Cycle(format!(
+                "making project {parent} the parent of project {child} would create a cycle: \
+                 project {parent} is already a descendant of project {child}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Ids of every project under `id`, at any depth (the project itself is
+    /// not included). `UNION` (not `UNION ALL`) so a malformed cycle
+    /// terminates instead of recursing forever.
+    fn project_descendant_ids(&self, id: i64) -> Result<HashSet<i64>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM projects WHERE parent_id = ?1 \
+                 UNION \
+                 SELECT c.id FROM projects c JOIN sub ON c.parent_id = sub.id \
+             ) SELECT id FROM sub",
+        )?;
+        let rows = stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
+    }
+
+    /// Deletes the project, every project beneath it and all of their tasks;
+    /// returns the destroyed records: the root, its descendants (depth-first,
+    /// each level in list order) and the tasks of all of them in that same
+    /// project order.
+    ///
+    /// The subtree goes with it via the `parent_id` FK's `ON DELETE CASCADE`
+    /// (task 668) — the echo is read first, in the same transaction, because
+    /// it is the recovery transcript that stands in for the confirmation
+    /// prompt mesa deliberately does not have, and it has to carry *every*
+    /// destroyed row.
+    pub fn delete_project(&mut self, id: i64) -> Result<(Project, Vec<Project>, Vec<Task>)> {
         let project = self.get_project(id)?;
         let tx = self.conn.transaction()?;
+        let subprojects = {
+            // One read of the project table, ordered the way every other
+            // project list is, then walked depth-first — so the echo's order
+            // is the tree's shape rather than whatever order the FK cascade
+            // happens to fire in.
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {PROJECT_COLUMNS} FROM projects p ORDER BY sort_order, id"
+            ))?;
+            let all = stmt
+                .query_map([], row_to_project)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut out = Vec::new();
+            collect_subtree(&all, id, &mut HashSet::new(), &mut out);
+            out
+        };
         let tasks = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT {TASK_COLUMNS} FROM tasks t WHERE t.project_id = ?1 ORDER BY t.id"
             ))?;
-            let rows = stmt.query_map([id], row_to_task)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut tasks = Vec::new();
+            for pid in std::iter::once(id).chain(subprojects.iter().map(|p| p.id)) {
+                let rows = stmt.query_map([pid], row_to_task)?;
+                tasks.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+            }
+            tasks
         };
         tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
         tx.commit()?;
-        Ok((project, tasks))
+        Ok((project, subprojects, tasks))
     }
 
     // ---- tasks ----
@@ -1322,11 +1459,14 @@ impl Store {
 
     /// Lists tasks. Scoped to `project` if given (archived-agnostic, matching
     /// every other scoped read); when `None`, excludes tasks whose project is
-    /// archived so unscoped views don't surface an archived project's work.
+    /// hidden — archived, or under an archived ancestor (task 668) — so
+    /// unscoped views don't surface an archived project's work.
     pub fn list_tasks(&self, project: Option<i64>) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
-             WHERE (?1 IS NULL OR t.project_id = ?1) AND (?1 IS NOT NULL OR p.archived = 0) \
+            "{HIDDEN_PROJECTS_CTE}SELECT {TASK_COLUMNS} FROM tasks t \
+             JOIN projects p ON p.id = t.project_id \
+             WHERE (?1 IS NULL OR t.project_id = ?1) \
+             AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
              ORDER BY t.sort_order, t.id"
         ))?;
         let rows = stmt.query_map([project], row_to_task)?;
@@ -1693,10 +1833,11 @@ impl Store {
         let priority_rank = PRIORITY_RANK;
         let task = {
             let sql = format!(
-                "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
+                "{HIDDEN_PROJECTS_CTE}SELECT {TASK_COLUMNS} FROM tasks t \
+                 JOIN projects p ON p.id = t.project_id \
                  WHERE t.status = 'todo' AND NOT {blocked_expr} \
                  AND (?1 IS NULL OR t.project_id = ?1) \
-                 AND (?1 IS NOT NULL OR p.archived = 0) \
+                 AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
                  ORDER BY {priority_rank}, t.id LIMIT 1"
             );
             self.conn
@@ -1713,9 +1854,10 @@ impl Store {
         // No actionable task: count by status / blocked within the filter.
         let count = |predicate: &str| -> Result<i64> {
             let sql = format!(
-                "SELECT COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id \
+                "{HIDDEN_PROJECTS_CTE}SELECT COUNT(*) FROM tasks t \
+                 JOIN projects p ON p.id = t.project_id \
                  WHERE (?1 IS NULL OR t.project_id = ?1) \
-                 AND (?1 IS NOT NULL OR p.archived = 0) AND {predicate}"
+                 AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) AND {predicate}"
             );
             Ok(self.conn.query_row(&sql, [project], |r| r.get(0))?)
         };
@@ -1739,10 +1881,11 @@ impl Store {
     /// each project's list per tick.
     pub fn list_refine_tasks(&self, project: Option<i64>) -> Result<Vec<Task>> {
         let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM tasks t JOIN projects p ON p.id = t.project_id \
+            "{HIDDEN_PROJECTS_CTE}SELECT {TASK_COLUMNS} FROM tasks t \
+             JOIN projects p ON p.id = t.project_id \
              WHERE t.status = 'refine' \
              AND (?1 IS NULL OR t.project_id = ?1) \
-             AND (?1 IS NOT NULL OR p.archived = 0) \
+             AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
              ORDER BY {PRIORITY_RANK}, t.id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2062,13 +2205,14 @@ impl Store {
         // `description` collide with `projects` columns, so this query
         // aliases the table and qualifies every column explicitly instead of
         // reusing the shared constant.
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.project_id, s.title, s.description, s.author, s.diagram_type, \
-             s.created_at, s.updated_at \
+        let mut stmt = self.conn.prepare(&format!(
+            "{HIDDEN_PROJECTS_CTE}SELECT s.id, s.project_id, s.title, s.description, s.author, \
+             s.diagram_type, s.created_at, s.updated_at \
              FROM storyboards s JOIN projects p ON p.id = s.project_id \
-             WHERE (?1 IS NULL OR s.project_id = ?1) AND (?1 IS NOT NULL OR p.archived = 0) \
-             ORDER BY s.id",
-        )?;
+             WHERE (?1 IS NULL OR s.project_id = ?1) \
+             AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
+             ORDER BY s.id"
+        ))?;
         let rows = stmt.query_map([project], row_to_storyboard)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -3053,6 +3197,19 @@ impl Store {
     }
 }
 
+/// Appends every project under `parent` to `out`, depth-first, each level in
+/// the order `all` is already in (`sort_order, id`). `seen` guards against a
+/// malformed parent cycle, so this terminates on any input.
+fn collect_subtree(all: &[Project], parent: i64, seen: &mut HashSet<i64>, out: &mut Vec<Project>) {
+    for child in all.iter().filter(|p| p.parent_id == Some(parent)) {
+        if !seen.insert(child.id) {
+            continue;
+        }
+        out.push(child.clone());
+        collect_subtree(all, child.id, seen, out);
+    }
+}
+
 /// Validates that `parent_id` exists and shares `project_id`. Operates on any
 /// `Connection` (including an open transaction) so import can reuse it.
 fn check_parent(conn: &Connection, parent_id: i64, project_id: i64) -> Result<()> {
@@ -3179,7 +3336,7 @@ mod tests {
     fn project_crud_round_trip() {
         let (mut store, _dir) = temp_store();
         let p = store
-            .create_project("alpha", Some("first"), None, None)
+            .create_project("alpha", Some("first"), None, None, None)
             .unwrap();
         assert_eq!(p.name, "alpha");
         assert_eq!(p.description.as_deref(), Some("first"));
@@ -3201,7 +3358,7 @@ mod tests {
         assert_eq!(updated.description, None);
         assert_eq!(store.get_project(p.id).unwrap(), updated);
 
-        let (deleted, tasks) = store.delete_project(p.id).unwrap();
+        let (deleted, _subprojects, tasks) = store.delete_project(p.id).unwrap();
         assert_eq!(deleted, updated);
         assert!(tasks.is_empty());
         assert!(matches!(store.get_project(p.id), Err(Error::NotFound(_))));
@@ -3210,7 +3367,9 @@ mod tests {
     #[test]
     fn archive_and_unarchive_are_idempotent_and_dont_hide_from_get_or_delete() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("alpha", None, None, None).unwrap();
+        let p = store
+            .create_project("alpha", None, None, None, None)
+            .unwrap();
         assert!(!p.archived);
 
         let archived = store.archive_project(p.id).unwrap();
@@ -3234,7 +3393,7 @@ mod tests {
         // Delete stays byte-identical on an archived project: full cascade,
         // full echo, no special-casing of the flag.
         let archived = store.archive_project(p.id).unwrap();
-        let (deleted, tasks) = store.delete_project(p.id).unwrap();
+        let (deleted, _subprojects, tasks) = store.delete_project(p.id).unwrap();
         assert_eq!(deleted, archived);
         assert!(tasks.is_empty());
     }
@@ -3242,8 +3401,12 @@ mod tests {
     #[test]
     fn list_projects_excludes_archived_list_projects_all_includes_them() {
         let (mut store, _dir) = temp_store();
-        let a = store.create_project("alpha", None, None, None).unwrap();
-        let b = store.create_project("beta", None, None, None).unwrap();
+        let a = store
+            .create_project("alpha", None, None, None, None)
+            .unwrap();
+        let b = store
+            .create_project("beta", None, None, None, None)
+            .unwrap();
         store.archive_project(b.id).unwrap();
 
         let visible = store.list_projects().unwrap();
@@ -3266,9 +3429,15 @@ mod tests {
     #[test]
     fn projects_list_in_sort_order_and_reorder_moves_one_row() {
         let (mut store, _dir) = temp_store();
-        let a = store.create_project("alpha", None, None, None).unwrap();
-        let b = store.create_project("beta", None, None, None).unwrap();
-        let c = store.create_project("gamma", None, None, None).unwrap();
+        let a = store
+            .create_project("alpha", None, None, None, None)
+            .unwrap();
+        let b = store
+            .create_project("beta", None, None, None, None)
+            .unwrap();
+        let c = store
+            .create_project("gamma", None, None, None, None)
+            .unwrap();
 
         // Backfill/next-value: untouched projects come out in creation order,
         // each one sort_order past the last.
@@ -3300,7 +3469,9 @@ mod tests {
 
         // A project created after the reordering still sorts last, not into
         // the gap the drag opened up.
-        let d = store.create_project("delta", None, None, None).unwrap();
+        let d = store
+            .create_project("delta", None, None, None, None)
+            .unwrap();
         assert_eq!(
             ids(store.list_projects().unwrap()),
             vec![c.id, a.id, b.id, d.id]
@@ -3357,18 +3528,381 @@ mod tests {
         );
     }
 
+    /// Task 668. The parent column on a db that predates it: every existing
+    /// row upgrades to top level, and the tree still lists in `sort_order`.
+    #[test]
+    fn project_parent_migration_leaves_existing_rows_at_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre668.db");
+        // Pinned by index, NOT `MIGRATIONS.len() - 1` (see the sort_order
+        // test above for why the positional form is a trap).
+        const PROJECT_PARENT: usize = 27;
+        assert!(
+            MIGRATIONS[PROJECT_PARENT].contains("ALTER TABLE projects ADD COLUMN parent_id"),
+            "PROJECT_PARENT points at the wrong migration",
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..PROJECT_PARENT] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", PROJECT_PARENT as i64)
+                .unwrap();
+            conn.execute_batch("INSERT INTO projects (name) VALUES ('one'), ('two');")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let listed = store.list_projects().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|p| (p.name.as_str(), p.parent_id))
+                .collect::<Vec<_>>(),
+            vec![("one", None), ("two", None)],
+        );
+    }
+
+    /// A parent round-trips through create/get/list/update, detaches on
+    /// `Some(None)`, and nests arbitrarily deep. Reparenting is *only* a
+    /// reparent: every other field on the row is left exactly as it was.
+    #[test]
+    fn project_parent_round_trips_and_reparent_touches_nothing_else() {
+        let (mut store, _dir) = temp_store();
+        let root = store
+            .create_project("root", None, None, None, None)
+            .unwrap();
+        assert_eq!(root.parent_id, None);
+
+        let child = store
+            .create_project("child", None, None, Some("/tmp/child"), Some(root.id))
+            .unwrap();
+        assert_eq!(child.parent_id, Some(root.id));
+        assert_eq!(store.get_project(child.id).unwrap(), child);
+        // A new child sorts last among its siblings, drawn from the one
+        // global sequence.
+        assert!(child.sort_order > root.sort_order);
+
+        // Three levels deep is fine — nesting has no depth limit.
+        let grandchild = store
+            .create_project("grandchild", None, None, None, Some(child.id))
+            .unwrap();
+        assert_eq!(grandchild.parent_id, Some(child.id));
+
+        // The list stays FLAT and in sort_order; the tree is the caller's job.
+        assert_eq!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .map(|p| (p.id, p.parent_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (root.id, None),
+                (child.id, Some(root.id)),
+                (grandchild.id, Some(child.id)),
+            ],
+        );
+
+        // Reparent: grandchild moves up under root, and nothing else on the
+        // row moves with it.
+        let moved = store
+            .update_project(
+                grandchild.id,
+                &ProjectPatch {
+                    parent_id: Some(Some(root.id)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            moved,
+            Project {
+                parent_id: Some(root.id),
+                ..grandchild.clone()
+            }
+        );
+
+        // `Some(None)` detaches to top level.
+        let detached = store
+            .update_project(
+                moved.id,
+                &ProjectPatch {
+                    parent_id: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(detached.parent_id, None);
+        // An unrelated update leaves the parent alone.
+        let renamed = store
+            .update_project(
+                child.id,
+                &ProjectPatch {
+                    name: Some("child!".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(renamed.parent_id, Some(root.id));
+    }
+
+    /// Self-parenting and any loop are `cycle`; an unknown parent is
+    /// `validation` — the same split of error kinds a task's parent uses.
+    #[test]
+    fn project_parent_rejects_cycles_and_unknown_parents() {
+        let (mut store, _dir) = temp_store();
+        let a = store.create_project("a", None, None, None, None).unwrap();
+        let b = store
+            .create_project("b", None, None, None, Some(a.id))
+            .unwrap();
+        let c = store
+            .create_project("c", None, None, None, Some(b.id))
+            .unwrap();
+
+        let self_parent = store.update_project(
+            a.id,
+            &ProjectPatch {
+                parent_id: Some(Some(a.id)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(self_parent, Err(Error::Cycle(_))),
+            "{self_parent:?}"
+        );
+
+        // Direct loop: a under its own child.
+        let direct = store.update_project(
+            a.id,
+            &ProjectPatch {
+                parent_id: Some(Some(b.id)),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(direct, Err(Error::Cycle(_))), "{direct:?}");
+
+        // Deeper loop: a under its own grandchild.
+        let deep = store.update_project(
+            a.id,
+            &ProjectPatch {
+                parent_id: Some(Some(c.id)),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(deep, Err(Error::Cycle(_))), "{deep:?}");
+
+        let unknown = store.update_project(
+            c.id,
+            &ProjectPatch {
+                parent_id: Some(Some(9999)),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(unknown, Err(Error::Validation(_))), "{unknown:?}");
+        assert!(matches!(
+            store.create_project("d", None, None, None, Some(9999)),
+            Err(Error::Validation(_))
+        ));
+        // Every rejection was a no-op: the tree is untouched.
+        assert_eq!(store.get_project(a.id).unwrap(), a);
+        assert_eq!(store.get_project(c.id).unwrap(), c);
+    }
+
+    /// Archiving cascades down the tree for UNSCOPED reads only, and does it
+    /// without writing a single descendant row: the flag is per-row,
+    /// visibility is derived (task 668).
+    #[test]
+    fn archiving_a_parent_hides_descendants_from_unscoped_reads_only() {
+        let (mut store, _dir) = temp_store();
+        let root = store
+            .create_project("root", None, None, None, None)
+            .unwrap();
+        let child = store
+            .create_project("child", None, None, None, Some(root.id))
+            .unwrap();
+        let grandchild = store
+            .create_project("grandchild", None, None, None, Some(child.id))
+            .unwrap();
+        let other = store
+            .create_project("other", None, None, None, None)
+            .unwrap();
+        let t_child = add_task(&mut store, child.id, "child task");
+        let t_other = add_task(&mut store, other.id, "other task");
+        store
+            .create_storyboard(child.id, "child board", None, None, None)
+            .unwrap();
+
+        store.archive_project(root.id).unwrap();
+
+        // Unscoped: the whole subtree is gone.
+        assert_eq!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![other.id],
+        );
+        assert_eq!(
+            store
+                .list_tasks(None)
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t_other.id],
+        );
+        assert!(matches!(
+            store.next_task(None).unwrap(),
+            NextResult::Task(t) if t.id == t_other.id
+        ));
+        assert!(store.list_storyboards(None).unwrap().is_empty());
+
+        // The descendants' own flag is untouched — nothing was written.
+        assert_eq!(store.get_project(child.id).unwrap(), child);
+        assert_eq!(store.get_project(grandchild.id).unwrap(), grandchild);
+        assert!(!store.get_project(child.id).unwrap().archived);
+        // ...and `list_projects_all` still returns everything.
+        assert_eq!(store.list_projects_all().unwrap().len(), 4);
+
+        // Scoped reads of a LIVE child of an archived parent are unaffected.
+        assert_eq!(
+            store
+                .list_tasks(Some(child.id))
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t_child.id],
+        );
+        assert!(matches!(
+            store.next_task(Some(child.id)).unwrap(),
+            NextResult::Task(t) if t.id == t_child.id
+        ));
+        assert_eq!(store.list_storyboards(Some(child.id)).unwrap().len(), 1);
+
+        // Unarchiving the root restores the subtree with no per-child write.
+        store.unarchive_project(root.id).unwrap();
+        assert_eq!(store.list_projects().unwrap().len(), 4);
+        assert_eq!(store.list_tasks(None).unwrap().len(), 2);
+        assert_eq!(store.get_project(child.id).unwrap(), child);
+    }
+
+    /// The refine listing reads through the same shared predicate, so an
+    /// archived ancestor hides a child's refine work from the watcher too.
+    #[test]
+    fn list_refine_tasks_unscoped_excludes_child_of_archived_parent() {
+        let (mut store, _dir) = temp_store();
+        let root = store
+            .create_project("root", None, None, None, None)
+            .unwrap();
+        let child = store
+            .create_project("child", None, None, None, Some(root.id))
+            .unwrap();
+        let t = add_task(&mut store, child.id, "refine me");
+        store
+            .update_task(
+                t.id,
+                &TaskPatch {
+                    status: Some(Status::Refine),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.list_refine_tasks(None).unwrap().len(), 1);
+
+        store.archive_project(root.id).unwrap();
+        assert!(store.list_refine_tasks(None).unwrap().is_empty());
+        // Scoped to the child itself, byte-identical to before.
+        assert_eq!(
+            store
+                .list_refine_tasks(Some(child.id))
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t.id],
+        );
+    }
+
+    /// Deleting a project takes its whole subtree — and the echo carries every
+    /// destroyed row, since it is the recovery transcript.
+    #[test]
+    fn delete_project_cascades_subtree_and_echoes_every_row() {
+        let (mut store, _dir) = temp_store();
+        let root = store
+            .create_project("root", None, None, None, None)
+            .unwrap();
+        let child = store
+            .create_project("child", None, None, None, Some(root.id))
+            .unwrap();
+        let grandchild = store
+            .create_project("grandchild", None, None, None, Some(child.id))
+            .unwrap();
+        let sibling = store
+            .create_project("sibling", None, None, None, Some(root.id))
+            .unwrap();
+        let keep = store
+            .create_project("keep", None, None, None, None)
+            .unwrap();
+        let t_root = add_task(&mut store, root.id, "root task");
+        let t_grand = add_task(&mut store, grandchild.id, "grandchild task");
+        let t_keep = add_task(&mut store, keep.id, "kept task");
+        let board = store
+            .create_storyboard(grandchild.id, "board", None, None, None)
+            .unwrap();
+
+        let (deleted, subprojects, tasks) = store.delete_project(root.id).unwrap();
+        assert_eq!(deleted.id, root.id);
+        // Depth-first, each level in list order.
+        assert_eq!(
+            subprojects.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![child.id, grandchild.id, sibling.id],
+        );
+        // Root's own tasks first, then each descendant's, in that same order.
+        assert_eq!(
+            tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![t_root.id, t_grand.id],
+        );
+
+        // Nothing of the subtree is left in the db; the untouched project and
+        // its task are still there.
+        for id in [root.id, child.id, grandchild.id, sibling.id] {
+            assert!(matches!(store.get_project(id), Err(Error::NotFound(_))));
+        }
+        assert!(matches!(
+            store.get_task(t_grand.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.get_storyboard(board.id),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(store.get_project(keep.id).unwrap(), keep);
+        assert_eq!(store.get_task(t_keep.id).unwrap().id, t_keep.id);
+
+        // A leaf delete is unchanged: an empty subtree.
+        let (_, subprojects, tasks) = store.delete_project(keep.id).unwrap();
+        assert!(subprojects.is_empty());
+        assert_eq!(
+            tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![t_keep.id]
+        );
+    }
+
     #[test]
     fn local_path_records_updates_and_clears() {
         let (mut store, _dir) = temp_store();
         let p = store
-            .create_project("alpha", None, None, Some("/tmp/checkout"))
+            .create_project("alpha", None, None, Some("/tmp/checkout"), None)
             .unwrap();
         assert_eq!(p.local_path.as_deref(), Some("/tmp/checkout"));
         assert_eq!(store.get_project(p.id).unwrap(), p);
 
         // Machine-local, not unique: two projects may share a folder.
         let q = store
-            .create_project("beta", None, None, Some("/tmp/checkout"))
+            .create_project("beta", None, None, Some("/tmp/checkout"), None)
             .unwrap();
         assert_eq!(q.local_path.as_deref(), Some("/tmp/checkout"));
 
@@ -3399,8 +3933,12 @@ mod tests {
     #[test]
     fn find_project_by_name_matches_case_insensitively_and_flags_ambiguity() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("Alpha", None, None, None).unwrap();
-        store.create_project("beta", None, None, None).unwrap();
+        let p = store
+            .create_project("Alpha", None, None, None, None)
+            .unwrap();
+        store
+            .create_project("beta", None, None, None, None)
+            .unwrap();
 
         assert_eq!(store.find_project_by_name("alpha").unwrap(), p);
         assert!(matches!(
@@ -3409,7 +3947,9 @@ mod tests {
         ));
 
         // A duplicate name is ambiguous: the caller must use the id.
-        store.create_project("ALPHA", None, None, None).unwrap();
+        store
+            .create_project("ALPHA", None, None, None, None)
+            .unwrap();
         assert!(matches!(
             store.find_project_by_name("alpha"),
             Err(Error::Conflict(_))
@@ -3420,7 +3960,7 @@ mod tests {
     fn root_commit_binds_resolves_and_rejects_duplicates() {
         let (mut store, _dir) = temp_store();
         let p = store
-            .create_project("alpha", None, Some("abc123"), None)
+            .create_project("alpha", None, Some("abc123"), None, None)
             .unwrap();
         assert_eq!(p.root_commit.as_deref(), Some("abc123"));
 
@@ -3433,12 +3973,14 @@ mod tests {
 
         // The same source code must not spawn a second project.
         assert!(matches!(
-            store.create_project("dup", None, Some("abc123"), None),
+            store.create_project("dup", None, Some("abc123"), None, None),
             Err(Error::Conflict(_))
         ));
 
         // Another project cannot steal the binding...
-        let q = store.create_project("beta", None, None, None).unwrap();
+        let q = store
+            .create_project("beta", None, None, None, None)
+            .unwrap();
         assert!(matches!(
             store.update_project(
                 q.id,
@@ -3509,7 +4051,7 @@ mod tests {
     #[test]
     fn task_crud_round_trip() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = store
             .create_task(
                 p.id,
@@ -3568,7 +4110,7 @@ mod tests {
     #[test]
     fn claim_sets_owner_and_moves_to_in_progress() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         assert_eq!(t.owner, None);
         assert_eq!(t.claimed_at, None);
@@ -3590,7 +4132,7 @@ mod tests {
     #[test]
     fn claim_rejects_a_different_live_owner_unless_forced() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         store.claim_task(t.id, "sess-a", false).unwrap();
 
@@ -3618,7 +4160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let mut a = Store::open(&path).unwrap();
-        let p = a.create_project("p", None, None, None).unwrap();
+        let p = a.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut a, p.id, "work");
         a.claim_task(t.id, "sess-a", false).unwrap();
 
@@ -3639,7 +4181,7 @@ mod tests {
     #[test]
     fn claim_by_the_same_owner_renews_the_lease() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         store.claim_task(t.id, "sess-a", false).unwrap();
         // Backdate the claim so the renewal is observable without sleeping:
@@ -3665,7 +4207,7 @@ mod tests {
         // The pre-claims world (and any plain `--status in_progress` flip):
         // in_progress with a null owner is not a live hold, so no --force.
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         store
             .update_task(
@@ -3683,7 +4225,7 @@ mod tests {
     #[test]
     fn release_clears_the_claim_and_is_idempotent() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         store.claim_task(t.id, "sess-a", false).unwrap();
 
@@ -3700,7 +4242,7 @@ mod tests {
     #[test]
     fn leaving_in_progress_drops_the_claim() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         store.claim_task(t.id, "sess-a", false).unwrap();
 
@@ -3722,7 +4264,7 @@ mod tests {
         // The whole point of `claimed_at`: `updated_at` moves on any field
         // write, `claimed_at` only on claim/renew.
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         store.claim_task(t.id, "sess-a", false).unwrap();
         store
@@ -3753,7 +4295,7 @@ mod tests {
     #[test]
     fn claim_rejects_an_empty_owner() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "work");
         assert!(matches!(
             store.claim_task(t.id, "   ", false),
@@ -3765,7 +4307,7 @@ mod tests {
     #[test]
     fn update_task_sets_and_clears_result() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "ship it");
         assert_eq!(t.result, None);
 
@@ -3800,7 +4342,7 @@ mod tests {
     #[test]
     fn update_task_appends_the_free_text_bodies() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "story");
         let seeded = store
             .update_task(
@@ -3886,7 +4428,9 @@ mod tests {
         let err = store.get_task(42).unwrap_err();
         assert!(matches!(&err, Error::NotFound(m) if m.contains("no tasks exist")));
 
-        let p = store.create_project("alpha", None, None, None).unwrap();
+        let p = store
+            .create_project("alpha", None, None, None, None)
+            .unwrap();
         let t1 = add_task(&mut store, p.id, "close one");
         let _t2 = add_task(&mut store, p.id, "far away");
 
@@ -3920,7 +4464,7 @@ mod tests {
     #[test]
     fn description_must_not_be_empty_on_create_or_update() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         for blank in ["", "   \n\t "] {
             let err = store
                 .create_task(p.id, blank, Priority::Medium, &[], None, None, None, None)
@@ -3955,7 +4499,7 @@ mod tests {
     #[test]
     fn create_with_status_lands_in_that_column_and_logs_creation_event() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = store
             .create_task(
                 p.id,
@@ -3986,8 +4530,8 @@ mod tests {
     #[test]
     fn parent_must_be_in_same_project() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
 
@@ -4047,7 +4591,7 @@ mod tests {
     #[test]
     fn delete_task_cascades_subtasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let root = add_task(&mut store, p.id, "root");
         let child = store
             .create_task(
@@ -4113,7 +4657,7 @@ mod tests {
     #[test]
     fn attachment_crud_round_trip() {
         let (mut store, _dir, _lock) = attachment_test_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "task with files");
 
         let created = store
@@ -4150,7 +4694,7 @@ mod tests {
     #[test]
     fn create_attachment_rejects_oversized_content() {
         let (mut store, _dir, _lock) = attachment_test_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "task");
 
         let oversized = vec![0u8; (attachments::MAX_ATTACHMENT_BYTES + 1) as usize];
@@ -4190,7 +4734,7 @@ mod tests {
     #[test]
     fn delete_task_cascade_unlinks_attachment_files_for_task_and_subtasks() {
         let (mut store, _dir, _lock) = attachment_test_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let root = add_task(&mut store, p.id, "root");
         let child = store
             .create_task(
@@ -4241,9 +4785,11 @@ mod tests {
     fn delete_project_cascades_tasks_and_returns_them() {
         let (mut store, _dir) = temp_store();
         let p = store
-            .create_project("doomed", Some("desc"), None, None)
+            .create_project("doomed", Some("desc"), None, None, None)
             .unwrap();
-        let keep = store.create_project("keeper", None, None, None).unwrap();
+        let keep = store
+            .create_project("keeper", None, None, None, None)
+            .unwrap();
         let t1 = add_task(&mut store, p.id, "one");
         let t2 = store
             .create_task(
@@ -4259,7 +4805,7 @@ mod tests {
             .unwrap();
         let survivor = add_task(&mut store, keep.id, "survivor");
 
-        let (project, tasks) = store.delete_project(p.id).unwrap();
+        let (project, _subprojects, tasks) = store.delete_project(p.id).unwrap();
         assert_eq!(project.id, p.id);
         assert_eq!(project.name, "doomed");
         assert_eq!(project.description.as_deref(), Some("desc"));
@@ -4277,7 +4823,7 @@ mod tests {
     #[test]
     fn self_edge_rejected_as_cycle() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
         let err = store.add_dependency(t.id, t.id).unwrap_err();
         assert!(matches!(err, Error::Cycle(_)));
@@ -4287,7 +4833,7 @@ mod tests {
     #[test]
     fn cycle_rejected_naming_the_edge() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -4308,7 +4854,7 @@ mod tests {
     #[test]
     fn duplicate_edge_is_idempotent() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let first = store.add_dependency(a.id, b.id).unwrap();
@@ -4325,7 +4871,7 @@ mod tests {
     #[test]
     fn blocked_is_derived_from_dependency_status() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let task = add_task(&mut store, p.id, "task");
         let dep1 = add_task(&mut store, p.id, "dep1");
         let dep2 = add_task(&mut store, p.id, "dep2");
@@ -4373,7 +4919,7 @@ mod tests {
     #[test]
     fn unblock_removes_edge_and_missing_edge_is_not_found() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         store.add_dependency(a.id, b.id).unwrap();
@@ -4388,7 +4934,7 @@ mod tests {
     #[test]
     fn list_blockers_returns_direct_blockers_only() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -4407,7 +4953,7 @@ mod tests {
     #[test]
     fn list_blocking_returns_direct_dependents_only() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -4432,7 +4978,9 @@ mod tests {
     #[test]
     fn backup_round_trip() {
         let (mut store, dir) = temp_store();
-        let p = store.create_project("p", Some("kept"), None, None).unwrap();
+        let p = store
+            .create_project("p", Some("kept"), None, None, None)
+            .unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         store.add_dependency(a.id, b.id).unwrap();
@@ -4451,7 +4999,7 @@ mod tests {
     #[test]
     fn status_events_logged_on_create_and_real_status_changes() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
 
         // Creation event: NULL -> initial status (todo).
@@ -4491,7 +5039,7 @@ mod tests {
     #[test]
     fn update_without_status_change_writes_no_event_but_bumps_updated_at() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let t = add_task(&mut store, p.id, "t");
         let before = store.get_task(t.id).unwrap();
         assert_eq!(before.created_at, before.updated_at);
@@ -4520,7 +5068,7 @@ mod tests {
     #[test]
     fn list_events_all_tasks_and_unknown_task() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a");
         let b = add_task(&mut store, p.id, "b");
         // Two creation events across all tasks, oldest first.
@@ -4558,7 +5106,7 @@ mod tests {
     #[test]
     fn next_task_orders_by_priority_then_id_and_excludes_non_actionable() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         // Lower id, but medium priority; the high-priority task wins despite
         // its higher id.
         let _med = create_with_priority(&mut store, p.id, "med", Priority::Medium);
@@ -4607,7 +5155,7 @@ mod tests {
     #[test]
     fn next_subtask_scopes_to_descendants_shares_next_task_rules() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sub = |store: &mut Store, parent: i64, title: &str, priority: Priority| -> Task {
             store
                 .create_task(p.id, title, priority, &[], Some(parent), None, None, None)
@@ -4673,7 +5221,7 @@ mod tests {
     #[test]
     fn next_task_counts_when_none_actionable() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let a = add_task(&mut store, p.id, "a"); // will block b
         let b = add_task(&mut store, p.id, "b");
         let c = add_task(&mut store, p.id, "c");
@@ -4715,7 +5263,7 @@ mod tests {
     #[test]
     fn next_task_excludes_backlog() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         store
             .create_task(
                 p.id,
@@ -4772,7 +5320,7 @@ mod tests {
     #[test]
     fn refine_tasks_are_listed_by_rank_and_never_dispatched_as_todo() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let refine = |store: &mut Store, name: &str, priority: Priority| {
             store
                 .create_task(
@@ -4848,8 +5396,12 @@ mod tests {
     #[test]
     fn list_refine_tasks_unscoped_excludes_archived_project() {
         let (mut store, _dir) = temp_store();
-        let archived = store.create_project("archived", None, None, None).unwrap();
-        let live = store.create_project("live", None, None, None).unwrap();
+        let archived = store
+            .create_project("archived", None, None, None, None)
+            .unwrap();
+        let live = store
+            .create_project("live", None, None, None, None)
+            .unwrap();
         let hidden = store
             .create_task(
                 archived.id,
@@ -4901,8 +5453,8 @@ mod tests {
     #[test]
     fn next_task_respects_project_filter() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
         let in_p2 = create_with_priority(&mut store, p2.id, "p2 high", Priority::High);
         let in_p1 = add_task(&mut store, p1.id, "p1 task");
 
@@ -4919,8 +5471,8 @@ mod tests {
     #[test]
     fn list_tasks_unscoped_excludes_archived_project_scoped_unaffected() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "p1 task");
         let t2 = add_task(&mut store, p2.id, "p2 task");
 
@@ -4962,8 +5514,8 @@ mod tests {
     #[test]
     fn next_task_unscoped_skips_archived_project_scoped_unaffected() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
         // p2's task is higher priority, so it would win an unscoped pick
         // unless the archived project is excluded.
         let in_p2 = create_with_priority(&mut store, p2.id, "p2 high", Priority::High);
@@ -4989,8 +5541,8 @@ mod tests {
         // site): an archived project with in_progress/blocked/todo tasks must
         // not be counted into the unscoped NextResult::None totals.
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
 
         // p1: one task, marked in_progress so it isn't "actionable" but does
         // count -- keeps the unscoped pick landing in NextResult::None.
@@ -5037,8 +5589,8 @@ mod tests {
     #[test]
     fn list_storyboards_unscoped_excludes_archived_project_scoped_unaffected() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
         let sb1 = store
             .create_storyboard(p1.id, "p1 board", None, None, None)
             .unwrap();
@@ -5075,7 +5627,7 @@ mod tests {
     #[test]
     fn import_creates_graph_atomically_and_wires_parent_and_deps() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         // a (parent) -> b (child of a, blocked by c) ; c (high priority).
         let doc = ImportDoc {
             project: p.id,
@@ -5119,7 +5671,7 @@ mod tests {
     #[test]
     fn import_in_graph_cycle_is_rejected_and_creates_nothing() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         // a blocked by b, b blocked by a -> cycle within the document.
         let doc = ImportDoc {
             project: p.id,
@@ -5144,7 +5696,7 @@ mod tests {
     #[test]
     fn import_rejects_unknown_project_and_bad_refs_leaving_db_empty() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
 
         // unknown project: nothing created.
         let bad_project = ImportDoc {
@@ -5305,7 +5857,7 @@ mod tests {
     #[test]
     fn storyboard_crud_round_trip_with_view() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "flow", Some("the happy path"), Some("agent-1"), None)
             .unwrap();
@@ -5365,7 +5917,7 @@ mod tests {
     #[test]
     fn frame_shape_must_belong_to_its_boards_diagram_type() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         // Each board type accepts exactly its own shape set and rejects every
         // other one (including the generic `None` card on a typed board).
         let sets = [
@@ -5480,7 +6032,7 @@ mod tests {
     #[test]
     fn frame_crud_and_view_ordering() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -5548,8 +6100,8 @@ mod tests {
     #[test]
     fn frame_task_link_must_be_same_project_and_nulls_on_task_delete() {
         let (mut store, _dir) = temp_store();
-        let p1 = store.create_project("p1", None, None, None).unwrap();
-        let p2 = store.create_project("p2", None, None, None).unwrap();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p1.id, "b", None, None, None)
             .unwrap();
@@ -5613,7 +6165,7 @@ mod tests {
     #[test]
     fn edge_crud_rejects_self_and_foreign_frames_and_allows_cycles() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -5685,7 +6237,7 @@ mod tests {
     #[test]
     fn delete_frame_cascades_edges_and_echoes_them() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -5711,7 +6263,7 @@ mod tests {
     #[test]
     fn delete_storyboard_cascades_and_echoes_full_view() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -5733,7 +6285,9 @@ mod tests {
     #[test]
     fn delete_project_cascades_storyboards() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("doomed", None, None, None).unwrap();
+        let p = store
+            .create_project("doomed", None, None, None, None)
+            .unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -5753,7 +6307,7 @@ mod tests {
     #[test]
     fn storyboard_change_history_records_actor_and_actions() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "flow", None, Some("agent-1"), None)
             .unwrap();
@@ -5856,7 +6410,7 @@ mod tests {
     #[test]
     fn delete_storyboard_cascades_its_change_history() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -5875,7 +6429,7 @@ mod tests {
     #[test]
     fn no_op_update_changes_nothing_and_logs_nothing() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", Some("d"), None, None)
             .unwrap();
@@ -5943,7 +6497,7 @@ mod tests {
     #[test]
     fn edge_anchor_patch_is_three_state_preserved_and_logged() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
             .create_storyboard(p.id, "b", None, None, None)
             .unwrap();
@@ -6096,7 +6650,7 @@ mod tests {
     #[test]
     fn assigning_an_inbox_item_converts_it_to_a_backlog_task() {
         let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None).unwrap();
+        let p = store.create_project("p", None, None, None, None).unwrap();
 
         // The description is the item's body verbatim; the name is its first
         // line (task 660 — an assigned item keeps every character it arrived

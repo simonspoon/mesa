@@ -156,6 +156,9 @@ export interface ProjectPatch {
   /** Manual nav position; the column is NOT NULL, so there is no `| null`
    *  clear here the way the free-text fields have one. */
   sort_order?: number
+  /** Parent project (task 668); `null` detaches to top level. A cycle is a
+   *  409, an unknown parent a 422. */
+  parent_id?: number | null
 }
 
 export interface TaskCreate {
@@ -199,10 +202,11 @@ export function updateProject(id: number, patch: ProjectPatch): Promise<Project>
   return request(`/api/projects/${id}`, jsonInit('PATCH', patch))
 }
 
-/** Returns the destroyed records: the project plus all cascaded tasks. */
+/** Returns the destroyed records: the project, the subprojects the cascade
+ *  took with it (task 668; `[]` for a leaf) and all their tasks. */
 export function deleteProject(
   id: number,
-): Promise<{ project: Project; tasks: Task[] }> {
+): Promise<{ project: Project; subprojects: Project[]; tasks: Task[] }> {
   return request(`/api/projects/${id}`, {
     method: 'DELETE',
     // No body, but the server's guard requires JSON Content-Type on all

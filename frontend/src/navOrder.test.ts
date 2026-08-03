@@ -52,4 +52,33 @@ describe('sortOrderForDrop', () => {
   it('assigns 1 when the list has nothing else in it', () => {
     expect(sortOrderForDrop([{ id: 1, sort_order: 7 }], 1, -1)).toBe(1)
   })
+
+  // Task 668: the list is a tree now, and a drag may only reorder a row among
+  // its own siblings. `nested` is one server-ordered array: two roots, two
+  // children under the first.
+  const nested: Orderable[] = [
+    { id: 1, sort_order: 1, parent_id: null },
+    { id: 10, sort_order: 2, parent_id: 1 },
+    { id: 11, sort_order: 3, parent_id: 1 },
+    { id: 2, sort_order: 4, parent_id: null },
+  ]
+
+  it('reorders among siblings, ignoring rows at other levels', () => {
+    // 11 dropped on 10: the only rows in play are 1's children [10, 11], so
+    // the midpoint is below 10's, not the parent's or the other root's.
+    expect(sortOrderForDrop(nested, 11, 10)).toBe(1)
+  })
+
+  it('returns null when the drop lands under a different parent', () => {
+    // A child dropped on a root, and a root dropped on someone's child:
+    // reparenting is explicit, never a drag — so neither issues a request.
+    expect(sortOrderForDrop(nested, 10, 2)).toBeNull()
+    expect(sortOrderForDrop(nested, 2, 10)).toBeNull()
+  })
+
+  it('still treats a drop on no row at all as the end of the sibling list', () => {
+    // The list's own droppable names no parent to disagree with, so the old
+    // "append to my level" behaviour is unchanged.
+    expect(sortOrderForDrop(nested, 10, -1)).toBe(4)
+  })
 })

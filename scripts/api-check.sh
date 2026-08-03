@@ -16,7 +16,9 @@
 #      makes the pair useful (it must NOT move on an ordinary field write);
 #   4. archived-project scoping over HTTP (unscoped hides, scoped does not);
 #   5. the project `sort_order` round-trip added by task 666 — the field the
-#      sidebar's drag-reorder writes, and the list order it drives;
+#      sidebar's drag-reorder writes, and the list order it drives, plus the
+#      `parent_id` surface added by task 668 (nesting, detach, cycle/unknown
+#      rejection, the archive cascade and the subtree delete echo);
 #   6. LAN mode — the Host allowlist is skipped while the Content-Type gate
 #      still applies, the two halves of one posture (CLAUDE.md).
 #
@@ -506,6 +508,93 @@ ok "PATCH without sort_order: value unchanged"
 
 api 422 PATCH "/api/projects/$OTHER" '{"sort_order":"first"}'
 ok "PATCH /api/projects/{id} non-numeric sort_order: 422"
+
+# =====================================================================
+# 5b. Subprojects: parent_id over HTTP (task 668)
+# =====================================================================
+
+api 201 POST "/api/projects" '{"name":"Subproject parent"}'
+SP=$(jqb .id)
+[ "$(jqb .parent_id)" = "null" ] || fail "POST /api/projects: default parent_id must be null"
+
+api 201 POST "/api/projects" "{\"name\":\"Subproject child\",\"parent_id\":$SP}"
+SC=$(jqb .id)
+[ "$(jqb .parent_id)" = "$SP" ] || fail "POST /api/projects {parent_id}: must nest"
+api 201 POST "/api/projects" "{\"name\":\"Subproject grandchild\",\"parent_id\":$SC}"
+SG=$(jqb .id)
+ok "POST /api/projects {parent_id}: 201, nests arbitrarily deep"
+
+# The list keeps its shape: one flat array, each row carrying parent_id.
+api 200 GET "/api/projects"
+[ "$(jqb 'map(select(.id == '"$SG"')) | .[0].parent_id')" = "$SC" ] ||
+  fail "GET /api/projects: each row must carry parent_id"
+[ "$(jqb 'map(select(.id == '"$SP"' or .id == '"$SC"' or .id == '"$SG"')) | map(.id) | join(",")')" \
+  = "$SP,$SC,$SG" ] ||
+  fail "GET /api/projects: a new child must sort last among its siblings"
+ok "GET /api/projects: flat array, parent_id present, child sorts last"
+
+# Reparent, then detach with an explicit null.
+api 200 PATCH "/api/projects/$SG" "{\"parent_id\":$SP}"
+[ "$(jqb .parent_id)" = "$SP" ] || fail "PATCH parent_id: must reparent"
+api 200 PATCH "/api/projects/$SG" '{"parent_id":null}'
+[ "$(jqb .parent_id)" = "null" ] || fail "PATCH parent_id null: must detach to top level"
+# Omitting the field leaves it alone (the double-option contract).
+api 200 PATCH "/api/projects/$SG" "{\"parent_id\":$SC}"
+api 200 PATCH "/api/projects/$SG" '{"name":"Subproject grandchild"}'
+[ "$(jqb .parent_id)" = "$SC" ] || fail "a PATCH without parent_id must leave it unchanged"
+ok "PATCH /api/projects/{id} {parent_id}: reparents, null detaches, absent is a no-op"
+
+# No new error codes: a cycle is the existing 409, an unknown parent the 422.
+api 409 PATCH "/api/projects/$SP" "{\"parent_id\":$SP}"
+[ "$(jqb .error.code)" = "cycle" ] || fail "self-parent over HTTP: error.code"
+api 409 PATCH "/api/projects/$SP" "{\"parent_id\":$SG}"
+[ "$(jqb .error.code)" = "cycle" ] || fail "deep cycle over HTTP: error.code"
+api 422 PATCH "/api/projects/$SP" '{"parent_id":999999}'
+[ "$(jqb .error.code)" = "validation" ] || fail "unknown parent over HTTP: error.code"
+api 422 POST "/api/projects" '{"name":"orphan","parent_id":999999}'
+ok "parent_id: 409 cycle / 422 validation, no new error codes"
+
+# Archiving the parent hides the subtree from unscoped reads only.
+api 201 POST "/api/tasks" "{\"project_id\":$SG,\"description\":\"grandchild work\"}"
+SGT=$(jqb .id)
+api 200 POST "/api/projects/$SP/archive"
+api 200 GET "/api/projects"
+[ "$(jqb 'map(select(.id == '"$SC"' or .id == '"$SG"')) | length')" = "0" ] ||
+  fail "archive cascade over HTTP: descendants must leave GET /api/projects"
+api 200 GET "/api/tasks"
+[ "$(jqb 'map(select(.id == '"$SGT"')) | length')" = "0" ] ||
+  fail "archive cascade over HTTP: a descendant's tasks must leave unscoped GET /api/tasks"
+api 200 GET "/api/projects/$SG"
+[ "$(jqb .archived)" = "false" ] ||
+  fail "archive cascade: a descendant's own archived flag must stay false"
+api 200 GET "/api/tasks?project=$SG"
+[ "$(jqb 'map(select(.id == '"$SGT"')) | length')" = "1" ] ||
+  fail "archive cascade: a scoped read of a live child must be unaffected"
+api 200 GET "/api/projects?include_archived=true"
+[ "$(jqb 'map(select(.id == '"$SG"')) | length')" = "1" ] ||
+  fail "?include_archived=true must still return the whole tree"
+api 200 POST "/api/projects/$SP/unarchive"
+api 200 GET "/api/projects"
+[ "$(jqb 'map(select(.id == '"$SG"')) | length')" = "1" ] ||
+  fail "unarchive of the root must restore the subtree in one call"
+ok "archive/unarchive cascade over HTTP: unscoped only, one write, scoped reads unaffected"
+
+# Deleting the root destroys the subtree; the echo carries every row.
+api 200 DELETE "/api/projects/$SP"
+[ "$(jqb .project.id)" = "$SP" ] || fail "DELETE project: root echoed"
+[ "$(jqb '.subprojects | map(.id) | join(",")')" = "$SC,$SG" ] ||
+  fail "DELETE project: subprojects echoed depth-first"
+[ "$(jqb "any(.tasks[]; .id == $SGT)")" = "true" ] ||
+  fail "DELETE project: a descendant's tasks must be echoed"
+api 404 GET "/api/projects/$SG"
+ok "DELETE /api/projects/{id}: cascades the subtree, echoes every destroyed row"
+
+api 201 POST "/api/projects" '{"name":"Subproject leaf"}'
+SL=$(jqb .id)
+api 200 DELETE "/api/projects/$SL"
+[ "$(jqb '.subprojects | length')" = "0" ] ||
+  fail "DELETE a leaf project: subprojects must be []"
+ok "DELETE /api/projects/{id} on a leaf: unchanged apart from an empty subprojects"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

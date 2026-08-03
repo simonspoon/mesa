@@ -18,7 +18,22 @@ import {
   updateProject,
 } from '../api'
 import { sortOrderForDrop } from '../navOrder'
+import {
+  expandAncestors,
+  loadCollapsed,
+  saveCollapsed,
+  toggleCollapsed,
+} from '../navCollapse'
+import {
+  ancestorIds,
+  buildTree,
+  effectivelyArchivedIds,
+  hasChildren,
+  todoCountFor,
+  visibleRows,
+} from '../projectTree'
 import type { GitStatus } from '../types/GitStatus'
+import type { Project } from '../types/Project'
 import type { CcTab } from '../pages/CCDashboardView'
 import { isPhone } from '../phoneTier'
 import { useFetch } from '../useFetch'
@@ -37,6 +52,15 @@ import {
 // off `main`'s rect each move rather than assumed from the viewport, so it
 // accounts for whatever the agent sidebar is currently taking.
 const MIN_MAIN_WIDTH = 320
+
+/** The project id a `#/projects/:id/...` hash names, or null for any other
+ *  route. Read straight off the URL rather than taken from the
+ *  `activeProjectId` prop so the subtree reveal below is driven by the
+ *  navigation event itself. */
+function projectIdFromHash(hash: string): number | null {
+  const id = Number(/^#\/projects\/(\d+)/.exec(hash)?.[1])
+  return Number.isFinite(id) ? id : null
+}
 
 // CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
 // overview (charts + KPIs); these are the table views split out beneath it.
@@ -91,13 +115,30 @@ function GitLine({ git }: { git: GitStatus | undefined }) {
  * sensors below carry activation thresholds: a plain click has to reach the
  * `<a>` inside and navigate.
  */
-function SortableProject({ id, children }: { id: number; children: ReactNode }) {
+function SortableProject({
+  id,
+  depth,
+  children,
+}: {
+  id: number
+  depth: number
+  children: ReactNode
+}) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id })
   return (
     <li
       ref={setNodeRef}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
+      style={
+        {
+          transform: CSS.Transform.toString(transform),
+          transition,
+          // Nesting is an indent step per level (task 668), not nested
+          // <ul>s: one flat sortable list is what lets dnd-kit reorder
+          // siblings, and the whole row still has to be the drag handle.
+          '--nav-depth': depth,
+        } as CSSProperties
+      }
       className={`nav-project-row${isDragging ? ' dragging' : ''}`}
       {...listeners}
       {...attributes}
@@ -141,15 +182,34 @@ export function Sidebar({
   onCollapsedChange: (collapsed: boolean) => void
 }) {
   const setCollapsed = onCollapsedChange
+  // Guards the one-shot deep-link reveal below (task 668).
+  const revealedRef = useRef(false)
   // One fetch, archived included (arch.md §"Spec 502" §4) — partitioned below
   // on `p.archived` so the main list and the archived group can never skew
   // against each other the way two separate requests could.
   const { data: allProjects, error, refetch } = useFetch(
-    () => listProjects(true),
+    () =>
+      listProjects(true).then((ps) => {
+        // A deep link to a project inside a collapsed subtree: the tree isn't
+        // knowable until the list lands, so the reveal rides along with it.
+        // FIRST load only — this fetcher re-runs on refocus, and re-revealing
+        // there would reopen a subtree the user has since collapsed by hand.
+        if (!revealedRef.current) {
+          revealedRef.current = true
+          revealProject(ps, projectIdFromHash(window.location.hash))
+        }
+        return ps
+      }),
     `projects-${version}`,
   )
-  const projects = allProjects?.filter((p) => !p.archived)
-  const archivedProjects = allProjects?.filter((p) => p.archived) ?? []
+  // Partitioned on EFFECTIVE visibility (task 668), not the raw `archived`
+  // flag: the server hides a project from unscoped reads iff it or any
+  // ancestor is archived, and the sidebar re-derives that same rule here —
+  // otherwise a live child of an archived parent would sit in the main list
+  // while `mesa project list` and every unscoped read omit it.
+  const hiddenIds = effectivelyArchivedIds(allProjects ?? [])
+  const projects = allProjects?.filter((p) => !hiddenIds.has(p.id))
+  const archivedProjects = allProjects?.filter((p) => hiddenIds.has(p.id)) ?? []
   // Per-project todo counts for the project rows; polls like the inbox badge
   // so counts stay current as agents create/close tasks.
   const { data: todos, refetch: refetchTodos } = useFetch(
@@ -195,6 +255,40 @@ export function Sidebar({
   const [archivedCollapsed, setArchivedCollapsed] = useState(true)
   const [unarchiveError, setUnarchiveError] = useState<string | null>(null)
   const [reorderError, setReorderError] = useState<string | null>(null)
+  // Per-project subtree collapse (task 668) — persisted, unlike the two
+  // section headers above: this is a nesting the user arranged themselves, and
+  // having it spring open on every reload is what the persistence answers.
+  const [collapsedIds, setCollapsedIds] = useState(loadCollapsed)
+  function toggleSubtree(id: number): void {
+    setCollapsedIds((c) => {
+      const next = toggleCollapsed(c, id)
+      saveCollapsed(next)
+      return next
+    })
+  }
+
+  // The rows to draw: the flat server array as a depth-annotated tree, minus
+  // whatever sits inside a collapsed subtree.
+  const rows = visibleRows(buildTree(projects ?? []), (id) => collapsedIds.has(id))
+
+  // Landing on a project inside a collapsed subtree must reveal it —
+  // highlighting a row nobody can see is worse than highlighting none.
+  // `expandAncestors` returns the same set when there was nothing to open, so
+  // the ordinary case writes no state and re-renders nothing.
+  //
+  // Called from the two places a landing actually happens — the project list
+  // arriving (a deep link on first paint) and a hash change (navigation) —
+  // rather than from an effect on `activeProjectId`: reacting to the prop
+  // would also fire when the user *collapses* the subtree they are sitting
+  // in, immediately reopening it and making the caret a dead control.
+  function revealProject(list: Project[], id: number | null): void {
+    if (id === null) return
+    setCollapsedIds((c) => {
+      const next = expandAncestors(c, ancestorIds(list, id))
+      if (next !== c) saveCollapsed(next)
+      return next
+    })
+  }
 
   // The board's sensor pair, and for the same two reasons (see KanbanBoard's
   // own comment): mouse gets a distance threshold so an ordinary click still
@@ -215,6 +309,9 @@ export function Sidebar({
     const { active, over } = event
     if (!over || !projects) return
     const id = Number(active.id)
+    // `sortOrderForDrop` scopes itself to the dragged row's own siblings
+    // (task 668) and answers null for a drop under a different parent, so the
+    // whole visible list is the right thing to hand it.
     const sortOrder = sortOrderForDrop(projects, id, Number(over.id))
     if (sortOrder === null) return
     updateProject(id, { sort_order: sortOrder }).then(
@@ -291,14 +388,17 @@ export function Sidebar({
   }, [resizing])
 
   // On phones the expanded sidebar is an overlay drawer; close it once the
-  // user has picked a destination so it doesn't sit over the new page.
+  // user has picked a destination so it doesn't sit over the new page. The
+  // same listener reveals the destination's ancestors (task 668) — navigation
+  // is the external event that should reopen a subtree, not a state change.
   useEffect(() => {
     const onNav = () => {
       if (isPhone()) setCollapsed(true)
+      if (allProjects) revealProject(allProjects, projectIdFromHash(window.location.hash))
     }
     window.addEventListener('hashchange', onNav)
     return () => window.removeEventListener('hashchange', onNav)
-  }, [setCollapsed])
+  }, [setCollapsed, allProjects])
 
   function handleUnarchive(id: number): void {
     setUnarchiveError(null)
@@ -405,29 +505,68 @@ export function Sidebar({
               // across the archive boundary and quietly mean "unarchive".
               <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
                 <SortableContext
-                  items={projects.map((p) => p.id)}
+                  items={rows.map((r) => r.project.id)}
                   strategy={verticalListSortingStrategy}
                 >
                   <ul className="nav-projects">
-                    {projects.map((p) => (
-                      <SortableProject key={p.id} id={p.id}>
-                        <a
-                          className={p.id === activeProjectId ? 'active' : ''}
-                          href={`#/projects/${p.id}`}
-                        >
-                          <span className="nav-project-name">{p.name}</span>
-                          {activeAgentProjectIds.has(p.id) && (
-                            <span className="live-dot on" title="agent running" />
+                    {rows.map(({ project: p, depth }) => {
+                      // Collapsed → the badge sums the subtree, so folding a
+                      // parent away can never hide work (task 668).
+                      const collapsed = collapsedIds.has(p.id)
+                      const todo = todoCountFor(projects, todoCounts, p.id, collapsed)
+                      return (
+                        <SortableProject key={p.id} id={p.id} depth={depth}>
+                          {hasChildren(projects, p.id) ? (
+                            <button
+                              type="button"
+                              className="nav-subtree-caret"
+                              aria-expanded={!collapsed}
+                              aria-label={
+                                collapsed
+                                  ? `Expand ${p.name}'s subprojects`
+                                  : `Collapse ${p.name}'s subprojects`
+                              }
+                              // The row is the drag handle, so the caret has
+                              // to keep its own click (and its own pointer
+                              // press) away from the sensor above it.
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                toggleSubtree(p.id)
+                              }}
+                            >
+                              {collapsed ? '▸' : '▾'}
+                            </button>
+                          ) : (
+                            // A leaf keeps the caret's width so names down a
+                            // level still line up with their siblings'.
+                            <span className="nav-subtree-caret empty" aria-hidden="true" />
                           )}
-                          {(todoCounts.get(p.id) ?? 0) > 0 && (
-                            <span className="inbox-badge todo-badge">
-                              {todoCounts.get(p.id)}
-                            </span>
-                          )}
-                          <GitLine git={gitByProject.get(p.id)} />
-                        </a>
-                      </SortableProject>
-                    ))}
+                          <a
+                            className={p.id === activeProjectId ? 'active' : ''}
+                            href={`#/projects/${p.id}`}
+                          >
+                            <span className="nav-project-name">{p.name}</span>
+                            {activeAgentProjectIds.has(p.id) && (
+                              <span className="live-dot on" title="agent running" />
+                            )}
+                            {todo > 0 && (
+                              <span
+                                className="inbox-badge todo-badge"
+                                title={
+                                  collapsed
+                                    ? 'todo tasks in this project and its subprojects'
+                                    : 'todo tasks in this project'
+                                }
+                              >
+                                {todo}
+                              </span>
+                            )}
+                            <GitLine git={gitByProject.get(p.id)} />
+                          </a>
+                        </SortableProject>
+                      )
+                    })}
                   </ul>
                 </SortableContext>
               </DndContext>
@@ -450,22 +589,34 @@ export function Sidebar({
                 </button>
                 {!archivedCollapsed && (
                   <ul className="nav-projects nav-archived">
-                    {archivedProjects.map((p) => (
-                      <li key={p.id}>
+                    {buildTree(archivedProjects).map(({ project: p, depth }) => (
+                      <li
+                        key={p.id}
+                        style={{ '--nav-depth': depth } as CSSProperties}
+                      >
                         <a
                           className={p.id === activeProjectId ? 'active' : ''}
                           href={`#/projects/${p.id}`}
                         >
                           <span className="nav-project-name">{p.name}</span>
                         </a>
-                        <button
-                          type="button"
-                          className="nav-unarchive-button"
-                          title="Restore to the main project list"
-                          onClick={() => handleUnarchive(p.id)}
-                        >
-                          restore
-                        </button>
+                        {/* `restore` belongs to the row that is actually
+                            archived and whose own parent is not (task 668):
+                            unarchiving it brings the whole subtree back in ONE
+                            call, because the descendants were only ever hidden
+                            by derivation — their rows were never written. A
+                            live child listed under an archived root has
+                            nothing of its own to restore. */}
+                        {p.archived && (p.parent_id === null || !hiddenIds.has(p.parent_id)) && (
+                          <button
+                            type="button"
+                            className="nav-unarchive-button"
+                            title="Restore this project and everything under it to the main list"
+                            onClick={() => handleUnarchive(p.id)}
+                          >
+                            restore
+                          </button>
+                        )}
                       </li>
                     ))}
                   </ul>

@@ -270,6 +270,39 @@ header {
    ordered but not sortable. */
 .nav-project-row {
   touch-action: pan-y;
+  display: flex;
+  align-items: flex-start;
+  /* One indent step per nesting level (mesa task 668). The tree is drawn as
+     one FLAT list — nested <ul>s would break the single sortable context the
+     drag needs — so depth is a custom property the row carries and this rule
+     turns into space. */
+  padding-left: calc(var(--nav-depth, 0) * 0.75rem);
+}
+
+.nav-project-row > a {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Subtree disclosure on a project that has children. Sized like the caret in
+   the section headers, and given the same width as a spacer on leaf rows so
+   names at one level line up whether or not their neighbours nest. */
+.nav-subtree-caret {
+  flex: none;
+  width: 1rem;
+  padding: 0.25rem 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.2;
+  text-align: center;
+}
+
+button.nav-subtree-caret:hover:not(:disabled) {
+  color: var(--cyan);
+  background: none;
+  box-shadow: none;
 }
 
 .nav-project-row.dragging {
@@ -344,6 +377,9 @@ header {
   display: flex;
   align-items: center;
   gap: 0.25rem;
+  /* Archived roots nest their descendants too (mesa task 668) — same indent
+     step as the active list, on top of the group's own base padding. */
+  padding-left: calc(var(--nav-depth, 0) * 0.75rem);
 }
 
 .nav-archived li a {
@@ -482,6 +518,28 @@ main {
   align-items: center;
   flex-wrap: wrap;
   margin: 0 0 1rem;
+}
+
+/* Parent-project picker (mesa task 668), just above the retirement control:
+   an ordinary edit rather than a destructive one, so it carries none of
+   `.project-danger`'s dimming — but it lives in the same quiet footer strip,
+   next to the other whole-project settings. */
+.project-parent {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 2.5rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.project-parent select {
+  max-width: 18rem;
+}
+
+/* ...which then joins straight on beneath it, without a second gap. */
+.project-parent + .project-danger {
+  margin-top: 0.75rem;
 }
 
 /* Discrete, de-emphasized destructive control in the project footer (S8). */

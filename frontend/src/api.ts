@@ -153,6 +153,9 @@ export interface ProjectPatch {
   name?: string
   description?: string | null
   local_path?: string | null
+  /** Manual nav position; the column is NOT NULL, so there is no `| null`
+   *  clear here the way the free-text fields have one. */
+  sort_order?: number
 }
 
 export interface TaskCreate {

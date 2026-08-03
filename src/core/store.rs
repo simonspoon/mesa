@@ -344,6 +344,21 @@ const MIGRATIONS: &[&str] = &[
     END;
     ALTER TABLE tasks DROP COLUMN title;
     ",
+    // Task 666: a project carries a manual `sort_order`, exactly mirroring the
+    // one tasks have carried since migration 6 — same REAL column, same
+    // fractional midpoint insertion, same next-value rule on create. It is
+    // what makes the left nav's project list drag-reorderable, and because
+    // `list_projects` orders by it, `mesa project list` and `GET /api/projects`
+    // agree with the sidebar rather than each holding their own idea of order.
+    //
+    // Backfilled `sort_order = id` (not left at the DEFAULT 0) so an existing
+    // db's list order is byte-identical the instant it upgrades: every row
+    // keeps its creation-order position, and the `id` tiebreak in the new
+    // ORDER BY only ever has to settle rows nobody has dragged.
+    "
+    ALTER TABLE projects ADD COLUMN sort_order REAL NOT NULL DEFAULT 0;
+    UPDATE projects SET sort_order = id;
+    ",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -408,7 +423,8 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
     })
 }
 
-const PROJECT_COLUMNS: &str = "id, name, description, root_commit, local_path, archived";
+const PROJECT_COLUMNS: &str =
+    "id, name, description, root_commit, local_path, archived, sort_order";
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -418,6 +434,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         root_commit: row.get(3)?,
         local_path: row.get(4)?,
         archived: row.get(5)?,
+        sort_order: row.get(6)?,
     })
 }
 
@@ -646,6 +663,10 @@ pub struct ProjectPatch {
     /// `Some(None)` clears the last-known working folder; `Some(Some(dir))`
     /// records it. Machine-local, not unique — no conflict checking.
     pub local_path: Option<Option<String>>,
+    /// Manual nav order (task 666); the caller (the sidebar, via the API)
+    /// computes the fractional value from the drop position, `Store` just
+    /// persists it. Same division of labour as `TaskPatch::sort_order`.
+    pub sort_order: Option<f64>,
 }
 
 /// Fields to change on a task; `None` means leave unchanged.
@@ -985,11 +1006,20 @@ impl Store {
         if let Some(hash) = root_commit {
             self.ensure_commit_free(hash, None)?;
         }
+        // Sort last, by the same next-value rule `create_task` uses: one past
+        // the current maximum rather than a count or a rowid, so a new project
+        // lands at the end of the nav no matter how far prior reordering has
+        // spread the fractional values.
+        let next_sort_order: f64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM projects",
+            [],
+            |r| r.get(0),
+        )?;
         self.conn
             .execute(
-                "INSERT INTO projects (name, description, root_commit, local_path) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                (name, description, root_commit, local_path),
+                "INSERT INTO projects (name, description, root_commit, local_path, sort_order) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (name, description, root_commit, local_path, next_sort_order),
             )
             .map_err(|e| match root_commit {
                 Some(hash) => Self::map_commit_conflict(e, hash),
@@ -1022,9 +1052,13 @@ impl Store {
         self.list_projects_where("")
     }
 
+    /// Manual order first, id as the tiebreak (task 666): the migration
+    /// backfills `sort_order = id`, so rows nobody has dragged stay in
+    /// creation order, and the tiebreak keeps that stable even if two rows
+    /// ever land on the same fractional value.
     fn list_projects_where(&self, clause: &str) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {PROJECT_COLUMNS} FROM projects {clause} ORDER BY id"
+            "SELECT {PROJECT_COLUMNS} FROM projects {clause} ORDER BY sort_order, id"
         ))?;
         let rows = stmt.query_map([], row_to_project)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1121,15 +1155,19 @@ impl Store {
         if let Some(local_path) = &patch.local_path {
             project.local_path = local_path.clone();
         }
+        if let Some(sort_order) = patch.sort_order {
+            project.sort_order = sort_order;
+        }
         self.conn
             .execute(
                 "UPDATE projects SET name = ?1, description = ?2, root_commit = ?3, \
-                 local_path = ?4 WHERE id = ?5",
+                 local_path = ?4, sort_order = ?5 WHERE id = ?6",
                 (
                     &project.name,
                     &project.description,
                     &project.root_commit,
                     &project.local_path,
+                    project.sort_order,
                     id,
                 ),
             )
@@ -3218,6 +3256,105 @@ mod tests {
             vec![a.id, b.id]
         );
         assert!(all.iter().any(|p| p.id == b.id && p.archived));
+    }
+
+    /// Task 666. Three things at once, because they are one contract: the
+    /// migration's `sort_order = id` backfill (a fresh db's list is still in
+    /// creation order), `create_project`'s next-value rule (a new project
+    /// sorts last), and the reorder itself (a midpoint write moves one row
+    /// and rewrites nothing else).
+    #[test]
+    fn projects_list_in_sort_order_and_reorder_moves_one_row() {
+        let (mut store, _dir) = temp_store();
+        let a = store.create_project("alpha", None, None, None).unwrap();
+        let b = store.create_project("beta", None, None, None).unwrap();
+        let c = store.create_project("gamma", None, None, None).unwrap();
+
+        // Backfill/next-value: untouched projects come out in creation order,
+        // each one sort_order past the last.
+        let ids = |ps: Vec<Project>| ps.iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.list_projects().unwrap()), vec![a.id, b.id, c.id]);
+        assert!(a.sort_order < b.sort_order && b.sort_order < c.sort_order);
+
+        // Drag the last to the front: the value the sidebar would compute for
+        // an insert above the head (`first - 1`), written to that row alone.
+        let moved = store
+            .update_project(
+                c.id,
+                &ProjectPatch {
+                    sort_order: Some(a.sort_order - 1.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.sort_order, a.sort_order - 1.0);
+        assert_eq!(ids(store.list_projects().unwrap()), vec![c.id, a.id, b.id]);
+        // The other two rows were not rewritten.
+        assert_eq!(store.get_project(a.id).unwrap(), a);
+        assert_eq!(store.get_project(b.id).unwrap(), b);
+        // Archived rows sort by the same key in the all-inclusive read.
+        assert_eq!(
+            ids(store.list_projects_all().unwrap()),
+            vec![c.id, a.id, b.id]
+        );
+
+        // A project created after the reordering still sorts last, not into
+        // the gap the drag opened up.
+        let d = store.create_project("delta", None, None, None).unwrap();
+        assert_eq!(
+            ids(store.list_projects().unwrap()),
+            vec![c.id, a.id, b.id, d.id]
+        );
+
+        // An update that omits sort_order leaves it alone.
+        let renamed = store
+            .update_project(
+                c.id,
+                &ProjectPatch {
+                    name: Some("gamma!".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(renamed.sort_order, moved.sort_order);
+    }
+
+    /// The backfill on a db that predates the column: existing rows keep
+    /// creation order rather than collapsing onto the DEFAULT 0 (where the
+    /// `id` tiebreak would be doing all the work and the first drag would
+    /// have nothing to interleave between).
+    #[test]
+    fn project_sort_order_migration_backfills_from_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre666.db");
+        // Pinned by index, NOT `MIGRATIONS.len() - 1`: the positional form
+        // silently re-aims at whatever migration ships next, and this test
+        // would then be exercising that one's backfill instead of this one's.
+        const PROJECT_SORT_ORDER: usize = 26;
+        assert!(
+            MIGRATIONS[PROJECT_SORT_ORDER].contains("ALTER TABLE projects ADD COLUMN sort_order"),
+            "PROJECT_SORT_ORDER points at the wrong migration",
+        );
+        let cutoff = PROJECT_SORT_ORDER;
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..cutoff] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", cutoff as i64)
+                .unwrap();
+            conn.execute_batch("INSERT INTO projects (name) VALUES ('one'), ('two'), ('three');")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let listed = store.list_projects().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|p| (p.name.as_str(), p.sort_order))
+                .collect::<Vec<_>>(),
+            vec![("one", 1.0), ("two", 2.0), ("three", 3.0)],
+        );
     }
 
     #[test]

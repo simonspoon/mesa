@@ -1,11 +1,23 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import {
+  DndContext,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import {
   getGitStatus,
   listAllAgents,
   listProjects,
   listTasks,
   unarchiveProject,
+  updateProject,
 } from '../api'
+import { sortOrderForDrop } from '../navOrder'
 import type { GitStatus } from '../types/GitStatus'
 import type { CcTab } from '../pages/CCDashboardView'
 import { isPhone } from '../phoneTier'
@@ -68,6 +80,35 @@ function GitLine({ git }: { git: GitStatus | undefined }) {
       {git.ahead > 0 && <span>↑{git.ahead}</span>}
       {git.behind > 0 && <span>↓{git.behind}</span>}
     </span>
+  )
+}
+
+/**
+ * One draggable project row in the active list (mesa task 666).
+ *
+ * The drag listeners go on the `<li>`, not on a separate grip, so the whole
+ * row is the handle — the same shape as a board card, and the reason the
+ * sensors below carry activation thresholds: a plain click has to reach the
+ * `<a>` inside and navigate.
+ */
+function SortableProject({ id, children }: { id: number; children: ReactNode }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id })
+  return (
+    <li
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={`nav-project-row${isDragging ? ' dragging' : ''}`}
+      {...listeners}
+      {...attributes}
+      // Same reasoning as the board's cards: dnd-kit's `attributes` add
+      // `role="button"`/`tabIndex={0}` for a KeyboardSensor this list doesn't
+      // configure, which would put a dead tab stop ahead of the real one (the
+      // link). Tab and the `hjkl` spatial nav both belong to the <a>.
+      tabIndex={-1}
+    >
+      {children}
+    </li>
   )
 }
 
@@ -153,6 +194,39 @@ export function Sidebar({
   // doesn't push the active project list down by default.
   const [archivedCollapsed, setArchivedCollapsed] = useState(true)
   const [unarchiveError, setUnarchiveError] = useState<string | null>(null)
+  const [reorderError, setReorderError] = useState<string | null>(null)
+
+  // The board's sensor pair, and for the same two reasons (see KanbanBoard's
+  // own comment): mouse gets a distance threshold so an ordinary click still
+  // follows the project link, and touch gets a *delay* rather than a distance
+  // so a vertical swipe scrolls the phone drawer natively instead of picking
+  // a project up. The matching `touch-action: pan-y` is on `.nav-project-row`
+  // in App.css.
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+  )
+
+  // One drag = one PATCH of the dragged project's `sort_order`; the rows it
+  // moved past keep the values they had. `projects` is already in server
+  // order (`ORDER BY sort_order, id`), which is what `sortOrderForDrop`
+  // expects, and a null result means the drop was a no-op — no request.
+  function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event
+    if (!over || !projects) return
+    const id = Number(active.id)
+    const sortOrder = sortOrderForDrop(projects, id, Number(over.id))
+    if (sortOrder === null) return
+    updateProject(id, { sort_order: sortOrder }).then(
+      () => {
+        setReorderError(null)
+        refetch()
+      },
+      (e: unknown) => {
+        setReorderError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
 
   // Drag-resize (mesa task 665), the mirror of the agent sidebar's own. The
   // width is applied as a custom property, never an inline `width`: at the
@@ -325,28 +399,40 @@ export function Sidebar({
             ) : projects.length === 0 ? (
               <p className="muted">No projects yet.</p>
             ) : (
-              <ul className="nav-projects">
-                {projects.map((p) => (
-                  <li key={p.id}>
-                    <a
-                      className={p.id === activeProjectId ? 'active' : ''}
-                      href={`#/projects/${p.id}`}
-                    >
-                      <span className="nav-project-name">{p.name}</span>
-                      {activeAgentProjectIds.has(p.id) && (
-                        <span className="live-dot on" title="agent running" />
-                      )}
-                      {(todoCounts.get(p.id) ?? 0) > 0 && (
-                        <span className="inbox-badge todo-badge">
-                          {todoCounts.get(p.id)}
-                        </span>
-                      )}
-                      <GitLine git={gitByProject.get(p.id)} />
-                    </a>
-                  </li>
-                ))}
-              </ul>
+              // Drag-reorder is scoped to this list alone (mesa task 666):
+              // the archived group below renders in the same order but is
+              // deliberately not sortable, so a drag can never carry a row
+              // across the archive boundary and quietly mean "unarchive".
+              <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+                <SortableContext
+                  items={projects.map((p) => p.id)}
+                  strategy={verticalListSortingStrategy}
+                >
+                  <ul className="nav-projects">
+                    {projects.map((p) => (
+                      <SortableProject key={p.id} id={p.id}>
+                        <a
+                          className={p.id === activeProjectId ? 'active' : ''}
+                          href={`#/projects/${p.id}`}
+                        >
+                          <span className="nav-project-name">{p.name}</span>
+                          {activeAgentProjectIds.has(p.id) && (
+                            <span className="live-dot on" title="agent running" />
+                          )}
+                          {(todoCounts.get(p.id) ?? 0) > 0 && (
+                            <span className="inbox-badge todo-badge">
+                              {todoCounts.get(p.id)}
+                            </span>
+                          )}
+                          <GitLine git={gitByProject.get(p.id)} />
+                        </a>
+                      </SortableProject>
+                    ))}
+                  </ul>
+                </SortableContext>
+              </DndContext>
             )}
+            {reorderError && <p className="error nav-archived-error">{reorderError}</p>}
             {archivedProjects.length > 0 && (
               <>
                 <button

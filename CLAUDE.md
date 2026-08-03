@@ -91,8 +91,8 @@ The code is the source of truth. These are the invariants you must not break:
 - **Frontend unit tests cover the pure logic modules, not components.** vitest
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
-  (`agentProject`, `boardView`, `keyboardScope`, `layout`, `navWidth`,
-  `sessionGraph`, `settingsDraft`, `syntaxHighlighter`, `time`) — predicates that historically
+  (`agentProject`, `boardView`, `keyboardScope`, `layout`, `navOrder`,
+  `navWidth`, `sessionGraph`, `settingsDraft`, `syntaxHighlighter`, `time`) — predicates that historically
   shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
   in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).
@@ -217,6 +217,16 @@ The code is the source of truth. These are the invariants you must not break:
 - A project may be **`archived`** — `docs/archiving.md`. One rule: archiving
   hides a project (and its tasks/storyboards) from **unscoped** reads only;
   every read scoped to an explicit project id/name is byte-identical to before.
+- A project carries a **`sort_order`** (REAL, NOT NULL) — the project-level
+  twin of `Task::sort_order`, and the single source of list order:
+  `Store::list_projects` is `ORDER BY sort_order, id`, so `mesa project list`,
+  `GET /api/projects` and the left nav can never disagree. Backfilled from
+  `id`, so an un-dragged install is in creation order; `create_project` seeds
+  `MAX + 1`, so a new project sorts last. Written by an ordinary update
+  (`project update --sort-order`, `PATCH {"sort_order": n}`) — the sidebar's
+  drag writes the **midpoint** between the drop's neighbours, so one drag is
+  one PATCH of one row and nothing else is renumbered
+  (`frontend/src/navOrder.ts`). Order is server-side, never client-local.
 
 ## Per-feature surfaces — read the linked doc before touching
 

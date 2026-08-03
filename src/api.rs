@@ -1048,6 +1048,12 @@ struct ProjectUpdate {
     root_commit: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     local_path: Option<Option<String>>,
+    /// Manual nav position (task 666). A plain `Option`, not a double one:
+    /// the column is NOT NULL, so there is nothing to clear — absent leaves
+    /// it unchanged, and an explicit `null` or a non-numeric value is a 422
+    /// from serde rather than a silent no-op.
+    #[serde(default)]
+    sort_order: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1132,6 +1138,7 @@ async fn update_project(
         description: body.description,
         root_commit: body.root_commit,
         local_path: body.local_path,
+        sort_order: body.sort_order,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_project(id, &patch)?).into_response())

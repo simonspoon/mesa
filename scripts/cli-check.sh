@@ -44,6 +44,31 @@ ok "project create returns full object, exit 0"
 run 0 "$MESA" project create "Other" --no-git
 P2=$(jqs .id)
 
+# ---- sort_order: the field the sidebar's drag-reorder writes (task 666) ----
+# Creation order first, then the head-insert value a drag computes. jq does the
+# arithmetic: `sort_order` is a REAL, so it serializes as `1.0` and bash's
+# integer-only $(( )) cannot touch it.
+run 0 "$MESA" project list
+[ "$(jqs 'map(select(.id == '"$P"' or .id == '"$P2"')) | map(.id) | join(",")')" = "$P,$P2" ] ||
+  fail "project list: new projects must list in creation order"
+run 0 "$MESA" project show "$P"
+P_ORDER=$(jqs .sort_order)
+[ "$P_ORDER" != "null" ] || fail "project show: sort_order must be present"
+P_ORDER_UP=$(jq -n --argjson f "$P_ORDER" '$f - 1')
+run 0 "$MESA" project update "$P2" --sort-order "$P_ORDER_UP"
+[ "$(jqs ".sort_order == $P_ORDER_UP")" = "true" ] || fail "project update --sort-order: value"
+run 0 "$MESA" project list
+[ "$(jqs 'map(select(.id == '"$P"' or .id == '"$P2"')) | map(.id) | join(",")')" = "$P2,$P" ] ||
+  fail "project list must reflect the new sort_order"
+run 0 "$MESA" project show "$P"
+[ "$(jqs ".sort_order == $P_ORDER")" = "true" ] ||
+  fail "updating one project's sort_order must not rewrite another's"
+# A non-numeric value is a usage error, not a silent no-op.
+run 2 "$MESA" project update "$P2" --sort-order not-a-number
+# Put it back so the rest of the gate sees creation order.
+run 0 "$MESA" project update "$P2" --sort-order "$(jq -n --argjson f "$P_ORDER" '$f + 1')"
+ok "project sort_order: listed order, one-row update, non-numeric is usage"
+
 run 0 "$MESA" task create --project "$P" --description "Design layout" --priority high --tags design,web
 T1=$(jqs .id)
 [ "$(jqs .blocked)" = "false" ] || fail "task create: blocked must be present and false"
@@ -649,8 +674,8 @@ PJQ=$(jqs .id)
 # moves between the two calls (Project carries no timestamp at all).
 run 0 "$MESA" project show "$PJQ"
 printf '%s' "$STDOUT" >"$TMP/pfull.json"
-# non-quiet output is unchanged: the full 6-key project object
-[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,root_commit" ] ||
+# non-quiet output is unchanged: the full 7-key project object
+[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,root_commit,sort_order" ] ||
   fail "project show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("description")')" = "true" ] || fail "project show (no --quiet): description present"
 run 0 "$MESA" project show "$PJQ" --quiet

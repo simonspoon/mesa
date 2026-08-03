@@ -259,6 +259,27 @@ header {
   border-left: 2px solid transparent;
 }
 
+/* Drag-reorderable row in the ACTIVE project list (mesa task 666). The whole
+   row is the drag handle, so it carries the board card's `touch-action:
+   pan-y` for the same reason: the touch sensor activates on a 250ms delay
+   rather than a distance, so a vertical swipe still scrolls the phone drawer
+   instead of picking a project up. `none` here would make the drawer's own
+   list — most of its height — un-scrollable by touch.
+
+   Rows in `.nav-archived` deliberately never get this class: that group is
+   ordered but not sortable. */
+.nav-project-row {
+  touch-action: pan-y;
+}
+
+.nav-project-row.dragging {
+  opacity: 0.4;
+}
+
+.nav-project-row.dragging a {
+  cursor: grabbing;
+}
+
 /* Git status under the project name: quiet telemetry, not a call to action. */
 .nav-git {
   flex-basis: 100%;

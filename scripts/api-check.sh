@@ -15,7 +15,9 @@
 #      status-leaves-in_progress clear, and the `claimed_at` asymmetry that
 #      makes the pair useful (it must NOT move on an ordinary field write);
 #   4. archived-project scoping over HTTP (unscoped hides, scoped does not);
-#   5. LAN mode — the Host allowlist is skipped while the Content-Type gate
+#   5. the project `sort_order` round-trip added by task 666 — the field the
+#      sidebar's drag-reorder writes, and the list order it drives;
+#   6. LAN mode — the Host allowlist is skipped while the Content-Type gate
 #      still applies, the two halves of one posture (CLAUDE.md).
 #
 # Attachment routes have their own gate (scripts/attachments-check.sh); the
@@ -458,12 +460,59 @@ api 404 DELETE "/api/tasks/999999"
 [ "$(jqb .error.code)" = "not_found" ] || fail "DELETE unknown task: error.code"
 ok "DELETE /api/tasks/{id} unknown id: 404 not_found"
 
+# =====================================================================
+# 5. Project sort_order: the drag-reorder round-trip (task 666)
+# =====================================================================
+
+# Baseline: creation order, one sort_order apart, and PROJ was created first.
+api 200 GET "/api/projects"
+[ "$(jqb 'map(select(.id == '"$PROJ"' or .id == '"$OTHER"')) | map(.id) | join(",")')" \
+  = "$PROJ,$OTHER" ] ||
+  fail "GET /api/projects: new projects must list in creation order"
+ok "GET /api/projects: sort_order backfill/next-value keeps creation order"
+
+api 200 GET "/api/projects/$PROJ"
+FIRST_ORDER=$(jqb .sort_order)
+[ "$FIRST_ORDER" != "null" ] || fail "GET /api/projects/{id}: sort_order must be serialized"
+# `sort_order` is a REAL, so it comes back as `1.0` — do the arithmetic and the
+# comparisons in jq, never in bash's integer-only $(( )).
+NEW_ORDER=$(jq -n --argjson f "$FIRST_ORDER" '$f - 1')
+
+# The drag: one PATCH of the moved project alone, with the value the sidebar
+# computes for an insert above the head (`first - 1`).
+api 200 PATCH "/api/projects/$OTHER" "{\"sort_order\": $NEW_ORDER}"
+[ "$(jqb ".sort_order == $NEW_ORDER")" = "true" ] ||
+  fail "PATCH /api/projects/{id}: sort_order must round-trip"
+ok "PATCH /api/projects/{id} {sort_order}: 200 + the new value"
+
+api 200 GET "/api/projects"
+[ "$(jqb 'map(select(.id == '"$PROJ"' or .id == '"$OTHER"')) | map(.id) | join(",")')" \
+  = "$OTHER,$PROJ" ] ||
+  fail "GET /api/projects must reflect the new sort_order"
+ok "GET /api/projects: the reordered project moved, the other one did not"
+
+# The un-dragged project keeps the value it had — one drag is one write.
+api 200 GET "/api/projects/$PROJ"
+[ "$(jqb ".sort_order == $FIRST_ORDER")" = "true" ] ||
+  fail "PATCH of one project must not rewrite another's sort_order"
+ok "PATCH sort_order: neighbours are untouched"
+
+# Omitting the field leaves it alone; a non-numeric value is a 422, never a
+# silent no-op.
+api 200 PATCH "/api/projects/$OTHER" '{"name":"API gate archived project"}'
+[ "$(jqb ".sort_order == $NEW_ORDER")" = "true" ] ||
+  fail "a PATCH without sort_order must leave it unchanged"
+ok "PATCH without sort_order: value unchanged"
+
+api 422 PATCH "/api/projects/$OTHER" '{"sort_order":"first"}'
+ok "PATCH /api/projects/{id} non-numeric sort_order: 422"
+
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
 
 # =====================================================================
-# 5. LAN mode: Host allowlist off, Content-Type gate still on
+# 6. LAN mode: Host allowlist off, Content-Type gate still on
 # =====================================================================
 #
 # `--lan` flips the bind address and the Host policy together — two halves of

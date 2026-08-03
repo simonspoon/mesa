@@ -253,6 +253,11 @@ EXAMPLES
         /// clear it
         #[arg(long, group = "fields")]
         path: Option<String>,
+        /// New manual list position; smaller sorts earlier. Fractional, so a
+        /// value between two neighbours' inserts between them without
+        /// renumbering anything else (the sidebar's drag writes exactly this)
+        #[arg(long, group = "fields")]
+        sort_order: Option<f64>,
         /// Print the project without its `description` instead of in full
         ///
         /// Deliberately outside the `fields` group: it is a modifier, so
@@ -1706,6 +1711,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             description,
             root_commit,
             path,
+            sort_order,
             quiet,
         } => {
             let local_path = match path {
@@ -1718,6 +1724,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                 description: description.map(clear_if_empty),
                 root_commit: root_commit.map(clear_if_empty),
                 local_path,
+                sort_order,
             };
             print_project(&store.update_project(id, &patch)?, quiet);
         }
@@ -2327,6 +2334,7 @@ mod tests {
             root_commit: Some("abc".into()),
             local_path: Some("/tmp/p".into()),
             archived: false,
+            sort_order: 3.5,
         }
     }
 
@@ -2471,6 +2479,7 @@ mod tests {
                 "root_commit",
                 "local_path",
                 "archived",
+                "sort_order",
             ]),
             "Project gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

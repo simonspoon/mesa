@@ -96,6 +96,13 @@ pub struct Project {
     /// `Store::archive_project` / `unarchive_project`; every query scoped to
     /// an explicit project id/name is unaffected.
     pub archived: bool,
+    /// Manual list position (task 666), the project-level twin of
+    /// `Task::sort_order`: `Store::list_projects` orders by it, so the CLI,
+    /// the API and the left nav all render one agreed order. Fractional —
+    /// a drag writes the midpoint between its new neighbours rather than
+    /// renumbering the list, so one drag is one write. Backfilled from `id`,
+    /// so an un-dragged install is still in creation order.
+    pub sort_order: f64,
 }
 
 /// One live Claude Code session as reported by `claude agents --json`.

@@ -3223,13 +3223,188 @@ body.nav-resizing {
   background: none;
 }
 
-.files-content-pane {
+/* The content half (mesa task 670): one pane, or two side by side with a
+   draggable divider between them. `position: relative` anchors the
+   right-edge split drop zone, which is the only absolutely-positioned thing
+   in here. */
+.files-panes {
+  position: relative;
   flex: 1;
   min-width: 0;
-  overflow: auto;
+  display: flex;
+  align-items: stretch;
+}
+
+.files-content-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  /* A column, so the tab strip stays put while only the file below it
+     scrolls — a strip that scrolled away with the content would be a tab bar
+     you cannot reach without scrolling back up. */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border: 1px solid var(--border);
   background: var(--panel);
+}
+
+.files-pane-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
   padding: 0.5rem 0.75rem;
+}
+
+/* Open files, one row, scrolling sideways rather than wrapping — a wrapped
+   strip changes height as tabs are opened, which moves the file underneath
+   it. `flex: none` on the row keeps it out of the pane's height fight. */
+.files-tab-strip {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  min-height: 2rem;
+}
+
+/* Which pane a tree click opens into. Deliberately just a tint on the strip
+   plus the accent under the active tab (below) — a frame around the focused
+   pane reads as an error state in this theme. Inert while unsplit, where the
+   one pane is always the focused one. */
+.files-tab-strip.focused {
+  background: var(--panel-raised);
+}
+
+.files-tab {
+  flex: none;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0 0.25rem 0 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  border-right: 1px solid var(--border);
+  cursor: grab;
+  white-space: nowrap;
+}
+
+.files-tab:hover {
+  background: var(--panel);
+}
+
+/* The active tab wears the file's own language accent as an underline, the
+   same hue its tree row and content header already use. */
+.files-tab.active {
+  background: var(--panel);
+  box-shadow: inset 0 -2px 0 currentColor;
+}
+
+.files-tab-label {
+  background: none;
+  border: none;
+  padding: 0.35rem 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: inherit;
+}
+
+.files-tab-close {
+  background: none;
+  border: none;
+  padding: 0 0.2rem;
+  margin: 0;
+  font: inherit;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.files-tab-close:hover {
+  opacity: 1;
+  color: var(--red);
+}
+
+/* The drop indicator: a rule in the gap the drop would insert at. Drawn on
+   the tab *after* the gap, so it needs no element of its own; the tail gap
+   past the last tab has one, since there is no tab after it. */
+.files-tab.drop-before::before {
+  content: '';
+  position: absolute;
+  left: -1px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--cyan);
+}
+
+.files-tab-drop-tail {
+  flex: none;
+  width: 2px;
+  background: var(--cyan);
+}
+
+.files-split-btn {
+  flex: none;
+  margin-left: auto;
+  align-self: center;
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+}
+
+/* The resize handle. Wider than it looks (the visible rule is a ::before) so
+   it is grabbable without becoming a gap between the panes. */
+.files-pane-divider {
+  flex: none;
+  position: relative;
+  width: 0.5rem;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.files-pane-divider::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--border);
+}
+
+.files-pane-divider:hover::before {
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-dim);
+}
+
+/* Drag a tab here to open the split. Rendered only while a tab drag is in
+   flight, and never at the narrow tier — and starting below the strip, so it
+   never covers the drop-at-the-end-of-the-strip gesture. */
+.files-split-drop {
+  position: absolute;
+  right: 0;
+  top: 2rem;
+  bottom: 0;
+  width: 4rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  background: rgba(6, 10, 16, 0.6);
+}
+
+.files-split-drop.armed {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 12px var(--cyan-dim);
 }
 
 .files-content-header {
@@ -3641,7 +3816,11 @@ body.nav-resizing {
     overflow-y: visible;
   }
 
-  .files-content-pane {
+  /* The viewport-bound box moves to the panes *container* now that a pane is
+     one of possibly two children of it (mesa task 670). There is never
+     actually more than one here — `FilesView` folds the split on the crossing
+     into this tier — but the box belongs to the row either way. */
+  .files-panes {
     height: var(--tab-viewport-height);
     min-height: var(--tab-viewport-min);
   }

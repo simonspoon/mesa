@@ -1,10 +1,29 @@
-import { useDeferredValue, useRef, useState } from 'react'
+import { useDeferredValue, useEffect, useRef, useState } from 'react'
+import type { CSSProperties, DragEvent as ReactDragEvent } from 'react'
 import {
   SyntaxHighlighter,
   vscDarkPlus,
   highlightOverlaySource,
   prismGrammar,
 } from '../syntaxHighlighter'
+import {
+  activateTab,
+  closeTab,
+  collapseSplit,
+  dropIndex,
+  emptyTabsState,
+  focusPane,
+  moveTab,
+  openFile,
+  openPaths,
+  setRatio,
+  splitPane,
+  splitWithTab,
+  type PaneSide,
+  type TabSource,
+  type TabsState,
+} from '../fileTabs'
+import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
@@ -121,6 +140,35 @@ function DeadFolderPlaceholder({ path }: { path: string }) {
   )
 }
 
+/**
+ * One open tab's view state, the part that must outlive a tab switch (mesa
+ * task 670).
+ *
+ * Before tabs there was one open file and `ContentPane` was
+ * `key={selectedPath}`-remounted, which meant this state simply died with the
+ * old file. That is still the right answer for *closing* a tab or switching
+ * project — but flipping to another tab and back is a navigation, and a
+ * navigation that silently ate a half-typed edit would be a bug. So it is
+ * lifted into `FilesView`, keyed by path, and this component is controlled.
+ *
+ * Deliberately not lifted: `saving`/`saveError`, which describe one in-flight
+ * request rather than the file, and which the pane has to be mounted to show.
+ */
+interface FileUiState {
+  editing: boolean
+  draft: string
+  historyOpen: boolean
+  /** The commit shown as a diff in place of the content, if any. */
+  selectedCommit: GitCommit | null
+}
+
+const BLANK_FILE_UI: FileUiState = {
+  editing: false,
+  draft: '',
+  historyOpen: false,
+  selectedCommit: null,
+}
+
 /** The selected file's content: monospace, with a language-tinted header,
  * binary/truncation indicators in place of raw/garbled bytes (M5/M6), and an
  * Edit affordance (task 327) for anything neither binary nor truncated — a
@@ -129,55 +177,49 @@ function DeadFolderPlaceholder({ path }: { path: string }) {
 function ContentPane({
   projectId,
   path,
+  ui,
+  onUi,
 }: {
   projectId: number
   path: string
+  ui: FileUiState
+  onUi: (patch: Partial<FileUiState>) => void
 }) {
   const { data, error, refetch } = useFetch(
     () => getProjectFilesContent(projectId, path),
     `files-content-${projectId}-${path}`,
   )
-  // Not path-keyed off `data` (which reloads under the same component
-  // instance as `path` changes) — the parent remounts this component on
-  // every path change via a `key={path}` prop, so this state naturally
-  // starts fresh per file; switching files mid-edit discards the draft,
-  // matching this app's no-confirmation posture on other destructive UI
-  // actions (deletes, etc.).
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState('')
+  // In-flight state for one save, and the error it may leave behind — the only
+  // two the tab does not carry (see `FileUiState`).
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  // History pane (task 542): a per-file commit list beside the content, and
-  // the commit currently being shown as a side-by-side diff in place of the
-  // content. Both live here rather than in FilesView so they reset with the
-  // same `key={selectedPath}` remount that discards an in-progress edit —
-  // one file's history must never be shown against another file's content.
-  const [historyOpen, setHistoryOpen] = useState(false)
-  const [selectedCommit, setSelectedCommit] = useState<GitCommit | null>(null)
 
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
 
   const editable = !data.is_binary && !data.truncated
+  const { editing, draft, historyOpen, selectedCommit } = ui
 
   function closeHistory() {
-    setHistoryOpen(false)
-    setSelectedCommit(null)
+    onUi({ historyOpen: false, selectedCommit: null })
   }
 
   function startEdit() {
     // Editing and browsing history are mutually exclusive views of the same
     // area — entering edit mode closes history rather than trying to show a
     // textarea and a commit diff in the same pane.
-    closeHistory()
-    setDraft(data!.content)
     setSaveError(null)
-    setEditing(true)
+    onUi({
+      historyOpen: false,
+      selectedCommit: null,
+      draft: data!.content,
+      editing: true,
+    })
   }
 
   function cancelEdit() {
-    setEditing(false)
     setSaveError(null)
+    onUi({ editing: false })
   }
 
   async function save() {
@@ -185,7 +227,7 @@ function ContentPane({
     setSaveError(null)
     try {
       await updateProjectFilesContent(projectId, path, draft)
-      setEditing(false)
+      onUi({ editing: false })
       refetch()
     } catch (e) {
       setSaveError(e instanceof ApiError ? e.message : 'Failed to save file.')
@@ -201,7 +243,7 @@ function ContentPane({
     <FileEditor
       value={draft}
       language={data.language}
-      onChange={setDraft}
+      onChange={(next) => onUi({ draft: next })}
       onCancel={cancelEdit}
       onSave={save}
     />
@@ -232,7 +274,9 @@ function ContentPane({
             )}
             <button
               className="files-edit-btn"
-              onClick={() => (historyOpen ? closeHistory() : setHistoryOpen(true))}
+              onClick={() =>
+                historyOpen ? closeHistory() : onUi({ historyOpen: true })
+              }
             >
               {historyOpen ? 'Hide history' : 'History'}
             </button>
@@ -256,7 +300,7 @@ function ContentPane({
             projectId={projectId}
             path={path}
             selected={selectedCommit}
-            onSelect={setSelectedCommit}
+            onSelect={(commit) => onUi({ selectedCommit: commit })}
           />
           <div className="files-history-main">
             {selectedCommit !== null ? (
@@ -264,7 +308,7 @@ function ContentPane({
                 projectId={projectId}
                 commit={selectedCommit}
                 path={path}
-                onBack={() => setSelectedCommit(null)}
+                onBack={() => onUi({ selectedCommit: null })}
               />
             ) : (
               body
@@ -602,9 +646,258 @@ function TreeNode({
   )
 }
 
+/** A path's last segment — what a tab is labelled with. The full relative
+ *  path stays on the tab's `title`, since basenames collide constantly
+ *  (`mod.rs`, `index.ts`) and the strip has no room to disambiguate. */
+function basename(path: string): string {
+  const i = path.lastIndexOf('/')
+  return i < 0 ? path : path.slice(i + 1)
+}
+
+/** The tab being dragged, for the length of one HTML5 drag.
+ *
+ * Module scope rather than component state on purpose: `dragover` fires many
+ * times a second and must be able to *read* the source to decide whether the
+ * drop is legal, and `DataTransfer.getData` is deliberately blank outside
+ * `drop` for exactly that read. A ref would work too; a module-level slot is
+ * simpler and there is only ever one drag in flight in one window. */
+let dragging: TabSource | null = null
+
+/** Where a drop indicator is currently showing: a strip and the gap in it. */
+interface DropMark {
+  side: PaneSide
+  index: number
+}
+
+/**
+ * One pane's tab strip: its open files in order, plus the Split control.
+ *
+ * All of the decision-making is `fileTabs.ts`; this owns the DOM half of it —
+ * measuring the tabs so `dropIndex` has rects to work with, and painting the
+ * indicator at the gap that measurement chose.
+ */
+function TabStrip({
+  side,
+  tabs,
+  active,
+  focused,
+  canSplit,
+  mark,
+  onActivate,
+  onClose,
+  onSplit,
+  onDragBegin,
+  onDragFinish,
+  onDragOverStrip,
+  onDropOnStrip,
+  onDragLeaveStrip,
+}: {
+  side: PaneSide
+  tabs: string[]
+  active: string | null
+  focused: boolean
+  canSplit: boolean
+  mark: DropMark | null
+  onActivate: (path: string) => void
+  onClose: (path: string) => void
+  onSplit: () => void
+  onDragBegin: () => void
+  onDragFinish: () => void
+  onDragOverStrip: (index: number) => void
+  onDropOnStrip: (index: number) => void
+  onDragLeaveStrip: () => void
+}) {
+  const stripRef = useRef<HTMLDivElement>(null)
+
+  // The pure part is `dropIndex`; the measuring stays here, where the DOM is.
+  function indexAt(clientX: number): number {
+    const strip = stripRef.current
+    if (strip === null) return tabs.length
+    const rects = [...strip.querySelectorAll('[data-file-tab]')].map((el) => {
+      const r = el.getBoundingClientRect()
+      return { left: r.left, right: r.right }
+    })
+    return dropIndex(rects, clientX)
+  }
+
+  // `dragenter` and `dragover` do the same thing, and both must: a browser
+  // treats an element as a drop target only from the moment one of them calls
+  // `preventDefault()`, so a pointer that crosses into a strip and releases
+  // before the first `dragover` fires would otherwise see the drop rejected.
+  function over(e: ReactDragEvent) {
+    if (dragging === null) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    onDragOverStrip(indexAt(e.clientX))
+  }
+
+  return (
+    <div
+      className={`files-tab-strip${focused ? ' focused' : ''}`}
+      ref={stripRef}
+      onDragEnter={over}
+      onDragOver={over}
+      onDragLeave={onDragLeaveStrip}
+      onDrop={(e) => {
+        if (dragging === null) return
+        e.preventDefault()
+        onDropOnStrip(indexAt(e.clientX))
+      }}
+    >
+      {tabs.map((path, i) => (
+        <div
+          key={path}
+          data-file-tab=""
+          title={path}
+          draggable
+          className={`files-tab ${accentClass(languageOfName(basename(path)))}${
+            path === active ? ' active' : ''
+          }${mark !== null && mark.side === side && mark.index === i ? ' drop-before' : ''}`}
+          onDragStart={(e) => {
+            dragging = { side, path }
+            e.dataTransfer.effectAllowed = 'move'
+            // Some browsers cancel a drag that carries no payload at all.
+            e.dataTransfer.setData('text/plain', path)
+            onDragBegin()
+          }}
+          onDragEnd={() => {
+            dragging = null
+            onDragFinish()
+          }}
+          // Middle-click closes, the editor convention. `auxclick` rather than
+          // `mouseup` so it fires once and only for a real button-2 click.
+          onAuxClick={(e) => {
+            if (e.button === 1) {
+              e.preventDefault()
+              onClose(path)
+            }
+          }}
+        >
+          <button
+            type="button"
+            className="files-tab-label"
+            onClick={() => onActivate(path)}
+          >
+            {basename(path)}
+          </button>
+          <button
+            type="button"
+            className="files-tab-close"
+            aria-label={`Close ${path}`}
+            onClick={() => onClose(path)}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+      {/* The tail gap, so a drop past the last tab has something to mark. */}
+      {mark !== null && mark.side === side && mark.index >= tabs.length && (
+        <span className="files-tab-drop-tail" aria-hidden="true" />
+      )}
+      {canSplit && (
+        <button
+          type="button"
+          className="files-split-btn"
+          onClick={onSplit}
+          title="Show a second file beside this one"
+        >
+          Split
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** A tab strip over the pane's active file — or, with nothing open, the same
+ *  empty state the single pane showed before tabs existed. */
+function FilePane({
+  projectId,
+  side,
+  tabs,
+  active,
+  focused,
+  canSplit,
+  mark,
+  fileUi,
+  onUi,
+  onFocus,
+  onActivate,
+  onClose,
+  onSplit,
+  onDragBegin,
+  onDragFinish,
+  onDragOverStrip,
+  onDropOnStrip,
+  onDragLeaveStrip,
+  style,
+}: {
+  projectId: number
+  side: PaneSide
+  tabs: string[]
+  active: string | null
+  focused: boolean
+  canSplit: boolean
+  mark: DropMark | null
+  fileUi: Map<string, FileUiState>
+  onUi: (path: string, patch: Partial<FileUiState>) => void
+  onFocus: () => void
+  onActivate: (path: string) => void
+  onClose: (path: string) => void
+  onSplit: () => void
+  onDragBegin: () => void
+  onDragFinish: () => void
+  onDragOverStrip: (index: number) => void
+  onDropOnStrip: (index: number) => void
+  onDragLeaveStrip: () => void
+  style?: CSSProperties
+}) {
+  return (
+    <section
+      className={`files-content-pane${focused ? ' focused' : ''}`}
+      style={style}
+      onMouseDown={onFocus}
+    >
+      <TabStrip
+        side={side}
+        tabs={tabs}
+        active={active}
+        focused={focused}
+        canSplit={canSplit}
+        mark={mark}
+        onActivate={onActivate}
+        onClose={onClose}
+        onSplit={onSplit}
+        onDragBegin={onDragBegin}
+        onDragFinish={onDragFinish}
+        onDragOverStrip={onDragOverStrip}
+        onDropOnStrip={onDropOnStrip}
+        onDragLeaveStrip={onDragLeaveStrip}
+      />
+      <div className="files-pane-body">
+        {active !== null ? (
+          // Only the *active* tab of each pane is mounted, so a dozen open
+          // files never means a dozen live syntax highlighters. What survives
+          // the switch is `fileUi`, one plain object per path, in the parent.
+          // `key` still carries the path so `useFetch` and the editor start
+          // clean per file, exactly as the pre-tabs `key={selectedPath}` did.
+          <ContentPane
+            key={active}
+            projectId={projectId}
+            path={active}
+            ui={fileUi.get(active) ?? BLANK_FILE_UI}
+            onUi={(patch) => onUi(active, patch)}
+          />
+        ) : (
+          <p className="muted">Select a file to see its content.</p>
+        )}
+      </div>
+    </section>
+  )
+}
+
 /**
  * The Files tab: the project's file tree (rooted at local_path) on the left,
- * expandable per directory, with the selected file's content on the right.
+ * expandable per directory, with the open files' content on the right.
  * The root level loads eagerly with the tab; each directory's own contents
  * load lazily on first expand and are cached thereafter (mesa task 410),
  * so the per-directory entry cap applies to one folder at a time instead of
@@ -614,15 +907,34 @@ function TreeNode({
  * read-only. Rendered in place inside ProjectTasksPage's frame, like
  * GitView. Empty states are quiet placeholders, matching the Git tab's
  * ladder, never a hard error (M10).
+ *
+ * The content half holds *many* open files as a strip of draggable tabs and
+ * can split once, into two side-by-side panes with independent strips (mesa
+ * task 670). None of that is deep-linked or persisted: it is component state
+ * with the same lifetime `selectedPath` had, reset on project change.
  */
 export function FilesView({ projectId }: { projectId: number }) {
   const { data, error } = useFetch(
     () => getProjectFiles(projectId),
     `files-${projectId}`,
   )
-  // Selected path and expanded dirs are component state, not URL (no
-  // deep-linking into the tree, matching GitView's selectedPath).
-  const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  // The open set — tabs, order, which pane is focused, whether it is split and
+  // at what ratio — together with the per-open-path view state that must
+  // outlive a tab switch. Component state, not URL and not localStorage: the
+  // same lifetime the single `selectedPath` had (no deep-linking into the
+  // tree).
+  //
+  // **One** state object, not two, and that is load-bearing: dropping a
+  // closed path's draft has to happen in the same update that closes it, and
+  // an updater is the only place with both the previous and the next tabs in
+  // hand. `fileUi` is keyed by path, so the same file open in both panes of a
+  // split shares one draft — the only coherent answer when both are editing
+  // the same bytes.
+  const [open, setOpen] = useState<{
+    tabs: TabsState
+    fileUi: Map<string, FileUiState>
+  }>(() => ({ tabs: emptyTabsState(), fileUi: new Map() }))
+  const { tabs, fileUi } = open
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   // Fetched-directory cache (mesa task 410's lazy per-directory walk):
   // populated on first expand, kept for the component's lifetime so
@@ -638,6 +950,35 @@ export function FilesView({ projectId }: { projectId: number }) {
   // `matchMedia` for the component to keep in sync (same rule the phone tab
   // bar follows, App.css).
   const [treeOpen, setTreeOpen] = useState(true)
+  // Whether a tab drag is in flight at all — what arms the right-edge split
+  // zone. Distinct from `mark`, which is only set while the pointer is over a
+  // strip: leaving the strip for the edge clears the indicator but must not
+  // take the drop target it is heading for with it.
+  const [dragActive, setDragActive] = useState(false)
+  // Where the drop indicator is painting, for the length of one drag.
+  const [mark, setMark] = useState<DropMark | null>(null)
+  // Whether a tab is currently over the right-edge split zone.
+  const [edgeArmed, setEdgeArmed] = useState(false)
+  const panesRef = useRef<HTMLDivElement>(null)
+  // A split of a ≤860px content area is two unusable columns, and the split is
+  // a React data structure rather than styling — so unlike `treeOpen` this one
+  // genuinely needs the breakpoint in JS (`docs/mobile.md`, same exception the
+  // terminal's pane tree takes one tier down).
+  const narrow = useNarrowTier()
+  // Edge-triggered on the crossing, never derived: re-deriving would re-fold a
+  // split the user opened at, say, 800px, on every render.
+  useEffect(
+    () =>
+      onNarrowTierChange((isNarrow) => {
+        if (!isNarrow) return
+        setOpen((prev) =>
+          prev.tabs.right === null
+            ? prev
+            : { ...prev, tabs: collapseSplit(prev.tabs) },
+        )
+      }),
+    [],
+  )
   // Reset on project change (render-time, off the changed prop — same
   // pattern as GitView/HistoryPane): this component isn't remounted when the
   // route moves between projects, so a stale selection from project A must
@@ -645,10 +986,44 @@ export function FilesView({ projectId }: { projectId: number }) {
   const [prevProject, setPrevProject] = useState(projectId)
   if (projectId !== prevProject) {
     setPrevProject(projectId)
-    setSelectedPath(null)
+    setOpen({ tabs: emptyTabsState(), fileUi: new Map() })
     setExpanded(new Set())
     setChildrenCache(new Map())
     setTreeOpen(true)
+  }
+
+  /**
+   * Every tabs write goes through here, as a **transition off the previous
+   * state** rather than off the render's `tabs` — so two opens landing in one
+   * batch both take effect, instead of the second overwriting the first from
+   * a stale closure. A `null` transition (`fileTabs.ts`'s no-op answer) writes
+   * nothing at all.
+   *
+   * It is also where a path whose last tab just closed drops its draft and
+   * history — the "closing a tab discards its draft, no confirm" half of the
+   * state lifetime, and the reason this is one updater and not two.
+   */
+  function commit(step: (prev: TabsState) => TabsState | null) {
+    setOpen((prev) => {
+      const next = step(prev.tabs)
+      if (next === null || next === prev.tabs) return prev
+      const keep = new Set(openPaths(next))
+      const stale = [...prev.fileUi.keys()].filter((p) => !keep.has(p))
+      if (stale.length === 0) return { tabs: next, fileUi: prev.fileUi }
+      const fileUi = new Map(prev.fileUi)
+      for (const p of stale) fileUi.delete(p)
+      return { tabs: next, fileUi }
+    })
+  }
+
+  function patchUi(path: string, patch: Partial<FileUiState>) {
+    setOpen((prev) => ({
+      ...prev,
+      fileUi: new Map(prev.fileUi).set(path, {
+        ...(prev.fileUi.get(path) ?? BLANK_FILE_UI),
+        ...patch,
+      }),
+    }))
   }
 
   function ensureChildren(path: string) {
@@ -680,6 +1055,20 @@ export function FilesView({ projectId }: { projectId: number }) {
     if (opening) ensureChildren(entry.path)
   }
 
+  // Same `dragenter`-as-well-as-`dragover` rule as the strips above.
+  function armEdge(e: ReactDragEvent) {
+    if (dragging === null) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    setEdgeArmed(true)
+  }
+
+  function endDrag() {
+    setDragActive(false)
+    setMark(null)
+    setEdgeArmed(false)
+  }
+
   if (error && !data) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
 
@@ -689,6 +1078,47 @@ export function FilesView({ projectId }: { projectId: number }) {
   }
   if (data.tree === null) {
     return <DeadFolderPlaceholder path={data.path} />
+  }
+
+  const split = tabs.right !== null
+  // The tree's highlight follows the focused pane's active tab — the file the
+  // user is looking at, in a split as much as out of one.
+  const selectedPath = (split && tabs.focused === 'right' ? tabs.right! : tabs.left)
+    .active
+
+  function paneProps(side: PaneSide) {
+    const pane = side === 'left' ? tabs.left : tabs.right!
+    return {
+      projectId,
+      side,
+      tabs: pane.tabs,
+      active: pane.active,
+      focused: !split || tabs.focused === side,
+      // One level of splitting, and the control only makes sense with
+      // something to show in the second pane.
+      canSplit: !split && !narrow && pane.active !== null,
+      mark,
+      fileUi,
+      onUi: patchUi,
+      onFocus: () => commit((prev) => focusPane(prev, side)),
+      onActivate: (path: string) => commit((prev) => activateTab(prev, side, path)),
+      onClose: (path: string) => commit((prev) => closeTab(prev, side, path)),
+      onSplit: () => commit(splitPane),
+      onDragBegin: () => setDragActive(true),
+      onDragFinish: endDrag,
+      onDragOverStrip: (index: number) => {
+        setEdgeArmed(false)
+        setMark({ side, index })
+      },
+      onDropOnStrip: (index: number) => {
+        const from = dragging
+        if (from !== null) commit((prev) => moveTab(prev, from, side, index))
+        endDrag()
+      },
+      // Only the indicator goes; the drag is still live and may yet land on
+      // the other strip or the split zone.
+      onDragLeaveStrip: () => setMark(null),
+    }
   }
 
   return (
@@ -728,7 +1158,9 @@ export function FilesView({ projectId }: { projectId: number }) {
                 childrenCache={childrenCache}
                 selectedPath={selectedPath}
                 onSelectFile={(path) => {
-                  setSelectedPath(path)
+                  // Opens into the focused pane and activates it — or just
+                  // activates the tab already holding it, wherever that is.
+                  commit((prev) => openFile(prev, path))
                   // Opening a file closes the tree, which is what makes the
                   // phone tier's stacked layout usable: the tree is a full
                   // column of rows, so leaving it up pushes the file itself
@@ -740,19 +1172,57 @@ export function FilesView({ projectId }: { projectId: number }) {
               />
             ))}
           </ul>
-          <div className="files-content-pane">
-            {selectedPath !== null ? (
-              // `key={selectedPath}` remounts on every file switch, which is
-              // what discards any in-progress edit's local state (draft,
-              // editing) when the user picks a different file — simpler than
-              // threading a reset effect through ContentPane.
-              <ContentPane
-                key={selectedPath}
-                projectId={projectId}
-                path={selectedPath}
-              />
-            ) : (
-              <p className="muted">Select a file to see its content.</p>
+          <div className="files-panes" ref={panesRef}>
+            <FilePane
+              {...paneProps('left')}
+              style={split ? { flex: `0 0 calc(${tabs.ratio * 100}% - 0.25rem)` } : undefined}
+            />
+            {split && (
+              <>
+                {/* Pointer events, not HTML5 drag: a divider is a continuous
+                    resize, and a drag image following the cursor would be
+                    nonsense. Capture keeps the drag alive over the panes'
+                    own iframes/textareas. */}
+                <div
+                  className="files-pane-divider"
+                  role="separator"
+                  aria-orientation="vertical"
+                  onPointerDown={(e) => {
+                    e.currentTarget.setPointerCapture(e.pointerId)
+                  }}
+                  onPointerMove={(e) => {
+                    if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
+                    const box = panesRef.current?.getBoundingClientRect()
+                    if (box === undefined || box.width === 0) return
+                    const ratio = (e.clientX - box.left) / box.width
+                    commit((prev) => setRatio(prev, ratio))
+                  }}
+                  onPointerUp={(e) => {
+                    e.currentTarget.releasePointerCapture(e.pointerId)
+                  }}
+                />
+                <FilePane {...paneProps('right')} style={{ flex: '1 1 0' }} />
+              </>
+            )}
+            {/* Drag a tab onto the right edge to open the split. Rendered
+                only mid-drag, so it never eats a click, and never at the
+                narrow tier, where there is no split to enter. */}
+            {!split && !narrow && dragActive && (
+              <div
+                className={`files-split-drop${edgeArmed ? ' armed' : ''}`}
+                onDragEnter={armEdge}
+                onDragOver={armEdge}
+                onDragLeave={() => setEdgeArmed(false)}
+                onDrop={(e) => {
+                  if (dragging === null) return
+                  e.preventDefault()
+                  const from = dragging
+                  commit((prev) => splitWithTab(prev, from))
+                  endDrag()
+                }}
+              >
+                <span>Split</span>
+              </div>
             )}
           </div>
         </div>

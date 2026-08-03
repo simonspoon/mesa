@@ -16,11 +16,18 @@ trigger is the absence of hover rather than a narrow screen (see *The canvas
 gesture model*). Reach for it only when that distinction is real — width is
 the default.
 
-`isPhone()` in `frontend/src/phoneTier.ts` (`matchMedia('(max-width: 600px)')`)
-is the one JS mirror of the phone tier. Anything new that needs the phone tier
-should prefer a CSS rule over a second JS media query — see *The scrim* below
-for the pattern; both `.drawer-scrim` and `.phone-tabbar` are rendered
-unconditionally and switched on by CSS alone.
+`frontend/src/phoneTier.ts` is the one JS mirror of these tiers, and holds
+**exactly one `MediaQueryList` per tier** — `isPhone()`/`usePhoneTier()`/
+`onPhoneTierChange()` over the 600px query, and `isNarrow()`/`useNarrowTier()`/
+`onNarrowTierChange()` over the 860px one (added by mesa task 670 for the Files
+tab's split). A second `matchMedia` for a query this module already owns, or a
+width breakpoint mirrored into JS anywhere else, is what it exists to prevent.
+Anything new that needs a tier should still prefer a CSS rule over a JS query
+at all — see *The scrim* below for the pattern; both `.drawer-scrim` and
+`.phone-tabbar` are rendered unconditionally and switched on by CSS alone. The
+exceptions are named where they occur, and both are the same shape: a *React
+data structure* whose meaning differs across the tier (the terminal's pane
+tree, the Files tab's split), which CSS could only hide rather than change.
 
 ## The three phone invariants
 
@@ -217,7 +224,7 @@ rather than a second `isPhone()` call.
 | CC Dashboard | grids collapse to 1 column; wide tables scroll inside `.cc-table-wrap` behind a frozen identity column — see *CC Dashboard tables* |
 | History rows | wrap instead of holding fixed timestamp/actor columns |
 | Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
-| Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified — see *Files tab and the unified diff* |
+| Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified; the content half is one pane, never split — see *Files tab and the unified diff* |
 | Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
 | Terminal / Agent panes | one pane, no split UI; shell height follows the on-screen keyboard — see *Terminal and agent panes* |
 | Inbox | body text wraps unbreakable URLs; the assign `<select>` is capped to its row — see *Crossing the breakpoint* for the audit's other half |
@@ -581,6 +588,14 @@ The rule: **tier-dependent state is edge-triggered on the crossing, never
 derived from the current tier.** `onPhoneTierChange()` in `phoneTier.ts` is
 that edge — it wraps the same one `MediaQueryList`'s `change` event, which
 fires only when `matches` flips.
+
+The Files tab's split (mesa task 670) is the second instance, one tier up:
+two side-by-side content panes are not survivable below 860px, so
+`onNarrowTierChange()` — the same shape over that tier's own single
+`MediaQueryList` — folds an open split onto the focused pane on the way in,
+and does nothing on the way out. Deriving instead would re-fold a split the
+user opened at 800px on every render, which is the same defect in a different
+place.
 
 Deriving instead (`collapsed = phone`) is the tempting shape and is wrong: it
 re-asserts on every render, so it would reopen a drawer the user just closed.

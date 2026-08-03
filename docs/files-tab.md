@@ -104,7 +104,8 @@ this surface.
 - Web UI: `FilesView` (`frontend/src/pages/FilesView.tsx`) under the project
   tabs — a left-hand expandable file tree (`.files-tree`, directories
   toggled open/closed in local component state, no deep-linking) and a
-  right-hand content pane, registered like the Git/Agents/Storyboards tabs (a
+  right-hand **content half holding many open files as tabs** (task 670, see
+  its own section below), registered like the Git/Agents/Storyboards tabs (a
   boolean `files` route prop threaded `App.tsx` → `ProjectTasksPage.tsx`'s tab
   bar + content switch). The root level loads eagerly with the tab (one
   `getProjectFiles(id)` call); each directory's contents load lazily on
@@ -154,18 +155,18 @@ this surface.
   Prism's markdown grammar in the shared table. Save errors
   (e.g. a 422 if the file changed underneath into something non-editable
   since it was loaded) render inline and keep edit mode open, mirroring
-  `InlineEdit`'s own error handling. Switching to a different file mid-edit
-  silently discards the draft (`ContentPane` is `key={selectedPath}`-remounted
-  on every selection change) — no confirm, matching this app's
-  no-confirmation posture on other destructive UI actions.
+  `InlineEdit`'s own error handling. **Closing** a tab mid-edit silently
+  discards its draft — no confirm, matching this app's no-confirmation posture
+  on other destructive UI actions. Merely *switching* tabs does not: see the
+  tabs section below for which half of that changed in task 670 and why.
   Beside **Edit** sits a **History** toggle (task 542). Open, it renders
   `FileHistoryPane` — a vertical commit list (`.files-history-pane`) for the
   selected file — to the *left* of the content, which keeps rendering as
   normal; picking a commit swaps only that content half for
   `CommitSideBySidePane`, an old|new rendering of that commit's change to
-  this file, with a `← File` affordance back. History state lives in
-  `ContentPane`, so the same `key={selectedPath}` remount that discards an
-  edit draft also clears it — one file's history can never be shown against
+  this file, with a `← File` affordance back. History state rides with the
+  open tab, alongside its edit draft (see the tabs section) — one file's
+  history can never be shown against
   another file's content. Edit and History are mutually exclusive views of
   the same area: entering edit mode closes history rather than trying to
   show a textarea and a commit diff at once. The pane's empty states are the
@@ -230,3 +231,88 @@ this surface.
   binary file still renders "Binary file — cannot display" instead of raw
   content; the no-`local_path` and dead-folder empty-state rungs render the
   same quiet-placeholder pattern as the Git tab, never a hard error.
+
+## Open files: tabs and the one-level split (task 670)
+
+The content half holds *many* open files, as a horizontally-scrolling strip of
+tabs above the file, and can split once into two side-by-side panes each with
+its own strip, active file and content. Frontend-only — every tab reads the
+same `GET /api/projects/{id}/files/content?path=` the single pane always read,
+and no route, `src/core/files.rs` function, store method or migration changed.
+
+**The decisions live in `frontend/src/fileTabs.ts`**, unit-tested in
+`fileTabs.test.ts` — same rule and same reason as `navOrder.ts` (CLAUDE.md):
+what an open, a close or a drop *resolves to* is the part that ships wrong, and
+it must be reachable by vitest rather than only by khora. `FilesView.tsx` keeps
+the fetching, the DOM and the drag events; it measures tab rects and hands them
+to `dropIndex`, and every state transition is one of that module's exports.
+
+The model is a `left` pane, an optional `right` pane, a `focused` side and a
+`ratio` — deliberately **not** a recursive pane tree. One split, side by side,
+is the whole feature; a tree would be a data structure most of whose states no
+UI can produce. Invariants the module preserves and its tests assert:
+`right === null` implies `focused === 'left'`; a pane's `active` is `null`
+exactly when it has no tabs and is otherwise one of them; no pane lists a path
+twice.
+
+- **Opening.** A tree click opens into the focused pane and activates it.
+  Already open in that pane → activate, never a second tab. Already open in the
+  *other* pane → focus that pane and activate it there, rather than minting a
+  duplicate. Dedupe is therefore **per pane**, and the one place the same path
+  is legitimately open twice is what the Split control produces (below). The
+  tree's `selected` row highlight follows the focused pane's active tab.
+- **Closing.** The × or a middle-click. Closing the active tab activates its
+  right-hand neighbour, else its left. Emptying a pane while split *collapses*
+  the split and the survivor takes the full width; emptying the only pane
+  leaves the same "Select a file" empty state as before.
+- **Split.** Entered from the strip's **Split** button — which **copies** the
+  active tab into a new right pane, because moving it would empty a one-tab
+  source pane and collapse the split it just created — or by dragging a tab
+  onto the right-hand edge zone, which **moves** it, and is refused (no-op)
+  when it is the source pane's only tab, for the same reason. A
+  `.files-pane-divider` sets the ratio, clamped to 0.15–0.85: a zero-width pane
+  still holds tabs and a focus, i.e. state with no way back to it.
+- **Drag.** Native HTML5 drag, not dnd-kit — this is a desktop-only affordance
+  over two short strips, with none of the collision detection or sortable
+  context the board and nav need. The dragged tab is held in a module-level
+  slot rather than `DataTransfer`, because `dragover` has to *read* it to
+  decide the drop and `getData` is deliberately blank outside `drop`. The drop
+  index is the board's midpoint scheme (`dropIndex`); a same-strip drop at the
+  tab's own index or the one just past it writes nothing, which is also what
+  makes "dropped on itself" a no-op with no special case.
+- **Per-tab state.** An open tab's edit draft, edit mode, open History and
+  selected commit are one `FileUiState` per path in `FilesView`, so flipping
+  to another tab and back is lossless — a navigation that silently ate a
+  half-typed edit would be a bug. Closing the tab (or switching project)
+  discards it, with no confirm: every `TabsState` write goes through
+  `FilesView`'s `commit()`, which drops the `FileUiState` of any path no longer
+  in `openPaths()`. Only the **active** tab of each pane is mounted, so a dozen
+  open files is never a dozen live syntax highlighters; `ContentPane` still
+  carries `key={path}` so `useFetch` and the editor start clean per file,
+  exactly as the pre-tabs `key={selectedPath}` did.
+- **Lifetime.** Tabs, order, split and ratio are component state with the same
+  lifetime the old single `selectedPath` had: reset on project change, no URL
+  hash, no `localStorage`, no server persistence. (Contrast `navWidth.ts`,
+  which *is* persisted — this matches the tab's existing "no deep-linking into
+  the tree" posture instead.)
+- **Mobile.** No split below the **narrow** tier (≤860px): a two-up split of a
+  360px screen is unusable, the Split control is not rendered, and a split open
+  when the viewport crosses that tier is folded onto the focused pane. That
+  fold is edge-triggered off `onNarrowTierChange()` in `phoneTier.ts` — which
+  gained the narrow query for this, under that module's standing rule of one
+  `MediaQueryList` **per tier** and never a second for the same one
+  (`docs/mobile.md`). It is in JS rather than CSS for the same reason the
+  terminal's pane tree is: the split is a React data structure, and a CSS rule
+  could only *hide* the second pane, leaving state whose meaning no longer
+  matches the screen. The strip scrolls horizontally at every width rather than
+  wrapping — a wrapping strip changes height as tabs open, which moves the file
+  underneath it. The phone tier's existing `treeOpen` breadcrumb collapse is
+  untouched.
+- **Keyboard.** No new global single-key shortcuts (`docs/keyboard.md`). Each
+  tab's label and its × are real `<button>`s reachable by Tab, as is Split, and
+  the editor's existing Escape-cancels / Cmd-Ctrl+Enter-saves bindings are
+  unchanged.
+
+Non-goals, deliberately: no new file operations (still no create, delete or
+rename), no recursive or stacked splits, no third pane, and nothing about
+`SideBySideDiff`, the markdown path or `syntaxHighlighter.ts` changed.

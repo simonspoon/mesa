@@ -16,11 +16,30 @@ import { useSyncExternalStore } from 'react'
  */
 const PHONE_QUERY = '(max-width: 600px)'
 
-// One `MediaQueryList` for the whole app, so "the one JS mirror" stays
-// literally one: `isPhone()` and `usePhoneTier()` below read the same object,
-// and a second `matchMedia(...)` call anywhere else is the thing this module
-// exists to prevent.
+/**
+ * The *narrow* tier (`docs/mobile.md`'s other width tier) — tablet and
+ * split-screen widths, where `.files-layout` and `.git-layout` already stack
+ * into a column.
+ *
+ * It lives here for the same reason the phone query does, and under the same
+ * rule: this module is the one place a width breakpoint may be mirrored into
+ * JS, and there is exactly one `MediaQueryList` **per tier**, never a second
+ * for the same one. Prefer a CSS rule to either.
+ *
+ * Its one JS consumer is the Files tab's split (mesa task 670): two side-by-
+ * side content panes are not survivable below 860px, and the split is a React
+ * data structure — a CSS rule could only hide the second pane, leaving state
+ * whose meaning no longer matches what is on screen. Same argument
+ * `usePhoneTier()` makes for the terminal's pane tree, one tier up.
+ */
+const NARROW_QUERY = '(max-width: 860px)'
+
+// One `MediaQueryList` per tier for the whole app, so "the one JS mirror"
+// stays literally one: `isPhone()` and `usePhoneTier()` below read the same
+// object, and a second `matchMedia(...)` call anywhere else is the thing this
+// module exists to prevent.
 const mql = window.matchMedia(PHONE_QUERY)
+const narrowMql = window.matchMedia(NARROW_QUERY)
 
 export const isPhone = () => mql.matches
 
@@ -67,4 +86,31 @@ export function onPhoneTierChange(
  */
 export function usePhoneTier(): boolean {
   return useSyncExternalStore(subscribe, isPhone, () => false)
+}
+
+export const isNarrow = () => narrowMql.matches
+
+/**
+ * `onPhoneTierChange()`'s twin for the narrow tier, and edge-triggered for the
+ * same reason: the Files tab's split is tier-dependent *state*, so it must be
+ * folded on the crossing rather than re-derived on every render — deriving it
+ * would re-collapse a split the user re-opened at, say, 800px.
+ */
+export function onNarrowTierChange(cb: (narrow: boolean) => void): () => void {
+  const handler = (e: MediaQueryListEvent) => cb(e.matches)
+  narrowMql.addEventListener('change', handler)
+  return () => narrowMql.removeEventListener('change', handler)
+}
+
+/** Reactive form of `isNarrow()`, for the same narrow exception: the Files
+ *  tab renders one pane and hides the Split control below 860px. */
+export function useNarrowTier(): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      narrowMql.addEventListener('change', cb)
+      return () => narrowMql.removeEventListener('change', cb)
+    },
+    isNarrow,
+    () => false,
+  )
 }

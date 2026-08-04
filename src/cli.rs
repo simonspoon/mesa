@@ -340,8 +340,8 @@ enum TaskCmd {
     /// (--parent) must be in the same project as its parent.
     ///
     /// The description is required and is the task's whole identity: its first
-    /// line, cut to 50 chars, is the `name` the board and every agent session
-    /// show. Give it positionally, with --description, or from a file.
+    /// non-empty line, cut to 50 chars, is the `name` the board and every agent
+    /// session show. Give it positionally, with --description, or from a file.
     #[command(after_help = "\
 EXAMPLES
   mesa task create 1 \"Draft homepage copy\"
@@ -353,7 +353,7 @@ EXAMPLES
         /// Project the task belongs to, by id or name (immutable after creation)
         #[arg(value_name = "PROJECT", required_unless_present = "project")]
         project_pos: Option<String>,
-        /// The task itself, in free text; its first line is the task's name
+        /// The task itself, in free text; its first non-empty line is the task's name
         #[arg(
             value_name = "DESCRIPTION",
             required_unless_present_any = ["description", "description_file"],
@@ -697,7 +697,8 @@ EXAMPLES
     /// file (hooks.json beside the database; MESA_HOOKS_FILE overrides) with
     /// the full task JSON on stdin, MESA_HOOK/MESA_TASK_ID/MESA_TASK_NAME/
     /// MESA_PROJECT_ID/MESA_DB in the environment, and the project's
-    /// local_path as the working directory when set. The hook's own exit code
+    /// local_path as the working directory when that folder exists (else the
+    /// caller's own cwd is inherited). The hook's own exit code
     /// lands in `exit_code` — a nonzero hook still exits 0 here. No hook
     /// configured is an error (code "validation").
     #[command(after_help = "\

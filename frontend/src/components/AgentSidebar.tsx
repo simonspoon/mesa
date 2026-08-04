@@ -19,6 +19,11 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
 import { isStaleWorking, projectForCwd } from '../agentProject'
+import {
+  clampAgentSidebarWidth,
+  DEFAULT_AGENT_SIDEBAR_WIDTH,
+  MIN_MAIN_WIDTH,
+} from '../agentSidebarWidth'
 import * as ptyPool from '../lib/ptyPool'
 import {
   axisPos,
@@ -46,15 +51,12 @@ import { useFetch } from '../useFetch'
 import { agentTerminalDescriptor } from './AgentTerminal'
 import { PtySlot } from './PtySlot'
 
-const MIN_WIDTH = 280
-const DEFAULT_WIDTH = 448 // 28rem, matches the CSS fallback
-// No fixed upper cap (unlike the old 720px ceiling) — but `main` still needs
-// a floor, or dragging past it squeezes its content (the CC Dashboard's
-// cards, etc.) into character-by-character wrapping rather than a clean
-// overflow the browser would otherwise catch. Measured live off `main`'s own
-// rect each move, not a hardcoded viewport fraction, so it tracks the left
-// nav sidebar's actual width (collapsed or expanded) instead of assuming one.
-const MIN_MAIN_WIDTH = 320
+// Width floors, the default and the clamp all live in `agentSidebarWidth.ts`
+// (mesa task 685) — a pure module so the rule is unit-tested, matching
+// `navWidth.ts`. There is still no fixed upper cap (unlike the old 720px
+// ceiling); the ceiling is `main`'s floor, measured live off `main`'s own rect
+// rather than a hardcoded viewport fraction, so it tracks the left nav
+// sidebar's actual width (collapsed or expanded) instead of assuming one.
 
 // The 'Agents' session-list rail (mesa task 414): docked to the sidebar
 // body's fixed right edge, independent of the tile area's agent panes —
@@ -550,7 +552,7 @@ export function AgentSidebar({
     ACTIVE: false,
     DONE: true,
   })
-  const [width, setWidth] = useState(DEFAULT_WIDTH)
+  const [width, setWidth] = useState(DEFAULT_AGENT_SIDEBAR_WIDTH)
   const [resizing, setResizing] = useState(false)
   // Maximized: the panel grows to fill the whole main content area (in place
   // of the fixed drag-resized width), matching the storyboard canvas's own
@@ -646,7 +648,7 @@ export function AgentSidebar({
       const next = window.innerWidth - e.clientX
       const mainLeft = document.querySelector('main')?.getBoundingClientRect().left ?? 0
       const max = window.innerWidth - mainLeft - MIN_MAIN_WIDTH
-      setWidth(Math.min(max, Math.max(MIN_WIDTH, next)))
+      setWidth(clampAgentSidebarWidth(next, max))
     }
     const onUp = () => setResizing(false)
     document.addEventListener('mousemove', onMove)
@@ -658,6 +660,29 @@ export function AgentSidebar({
       document.body.classList.remove('agent-sidebar-resizing')
     }
   }, [resizing])
+
+  // Mount/expand clamp (mesa task 685): the default width is sized for a
+  // readable cc session, which is wider than a small window can give — and
+  // the initial width is otherwise used raw, since only the *drag* clamps. So
+  // every time the panel becomes visible (mount if already open, and each
+  // expand) pull the current width back through the same clamp the drag uses,
+  // against the same live `max`. It may only shrink: a user who dragged
+  // narrower on purpose must never be widened back out by a re-expand. Expand
+  // is the trigger rather than a `window.resize` listener — while the panel is
+  // open, `main`'s own floor is what a resize would violate, and that is
+  // enforced the same way everywhere else in the shell.
+  useEffect(() => {
+    if (collapsed) return
+    const clampToLayout = () => {
+      const mainLeft = document.querySelector('main')?.getBoundingClientRect().left ?? 0
+      const max = window.innerWidth - mainLeft - MIN_MAIN_WIDTH
+      // `Math.min` on top of the clamp is the only-shrink rule: the clamp
+      // alone would also *raise* a sub-floor width, which is not this
+      // effect's business.
+      setWidth((w) => Math.min(w, clampAgentSidebarWidth(w, max)))
+    }
+    clampToLayout()
+  }, [collapsed])
 
   // List-rail drag-resize (mesa task 414): the handle sits on the rail's own
   // left edge, so the new width is the distance from the pointer to the

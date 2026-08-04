@@ -2551,7 +2551,7 @@ body.files-tree-resizing {
 
 .agent-sidebar {
   flex: none;
-  width: var(--agent-sidebar-width, 28rem);
+  width: var(--agent-sidebar-width, 55rem);
   position: sticky;
   top: 0;
   /* Fills the shell-body's definite height — see `.sidebar`. */
@@ -2697,7 +2697,7 @@ body.files-tree-resizing {
   /* Stays at the last expanded width even while the aside itself clips to
      2.5rem on collapse — an attached terminal's fitted size must not change
      under a collapse/expand cycle (see the comment on AgentSidebar.tsx). */
-  width: var(--agent-sidebar-width, 28rem);
+  width: var(--agent-sidebar-width, 55rem);
   display: flex;
   /* Row: the tile area (agent panes) and the 'Agents' list rail (task 414)
      sit side by side, the rail fixed to the trailing edge. */

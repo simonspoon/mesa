@@ -858,8 +858,10 @@ EXAMPLES
 enum CcCmd {
     /// Print the full dashboard as one JSON object (overview + breakdowns)
     ///
-    /// Reads Claude Code's own session transcripts under ~/.claude/projects and
-    /// aggregates them. This is read-only telemetry, not mesa data — no project
+    /// Ingests anything new from Claude Code's own session transcripts under
+    /// ~/.claude/projects (the same pass `cc sync` runs), then aggregates the
+    /// persisted `cc_*` rows — so a session stays counted after Claude Code
+    /// deletes its transcript. This is telemetry, not mesa data — no project
     /// or task is touched. Costs are estimates from a static price table.
     #[command(after_help = "\
 EXAMPLES
@@ -867,13 +869,15 @@ EXAMPLES
   mesa cc summary --window all    # everything
   mesa cc summary --window 7d")]
     Summary {
-        /// Time window: 7d | 30d | 90d | all | <n>d
+        /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
+        /// falls back to 30d)
         #[arg(long, default_value = "30d")]
         window: String,
     },
     /// Print per-session rows as a bare JSON array, newest first
     Sessions {
-        /// Time window: 7d | 30d | 90d | all | <n>d
+        /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
+        /// falls back to 30d)
         #[arg(long, default_value = "30d")]
         window: String,
         /// Cap the number of rows
@@ -882,12 +886,13 @@ EXAMPLES
     },
     /// Print one session's call tree as a JSON graph (nodes + edges)
     ///
-    /// One node per tool call and per subagent run, rooted at the session's
-    /// main thread. A subagent hangs off the `Task` call that spawned it.
-    /// Session and agent nodes carry their own rolled-up tokens; a tool node
-    /// carries the tokens of the assistant message that ISSUED the call, which
-    /// siblings share — `tokens_are_rollup` marks the difference, and tool-node
-    /// tokens must never be summed.
+    /// One node per tool call, per subagent run and per assistant message that
+    /// emitted prose (a `response` node), rooted at the session's main thread.
+    /// A subagent hangs off the `Task` call that spawned it.
+    /// Session and agent nodes carry their own rolled-up tokens; a tool or
+    /// response node carries the tokens of the assistant message that ISSUED
+    /// it, which siblings share — `tokens_are_rollup` marks the difference, and
+    /// those tokens must never be summed.
     #[command(after_help = "\
 EXAMPLES
   mesa cc graph 72c9161c-16c9-47f4-8217-39fde068a39b
@@ -895,14 +900,18 @@ EXAMPLES
     Graph {
         /// The session id (as printed by `mesa cc sessions`)
         session_id: String,
-        /// Cap on tool nodes. Subagent runs and the calls that spawned them
-        /// are always kept, so the tree stays connected.
+        /// Cap on tool nodes, applied a second time to `response` nodes as
+        /// their own separate budget; what each one dropped is reported as
+        /// `omitted_tool_calls` / `omitted_responses`. Subagent runs and the
+        /// calls that spawned them never count against it and are always
+        /// kept, so the tree stays connected.
         #[arg(long, default_value_t = crate::core::cc::GRAPH_NODE_LIMIT)]
         limit: usize,
     },
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
-        /// Time window: 7d | 30d | 90d | all | <n>d
+        /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
+        /// falls back to 30d)
         #[arg(long, default_value = "30d")]
         window: String,
     },
@@ -919,25 +928,33 @@ EXAMPLES
   mesa cc sync --rebuild   # clear cursors, re-walk everything from scratch")]
     Sync {
         /// Clear all cc_files cursors first, forcing every transcript to be
-        /// re-parsed from byte 0. Use after a cc.rs parsing fix, so it
-        /// retroactively applies to already-ingested history. Existing rows
-        /// are corrected in place (upsert on a stable key), never truncated.
+        /// re-parsed from byte 0. Never truncates: every row inserts on a
+        /// stable key and an already-stored row keeps its values, only its
+        /// still-NULL columns are backfilled. So a cc.rs parsing fix applies
+        /// retroactively only when it makes the parser emit a row it
+        /// previously missed entirely; changing an ingested row's values
+        /// still means deleting that row by hand first.
         #[arg(long)]
         rebuild: bool,
     },
     /// Print currently-running sessions (the live-sessions object)
     ///
     /// Sessions whose newest transcript event lands inside the last `--minutes`,
-    /// each with a per-minute token "spark" and active/idle status.
+    /// each with a per-minute token "spark" and active/idle status. Parses the
+    /// recent transcript files directly — unlike the dashboard pages this one
+    /// neither ingests nor reads the `cc_*` tables, so it stays cheap to poll.
     Live {
-        /// Recency window in minutes (1..=1440)
+        /// Recency window in minutes. A value outside 1..=1440 is CLAMPED into
+        /// that range, not rejected — `--minutes 0` succeeds with a 1-minute
+        /// window
         #[arg(long, default_value_t = crate::core::cc::DEFAULT_LIVE_MINUTES)]
         minutes: i64,
     },
     /// Print live subscription usage (plan limits + reset times) as one JSON object
     ///
     /// Fetches Anthropic's `/usage` data using the local Claude Code OAuth token
-    /// (macOS Keychain or ~/.claude/.credentials.json). Unlike the other `cc`
+    /// (the `CLAUDE_CODE_OAUTH_TOKEN` env var, the macOS Keychain, or
+    /// ~/.claude/.credentials.json). Unlike the other `cc`
     /// subcommands this is a network read; on a missing token or unreachable
     /// upstream it prints `{"error":{"code":"unavailable",...}}` and exits 1.
     Usage,

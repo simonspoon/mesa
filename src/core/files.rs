@@ -350,6 +350,60 @@ pub fn read_file(root: &str, rel: &str) -> Option<FileContentView> {
     })
 }
 
+/// Whole-file byte cap for [`read_file_download`] — deliberately three orders
+/// of magnitude above [`FILE_CONTENT_CAP`], because the two caps answer
+/// different questions: `FILE_CONTENT_CAP` bounds a JSON *view* a browser has
+/// to render, this one bounds only how much memory one response may occupy.
+/// It exists at all because the crate has no streaming-body dependency (no
+/// `tokio-util`), so the API layer builds the response from a `Vec<u8>` held
+/// whole in memory; a file past this size is refused rather than read. Adding
+/// a dependency to stream instead is a separate decision, not this cap's job.
+const FILE_DOWNLOAD_CAP: u64 = 100 * 1024 * 1024;
+
+/// Why [`read_file_download`] rejected the request, collapsing causes the same
+/// way [`WriteFileError`] does:
+///   - `NotFound`: [`safe_path`] rejected `rel` (traversal, absolute-path
+///     smuggling, symlink escape, nonexistent path), the target is a
+///     directory, or an `fs` call (metadata/open/read) failed — the same
+///     "io failure collapses to NotFound" precedent [`write_file`] sets.
+///   - `TooLarge`: the file is bigger than [`FILE_DOWNLOAD_CAP`]. Detected by
+///     stat, so an over-cap file is never read into memory at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadFileError {
+    NotFound,
+    TooLarge,
+}
+
+/// Returns `(basename, full bytes)` for the file at `rel` under `root` — the
+/// raw file, for saving to disk, NOT the capped/sniffed view [`read_file`]
+/// builds for display. So: no [`FILE_CONTENT_CAP`], no binary sniff, no lossy
+/// UTF-8, and every file qualifies — including the two the viewer can show
+/// nothing useful for (binary, and text past the display cap), which is
+/// exactly where a download earns its place. [`read_file`] and
+/// `FILE_CONTENT_CAP` are untouched by this path.
+///
+/// `rel` is resolved through [`safe_path`] like every other reader here — no
+/// second path-resolution rule. The basename is the RESOLVED path's final
+/// component (so it can never carry a directory prefix out of `rel`), falling
+/// back to `rel` only if there is none.
+pub fn read_file_download(root: &str, rel: &str) -> Result<(String, Vec<u8>), DownloadFileError> {
+    let path = safe_path(root, rel).ok_or(DownloadFileError::NotFound)?;
+    // Stat before reading: an over-cap file must be refused, not slurped.
+    let meta = fs::metadata(&path).map_err(|_| DownloadFileError::NotFound)?;
+    if meta.is_dir() {
+        return Err(DownloadFileError::NotFound);
+    }
+    if meta.len() > FILE_DOWNLOAD_CAP {
+        return Err(DownloadFileError::TooLarge);
+    }
+    let bytes = fs::read(&path).map_err(|_| DownloadFileError::NotFound)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| rel.to_string());
+    Ok((name, bytes))
+}
+
 /// Why [`write_file`] rejected the request. Both variants collapse many
 /// distinct causes into one, mirroring `read_file`'s own "one `None` for
 /// traversal/absolute/unlisted/directory" precedent:
@@ -931,6 +985,103 @@ mod tests {
         fs::write(dir.path().join("notes.xyz"), "plain text").unwrap();
         let v = read_file(root, "notes.xyz").unwrap();
         assert_eq!(v.language, None);
+    }
+
+    // --- read_file_download -------------------------------------------------
+
+    #[test]
+    fn read_file_download_returns_basename_and_full_text_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("src/core")).unwrap();
+        fs::write(dir.path().join("src/core/main.rs"), "fn main() {}\n").unwrap();
+
+        let (name, bytes) = read_file_download(root, "src/core/main.rs").unwrap();
+        // The final component, never the `rel` that was asked for.
+        assert_eq!(name, "main.rs");
+        assert_eq!(bytes, b"fn main() {}\n");
+    }
+
+    #[test]
+    fn read_file_download_returns_binary_bytes_verbatim_including_nuls() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let raw: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x00, 0x0d, 0x0a];
+        fs::write(dir.path().join("img.png"), &raw).unwrap();
+        // The display path shows nothing for this file — the download must
+        // still hand back every byte, unchanged and not lossy-UTF-8'd.
+        assert!(read_file(root, "img.png").unwrap().is_binary);
+
+        let (name, bytes) = read_file_download(root, "img.png").unwrap();
+        assert_eq!(name, "img.png");
+        assert_eq!(bytes, raw);
+    }
+
+    #[test]
+    fn read_file_download_returns_an_over_display_cap_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let big = "a".repeat(FILE_CONTENT_CAP + 1000);
+        fs::write(dir.path().join("big.txt"), &big).unwrap();
+        // The viewer shows this one `truncated`; the download is the whole file.
+        assert!(read_file(root, "big.txt").unwrap().truncated);
+
+        let (_, bytes) = read_file_download(root, "big.txt").unwrap();
+        assert_eq!(bytes.len(), big.len());
+        assert_eq!(bytes, big.as_bytes());
+    }
+
+    #[test]
+    fn read_file_download_not_found_for_traversal_absolute_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        let root = root.to_str().unwrap();
+
+        for bad in ["../secret.txt", "/etc/passwd", "nope.txt"] {
+            assert_eq!(
+                read_file_download(root, bad),
+                Err(DownloadFileError::NotFound),
+                "path {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_file_download_not_found_for_directory_given_as_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert_eq!(
+            read_file_download(root, "sub"),
+            Err(DownloadFileError::NotFound)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_file_download_not_found_for_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "top secret").unwrap();
+        symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+
+        assert_eq!(
+            read_file_download(root.to_str().unwrap(), "link.txt"),
+            Err(DownloadFileError::NotFound)
+        );
+    }
+
+    #[test]
+    fn read_file_download_cap_sits_far_above_the_display_cap() {
+        // No 100 MiB fixture: the length check is asserted by the one property
+        // that matters for the cases above — every file the viewer can open,
+        // truncated ones included, is comfortably under the download cap.
+        assert!(FILE_DOWNLOAD_CAP > FILE_CONTENT_CAP as u64);
     }
 
     // --- write_file ---------------------------------------------------------

@@ -17,9 +17,10 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   both `root` and `root.join(rel)` (resolving `.`/`..` **and** symlinks) and
   requires the result to be `root` itself or a descendant — rejects
   `../` traversal, absolute-path smuggling, symlink escapes, and nonexistent
-  paths in one check. `read_file`, `write_file`, `tree_level` and
-  `create_file` are its only callers — and `create_file` is the one that
-  resolves something other than the request path itself (see below).
+  paths in one check. `read_file`, `read_file_download`, `write_file`,
+  `tree_level` and `create_file` are its only callers — and `create_file` is
+  the one that resolves something other than the request path itself (see
+  below).
 - `pub fn tree_level(root: &str, rel: &str) -> Option<(Vec<FileTreeEntry>, bool)>`
   (mesa task 410) lists ONE directory level — `root` itself when `rel` is
   `""`, else the subdirectory `rel` resolves to underneath `root`, resolved
@@ -45,6 +46,21 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   bytes with the same lossy-UTF8/char-boundary truncation as `git.rs::capped`.
   `language` is an extension→tag lookup (e.g. `rs`→`rust`) set in both
   branches — it describes the file, not the content.
+- `pub fn read_file_download(root: &str, rel: &str) -> Result<(String,
+  Vec<u8>), DownloadFileError>` (task 683) returns `(basename, full bytes)` —
+  the file, not a view of it. It resolves `rel` through the same `safe_path`
+  and rejects a directory the same way, but shares nothing else with
+  `read_file`: no `FILE_CONTENT_CAP`, no binary sniff, no lossy UTF-8. It
+  stats first (`fs::metadata().len()`) and returns `TooLarge` for anything
+  over `FILE_DOWNLOAD_CAP` (100 MiB) rather than reading it; every other
+  failure — `safe_path` rejecting `rel`, a directory, any `fs` error —
+  collapses to `NotFound`, `write_file`'s precedent. The cap exists because
+  the crate has no streaming-body dependency (no `tokio-util`), so the
+  response is built from a `Vec<u8>` held whole in memory; adding a
+  dependency to stream instead is a separate decision. The basename is the
+  **resolved** path's final component (never a directory prefix out of
+  `rel`), falling back to `rel` only when there is none. `read_file` and
+  `FILE_CONTENT_CAP` are untouched by this path.
 - `pub fn write_file(root: &str, rel: &str, content: &str) -> Result<(),
   WriteFileError>` (task 327) reuses `read_file` to resolve `rel` and check
   editability before writing a byte, then re-resolves via `safe_path` for the
@@ -105,6 +121,32 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   matching the Git tab's "bad sha and no repo both mean not_found"
   precedent. Content reads are not cached (on-demand, one file, cheap, like
   the Git tab's diff routes).
+- `GET /api/projects/{id}/files/download?path=<relpath>` (task 683) → the
+  file's raw bytes via `files::read_file_download`. Same `?path=` contract as
+  the content GET above and the same error mapping — missing `?path=` is 422
+  `validation`, and no `local_path` / dead folder / anything `safe_path`
+  rejects is 404 `not_found` with the identical `file not found: <path>`
+  message. `DownloadFileError::TooLarge` is the one addition: 422
+  `validation`, "file is larger than mesa can download". No new error code.
+
+  **Why a route and not a client-side blob of `content`:** the content GET
+  returns `content: ""` for a binary file and caps text at
+  `FILE_CONTENT_CAP`, so building the download in the browser from that
+  payload would hand the user an empty or silently truncated file — and
+  binary and truncated files are precisely the two the viewer can show
+  nothing useful for, which is where the button earns its place. So the
+  affordance is offered for **every** file, unlike Edit.
+
+  `Content-Type` is a **fixed** `application/octet-stream` — never sniffed,
+  never derived from the extension, so a repo's own `.html`/`.svg` can never
+  be served inline as same-origin markup off this API. `Content-Disposition`
+  comes from the **existing** `content_disposition()` helper the attachments
+  download uses (quoting + RFC 5987 escaping included), not a second copy.
+  Gate: the standard `guard` only, like the content GET and the git reads —
+  it is a read, so neither `require_local_path_write` nor
+  `require_agent_access` applies and the Content-Type gate doesn't fire on a
+  GET. Adding a download does not make this surface a delete, rename or move:
+  it still has none of those.
 - `PATCH /api/projects/{id}/files/content` (task 327; same path as the GET
   above, body `{path, content}` — JSON, not a query string, so this mutating
   call stays inside the Content-Type CSRF gate, same reasoning as the
@@ -148,7 +190,8 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   here. The commit a user then picks is diffed through the **existing**
   `GET /api/projects/{id}/git/commits/{sha}/diff?path=` route unchanged; no
   new diff endpoint exists for this feature.
-- Tree listing and content reads stay standard-guard-only, like the Git tab —
+- Tree listing, content reads and the byte download stay standard-guard-only,
+  like the Git tab —
   no agent-style gate (browsing executes nothing) and no Content-Type gate
   (GET-only). The two writes above are the exception: both are gated by
   `require_agent_access` and both, being mutations with JSON bodies, sit
@@ -172,6 +215,18 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   *collapses* the tree behind a breadcrumb toggle (`treeOpen`, task 559),
   because a full tree above the file pushes the file below the fold; the flag
   is inert at every wider width, and the reasoning is in `docs/mobile.md`. A
+  The viewer's header (`.files-header-actions`, hidden in edit mode) carries
+  up to three controls. **Download** (task 683) is the only one shown
+  unconditionally — binary and truncated files get it too — and sits last,
+  after Edit and History. It is a real `<button>`, not an `<a download>`,
+  because the app's button chrome hangs off the `button` element selector in
+  `index.css`; consequently the feature needed no new CSS. Clicking it
+  `fetch`es `projectFileDownloadUrl()`, then clicks a throwaway
+  `<a download={basename(path)}>` at an object URL it revokes immediately.
+  Going through `fetch` rather than a plain link is what keeps a 404/422
+  *inside* the pane (the API's own `error.message`, in the existing
+  `saveError` slot) instead of navigating the SPA away to a JSON error page;
+  the button is disabled while a download is in flight, mirroring Save. A
   non-binary, non-truncated file's content pane
   shows an **Edit** button; clicking it swaps the rendered content for a
   full-height `<textarea>` (`.files-content-editor`) pre-filled with the

@@ -420,6 +420,17 @@ export function getProjectFilesContent(
 }
 
 /**
+ * Raw-bytes download URL for one file of the project's tree (mesa task 683) —
+ * the file itself, not the capped/binary-blanked view above, which is why the
+ * download can't be built client-side from `content`. Fetched (not used as an
+ * `<a href>`) so a 404/422 renders in the pane instead of navigating the SPA
+ * away to a JSON error page.
+ */
+export function projectFileDownloadUrl(id: number, path: string): string {
+  return `/api/projects/${id}/files/download?path=${encodeURIComponent(path)}`
+}
+
+/**
  * Saves a file's full content, overwriting it on disk. Path and content ride
  * the JSON body (matches the request wrapper's Content-Type header, keeping
  * this mutating call inside the API's CSRF gate). A binary/truncated target,

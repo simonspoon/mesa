@@ -871,6 +871,15 @@ fn router(state: AppState) -> Router {
                 .patch(update_project_files_content)
                 .post(create_project_file),
         )
+        // The same file as raw bytes, for saving to disk (task 683). A
+        // separate route rather than a flag on the one above because the two
+        // return different things: that one a capped, binary-blanked JSON
+        // *view*, this one the file. Still a plain read — standard guard only,
+        // like its sibling's GET.
+        .route(
+            "/api/projects/{id}/files/download",
+            get(download_project_file),
+        )
         // New-project folder picker: unscoped (not one project's local_path)
         // server-side directory listing, plus creating one folder to pick.
         // Loopback-only in BOTH serve modes, reusing `require_local_path_write`
@@ -2607,6 +2616,72 @@ async fn get_project_files_content(
     view.map(|v| Json(v).into_response()).ok_or_else(not_found)
 }
 
+/// Files tab raw-bytes download (task 683) — the same `?path=` contract as
+/// [`get_project_files_content`] above (missing `path` 422 `validation`, no
+/// `local_path` / dead folder / anything `safe_path` rejects 404 `not_found`
+/// with the identical message), differing only in what comes back: the file
+/// itself rather than a `FileContentView`. That is why it is a server route at
+/// all — a client-side blob built from `content` would be empty for a binary
+/// file and silently short for one past `FILE_CONTENT_CAP`, the two cases this
+/// button most exists for.
+///
+/// `Content-Type` is a FIXED `application/octet-stream`, never sniffed or
+/// derived from the extension: a repo's own `.html`/`.svg` must never be
+/// servable as same-origin markup off this API. `Content-Disposition` reuses
+/// [`content_disposition`] verbatim — the attachments download's header
+/// builder, quoting and RFC 5987 escaping included.
+///
+/// Gate: the standard `guard` only, like `get_project_files_content` and the
+/// git read routes. It reads a file the tree route already lists; it writes
+/// nothing, so neither `require_local_path_write` nor `require_agent_access`
+/// applies, and the Content-Type gate doesn't fire on a GET.
+async fn download_project_file(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FilesContentQuery>,
+) -> ApiResult<Response> {
+    let wanted = q.path.ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {wanted}"),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let rel = wanted.clone();
+    // Reading a whole file isn't free; keep it off the async workers, same
+    // rationale as the content route's own read.
+    let read = tokio::task::spawn_blocking(move || files::read_file_download(&root, &rel))
+        .await
+        .unwrap_or(Err(files::DownloadFileError::NotFound));
+    let (filename, bytes) = match read {
+        Ok(v) => v,
+        Err(files::DownloadFileError::NotFound) => return Err(not_found()),
+        Err(files::DownloadFileError::TooLarge) => {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: "file is larger than mesa can download".into(),
+            });
+        }
+    };
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, content_disposition(&filename)),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 #[derive(Deserialize)]
 struct FilesContentUpdate {
     path: String,
@@ -4247,6 +4322,164 @@ mod tests {
         )
         .await;
         assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Files tab: GET /files/download (mesa task 683) --------------------
+
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn files_download_serves_raw_bytes_as_an_attachment() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let raw: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x0a];
+        std::fs::write(root.join("src/img.png"), &raw).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = download_project_file(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("src/img.png".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Fixed octet-stream — never sniffed, never the extension's type.
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/octet-stream"
+        );
+        let disp = resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disp.starts_with("attachment; "), "{disp}");
+        // The basename, not the `rel` that was requested.
+        assert!(disp.contains("filename=\"img.png\""), "{disp}");
+        assert_eq!(body_bytes(resp).await, raw);
+    }
+
+    #[tokio::test]
+    async fn files_download_serves_a_truncated_file_whole() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let big = "a".repeat(300 * 1024);
+        std::fs::write(root.join("big.txt"), &big).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        // The view route caps it...
+        let view = get_project_files_content(
+            State(state.clone()),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("big.txt".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(json_body(view).await["truncated"], true);
+
+        // ...the download route does not.
+        let resp = download_project_file(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("big.txt".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body_bytes(resp).await.len(), big.len());
+    }
+
+    #[tokio::test]
+    async fn files_download_missing_query_is_validation_error() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let err = download_project_file(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery { path: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "validation");
+    }
+
+    #[tokio::test]
+    async fn files_download_traversal_and_bad_paths_are_not_found() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for bad in ["../secret.txt", "/etc/passwd", "nope.txt", "sub"] {
+            let err = download_project_file(
+                State(state.clone()),
+                Path(id),
+                Query(FilesContentQuery {
+                    path: Some(bad.to_string()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::NOT_FOUND, "path {bad:?}");
+            assert_eq!(err.code, "not_found", "path {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn files_download_no_local_path_or_dead_folder_is_not_found() {
+        let (dir, state) = test_state();
+        let no_path_project = new_project(&state, None);
+        let err = download_project_file(
+            State(state.clone()),
+            Path(no_path_project),
+            Query(FilesContentQuery {
+                path: Some("a.txt".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        let gone = dir.path().join("gone").to_str().unwrap().to_string();
+        let dead_project = new_project(&state, Some(&gone));
+        let err = download_project_file(
+            State(state),
+            Path(dead_project),
+            Query(FilesContentQuery {
+                path: Some("a.txt".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     // --- Files tab: PATCH /files/content (mesa task 327) -------------------

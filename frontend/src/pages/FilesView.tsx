@@ -44,6 +44,7 @@ import {
   getProjectFilesContent,
   getProjectGitCommitDiff,
   getProjectGitFileLog,
+  projectFileDownloadUrl,
   updateProjectFilesContent,
 } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
@@ -185,8 +186,9 @@ function DeadFolderPlaceholder({ path }: { path: string }) {
  * navigation that silently ate a half-typed edit would be a bug. So it is
  * lifted into `FilesView`, keyed by path, and this component is controlled.
  *
- * Deliberately not lifted: `saving`/`saveError`, which describe one in-flight
- * request rather than the file, and which the pane has to be mounted to show.
+ * Deliberately not lifted: `saving`/`downloading`/`saveError`, which describe
+ * one in-flight request rather than the file, and which the pane has to be
+ * mounted to show.
  */
 interface FileUiState {
   editing: boolean
@@ -227,6 +229,7 @@ function ContentPane({
   // two the tab does not carry (see `FileUiState`).
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [downloading, setDownloading] = useState(false)
 
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
@@ -267,6 +270,33 @@ function ContentPane({
       setSaveError(e instanceof ApiError ? e.message : 'Failed to save file.')
     } finally {
       setSaving(false)
+    }
+  }
+
+  /** Saves the file to disk as its real bytes (task 683). `fetch` + a blob
+   * rather than an `<a href>`: a 404/422 must render in this pane, not
+   * navigate the SPA away to a JSON error page — and the bytes have to come
+   * from the download route, since `data.content` is blank for a binary file
+   * and short for a truncated one. */
+  async function download() {
+    setDownloading(true)
+    setSaveError(null)
+    try {
+      const resp = await fetch(projectFileDownloadUrl(projectId, path))
+      if (!resp.ok) {
+        setSaveError(await downloadErrorMessage(resp))
+        return
+      }
+      const url = URL.createObjectURL(await resp.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = basename(path)
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      setSaveError('Failed to download file.')
+    } finally {
+      setDownloading(false)
     }
   }
 
@@ -314,6 +344,18 @@ function ContentPane({
             >
               {historyOpen ? 'Hide history' : 'History'}
             </button>
+            {/* Unlike Edit, offered for EVERY file — a binary or truncated
+             * file is exactly the case the viewer can show nothing useful
+             * for. A real <button> because the app's button chrome hangs off
+             * the `button` element selector in index.css; an <a download>
+             * would need all of it duplicated. */}
+            <button
+              className="files-edit-btn"
+              onClick={download}
+              disabled={downloading}
+            >
+              {downloading ? 'Downloading…' : 'Download'}
+            </button>
           </span>
         )}
         {editing && (
@@ -354,6 +396,25 @@ function ContentPane({
       )}
     </div>
   )
+}
+
+/** The message out of a failed download response's `{"error": {code, message}}`
+ * envelope — the same shape `request()` unwraps into an `ApiError`, re-read
+ * here because this one call goes through raw `fetch` to keep the bytes out of
+ * the JSON wrapper. A non-JSON or shapeless body falls back to a generic line
+ * rather than showing the raw text. */
+async function downloadErrorMessage(resp: Response): Promise<string> {
+  const fallback = 'Failed to download file.'
+  try {
+    const body: unknown = await resp.json()
+    const error =
+      typeof body === 'object' && body !== null
+        ? (body as { error?: { message?: unknown } }).error
+        : undefined
+    return typeof error?.message === 'string' ? error.message : fallback
+  } catch {
+    return fallback
+  }
 }
 
 /** The selected file's own commit history, as a vertical pane beside the

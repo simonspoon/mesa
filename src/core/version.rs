@@ -56,9 +56,12 @@ fn read_capped(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// `version` in Cargo.toml's `[package]` table.
+/// `version` in Cargo.toml's `[package]` table, else `[workspace.package]` —
+/// a virtual workspace root has no `[package]` at all, and a root crate that
+/// inherits with `version.workspace = true` yields nothing on the first pass
+/// either, so both land on the workspace's version.
 fn parse_cargo_toml(text: &str) -> Option<String> {
-    toml_version_in(text, &["package"])
+    toml_version_in(text, &["package"]).or_else(|| toml_version_in(text, &["workspace.package"]))
 }
 
 /// `version` in pyproject.toml's `[project]` table, else `[tool.poetry]`.
@@ -147,6 +150,24 @@ mod tests {
     fn cargo_stops_at_the_next_header() {
         let text = "[package]\nname = \"x\"\n[dependencies]\nversion = \"7.7.7\"\n";
         assert_eq!(parse_cargo_toml(text), None);
+    }
+
+    #[test]
+    fn cargo_virtual_workspace_root() {
+        let text = "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.3.18\"\nedition = \"2024\"\n";
+        assert_eq!(parse_cargo_toml(text), Some("0.3.18".to_string()));
+    }
+
+    #[test]
+    fn cargo_package_wins_over_workspace_package() {
+        let text = "[package]\nversion = \"1.1.1\"\n\n[workspace.package]\nversion = \"2.2.2\"\n";
+        assert_eq!(parse_cargo_toml(text), Some("1.1.1".to_string()));
+    }
+
+    #[test]
+    fn cargo_inherited_version_falls_back_to_workspace() {
+        let text = "[package]\nname = \"x\"\nversion.workspace = true\n\n[workspace.package]\nversion = \"0.5.0\"\n";
+        assert_eq!(parse_cargo_toml(text), Some("0.5.0".to_string()));
     }
 
     #[test]

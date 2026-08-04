@@ -13,12 +13,13 @@ one that yields a non-empty version wins:
 
 | # | File | Where the version comes from |
 | --- | --- | --- |
-| 1 | `Cargo.toml` | `version` in the `[package]` table |
+| 1 | `Cargo.toml` | `version` in `[package]`, else in `[workspace.package]` |
 | 2 | `package.json` | the top-level `"version"` string |
 | 3 | `pyproject.toml` | `version` in `[project]`, else in `[tool.poetry]` |
 
 A file that exists but has no usable version **falls through to the next one**
-(a virtual-workspace `Cargo.toml` next to a `package.json` reports the
+(a `Cargo.toml` carrying neither table's `version` — a bare `[workspace]` with
+no `[workspace.package]`, say — next to a `package.json` reports the
 package.json's version).
 
 The only path input is the project's own `local_path` — there is no

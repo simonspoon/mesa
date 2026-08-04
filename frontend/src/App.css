@@ -950,9 +950,12 @@ main {
 
 .kanban {
   display: grid;
-  /* One track per COLUMNS entry in KanbanBoard.tsx: backlog · refine · todo ·
-     in_progress · done (mesa task 661). */
-  grid-template-columns: repeat(5, 1fr);
+  /* Track count comes from the grid's OWN width, not the viewport (mesa task
+     687): the left nav is user-resizable, so 5 fixed tracks turned into
+     unreadable slivers on a ~1000px board. Columns wrap onto a second row
+     below ~14rem each. `min(…, 100%)` keeps it from overflowing a container
+     narrower than one track (the phone tier). */
+  grid-template-columns: repeat(auto-fit, minmax(min(14rem, 100%), 1fr));
   gap: 0.75rem;
 }
 

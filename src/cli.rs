@@ -37,22 +37,24 @@ OUTPUT
   not done/cancelled).
 
   --quiet (opt-in, long form only; no -q) prints the COMPACT projection
-  instead — the record minus its unbounded free-text fields, the same bounded
-  shape `list` already emits. Accepted on every mutation and `show`/`get` in
-  `project`, `task`, `storyboard` (+ `frame`, `edge`) and `inbox`; composite
-  payloads keep their key structure and compact their members. It changes
-  stdout only — never exit codes, stderr or stored data — and default output
-  is byte-identical to before the flag existed. On a `delete` it waives the
-  full echo, which is mesa's recovery transcript standing in for the absent
-  confirmation prompt: allowed because you asked, never a default.
+  instead — the record minus its unbounded free-text fields; for a task that
+  is exactly the bounded shape `task list` already emits. Accepted on every
+  mutation and `show`/`get` in `project`, `task`, `storyboard` (+ `frame`,
+  `edge`) and `inbox`; composite payloads keep their key structure and
+  compact their members. It changes stdout only — never exit codes, stderr or
+  stored data — and default output is byte-identical to before the flag
+  existed. On a `delete` it waives the full echo, which is mesa's recovery
+  transcript standing in for the absent confirmation prompt: allowed because
+  you asked, never a default.
   `mesa task update <id> --quiet` with no field flag is still a usage error
   (exit 2) — `--quiet` sits outside the required field group.
 
   Errors are JSON on stderr:
     {\"error\": {\"code\": \"not_found|cycle|validation|conflict|usage|unavailable\", \"message\": \"...\"}}
   Exit codes: 0 success, 1 domain/runtime error, 2 usage error. `unavailable`
-  is scoped to `cc usage` (missing token or unreachable upstream); see
-  `mesa cc usage --help`.
+  is scoped to the two commands that depend on something outside mesa:
+  `cc usage` (missing token or unreachable upstream) and `task execute` (the
+  hook shell could not be started).
 
 DATABASE
   Defaults to ~/Library/Application Support/mesa/mesa.db;
@@ -121,12 +123,15 @@ enum Command {
         /// can run code via the Agents or Terminal tabs.
         #[arg(long, default_value_t = false)]
         lan: bool,
-        /// Periodically check every project for an actionable todo task when
-        /// nothing is in_progress, and auto-start a background `claude` agent
-        /// on it (prompt: `/execute-mesa-task <task-id>`). Off by default:
-        /// this spawns real agents (API cost, code execution) with no user
-        /// request behind it. Preserved across the web UI's Restart Server
-        /// action.
+        /// Periodically check every project for an actionable todo task and
+        /// auto-start a background `claude` agent on it (default prompt:
+        /// `/execute-mesa-task <task-id>`, configurable in
+        /// ~/.mesa/config.json). A project is busy only while an in_progress
+        /// *leaf* holds it; an in_progress task that has subtasks is an
+        /// umbrella, which narrows the tick to its own descendants instead of
+        /// parking the project. Off by default: this spawns real agents (API
+        /// cost, code execution) with no user request behind it. Preserved
+        /// across the web UI's Restart Server action.
         #[arg(long, default_value_t = false)]
         watch_todo: bool,
         /// Periodically auto-start a background `claude` agent on one task per
@@ -139,7 +144,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         watch_refine: bool,
         /// Periodically auto-start a background `claude` agent to triage each
-        /// pending item in the global inbox (prompt: `/inbox-triage <id>`, cwd
+        /// pending item in the global inbox (default prompt:
+        /// `/inbox-triage <id>`, configurable in ~/.mesa/config.json; cwd
         /// `$HOME` — an inbox item belongs to no project). Off by default:
         /// this spawns real agents (API cost, code execution) with no user
         /// request behind it. Independent of --watch-todo. Each item is

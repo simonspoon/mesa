@@ -761,7 +761,8 @@ EXAMPLES
     /// item lands in the review queue, not the actionable one. The task's
     /// description is the item's body verbatim; its name — like every task's —
     /// is that body's first line cut to 50 chars. Prints the created task.
-    /// Assigning to an unknown project is a validation error.
+    /// Assigning to a project id that does not exist is a validation error; an
+    /// unknown project NAME is "not_found", from the shared name resolver.
     #[command(after_help = "\
 EXAMPLES
   mesa inbox assign 3 1        # convert item 3 into a backlog task in project 1")]
@@ -831,11 +832,13 @@ EXAMPLES
     },
     /// Write an attachment's bytes to a local path; prints the metadata JSON
     ///
-    /// Creates or overwrites DEST with no confirmation. Content bytes never
-    /// ride stdout — only the attachment's metadata JSON does.
+    /// Creates or overwrites DEST with no confirmation, but does not create
+    /// its parent directory — writing into a folder that does not exist is a
+    /// validation error. Content bytes never ride stdout — only the
+    /// attachment's metadata JSON does.
     #[command(after_help = "\
 EXAMPLES
-  mesa attachment fetch 7 ./out/screenshot.png")]
+  mesa attachment fetch 7 ./screenshot.png")]
     Fetch {
         /// Attachment id
         id: i64,

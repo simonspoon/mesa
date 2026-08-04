@@ -37,8 +37,9 @@ instructions**; `author` is free-text attribution.
   free-text message as a trailing positional (quoting optional; words joined),
   always unassigned; `--author` attributes (place it before the text). `assign
   <id> <project>` (project required) converts the item into a backlog task in that
-  project and **prints the created task**; assigning to an unknown project is
-  `validation`. `delete` echoes the destroyed item.
+  project and **prints the created task**; assigning to a project id that does
+  not exist is `validation` (an unknown project *name* is `not_found`, from the
+  shared resolver). `delete` echoes the destroyed item.
 - API: `/api/inbox` (GET list, POST create — body `{body, author}`),
   `/api/inbox/{id}` (GET show, PATCH assign, DELETE). PATCH body is
   `{project_id: <number>}` (required) and **returns the created task** (not the

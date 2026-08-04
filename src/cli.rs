@@ -211,8 +211,9 @@ instead of detecting it.")]
         #[arg(long)]
         quiet: bool,
     },
-    /// List all projects as a bare JSON array; archived projects are omitted
-    /// unless --include-archived is given
+    /// List all projects as a bare JSON array; archived projects — and every
+    /// project under an archived one — are omitted unless --include-archived
+    /// is given
     List {
         /// Include archived projects in the result
         #[arg(long)]
@@ -281,11 +282,13 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Delete a project AND all its tasks (no confirmation)
+    /// Delete a project, its subprojects AND all their tasks (no confirmation)
     ///
-    /// Cascades immediately. The output echoes the deleted project and every
-    /// cascaded task in full, so the transcript is a recoverable record.
-    /// Take `mesa backup <path>` first if you want a safety net.
+    /// Cascades immediately over the whole subtree — every descendant project,
+    /// its tasks and its storyboards go too. The output echoes the deleted
+    /// project, the destroyed `subprojects` and every cascaded task in full, so
+    /// the transcript is a recoverable record. Take `mesa backup <path>` first
+    /// if you want a safety net.
     Delete {
         /// Project id
         id: i64,
@@ -301,8 +304,10 @@ EXAMPLES
     ///
     /// Archiving never deletes anything — `project show`/`update`/`delete`
     /// and every query scoped to this project's explicit id or name are
-    /// unaffected. Idempotent: archiving an already-archived project
-    /// succeeds and returns its current state.
+    /// unaffected. Unscoped views hide its subprojects too, whose own
+    /// `archived` stays false — the rule is derived, not written to them.
+    /// Idempotent: archiving an already-archived project succeeds and returns
+    /// its current state.
     Archive {
         /// Project id or name
         #[arg(value_name = "ID|NAME")]

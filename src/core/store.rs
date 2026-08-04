@@ -1726,12 +1726,20 @@ impl Store {
                 doc.project
             )));
         }
-        // Duplicate refs would make resolution ambiguous.
+        // Duplicate refs would make resolution ambiguous. A description is the
+        // task's identity, so import enforces the same non-empty rule as
+        // `create_task` — both pre-transaction, so nothing is created.
         let mut refs: HashMap<&str, i64> = HashMap::new();
         for t in &doc.tasks {
             if refs.insert(t.ref_.as_str(), 0).is_some() {
                 return Err(Error::Validation(format!(
                     "duplicate task ref \"{}\" in import document",
+                    t.ref_
+                )));
+            }
+            if t.description.trim().is_empty() {
+                return Err(Error::Validation(format!(
+                    "task ref \"{}\" has an empty description",
                     t.ref_
                 )));
             }
@@ -5733,6 +5741,27 @@ mod tests {
             Error::Validation(_)
         ));
         assert!(store.list_tasks(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_empty_description_creating_nothing() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+
+        // A description is the task's identity: import enforces the same
+        // non-empty rule as `create_task`, so this is not a second write path
+        // into a state the rest of the surface treats as impossible.
+        for empty in ["", "   "] {
+            let doc = ImportDoc {
+                project: p.id,
+                tasks: vec![import_task("a", "valid"), import_task("b", empty)],
+            };
+            let err = store.import_tasks(&doc).unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "got {err:?}");
+            // Rejected before the transaction opens: no tasks, no events.
+            assert!(store.list_tasks(None).unwrap().is_empty());
+            assert!(store.list_events(None).unwrap().is_empty());
+        }
     }
 
     #[test]

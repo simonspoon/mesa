@@ -418,6 +418,19 @@ AFTER=$("$MESA" task list --project "$PI" | jq length)
 [ "$BEFORE" = "$AFTER" ] || fail "import cycle: rolled back (count $BEFORE -> $AFTER)"
 ok "task import: in-graph cycle rejected (code=cycle, nothing created)"
 
+# an empty description is rejected like `task create` (identity, not optional)
+BEFORE=$("$MESA" task list --project "$PI" | jq length)
+EMPTYDESC="{\"project\":$PI,\"tasks\":[{\"ref\":\"a\",\"description\":\"\"}]}"
+set +e
+STDOUT=$(echo "$EMPTYDESC" | "$MESA" task import 2>"$TMP/stderr"); CODE=$?
+set -e
+STDERR=$(cat "$TMP/stderr")
+[ "$CODE" -eq 1 ] || fail "import empty description: expected exit 1, got $CODE"
+[ "$(jqe .error.code)" = "validation" ] || fail "import empty description: error.code"
+AFTER=$("$MESA" task list --project "$PI" | jq length)
+[ "$BEFORE" = "$AFTER" ] || fail "import empty description: rolled back (count $BEFORE -> $AFTER)"
+ok "task import: empty description rejected (code=validation, nothing created)"
+
 # malformed JSON is a usage error
 run 2 bash -c "echo 'not json' | $MESA task import"
 [ "$(jqe .error.code)" = "usage" ] || fail "import malformed JSON: error.code"

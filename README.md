@@ -184,7 +184,8 @@ echo '{"project":1,"tasks":[
 ]}' | mesa task import
 ```
 
-On any error nothing is created.
+On any error nothing is created. An empty or whitespace-only `description` is
+rejected just as it is by `task create` — a description is the task's identity.
 
 ## Web UI & HTTP API
 

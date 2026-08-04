@@ -19,7 +19,8 @@ function navigate(hash: string) {
 
 /**
  * Fixed top-level destinations plus, per project: "Go to <name>" (the
- * board), the git/files/terminal/dashboard/storyboards sub-views, and
+ * board), the git/files/terminal/dashboard/storyboards/settings sub-views,
+ * and
  * "Create task in <name>" (which lands on the create-task route —
  * ProjectTasksPage opens the form with its description field focused).
  */
@@ -65,6 +66,12 @@ function buildCommands(projects: Project[]): Command[] {
       label: `${p.name} — Storyboards`,
       search: `${name} storyboards`,
       run: () => navigate(`#/projects/${p.id}/storyboards`),
+    })
+    commands.push({
+      id: `settings-${p.id}`,
+      label: `${p.name} — Settings`,
+      search: `${name} settings`,
+      run: () => navigate(`#/projects/${p.id}/settings`),
     })
     commands.push({
       id: `create-${p.id}`,

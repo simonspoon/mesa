@@ -1,14 +1,5 @@
 import { useEffect, useState } from 'react'
-import {
-  archiveProject,
-  getProject,
-  listAllAgents,
-  listProjects,
-  listTasks,
-  unarchiveProject,
-  updateProject,
-} from '../api'
-import { descendantIds } from '../projectTree'
+import { getProject, listAllAgents, listTasks, updateProject } from '../api'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskModal } from '../components/TaskModal'
@@ -19,6 +10,7 @@ import { CCDashboardView } from './CCDashboardView'
 import { FilesView } from './FilesView'
 import { GitView } from './GitView'
 import { StoryboardBoardView } from './StoryboardBoardView'
+import { ProjectSettingsView } from './ProjectSettingsView'
 import { StoryboardListView } from './StoryboardListView'
 import { TerminalPage } from './TerminalPage'
 
@@ -26,7 +18,8 @@ import { TerminalPage } from './TerminalPage'
 // route (spec req 1) — a hash navigation, no new form plumbing;
 // ProjectTasksPage's own `createTask` prop handling opens the panel on
 // arrival. Board-scoped by construction — `active` is false whenever a
-// non-Board view (Storyboards/Git/Files/Terminal/Dashboard) is showing, so the
+// non-Board view (Storyboards/Git/Files/Terminal/Dashboard/Settings) is
+// showing, so the
 // listener is a no-op there without a route string check
 // (.scratch/arch-449-keyboard.md §3). `shouldIgnoreShortcut`
 // (keyboardScope.ts) covers modifiers, text-editing contexts, terminals, the
@@ -53,6 +46,7 @@ export function ProjectTasksPage({
   files,
   terminal,
   dashboard,
+  settings,
   createTask,
   onProjectsChanged,
 }: {
@@ -75,6 +69,11 @@ export function ProjectTasksPage({
   // Dashboard is another URL-driven view: this project's scoped CC telemetry
   // (project-scoped CCDashboardView, overview only).
   dashboard: boolean
+  // Settings is another URL-driven view: the project's own whole-project
+  // controls — folder (local_path), parent project, archive/unarchive
+  // (mesa task 682). Distinct from the GLOBAL #/settings page, which edits
+  // ~/.mesa/config.json.
+  settings: boolean
   // True while on the #/projects/:id/create-task route (the command
   // palette's "Create task in <project>" entry): seeds the create-task
   // panel open on arrival. `closePanel`/the panel's `onCreated` return the
@@ -117,7 +116,8 @@ export function ProjectTasksPage({
   // The Board is the default view — every other tab is URL-driven. Named
   // once because both the 'a' shortcut and the agents poll below are scoped
   // to it.
-  const onBoard = !storyboards && !git && !files && !terminal && !dashboard
+  const onBoard =
+    !storyboards && !git && !files && !terminal && !dashboard && !settings
 
   const {
     data: project,
@@ -133,14 +133,6 @@ export function ProjectTasksPage({
     // dropped in useFetch, so an unchanged view never re-renders.
     { pollMs: 3000 },
   )
-  // Every project, for the parent picker below (task 668). Archived ones
-  // included: nesting under an archived project is legal (it just inherits
-  // being hidden), and omitting them would silently drop the CURRENT parent
-  // out of the list the picker renders.
-  const { data: allProjects, refetch: refetchAllProjects } = useFetch(
-    () => listProjects(true),
-    'projects-picker',
-  )
   // Live-agent markers on the cards (mesa task 663). Purely decorative: the
   // same `listAllAgents()` feed and 3s interval the Agents sidebar polls, so
   // it rides the server's existing 2s cache rather than adding `claude agents
@@ -151,31 +143,16 @@ export function ProjectTasksPage({
   const { data: sessions } = useFetch(() => listAllAgents(), 'board-agents', {
     pollMs: onBoard ? 3000 : undefined,
   })
-  // Storyboards, Git, Files, Terminal, and Dashboard are their own views
-  // with their own fetches/error handling, so a failed task fetch must not
-  // block them; only surface it on the Board view.
-  const error =
-    projectError ??
-    (storyboards || git || files || terminal || dashboard ? null : tasksError)
+  // Storyboards, Git, Files, Terminal, Dashboard and Settings are their own
+  // views with their own fetches/error handling, so a failed task fetch must
+  // not block them; only surface it on the Board view.
+  const error = projectError ?? (onBoard ? tasksError : null)
 
   // Same board-vs-other-view condition the tabs use below (spec req 2: 'a'
   // is inert on non-Board pages). Called unconditionally, ahead of the
   // early error return, per the rules of hooks; `active` gates the listener
   // itself, not this call.
   useCreateTaskShortcut(onBoard, projectId)
-
-  // Archiving hides the project (reversible), never deletes — spec req 12 /
-  // Won't list: no confirmation prompt, no "this deletes N tasks" copy.
-  // Declared ahead of the early error return below, per the rules of hooks.
-  // One in-flight flag / one error slot covers both directions: the footer
-  // only ever offers whichever of archive/unarchive this project isn't
-  // already in (task 509).
-  const [archiving, setArchiving] = useState(false)
-  const [archiveError, setArchiveError] = useState<string | null>(null)
-  // Reparenting (task 668) — its own in-flight/error pair, since it sits in
-  // the same footer row as archive but is an ordinary, non-retiring edit.
-  const [reparenting, setReparenting] = useState(false)
-  const [parentError, setParentError] = useState<string | null>(null)
 
   if (error) return <p className="error">{error}</p>
 
@@ -187,8 +164,7 @@ export function ProjectTasksPage({
   // returns the hash to the project URL so the switch happens in place,
   // matching how the tabs toggle among any views (M5 symmetric return).
   function selectBoard() {
-    if (storyboards || git || files || terminal || dashboard)
-      window.location.hash = `#/projects/${projectId}`
+    if (!onBoard) window.location.hash = `#/projects/${projectId}`
   }
 
   function closePanel() {
@@ -206,43 +182,6 @@ export function ProjectTasksPage({
     // One panel, latest action wins: drop an open task back to the
     // project URL (the create form is not URL-addressed).
     if (taskId !== null) window.location.hash = `#/projects/${projectId}`
-  }
-
-  function handleArchive() {
-    setArchiving(true)
-    setArchiveError(null)
-    archiveProject(projectId)
-      .then(() => {
-        onProjectsChanged()
-        // The project just vanished from the default list/sidebar; land
-        // somewhere still valid instead of leaving the user on a page for
-        // a now-hidden project.
-        window.location.hash = '#/'
-      })
-      .catch((e: unknown) => {
-        setArchiving(false)
-        setArchiveError(e instanceof Error ? e.message : String(e))
-      })
-  }
-
-  // Restoring keeps the user where they are (the page was already valid while
-  // archived — `show` is a scoped read, unaffected by the flag), so unlike
-  // `handleArchive` there is no navigation and the in-flight flag has to be
-  // cleared here. Refetching the project is what flips this footer back to
-  // "archive project" and drops the header badge.
-  function handleUnarchive() {
-    setArchiving(true)
-    setArchiveError(null)
-    unarchiveProject(projectId)
-      .then(() => {
-        setArchiving(false)
-        refetchProject()
-        onProjectsChanged()
-      })
-      .catch((e: unknown) => {
-        setArchiving(false)
-        setArchiveError(e instanceof Error ? e.message : String(e))
-      })
   }
 
   return (
@@ -268,7 +207,7 @@ export function ProjectTasksPage({
           {project?.archived && (
             <span
               className="badge project-archived-badge"
-              title="Hidden from the sidebar's main list and from unscoped task/storyboard views. Restore below."
+              title="Hidden from the sidebar's main list and from unscoped task/storyboard views. Restore from the Settings tab."
             >
               archived
             </span>
@@ -301,11 +240,7 @@ export function ProjectTasksPage({
             Dashboard
           </button>
           <button
-            className={
-              !storyboards && !git && !files && !terminal && !dashboard
-                ? 'active'
-                : ''
-            }
+            className={onBoard ? 'active' : ''}
             onClick={selectBoard}
           >
             Board
@@ -346,18 +281,40 @@ export function ProjectTasksPage({
           >
             Terminal
           </button>
+          {/* Whole-project settings (folder / parent / archive) — last,
+              after the working views (mesa task 682). */}
+          <button
+            className={settings ? 'active' : ''}
+            onClick={() => {
+              if (!settings)
+                window.location.hash = `#/projects/${projectId}/settings`
+            }}
+          >
+            Settings
+          </button>
         </div>
 
         {/* Create action lives where the user is working: below the tabs, on
             the Board view only (spec S5), not on Storyboards/
             Git/Files/Dashboard (those carry their own content). */}
-        {!storyboards && !git && !files && !terminal && !dashboard && (
+        {onBoard && (
           <p className="task-actions">
             <button onClick={openCreate}>add task</button>
           </p>
         )}
 
-        {dashboard ? (
+        {settings ? (
+          !project ? (
+            <p className="muted">Loading…</p>
+          ) : (
+            <ProjectSettingsView
+              projectId={projectId}
+              project={project}
+              refetchProject={refetchProject}
+              onProjectsChanged={onProjectsChanged}
+            />
+          )
+        ) : dashboard ? (
           <CCDashboardView tab="overview" projectId={projectId} />
         ) : git ? (
           <GitView projectId={projectId} />
@@ -406,81 +363,6 @@ export function ProjectTasksPage({
           />
         )}
 
-        {/* Retirement action tucked away, de-emphasized (spec S8): rarely
-            used, kept reachable in a low-key project footer. Archiving is
-            reversible (this same footer, or the sidebar's archived group,
-            restores it), so this is a plain
-            button with no confirm step and no destructive copy — spec's
-            Won't list explicitly rules out a confirmation prompt here.
-            Deleting a project is still possible; it's just no longer
-            offered from this control (CLI/API unchanged). */}
-        {/* Rendered only once the project is loaded: the footer's verb depends
-            on `archived`, and offering "archive project" for a moment on a
-            project that is already archived is the very confusion task 509
-            reports. */}
-        {/* Parent project (task 668): the UI half of a field that would
-            otherwise be CLI-only. Eligible parents exclude this project and
-            everything under it — `Store` would answer a cycle with a 409, but
-            an option that can only fail is not a choice worth offering.
-            Task 669 gave the nav a drag that reparents too (drop into the
-            middle of a row); this picker stays as the explicit, list-shaped
-            way to do the same thing — the two write the same field. */}
-        {project && allProjects && (
-          <p className="project-parent">
-            <label>
-              parent project{' '}
-              <select
-                value={project.parent_id ?? ''}
-                disabled={reparenting}
-                onChange={(e) => {
-                  const value = e.target.value === '' ? null : Number(e.target.value)
-                  setReparenting(true)
-                  setParentError(null)
-                  updateProject(projectId, { parent_id: value })
-                    .then(() => {
-                      setReparenting(false)
-                      refetchProject()
-                      refetchAllProjects()
-                      // The nav is a tree of this field; it has to redraw.
-                      onProjectsChanged()
-                    })
-                    .catch((err: unknown) => {
-                      setReparenting(false)
-                      setParentError(err instanceof Error ? err.message : String(err))
-                    })
-                }}
-              >
-                <option value="">— top level —</option>
-                {allProjects
-                  .filter(
-                    (p) =>
-                      p.id !== projectId &&
-                      !descendantIds(allProjects, projectId).includes(p.id),
-                  )
-                  .map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            {parentError && <span className="error">{parentError}</span>}
-          </p>
-        )}
-        {project && (
-          <p className="project-danger">
-            {project.archived ? (
-              <button onClick={handleUnarchive} disabled={archiving}>
-                unarchive project
-              </button>
-            ) : (
-              <button onClick={handleArchive} disabled={archiving}>
-                archive project
-              </button>
-            )}
-            {archiveError && <span className="error">{archiveError}</span>}
-          </p>
-        )}
     {taskId !== null && (
       <TaskModal
         key={taskId}

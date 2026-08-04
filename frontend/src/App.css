@@ -571,8 +571,8 @@ main {
 
 /* Parent-project picker (mesa task 668), just above the retirement control:
    an ordinary edit rather than a destructive one, so it carries none of
-   `.project-danger`'s dimming — but it lives in the same quiet footer strip,
-   next to the other whole-project settings. */
+   `.project-danger`'s dimming — but it sits in the same quiet strip on the
+   Settings tab, next to the other whole-project settings (task 682). */
 .project-parent {
   display: flex;
   align-items: center;
@@ -591,7 +591,7 @@ main {
   margin-top: 0.75rem;
 }
 
-/* Discrete, de-emphasized destructive control in the project footer (S8). */
+/* Discrete, de-emphasized destructive control (S8). */
 .project-danger {
   margin-top: 2.5rem;
   padding-top: 0.75rem;
@@ -641,8 +641,48 @@ main {
   border-left: 2px solid var(--cyan-dim);
 }
 
-/* New-project folder picker (CreateProjectPanel): the collapsed field shows
-   the current selection, "choose folder…" swaps it for the DirBrowser below. */
+/* The Settings tab (mesa task 682): the project's three whole-project
+   controls, each its own section. The sections themselves reuse
+   `.project-parent` / `.project-danger` / `.dir-picker-*`; only the headings
+   and the spacing between sections are new. */
+.project-settings section + section {
+  margin-top: 2.5rem;
+}
+
+.project-settings h2 {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+}
+
+/* The two moved blocks carry their old footer top-margins and, on
+   `.project-danger`, a separator rule — inside a section that already has its
+   own heading and gap, both are doubled up. */
+.project-settings .project-parent,
+.project-settings .project-danger {
+  margin-top: 0;
+}
+
+.project-settings .project-danger {
+  padding-top: 0;
+  border-top: none;
+}
+
+/* Unlike the new-project panel this page is full-width, and a field stretched
+   across it strands its buttons at the far right. Same cap as the parent
+   picker's select, one size up for a path. */
+.project-settings .dir-picker-field,
+.project-settings .dir-browser {
+  max-width: 34rem;
+}
+
+.project-settings .settings-hint {
+  margin: 0 0 0.75rem;
+  font-size: 0.8rem;
+}
+
+/* Folder picker (CreateProjectPanel's new-project form, and the Settings tab's
+   project folder): the collapsed field shows the current selection, "choose
+   folder…" swaps it for the DirBrowser below. */
 .dir-picker-field {
   display: flex;
   align-items: center;
@@ -860,7 +900,7 @@ main {
   display: flex;
   gap: 0.5rem;
   margin: 1rem 0;
-  /* Six view tabs outgrow a phone screen; wrap instead of overflowing. */
+  /* Seven view tabs outgrow a phone screen; wrap instead of overflowing. */
   flex-wrap: wrap;
 }
 

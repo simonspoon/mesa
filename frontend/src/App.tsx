@@ -25,6 +25,8 @@ import { useVisualViewportHeightVar } from './visualViewport'
 // #/projects/:id/terminal (the Terminal page's shell panes, rooted at the
 // project's local_path — the project-scoped twin of #/terminal below),
 // #/projects/:id/dashboard (project-scoped CC telemetry),
+// #/projects/:id/settings (this project's folder / parent / archive — not to
+// be confused with #/settings, the global ~/.mesa/config.json editor),
 // #/projects/:id/create-task (opens straight into the create-task form;
 // closing/saving it returns to the plain project URL — see
 // ProjectTasksPage's `createTask` prop), #/terminal (global shell pane-tree;
@@ -175,6 +177,9 @@ function App() {
   // mounted global page.
   const projectTerminalMatch = /^\/projects\/(\d+)\/terminal$/.exec(path)
   const dashboardMatch = /^\/projects\/(\d+)\/dashboard$/.exec(path)
+  // The project's OWN settings tab (folder / parent / archive) — distinct
+  // from `settingsMatch` above, which is the global config.json editor.
+  const projectSettingsMatch = /^\/projects\/(\d+)\/settings$/.exec(path)
   // Route the command palette's "Create task in <project>" entry navigates
   // to; ProjectTasksPage opens the create-task form on arrival and returns
   // to the plain project route once the form is closed or saved (spec
@@ -194,11 +199,13 @@ function App() {
             ? Number(projectTerminalMatch[1])
             : dashboardMatch
               ? Number(dashboardMatch[1])
-              : createTaskMatch
-                ? Number(createTaskMatch[1])
-                : projectMatch
-                  ? Number(projectMatch[1])
-                  : null
+              : projectSettingsMatch
+                ? Number(projectSettingsMatch[1])
+                : createTaskMatch
+                  ? Number(createTaskMatch[1])
+                  : projectMatch
+                    ? Number(projectMatch[1])
+                    : null
 
   let page
   if (settingsMatch) {
@@ -228,6 +235,7 @@ function App() {
         files={false}
         terminal={false}
         dashboard={false}
+        settings={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -244,6 +252,7 @@ function App() {
         files={false}
         terminal={false}
         dashboard={false}
+        settings={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -260,6 +269,7 @@ function App() {
         files={false}
         terminal={false}
         dashboard={false}
+        settings={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -276,6 +286,7 @@ function App() {
         files
         terminal={false}
         dashboard={false}
+        settings={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -297,6 +308,7 @@ function App() {
         files={false}
         terminal
         dashboard={false}
+        settings={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -313,6 +325,25 @@ function App() {
         files={false}
         terminal={false}
         dashboard
+        settings={false}
+        createTask={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (projectSettingsMatch) {
+    // Whole-project settings (folder / parent / archive), in place inside the
+    // project page frame like Git/Files (mesa task 682).
+    page = (
+      <ProjectTasksPage
+        projectId={Number(projectSettingsMatch[1])}
+        taskId={null}
+        storyboards={false}
+        storyboardId={null}
+        git={false}
+        files={false}
+        terminal={false}
+        dashboard={false}
+        settings
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -330,6 +361,7 @@ function App() {
         files={false}
         terminal={false}
         dashboard={false}
+        settings={false}
         createTask
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -345,6 +377,7 @@ function App() {
         files={false}
         terminal={false}
         dashboard={false}
+        settings={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />

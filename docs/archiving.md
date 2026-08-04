@@ -68,9 +68,10 @@ Both directions are reachable from two places:
   archived root and carries `restore` on the root — the row that is actually
   archived. One call brings the subtree back; a live child listed under an
   archived root has nothing of its own to restore, so it offers no button.
-- The project page's footer offers `unarchive project` (and its title an
-  `archived` badge) whenever `project.archived` is set — the page keeps working
-  while archived, since every read on it is project-scoped.
+- The project page's **Settings** tab (`#/projects/:id/settings`, mesa task 682
+  — it used to be a footer under every tab) offers `unarchive project` (and the
+  page title an `archived` badge) whenever `project.archived` is set — the page
+  keeps working while archived, since every read on it is project-scoped.
 
 The sidebar's restore **must** re-run the two *unscoped* nav fetches
 (`GET /api/tasks?status=todo`, `GET /api/git-status`) alongside the project list:

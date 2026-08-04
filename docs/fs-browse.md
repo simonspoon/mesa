@@ -1,7 +1,10 @@
 # Filesystem browse (server-side directory listing for the folder picker)
 
-Backs the web UI's new-project folder picker (`CreateProjectModal` /
-`DirBrowser`, mesa task 406): browser-native file pickers withhold real
+Backs the web UI's folder pickers (`DirBrowser`, mesa task 406) — the
+new-project form's (`CreateProjectModal`) and, since task 682, the project
+Settings tab's `project folder` control (`ProjectSettingsView`, which PATCHes
+`local_path` on the project that already exists). One component, two consumers:
+browser-native file pickers withhold real
 absolute paths, so the folder picker instead drives one server-side
 directory-listing endpoint (plus, since task 489, a create-one-folder
 mutation on the same route). Unlike the Git/Files tabs, this surface is **not

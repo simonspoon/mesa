@@ -19,8 +19,8 @@ pub use types::{
     CcModelStat, CcOverview, CcProjectStat, CcSessionRow, CcSkillStat, CcTokens, CcUsage,
     CcUsageExtra, CcUsageWindow, ConfigCommand, Dependency, DiagramType, DirEntry, DirListing,
     FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
-    GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, Priority, Project,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, MesaVersion, Priority,
+    Project, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
     ProjectVersion, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
     Waypoint, task_name,
 };

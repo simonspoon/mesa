@@ -24,6 +24,25 @@ header {
   flex: none;
 }
 
+/* Wordmark + version stack beside the (unmoved) mark. `line-height: 1` on the
+   word pays for most of the second line, so the header band barely grows —
+   what it grows comes straight out of the boards below it. */
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1;
+}
+
+.brand-version {
+  font-size: 0.6rem;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--muted);
+  text-shadow: none;
+  margin-top: 0.2rem;
+}
+
 /* App shell: header on top, then sidebar + full-width main. Fills the
    viewport-locked `#root` (index.css) and never scrolls itself — `main`
    scrolls internally instead, so the two sticky sidebars are height-bounded

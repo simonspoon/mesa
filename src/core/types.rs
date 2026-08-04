@@ -227,6 +227,15 @@ pub struct ProjectVersion {
     pub source: Option<String>,
 }
 
+/// `GET /api/version`: the running binary's own version
+/// (`CARGO_PKG_VERSION`), shown under the wordmark in the app header.
+/// Unrelated to `ProjectVersion` above, which reads a *project's* manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct MesaVersion {
+    pub version: String,
+}
+
 /// One changed/untracked/conflicted path from `git status --porcelain=v2`
 /// (see `core::git::view_of`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

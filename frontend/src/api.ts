@@ -21,6 +21,7 @@ import type { FrameShape } from './types/FrameShape'
 import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
+import type { MesaVersion } from './types/MesaVersion'
 import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
@@ -280,6 +281,11 @@ export function attachmentDownloadUrl(id: number): string {
 /** Git status of each project's local_path; projects without a repo omitted. */
 export function getGitStatus(): Promise<ProjectGitStatus[]> {
   return request('/api/git-status')
+}
+
+/** mesa's own version (the running binary's CARGO_PKG_VERSION). */
+export function getMesaVersion(): Promise<MesaVersion> {
+  return request('/api/version')
 }
 
 /**

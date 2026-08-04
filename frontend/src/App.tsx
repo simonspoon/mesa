@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import './App.css'
-import { getTask, listInbox } from './api'
+import { getMesaVersion, getTask, listInbox } from './api'
 import { AgentSidebar } from './components/AgentSidebar'
 import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
@@ -140,6 +140,10 @@ function App() {
   const unassigned = inbox
     ? inbox.filter((i) => i.project_id === null).length
     : 0
+  // Which build am I looking at? Fetched once — a running server's version
+  // cannot change, so no `pollMs`. Pure decoration: no error branch, and
+  // nothing renders until it lands (a placeholder would be noise).
+  const { data: mesaVersion } = useFetch(() => getMesaVersion(), 'mesa-version')
 
   const inboxMatch = /^\/inbox$/.exec(path)
   // Settings: global, above projects like the Inbox — the config file it edits
@@ -397,7 +401,12 @@ function App() {
             <polygon points="16,68 16,52 26,52 26,34 74,34 74,52 84,52 84,68" fill="#00a8c2" />
             <polygon points="26,52 26,34 74,34 74,52" fill="#00e5ff" />
           </svg>
-          mesa
+          <span className="brand-text">
+            mesa
+            {mesaVersion && (
+              <span className="brand-version">v{mesaVersion.version}</span>
+            )}
+          </span>
         </a>
       </header>
       <div className="shell-body">

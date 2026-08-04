@@ -38,10 +38,10 @@ use serde_json::json;
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, InboxItem, NextResult, Priority, ProjectAgents,
-    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
-    Status, Store, StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments,
-    config, files, git, hooks, version,
+    GitRepoView, GitStatus, GitWorktree, InboxItem, MesaVersion, NextResult, Priority,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
+    ProjectVersion, Status, Store, StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents,
+    attachments, config, files, git, hooks, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -833,6 +833,10 @@ fn router(state: AppState) -> Router {
         // Sidebar decoration: working-tree git status of each project's
         // `local_path`. Read-only external state (shells `git status`).
         .route("/api/git-status", get(get_git_status))
+        // Header decoration: mesa's own version. A compile-time constant —
+        // no store, no gate (it leaks nothing and the header needs it under
+        // `--lan` too).
+        .route("/api/version", get(get_mesa_version))
         // Project git tab: working-tree view (branch + changed files) and a
         // per-file unified diff. Read-only external state like /api/git-status,
         // so the same standard guard only — no agent access gate.
@@ -2033,6 +2037,15 @@ async fn get_git_status(State(state): State<AppState>) -> ApiResult<Response> {
         }
     }
     Ok(Json(rows).into_response())
+}
+
+/// `GET /api/version` — the running binary's own version, for the header.
+/// Infallible and always 200: it is `CARGO_PKG_VERSION`, baked in at compile
+/// time. Not to be confused with `get_project_version` below.
+async fn get_mesa_version() -> Json<MesaVersion> {
+    Json(MesaVersion {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 /// `GET /api/projects/{id}/version` — the app version in the project's

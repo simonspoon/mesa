@@ -1046,8 +1046,8 @@ EXAMPLES
     /// Each row records one change — who, what, when: {id, storyboard_id, actor,
     /// action, summary, at}. `action` is a stable token (storyboard_created,
     /// storyboard_edited, frame_added, frame_moved, frame_edited, frame_removed,
-    /// edge_added, edge_relabeled, edge_removed). This is the collaboration
-    /// record across agents and users.
+    /// edge_added, edge_relabeled, edge_rerouted, edge_anchor_changed,
+    /// edge_removed). This is the collaboration record across agents and users.
     Events {
         /// Storyboard id
         id: i64,
@@ -1106,10 +1106,11 @@ EXAMPLES
         /// Optional task id to link (must be in the storyboard's project)
         #[arg(long)]
         task: Option<i64>,
-        /// Node shape: process|decision|start_end|entity|central|idea, valid
-        /// only for the board's diagram type (must be omitted on a storyboard
-        /// board); immutable after creation — no --shape on
-        /// `storyboard frame update`
+        /// Node shape, required to match the board's diagram type: omit it on
+        /// a storyboard board, process|decision|start_end on a flowchart,
+        /// entity on an erd, central|idea on a brainstorm. Any mismatch —
+        /// including omitting it on a typed board — is a "validation" error.
+        /// Immutable after creation — no --shape on `storyboard frame update`
         #[arg(long, value_parser = parse_frame_shape)]
         shape: Option<FrameShape>,
         /// Free-text actor id of the creator (an agent name or "user")

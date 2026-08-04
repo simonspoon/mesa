@@ -8,6 +8,7 @@ pub mod hooks;
 mod store;
 mod types;
 pub mod usage;
+pub mod version;
 
 pub use store::{
     EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, ProjectPatch, Result, Store,
@@ -19,6 +20,7 @@ pub use types::{
     CcUsageExtra, CcUsageWindow, ConfigCommand, Dependency, DiagramType, DirEntry, DirListing,
     FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
     GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, Priority, Project,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, Status,
-    Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary, Waypoint, task_name,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectVersion, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskSummary,
+    Waypoint, task_name,
 };

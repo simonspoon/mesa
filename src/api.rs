@@ -39,9 +39,9 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, NextResult, Priority, ProjectAgents,
-    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, Status, Store,
-    StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files,
-    git, hooks,
+    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
+    Status, Store, StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments,
+    config, files, git, hooks, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -837,6 +837,11 @@ fn router(state: AppState) -> Router {
         // per-file unified diff. Read-only external state like /api/git-status,
         // so the same standard guard only — no agent access gate.
         .route("/api/projects/{id}/git", get(get_project_git))
+        // Project header decoration: the app version in `local_path`'s
+        // manifest. Same read-only, standard-guard-only posture as the git
+        // routes — a plain file read of the project's own folder, no cache
+        // (this is a per-page fetch, not a poll).
+        .route("/api/projects/{id}/version", get(get_project_version))
         .route("/api/projects/{id}/git/diff", get(get_project_git_diff))
         // Commit history: recent log, one commit's changed files, and one
         // commit-file's diff. Same read-only/standard-guard-only posture as
@@ -2028,6 +2033,42 @@ async fn get_git_status(State(state): State<AppState>) -> ApiResult<Response> {
         }
     }
     Ok(Json(rows).into_response())
+}
+
+/// `GET /api/projects/{id}/version` — the app version in the project's
+/// `local_path`, out of its `Cargo.toml`/`package.json`/`pyproject.toml`
+/// (`core::version`). Best-effort decoration, so it borrows
+/// `project_git_view`'s posture exactly: no `local_path`, a folder that is
+/// gone, or no usable manifest all return `200 {"version":null,"source":null}`
+/// rather than an error. Only an unknown project id is `not_found`.
+async fn get_project_version(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let empty = ProjectVersion {
+        version: None,
+        source: None,
+    };
+    let local_path = state.store.lock().unwrap().get_project(id)?.local_path;
+    let Some(path) = local_path else {
+        return Ok(Json(empty).into_response());
+    };
+    if !std::path::Path::new(&path).is_dir() {
+        return Ok(Json(empty).into_response());
+    }
+    // Blocking file reads (like the git shell-outs) — keep them off the async
+    // workers. A panic just means "no version this request".
+    let found = tokio::task::spawn_blocking(move || version::version_of(&path))
+        .await
+        .unwrap_or(None);
+    let body = match found {
+        Some((version, source)) => ProjectVersion {
+            version: Some(version),
+            source: Some(source),
+        },
+        None => empty,
+    };
+    Ok(Json(body).into_response())
 }
 
 /// Resolves a project's `local_path` and the working-tree view behind it,

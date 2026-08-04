@@ -1,5 +1,11 @@
 import { useEffect, useState } from 'react'
-import { getProject, listAllAgents, listTasks, updateProject } from '../api'
+import {
+  getProject,
+  getProjectVersion,
+  listAllAgents,
+  listTasks,
+  updateProject,
+} from '../api'
 import { CreateTaskModal } from '../components/CreateTaskModal'
 import { InlineEdit } from '../components/InlineEdit'
 import { TaskModal } from '../components/TaskModal'
@@ -124,6 +130,14 @@ export function ProjectTasksPage({
     error: projectError,
     refetch: refetchProject,
   } = useFetch(() => getProject(projectId), `project-${projectId}`)
+  // The app version in the project's folder, for the badge beside its name
+  // (mesa task 684). Decoration, so it is deliberately a plain keyed fetch
+  // with no `pollMs` — one read per project page — and its `error` is unread:
+  // the quiet empty shape is a 200, so a failure here just means no badge.
+  const { data: appVersion } = useFetch(
+    () => getProjectVersion(projectId),
+    `project-version-${projectId}`,
+  )
   // The board always shows every status column, so it fetches unfiltered.
   const { data: tasks, error: tasksError, refetch } = useFetch(
     () => listTasks({ project: projectId }),
@@ -199,6 +213,22 @@ export function ProjectTasksPage({
             />
           ) : (
             `Project ${projectId}`
+          )}
+          {/* The version of the app this project's folder holds (task 684),
+              derived from its manifest on every read. Best-effort: absent
+              whenever there is no folder or no readable version, so the
+              header is unchanged for a project that isn't an app. The `v`
+              prefix is added only when the manifest didn't already write
+              one. */}
+          {appVersion?.version && (
+            <span
+              className="badge project-version-badge"
+              title={`from ${appVersion.source}`}
+            >
+              {appVersion.version.startsWith('v')
+                ? appVersion.version
+                : `v${appVersion.version}`}
+            </span>
           )}
           {/* An archived project's page is otherwise identical to a live
               one's — every read here is project-scoped, so the flag changes

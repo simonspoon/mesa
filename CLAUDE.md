@@ -260,6 +260,7 @@ The code is the source of truth. These are the invariants you must not break:
 | --- | --- | --- |
 | Attachments | Files/images on a task, stored outside the DB; 25 MiB cap, base64-in-JSON upload to stay inside the CSRF gate | `docs/attachments.md` |
 | Git tab | Read-only working-tree + history per project; external `git` shell-outs only | `docs/git-tab.md` |
+| Project version | The app version in a project's `local_path`, read from its manifest and shown beside the name; derived on every read, never stored, quiet-empty on any miss | `docs/project-version.md` |
 | Files tab | Project file browser + editor; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
 | Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |

@@ -25,6 +25,7 @@ import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
 import type { ProjectGitView } from './types/ProjectGitView'
+import type { ProjectVersion } from './types/ProjectVersion'
 import type { Priority } from './types/Priority'
 import type { Project } from './types/Project'
 import type { Status } from './types/Status'
@@ -279,6 +280,16 @@ export function attachmentDownloadUrl(id: number): string {
 /** Git status of each project's local_path; projects without a repo omitted. */
 export function getGitStatus(): Promise<ProjectGitStatus[]> {
   return request('/api/git-status')
+}
+
+/**
+ * The app version in the project's local_path, read out of its manifest
+ * (Cargo.toml, then package.json, then pyproject.toml). Decoration for the
+ * project header: no folder / no manifest is `{version: null, source: null}`,
+ * never an error.
+ */
+export function getProjectVersion(id: number): Promise<ProjectVersion> {
+  return request(`/api/projects/${id}/version`)
 }
 
 /**

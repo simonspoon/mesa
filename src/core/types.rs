@@ -215,6 +215,18 @@ pub struct ProjectGitStatus {
     pub git: GitStatus,
 }
 
+/// `GET /api/projects/{id}/version`: the version of the app in a project's
+/// `local_path`, read out of its package manifest (`core::version`). Derived
+/// on every read, never stored. Both fields are `None` — the quiet empty
+/// shape, never an error — when there is no folder or no usable manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectVersion {
+    pub version: Option<String>,
+    /// The bare manifest filename the version came from, e.g. "Cargo.toml".
+    pub source: Option<String>,
+}
+
 /// One changed/untracked/conflicted path from `git status --porcelain=v2`
 /// (see `core::git::view_of`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

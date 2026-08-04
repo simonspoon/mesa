@@ -177,6 +177,7 @@ enum ProjectCmd {
 EXAMPLES
   mesa project create \"Website redesign\"
   mesa project create \"API v2\" --description \"second public API\"
+  mesa project create --name \"API v2\" --description \"second public API\"  # flag form
 
 By default the current directory's git repo (or the --path directory's, when
 given) is bound to the new project via its root (first) commit hash, so every
@@ -186,7 +187,11 @@ resolve`). Binding a commit already held by another project fails with
 instead of detecting it.")]
     Create {
         /// Project name
-        name: String,
+        #[arg(value_name = "NAME", required_unless_present = "name")]
+        name_pos: Option<String>,
+        /// Project name (flag form of NAME)
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "name_pos")]
+        name: Option<String>,
         /// Optional free-text description
         #[arg(long)]
         description: Option<String>,
@@ -1684,6 +1689,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
         ProjectCmd::Create {
+            name_pos,
             name,
             description,
             root_commit,
@@ -1692,6 +1698,8 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             parent,
             quiet,
         } => {
+            // clap's required_unless_present guarantees exactly one is set.
+            let name = name.or(name_pos).unwrap();
             // An explicit --root-commit or --no-git says "I am describing
             // somewhere else", so it suppresses ALL cwd auto-detection —
             // including the working-folder default below.

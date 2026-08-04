@@ -41,6 +41,16 @@ run 0 "$MESA" project create "Website" --description "marketing site" --no-git
 P=$(jqs .id)
 ok "project create returns full object, exit 0"
 
+# positional form: project create <NAME> ≡ --name, like every other create
+run 0 "$MESA" project create --name "Flag form" --no-git
+[ "$(jqs .name)" = "Flag form" ] || fail "project create --name: name"
+run 0 "$MESA" project delete "$(jqs .id)"
+run 2 "$MESA" project create "A" --name "B" --no-git
+[ "$(jqe .error.code)" = "usage" ] || fail "positional+flag name: code=usage"
+run 2 "$MESA" project create --no-git
+[ "$(jqe .error.code)" = "usage" ] || fail "missing name: code=usage"
+ok "project create: positional/flag name forms; both or neither is usage"
+
 run 0 "$MESA" project create "Other" --no-git
 P2=$(jqs .id)
 

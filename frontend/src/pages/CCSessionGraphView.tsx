@@ -23,8 +23,9 @@ import {
 import type { CcGraphNode } from '../types/CcGraphNode'
 import { useFetch } from '../useFetch'
 
-// One session's call tree, reached by clicking a row in the CC Dashboard's
-// Sessions table (`#/cc/sessions/:id`). A node per tool call and per subagent
+// One session's call tree (`#/cc/sessions/:id/graph`), reached from the
+// `Call graph →` link on that session's detail page — which is what a row in
+// the CC Dashboard's Sessions table now opens. A node per tool call and per subagent
 // run; a subagent hangs off the `Task` call that spawned it, so the picture is
 // the session's actual control flow rather than a flat list.
 //
@@ -63,8 +64,14 @@ export function CCSessionGraphView({ sessionId }: { sessionId: string }) {
   return (
     <div className="cc-graph-page">
       <header className="cc-graph-head">
-        <a className="cc-graph-back" href="#/cc/sessions">
-          ← Sessions
+        {/* Back one step, to this session's detail page — the default
+            drill-down this graph is reached from — not all the way out to the
+            sessions table. */}
+        <a
+          className="cc-graph-back"
+          href={`#/cc/sessions/${encodeURIComponent(sessionId)}`}
+        >
+          ← Session
         </a>
         <h1>Session {sessionId.split('-')[0]}</h1>
         {data && (

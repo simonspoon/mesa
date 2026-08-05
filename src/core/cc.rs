@@ -37,13 +37,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::store::{
-    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcSessionUpsert, CcToolCallRow,
-    Result, Store,
+    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcSessionRecord, CcSessionUpsert,
+    CcToolCallRow, Result, Store,
 };
 use super::types::{
     CcAgentStat, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
-    CcLiveSession, CcLiveSubagent, CcModelStat, CcOverview, CcProjectStat, CcSessionGraph,
-    CcSessionRow, CcSkillStat, CcTokens, CcToolStat,
+    CcLiveSession, CcLiveSubagent, CcModelStat, CcOverview, CcProjectStat, CcSessionBucket,
+    CcSessionDetail, CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat,
+    CcSessionThreadStat, CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -1665,6 +1666,267 @@ pub fn session_graph(
     }))
 }
 
+// ---- session detail (`mesa cc session`, `GET /api/cc/sessions/{id}`) ----
+
+/// Buckets in [`CcSessionDetail::activity`]. Fixed rather than derived from the
+/// span so the series is the same width for a 2-minute session and an 8-hour
+/// one, which is what lets the frontend draw it without a scale of its own.
+pub const ACTIVITY_BUCKETS: usize = 60;
+
+/// One session's exact aggregates. `Ok(None)` when the session was never
+/// ingested (mirrors [`session_graph`]).
+///
+/// Every persisted row is counted — no cap, no truncation flag. That is the
+/// point of this being a separate read: the graph's tool nodes are capped, and
+/// its tool/response nodes repeat their issuing message's usage, so neither an
+/// exact per-tool count nor a token-over-time series can be derived from it.
+pub fn session_detail(store: &Store, session_id: &str) -> Result<Option<CcSessionDetail>> {
+    let Some(sess) = store.cc_session(session_id)? else {
+        return Ok(None);
+    };
+    let messages = store.cc_session_messages(session_id)?;
+    let tool_calls = store.cc_session_tool_calls(session_id)?;
+    let runs = store.cc_session_agent_runs(session_id)?;
+
+    // ---- per-thread rollups, keyed by agent_id (None = the main thread), the
+    // same keying `session_graph` uses ----
+    #[derive(Default)]
+    struct Thread {
+        tok: Tok,
+        cost: f64,
+        messages: i64,
+        tool_calls: i64,
+        models: BTreeMap<String, i64>,
+        first_ts: Option<i64>,
+        last_ts: Option<i64>,
+    }
+    impl Thread {
+        fn touch(&mut self, ts: i64) {
+            self.first_ts = Some(self.first_ts.map_or(ts, |t| t.min(ts)));
+            self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
+        }
+    }
+    #[derive(Default)]
+    struct ModelAcc {
+        tok: Tok,
+        cost: f64,
+        messages: i64,
+    }
+
+    let mut threads: BTreeMap<Option<String>, Thread> = BTreeMap::new();
+    let mut models: BTreeMap<String, ModelAcc> = BTreeMap::new();
+    // name -> (calls, subagent_calls); keyed on the tool NAME alone, never the
+    // target, so one Bash row means "Bash", not one row per command.
+    let mut tools: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut skills: BTreeMap<String, i64> = BTreeMap::new();
+
+    for m in &messages {
+        let (i, o, cr, cw) = prices(&m.model);
+        let cost = (m.input_tokens as f64 * i
+            + m.output_tokens as f64 * o
+            + m.cache_read_tokens as f64 * cr
+            + m.cache_creation_tokens as f64 * cw)
+            / 1_000_000.0;
+        let t = threads.entry(m.agent_id.clone()).or_default();
+        t.tok.input += m.input_tokens;
+        t.tok.output += m.output_tokens;
+        t.tok.cache_read += m.cache_read_tokens;
+        t.tok.cache_creation += m.cache_creation_tokens;
+        t.cost += cost;
+        t.messages += 1;
+        *t.models.entry(m.model.clone()).or_insert(0) += 1;
+        t.touch(m.ts);
+
+        let a = models.entry(m.model.clone()).or_default();
+        a.tok.input += m.input_tokens;
+        a.tok.output += m.output_tokens;
+        a.tok.cache_read += m.cache_read_tokens;
+        a.tok.cache_creation += m.cache_creation_tokens;
+        a.cost += cost;
+        a.messages += 1;
+    }
+    for c in &tool_calls {
+        let t = threads.entry(c.agent_id.clone()).or_default();
+        t.tool_calls += 1;
+        t.touch(c.ts);
+        let e = tools.entry(c.name.clone()).or_insert((0, 0));
+        e.0 += 1;
+        if c.agent_id.is_some() {
+            e.1 += 1;
+        }
+        // Same promotion the call tree does: a `Skill` call is named for the
+        // skill it ran. A row ingested before migration 22 has no target and so
+        // has no name to report — it stays a plain tool row only.
+        if c.name == "Skill"
+            && let Some(skill) = c.target.as_deref()
+        {
+            *skills.entry(skill.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    // A run row supplies a thread's identity; a thread seen only in messages or
+    // tool calls still gets an entry, with those fields left None.
+    let run_by_id: BTreeMap<&str, &CcAgentRunUpsert> =
+        runs.iter().map(|r| (r.agent_id.as_str(), r)).collect();
+    for r in &runs {
+        threads.entry(Some(r.agent_id.clone())).or_default();
+    }
+
+    let stat = |agent_id: Option<&str>, t: Option<&Thread>| {
+        let run = agent_id.and_then(|a| run_by_id.get(a));
+        CcSessionThreadStat {
+            agent_id: agent_id.map(str::to_string),
+            agent: run.and_then(|r| r.agent.clone()),
+            skill: run.and_then(|r| r.skill.clone()),
+            description: run.and_then(|r| r.description.clone()),
+            spawn_depth: run.and_then(|r| r.spawn_depth),
+            model: t.and_then(|t| top_model(&t.models)),
+            messages: t.map_or(0, |t| t.messages),
+            tool_calls: t.map_or(0, |t| t.tool_calls),
+            tokens: t
+                .map(|t| t.tok.to_cc())
+                .unwrap_or_else(|| Tok::default().to_cc()),
+            total_tokens: t.map_or(0, |t| t.tok.total()),
+            est_cost_usd: round4(t.map_or(0.0, |t| t.cost)),
+            start: t.and_then(|t| t.first_ts).map(fmt_ts),
+            end: t.and_then(|t| t.last_ts).map(fmt_ts),
+        }
+    };
+
+    let main = stat(None, threads.get(&None));
+    let mut agents: Vec<CcSessionThreadStat> = threads
+        .iter()
+        .filter_map(|(k, t)| k.as_deref().map(|a| stat(Some(a), Some(t))))
+        .collect();
+    agents.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+
+    let mut model_stats: Vec<CcSessionModelStat> = models
+        .into_iter()
+        .map(|(model, a)| CcSessionModelStat {
+            model,
+            messages: a.messages,
+            tokens: a.tok.to_cc(),
+            total_tokens: a.tok.total(),
+            est_cost_usd: round4(a.cost),
+        })
+        .collect();
+    model_stats.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
+    let mut tool_stats: Vec<CcSessionToolStat> = tools
+        .into_iter()
+        .map(|(name, (calls, subagent_calls))| CcSessionToolStat {
+            name,
+            calls,
+            subagent_calls,
+        })
+        .collect();
+    tool_stats.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
+
+    let mut skill_stats: Vec<CcSessionSkillStat> = skills
+        .into_iter()
+        .map(|(name, calls)| CcSessionSkillStat { name, calls })
+        .collect();
+    skill_stats.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
+
+    // ---- whole-session totals: every thread, the only additive numbers ----
+    let mut all = Tok::default();
+    let mut cost = 0.0;
+    let mut msg_count = 0;
+    for t in threads.values() {
+        all.input += t.tok.input;
+        all.output += t.tok.output;
+        all.cache_read += t.tok.cache_read;
+        all.cache_creation += t.tok.cache_creation;
+        cost += t.cost;
+        msg_count += t.messages;
+    }
+
+    let activity = activity_series(&sess, &messages, &tool_calls);
+    let dur = match (sess.start_ts, sess.end_ts) {
+        (Some(s), Some(e)) if e > s => (e - s) as f64 / 60.0,
+        _ => 0.0,
+    };
+
+    Ok(Some(CcSessionDetail {
+        session_id: session_id.to_string(),
+        project: sess.cwd.as_deref().map(short_project),
+        cwd: sess.cwd,
+        git_branch: sess.git_branch,
+        entrypoint: sess.entrypoint,
+        start: sess.start_ts.map(fmt_ts),
+        end: sess.end_ts.map(fmt_ts),
+        duration_minutes: round2(dur),
+        used_subagent: sess.used_subagent,
+        tokens: all.to_cc(),
+        total_tokens: all.total(),
+        est_cost_usd: round4(cost),
+        messages: msg_count,
+        tool_calls: tool_calls.len() as i64,
+        agent_runs: runs.len() as i64,
+        main,
+        agents,
+        models: model_stats,
+        tools: tool_stats,
+        skills: skill_stats,
+        activity,
+    }))
+}
+
+/// [`ACTIVITY_BUCKETS`] evenly-sized buckets over `start_ts..=end_ts`, the last
+/// one inclusive of `end_ts` so no event is dropped. Zero-activity buckets are
+/// still emitted — a flat gap is signal. A session with no known span, or one
+/// whose span is a single instant, is exactly one bucket holding everything.
+fn activity_series(
+    sess: &CcSessionRecord,
+    messages: &[CcMessageRow],
+    tool_calls: &[CcToolCallRow],
+) -> Vec<CcSessionBucket> {
+    let span = match (sess.start_ts, sess.end_ts) {
+        (Some(s), Some(e)) if e > s => Some((s, e)),
+        _ => None,
+    };
+    let n = if span.is_some() { ACTIVITY_BUCKETS } else { 1 };
+    let idx = |ts: i64| match span {
+        // Clamped both ways: an event outside the recorded span (a session row
+        // whose start/end predates a later ingest) lands in an end bucket
+        // rather than being dropped or panicking.
+        Some((s, e)) => (((ts - s).max(0) as i128 * n as i128) / (e - s) as i128)
+            .clamp(0, n as i128 - 1) as usize,
+        None => 0,
+    };
+    let mut out: Vec<CcSessionBucket> = (0..n)
+        .map(|i| CcSessionBucket {
+            start: fmt_ts(match span {
+                Some((s, e)) => s + ((e - s) * i as i64) / n as i64,
+                None => sess.start_ts.or(sess.end_ts).unwrap_or(0),
+            }),
+            messages: 0,
+            tool_calls: 0,
+            total_tokens: 0,
+            output_tokens: 0,
+        })
+        .collect();
+    for m in messages {
+        let b = &mut out[idx(m.ts)];
+        b.messages += 1;
+        b.total_tokens +=
+            m.input_tokens + m.output_tokens + m.cache_read_tokens + m.cache_creation_tokens;
+        b.output_tokens += m.output_tokens;
+    }
+    for c in tool_calls {
+        out[idx(c.ts)].tool_calls += 1;
+    }
+    out
+}
+
 /// The model a thread mostly ran on: most messages, ties broken by name so the
 /// answer is stable across runs.
 fn top_model(models: &BTreeMap<String, i64>) -> Option<String> {
@@ -2972,6 +3234,202 @@ mod tests {
 
     fn node_total(g: &CcSessionGraph, id: &str) -> i64 {
         g.nodes.iter().find(|n| n.id == id).unwrap().total_tokens
+    }
+
+    /// A session bigger than the graph's node cap: 700 Bash calls (main +
+    /// subagent), a `Skill` call, and one message per thread. Ingested straight
+    /// into the store so the fixture stays a few lines rather than 700 of JSON.
+    fn seed_big_session(store: &mut Store) {
+        let mut tool_calls: Vec<CcToolCallRow> = Vec::new();
+        for i in 0..700 {
+            tool_calls.push(CcToolCallRow {
+                tool_use_id: format!("tu{i}"),
+                message_uuid: "u1".into(),
+                session_id: "big".into(),
+                // Every 10th call is the subagent's, so `subagent_calls` is a
+                // real subset rather than 0 or everything.
+                agent_id: if i % 10 == 0 { Some("a1".into()) } else { None },
+                name: "Bash".into(),
+                caller: None,
+                // Spread over the whole span so the buckets are not one spike.
+                ts: 1000 + i,
+                target: Some(format!("echo {i}")),
+            });
+        }
+        tool_calls.push(CcToolCallRow {
+            tool_use_id: "tu-skill".into(),
+            message_uuid: "u1".into(),
+            session_id: "big".into(),
+            agent_id: None,
+            name: "Skill".into(),
+            caller: None,
+            ts: 1200,
+            target: Some("inaros-swe:refine".into()),
+        });
+        let msg = |uuid: &str, agent: Option<&str>, ts: i64, out: i64| CcMessageRow {
+            uuid: uuid.into(),
+            session_id: "big".into(),
+            agent_id: agent.map(str::to_string),
+            ts,
+            model: "claude-opus-4-8".into(),
+            input_tokens: 100,
+            output_tokens: out,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            skill: None,
+            agent: None,
+            preview: None,
+        };
+        store
+            .cc_ingest_file(
+                "/t/big.jsonl",
+                &CcFileCursor {
+                    mtime: 1,
+                    size: 1,
+                    byte_offset: 1,
+                },
+                &CcFileBatch {
+                    sessions: vec![CcSessionUpsert {
+                        session_id: "big".into(),
+                        cwd: Some("/home/me/work/widget".into()),
+                        git_branch: Some("main".into()),
+                        entrypoint: Some("cli".into()),
+                        used_subagent: true,
+                        start_ts: Some(1000),
+                        end_ts: Some(1699),
+                    }],
+                    agent_runs: vec![CcAgentRunUpsert {
+                        session_id: "big".into(),
+                        agent_id: "a1".into(),
+                        agent: Some("Explore".into()),
+                        skill: None,
+                        tool_use_id: Some("tu0".into()),
+                        description: Some("look around".into()),
+                        spawn_depth: Some(1),
+                        parent_agent_id: None,
+                    }],
+                    messages: vec![msg("u1", None, 1000, 200), msg("u2", Some("a1"), 1400, 20)],
+                    tool_calls,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn session_detail_counts_every_row_past_the_graph_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        seed_big_session(&mut store);
+
+        let d = session_detail(&store, "big").unwrap().unwrap();
+        // Exact, not a prefix: the graph would keep at most GRAPH_NODE_LIMIT
+        // tool nodes, which is the whole reason this is its own read.
+        assert!(d.tool_calls > GRAPH_NODE_LIMIT as i64);
+        assert_eq!(d.tool_calls, 701);
+        let bash = d.tools.iter().find(|t| t.name == "Bash").unwrap();
+        assert_eq!(bash.calls, 700);
+        assert_eq!(bash.subagent_calls, 70);
+        // Tools are keyed on the name alone — 700 distinct targets, one row.
+        assert_eq!(d.tools.len(), 2);
+        // `Skill` is promoted to the skill it ran, as in the call tree.
+        assert_eq!(d.skills.len(), 1);
+        assert_eq!(d.skills[0].name, "inaros-swe:refine");
+        assert_eq!(d.skills[0].calls, 1);
+
+        // Main vs subagent split: main 100+200, subagent 100+20 — and the
+        // whole-session rollup is their sum.
+        assert_eq!(d.main.agent_id, None);
+        assert_eq!(d.main.total_tokens, 300);
+        assert_eq!(d.main.tool_calls, 631);
+        assert_eq!(d.agents.len(), 1);
+        assert_eq!(d.agents[0].agent_id.as_deref(), Some("a1"));
+        assert_eq!(d.agents[0].agent.as_deref(), Some("Explore"));
+        assert_eq!(d.agents[0].description.as_deref(), Some("look around"));
+        assert_eq!(d.agents[0].spawn_depth, Some(1));
+        assert_eq!(d.agents[0].total_tokens, 120);
+        assert_eq!(d.agents[0].tool_calls, 70);
+        assert_eq!(d.total_tokens, 420);
+        assert_eq!(d.messages, 2);
+        assert_eq!(d.agent_runs, 1);
+        assert!((d.est_cost_usd - (d.main.est_cost_usd + d.agents[0].est_cost_usd)).abs() < 1e-9);
+        assert_eq!(d.project.as_deref(), Some("widget"));
+
+        // The activity series is a partition of the session: every message and
+        // every tool call lands in exactly one bucket, none dropped.
+        assert_eq!(d.activity.len(), ACTIVITY_BUCKETS);
+        assert_eq!(
+            d.activity.iter().map(|b| b.messages).sum::<i64>(),
+            d.messages
+        );
+        assert_eq!(
+            d.activity.iter().map(|b| b.tool_calls).sum::<i64>(),
+            d.tool_calls
+        );
+        assert_eq!(
+            d.activity.iter().map(|b| b.total_tokens).sum::<i64>(),
+            d.total_tokens
+        );
+        assert_eq!(d.activity.iter().map(|b| b.output_tokens).sum::<i64>(), 220);
+        // The last event sits exactly on `end_ts` and belongs to the last
+        // bucket, not to a 61st one.
+        assert!(d.activity.last().unwrap().tool_calls > 0);
+
+        // A session that was never ingested is None, not an empty detail.
+        assert!(session_detail(&store, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn session_detail_collapses_to_one_bucket_without_a_span() {
+        // No usable span (start == end): one bucket holding everything, rather
+        // than 60 buckets 59 of which are a lie.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        store
+            .cc_ingest_file(
+                "/t/flat.jsonl",
+                &CcFileCursor {
+                    mtime: 1,
+                    size: 1,
+                    byte_offset: 1,
+                },
+                &CcFileBatch {
+                    sessions: vec![CcSessionUpsert {
+                        session_id: "flat".into(),
+                        cwd: None,
+                        git_branch: None,
+                        entrypoint: None,
+                        used_subagent: false,
+                        start_ts: Some(500),
+                        end_ts: Some(500),
+                    }],
+                    messages: vec![CcMessageRow {
+                        uuid: "m1".into(),
+                        session_id: "flat".into(),
+                        agent_id: None,
+                        ts: 500,
+                        model: "claude-opus-4-8".into(),
+                        input_tokens: 1,
+                        output_tokens: 2,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        skill: None,
+                        agent: None,
+                        preview: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let d = session_detail(&store, "flat").unwrap().unwrap();
+        assert_eq!(d.activity.len(), 1);
+        assert_eq!(d.activity[0].messages, 1);
+        assert_eq!(d.activity[0].total_tokens, 3);
+        assert_eq!(d.duration_minutes, 0.0);
+        // No tool calls and no subagents: quiet empties, never an error.
+        assert!(d.tools.is_empty() && d.skills.is_empty() && d.agents.is_empty());
+        assert_eq!(d.main.messages, 1);
+        assert_eq!(d.models.len(), 1);
     }
 
     #[test]

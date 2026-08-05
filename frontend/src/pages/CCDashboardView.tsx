@@ -1,7 +1,12 @@
 import { useState } from 'react'
 import { getCcDashboard, getCcLive, getCcUsage, getProjectCcDashboard } from '../api'
 import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
+import { DataTable, Kpi } from '../components/ccTable'
 import { shortModel } from '../sessionGraph'
+// Formatters and the token palette live in the unit-tested module and are
+// shared with the session detail page — two copies of `fmtTok` is exactly the
+// drift the `shortModel` note below warns about.
+import { TOK, fmtInt, fmtPct, fmtTok, fmtUsd } from '../sessionDetail'
 import type { CcDashboard } from '../types/CcDashboard'
 import type { CcLiveSession } from '../types/CcLiveSession'
 import type { CcUsageWindow } from '../types/CcUsageWindow'
@@ -19,14 +24,6 @@ const WINDOWS: { id: string; label: string }[] = [
   { id: 'all', label: 'All time' },
 ]
 
-// Token-type colours, shared by the legend, the daily chart, and the breakdown.
-const TOK = {
-  input: { label: 'input', color: 'var(--cyan)' },
-  output: { label: 'output', color: 'var(--magenta)' },
-  cache_read: { label: 'cache read', color: 'var(--green)' },
-  cache_creation: { label: 'cache write', color: 'var(--amber)' },
-} as const
-
 // Donut palette for the model split.
 const PALETTE = [
   'var(--cyan)',
@@ -38,142 +35,17 @@ const PALETTE = [
   '#5d7f8f',
 ]
 
-const fmtInt = (n: number) => n.toLocaleString()
-const fmtTok = (n: number) =>
-  n >= 1e9
-    ? `${(n / 1e9).toFixed(2)}B`
-    : n >= 1e6
-      ? `${(n / 1e6).toFixed(2)}M`
-      : n >= 1e3
-        ? `${(n / 1e3).toFixed(1)}k`
-        : `${n}`
-const fmtUsd = (n: number) =>
-  n >= 1000 ? `$${(n / 1000).toFixed(2)}k` : `$${n.toFixed(2)}`
+// The dashboard's own coarse minutes/hours reading, kept local: the detail
+// page's `fmtDuration` also spells sub-minute spans in seconds, which is a
+// change to what these cells say and not this story's business.
 const fmtMin = (n: number) =>
   n >= 60 ? `${(n / 60).toFixed(1)}h` : `${Math.round(n)}m`
-const fmtPct = (n: number) => `${(n * 100).toFixed(1)}%`
 const fmtAgo = (s: number) =>
   s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`
 // `shortModel` lives in sessionGraph.ts (the unit-tested module) rather than
 // here: two same-named model shorteners in one feature is exactly the kind of
 // drift where one gets fixed and the other keeps the old reading.
 const modelLabel = (m: string) => shortModel(m) ?? m
-
-// ---- generic sortable table ----
-
-type Col<T> = {
-  key: string
-  label: string
-  render: (r: T) => React.ReactNode
-  sort?: (r: T) => number | string
-  numeric?: boolean
-}
-
-function DataTable<T>({
-  rows,
-  cols,
-  initialKey,
-  initialDir = 'desc',
-  empty,
-  rowKey,
-  rowHref,
-}: {
-  rows: T[]
-  cols: Col<T>[]
-  initialKey: string
-  initialDir?: 'asc' | 'desc'
-  empty: string
-  // Stable identity per row so React reconciles correctly across re-sorts.
-  rowKey: (r: T) => string
-  // Optional drill-down target. The first cell becomes a real `<a>` — so the
-  // row is reachable by keyboard, announced as a link, and middle-clickable —
-  // and the whole row additionally navigates on click, which is what a table
-  // of clickable rows is expected to do.
-  rowHref?: (r: T) => string
-}) {
-  const [key, setKey] = useState(initialKey)
-  const [dir, setDir] = useState<'asc' | 'desc'>(initialDir)
-  const col = cols.find((c) => c.key === key)
-  const sorted =
-    col?.sort != null
-      ? [...rows].sort((a, b) => {
-          const av = col.sort!(a)
-          const bv = col.sort!(b)
-          const cmp = av < bv ? -1 : av > bv ? 1 : 0
-          return dir === 'asc' ? cmp : -cmp
-        })
-      : rows
-  function clickHeader(c: Col<T>) {
-    if (!c.sort) return
-    if (c.key === key) setDir((d) => (d === 'asc' ? 'desc' : 'asc'))
-    else {
-      setKey(c.key)
-      setDir('desc')
-    }
-  }
-  if (rows.length === 0) return <p className="muted">{empty}</p>
-  return (
-    // The scroll box wraps the table only — scrolling the panel instead takes
-    // its heading and hint along, which is what a 390px screen exposed.
-    <div className="cc-table-wrap">
-      <table className="cc-table">
-        <thead>
-          <tr>
-            {cols.map((c) => (
-              <th
-                key={c.key}
-                className={`${c.numeric ? 'num' : ''}${c.sort ? ' sortable' : ''}`}
-                onClick={() => clickHeader(c)}
-              >
-                {c.label}
-                {c.key === key ? (dir === 'asc' ? ' ▲' : ' ▼') : ''}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((r) => {
-            const href = rowHref?.(r)
-            return (
-              <tr
-                key={rowKey(r)}
-                className={href ? 'cc-row-link' : undefined}
-                onClick={
-                  href
-                    ? (e) => {
-                        // The first cell's own `<a>` already navigates, and a
-                        // drag that ends up selecting text is not a click —
-                        // reacting to either would hijack the gesture.
-                        if ((e.target as HTMLElement).closest('a')) return
-                        if (window.getSelection()?.toString()) return
-                        window.location.hash = href
-                      }
-                    : undefined
-                }
-              >
-                {cols.map((c, i) => (
-                  <td key={c.key} className={c.numeric ? 'num' : ''}>
-                    {href && i === 0 ? <a href={href}>{c.render(r)}</a> : c.render(r)}
-                  </td>
-                ))}
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-function Kpi({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <div className="cc-kpi">
-      <div className="cc-kpi-value">{value}</div>
-      <div className="cc-kpi-label">{label}</div>
-      {sub && <div className="cc-kpi-sub">{sub}</div>}
-    </div>
-  )
-}
 
 // The dashboard is split into an overview (charts + KPIs, plus the live and
 // subscription cards) and three table sub-pages. All share one windowed fetch;

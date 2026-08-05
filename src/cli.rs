@@ -889,6 +889,19 @@ EXAMPLES
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Print one session's aggregate detail as one JSON object
+    ///
+    /// Totals, the main thread vs each subagent, per-model / per-tool /
+    /// per-skill breakdowns and an activity series over the session span.
+    /// Aggregated over EVERY persisted row — unlike `cc graph`, which caps its
+    /// nodes and whose tool nodes repeat their issuing message's usage.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc session 72c9161c-16c9-47f4-8217-39fde068a39b")]
+    Session {
+        /// The session id (as printed by `mesa cc sessions`)
+        session_id: String,
+    },
     /// Print one session's call tree as a JSON graph (nodes + edges)
     ///
     /// One node per tool call, per subagent run and per assistant message that
@@ -2238,6 +2251,18 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
                 rows.truncate(n);
             }
             print_json(&rows);
+        }
+        CcCmd::Session { session_id } => {
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store, false)?;
+            match crate::core::cc::session_detail(&store, &session_id)? {
+                Some(d) => print_json(&d),
+                None => {
+                    return Err(Error::NotFound(format!(
+                        "no ingested session {session_id} (see `mesa cc sessions`)"
+                    )));
+                }
+            }
         }
         CcCmd::Graph { session_id, limit } => {
             let mut store = Store::open_default()?;

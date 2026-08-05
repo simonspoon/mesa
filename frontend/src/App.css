@@ -5119,6 +5119,109 @@ button:focus-visible,
   border-left-color: var(--border);
 }
 
+/* ---- CC session detail (#/cc/sessions/:id) — the default drill-down ----
+   Reuses the dashboard's panels, KPI cards and `.cc-table-wrap` (so the phone
+   rules in docs/mobile.md keep applying); only the bits that page has no
+   equivalent of live here. */
+
+/* Pushed to the far end of the header row, opposite the `← Sessions` link. */
+.cc-detail-graphlink {
+  margin-left: auto;
+}
+
+/* One labelled sparkline row: tokens and tool calls get their own scale, so
+   each is a full-width chart with its own caption rather than a shared axis. */
+.cc-spark-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.4rem;
+}
+
+.cc-spark-row .spark {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+}
+
+.cc-spark-label {
+  width: 5.5rem;
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Top-tools bar list: name, proportional bar, count, subagent note. Grid
+   rather than flex so every bar shares one column and the list reads as a
+   chart. */
+.cc-toolbars {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(6rem, 10rem) 1fr auto auto;
+  align-items: center;
+  gap: 0.35rem 0.7rem;
+  font-size: 0.8rem;
+}
+
+.cc-toolbars li {
+  display: contents;
+}
+
+.cc-toolbar-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-h);
+}
+
+.cc-toolbar-track {
+  background: var(--panel-raised);
+  height: 0.7rem;
+  min-width: 2px;
+}
+
+.cc-toolbar-fill {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+}
+
+.cc-toolbar-num {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-h);
+}
+
+.cc-toolbar-sub {
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+/* Key/value details block: label column + value column. */
+.cc-details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.3rem 1rem;
+  margin: 0.4rem 0 0.8rem;
+  font-size: 0.82rem;
+}
+
+.cc-details dt {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.72rem;
+}
+
+.cc-details dd {
+  margin: 0;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
 /* --- Settings page (mesa task 654) -------------------------------------- */
 
 /* A form, not a dashboard: a reading-width column so a command template — the

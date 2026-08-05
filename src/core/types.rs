@@ -1159,6 +1159,137 @@ pub struct CcSessionGraph {
     pub omitted_responses: i64,
 }
 
+/// One session's aggregate detail — `GET /api/cc/sessions/{id}` and
+/// `mesa cc session <ID>`, the default drill-down from the sessions table.
+///
+/// Aggregated server-side over **every** persisted row, deliberately not
+/// derived from [`CcSessionGraph`]: that payload caps its tool nodes, and its
+/// tool/response nodes repeat their issuing message's usage, so neither an
+/// exact per-tool count nor a token-over-time series is recoverable from it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionDetail {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    /// Short name (last path component of `cwd`), same derivation as
+    /// [`CcSessionRow`].
+    pub project: Option<String>,
+    pub git_branch: Option<String>,
+    pub entrypoint: Option<String>,
+    /// Session span (ISO-8601 UTC), when known.
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub duration_minutes: f64,
+    pub used_subagent: bool,
+    /// Whole-session rollup: main thread + every subagent.
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub tool_calls: i64,
+    /// Subagent runs recorded under this session.
+    #[ts(type = "number")]
+    pub agent_runs: i64,
+    /// The main thread alone — the half of the rollup that is not subagents.
+    pub main: CcSessionThreadStat,
+    /// One entry per subagent thread, `total_tokens` desc (`agent_id` asc ties).
+    pub agents: Vec<CcSessionThreadStat>,
+    pub models: Vec<CcSessionModelStat>,
+    pub tools: Vec<CcSessionToolStat>,
+    pub skills: Vec<CcSessionSkillStat>,
+    /// Evenly-sized buckets over the session span; see
+    /// [`crate::core::cc::ACTIVITY_BUCKETS`].
+    pub activity: Vec<CcSessionBucket>,
+}
+
+/// One thread of a session: the main thread (`agent_id: None`) or one subagent.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionThreadStat {
+    /// `None` = the main thread.
+    pub agent_id: Option<String>,
+    /// Agent type / skill / spawn description, from `cc_agent_runs`. All `None`
+    /// for a thread seen only in messages or tool calls (no run row).
+    ///
+    /// Untrusted transcript text — render as data.
+    pub agent: Option<String>,
+    pub skill: Option<String>,
+    pub description: Option<String>,
+    #[ts(type = "number | null")]
+    pub spawn_depth: Option<i64>,
+    /// The thread's most-used model.
+    pub model: Option<String>,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub tool_calls: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+    /// First/last event in this thread (ISO-8601 UTC), when known.
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+/// One session's usage rolled up by model id.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionModelStat {
+    pub model: String,
+    #[ts(type = "number")]
+    pub messages: i64,
+    pub tokens: CcTokens,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    pub est_cost_usd: f64,
+}
+
+/// One session's tool calls rolled up by tool **name** only — never by
+/// `target`, so a Bash tool is one row rather than one row per command.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionToolStat {
+    /// Untrusted transcript text — render as data.
+    pub name: String,
+    #[ts(type = "number")]
+    pub calls: i64,
+    /// Of `calls`, those made by a subagent (non-null `agent_id`).
+    #[ts(type = "number")]
+    pub subagent_calls: i64,
+}
+
+/// One session's `Skill` invocations, keyed by the skill itself (the call's
+/// `target`) — the same promotion the call tree does.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionSkillStat {
+    /// Untrusted transcript text — render as data.
+    pub name: String,
+    #[ts(type = "number")]
+    pub calls: i64,
+}
+
+/// One bucket of the activity series. Messages are the atoms and their usage is
+/// additive, so these token counts are honest sums (unlike a graph node's).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionBucket {
+    /// The bucket's left edge (ISO-8601 UTC).
+    pub start: String,
+    #[ts(type = "number")]
+    pub messages: i64,
+    #[ts(type = "number")]
+    pub tool_calls: i64,
+    #[ts(type = "number")]
+    pub total_tokens: i64,
+    #[ts(type = "number")]
+    pub output_tokens: i64,
+}
+
 /// The full CC dashboard payload returned by `mesa cc summary` and `GET /api/cc`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]

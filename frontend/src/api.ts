@@ -8,6 +8,7 @@ import type { AnchorSide } from './types/AnchorSide'
 import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
+import type { CcSessionDetail } from './types/CcSessionDetail'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
@@ -713,6 +714,16 @@ export function getCcLive(minutes: number): Promise<CcLive> {
  */
 export function getCcSessionGraph(sessionId: string): Promise<CcSessionGraph> {
   return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/graph`)
+}
+
+/**
+ * One session's aggregate detail — the default drill-down. Aggregated
+ * server-side over every persisted row (the graph payload caps its nodes and
+ * repeats one message's usage across siblings, so none of this is derivable
+ * from it). 404s for a session that was never ingested.
+ */
+export function getCcSessionDetail(sessionId: string): Promise<CcSessionDetail> {
+  return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}`)
 }
 
 /** Live subscription usage (plan limits + reset times), fetched from Anthropic. */

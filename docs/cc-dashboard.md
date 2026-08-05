@@ -148,6 +148,27 @@ CLI and API share it and never diverge.
   `MESA_DB` isolates the store as everywhere else.
 - The read entry point is `cc::collect(store, window) -> CcDashboard` (overview +
   daily series + model/skill/agent/project/tool breakdowns + capped session rows).
+- **Session detail** — `cc::session_detail(store, session_id) -> Option<CcSessionDetail>`,
+  the other per-session read and the **default** drill-down. Whole-session
+  rollup + the main thread vs each subagent (`CcSessionThreadStat`, keyed on
+  `agent_id` exactly as the call tree keys threads), per-model / per-tool /
+  per-skill breakdowns, and an activity series of `cc::ACTIVITY_BUCKETS` (60)
+  evenly-sized buckets over the span (the last inclusive of `end_ts`; a session
+  with no usable span is exactly one bucket). Aggregated over **every**
+  persisted row — no cap, no truncation flag.
+  **Why this is a server-side read rather than something the browser derives
+  from the graph payload:** the graph caps its tool nodes
+  (`GRAPH_NODE_LIMIT = 600`, API clamp 5,000) so a per-tool count taken from
+  its nodes would silently cover only a prefix of a long session (real sessions
+  reach ~6.6k calls); and its tool/response nodes carry no message identity and
+  repeat their issuing message's usage, so a token-over-time series is not
+  derivable client-side at all. Tools are keyed on `name` alone, never `target`
+  (the same rule as `toolColor`), and a `Skill` call is promoted into `skills`
+  under the skill it ran — the same promotion the call tree does.
+  CLI `mesa cc session <SESSION_ID>`; API `GET /api/cc/sessions/{id}` (no query
+  parameters). Unknown session is `not_found` (CLI exit 1, HTTP 404); like the
+  graph it syncs first and is **not** cached — an on-demand drill-down, not a
+  poll.
 - **Session call tree** — `cc::session_graph(store, session_id, limit)`, the one
   read that is per-session rather than windowed (it always covers the whole
   session; the `Store::cc_session_*` reads filter on `session_id`, never `ts`).
@@ -241,7 +262,7 @@ CLI and API share it and never diverge.
     `not_found` (CLI exit 1, HTTP 404) — distinct from an empty graph, which is
     the right answer for a session that made no calls. Unlike `GET /api/cc`
     this response is **not** cached: it is an on-demand drill-down, not a poll.
-- CLI: `mesa cc {summary,sessions,skills,graph,sync}` (JSON only; `summary` prints the
+- CLI: `mesa cc {summary,sessions,skills,session,graph,sync}` (JSON only; `summary` prints the
   full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
   `--limit` on `sessions` and `--rebuild` on `sync`). Like every other handler
   these open the database; only `cc live` and `cc usage` stay store-less.
@@ -266,8 +287,28 @@ CLI and API share it and never diverge.
   table's min-content width routinely exceeds its panel; scrolling the panel
   instead carries its own heading and hint off-screen. Phone-tier readability
   (the frozen identity column) is in `docs/mobile.md`.
-- **Session graph page** (`#/cc/sessions/:id`): clicking a Sessions row opens
-  the call tree on a React Flow canvas (`CCSessionGraphView.tsx`). Layout is a
+- **Session detail page** (`#/cc/sessions/:id`) — what clicking a Sessions row
+  opens. `CCSessionDetailView.tsx` over `GET /api/cc/sessions/{id}`: KPI row
+  (tokens, est. cost, duration, messages, tool calls, subagent runs, cache-hit
+  ratio, tokens/minute), a token-composition donut, one `Sparkbars` per
+  activity series (tokens and tool calls get their own scale — sharing one
+  would flatten the calls into the axis), a top-12-plus-`other` tool bar list,
+  and models / threads tables. The page's pure logic lives in
+  `frontend/src/sessionDetail.ts` (vitest-covered, per CLAUDE.md's
+  frontend-test rule), which also owns the shared `TOK` colour map and the
+  `fmtTok`/`fmtUsd`/`fmtPct`/`fmtInt` formatters the dashboard imports; the
+  sortable `DataTable` and the `Kpi` card moved to
+  `frontend/src/components/ccTable.tsx` unchanged so both pages use one
+  implementation. Charts still come only from `components/charts.tsx` — no
+  chart dependency. Zero states (no tool calls, no subagents, no skills) are
+  quiet muted lines, never errors, and `agent`/`skill`/`description`/tool names
+  /`project`/`cwd` are rendered as text children or `title` attributes only.
+- **Session graph page** (`#/cc/sessions/:id/graph`): one link (`Call graph →`)
+  from the detail page above, which its own `← Session` link returns to. The
+  call tree on a React Flow canvas (`CCSessionGraphView.tsx`). The two route
+  patterns are disjoint — the id segment is `[^/]+`, so a `/graph` suffix can
+  never be swallowed by the detail pattern — and both keep the nav highlighting
+  Sessions. Layout is a
   hand-rolled tidy tree in `frontend/src/sessionGraph.ts` — React Flow ships no
   layout algorithm, and unlike `layout.ts` (whose storyboard edges may be
   cyclic) this input is a guaranteed tree, so it needs no cycle-breaking. Flow
@@ -349,6 +390,13 @@ CLI and API share it and never diverge.
   line is the only way to assert the `[response, tool, tool]` sibling order —
   plus a prose-free message that must get no node, and it is appended after
   every whole-dashboard count assertion so it perturbs none of them.
+  `cc session` is asserted the same way over both surfaces: the key set, totals
+  agreeing **with the graph's** `total_tokens`/`est_cost_usd` (two code paths,
+  one answer), `agents` length matching `agent_runs`, the activity buckets
+  summing to the session's own message/tool-call/token totals, an HTTP payload
+  equal to the CLI's, `--quiet` rejected (exit 2), and `not_found`/404 on an
+  unknown session. Exactness past the graph's cap is a `cc.rs` unit test (701
+  tool calls in one session), not a shell fixture.
 
 ## Subscription usage (the one network read)
 

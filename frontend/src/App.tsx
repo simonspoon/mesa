@@ -7,6 +7,7 @@ import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
+import { CCSessionDetailView } from './pages/CCSessionDetailView'
 import { CCSessionGraphView } from './pages/CCSessionGraphView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
@@ -161,15 +162,22 @@ function App() {
   // (#/cc/skills-agents, #/cc/projects, #/cc/sessions) carry the table views;
   // capture group 1 is the active sub-page, undefined for the overview.
   const ccMatch = /^\/(?:cc(?:\/(skills-agents|projects|sessions))?)?$/.exec(path)
-  // One session's call tree, drilled into from the Sessions table. Session ids
-  // are UUIDs, but the segment is matched loosely and decoded rather than
-  // pattern-matched, so an id shape change upstream can't silently 404 here.
-  const ccGraphMatch = /^\/cc\/sessions\/([^/]+)$/.exec(path)
-  // The graph is a drill-down *of* the Sessions tab, so the nav keeps
-  // highlighting Sessions while it is open.
+  // One session, drilled into from the Sessions table: the aggregate detail
+  // page by default, its call tree one link further in. Session ids are UUIDs,
+  // but the segment is matched loosely and decoded rather than pattern-matched,
+  // so an id shape change upstream can't silently 404 here.
+  //
+  // The two patterns cannot swallow each other: the id segment is `[^/]+`, so
+  // a `/graph` suffix can never be part of it and the detail pattern anchors
+  // its end right after the id. Keep it that way — a `.+` there would make the
+  // order of these two matches load-bearing.
+  const ccDetailMatch = /^\/cc\/sessions\/([^/]+)$/.exec(path)
+  const ccGraphMatch = /^\/cc\/sessions\/([^/]+)\/graph$/.exec(path)
+  // Both are drill-downs *of* the Sessions tab, so the nav keeps highlighting
+  // Sessions while either is open.
   const ccTab = ccMatch
     ? ((ccMatch[1] ?? 'overview') as CcTab)
-    : ccGraphMatch
+    : ccDetailMatch || ccGraphMatch
       ? ('sessions' as CcTab)
       : null
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
@@ -220,9 +228,11 @@ function App() {
     // frame) and carries no active project in the nav.
     page = <InboxView />
   } else if (ccGraphMatch) {
-    // Checked before `ccMatch` for readability only — the two patterns are
-    // disjoint (`ccMatch` anchors the end right after `sessions`).
+    // Checked before `ccMatch` for readability only — every one of these
+    // patterns is disjoint (`ccMatch` anchors the end right after `sessions`).
     page = <CCSessionGraphView sessionId={decodeURIComponent(ccGraphMatch[1])} />
+  } else if (ccDetailMatch) {
+    page = <CCSessionDetailView sessionId={decodeURIComponent(ccDetailMatch[1])} />
   } else if (ccMatch) {
     // CC Dashboard: global telemetry view, also above projects. `ccTab` is
     // non-null whenever ccMatch is.

@@ -95,7 +95,7 @@ The code is the source of truth. These are the invariants you must not break:
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `agentSidebarWidth`, `boardView`, `filesTreeWidth`,
   `keyboardScope`, `layout`, `navCollapse`, `navOrder`, `navWidth`,
-  `projectTree`, `sessionGraph`,
+  `projectTree`, `sessionDetail`, `sessionGraph`,
   `settingsDraft`, `syntaxHighlighter`, `time`) — predicates that historically
   shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
@@ -275,7 +275,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Inbox watcher | `serve --watch-inbox` auto-triage, off by default and independent of `--watch-todo`; re-dispatch guard is an **in-memory** set, not a db write | `docs/inbox-watcher.md` |
 | Hooks | User-configured shell commands on events (`task-execute`); a nonzero exit is **data**, not a failure | `docs/hooks.md` |
 | Config | `~/.mesa/config.json`: the 4 agent-spawn command templates (todo-watcher, refine-watcher, inbox-watcher, add-agent). **A value is never spliced into a string a shell parses** — one line is argv (substitution happens after tokenizing, so an untrusted name is one argument); a value with a **newline** is a `bash -c` script whose values arrive as `MESA_*` env vars, never substituted into the body (so `{}` in a script is a save-time error). Edited from the **Settings** page (`#/settings`, sticky at the bottom of the left nav) over `GET`/`PUT /api/config`; blank = the built-in default, and the write is loopback-only in **both** serve modes | `docs/config.md` |
-| CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files. Includes the per-session call tree | `docs/cc-dashboard.md` |
+| CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files. A session drills into an aggregate detail page, and that into the call tree | `docs/cc-dashboard.md` |
 
 ## Untrusted input
 

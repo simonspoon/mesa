@@ -397,6 +397,69 @@ assert d["error"]["code"]=="not_found", d
 ' || fail "cc graph unknown session did not return error.code=not_found"
 echo "cc graph: unknown session -> not_found ok"
 
+# ---- cc session: the aggregate detail read (CLI half, mesa task 689) ----
+#
+# The default drill-down. Aggregated over EVERY persisted row, so its totals
+# must agree with the graph's (which is capped) exactly — that agreement is the
+# assertion, not a re-derivation of the numbers.
+GRAPH_A=$("$BIN" cc graph a) || fail "cc graph a exited nonzero"
+"$BIN" cc session a | GRAPH="$GRAPH_A" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+g=json.loads(os.environ["GRAPH"])
+for k in ["session_id","cwd","project","git_branch","entrypoint","start","end",
+          "duration_minutes","used_subagent","tokens","total_tokens","est_cost_usd",
+          "messages","tool_calls","agent_runs","main","agents","models","tools",
+          "skills","activity"]:
+    assert k in d, f"missing key {k}"
+assert d["session_id"]=="a" and d["project"]=="demo", d
+assert d["git_branch"]=="main" and d["entrypoint"]=="cli", d
+assert d["used_subagent"] is True and d["duration_minutes"]==10.0, d
+# Same numbers as the graph, from a different code path over uncapped rows.
+assert d["total_tokens"]==g["total_tokens"]==380, (d["total_tokens"],g["total_tokens"])
+assert d["est_cost_usd"]==g["est_cost_usd"], (d["est_cost_usd"],g["est_cost_usd"])
+assert d["tool_calls"]==4 and d["messages"]==2, d
+# One `agents` entry per ingested run.
+assert d["agent_runs"]==1 and len(d["agents"])==1, d
+a=d["agents"][0]
+assert a["agent_id"]=="x1" and a["agent"]=="Explore", a
+assert a["description"]=="look around" and a["spawn_depth"]==1, a
+assert a["total_tokens"]==30 and a["messages"]==1, a
+# Main thread vs subagents split, and the two halves sum to the rollup.
+assert d["main"]["agent_id"] is None and d["main"]["total_tokens"]==350, d["main"]
+assert d["main"]["total_tokens"]+a["total_tokens"]==d["total_tokens"], d
+# Tools keyed on NAME only (never target), skills promoted to the skill itself.
+assert {t["name"]:t["calls"] for t in d["tools"]}=={"Bash":1,"Read":1,"Skill":1,
+                                                    "AskUserQuestion":1}, d["tools"]
+assert all(t["subagent_calls"]==0 for t in d["tools"]), d["tools"]
+assert d["skills"]==[{"name":"inaros-swe:refine","calls":1}], d["skills"]
+assert {m["model"] for m in d["models"]}=={"claude-opus-4-8","claude-haiku-4-5"}, d["models"]
+# The activity series is a partition of the session: nothing dropped, nothing
+# double-counted, one bucket per ACTIVITY_BUCKETS over a known span.
+assert len(d["activity"])==60, len(d["activity"])
+assert sum(b["messages"] for b in d["activity"])==d["messages"], d["activity"]
+assert sum(b["tool_calls"] for b in d["activity"])==d["tool_calls"], d["activity"]
+assert sum(b["total_tokens"] for b in d["activity"])==d["total_tokens"], d["activity"]
+print("cc session: aggregate detail ok")
+' || fail "cc session did not return the expected aggregate detail"
+
+# Unknown session is not_found (exit 1), exactly like `cc graph`.
+if "$BIN" cc session no-such-session >"$TMP/detail-err" 2>&1; then
+  fail "cc session on an unknown session should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/detail-err"))
+assert d["error"]["code"]=="not_found", d
+' || fail "cc session unknown session did not return error.code=not_found"
+echo "cc session: unknown session -> not_found ok"
+
+# `--quiet` is not accepted on any `cc` subcommand: unknown argument, exit 2.
+RC=0
+"$BIN" cc session a --quiet >/dev/null 2>&1 || RC=$?
+[ "$RC" = "2" ] || fail "cc session --quiet expected exit 2, got $RC"
+echo "cc session: --quiet rejected (exit 2) ok"
+
 PORT=17773
 "$BIN" serve --port "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
@@ -487,6 +550,30 @@ d=json.load(open("'"$TMP"'/graph-404"))
 assert d["error"]["code"]=="not_found", d
 ' || fail "api cc graph: unknown session did not return error.code=not_found"
 echo "api cc graph: unknown session -> 404 not_found ok"
+
+# ---- cc session over HTTP: byte-identical to the CLI, plus the 404 ----
+curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/a" >"$TMP/detail-http" \
+  || fail "GET /api/cc/sessions/{id} failed"
+"$BIN" cc session a >"$TMP/detail-cli" || fail "cc session a exited nonzero"
+python3 -c '
+import json
+h=json.load(open("'"$TMP"'/detail-http")); c=json.load(open("'"$TMP"'/detail-cli"))
+# One `core` aggregator, two surfaces: same object, not merely a similar one.
+assert h==c, (h,c)
+assert h["total_tokens"]==380 and h["tool_calls"]==4, h
+assert len(h["agents"])==h["agent_runs"]==1, h
+assert len(h["activity"])==60, len(h["activity"])
+print("api cc session: payload matches the CLI ok")
+' || fail "GET /api/cc/sessions/{id} did not match the CLI payload"
+
+STATUS=$(curl -s -o "$TMP/detail-404" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/no-such-session")
+[ "$STATUS" = "404" ] || fail "api cc session: unknown session expected 404, got $STATUS ($(cat "$TMP/detail-404"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/detail-404"))
+assert d["error"]["code"]=="not_found", d
+' || fail "api cc session: unknown session did not return error.code=not_found"
+echo "api cc session: unknown session -> 404 not_found ok"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

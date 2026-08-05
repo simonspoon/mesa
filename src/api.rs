@@ -900,6 +900,8 @@ fn router(state: AppState) -> Router {
         .route("/api/cc", get(get_cc_dashboard))
         // Live sessions: cheap, frequently-polled slice of the telemetry.
         .route("/api/cc/live", get(get_cc_live))
+        // The drill-down pair: aggregate detail (the default) and the call tree.
+        .route("/api/cc/sessions/{session_id}", get(get_cc_session_detail))
         .route(
             "/api/cc/sessions/{session_id}/graph",
             get(get_cc_session_graph),
@@ -3865,6 +3867,26 @@ async fn get_cc_session_graph(
     };
     match graph {
         Some(g) => Ok(Json(g).into_response()),
+        None => Err(Error::NotFound(format!("no ingested session {session_id}")).into()),
+    }
+}
+
+/// Returns one session's aggregate detail (`CcSessionDetail`) — the default
+/// drill-down from the sessions table. Same shape as `get_cc_session_graph`:
+/// syncs first, **not** cached (an on-demand drill-down, not a poll), unknown
+/// session is `not_found` (404). No query parameters — the aggregates are
+/// exact and unwindowed by construction.
+async fn get_cc_session_detail(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult<Response> {
+    let detail = {
+        let mut store = state.store.lock().unwrap();
+        crate::core::cc::sync(&mut store, false)?;
+        crate::core::cc::session_detail(&store, &session_id)?
+    };
+    match detail {
+        Some(d) => Ok(Json(d).into_response()),
         None => Err(Error::NotFound(format!("no ingested session {session_id}")).into()),
     }
 }

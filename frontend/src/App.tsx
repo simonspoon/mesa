@@ -6,6 +6,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
+import { rememberView } from './lastView'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionDetailView } from './pages/CCSessionDetailView'
 import { CCSessionTimelineView } from './pages/CCSessionTimelineView'
@@ -33,10 +34,23 @@ import { useVisualViewportHeightVar } from './visualViewport'
 // ProjectTasksPage's `createTask` prop), #/terminal (global shell pane-tree;
 // TerminalPage is a permanent sibling mount, not resolved into `page` — see
 // the render below).
+//
+// Every project-tab and #/cc route is *recorded* browser-local as the last
+// view (`lastView.ts`), so the nav's project and CC Dashboard links reopen it.
+// Links only — nothing here ever rewrites the hash, so these routes stay
+// refresh- and back-stable.
 function useHashPath(): string {
-  const [path, setPath] = useState(() => window.location.hash.slice(1) || '/')
+  // `rememberView` runs *before* the state update, not in an effect: the nav's
+  // links read the remembered tab during render, and an effect would land a
+  // render too late, leaving them one navigation stale.
+  const read = () => {
+    const p = window.location.hash.slice(1) || '/'
+    rememberView(p)
+    return p
+  }
+  const [path, setPath] = useState(read)
   useEffect(() => {
-    const onChange = () => setPath(window.location.hash.slice(1) || '/')
+    const onChange = () => setPath(read())
     window.addEventListener('hashchange', onChange)
     return () => window.removeEventListener('hashchange', onChange)
   }, [])

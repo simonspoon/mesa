@@ -37,6 +37,7 @@ import {
   todoCountFor,
   visibleRows,
 } from '../projectTree'
+import { ccHref, projectHref } from '../lastView'
 import type { GitStatus } from '../types/GitStatus'
 import type { Project } from '../types/Project'
 import type { CcTab } from '../pages/CCDashboardView'
@@ -558,7 +559,7 @@ export function Sidebar({
         </button>
         <a
           className={`nav-item${ccTab === 'overview' ? ' active' : ''}`}
-          href="#/cc"
+          href={ccHref()}
         >
           <span className="nav-item-label">CC Dashboard</span>
         </a>
@@ -652,7 +653,7 @@ export function Sidebar({
                           )}
                           <a
                             className={p.id === activeProjectId ? 'active' : ''}
-                            href={`#/projects/${p.id}`}
+                            href={projectHref(p.id)}
                           >
                             <span className="nav-project-name">{p.name}</span>
                             {activeAgentProjectIds.has(p.id) && (
@@ -704,7 +705,7 @@ export function Sidebar({
                       >
                         <a
                           className={p.id === activeProjectId ? 'active' : ''}
-                          href={`#/projects/${p.id}`}
+                          href={projectHref(p.id)}
                         >
                           <span className="nav-project-name">{p.name}</span>
                         </a>

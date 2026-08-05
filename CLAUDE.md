@@ -94,7 +94,7 @@ The code is the source of truth. These are the invariants you must not break:
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `agentSidebarWidth`, `boardView`, `filesTreeWidth`,
-  `keyboardScope`, `layout`, `navCollapse`, `navOrder`, `navWidth`,
+  `keyboardScope`, `lastView`, `layout`, `navCollapse`, `navOrder`, `navWidth`,
   `pricingDraft`, `projectTree`, `sessionDetail`, `sessionGraph`,
   `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`, `time`) —
   predicates that historically

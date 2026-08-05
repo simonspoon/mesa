@@ -943,7 +943,8 @@ EXAMPLES
     #[command(after_help = "\
 EXAMPLES
   mesa cc sync             # incremental: only new/changed transcript bytes
-  mesa cc sync --rebuild   # clear cursors, re-walk everything from scratch")]
+  mesa cc sync --rebuild   # clear cursors, re-walk everything from scratch
+  mesa cc reset            # purge the stored telemetry, then re-ingest")]
     Sync {
         /// Clear all cc_files cursors first, forcing every transcript to be
         /// re-parsed from byte 0. Never truncates: every row inserts on a
@@ -955,6 +956,17 @@ EXAMPLES
         #[arg(long)]
         rebuild: bool,
     },
+    /// Purge the stored cc_* telemetry, then re-ingest every transcript
+    ///
+    /// The corrective counterpart to `sync --rebuild`, which is additive-only:
+    /// a re-walk can add a row the parser once missed but never corrects an
+    /// already-stored row's values. Deletes every cc_* row and re-reads the
+    /// transcripts still on disk, so pre-fix rows come back correct. Prints
+    /// the same report `cc sync` does.
+    ///
+    /// Destructive: a session whose transcript file Claude Code has since
+    /// deleted cannot be re-read and is lost permanently.
+    Reset,
     /// Print currently-running sessions (the live-sessions object)
     ///
     /// Sessions whose newest transcript event lands inside the last `--minutes`,
@@ -2284,6 +2296,10 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
         CcCmd::Sync { rebuild } => {
             let mut store = Store::open_default()?;
             print_json(&crate::core::cc::sync(&mut store, rebuild)?)
+        }
+        CcCmd::Reset => {
+            let mut store = Store::open_default()?;
+            print_json(&crate::core::cc::reset_and_sync(&mut store)?)
         }
         CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
         CcCmd::Usage => match crate::core::usage::fetch() {

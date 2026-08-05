@@ -3,9 +3,11 @@ import {
   getConfig,
   getPricing,
   listProjects,
+  resetCcIndex,
   restartServer,
   updateConfig,
   updatePricing,
+  type CcResetReport,
 } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import {
@@ -473,7 +475,52 @@ function PricingSection() {
         </p>
       ))}
       {saveError && <p className="error">{saveError}</p>}
+
+      <ResetCcIndex />
     </>
+  )
+}
+
+/**
+ * Purges the stored Claude Code telemetry and re-ingests the transcripts on
+ * disk (mesa task 698). It lives in the pricing section because it is the
+ * other half of "what the CC Dashboard's cost says" — not in the header row,
+ * where Restart is deliberately the one always-reachable control.
+ *
+ * Confirmed, because it is destructive of history: rows whose transcript file
+ * Claude Code has since deleted cannot come back. Nothing on this page reads
+ * cc data, so there is nothing to refetch — the counts are the receipt, and
+ * the dashboard picks the new rows up on its next read.
+ */
+function ResetCcIndex() {
+  const [pending, setPending] = useState(false)
+  const [report, setReport] = useState<CcResetReport | null>(null)
+
+  function reset() {
+    setPending(true)
+    setReport(null)
+    return resetCcIndex()
+      .then((r) => setReport(r))
+      .finally(() => setPending(false))
+  }
+
+  return (
+    <div className="settings-actions">
+      <ConfirmDelete
+        // Remount after a run so the control disarms itself, ready for the next.
+        key={report ? 'done' : 'idle'}
+        label="Reset CC index"
+        message="Deletes the stored Claude Code telemetry and re-reads every transcript on disk (10-30s). Fixes inflated costs recorded before the dedupe fix. Sessions whose transcript file no longer exists are lost permanently."
+        onDelete={reset}
+      />
+      {pending && <span className="muted">re-reading transcripts…</span>}
+      {report && !pending && (
+        <span className="settings-saved">
+          re-indexed {report.files_ingested}/{report.files_scanned} transcripts —{' '}
+          {report.sessions} sessions, {report.messages_added} messages
+        </span>
+      )}
+    </div>
   )
 }
 

@@ -2868,6 +2868,30 @@ impl Store {
         Ok(())
     }
 
+    /// Purges ALL persisted Claude Code telemetry — every row of `cc_messages`,
+    /// `cc_tool_calls`, `cc_agent_runs`, `cc_sessions` and the `cc_files`
+    /// cursors — in one transaction, so a crash leaves either the whole index
+    /// or none of it. The corrective counterpart to `cc_clear_cursors`, which
+    /// is additive-only: re-ingest can never *change* an existing row's values
+    /// (task 693's usage dedupe), so fixing already-stored rows means deleting
+    /// them first. Destructive of history: a session whose transcript file is
+    /// gone from disk cannot be re-ingested and is lost permanently — so this
+    /// is only ever reached from an explicit operator action, never a read.
+    pub fn cc_reset(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for table in [
+            "cc_messages",
+            "cc_tool_calls",
+            "cc_agent_runs",
+            "cc_sessions",
+            "cc_files",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Upserts one transcript file's parsed telemetry and its cursor row in
     /// ONE transaction, so a crash mid-sync loses at most "this file not yet
     /// ingested", never a half-advanced cursor. Idempotent by construction:
@@ -3227,9 +3251,12 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
-    /// Monotone stamp of persisted cc state: total rows across `cc_messages`,
-    /// `cc_tool_calls`, `cc_sessions`. cc rows are never deleted, so the stamp
-    /// only grows; the API uses it as the dashboard cache key (a change by any
+    /// Stamp of persisted cc state: total rows across `cc_messages`,
+    /// `cc_tool_calls`, `cc_sessions`. It normally only grows (ingest is
+    /// insert-only); [`Store::cc_reset`] is the one thing that can move it
+    /// *down*. It stays a usable cache key either way: a purge + re-ingest
+    /// landing on exactly the same total across three tables is not reachable
+    /// in practice. The API uses it as the dashboard cache key (a change by any
     /// process — CLI sync, cron — moves it, while transcript-file deletion,
     /// which must not invalidate the history-inclusive view, does not).
     pub fn cc_stamp(&self) -> Result<i64> {
@@ -7006,6 +7033,36 @@ mod tests {
         assert_eq!(stamp, 4);
         store.cc_ingest_file("/t/a.jsonl", &cursor, &batch).unwrap();
         assert_eq!(store.cc_stamp().unwrap(), stamp);
+    }
+
+    #[test]
+    fn cc_reset_empties_every_cc_table_including_cursors() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 111,
+            size: 222,
+            byte_offset: 222,
+        };
+        store
+            .cc_ingest_file("/t/a.jsonl", &cursor, &cc_batch())
+            .unwrap();
+        assert!(store.cc_stamp().unwrap() > 0);
+        assert!(!store.cc_cursors().unwrap().is_empty());
+
+        store.cc_reset().unwrap();
+
+        // Stamp back to zero — the one write that makes it go *down* — and the
+        // cursors are gone too, so the next plain sync re-walks from byte 0.
+        assert_eq!(store.cc_stamp().unwrap(), 0);
+        assert!(store.cc_cursors().unwrap().is_empty());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM cc_agent_runs", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

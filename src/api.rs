@@ -906,6 +906,11 @@ fn router(state: AppState) -> Router {
             "/api/cc/sessions/{session_id}/graph",
             get(get_cc_session_graph),
         )
+        // The one CC *write*: purge the stored telemetry and re-ingest from
+        // the transcripts on disk. An explicit operator action (Settings →
+        // Model pricing), never something a read can trigger — so it is a
+        // POST, on its own route, loopback-only in BOTH modes.
+        .route("/api/cc/reset", post(reset_cc_index))
         // Project-scoped CC Dashboard: same telemetry, filtered to sessions
         // whose cwd matches this project's local_path. Reads the store only
         // for the project's local_path (like the git tab), so the standard
@@ -3908,6 +3913,37 @@ async fn get_cc_dashboard(
     Ok(Json(dash).into_response())
 }
 
+/// `POST /api/cc/reset` — purge the stored cc_* telemetry and re-ingest every
+/// transcript still on disk, echoing the `CcSyncReport` (`cc::reset_and_sync`,
+/// the same code path as `mesa cc reset`). The corrective counterpart to
+/// `sync --rebuild`; the Settings page's confirmed operator action.
+///
+/// **Loopback-only in both modes**, like `update_config`: it destroys stored
+/// history (a session whose transcript file is gone cannot come back), which
+/// is not a capability a LAN peer gets from `--lan`'s "trust the LAN" opt-in.
+/// Being a mutation it also sits inside the Content-Type gate.
+///
+/// No explicit cache invalidation: both CC caches are keyed by
+/// `Store::cc_stamp`, and the purge moves it (see that fn's doc on why it is
+/// still a sound key once it can go down).
+async fn reset_cc_index(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "resetting the CC index is loopback-only; connect from this machine",
+    )?;
+    let report = {
+        let mut store = state.store.lock().unwrap();
+        crate::core::cc::reset_and_sync(&mut store)?
+    };
+    Ok(Json(report).into_response())
+}
+
 #[derive(Deserialize)]
 struct CcGraphQuery {
     /// Cap on tool nodes; defaults to `cc::GRAPH_NODE_LIMIT`.
@@ -5130,6 +5166,37 @@ mod tests {
             }),
         )
         .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    // --- CC index reset: POST /api/cc/reset (mesa task 698) -----------------
+    //
+    // The gate is what matters here: the handler destroys stored history, so
+    // it carries the config routes' loopback-only-in-BOTH-modes gate rather
+    // than the plain guard the /api/cc reads use. What it *does* is covered by
+    // `core::cc`'s tests and `scripts/cc-check.sh` against a synthetic tree.
+
+    #[tokio::test]
+    async fn reset_cc_index_rejects_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        assert!(!state.lan);
+        let resp = reset_cc_index(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn reset_cc_index_rejects_non_loopback_peer_under_lan_mode() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        // Host/Origin `require_lan_page_access` would accept: a LAN peer that
+        // under `--lan` may write tasks still must not get to wipe the index.
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let resp = reset_cc_index(State(state), ConnectInfo(lan_peer()), headers).await;
         assert!(resp.unwrap_err().status.is_client_error());
     }
 

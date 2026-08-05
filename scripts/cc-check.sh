@@ -4,7 +4,8 @@
 # drives it against a tiny synthetic transcript tree (MESA_CC_PROJECTS_DIR) and a
 # throwaway db (MESA_DB), asserting: the summary/sessions/skills JSON shapes, the
 # `cc sync` report + its idempotency (second sync = no-op), `cc sync --rebuild`
-# re-walking without duplicating rows, tool-call and subagent rows, persistence
+# re-walking without duplicating rows, `cc reset` purging + re-adding them,
+# tool-call and subagent rows, persistence
 # across transcript deletion, and auto-ingest on a plain dashboard read.
 # `cc live` stays a direct file parse (no db) and is checked last.
 set -euo pipefail
@@ -89,6 +90,30 @@ assert r["messages_added"]==0, r
 assert r["tool_calls_added"]==0, r
 print("sync --rebuild ok")
 ' || fail "sync --rebuild did not re-walk without duplicating rows"
+
+# cc reset: purges every cc_* row, then re-ingests. Unlike the rebuild above it
+# is corrective, so the rows really are re-ADDED (messages_added > 0 where the
+# rebuild added zero) — and because every transcript is still on disk, the
+# resulting dashboard is identical to the pre-reset one.
+BEFORE=$("$BIN" cc summary --window all) || fail "cc summary before reset exited nonzero"
+"$BIN" cc reset | python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+assert r["files_scanned"]==2, r
+assert r["files_ingested"]==2, r
+assert r["sessions"]==1, r
+assert r["messages_added"]==4, r  # purged, so the same 4 rows land again
+assert r["tool_calls_added"]==4, r
+print("cc reset ok")
+' || fail "cc reset did not purge and re-add rows"
+AFTER=$("$BIN" cc summary --window all) || fail "cc summary after reset exited nonzero"
+python3 -c '
+import json,sys
+a,b=json.loads(sys.argv[1]),json.loads(sys.argv[2])
+a.pop("generated_at_unix"); b.pop("generated_at_unix")
+assert a==b, "summary changed across a reset of a fully-present tree"
+print("reset round-trips the summary ok")
+' "$BEFORE" "$AFTER" || fail "summary differed after cc reset"
 
 # summary: full dashboard object with the expected top-level keys + counts,
 # including the tools breakdown and the subagent-attributed agents breakdown.

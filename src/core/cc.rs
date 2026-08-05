@@ -694,6 +694,23 @@ pub fn sync(store: &mut Store, rebuild: bool) -> Result<CcSyncReport> {
     Ok(report)
 }
 
+/// Purge the persisted `cc_*` telemetry and re-ingest every transcript still
+/// on disk — the *corrective* counterpart to `sync(store, true)`'s additive
+/// re-walk. A rebuild can only add rows a parser previously missed; only a
+/// purge can fix rows whose stored values are wrong (task 693: Claude Code
+/// repeats one API response's `usage` across several transcript lines, so
+/// pre-fix rows double-count cost and tokens).
+///
+/// Destructive of history: a session whose transcript file Claude Code has
+/// since deleted cannot be re-read, so its rows are gone permanently. Shared
+/// verbatim by `mesa cc reset` and `POST /api/cc/reset` so the two cannot
+/// diverge; no read path may call it.
+pub fn reset_and_sync(store: &mut Store) -> Result<CcSyncReport> {
+    store.cc_reset()?;
+    // Cursors went with the reset, so a plain sync already re-walks from 0.
+    sync(store, false)
+}
+
 /// The `.meta.json` sidecar Claude Code writes beside each subagent
 /// transcript: how the run was spawned. Not telemetry — none of it appears on
 /// the transcript lines, so without this the `Task` call that started a

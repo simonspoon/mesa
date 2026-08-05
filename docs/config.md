@@ -325,6 +325,15 @@ cached — the table is loaded **once per dashboard request** and a save applies
 to the next read, past sessions included, with no restart. Cost is derived on
 every read, so there is no stored figure to migrate.
 
+The Settings page renders the pricing rows in a **Model pricing** section, and
+that section also carries the one non-config control on the page: **Reset CC
+index** (`POST /api/cc/reset`, mesa task 698) — a confirmed operator action
+that purges the stored `cc_*` telemetry and re-ingests the transcripts on disk,
+which is what corrects costs recorded before the usage-dedupe fix. It lives
+here because it is the other half of "what the dashboard's cost says", not in
+the title row, where Restart is deliberately the one always-reachable control.
+See `docs/cc-dashboard.md` for the permanent-loss property.
+
 ### Routes
 
 - `GET /api/config/pricing` → `ConfigPrice[]`: the built-in families in

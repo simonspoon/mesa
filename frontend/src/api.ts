@@ -743,6 +743,27 @@ export function restartServer(): Promise<{ restarting: boolean }> {
   return request('/api/restart', jsonInit('POST', {}))
 }
 
+/** What one CC index reset re-ingested. Mirrors Rust's `CcSyncReport`, which
+ * is CLI-facing and deliberately not a ts-rs export — hence hand-written here,
+ * like `restartServer()`'s `{restarting}`. */
+export type CcResetReport = {
+  files_scanned: number
+  files_ingested: number
+  sessions: number
+  messages_added: number
+  tool_calls_added: number
+}
+
+/**
+ * Deletes every stored `cc_*` row and re-reads the transcripts on disk — the
+ * fix for costs recorded before the usage-dedupe fix, which a plain re-sync
+ * cannot correct. Destructive: sessions whose transcript file is gone are lost
+ * permanently. Takes ~10-30s on a real tree.
+ */
+export function resetCcIndex(): Promise<CcResetReport> {
+  return request('/api/cc/reset', jsonInit('POST', {}))
+}
+
 /**
  * The four agent-spawn command templates in `~/.mesa/config.json`, each with
  * the built-in default it falls back to and the placeholders it may use

@@ -183,11 +183,25 @@ CLI and API share it and never diverge.
   motivating case, mesa task 340's advisor-accounting fix, which added a
   second `cc_messages` row under a key that never existed before. A fix that
   needs to *change* an already-ingested row's values still needs that row
-  deleted by hand before a rebuild backfills it. Only exposed via the CLI,
-  not the API — an operator/one-off action, not something a dashboard read
-  should ever trigger. `mesa cc sync` prints
+  deleted by hand before a rebuild backfills it. `--rebuild` is exposed via
+  the CLI only, not the API — an operator/one-off action, not something a
+  dashboard read should ever trigger. `mesa cc sync` prints
   the `CcSyncReport` (`{files_scanned, files_ingested, sessions,
   messages_added, tool_calls_added}`; a no-change re-run adds zeros).
+- **Reset is the corrective one** (mesa task 698): `cc::reset_and_sync` =
+  `Store::cc_reset` (one transaction deleting `cc_messages`, `cc_tool_calls`,
+  `cc_agent_runs`, `cc_sessions`, `cc_files`) followed by a plain sync. It is
+  what fixes rows whose stored *values* are wrong — the inflated cost/tokens
+  recorded before task 693's usage dedupe — which no rebuild can do. It is
+  **destructive of history**: a session whose transcript file Claude Code has
+  since deleted cannot be re-read and is gone permanently. So unlike
+  `--rebuild` it *is* exposed to the UI, but only ever as a deliberate,
+  confirmed **operator action** — `mesa cc reset` and `POST /api/cc/reset`
+  (loopback-only in both serve modes, like the config writes), reached from a
+  confirm button in Settings → Model pricing. No read path — `GET /api/cc`,
+  `cc summary`, the auto-ingest — can trigger it. Both CC caches invalidate on
+  their own, being keyed by `Store::cc_stamp`, which the purge moves (it is
+  the one write that can move the stamp *down*).
 - **Cost is estimated at read time** from a per-model price table (USD per
   Mtok) — tokens are stored, dollars never are. The table is
   `config::PriceTable`: the rates mesa ships, overlaid by the `pricing` section

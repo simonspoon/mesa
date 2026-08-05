@@ -68,9 +68,12 @@ function projectIdFromHash(hash: string): number | null {
   return Number.isFinite(id) ? id : null
 }
 
-// CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link is the
-// overview (charts + KPIs); these are the table views split out beneath it.
+// CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link goes to
+// the *remembered* sub-page (task 694), so the overview (charts + KPIs) is a
+// subnav row like the rest — its hash is the bare `#/cc`, there is no
+// `#/cc/overview` segment (mesa task 699).
 const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
+  { tab: 'overview', label: 'Overview', hash: '#/cc' },
   { tab: 'skills-agents', label: 'Skills / Agents', hash: '#/cc/skills-agents' },
   { tab: 'projects', label: 'Projects', hash: '#/cc/projects' },
   { tab: 'sessions', label: 'Sessions', hash: '#/cc/sessions' },
@@ -558,7 +561,7 @@ export function Sidebar({
           «
         </button>
         <a
-          className={`nav-item${ccTab === 'overview' ? ' active' : ''}`}
+          className={`nav-item${ccTab !== null ? ' active' : ''}`}
           href={ccHref()}
         >
           <span className="nav-item-label">CC Dashboard</span>

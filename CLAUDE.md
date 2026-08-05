@@ -95,7 +95,7 @@ The code is the source of truth. These are the invariants you must not break:
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `agentSidebarWidth`, `boardView`, `filesTreeWidth`,
   `keyboardScope`, `layout`, `navCollapse`, `navOrder`, `navWidth`,
-  `projectTree`, `sessionDetail`, `sessionGraph`,
+  `projectTree`, `sessionDetail`, `sessionGraph`, `sessionTimeline`,
   `settingsDraft`, `syntaxHighlighter`, `time`) — predicates that historically
   shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline

@@ -22,7 +22,7 @@ CLI and API share it and never diverge.
   whole.** `cc::tool_target` lifts the first string under an ordered key list
   (`skill`, `command`, `file_path`, `url`, `query`, `pattern`, `path`, `name`,
   `subject`, `title`, `description`) into `cc_tool_calls.target` (migration 22),
-  which is what lets a graph node say `Bash / cargo test` instead of `Bash`.
+  which is what lets a timeline row say `Bash / cargo test` instead of `Bash`.
   Everything else in the payload is still dropped: the bulk keys (`content`,
   `new_string`, `prompt`, `script`) are absent from the list on purpose, since
   a `Write` input is a whole file. Three properties hold it in place:
@@ -303,69 +303,87 @@ CLI and API share it and never diverge.
   chart dependency. Zero states (no tool calls, no subagents, no skills) are
   quiet muted lines, never errors, and `agent`/`skill`/`description`/tool names
   /`project`/`cwd` are rendered as text children or `title` attributes only.
-- **Session graph page** (`#/cc/sessions/:id/graph`): one link (`Call graph →`)
-  from the detail page above, which its own `← Session` link returns to. The
-  call tree on a React Flow canvas (`CCSessionGraphView.tsx`). The two route
-  patterns are disjoint — the id segment is `[^/]+`, so a `/graph` suffix can
-  never be swallowed by the detail pattern — and both keep the nav highlighting
-  Sessions. Layout is a
-  hand-rolled tidy tree in `frontend/src/sessionGraph.ts` — React Flow ships no
-  layout algorithm, and unlike `layout.ts` (whose storyboard edges may be
-  cyclic) this input is a guaranteed tree, so it needs no cycle-breaking. Flow
-  runs left→right by depth; a parent aligns with its **first** child, not the
-  midpoint, because a main thread of hundreds of calls would otherwise strand
-  the root halfway down a column thousands of pixels tall. `fitView` is clamped
-  (`minZoom: 0.55`) for the same reason — unclamped it squeezes a 17,000px tree
-  into the canvas and every label becomes a smudge.
-  Node colour is two-level. The three structural kinds (session, agent, skill)
-  have fixed colours in `App.css`; a **tool** node is coloured by its tool
+- **Session timeline page** (`#/cc/sessions/:id/timeline`): one link
+  (`Timeline →`) from the detail page above, which its own `← Session` link
+  returns to. A chronological, thread-grouped **row list**
+  (`CCSessionTimelineView.tsx`) over the same `GET /api/cc/sessions/{id}/graph`
+  payload — which is unchanged, and is still `mesa cc graph`'s.
+  `#/cc/sessions/:id/graph` is kept as an alias of this route so links and
+  bookmarks from the React Flow canvas that used to live here still resolve
+  (mesa task 691). The two route patterns are disjoint — the id segment is
+  `[^/]+`, so a trailing suffix can never be swallowed by the detail pattern —
+  and all of them keep the nav highlighting Sessions.
+  A list rather than a canvas because a session's "tree" is almost always one
+  straight column of a few hundred main-thread calls: the graph paid
+  canvas/pan/zoom/minimap cost to encode structure that was nearly always
+  trivial (its `fitView` had to be clamped precisely because an unclamped one
+  squeezed a 17,000px column into a smudge), while what a reader wants — what
+  happened, in order, what it acted on, what it said, where the tokens went —
+  is a list, which is also scannable, searchable and phone-usable. The only
+  genuinely tree-shaped content is a subagent run, and that reads fine as
+  indentation under its thread's header row.
+  The page fetches with `limit=5000` (the server's own clamp, no server
+  change): plain rows are cheap where 600 canvas nodes were not.
+  Pure logic lives in `frontend/src/sessionTimeline.ts` (vitest-covered, per
+  CLAUDE.md's frontend-test rule): `threadOf` walks the edges up to each node's
+  nearest `agent` **ancestor** (so an agent's own row sits at the indent of the
+  thread that spawned it, with its children one level in) with a seen-set that
+  survives a malformed cyclic payload; `timelineRows` drops the `session` root
+  (its data is the page header) and otherwise **preserves payload order** — the
+  server already emits "root first, then oldest first" with equal-`ts` ties
+  fixed as response-before-tool, so nothing client-side re-sorts. Its one
+  exception is placement, not sorting: `cc::session_graph` appends every
+  **agent** node after the whole tool/response block, so at its literal payload
+  position a subagent's header row lands at the bottom of the page, hundreds of
+  rows below the run it names — each header is therefore emitted immediately
+  before the first row of its own thread (outer thread first, for a nested
+  spawn), and an agent whose rows were all truncated away still appears, at the
+  end. Tool and response rows never move; `filterRows`
+  applies the case-insensitive substring over `name` + `target`, the kind
+  allow-set and an optional thread (whose own agent header row is kept);
+  `threadOptions` builds the selector, main thread first, subagents in
+  first-appearance order, each labelled from `name`/`skill`/`description` with
+  a non-blank fallback.
+  A row is: clock (`HH:MM:SS` from `ts`, blank when null) · `name` · the
+  `target`/preview, wrapped and CSS-line-clamped with the full value in the
+  hover `title` · a right gutter of `shortModel(model)` and
+  `formatTokens(total_tokens)`, prefixed `≈` when `tokens_are_rollup` is false
+  and carrying the same explanatory `title` as before — a tool/response row's
+  tokens are the *issuing message's*, shared with its siblings, so no column of
+  them is ever summed. The honest total is the payload's `total_tokens`, in the
+  header.
+  Row colour keeps the old two-level split. The structural kinds (agent, skill)
+  have fixed colours in `App.css`; a **tool** row is coloured by its tool
   *name* — `toolColor()` in `sessionGraph.ts`, applied as an inline style on
-  the left border and the name line, because the set of tool names is
-  open-ended (`mcp__*`, whatever ships next) and can never live in a
-  stylesheet. It is a hand-assigned palette slot for the tools that dominate a
-  transcript (Bash/Read/Edit are ~80% of all calls and must not sit on
-  neighbouring hues) with an FNV-1a hash fallback for everything else, so a new
-  tool gets a real colour rather than the old undifferentiated grey. Keyed on
-  `name` alone, never `target` — the same reason the ingest keeps them in
-  separate columns. The MiniMap draws raw fills and cannot see any of that, so
-  it is fed the *same* mapping explicitly via `nodeColor`.
-  A **response** node is on the structural side of that split, not the hashed
+  the left border and the name, because the set of tool names is open-ended
+  (`mcp__*`, whatever ships next) and can never live in a stylesheet. It is a
+  hand-assigned palette slot for the tools that dominate a transcript
+  (Bash/Read/Edit are ~80% of all calls and must not sit on neighbouring hues)
+  with an FNV-1a hash fallback for everything else. Keyed on `name` alone,
+  never `target` — the same reason the ingest keeps them in separate columns.
+  A **response** row is on the structural side of that split, not the hashed
   one: `toolColor()` keys on a tool *name* and a response has none, so it owns
   a reserved `RESPONSE_COLOR` (`hsl(36, 30%, 76%)`) written once in
-  `sessionGraph.ts` and mirrored into both `MINIMAP_KIND_COLOR` and
-  `.cc-graph-node.kind-response` in `App.css`. A pale warm neutral is the one
-  free band — every `TOOL_PALETTE` entry sits at 35%+ saturation and
-  session/agent/skill own the neon hues — so a reply can never be mistaken for
-  a call. It keeps the ordinary `NODE_W`×`NODE_H` (210×80) box: no per-kind
-  size, which would pull `NODE_H` out of both the stacking pass and
-  `minimapStrokeWidth()`. Its three lines are `"Response"`, the preview, then
-  model + `≈tokens`; the preview goes in as a **text child**, and the hover
-  `title` (`description ?? target`) shows the full 200 characters, so the ~40
-  the box fits is not the only access. `shortTarget()` is given the node's
-  `kind` and returns a response's target **unchanged** — its path-shortening
-  heuristic would otherwise mangle a one-word reply like `/clear` into a path
-  segment. The truncation banner gates each of its two sentences on its own
-  counter (`omitted_tool_calls` / `omitted_responses`), since `truncated` now
-  means either population was cut and a response-only truncation would
-  otherwise read "0 omitted" tool calls.
-  Two non-obvious things keep that MiniMap drawing at all. First, every laid-out
-  node carries an explicit `width`/`height` (`NODE_W`/`NODE_H`): React Flow only
-  writes a node's *measured* size back through `onNodesChange`, which this
-  read-only canvas does not have, so `node.measured` stays undefined and
-  `<MiniMap>` — which reads the user node, not the internal one — skips every
-  node without a size. The main canvas is unaffected (it measures the DOM), so
-  the symptom is a MiniMap drawing its mask and nothing else. Second, a session's
-  main thread is one tall column, so a few hundred calls make the graph tens of
-  thousands of flow units tall and shrink an 80-unit node to a fifth of a pixel;
-  `minimapStrokeWidth()` derives a size-aware `nodeStrokeWidth` (in flow units,
-  same colour as the fill) that floors each mark at ~3px, and returns 0 on a
-  graph small enough not to need it.
-  The canvas is read-only (no drag/connect/select, `deleteKeyCode={null}`),
-  which is also what keeps it clear of the touch traps `docs/mobile.md`
-  records: its `Handle`s exist only as edge anchors and are
-  `pointer-events: none`, so there is nothing hover-revealed to swallow a pan.
-  The MiniMap is omitted at the phone tier (`usePhoneTier()`) — 200x150 is a
-  sixth of a phone canvas and parks over the corner it blocks.
+  `sessionGraph.ts` and mirrored into `.cc-tl-row.kind-response` in `App.css`.
+  A pale warm neutral is the one free band — every `TOOL_PALETTE` entry sits at
+  35%+ saturation and agent/skill own the neon hues — so a reply can never be
+  mistaken for a call. `sessionGraph.ts` is now only these shared presentation
+  helpers (`formatTokens`, `shortModel`, `toolColor`, `RESPONSE_COLOR`,
+  `shortTarget`, all still used by the dashboard and detail pages); the tidy-tree
+  layout, the `NODE_W`/`NODE_H` box and `minimapStrokeWidth` went with the
+  canvas. `@xyflow/react` stays a dependency — the storyboard canvas uses it.
+  The truncation banner gates each of its two sentences on its own counter
+  (`omitted_tool_calls` / `omitted_responses`), since `truncated` means either
+  population was cut and a response-only truncation would otherwise read
+  "0 omitted" tool calls. Zero states are quiet muted lines — "This session
+  recorded no tool calls or subagent runs." and, when a filter excludes
+  everything, "No rows match this filter." — never errors. Every
+  model/transcript-authored string (`target`/preview, `name`, `caller`,
+  `description`, `skill`, `project`, `cwd`) renders as a text child or a
+  `title` only: never markup, never an `href`, and a path or URL target is
+  deliberately not linkified. At the phone tier (`docs/mobile.md`, ≤600px) the
+  five-track row grid collapses to clock · name · tokens with the body and
+  model wrapping full-width beneath.
   The Sessions table's drill-down is a real `<a>` in the first cell (keyboard,
   middle-click) *plus* a row-level click handler, which skips the gesture when
   the click landed on that anchor or ended a text selection.

@@ -8,7 +8,7 @@ import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionDetailView } from './pages/CCSessionDetailView'
-import { CCSessionGraphView } from './pages/CCSessionGraphView'
+import { CCSessionTimelineView } from './pages/CCSessionTimelineView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { SettingsView } from './pages/SettingsView'
@@ -163,21 +163,25 @@ function App() {
   // capture group 1 is the active sub-page, undefined for the overview.
   const ccMatch = /^\/(?:cc(?:\/(skills-agents|projects|sessions))?)?$/.exec(path)
   // One session, drilled into from the Sessions table: the aggregate detail
-  // page by default, its call tree one link further in. Session ids are UUIDs,
+  // page by default, its timeline one link further in. Session ids are UUIDs,
   // but the segment is matched loosely and decoded rather than pattern-matched,
   // so an id shape change upstream can't silently 404 here.
   //
+  // `/graph` is the timeline's old URL, kept as an alias so existing links and
+  // bookmarks from the React Flow canvas era still land somewhere (mesa task
+  // 691).
+  //
   // The two patterns cannot swallow each other: the id segment is `[^/]+`, so
-  // a `/graph` suffix can never be part of it and the detail pattern anchors
+  // a trailing suffix can never be part of it and the detail pattern anchors
   // its end right after the id. Keep it that way — a `.+` there would make the
   // order of these two matches load-bearing.
   const ccDetailMatch = /^\/cc\/sessions\/([^/]+)$/.exec(path)
-  const ccGraphMatch = /^\/cc\/sessions\/([^/]+)\/graph$/.exec(path)
+  const ccTimelineMatch = /^\/cc\/sessions\/([^/]+)\/(?:graph|timeline)$/.exec(path)
   // Both are drill-downs *of* the Sessions tab, so the nav keeps highlighting
   // Sessions while either is open.
   const ccTab = ccMatch
     ? ((ccMatch[1] ?? 'overview') as CcTab)
-    : ccDetailMatch || ccGraphMatch
+    : ccDetailMatch || ccTimelineMatch
       ? ('sessions' as CcTab)
       : null
   const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
@@ -227,10 +231,10 @@ function App() {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
     page = <InboxView />
-  } else if (ccGraphMatch) {
+  } else if (ccTimelineMatch) {
     // Checked before `ccMatch` for readability only — every one of these
     // patterns is disjoint (`ccMatch` anchors the end right after `sessions`).
-    page = <CCSessionGraphView sessionId={decodeURIComponent(ccGraphMatch[1])} />
+    page = <CCSessionTimelineView sessionId={decodeURIComponent(ccTimelineMatch[1])} />
   } else if (ccDetailMatch) {
     page = <CCSessionDetailView sessionId={decodeURIComponent(ccDetailMatch[1])} />
   } else if (ccMatch) {

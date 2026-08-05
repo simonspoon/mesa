@@ -4829,6 +4829,45 @@ body.files-tree-resizing {
   .diff-split-text.diff-split-ctx::before {
     content: ' ';
   }
+
+  /* ── CC session timeline (mesa task 691) ────────────────────────────────
+     Five tracks across 390px gives the body column ~60px, which is narrower
+     than the shell commands and paths it quotes. So the row becomes two
+     rows: the identifying line (clock · name · tokens) stays a grid, and the
+     body/model wrap underneath it across the full width. Same markup — only
+     the track list changes. */
+  .cc-tl-row {
+    grid-template-columns: 4.2rem 1fr max-content;
+  }
+
+  /* Placed explicitly, not auto-flowed: the DOM order is clock · name · body ·
+     model · tokens, so a bare `grid-column: 1 / -1` on the body would push the
+     token gutter down to a row of its own. */
+  .cc-tl-clock {
+    grid-area: 1 / 1;
+  }
+
+  .cc-tl-name {
+    grid-area: 1 / 2;
+  }
+
+  .cc-tl-tokens {
+    grid-area: 1 / 3;
+  }
+
+  .cc-tl-body {
+    grid-area: 2 / 1 / auto / -1;
+  }
+
+  .cc-tl-model {
+    grid-area: 3 / 1 / auto / -1;
+  }
+
+  /* The subagent indent is a whole tap-target of a 390px screen; the tint and
+     the header row above already say which thread a row belongs to. */
+  .cc-tl-row[data-indent='1'] {
+    padding-left: 0.9rem;
+  }
 }
 
 /* Coarse-pointer tier (mesa task 558) — a *capability* query, not a width
@@ -4961,161 +5000,159 @@ button:focus-visible,
   color: var(--amber);
 }
 
-/* Standalone page, not a project tab: it fills `main` and lets the canvas take
-   whatever the header/note leave, instead of the --tab-viewport-* box (which
-   subtracts 18rem of project-tab chrome this page does not have, and stranded
-   ~170px below the canvas). `main` has a definite height (`#root` is
-   viewport-locked, index.css), so `height: 100%` resolves — and on a phone
-   `#root` tracks `--phone-shell-height` (the VISUAL viewport), so the graph
-   still shrinks with the on-screen keyboard for free. */
-.cc-graph-page {
+/* ---- CC session timeline (#/cc/sessions/:id/timeline, and the older /graph
+   alias) — a plain scrolling row list, not a canvas (mesa task 691). ----
+   Standalone page, not a project tab: it fills `main` and lets the row list
+   take whatever the header/filters leave, instead of the --tab-viewport-* box
+   (which subtracts 18rem of project-tab chrome this page does not have).
+   `main` has a definite height (`#root` is viewport-locked, index.css), so
+   `height: 100%` resolves — and on a phone `#root` tracks
+   `--phone-shell-height` (the VISUAL viewport), so the list still shrinks with
+   the on-screen keyboard for free. */
+.cc-timeline-page {
   display: flex;
   flex-direction: column;
   min-height: 0;
   height: 100%;
 }
 
-/* `flex: 1` on the column's main axis — a `height` here would be inert
-   (a definite flex-basis wins), so the fill is expressed as flex, not height.
-   `min-height` still works as a floor on that axis. */
-.cc-graph-canvas {
-  flex: 1;
-  min-height: var(--tab-viewport-min);
-  border: 1px solid var(--border);
-  background: var(--panel);
-}
-
-.cc-graph-canvas .react-flow {
-  background: transparent;
-}
-
-.cc-graph-canvas .react-flow__edge-path {
-  stroke: var(--cyan-dim);
-  stroke-width: 1.5;
-}
-
-/* This canvas is read-only: handles exist purely so edges have an anchor.
-   Making them invisible AND untouchable is what keeps this page clear of the
-   hover-revealed-affordance touch trap the storyboard canvas had to fix —
-   there is nothing here to reveal under a coarse pointer. */
-.cc-graph-canvas .react-flow__handle {
-  opacity: 0;
-  pointer-events: none;
-  border: 0;
-  min-width: 1px;
-  min-height: 1px;
-  width: 1px;
-  height: 1px;
-}
-
-.cc-graph-canvas .react-flow__controls {
-  box-shadow: none;
-  border: 1px solid var(--border);
-}
-
-.cc-graph-canvas .react-flow__controls button {
-  background: rgba(6, 10, 16, 0.85);
-  border-bottom: 1px solid var(--border);
-  color: var(--cyan);
-  fill: var(--cyan);
-}
-
-.cc-graph-canvas .react-flow__controls button:hover {
-  background: var(--panel-raised);
-}
-
-.cc-graph-canvas .react-flow__minimap {
-  background: var(--panel);
-}
-
-/* Width/height are mirrored by NODE_W/NODE_H in sessionGraph.ts — React Flow
-   positions by top-left and lays out before it can measure, so the two must
-   agree or the tidy-tree spacing drifts. */
-.cc-graph-node {
-  width: 210px;
-  height: 80px;
-  box-sizing: border-box;
-  padding: 0.4rem 0.55rem;
-  border: 1px solid var(--border);
-  border-left-width: 3px;
-  background: var(--panel-raised);
+.cc-tl-filters {
   display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 0.2rem;
-  overflow: hidden;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+  margin-bottom: 0.4rem;
 }
 
-.cc-graph-node-name {
-  font-size: 0.8rem;
-  color: var(--text-h);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.cc-tl-search {
+  flex: 0 1 16rem;
+  min-width: 8rem;
 }
 
-/* What the call acted on: a command, a file name, a URL. Monospace because
-   it is nearly always a shell fragment or a path, and one line only — the
-   full value lives in the node's hover title. */
-.cc-graph-node-target {
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
+.cc-tl-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.7rem;
+  font-size: 0.75rem;
   color: var(--text-dim);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-.cc-graph-node-row {
-  display: flex;
+.cc-tl-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  cursor: pointer;
+}
+
+.cc-tl-thread {
+  max-width: 20rem;
+  font-size: 0.75rem;
+}
+
+/* `flex: 1` on the column's main axis — a `height` here would be inert (a
+   definite flex-basis wins), so the fill is expressed as flex, not height. */
+.cc-tl-rows {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+/* One call. A grid rather than flex so the clock, model and token gutters line
+   up down the whole column — that vertical alignment is what makes a few
+   hundred rows scannable. The body column is the only elastic one. */
+.cc-tl-row {
+  display: grid;
+  grid-template-columns: 4.6rem minmax(6rem, max-content) 1fr max-content 4rem;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 0.4rem;
+  gap: 0.2rem 0.6rem;
+  padding: 0.22rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  font-size: 0.78rem;
+}
+
+/* Inside a subagent: indented under its thread's header row, and tinted so the
+   run reads as one block even when its header has scrolled away. */
+.cc-tl-row[data-indent='1'] {
+  padding-left: 1.7rem;
+  background: var(--panel-raised);
+}
+
+.cc-tl-clock {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.cc-tl-name {
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+/* What the call acted on, or the assistant's prose preview. Wrapped rather
+   than truncated to one line — the preview is the point of a response row —
+   but clamped, so no single row can push the rest of the session off screen.
+   The full value is the hover title. */
+.cc-tl-body {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
+.cc-tl-model {
+  font-family: var(--font-mono);
   font-size: 0.68rem;
   color: var(--text-dim);
-}
-
-.cc-graph-model {
-  font-family: var(--font-mono);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-.cc-graph-tokens {
+.cc-tl-tokens {
+  font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
+  text-align: right;
   white-space: nowrap;
   color: var(--text);
 }
 
-.cc-graph-node.kind-session {
-  border-left-color: var(--cyan);
+/* A subagent's header row: the thread it opens hangs below it, so it carries
+   the block's weight. */
+.cc-tl-row.kind-agent {
+  border-left-color: var(--magenta);
+  background: var(--panel-raised);
 }
 
-.cc-graph-node.kind-agent {
-  border-left-color: var(--magenta);
+.cc-tl-row.kind-agent .cc-tl-name {
+  color: var(--magenta);
+  font-weight: 600;
 }
 
 /* A skill sits between a subagent and a plain tool call — its own colour so a
-   long column of tool calls still shows where each skill was entered. Mirrored
-   as a literal in CCSessionGraphView's MINIMAP_COLOR. */
-.cc-graph-node.kind-skill {
+   long column of tool calls still shows where each skill was entered. */
+.cc-tl-row.kind-skill {
   border-left-color: #7c5cff;
 }
 
 /* One assistant message's prose. Pale warm neutral: every tool hue is 35%+
-   saturation and the three structural kinds own cyan/violet/magenta, so this is
-   the one band nothing else can reach — a response can never be mistaken for a
-   call. Mirrored as RESPONSE_COLOR in sessionGraph.ts (the minimap draws raw
-   fills and cannot read this rule). */
-.cc-graph-node.kind-response {
+   saturation and the structural kinds own violet/magenta, so this is the one
+   band nothing else can reach. Mirrored as RESPONSE_COLOR in sessionGraph.ts,
+   which is where the row's inline tint comes from. */
+.cc-tl-row.kind-response {
   border-left-color: hsl(36, 30%, 76%);
 }
 
-/* Fallback only. A tool node's real colour is per tool *name* and arrives as
-   an inline style from `toolColor()` — the name set is open-ended, so it can
-   never live in a stylesheet. This is what shows if that ever returns nothing. */
-.cc-graph-node.kind-tool {
+/* Fallback only. A tool row's real colour is per tool *name* and arrives as an
+   inline style from `toolColor()` — the name set is open-ended, so it can never
+   live in a stylesheet. This is what shows if that ever returns nothing. */
+.cc-tl-row.kind-tool {
   border-left-color: var(--border);
 }
 

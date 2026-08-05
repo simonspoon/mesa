@@ -712,8 +712,9 @@ export function getCcLive(minutes: number): Promise<CcLive> {
  * ingested — an empty graph is a real answer for a session that made no calls,
  * so the two are kept distinct.
  */
-export function getCcSessionGraph(sessionId: string): Promise<CcSessionGraph> {
-  return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/graph`)
+export function getCcSessionGraph(sessionId: string, limit?: number): Promise<CcSessionGraph> {
+  const q = limit === undefined ? '' : `?limit=${limit}`
+  return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/graph${q}`)
 }
 
 /**

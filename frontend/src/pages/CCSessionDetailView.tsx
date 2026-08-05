@@ -60,8 +60,8 @@ export function CCSessionDetailView({ sessionId }: { sessionId: string }) {
             </span>
           </div>
         )}
-        <a className="cc-graph-back cc-detail-graphlink" href={graphHref(sessionId)}>
-          Call graph →
+        <a className="cc-graph-back cc-detail-graphlink" href={timelineHref(sessionId)}>
+          Timeline →
         </a>
       </header>
 
@@ -72,8 +72,8 @@ export function CCSessionDetailView({ sessionId }: { sessionId: string }) {
   )
 }
 
-function graphHref(sessionId: string) {
-  return `#/cc/sessions/${encodeURIComponent(sessionId)}/graph`
+function timelineHref(sessionId: string) {
+  return `#/cc/sessions/${encodeURIComponent(sessionId)}/timeline`
 }
 
 function Body({ d }: { d: CcSessionDetail }) {
@@ -339,8 +339,8 @@ function Body({ d }: { d: CcSessionDetail }) {
           <dd>{stamp(d.end)}</dd>
         </dl>
         <p className="muted cc-hint">
-          Costs are estimates from a static price table. <a href={graphHref(d.session_id)}>
-            Open the call graph →
+          Costs are estimates from a static price table. <a href={timelineHref(d.session_id)}>
+            Open the timeline →
           </a>
         </p>
       </section>

@@ -215,7 +215,14 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   *collapses* the tree behind a breadcrumb toggle (`treeOpen`, task 559),
   because a full tree above the file pushes the file below the fold; the flag
   is inert at every wider width, and the reasoning is in `docs/mobile.md`. A
-  The viewer's header (`.files-header-actions`, hidden in edit mode) carries
+  The viewer's header is `position: sticky` inside `.files-pane-body` (task
+  697) — the pane is the only scroller, so the path, badges and the action
+  group stay pinned at its top and Edit/History/Download are reachable from
+  the bottom of a long file instead of being a scroll back up; it is opaque
+  and bleeds into the pane's gutters so the file passes fully behind it, and
+  the pane gives up its top padding to the header for the same reason. Inert
+  at the ≤860px tier, where the pane sizes to content and `main` scrolls.
+  The header (`.files-header-actions`, hidden in edit mode) carries
   up to three controls. **Download** (task 683) is the only one shown
   unconditionally — binary and truncated files get it too — and sits last,
   after Edit and History. It is a real `<button>`, not an `<a download>`,

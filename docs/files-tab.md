@@ -397,11 +397,39 @@ twice.
   open files is never a dozen live syntax highlighters; `ContentPane` still
   carries `key={path}` so `useFetch` and the editor start clean per file,
   exactly as the pre-tabs `key={selectedPath}` did.
-- **Lifetime.** Tabs, order, split and ratio are component state with the same
-  lifetime the old single `selectedPath` had: reset on project change, no URL
-  hash, no `localStorage`, no server persistence. (Contrast `navWidth.ts`,
-  which *is* persisted — this matches the tab's existing "no deep-linking into
-  the tree" posture instead.)
+- **Lifetime.** Tabs, order, active tab, focus, split and ratio (`TabsState`)
+  are **remembered per project** in `localStorage` under one key,
+  `mesa-open-files`, so leaving the tab, switching project or reloading comes
+  back to the same open set (mesa task 696). `frontend/src/openFiles.ts` owns
+  that key — `fileTabs.ts` stays storage-free, the pure transitions module.
+  `FilesView` seeds its state from `loadOpenFiles(projectId, narrow)` (at mount
+  *and* on the render-time project-change reset) and persists with one effect
+  on `[projectId, tabs]`; every mutation already funnels through `commit()`, so
+  there are no save calls in the handlers.
+  - Reads are **total**: absent, unparseable, non-object or structurally
+    invalid all resolve to `emptyTabsState()`, and a salvageable entry is
+    *repaired* rather than trusted — duplicate/non-string tabs dropped, an
+    `active` that isn't in its pane pulled back to a member, an empty right
+    pane dropped, `focused: 'right'` without a right pane corrected, `ratio`
+    through `clampRatio`. A hand-edited or older-shape value can never render
+    a state `fileTabs.ts`'s invariants forbid.
+  - `narrow === true` folds a stored split via `collapseSplit()` **on load**:
+    the tier fold below is edge-triggered, so a split stored at 1400px and
+    restored at 360px would otherwise never be folded.
+  - An empty state **deletes** that project's entry instead of storing an empty
+    object, so the key doesn't accumulate noise.
+  - Still **not** persisted, deliberately: `fileUi` (edit drafts, edit mode,
+    open History, selected commit) — an unsaved draft surviving a browser
+    restart is a different, riskier feature, so drafts keep the component's
+    lifetime and die on unmount; tree `expanded`/`childrenCache`/`treeOpen` and
+    scroll; and anything server-side — no DB column, no migration, no API
+    route, no CLI change. This is machine-local browser state, like
+    `lastView.ts` / `lastFolder.ts` / `filesTreeWidth.ts`. There is still no
+    URL hash deep-linking into the tree.
+  - **Stale paths are not pruned.** A remembered file deleted or renamed on
+    disk since is restored as a tab and shows `ContentPane`'s ordinary per-file
+    fetch error; closing it drops it from storage. No validation round-trip, no
+    reconciliation against the tree fetch.
 - **Mobile.** No split below the **narrow** tier (≤860px): a two-up split of a
   360px screen is unusable, the Split control is not rendered, and a split open
   when the viewport crosses that tier is folded onto the focused pane. That

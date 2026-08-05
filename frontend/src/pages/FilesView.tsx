@@ -11,7 +11,6 @@ import {
   closeTab,
   collapseSplit,
   dropIndex,
-  emptyTabsState,
   focusPane,
   moveTab,
   openFile,
@@ -37,6 +36,7 @@ import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
 import { newFilePath } from '../newFile'
+import { loadOpenFiles, saveOpenFiles } from '../openFiles'
 import {
   ApiError,
   createProjectFile,
@@ -1114,11 +1114,18 @@ export function FilesView({ projectId }: { projectId: number }) {
     () => getProjectFiles(projectId),
     `files-${projectId}`,
   )
+  // A split of a ≤860px content area is two unusable columns, and the split is
+  // a React data structure rather than styling — so unlike `treeOpen` below
+  // this one genuinely needs the breakpoint in JS (`docs/mobile.md`, same
+  // exception the terminal's pane tree takes one tier down). Read before the
+  // open set because the seed folds a stored split against it.
+  const narrow = useNarrowTier()
   // The open set — tabs, order, which pane is focused, whether it is split and
   // at what ratio — together with the per-open-path view state that must
-  // outlive a tab switch. Component state, not URL and not localStorage: the
-  // same lifetime the single `selectedPath` had (no deep-linking into the
-  // tree).
+  // outlive a tab switch. The tabs half is remembered per project in
+  // localStorage (`openFiles.ts`, mesa task 696); `fileUi` is not — a draft
+  // keeps the component's lifetime and is dropped on unmount. Still no URL
+  // deep-linking into the tree.
   //
   // **One** state object, not two, and that is load-bearing: dropping a
   // closed path's draft has to happen in the same update that closes it, and
@@ -1129,7 +1136,7 @@ export function FilesView({ projectId }: { projectId: number }) {
   const [open, setOpen] = useState<{
     tabs: TabsState
     fileUi: Map<string, FileUiState>
-  }>(() => ({ tabs: emptyTabsState(), fileUi: new Map() }))
+  }>(() => ({ tabs: loadOpenFiles(projectId, narrow), fileUi: new Map() }))
   const { tabs, fileUi } = open
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   // Fetched-directory cache (mesa task 410's lazy per-directory walk):
@@ -1172,11 +1179,6 @@ export function FilesView({ projectId }: { projectId: number }) {
   // Whether a tab is currently over the right-edge split zone.
   const [edgeArmed, setEdgeArmed] = useState(false)
   const panesRef = useRef<HTMLDivElement>(null)
-  // A split of a ≤860px content area is two unusable columns, and the split is
-  // a React data structure rather than styling — so unlike `treeOpen` this one
-  // genuinely needs the breakpoint in JS (`docs/mobile.md`, same exception the
-  // terminal's pane tree takes one tier down).
-  const narrow = useNarrowTier()
   // Edge-triggered on the crossing, never derived: re-deriving would re-fold a
   // split the user opened at, say, 800px, on every render.
   useEffect(
@@ -1246,14 +1248,20 @@ export function FilesView({ projectId }: { projectId: number }) {
     }
   }, [treeResizing])
 
+  // Persist the open set (never `fileUi`). Every tabs write funnels through
+  // `commit()`, so this one effect covers open/close/activate/focus/split/
+  // move/ratio — no save calls sprinkled through the handlers.
+  useEffect(() => saveOpenFiles(projectId, tabs), [projectId, tabs])
+
   // Reset on project change (render-time, off the changed prop — same
   // pattern as GitView/HistoryPane): this component isn't remounted when the
   // route moves between projects, so a stale selection from project A must
-  // not leak into project B.
+  // not leak into project B. Tabs are the one thing that *restores* rather
+  // than empties — the new project's own remembered set, never A's.
   const [prevProject, setPrevProject] = useState(projectId)
   if (projectId !== prevProject) {
     setPrevProject(projectId)
-    setOpen({ tabs: emptyTabsState(), fileUi: new Map() })
+    setOpen({ tabs: loadOpenFiles(projectId, narrow), fileUi: new Map() })
     setExpanded(new Set())
     setChildrenCache(new Map())
     setTreeOpen(true)

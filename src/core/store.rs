@@ -371,6 +371,26 @@ const MIGRATIONS: &[&str] = &[
     // rely on. Cycle rejection is *not* the schema's job: like a task's
     // parent, it is validated in `Store` (see `check_project_parent`).
     "ALTER TABLE projects ADD COLUMN parent_id INTEGER REFERENCES projects(id) ON DELETE CASCADE;",
+    // Task 693: the billing identity of an assistant turn. Claude Code writes
+    // ONE API response as several transcript lines (typically a `thinking`
+    // line then the `text`/`tool_use` line) and repeats the identical
+    // `message.usage` block on every one of them. `cc_messages` is keyed on
+    // the per-LINE uuid, so summing rows counted one billed response 2-4
+    // times (~35-40% inflation on every token and cost figure). `message.id`
+    // is the same on every line of one response and differs across responses,
+    // so it is the dedupe key; reads sum usage once per key while the rows
+    // stay per-line (`cc_tool_calls.message_uuid` and the session graph's
+    // response nodes both need them).
+    "ALTER TABLE cc_messages ADD COLUMN message_id TEXT;",
+    // The cursor clear that fills the column above on rows ingested before it,
+    // exactly as migration 25 did for `cc_messages.preview`: ingest is
+    // cursor-driven, so without this an unchanged transcript is skipped unread
+    // and the guarded `message_id IS NULL` backfill in `cc_ingest_file` is
+    // never reached. Ships in the SAME binary as the extraction — a bare
+    // column release would spend the re-walk under a binary that still writes
+    // NULL and never get a second chance. One-shot and additive: `cc_files`
+    // holds cursors, not data.
+    "DELETE FROM cc_files;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -930,6 +950,13 @@ pub struct CcAgentRunUpsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CcMessageRow {
     pub uuid: String,
+    /// The API response this line belongs to (`message.id`) — the billing
+    /// identity. Several transcript lines of one response repeat the identical
+    /// usage block under one `message.id`, so reads sum usage once per
+    /// `message_id` (`core::cc::dedupe_key`). `None` for a row ingested before
+    /// migration 29, or a line genuinely without one: such a row falls back to
+    /// its own `uuid`, so it is still counted exactly once, never dropped.
+    pub message_id: Option<String>,
     pub session_id: String,
     /// `None` = main thread; `Some` attributes the message to a subagent run.
     pub agent_id: Option<String>,
@@ -2916,8 +2943,9 @@ impl Store {
             let mut msg = tx.prepare(
                 "INSERT INTO cc_messages \
                      (uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
-                      cache_read_tokens, cache_creation_tokens, skill, agent, preview) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                      cache_read_tokens, cache_creation_tokens, skill, agent, preview, \
+                      message_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                  ON CONFLICT(uuid) DO NOTHING",
             )?;
             // `preview` arrived after these rows did (migration 24), so it needs
@@ -2931,6 +2959,14 @@ impl Store {
             let mut msg_backfill = tx.prepare(
                 "UPDATE cc_messages SET preview = ?2 \
                  WHERE uuid = ?1 AND preview IS NULL",
+            )?;
+            // Same shape, same reasoning, for `message_id` (migration 29): a
+            // separate guarded UPDATE rather than a `DO UPDATE` arm, so the
+            // cursor-cleared re-walk that migration 30 forces backfills the
+            // column without reporting a fake full-table import.
+            let mut msg_id_backfill = tx.prepare(
+                "UPDATE cc_messages SET message_id = ?2 \
+                 WHERE uuid = ?1 AND message_id IS NULL",
             )?;
             for m in &batch.messages {
                 let added = msg.execute((
@@ -2946,10 +2982,14 @@ impl Store {
                     &m.skill,
                     &m.agent,
                     &m.preview,
+                    &m.message_id,
                 ))? as i64;
                 counts.messages_added += added;
                 if added == 0 && m.preview.is_some() {
                     msg_backfill.execute((&m.uuid, &m.preview))?;
+                }
+                if added == 0 && m.message_id.is_some() {
+                    msg_id_backfill.execute((&m.uuid, &m.message_id))?;
                 }
             }
 
@@ -3027,12 +3067,16 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Message rows with `ts >= cutoff` (`None` = all).
+    /// Message rows with `ts >= cutoff` (`None` = all), oldest first —
+    /// deterministic order so the row a read-time dedupe keeps is stable
+    /// (`core::cc::dedupe_key`), the same guarantee `cc_session_messages`
+    /// already gave.
     pub fn cc_read_messages(&self, cutoff: Option<i64>) -> Result<Vec<CcMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
-                    cache_read_tokens, cache_creation_tokens, skill, agent, preview \
-             FROM cc_messages WHERE ?1 IS NULL OR ts >= ?1",
+                    cache_read_tokens, cache_creation_tokens, skill, agent, preview, \
+                    message_id \
+             FROM cc_messages WHERE ?1 IS NULL OR ts >= ?1 ORDER BY ts, uuid",
         )?;
         let rows = stmt.query_map([cutoff], |r| {
             Ok(CcMessageRow {
@@ -3048,6 +3092,7 @@ impl Store {
                 skill: r.get(9)?,
                 agent: r.get(10)?,
                 preview: r.get(11)?,
+                message_id: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3106,7 +3151,8 @@ impl Store {
     pub fn cc_session_messages(&self, session_id: &str) -> Result<Vec<CcMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT uuid, session_id, agent_id, ts, model, input_tokens, output_tokens, \
-                    cache_read_tokens, cache_creation_tokens, skill, agent, preview \
+                    cache_read_tokens, cache_creation_tokens, skill, agent, preview, \
+                    message_id \
              FROM cc_messages WHERE session_id = ?1 ORDER BY ts, uuid",
         )?;
         let rows = stmt.query_map([session_id], |r| {
@@ -3123,6 +3169,7 @@ impl Store {
                 skill: r.get(9)?,
                 agent: r.get(10)?,
                 preview: r.get(11)?,
+                message_id: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -6765,6 +6812,7 @@ mod tests {
             messages: vec![
                 CcMessageRow {
                     uuid: "uuid-1".into(),
+                    message_id: None,
                     session_id: "sess-1".into(),
                     agent_id: None,
                     ts: 1500,
@@ -6779,6 +6827,7 @@ mod tests {
                 },
                 CcMessageRow {
                     uuid: "uuid-2".into(),
+                    message_id: None,
                     session_id: "sess-1".into(),
                     agent_id: Some("agent-1".into()),
                     ts: 1600,
@@ -7190,6 +7239,7 @@ mod tests {
         let row = |preview: Option<&str>| CcFileBatch {
             messages: vec![CcMessageRow {
                 uuid: "u1".into(),
+                message_id: None,
                 session_id: "s".into(),
                 agent_id: None,
                 ts: 10,

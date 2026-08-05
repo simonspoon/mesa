@@ -41,6 +41,57 @@ CLI and API share it and never diverge.
   A tool whose input has no listed key (`advisor`'s `{}`, `StructuredOutput`'s
   caller-defined payload) simply gets `NULL`, as does one whose input failed
   upstream parsing (`{"__unparsedToolInput": …}`) or is not an object at all.
+- **One API response is several transcript lines, and usage is counted once per
+  response.** Claude Code writes a single assistant response as a *line per
+  content-block group* — typically a `thinking` line, then the
+  `text`/`tool_use` line — and **repeats the identical `message.usage` block on
+  every one of them**. Rows are keyed on the per-line `uuid`, so summing rows
+  counted one billed call 2-4 times: measured over three days of real
+  transcripts, 3,971 assistant usage lines carried only 2,557 distinct
+  `message.id` values (groups of 2 ×1,200, 3 ×104, 4 ×2), **zero** groups
+  disagreed on their usage, and every group sat inside one file and one
+  session. That was ~35-40% inflation on every token and cost figure mesa
+  reported, everywhere.
+
+  `message.id` is the **billing identity** and is stored as
+  `cc_messages.message_id` (migration 29, nullable). The rows stay **per line**
+  — `cc_tool_calls.message_uuid` points at an event uuid and the call tree
+  draws one `response` node per line — and instead **every read that sums usage
+  dedupes in Rust**: iterate in a deterministic order (`ORDER BY ts, uuid`) and
+  let a row contribute its tokens, cost and `messages` count only the first
+  time its key is seen. The key (`cc::dedupe_key`) is `message_id` when
+  non-`NULL`, else the row's own `uuid`, so a row predating the column or a
+  line genuinely without a `message.id` is counted exactly once, never dropped.
+  Applied in `cc::collect_inner`, `cc::session_detail`, the live path
+  `cc::parse_live_file` (which parses files directly and duplicates
+  identically), and the thread rollup inside `cc::session_graph` — that last
+  one so a session's KPIs and its own call tree can't disagree; the graph's
+  *nodes* are untouched.
+
+  **The advisor exception:** `fold_line` emits a second `cc_messages` row for
+  an advisor call's nested `usage.iterations[]`, keyed on the parent event's
+  uuid plus a suffix. Its `message_id` is its own synthetic key —
+  `<parent message.id>:advisor:<i>` — never the parent's bare `message.id`,
+  which would discard real advisor tokens as a duplicate of the wrapper turn
+  (the copy repeated on each line of one response still collapses to one).
+  Covered by `cc::tests::one_api_response_written_as_several_lines_is_counted_once`.
+
+  Existing rows predate the column, so it takes the same two-part upgrade
+  `preview` did: a separate guarded `UPDATE cc_messages SET message_id = ?2
+  WHERE uuid = ?1 AND message_id IS NULL` in `Store::cc_ingest_file` (never a
+  `DO UPDATE` arm, so `messages_added` keeps meaning "rows inserted"), plus a
+  **`DELETE FROM cc_files;` cursor clear as migration 30**, shipped in the same
+  binary as the extraction so the next *ordinary* `cc sync` re-walks every
+  transcript once and fills the column. Releasing the bare column alone is the
+  bug.
+
+  Measured on a copy of the real db: opening it moves `user_version` 28 → 30
+  and empties `cc_files` (3,956 cursors → 0); the next ordinary `cc sync`
+  re-walks 3,292 transcripts, reports `messages_added: 166` (genuinely new
+  lines, not 151k) and fills `message_id` on 95,508 of 151,307 rows. The
+  remainder are rows whose transcript has since been deleted — the same
+  inherent gap `preview` has — and they keep counting under their `uuid`.
+  The 7-day total went 906.9m → 391.0m tokens.
 - **An assistant message's own prose is kept only as a bounded preview** —
   `cc_messages.preview` (migration 24, nullable), the second derived `cc_*`
   column and the one deliberate relaxation of "bulk keys are never stored".
@@ -149,7 +200,27 @@ CLI and API share it and never diverge.
   loaded **once per request**, never per message. Labelled "estimated" in the
   UI.
 - Window is `7d`/`30d`/`90d`/`all`/`<n>d`, applied at read time over persisted
-  rows (ingest is always total). Transcript location resolves from
+  rows (ingest is always total). **`<n>d` means n calendar days ending today**:
+  the cutoff is UTC midnight of `today - (n - 1)` (`cc::window_cutoff`, the one
+  place it is computed — `empty_dashboard` and `collect_inner` share it), so
+  `since` is the true inclusive first day and `active_days <= n`. It used to
+  floor `now - n·86400`, i.e. `t-7 .. t` = **eight** dates for `7d`; on real
+  data that extra day added 319.4m tokens and 16 sessions (task 693).
+  Days are bucketed in **UTC** (`fmt_date`), deliberately not local time: the
+  measured difference over a week is ~0.6% (585.0m local vs 588.4m UTC) and
+  switching would churn every date across the API and TS surface.
+- **Reconciliation with Claude Code's own stats screen** (recorded once so the
+  next reader doesn't re-derive it): mesa rolls **subagent/sidechain** usage
+  into the parent session; Claude's screen counts main-session transcripts
+  only, and **double-counts per response exactly the way mesa used to**. Over
+  the same 7 local days, main-transcripts-only with no dedupe = 41.4k in /
+  2.73m out / 516.6m cache read / 19.2m cache write = 538.6m over 78 sessions,
+  matching that screen's 540.5m / 78 to within the minutes between the two
+  measurements. mesa's deduped 7-day figure is therefore *lower* than what
+  Claude shows (~380m vs the 906.9m mesa reported before this fix) — and that
+  is the correct outcome, not a shortfall. Subagent tokens are real billed
+  tokens and mesa keeps counting them.
+- Transcript location resolves from
   `MESA_CC_PROJECTS_DIR` (tests) → `$CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects`;
   `MESA_DB` isolates the store as everywhere else.
 - The read entry point is `cc::collect(store, window) -> CcDashboard` (overview +

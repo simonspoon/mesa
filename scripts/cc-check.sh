@@ -21,10 +21,17 @@ trap 'rm -rf "$TMP"; [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null;
 # Synthetic tree: one session "a" whose main transcript carries a usage event
 # with a tool_use block, plus a subagent transcript (same sessionId, agentId)
 # under <session>/subagents/ — the layout Claude Code writes.
+#
+# `u6`/`u7` are ONE API response written as two lines repeating the identical
+# `usage` under one `message.id` — the shape Claude Code actually writes (task
+# 693). Both rows persist, but every total below counts its 620 tokens once:
+# 350 (u1) + 30 (u2) + 620 = 1000, never 1620.
 mkdir -p "$TMP/tree/-demo-project/s/subagents"
 cat > "$TMP/tree/-demo-project/s.jsonl" <<'JSONL'
 {"type":"user","sessionId":"a","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/demo","gitBranch":"main","entrypoint":"cli","message":{"role":"user","content":"hi"}}
 {"type":"assistant","uuid":"u1","sessionId":"a","timestamp":"2026-06-15T01:05:00.000Z","cwd":"/home/me/demo","attributionSkill":"build","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","caller":"skill:build","input":{"command":"grep -rn 'x'\tsrc/","description":"search"}},{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/home/me/demo/src/core/cc.rs","limit":20}},{"type":"tool_use","id":"toolu_3","name":"Skill","input":{"skill":"inaros-swe:refine","args":"583"}},{"type":"tool_use","id":"toolu_4","name":"AskUserQuestion","input":{"questions":[]}}]}}
+{"type":"assistant","uuid":"u6","sessionId":"a","timestamp":"2026-06-15T01:06:00.000Z","cwd":"/home/me/demo","message":{"id":"msg_dup","model":"claude-opus-4-8","usage":{"input_tokens":20,"output_tokens":600,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"assistant","uuid":"u7","sessionId":"a","timestamp":"2026-06-15T01:06:01.000Z","cwd":"/home/me/demo","message":{"id":"msg_dup","model":"claude-opus-4-8","usage":{"input_tokens":20,"output_tokens":600,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
 JSONL
 cat > "$TMP/tree/-demo-project/s/subagents/x.jsonl" <<'JSONL'
 {"type":"assistant","uuid":"u2","isSidechain":true,"sessionId":"a","agentId":"x1","timestamp":"2026-06-15T01:10:00.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
@@ -53,7 +60,7 @@ for k in ["files_scanned","files_ingested","sessions","messages_added","tool_cal
 assert r["files_scanned"]==2, r
 assert r["files_ingested"]==2, r
 assert r["sessions"]==1, r
-assert r["messages_added"]==2, r
+assert r["messages_added"]==4, r  # 4 ROWS (u1,u2,u6,u7); u4/u5 are one response
 assert r["tool_calls_added"]==4, r
 print("sync ok")
 ' || fail "sync report shape/counts"
@@ -93,8 +100,9 @@ for k in ["generated_at_unix","window","since","overview","daily","models","skil
     assert k in d, f"missing key {k}"
 o=d["overview"]
 assert o["sessions"]==1, o["sessions"]
-assert o["messages"]==2, o["messages"]
-assert o["total_tokens"]==380, o["total_tokens"]
+# 3 responses, not 4 rows: u6/u7 are one API response written twice.
+assert o["messages"]==3, o["messages"]
+assert o["total_tokens"]==1000, o["total_tokens"]  # 1620 = the duplicate counted twice
 assert o["est_cost_usd"]>0
 assert d["since"] is None
 t=[t for t in d["tools"] if t["name"]=="Bash"]
@@ -141,7 +149,7 @@ rm -rf "$TMP/tree/-demo-project"
 import json,sys
 d=json.load(sys.stdin)
 o=d["overview"]
-assert o["sessions"]==1 and o["messages"]==2 and o["total_tokens"]==380, o
+assert o["sessions"]==1 and o["messages"]==3 and o["total_tokens"]==1000, o
 assert any(a["agent"]=="Explore" for a in d["agents"]), d["agents"]
 assert any(t["name"]=="Bash" for t in d["tools"]), d["tools"]
 s=d["sessions"][0]
@@ -158,7 +166,7 @@ JSONL
 "$BIN" cc summary --window all | python3 -c '
 import json,sys
 o=json.load(sys.stdin)["overview"]
-assert o["sessions"]==2 and o["messages"]==3 and o["total_tokens"]==1380, o
+assert o["sessions"]==2 and o["messages"]==4 and o["total_tokens"]==2000, o
 print("auto-ingest ok")
 ' || fail "summary did not auto-ingest the new transcript"
 [ "$("$BIN" cc sync | python3 -c 'import json,sys;r=json.load(sys.stdin);print(r["messages_added"]+r["tool_calls_added"]+r["files_ingested"])')" = "0" ] \
@@ -287,15 +295,16 @@ assert s["target"] is None and a["target"] is None, (s,a)
 assert a["skill"] is None and a["description"]=="look around" and a["spawn_depth"]==1, a
 # Node labels the ticket asks for: name + model + total tokens, on every node.
 assert s["model"]=="claude-opus-4-8" and a["model"]=="claude-haiku-4-5", (s,a)
-# Rollups are the thread`s own usage: main 100+200+50=350, subagent 10+20=30.
-assert s["tokens_are_rollup"] and s["total_tokens"]==350, s
+# Rollups are the thread`s own usage, deduped per API response: main
+# 100+200+50 + 20+600 = 970 (u6/u7 once, not 1590), subagent 10+20=30.
+assert s["tokens_are_rollup"] and s["total_tokens"]==970, s
 assert a["tokens_are_rollup"] and a["total_tokens"]==30, a
 # A tool node reports its ISSUING message`s usage and says so, so the number is
 # not additive with the rollups above.
 assert t["tokens_are_rollup"] is False and t["total_tokens"]==350, t
 assert t["model"]=="claude-opus-4-8" and t["caller"]=="skill:build", t
 # Whole-session total is the honest sum: both threads.
-assert g["total_tokens"]==380, g
+assert g["total_tokens"]==1000, g
 assert g["truncated"] is False and g["omitted_tool_calls"]==0, g
 # A prose-free session is byte-identical to before response nodes existed: the
 # same ids in the same order, no `msg:` node, and an honest zero counter.
@@ -416,9 +425,9 @@ assert d["session_id"]=="a" and d["project"]=="demo", d
 assert d["git_branch"]=="main" and d["entrypoint"]=="cli", d
 assert d["used_subagent"] is True and d["duration_minutes"]==10.0, d
 # Same numbers as the graph, from a different code path over uncapped rows.
-assert d["total_tokens"]==g["total_tokens"]==380, (d["total_tokens"],g["total_tokens"])
+assert d["total_tokens"]==g["total_tokens"]==1000, (d["total_tokens"],g["total_tokens"])
 assert d["est_cost_usd"]==g["est_cost_usd"], (d["est_cost_usd"],g["est_cost_usd"])
-assert d["tool_calls"]==4 and d["messages"]==2, d
+assert d["tool_calls"]==4 and d["messages"]==3, d
 # One `agents` entry per ingested run.
 assert d["agent_runs"]==1 and len(d["agents"])==1, d
 a=d["agents"][0]
@@ -426,7 +435,7 @@ assert a["agent_id"]=="x1" and a["agent"]=="Explore", a
 assert a["description"]=="look around" and a["spawn_depth"]==1, a
 assert a["total_tokens"]==30 and a["messages"]==1, a
 # Main thread vs subagents split, and the two halves sum to the rollup.
-assert d["main"]["agent_id"] is None and d["main"]["total_tokens"]==350, d["main"]
+assert d["main"]["agent_id"] is None and d["main"]["total_tokens"]==970, d["main"]
 assert d["main"]["total_tokens"]+a["total_tokens"]==d["total_tokens"], d
 # Tools keyed on NAME only (never target), skills promoted to the skill itself.
 assert {t["name"]:t["calls"] for t in d["tools"]}=={"Bash":1,"Read":1,"Skill":1,
@@ -524,7 +533,7 @@ assert by["tool:toolu_1"]["tokens_are_rollup"] is False, by["tool:toolu_1"]
 assert by["tool:toolu_1"]["target"]=="grep -rn '"'"'x'"'"' src/", by["tool:toolu_1"]
 assert by["tool:toolu_3"]["kind"]=="skill", by["tool:toolu_3"]
 assert by["tool:toolu_3"]["name"]=="inaros-swe:refine", by["tool:toolu_3"]
-assert g["total_tokens"]==380, g
+assert g["total_tokens"]==1000, g
 print("api cc graph: payload matches the CLI ok")
 ' || fail "GET /api/cc/sessions/{id}/graph did not match the CLI payload"
 
@@ -560,7 +569,7 @@ import json
 h=json.load(open("'"$TMP"'/detail-http")); c=json.load(open("'"$TMP"'/detail-cli"))
 # One `core` aggregator, two surfaces: same object, not merely a similar one.
 assert h==c, (h,c)
-assert h["total_tokens"]==380 and h["tool_calls"]==4, h
+assert h["total_tokens"]==1000 and h["tool_calls"]==4, h
 assert len(h["agents"])==h["agent_runs"]==1, h
 assert len(h["activity"])==60, len(h["activity"])
 print("api cc session: payload matches the CLI ok")

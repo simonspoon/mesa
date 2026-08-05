@@ -16,6 +16,15 @@
 //! every line with a timestamp contributes to a session's start/end span. Lines
 //! that don't parse, or aren't telemetry, are skipped.
 //!
+//! One API response is written as SEVERAL transcript lines — typically a
+//! `thinking` line then the `text`/`tool_use` line — and every one of them
+//! repeats the *identical* `message.usage` block. `message.id` is what those
+//! lines share and what a separate billed call differs on, so it is the
+//! billing identity: rows stay per-line (a tool call links to its event uuid,
+//! and the session graph draws one response node per line) while every read
+//! that sums usage counts each [`dedupe_key`] once. Without that, a single
+//! billed response was counted 2-4 times (task 693).
+//!
 //! A call to the built-in `advisor` tool doesn't get its own transcript line
 //! or file the way a Task-tool subagent does — it's a `server_tool_use` block
 //! on an ordinary event, and the advisor model's own (often large) usage is
@@ -84,6 +93,13 @@ struct RawLine {
 
 #[derive(Deserialize)]
 struct RawMessage {
+    /// The API response id (`msg_…`). One response is written as SEVERAL
+    /// transcript lines (a `thinking` line, then the `text`/`tool_use` line),
+    /// each repeating the identical `usage` block under this one id — so it,
+    /// not the per-line `uuid`, is the billing identity reads dedupe on
+    /// ([`dedupe_key`]).
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -470,8 +486,7 @@ pub fn collect_for_project(
 /// drift out of sync.
 fn empty_dashboard(window: &str) -> CcDashboard {
     let now = now_unix();
-    let cutoff = window_days(window).map(|d| (now - d * 86_400).div_euclid(86_400) * 86_400);
-    Agg::default().finish(window, cutoff, now)
+    Agg::default().finish(window, window_cutoff(window, now), now)
 }
 
 /// Shared body of [`collect`] and [`collect_for_project`]. `cwd_filter: None`
@@ -480,13 +495,7 @@ fn empty_dashboard(window: &str) -> CcDashboard {
 fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Result<CcDashboard> {
     let prices = load_prices()?;
     let now = now_unix();
-    // Floor the cutoff to UTC midnight so `since` (a date) is genuinely the
-    // inclusive first day of the window — otherwise the boundary day would be
-    // partially excluded by now's time-of-day.
-    let cutoff = window_days(window).map(|d| {
-        let raw = now - d * 86_400;
-        raw.div_euclid(86_400) * 86_400
-    });
+    let cutoff = window_cutoff(window, now);
 
     let mut agg = Agg::default();
 
@@ -519,7 +528,15 @@ fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Resul
         }
     }
 
+    // One billed API response spans several transcript lines that repeat its
+    // usage; rows arrive in a deterministic order (`ORDER BY ts, uuid`), so the
+    // first line of a response contributes everything and its repeats nothing
+    // — including the `messages` counts, which count responses, not lines.
+    let mut seen: HashSet<String> = HashSet::new();
     for m in store.cc_read_messages(cutoff)? {
+        if !seen.insert(dedupe_key(&m).to_string()) {
+            continue;
+        }
         let usage = RawUsage {
             input_tokens: m.input_tokens,
             output_tokens: m.output_tokens,
@@ -857,6 +874,7 @@ fn fold_line(
     if let (Some(model), Some(usage)) = (msg.model.as_ref(), msg.usage.as_ref()) {
         batch.messages.push(CcMessageRow {
             uuid: uuid.clone(),
+            message_id: msg.id.clone(),
             session_id: sid.clone(),
             agent_id: raw.agent_id.clone(),
             ts,
@@ -891,6 +909,16 @@ fn fold_line(
             };
             batch.messages.push(CcMessageRow {
                 uuid: format!("{uuid}:advisor:{i}"),
+                // Its OWN key, never the parent's bare `message.id` — that
+                // would make these real advisor tokens read as a duplicate of
+                // the wrapper turn and be discarded. Built from the parent's
+                // `message.id` when there is one so that the iterations
+                // repeated on every line of one response still collapse to
+                // one, and from the per-line uuid otherwise.
+                message_id: Some(format!(
+                    "{}:advisor:{i}",
+                    msg.id.as_deref().unwrap_or(uuid.as_str())
+                )),
                 session_id: sid.clone(),
                 agent_id: None,
                 ts,
@@ -1060,6 +1088,11 @@ fn parse_live_file(
         Ok(c) => c,
         Err(_) => return,
     };
+    // The same per-response duplication the persisted path dedupes: the lines
+    // of one API response repeat its usage, and they are always in one file,
+    // so a per-file set is enough. Keyed on `message.id`, falling back to the
+    // line uuid; a line with neither is never deduped, so it still counts.
+    let mut seen: HashSet<String> = HashSet::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1126,6 +1159,16 @@ fn parse_live_file(
         let Some(model) = raw.message.as_ref().and_then(|m| m.model.clone()) else {
             continue;
         };
+        let key = raw
+            .message
+            .as_ref()
+            .and_then(|m| m.id.as_deref())
+            .or(raw.uuid.as_deref());
+        if let Some(key) = key
+            && !seen.insert(key.to_string())
+        {
+            continue;
+        }
         s.models.insert(model.clone());
         s.messages += 1;
         s.tokens.add(usage);
@@ -1396,16 +1439,23 @@ pub fn session_graph(
     // can sit on an event carrying no usage, so this is a lookup, not a join.
     let mut by_uuid: HashMap<&str, (&str, Tok, f64)> = HashMap::new();
 
+    // Nodes stay per transcript line (`by_uuid` below, and one response node
+    // per prose line), but the thread ROLLUP the session/agent nodes show is
+    // usage — so it counts one API response once, exactly as the detail page
+    // does. Otherwise a session's own KPIs and its call tree would disagree.
+    let mut seen: HashSet<&str> = HashSet::new();
     for m in &messages {
         let cost = row_cost(&prices, m);
-        let t = threads.entry(m.agent_id.clone()).or_default();
-        t.tok.input += m.input_tokens;
-        t.tok.output += m.output_tokens;
-        t.tok.cache_read += m.cache_read_tokens;
-        t.tok.cache_creation += m.cache_creation_tokens;
-        t.cost += cost;
-        t.messages += 1;
-        *t.models.entry(m.model.clone()).or_insert(0) += 1;
+        if seen.insert(dedupe_key(m)) {
+            let t = threads.entry(m.agent_id.clone()).or_default();
+            t.tok.input += m.input_tokens;
+            t.tok.output += m.output_tokens;
+            t.tok.cache_read += m.cache_read_tokens;
+            t.tok.cache_creation += m.cache_creation_tokens;
+            t.cost += cost;
+            t.messages += 1;
+            *t.models.entry(m.model.clone()).or_insert(0) += 1;
+        }
         by_uuid.insert(
             &m.uuid,
             (
@@ -1698,7 +1748,18 @@ pub fn session_detail(store: &Store, session_id: &str) -> Result<Option<CcSessio
     let Some(sess) = store.cc_session(session_id)? else {
         return Ok(None);
     };
-    let messages = store.cc_session_messages(session_id)?;
+    // Usage is per API response, not per transcript line: keep the first row
+    // of each response (rows come back `ORDER BY ts, uuid`) and drop its
+    // repeats, so every rollup below — threads, models, whole-session totals
+    // and the activity series — counts one response once. The call tree
+    // (`session_graph`) deliberately does NOT do this: its response nodes are
+    // per line.
+    let mut seen: HashSet<String> = HashSet::new();
+    let messages: Vec<CcMessageRow> = store
+        .cc_session_messages(session_id)?
+        .into_iter()
+        .filter(|m| seen.insert(dedupe_key(m).to_string()))
+        .collect();
     let tool_calls = store.cc_session_tool_calls(session_id)?;
     let runs = store.cc_session_agent_runs(session_id)?;
 
@@ -1956,6 +2017,24 @@ fn short_session(session_id: &str) -> String {
 }
 
 // ---- small helpers ----
+
+/// What a persisted message row is counted *under* when summing usage: its
+/// `message.id` (one billed API response, however many transcript lines it was
+/// written as), falling back to the per-line `uuid` for a row ingested before
+/// migration 29 or a line that genuinely carries no `message.id`. The fallback
+/// is what makes the rule lossless — such a row is counted exactly once, never
+/// dropped.
+fn dedupe_key(m: &CcMessageRow) -> &str {
+    m.message_id.as_deref().unwrap_or(&m.uuid)
+}
+
+/// UTC-midnight cutoff for `window`: `<n>d` is **n calendar days ending
+/// today**, i.e. midnight of `today - (n - 1)`, so `since` is the true
+/// inclusive first day and `active_days <= n`. (Subtracting n days would make
+/// `7d` span 8 dates.) `all` has no cutoff.
+fn window_cutoff(window: &str, now: i64) -> Option<i64> {
+    window_days(window).map(|d| (now.div_euclid(86_400) - (d - 1)) * 86_400)
+}
 
 /// `all` => no cutoff; `<n>d` => n days; anything else falls back to 30 days.
 fn window_days(window: &str) -> Option<i64> {
@@ -2633,6 +2712,106 @@ mod tests {
     }
 
     #[test]
+    fn one_api_response_written_as_several_lines_is_counted_once() {
+        // task 693: Claude Code writes one API response as several transcript
+        // lines (thinking, then text/tool_use), each repeating the identical
+        // `message.usage`. Rows stay per line; usage is summed once per
+        // `message.id`. The advisor turn nested in that usage is NOT a
+        // duplicate — it is real, separately billed tokens and must survive.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        let usage = r#""usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40,"iterations":[{"type":"advisor_message","model":"claude-opus-4-8","input_tokens":1000,"output_tokens":2000}]}"#;
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                &format!(
+                    r#"{{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/w","message":{{"id":"msg_A","model":"claude-sonnet-5","content":[{{"type":"text","text":"thinking out loud"}}],{usage}}}}}"#
+                ),
+                &format!(
+                    r#"{{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-06-15T01:00:01.000Z","cwd":"/w","message":{{"id":"msg_A","model":"claude-sonnet-5","content":[{{"type":"text","text":"hi"}}],{usage}}}}}"#
+                ),
+                // A second, genuinely distinct response.
+                r#"{"type":"assistant","uuid":"u3","sessionId":"s1","timestamp":"2026-06-15T01:00:02.000Z","cwd":"/w","message":{"id":"msg_B","model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        // Rows are per line and untouched: 3 events + 2 advisor rows.
+        assert_eq!(q::<i64>(&db, "SELECT COUNT(*) FROM cc_messages"), 5);
+        assert_eq!(
+            q::<String>(&db, "SELECT message_id FROM cc_messages WHERE uuid = 'u2'"),
+            "msg_A"
+        );
+        // The advisor row's key is its own, derived from the parent's
+        // `message.id` — so the copy on each line collapses to one, but it is
+        // never mistaken for the wrapper turn.
+        assert_eq!(
+            q::<String>(
+                &db,
+                "SELECT message_id FROM cc_messages WHERE uuid = 'u1:advisor:0'"
+            ),
+            "msg_A:advisor:0"
+        );
+
+        let d = collect(&store, "all").unwrap();
+        // msg_A once + msg_B once + the advisor turn once = 3 messages.
+        assert_eq!(d.overview.messages, 3);
+        assert_eq!(d.overview.tokens.input, 10 + 1 + 1000);
+        assert_eq!(d.overview.tokens.output, 20 + 2 + 2000);
+        assert_eq!(d.overview.tokens.cache_read, 30);
+        assert_eq!(d.overview.tokens.cache_creation, 40);
+        assert_eq!(d.sessions[0].messages, 3);
+        assert_eq!(
+            d.agents
+                .iter()
+                .find(|a| a.agent == "advisor")
+                .unwrap()
+                .tokens
+                .output,
+            2000
+        );
+
+        // The session detail page sums the same way.
+        let det = session_detail(&store, "s1").unwrap().unwrap();
+        assert_eq!(det.messages, 3);
+        assert_eq!(det.tokens.input, 10 + 1 + 1000);
+        assert_eq!(det.total_tokens, d.overview.total_tokens);
+        // …while the call tree still draws one response node per line.
+        let g = session_graph(&store, "s1", 100).unwrap().unwrap();
+        assert_eq!(
+            g.nodes
+                .iter()
+                .filter(|n| n.kind == CcGraphNodeKind::Response)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn window_of_n_days_covers_n_calendar_days_ending_today() {
+        // task 693: `7d` used to floor `now - 7*86400` to midnight, i.e. days
+        // t-7..t inclusive = EIGHT dates.
+        let day: i64 = 86_400;
+        let now: i64 = 1_800_000_000; // arbitrary; only the date floor matters
+        let today = now.div_euclid(day) * day;
+        assert_eq!(window_cutoff("7d", now), Some(today - 6 * day));
+        assert_eq!(window_cutoff("1d", now), Some(today));
+        assert_eq!(window_cutoff("30d", now), Some(today - 29 * day));
+        assert_eq!(window_cutoff("all", now), None);
+    }
+
+    #[test]
     fn sync_ingests_advisor_calls() {
         // task 340: an advisor call is one `assistant` event with a
         // `server_tool_use` block naming "advisor" and its own (large) model
@@ -3295,6 +3474,7 @@ mod tests {
             target: Some("inaros-swe:refine".into()),
         });
         let msg = |uuid: &str, agent: Option<&str>, ts: i64, out: i64| CcMessageRow {
+            message_id: None,
             uuid: uuid.into(),
             session_id: "big".into(),
             agent_id: agent.map(str::to_string),
@@ -3432,6 +3612,7 @@ mod tests {
                     }],
                     messages: vec![CcMessageRow {
                         uuid: "m1".into(),
+                        message_id: None,
                         session_id: "flat".into(),
                         agent_id: None,
                         ts: 500,

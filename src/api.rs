@@ -38,7 +38,7 @@ use serde_json::json;
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, InboxItem, MesaVersion, NextResult, Priority,
+    GitRepoView, GitStatus, GitWorktree, InboxItem, MesaVersion, ModelRates, NextResult, Priority,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
     ProjectVersion, Status, Store, StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents,
     attachments, config, files, git, hooks, version,
@@ -921,6 +921,13 @@ fn router(state: AppState) -> Router {
         // agent-spawn command templates. Both verbs sit in the agents'
         // capability class (see `get_config`/`update_config`), not task CRUD.
         .route("/api/config", get(get_config).put(update_config))
+        // The same file's `pricing` section — the CC Dashboard's cost rates.
+        // Separate routes so `/api/config`'s shape (a bare ConfigCommand[])
+        // stays exactly what agents and config-check.sh already assert.
+        .route(
+            "/api/config/pricing",
+            get(get_config_pricing).put(update_config_pricing),
+        )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -3343,6 +3350,70 @@ async fn update_config(
     get_config(State(state), ConnectInfo(addr), headers).await
 }
 
+/// `GET /api/config/pricing` — the per-model-family price table the CC
+/// Dashboard estimates cost from: mesa's built-in rates, each with whatever
+/// `~/.mesa/config.json` overrides it with (`docs/config.md`, mesa task 692).
+///
+/// Gated like `get_config` — same file, same class of secret — and a malformed
+/// config is the same 502 `unavailable`, for the same reason: the editor must
+/// never render blank over a file it couldn't read.
+async fn get_config_pricing(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::pricing() {
+        Ok(prices) => Ok(Json(prices).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct PricingUpdate {
+    /// Only the prefixes present are touched; `null` removes one — restoring
+    /// the built-in rate for a family mesa ships, deleting the row for one the
+    /// user added. Absent keys keep whatever the file already says.
+    pricing: HashMap<String, Option<ModelRates>>,
+}
+
+/// `PUT /api/config/pricing` — writes price rows and echoes the table.
+///
+/// **Loopback-only in both modes**, like `update_config`: it is the same file,
+/// and a write that a LAN peer could aim at mesa's own config is exactly the
+/// thing that gate exists to stop — the section it lands in is not the
+/// distinction that matters.
+async fn update_config_pricing(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PricingUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    config::save_pricing(&body.pricing).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_pricing(State(state), ConnectInfo(addr), headers).await
+}
+
 async fn restart_server(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -5015,6 +5086,46 @@ mod tests {
                 commands: HashMap::from([(
                     config::TODO_WATCHER.to_string(),
                     "attacker-tool".to_string(),
+                )]),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    // The pricing verbs share the config gates exactly — same file, same
+    // capability class. Asserted separately because they are separate routes.
+
+    #[tokio::test]
+    async fn get_config_pricing_rejects_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        let resp = get_config_pricing(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn update_config_pricing_rejects_non_loopback_peer_under_lan_mode() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let resp = update_config_pricing(
+            State(state),
+            ConnectInfo(lan_peer()),
+            headers,
+            Json(PricingUpdate {
+                pricing: HashMap::from([(
+                    "claude-opus".to_string(),
+                    Some(ModelRates {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    }),
                 )]),
             }),
         )

@@ -399,6 +399,82 @@ grep -Fqx "agent-spawn|yes|saved from settings|<unset>|<unset>" "$SCRIPT_LOG" ||
   fail "the just-saved script did not drive the next spawn: $(cat "$SCRIPT_LOG")"
 ok "a script saved over PUT /api/config round-trips verbatim, reports its MESA_* vocabulary, and drives the very next spawn"
 
+# ---- the pricing section: GET/PUT /api/config/pricing (mesa task 692) ----
+
+# Same file, same rules, a different section — and the two must not disturb
+# each other, which is the whole reason the saver is a sibling of the commands
+# one rather than a second file format.
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}}
+EOF
+api GET /api/config/pricing
+[ "$CODE" = "200" ] || fail "GET pricing: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r 'map(.prefix) | join(",")' <<<"$STDOUT")" = "claude-fable,claude-mythos,claude-opus,claude-sonnet,claude-haiku" ] ||
+  fail "GET pricing must list the built-in families in order: $STDOUT"
+[ "$(jq -r '.[] | select(.prefix=="claude-opus") | .value' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured prefix must report value: null, got $STDOUT"
+[ "$(jq '.[] | select(.prefix=="claude-opus") | .default.output == 25' <<<"$STDOUT")" = "true" ] ||
+  fail "GET pricing: built-in opus rate wrong: $STDOUT"
+ok "GET /api/config/pricing lists the built-in model families with value: null (no override) and the shipped rates as default"
+
+api PUT /api/config/pricing '{"pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}, "newco-x": {"input": 7, "output": 8, "cache_read": 0, "cache_write": 0}}}'
+[ "$CODE" = "200" ] || fail "PUT pricing: expected 200, got $CODE: $STDOUT"
+[ "$(jq '.[] | select(.prefix=="claude-opus") | .value.output == 2' <<<"$STDOUT")" = "true" ] ||
+  fail "PUT must echo the stored override: $STDOUT"
+[ "$(jq '.[] | select(.prefix=="claude-opus") | .default.output == 25' <<<"$STDOUT")" = "true" ] ||
+  fail "the built-in must still be reported behind an override: $STDOUT"
+# A prefix the binary never heard of is the point: a new family, no rebuild.
+[ "$(jq -r '.[] | select(.prefix=="newco-x") | .default' <<<"$STDOUT")" = "null" ] ||
+  fail "a user-added prefix must have no built-in behind it: $STDOUT"
+[ "$(jq '.[] | select(.prefix=="newco-x") | .value.input == 7' <<<"$STDOUT")" = "true" ] ||
+  fail "a user-added prefix must round-trip: $STDOUT"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "a pricing write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "a pricing write dropped a section it doesn't own: $(cat "$CONFIG")"
+ok "PUT /api/config/pricing overrides a built-in family and adds a wholly new prefix, leaving commands and unknown sections verbatim"
+
+# The commands saver has to be just as careful in the other direction.
+api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
+[ "$CODE" = "200" ] || fail "PUT commands after pricing: expected 200, got $CODE: $STDOUT"
+[ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
+  fail "a commands write clobbered the pricing section: $(cat "$CONFIG")"
+ok "a commands write preserves the pricing section, exactly as a pricing write preserves commands"
+
+api PUT /api/config/pricing '{"pricing": {"claude-opus": null, "newco-x": null}}'
+[ "$CODE" = "200" ] || fail "PUT pricing null: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.[] | select(.prefix=="claude-opus") | .value' <<<"$STDOUT")" = "null" ] ||
+  fail "null must restore the built-in for a shipped family: $STDOUT"
+[ "$(jq -r 'map(select(.prefix=="newco-x")) | length' <<<"$STDOUT")" = "0" ] ||
+  fail "null must delete a user-added prefix outright: $STDOUT"
+[ "$(jq -r '.pricing | has("claude-opus")' < "$CONFIG")" = "false" ] ||
+  fail "null must remove the key, never store it zeroed: $(cat "$CONFIG")"
+ok "PUT null restores the built-in rate for a shipped family and deletes a user-added prefix"
+
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config/pricing '{"pricing": {"claude-opus": {"input": -1, "output": 2, "cache_read": 3, "cache_write": 4}}}'
+[ "$CODE" = "422" ] || fail "negative rate: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "negative rate: expected code validation, got $STDOUT"
+api PUT /api/config/pricing '{"pricing": {"claude opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}}}'
+[ "$CODE" = "422" ] || fail "prefix with whitespace: expected 422, got $CODE: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected pricing PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT /api/config/pricing rejects a negative rate and a whitespace-bearing prefix as 422 validation, writing nothing"
+
+# The write is loopback-only in both modes; from a loopback shell the reachable
+# half of that gate is the Host allowlist the same stack enforces.
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/pricing")
+[ "$CODE" = "403" ] || fail "GET pricing with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
+  -H 'Content-Type: application/json' \
+  --data '{"pricing": {"claude-opus": null}}' \
+  "http://127.0.0.1:$PORT/api/config/pricing")
+[ "$CODE" = "403" ] || fail "PUT pricing with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused pricing PUT must not touch the file"
+ok "both pricing verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"
@@ -406,9 +482,13 @@ api GET /api/config
   fail "malformed config GET: expected code unavailable, got $STDOUT"
 api PUT /api/config '{"commands": {"agent-spawn": "mytool"}}'
 [ "$CODE" = "502" ] || fail "malformed config PUT: expected 502, got $CODE: $STDOUT"
+api GET /api/config/pricing
+[ "$CODE" = "502" ] || fail "malformed config pricing GET: expected 502, got $CODE: $STDOUT"
+api PUT /api/config/pricing '{"pricing": {"claude-opus": null}}'
+[ "$CODE" = "502" ] || fail "malformed config pricing PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
-ok "a malformed config is 502 unavailable on both verbs, and a PUT never overwrites a file it could not read"
+ok "a malformed config is 502 unavailable on all four config verbs, and a PUT never overwrites a file it could not read"
 
 # ---- an unconfigured command falls back to the built-in claude argv ----
 

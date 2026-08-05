@@ -280,6 +280,68 @@ Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
 
 Nothing is cached: a save is live on the next dispatch, with no restart.
 
+## Pricing
+
+A second, independent section prices model families for the CC Dashboard's
+estimated cost (`docs/cc-dashboard.md`). It exists so a price change or a whole
+new model family is a Settings edit rather than a rebuild — before it, the
+table was an `if`-chain in `src/core/cc.rs` and anything unrecognized silently
+estimated $0.
+
+```json
+{
+  "pricing": {
+    "claude-opus":        {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
+    "claude-opus-5-mini": {"input": 1.0, "output": 5.0,  "cache_read": 0.1, "cache_write": 1.25}
+  }
+}
+```
+
+- Keys are model-family **prefixes**, matched against a transcript's model id
+  with `starts_with` — the same rule the hardcoded table used, so a point
+  release prices correctly with no edit. All four rates are USD per **1M
+  tokens** and all four are required; mesa never derives a cache rate from the
+  input rate.
+- mesa ships defaults for `claude-fable`, `claude-mythos`, `claude-opus`,
+  `claude-sonnet` and `claude-haiku` (`config::DEFAULT_PRICES`). An **absent
+  key uses the built-in**; the config only ever overlays.
+- **Longest matching prefix wins** over the merged table, so a variant can be
+  priced beside its family. A model no prefix matches estimates **$0** — no
+  cost rather than a wrong one.
+- A prefix mesa has never heard of is allowed. That is the point.
+- Removing a key (`PUT` value `null`) restores the built-in for a shipped
+  family and deletes a user-added prefix outright.
+- A malformed config is `unavailable`, never a silent fall back to the
+  built-ins — the same rule the spawn path follows.
+
+Validation happens in `core::config` before anything is written, and is
+all-or-nothing: a prefix must be non-empty after trimming, whitespace-free and
+≤ 64 characters, and every rate must be finite and ≥ 0. A rejected save leaves
+the file byte-identical.
+
+The two sections are siblings over one document: saving `pricing` preserves
+`commands` (and any section mesa doesn't know) and vice versa. Nothing is
+cached — the table is loaded **once per dashboard request** and a save applies
+to the next read, past sessions included, with no restart. Cost is derived on
+every read, so there is no stored figure to migrate.
+
+### Routes
+
+- `GET /api/config/pricing` → `ConfigPrice[]`: the built-in families in
+  declaration order, then any user-added prefix, sorted. Each row carries
+  `value` (the override, `null` when unset) and `default` (the built-in,
+  `null` for a user-added prefix). Gated like `GET /api/config`
+  (`require_agent_access`); a malformed config is **502 `unavailable`**.
+- `PUT /api/config/pricing`, body `{"pricing": {"<prefix>": {rates} | null}}`
+  → echoes the getter. Only the keys present are touched, so two editors can't
+  clobber each other. A bad prefix or rate is **422 `validation`**. Gated with
+  `require_local_path_write` — **loopback-only in both serve modes**, exactly
+  like `PUT /api/config`: it is the same file, and which file a LAN peer may
+  rewrite is not a per-section question.
+
+`/api/config`'s own shape is unchanged — a bare `ConfigCommand[]` and
+`{commands: {…}}` — because that is what agents and `config-check.sh` assert.
+
 ## Gate
 
 `scripts/config-check.sh` — all four commands driven by a configured template
@@ -295,3 +357,10 @@ unset-not-empty rule, a hostile `{name}` proven not to reach a shell, and the
 422s for `{}`-in-a-script and a bash syntax error. It writes a real
 `~/.mesa/config.json` under a throwaway `HOME` rather than using
 `MESA_CONFIG_FILE`, so the default path resolution is covered too.
+
+For pricing it also covers the round trip: `GET` showing the built-ins with
+null values, an override and a wholly new prefix landing, `PUT null` restoring
+one and deleting the other, each section surviving the other's write, a
+negative rate and a whitespace-bearing prefix as 422, both verbs 502 on a
+malformed file, and a request that isn't from this machine's own page refused
+without touching the file.

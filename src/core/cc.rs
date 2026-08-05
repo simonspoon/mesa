@@ -25,9 +25,12 @@
 //! and their real token/cost show up under their own model, tagged agent
 //! `"advisor"`.
 //!
-//! Cost is **estimated** from a static per-model price table (USD per million
-//! tokens). It is labelled as an estimate in the UI and will drift as pricing
-//! changes — update [`prices`] when it does.
+//! Cost is **estimated** from a per-model price table (USD per million
+//! tokens), labelled as an estimate in the UI. The table is
+//! [`crate::core::config::PriceTable`] — the rates mesa ships, overlaid by the
+//! `pricing` section of `~/.mesa/config.json` — so a price change or a new
+//! model family is a Settings edit rather than a rebuild. It is built once per
+//! request and threaded through the per-message loops below.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -36,6 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::config::PriceTable;
 use super::store::{
     CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcSessionRecord, CcSessionUpsert,
     CcToolCallRow, Result, Store,
@@ -284,31 +288,37 @@ struct RawIteration {
     cache_creation_input_tokens: i64,
 }
 
-// ---- pricing (USD per 1M tokens): (input, output, cache_read, cache_write) ----
+// ---- pricing (USD per 1M tokens) ----
 //
-// cache_read ≈ 0.1× input, cache_write (5-minute TTL) ≈ 1.25× input. Matched on
-// a model-family prefix so new point releases price correctly without an edit.
-fn prices(model: &str) -> (f64, f64, f64, f64) {
-    if model.starts_with("claude-fable") || model.starts_with("claude-mythos") {
-        (10.0, 50.0, 1.0, 12.5)
-    } else if model.starts_with("claude-opus") {
-        (5.0, 25.0, 0.5, 6.25)
-    } else if model.starts_with("claude-sonnet") {
-        (3.0, 15.0, 0.3, 3.75)
-    } else if model.starts_with("claude-haiku") {
-        (1.0, 5.0, 0.1, 1.25)
-    } else {
-        // Synthetic/unknown models (e.g. "<synthetic>"): no cost estimate.
-        (0.0, 0.0, 0.0, 0.0)
-    }
+// The table lives in `~/.mesa/config.json` over the built-in defaults
+// (`core::config::PriceTable`, mesa task 692), matched on a model-family
+// prefix. It is loaded ONCE per request and threaded down: these are
+// per-message loops, so a per-row file read would be a real cost.
+
+/// The merged price table, or the store's error type — a config file that
+/// exists but can't be read is surfaced, never silently priced at the
+/// built-ins (`docs/config.md`).
+fn load_prices() -> Result<PriceTable> {
+    PriceTable::load().map_err(|e| super::store::Error::Io(std::io::Error::other(e)))
 }
 
-fn estimate_cost(model: &str, u: &RawUsage) -> f64 {
-    let (i, o, cr, cw) = prices(model);
-    (u.input_tokens as f64 * i
-        + u.output_tokens as f64 * o
-        + u.cache_read_input_tokens as f64 * cr
-        + u.cache_creation_input_tokens as f64 * cw)
+fn estimate_cost(prices: &PriceTable, model: &str, u: &RawUsage) -> f64 {
+    let r = prices.for_model(model);
+    (u.input_tokens as f64 * r.input
+        + u.output_tokens as f64 * r.output
+        + u.cache_read_input_tokens as f64 * r.cache_read
+        + u.cache_creation_input_tokens as f64 * r.cache_write)
+        / 1_000_000.0
+}
+
+/// The cost of one stored message row — the db-side twin of [`estimate_cost`],
+/// shared by the two per-session rollups so the formula exists once.
+fn row_cost(prices: &PriceTable, m: &CcMessageRow) -> f64 {
+    let r = prices.for_model(&m.model);
+    (m.input_tokens as f64 * r.input
+        + m.output_tokens as f64 * r.output
+        + m.cache_read_tokens as f64 * r.cache_read
+        + m.cache_creation_tokens as f64 * r.cache_write)
         / 1_000_000.0
 }
 
@@ -468,6 +478,7 @@ fn empty_dashboard(window: &str) -> CcDashboard {
 /// is unfiltered (the global dashboard); `Some(path)` restricts every
 /// aggregation loop to sessions whose `cwd` exactly equals `path`.
 fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Result<CcDashboard> {
+    let prices = load_prices()?;
     let now = now_unix();
     // Floor the cutoff to UTC midnight so `since` (a date) is genuinely the
     // inclusive first day of the window — otherwise the boundary day would be
@@ -516,7 +527,7 @@ fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Resul
             cache_creation_input_tokens: m.cache_creation_tokens,
             ..Default::default()
         };
-        let cost = estimate_cost(&m.model, &usage);
+        let cost = estimate_cost(&prices, &m.model, &usage);
         // The message's session is always present above (its ts bounds the
         // session span) unless the sessions loop filtered it out for cwd —
         // so a missing session here means either a corrupt db (unfiltered
@@ -937,6 +948,11 @@ struct SubAcc {
 /// predates the window, so it stays cheap enough to poll on a short interval —
 /// only sessions with a *recent* event are parsed at all.
 pub fn live(window_minutes: i64) -> CcLive {
+    // `live` cannot fail — it returns a view, not a Result — so an unreadable
+    // config falls back to the shipped rates here rather than blanking the
+    // panel. The verbs that *edit* the table (`/api/config/pricing`) are where
+    // a malformed file is reported, as 502.
+    let prices = PriceTable::load().unwrap_or_else(|_| PriceTable::builtin());
     let now = now_unix();
     let win = window_minutes.clamp(1, MAX_LIVE_MINUTES);
     let n_buckets = win as usize;
@@ -950,7 +966,7 @@ pub fn live(window_minutes: i64) -> CcLive {
             if file_mtime(&f).is_some_and(|m| m < cutoff) {
                 continue;
             }
-            parse_live_file(&f, cutoff, first_min, n_buckets, &mut sessions);
+            parse_live_file(&f, &prices, cutoff, first_min, n_buckets, &mut sessions);
         }
     }
 
@@ -1034,6 +1050,7 @@ pub fn live(window_minutes: i64) -> CcLive {
 
 fn parse_live_file(
     path: &Path,
+    prices: &PriceTable,
     cutoff: i64,
     first_min: i64,
     n_buckets: usize,
@@ -1112,7 +1129,7 @@ fn parse_live_file(
         s.models.insert(model.clone());
         s.messages += 1;
         s.tokens.add(usage);
-        s.cost += estimate_cost(&model, usage);
+        s.cost += estimate_cost(prices, &model, usage);
         // The entry was already created above for any line carrying an `agentId`,
         // so reuse it by mutable handle (no second insert, no clone).
         if let Some(aid) = raw.agent_id.as_ref()
@@ -1356,6 +1373,7 @@ pub fn session_graph(
     session_id: &str,
     limit: usize,
 ) -> Result<Option<CcSessionGraph>> {
+    let prices = load_prices()?;
     let Some(sess) = store.cc_session(session_id)? else {
         return Ok(None);
     };
@@ -1379,12 +1397,7 @@ pub fn session_graph(
     let mut by_uuid: HashMap<&str, (&str, Tok, f64)> = HashMap::new();
 
     for m in &messages {
-        let (i, o, cr, cw) = prices(&m.model);
-        let cost = (m.input_tokens as f64 * i
-            + m.output_tokens as f64 * o
-            + m.cache_read_tokens as f64 * cr
-            + m.cache_creation_tokens as f64 * cw)
-            / 1_000_000.0;
+        let cost = row_cost(&prices, m);
         let t = threads.entry(m.agent_id.clone()).or_default();
         t.tok.input += m.input_tokens;
         t.tok.output += m.output_tokens;
@@ -1681,6 +1694,7 @@ pub const ACTIVITY_BUCKETS: usize = 60;
 /// its tool/response nodes repeat their issuing message's usage, so neither an
 /// exact per-tool count nor a token-over-time series can be derived from it.
 pub fn session_detail(store: &Store, session_id: &str) -> Result<Option<CcSessionDetail>> {
+    let prices = load_prices()?;
     let Some(sess) = store.cc_session(session_id)? else {
         return Ok(None);
     };
@@ -1721,12 +1735,7 @@ pub fn session_detail(store: &Store, session_id: &str) -> Result<Option<CcSessio
     let mut skills: BTreeMap<String, i64> = BTreeMap::new();
 
     for m in &messages {
-        let (i, o, cr, cw) = prices(&m.model);
-        let cost = (m.input_tokens as f64 * i
-            + m.output_tokens as f64 * o
-            + m.cache_read_tokens as f64 * cr
-            + m.cache_creation_tokens as f64 * cw)
-            / 1_000_000.0;
+        let cost = row_cost(&prices, m);
         let t = threads.entry(m.agent_id.clone()).or_default();
         t.tok.input += m.input_tokens;
         t.tok.output += m.output_tokens;
@@ -2133,10 +2142,29 @@ mod tests {
             cache_creation_input_tokens: 0,
             ..Default::default()
         };
+        let builtin = PriceTable::builtin();
         // Opus: $5 in + $25 out per Mtok = $30.
-        assert!((estimate_cost("claude-opus-4-8", &u) - 30.0).abs() < 1e-9);
+        assert!((estimate_cost(&builtin, "claude-opus-4-8", &u) - 30.0).abs() < 1e-9);
         // Unknown / synthetic: zero.
-        assert_eq!(estimate_cost("<synthetic>", &u), 0.0);
+        assert_eq!(estimate_cost(&builtin, "<synthetic>", &u), 0.0);
+
+        // …and a configured override moves the number, with no rebuild — the
+        // whole point of mesa task 692.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"pricing": {"claude-opus": {"input": 1, "output": 2,
+                                            "cache_read": 0, "cache_write": 0}}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", &path) };
+        let configured = PriceTable::load().unwrap();
+        // Point the seam back at a path that doesn't exist rather than unsetting
+        // it: the api tests rely on MESA_CONFIG_FILE staying set to "no file".
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", dir.path().join("gone.json")) };
+        assert!((estimate_cost(&configured, "claude-opus-4-8", &u) - 3.0).abs() < 1e-9);
     }
 
     #[test]

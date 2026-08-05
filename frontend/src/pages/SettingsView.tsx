@@ -1,6 +1,30 @@
 import { useState } from 'react'
-import { getConfig, listProjects, restartServer, updateConfig } from '../api'
+import {
+  getConfig,
+  getPricing,
+  listProjects,
+  restartServer,
+  updateConfig,
+  updatePricing,
+} from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
+import {
+  RATE_FIELDS,
+  addedPricing,
+  blankRates,
+  changedPricing,
+  draftFrom as pricingDraftFrom,
+  isBlank,
+  isDirty as isPricingDirty,
+  isNewRowStarted,
+  isSavable,
+  newRow,
+  newRowErrors,
+  type NewRow,
+  type PricingDraft,
+  type RateField,
+} from '../pricingDraft'
+import type { ConfigPrice } from '../types/ConfigPrice'
 import {
   changedCommands,
   draftFrom,
@@ -217,6 +241,8 @@ export function SettingsView() {
         {saved && !dirty && <span className="settings-saved">saved</span>}
       </div>
       {saveError && <p className="error">{saveError}</p>}
+
+      <PricingSection />
     </div>
   )
 }
@@ -300,5 +326,250 @@ function CommandRow({
       </p>
       {placeholderError && <p className="error">{placeholderError}</p>}
     </section>
+  )
+}
+
+/**
+ * Model pricing: the rates the CC Dashboard's est. cost is computed from
+ * (mesa task 692). Its own section, its own draft and its own save button —
+ * it is a separate endpoint, so merging the two forms would let one form's
+ * rejection strand the other's edits.
+ *
+ * Two rules, both the server's:
+ * - matching is by **prefix** (`claude-opus` prices every Opus release), the
+ *   longest match winning, so a variant can be priced beside its family;
+ * - a blank row is "use the built-in rate" — the reset for a family mesa
+ *   ships, the delete for a prefix the user added.
+ */
+function PricingSection() {
+  const { data: prices, error, refetch } = useFetch(() => getPricing(), 'pricing')
+  const [draft, setDraft] = useState<PricingDraft | null>(null)
+  const [extra, setExtra] = useState<NewRow[]>([])
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const seeded: PricingDraft = draft ?? (prices ? pricingDraftFrom(prices) : {})
+
+  function editRate(prefix: string, field: RateField, value: string) {
+    setDraft({ ...seeded, [prefix]: { ...seeded[prefix], [field]: value } })
+    setSaved(false)
+  }
+
+  function clearRow(prefix: string) {
+    setDraft({ ...seeded, [prefix]: blankRates() })
+    setSaved(false)
+  }
+
+  function editNew(index: number, next: NewRow) {
+    setExtra(extra.map((row, i) => (i === index ? next : row)))
+    setSaved(false)
+  }
+
+  function save() {
+    if (!prices) return
+    setSaving(true)
+    setSaveError(null)
+    updatePricing({
+      ...changedPricing(prices, seeded),
+      ...addedPricing(extra),
+    }).then(
+      (fresh) => {
+        // Re-seed from what landed; an added prefix comes back an ordinary row.
+        setDraft(pricingDraftFrom(fresh))
+        setExtra([])
+        setSaving(false)
+        setSaved(true)
+        refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Model pricing</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!prices) {
+    return (
+      <>
+        <h2>Model pricing</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isPricingDirty(prices, seeded) || extra.some(isNewRowStarted)
+  const errors = newRowErrors(extra)
+  const savable = isSavable(prices, seeded) && errors.length === 0
+
+  return (
+    <>
+      <h2>Model pricing</h2>
+      <p className="muted">
+        USD per 1M tokens, used for the CC Dashboard's estimated cost. Models are
+        matched by <strong>prefix</strong> — <code>claude-opus</code> prices every
+        Opus release — and the longest matching prefix wins, so{' '}
+        <code>claude-opus-5-mini</code> can be priced separately. Leave a row
+        blank to use the built-in rate shown in the boxes; a model no prefix
+        matches is estimated at $0. A change applies on the next dashboard read,
+        past sessions included, with no restart.
+      </p>
+
+      <div className="settings-prices">
+        <div className="settings-price-head muted">
+          <span>prefix</span>
+          <span>input</span>
+          <span>output</span>
+          <span>cache read</span>
+          <span>cache write</span>
+          <span />
+        </div>
+        {prices.map((p) => (
+          <PriceRow
+            key={p.prefix}
+            price={p}
+            draft={seeded}
+            onEdit={(field, value) => editRate(p.prefix, field, value)}
+            onClear={() => clearRow(p.prefix)}
+          />
+        ))}
+        {extra.map((row, i) => (
+          <NewPriceRow
+            key={i}
+            row={row}
+            onEdit={(next) => editNew(i, next)}
+            onRemove={() => setExtra(extra.filter((_, j) => j !== i))}
+          />
+        ))}
+      </div>
+
+      <div className="settings-actions">
+        <button type="button" onClick={() => setExtra([...extra, newRow()])}>
+          add model prefix
+        </button>
+        <button
+          type="button"
+          disabled={!dirty || !savable || saving}
+          onClick={save}
+        >
+          {saving ? 'saving…' : 'save pricing'}
+        </button>
+        {dirty && savable && !saving && (
+          <span className="muted">unsaved changes</span>
+        )}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {errors.map((e) => (
+        <p className="error" key={e}>
+          {e}
+        </p>
+      ))}
+      {saveError && <p className="error">{saveError}</p>}
+    </>
+  )
+}
+
+/** One priced family: four boxes over the built-in rate as placeholder. */
+function PriceRow({
+  price,
+  draft,
+  onEdit,
+  onClear,
+}: {
+  price: ConfigPrice
+  draft: PricingDraft
+  onEdit: (field: RateField, value: string) => void
+  onClear: () => void
+}) {
+  const row = draft[price.prefix] ?? blankRates()
+  const overridden = !isBlank(row)
+  return (
+    <div className="settings-price-row">
+      <code className="settings-price-prefix">{price.prefix}</code>
+      {RATE_FIELDS.map((field) => (
+        <input
+          key={field}
+          type="number"
+          min="0"
+          step="any"
+          className="settings-price-input"
+          aria-label={`${price.prefix} ${field}`}
+          value={row[field]}
+          placeholder={price.default ? String(price.default[field]) : '0'}
+          onChange={(e) => onEdit(field, e.target.value)}
+        />
+      ))}
+      {overridden ? (
+        <button
+          type="button"
+          className="settings-reset"
+          title={
+            price.default
+              ? 'Clear this row, restoring the built-in rate'
+              : 'Remove this prefix'
+          }
+          onClick={onClear}
+        >
+          {price.default ? 'reset to default' : 'remove'}
+        </button>
+      ) : (
+        <span className="muted settings-price-note">built-in</span>
+      )}
+    </div>
+  )
+}
+
+/** A prefix being added: the same row, plus an editable prefix box. */
+function NewPriceRow({
+  row,
+  onEdit,
+  onRemove,
+}: {
+  row: NewRow
+  onEdit: (next: NewRow) => void
+  onRemove: () => void
+}) {
+  return (
+    <div className="settings-price-row">
+      <input
+        type="text"
+        className="settings-price-input"
+        aria-label="new model prefix"
+        placeholder="claude-opus-5-mini"
+        spellCheck={false}
+        value={row.prefix}
+        onChange={(e) => onEdit({ ...row, prefix: e.target.value })}
+      />
+      {RATE_FIELDS.map((field) => (
+        <input
+          key={field}
+          type="number"
+          min="0"
+          step="any"
+          className="settings-price-input"
+          aria-label={`new prefix ${field}`}
+          value={row.rates[field]}
+          onChange={(e) =>
+            onEdit({ ...row, rates: { ...row.rates, [field]: e.target.value } })
+          }
+        />
+      ))}
+      <button
+        type="button"
+        className="settings-reset"
+        title="Drop this row"
+        onClick={onRemove}
+      >
+        remove
+      </button>
+    </div>
   )
 }

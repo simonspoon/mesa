@@ -5404,3 +5404,44 @@ button:focus-visible,
   color: var(--cyan);
   font-size: 0.8rem;
 }
+
+/* Model pricing: a prefix, four rates and one action per row. The grid is
+   declared once on the container so the header labels and every row share
+   their columns — the header is the only thing naming what the boxes are. */
+.settings-prices {
+  display: grid;
+  grid-template-columns: minmax(9rem, 1.4fr) repeat(4, minmax(4.5rem, 1fr)) auto;
+  gap: 0.35rem 0.5rem;
+  align-items: center;
+  margin-top: 0.75rem;
+  overflow-x: auto;
+}
+
+.settings-price-head,
+.settings-price-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+}
+
+.settings-price-head {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.settings-price-prefix {
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
+.settings-price-input {
+  width: 100%;
+  min-width: 0;
+  font-size: 0.8rem;
+}
+
+.settings-price-note {
+  font-size: 0.7rem;
+}

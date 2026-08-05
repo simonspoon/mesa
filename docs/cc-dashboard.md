@@ -137,11 +137,17 @@ CLI and API share it and never diverge.
   should ever trigger. `mesa cc sync` prints
   the `CcSyncReport` (`{files_scanned, files_ingested, sessions,
   messages_added, tool_calls_added}`; a no-change re-run adds zeros).
-- **Cost is estimated at read time** from a static per-model price table
-  (`prices` in `cc.rs`, USD per Mtok; cache-read ≈0.1× input, cache-write
-  ≈1.25×) — tokens are stored, dollars never are. Matched on a model-family
-  prefix so point releases price correctly; **update the table when pricing
-  changes.** Labelled "estimated" in the UI.
+- **Cost is estimated at read time** from a per-model price table (USD per
+  Mtok) — tokens are stored, dollars never are. The table is
+  `config::PriceTable`: the rates mesa ships, overlaid by the `pricing` section
+  of `~/.mesa/config.json` and editable from the Settings page
+  (`docs/config.md`), so a price change or a new model family needs no rebuild.
+  Matched on a model-family prefix, longest match winning, so point releases
+  price correctly and a variant can be priced beside its family; an unmatched
+  model estimates $0. Because cost is derived on every read, an edit
+  retroactively restates every historical figure — intended. The table is
+  loaded **once per request**, never per message. Labelled "estimated" in the
+  UI.
 - Window is `7d`/`30d`/`90d`/`all`/`<n>d`, applied at read time over persisted
   rows (ingest is always total). Transcript location resolves from
   `MESA_CC_PROJECTS_DIR` (tests) → `$CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects`;

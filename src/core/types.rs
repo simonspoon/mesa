@@ -186,6 +186,37 @@ pub struct ConfigCommand {
     pub env_vars: Vec<String>,
 }
 
+/// One model family's rates, USD per **1M tokens**. All four are explicit —
+/// mesa never derives a cache rate from the input rate, because the
+/// relationship is a pricing convention, not arithmetic mesa gets to assume.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ModelRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+/// One model-family price row as the Settings page sees it (`core::config`,
+/// `docs/config.md`). Like [`ConfigCommand`] this is a view of
+/// `~/.mesa/config.json`, not db state, and the same null-means-fallback rule
+/// applies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigPrice {
+    /// The model-family **prefix**, matched with `starts_with` against a
+    /// transcript's model id (`claude-opus`, `claude-opus-5-mini`, …).
+    pub prefix: String,
+    /// The configured rates, or `null` when the prefix is absent from the
+    /// config — then `default` is what applies.
+    pub value: Option<ModelRates>,
+    /// The built-in rates behind this prefix, or `null` for a prefix the user
+    /// added that the binary knows nothing about (then `value` is the only
+    /// thing keeping the row alive, and clearing it deletes the row).
+    pub default: Option<ModelRates>,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

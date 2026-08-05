@@ -1,4 +1,5 @@
-//! User config: the command lines mesa uses when it starts a coding agent.
+//! User config: the command lines mesa uses when it starts a coding agent,
+//! and the per-model price table the CC Dashboard estimates cost from.
 //!
 //! mesa spawns an agent from exactly four places — the todo-watcher's
 //! dispatch, the refine-watcher's refinement pass, the inbox-watcher's triage,
@@ -42,6 +43,22 @@
 //!
 //! Unlike `hooks.json` (a genuine `sh -c` string, [`crate::core::hooks`]) no
 //! value mesa holds is ever interpolated into a string a shell parses.
+//!
+//! ## Pricing
+//!
+//! A second, independent section prices model families for the CC Dashboard's
+//! cost estimate (mesa task 692):
+//!
+//! ```json
+//! { "pricing": { "claude-opus": {"input": 5.0, "output": 25.0,
+//!                                "cache_read": 0.5, "cache_write": 6.25} } }
+//! ```
+//!
+//! Keys are model-family **prefixes** (`starts_with`), values USD per 1M
+//! tokens. [`DEFAULT_PRICES`] ships the families mesa knows; the config
+//! overlays them and may add prefixes the binary has never heard of, which is
+//! the point — a new model family gets priced without a rebuild. See
+//! [`PriceTable`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,7 +66,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::core::types::ConfigCommand;
+use crate::core::types::{ConfigCommand, ConfigPrice, ModelRates};
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
 pub const TODO_WATCHER: &str = "todo-watcher";
@@ -230,18 +247,7 @@ fn save_commands_in(path: &Path, updates: &HashMap<String, String>) -> Result<()
         }
     }
 
-    let mut root: serde_json::Value = match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-            SaveError::Unavailable(format!("malformed mesa config {}: {e}", path.display()))
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => {
-            return Err(SaveError::Unavailable(format!(
-                "cannot read {}: {e}",
-                path.display()
-            )));
-        }
-    };
+    let mut root = read_config_document(path)?;
     let Some(object) = root.as_object_mut() else {
         return Err(SaveError::Unavailable(format!(
             "malformed mesa config {}: the file is not a JSON object",
@@ -669,6 +675,258 @@ pub fn tokenize(s: &str) -> Result<Vec<String>, String> {
         tokens.push(cur);
     }
     Ok(tokens)
+}
+
+// ---- pricing (mesa task 692) -------------------------------------------
+
+/// The shipped price table: model-family prefix → USD per 1M tokens, in the
+/// order the Settings page lists them. These are the exact numbers `cc.rs`
+/// hardcoded before the config could override them.
+///
+/// `cache_read` ≈ 0.1× input and `cache_write` (5-minute TTL) ≈ 1.25× input,
+/// but both are written out rather than derived — a pricing convention is not
+/// arithmetic mesa gets to assume on a family it has never seen.
+pub const DEFAULT_PRICES: [(&str, ModelRates); 5] = [
+    ("claude-fable", rates(10.0, 50.0, 1.0, 12.5)),
+    ("claude-mythos", rates(10.0, 50.0, 1.0, 12.5)),
+    ("claude-opus", rates(5.0, 25.0, 0.5, 6.25)),
+    ("claude-sonnet", rates(3.0, 15.0, 0.3, 3.75)),
+    ("claude-haiku", rates(1.0, 5.0, 0.1, 1.25)),
+];
+
+const fn rates(input: f64, output: f64, cache_read: f64, cache_write: f64) -> ModelRates {
+    ModelRates {
+        input,
+        output,
+        cache_read,
+        cache_write,
+    }
+}
+
+/// The built-in rates for `prefix` as an exact key (not a prefix match), or
+/// `None` for a prefix mesa doesn't ship — the pricing twin of
+/// [`default_command`].
+pub fn default_price(prefix: &str) -> Option<ModelRates> {
+    DEFAULT_PRICES
+        .iter()
+        .find(|(p, _)| *p == prefix)
+        .map(|(_, r)| *r)
+}
+
+/// The `pricing` map, deserialized on its own so a broken price entry can
+/// never take the spawn path down with it (and vice versa): the two sections
+/// are independent features that happen to share a file.
+#[derive(Debug, Default, Deserialize)]
+struct PricingConfig {
+    #[serde(default)]
+    pricing: HashMap<String, ModelRates>,
+}
+
+/// The merged price table: [`DEFAULT_PRICES`] overlaid by the config's
+/// `pricing` section. Built **once per request** and passed down — `cc.rs`
+/// prices every message through it, so re-reading the file per message would
+/// be a per-row `stat`+parse in a hot loop.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PriceTable {
+    entries: HashMap<String, ModelRates>,
+}
+
+impl PriceTable {
+    /// Just the shipped rates — what mesa costs with no config file.
+    pub fn builtin() -> PriceTable {
+        PriceTable {
+            entries: DEFAULT_PRICES
+                .iter()
+                .map(|(p, r)| ((*p).to_string(), *r))
+                .collect(),
+        }
+    }
+
+    /// Built-ins overlaid by `~/.mesa/config.json`. `Err` when the file exists
+    /// but can't be read or parsed — a broken config is visible, never a
+    /// silent fall back to the built-in numbers (same rule as the spawn path).
+    pub fn load() -> Result<PriceTable, String> {
+        Self::load_from(&config_file())
+    }
+
+    fn load_from(path: &Path) -> Result<PriceTable, String> {
+        let mut table = Self::builtin();
+        for (prefix, rates) in read_pricing(path)? {
+            table.entries.insert(prefix, rates);
+        }
+        Ok(table)
+    }
+
+    /// The rates for a model id: **longest matching prefix wins**, so
+    /// `claude-opus-5-mini` can be priced separately from `claude-opus`. No
+    /// match is all-zeros — a synthetic or unknown model gets no estimate
+    /// rather than a wrong one.
+    pub fn for_model(&self, model: &str) -> ModelRates {
+        self.entries
+            .iter()
+            .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, r)| *r)
+            .unwrap_or(rates(0.0, 0.0, 0.0, 0.0))
+    }
+}
+
+fn read_pricing(path: &Path) -> Result<HashMap<String, ModelRates>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: PricingConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.pricing)
+}
+
+/// Every price row for the Settings page (`GET /api/config/pricing`): the
+/// built-in families first in declaration order, then any prefix the user
+/// added, sorted. A configured built-in reports both `value` and `default`, so
+/// the editor can offer "reset" for one and "remove" for the other.
+pub fn pricing() -> Result<Vec<ConfigPrice>, String> {
+    pricing_in(&config_file())
+}
+
+fn pricing_in(path: &Path) -> Result<Vec<ConfigPrice>, String> {
+    let configured = read_pricing(path)?;
+    let mut rows: Vec<ConfigPrice> = DEFAULT_PRICES
+        .iter()
+        .map(|(prefix, default)| ConfigPrice {
+            prefix: (*prefix).to_string(),
+            value: configured.get(*prefix).copied(),
+            default: Some(*default),
+        })
+        .collect();
+    let mut extra: Vec<&String> = configured
+        .keys()
+        .filter(|k| default_price(k).is_none())
+        .collect();
+    extra.sort();
+    rows.extend(extra.into_iter().map(|prefix| ConfigPrice {
+        prefix: prefix.clone(),
+        value: configured.get(prefix).copied(),
+        default: None,
+    }));
+    Ok(rows)
+}
+
+/// Writes the `pricing` entries named in `updates` into the config file.
+///
+/// - `None` **removes** the key: for a built-in prefix that restores the
+///   shipped rates, for a user-added one it deletes the row outright. Same
+///   meaning blank has on the commands side.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_commands`] on purpose: one read-modify-write over the
+///   whole document, so `commands` and `pricing` each survive the other's
+///   edits along with any section mesa doesn't know.
+pub fn save_pricing(updates: &HashMap<String, Option<ModelRates>>) -> Result<(), SaveError> {
+    save_pricing_in(&config_file(), updates)
+}
+
+fn save_pricing_in(
+    path: &Path,
+    updates: &HashMap<String, Option<ModelRates>>,
+) -> Result<(), SaveError> {
+    let mut prefixes: Vec<&String> = updates.keys().collect();
+    prefixes.sort();
+    for prefix in &prefixes {
+        validate_prefix(prefix).map_err(SaveError::Validation)?;
+        if let Some(rates) = &updates[*prefix] {
+            validate_rates(prefix, rates).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("pricing")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"pricing\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for prefix in prefixes {
+        match &updates[prefix] {
+            None => {
+                section.remove(prefix.trim());
+            }
+            Some(rates) => {
+                let value = serde_json::to_value(rates).map_err(|e| {
+                    SaveError::Unavailable(format!("cannot serialize the mesa config: {e}"))
+                })?;
+                section.insert(prefix.trim().to_string(), value);
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// The whole config document as JSON, or `{}` when the file doesn't exist yet.
+/// Shared by both savers so neither can invent a second file format.
+fn read_config_document(path: &Path) -> Result<serde_json::Value, SaveError> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            SaveError::Unavailable(format!("malformed mesa config {}: {e}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(e) => Err(SaveError::Unavailable(format!(
+            "cannot read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// A prefix has to be usable as a `starts_with` needle and as a JSON key:
+/// non-empty, no whitespace (a model id has none), and bounded so the file
+/// can't be stuffed through the editor.
+fn validate_prefix(prefix: &str) -> Result<(), String> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Err("a model prefix cannot be empty".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "the model prefix {trimmed:?} contains whitespace; a model id has none"
+        ));
+    }
+    if trimmed.chars().count() > 64 {
+        return Err(format!(
+            "the model prefix {trimmed:?} is longer than 64 characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rates(prefix: &str, rates: &ModelRates) -> Result<(), String> {
+    for (label, value) in [
+        ("input", rates.input),
+        ("output", rates.output),
+        ("cache_read", rates.cache_read),
+        ("cache_write", rates.cache_write),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "the {label} rate for {:?} must be a number ≥ 0, got {value}",
+                prefix.trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1261,6 +1519,231 @@ mod tests {
         for row in &settings {
             assert_eq!(row.placeholders.len(), row.env_vars.len(), "{}", row.action);
         }
+    }
+
+    // ---- pricing (mesa task 692) ----------------------------------------
+
+    fn price(pairs: &[(&str, Option<ModelRates>)]) -> HashMap<String, Option<ModelRates>> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn price_table_falls_back_to_the_built_ins_and_zeros_the_unknown() {
+        let table = PriceTable::builtin();
+        assert_eq!(
+            table.for_model("claude-opus-4-8"),
+            rates(5.0, 25.0, 0.5, 6.25)
+        );
+        assert_eq!(
+            table.for_model("claude-haiku-4-5"),
+            rates(1.0, 5.0, 0.1, 1.25)
+        );
+        // A model no prefix matches gets no estimate rather than a wrong one.
+        assert_eq!(table.for_model("<synthetic>"), rates(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn config_overlays_the_built_ins_and_longest_prefix_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"pricing": {
+                 "claude-opus": {"input": 9, "output": 9, "cache_read": 9, "cache_write": 9},
+                 "claude-opus-5-mini": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}
+               }}"#,
+        );
+        let table = PriceTable::load_from(&path).unwrap();
+        // The overlay beats the built-in…
+        assert_eq!(
+            table.for_model("claude-opus-4-8"),
+            rates(9.0, 9.0, 9.0, 9.0)
+        );
+        // …and a longer prefix beats a shorter one that also matches.
+        assert_eq!(
+            table.for_model("claude-opus-5-mini-20260101"),
+            rates(1.0, 2.0, 3.0, 4.0)
+        );
+        // An untouched family keeps its shipped rates.
+        assert_eq!(
+            table.for_model("claude-sonnet-5"),
+            rates(3.0, 15.0, 0.3, 3.75)
+        );
+        // A prefix the binary never heard of prices anyway — the whole point.
+        let path = write_config(
+            dir.path(),
+            r#"{"pricing": {"newco-x": {"input": 2, "output": 4, "cache_read": 0, "cache_write": 0}}}"#,
+        );
+        let table = PriceTable::load_from(&path).unwrap();
+        assert_eq!(table.for_model("newco-x-1"), rates(2.0, 4.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn a_malformed_config_never_silently_prices_at_the_built_ins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        assert!(
+            PriceTable::load_from(&path)
+                .unwrap_err()
+                .contains("malformed mesa config")
+        );
+        assert!(pricing_in(&path).unwrap_err().contains("malformed"));
+        // No file at all is not malformed — it's the shipped table.
+        assert_eq!(
+            PriceTable::load_from(Path::new("/nonexistent/config.json")).unwrap(),
+            PriceTable::builtin()
+        );
+    }
+
+    #[test]
+    fn pricing_lists_built_ins_first_then_sorted_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"pricing": {
+                 "zeta": {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1},
+                 "alpha": {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1},
+                 "claude-opus": {"input": 7, "output": 7, "cache_read": 7, "cache_write": 7}
+               }}"#,
+        );
+        let rows = pricing_in(&path).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.prefix.as_str()).collect::<Vec<_>>(),
+            [
+                "claude-fable",
+                "claude-mythos",
+                "claude-opus",
+                "claude-sonnet",
+                "claude-haiku",
+                "alpha",
+                "zeta"
+            ]
+        );
+        // A configured built-in carries both, so the editor can offer "reset".
+        assert_eq!(rows[2].value, Some(rates(7.0, 7.0, 7.0, 7.0)));
+        assert_eq!(rows[2].default, Some(rates(5.0, 25.0, 0.5, 6.25)));
+        // An unconfigured one is "falling back", not "empty".
+        assert_eq!(rows[3].value, None);
+        // A user-added prefix has nothing behind it — clearing it deletes it.
+        assert_eq!(rows[5].default, None);
+        assert_eq!(rows[5].value, Some(rates(1.0, 1.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn the_two_sections_preserve_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"other": {"x": 1}, "commands": {"todo-watcher": "mytool {id}"}}"#,
+        );
+        save_pricing_in(
+            &path,
+            &price(&[("claude-opus", Some(rates(1.0, 2.0, 3.0, 4.0)))]),
+        )
+        .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["commands"]["todo-watcher"], "mytool {id}");
+        assert_eq!(written["other"]["x"], 1);
+        assert_eq!(written["pricing"]["claude-opus"]["output"], 2.0);
+        // …and the commands saver leaves the pricing section alone in turn.
+        save_commands_in(&path, &update(&[(INBOX_WATCHER, "mytool triage {id}")])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["pricing"]["claude-opus"]["output"], 2.0);
+        assert_eq!(written["commands"]["inbox-watcher"], "mytool triage {id}");
+        // Both are visible to the ordinary read paths.
+        assert_eq!(
+            PriceTable::load_from(&path)
+                .unwrap()
+                .for_model("claude-opus-9"),
+            rates(1.0, 2.0, 3.0, 4.0)
+        );
+        assert_eq!(
+            command_in(&path, INBOX_WATCHER).unwrap().as_deref(),
+            Some("mytool triage {id}")
+        );
+    }
+
+    #[test]
+    fn removing_a_price_restores_a_built_in_and_deletes_a_user_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"pricing": {
+                 "claude-opus": {"input": 9, "output": 9, "cache_read": 9, "cache_write": 9},
+                 "newco": {"input": 9, "output": 9, "cache_read": 9, "cache_write": 9}
+               }}"#,
+        );
+        save_pricing_in(&path, &price(&[("claude-opus", None), ("newco", None)])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Removed, not stored zeroed: the default is expressed by absence.
+        assert!(written["pricing"].get("claude-opus").is_none());
+        assert!(written["pricing"].get("newco").is_none());
+        let table = PriceTable::load_from(&path).unwrap();
+        assert_eq!(
+            table.for_model("claude-opus-4-8"),
+            rates(5.0, 25.0, 0.5, 6.25)
+        );
+        assert_eq!(table.for_model("newco-1"), rates(0.0, 0.0, 0.0, 0.0));
+        // And the row disappears from the Settings view entirely.
+        assert!(
+            pricing_in(&path)
+                .unwrap()
+                .iter()
+                .all(|r| r.prefix != "newco")
+        );
+    }
+
+    #[test]
+    fn save_pricing_rejects_a_bad_prefix_or_rate_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"pricing": {"claude-opus": {"input": 9, "output": 9, "cache_read": 9, "cache_write": 9}}}"#;
+        let path = write_config(dir.path(), before);
+        let good = Some(rates(1.0, 1.0, 1.0, 1.0));
+        for (label, updates) in [
+            ("empty prefix", price(&[("  ", good)])),
+            ("whitespace", price(&[("claude opus", good)])),
+            ("too long", price(&[(&"x".repeat(65), good)])),
+            (
+                "negative rate",
+                price(&[("claude-opus", Some(rates(1.0, -1.0, 1.0, 1.0)))]),
+            ),
+            (
+                "non-finite rate",
+                price(&[("claude-opus", Some(rates(f64::NAN, 1.0, 1.0, 1.0)))]),
+            ),
+        ] {
+            let err = save_pricing_in(&path, &updates).unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "{label}: {err:?}");
+        }
+        // A batch with one bad entry lands nothing at all.
+        let err = save_pricing_in(
+            &path,
+            &price(&[
+                ("claude-sonnet", good),
+                ("claude-haiku", Some(rates(0.0, 0.0, 0.0, -0.5))),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Validation(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn save_pricing_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = save_pricing_in(
+            &path,
+            &price(&[("claude-opus", Some(rates(1.0, 1.0, 1.0, 1.0)))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]

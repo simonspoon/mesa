@@ -12,6 +12,7 @@ import type { CcSessionDetail } from './types/CcSessionDetail'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
+import type { ConfigPrice } from './types/ConfigPrice'
 import type { DiagramType } from './types/DiagramType'
 import type { DirEntry } from './types/DirEntry'
 import type { DirListing } from './types/DirListing'
@@ -23,6 +24,7 @@ import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { MesaVersion } from './types/MesaVersion'
+import type { ModelRates } from './types/ModelRates'
 import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
@@ -762,4 +764,28 @@ export function updateConfig(
   commands: Record<string, string>,
 ): Promise<ConfigCommand[]> {
   return request('/api/config', jsonInit('PUT', { commands }))
+}
+
+/**
+ * The per-model-family price table the CC Dashboard estimates cost from: the
+ * rates mesa ships, each with the `~/.mesa/config.json` override that beats it
+ * (docs/config.md). `value: null` means the built-in `default` is in use; a
+ * `default: null` row is a prefix the user added. 502 `unavailable` means the
+ * config file itself is unreadable, exactly as for `getConfig`.
+ */
+export function getPricing(): Promise<ConfigPrice[]> {
+  return request('/api/config/pricing')
+}
+
+/**
+ * Writes price rows and echoes the table as re-read from disk. Only the
+ * prefixes passed are touched; `null` removes one — restoring the built-in
+ * rate for a family mesa ships, deleting the row for one you added. 422
+ * `validation` is a bad prefix or a rate that isn't a finite number ≥ 0, and
+ * nothing is written in that case.
+ */
+export function updatePricing(
+  pricing: Record<string, ModelRates | null>,
+): Promise<ConfigPrice[]> {
+  return request('/api/config/pricing', jsonInit('PUT', { pricing }))
 }

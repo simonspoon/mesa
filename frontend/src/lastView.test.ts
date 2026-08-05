@@ -6,6 +6,7 @@ import {
   getLastProjectTab,
   projectHref,
   projectTabFromPath,
+  projectViewFromPath,
   rememberView,
 } from './lastView'
 
@@ -31,6 +32,24 @@ describe('projectTabFromPath', () => {
   it('is null for anything that is not a project route', () => {
     for (const p of ['/', '/inbox', '/settings', '/terminal', '/cc', '/projects']) {
       expect(projectTabFromPath(p)).toBeNull()
+    }
+  })
+})
+
+describe('projectViewFromPath', () => {
+  it('keeps the project id alongside the tab', () => {
+    expect(projectViewFromPath('/projects/7')).toEqual({ id: 7, tab: 'board' })
+    expect(projectViewFromPath('/projects/9/files')).toEqual({ id: 9, tab: 'files' })
+    expect(projectViewFromPath('/projects/12/storyboards/3')).toEqual({
+      id: 12,
+      tab: 'storyboards',
+    })
+    expect(projectViewFromPath('/projects/7/tasks/12')).toEqual({ id: 7, tab: 'board' })
+  })
+
+  it('is null for anything that is not a project route', () => {
+    for (const p of ['/', '/inbox', '/cc', '/projects']) {
+      expect(projectViewFromPath(p)).toBeNull()
     }
   })
 })
@@ -61,27 +80,55 @@ describe('rememberView', () => {
   it('records the project tab and leaves the cc memory alone', () => {
     rememberView('/cc/sessions')
     rememberView('/projects/7/files')
-    expect(getLastProjectTab()).toBe('files')
+    expect(getLastProjectTab(7)).toBe('files')
     expect(getLastCcTab()).toBe('sessions')
+  })
+
+  it('keeps one tab per project', () => {
+    rememberView('/projects/7/terminal')
+    rememberView('/projects/9/files')
+    expect(getLastProjectTab(7)).toBe('terminal')
+    expect(getLastProjectTab(9)).toBe('files')
+    expect(getLastProjectTab(11)).toBe('board')
+  })
+
+  it('records a return to the board', () => {
+    rememberView('/projects/7/files')
+    rememberView('/projects/7')
+    expect(getLastProjectTab(7)).toBe('board')
+  })
+
+  it('drops 694s single-tab key on the first write', () => {
+    localStorage.setItem('mesa-last-project-tab', 'files')
+    rememberView('/projects/7/git')
+    expect(localStorage.getItem('mesa-last-project-tab')).toBeNull()
   })
 
   it('records nothing for non-project, non-cc routes', () => {
     rememberView('/projects/7/git')
     rememberView('/cc/projects')
     for (const p of ['/inbox', '/settings', '/terminal', '/']) rememberView(p)
-    expect(getLastProjectTab()).toBe('git')
+    expect(getLastProjectTab(7)).toBe('git')
     expect(getLastCcTab()).toBe('projects')
   })
 })
 
 describe('stored value', () => {
   it('falls back to board/overview when absent, unknown or corrupt', () => {
-    expect(getLastProjectTab()).toBe('board')
+    expect(getLastProjectTab(7)).toBe('board')
     expect(getLastCcTab()).toBe('overview')
-    localStorage.setItem('mesa-last-project-tab', 'wat')
     localStorage.setItem('mesa-last-cc-tab', '{"nope":1}')
-    expect(getLastProjectTab()).toBe('board')
     expect(getLastCcTab()).toBe('overview')
+    for (const bad of ['', 'wat', 'null', '[]', '"files"', '{"7":5}', '{"7":"wat"}']) {
+      localStorage.setItem('mesa-last-project-tabs', bad)
+      expect(getLastProjectTab(7)).toBe('board')
+    }
+  })
+
+  it('keeps the readable entries of a partly-corrupt map', () => {
+    localStorage.setItem('mesa-last-project-tabs', '{"7":"files","9":{"x":1}}')
+    expect(getLastProjectTab(7)).toBe('files')
+    expect(getLastProjectTab(9)).toBe('board')
   })
 })
 
@@ -89,8 +136,10 @@ describe('hrefs', () => {
   it('emits the bare project route for board, the tab segment otherwise', () => {
     expect(projectHref(7)).toBe('#/projects/7')
     rememberView('/projects/1/files')
+    expect(projectHref(7)).toBe('#/projects/7')
+    rememberView('/projects/7/files')
     expect(projectHref(7)).toBe('#/projects/7/files')
-    rememberView('/projects/1/storyboards/3')
+    rememberView('/projects/7/storyboards/3')
     expect(projectHref(7)).toBe('#/projects/7/storyboards')
   })
 

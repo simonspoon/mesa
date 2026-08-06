@@ -70,7 +70,11 @@ export function PtyTerminal({
     let disposed = false
     const term = new Terminal({
       cursorBlink: true,
-      fontFamily: '"Share Tech Mono", Menlo, monospace',
+      // Share Tech Mono stays primary, so ordinary text looks unchanged; the
+      // second family is an icons-only Nerd Font (bundled, see main.tsx) that
+      // only ever supplies the Private Use Area codepoints a prompt emits
+      // (starship/p10k segments, git/branch icons) and Share Tech Mono lacks.
+      fontFamily: '"Share Tech Mono", "Pure Nerd Font", Menlo, monospace',
       fontSize: ptyFontSize(),
       scrollback: 5000,
       theme: {

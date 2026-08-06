@@ -68,6 +68,21 @@ independent: opening several panes runs distinct, concurrently-progressing
 shells, and a pane's explicit **close** button kills only its own process,
 leaving every other open pane's process and output untouched.
 
+**Pane font stack.** Every embedded terminal — Terminal-page panes, the
+per-project Terminal tab, and the Agent sidebar's `claude attach` panes —
+renders through the one xterm.js component `PtyTerminal.tsx`, which is the
+**only** place the family list is named: `"Share Tech Mono", "Pure Nerd Font",
+Menlo, monospace`. Share Tech Mono stays primary so ordinary text looks exactly
+as it did; the second family is an icons-only Nerd Font (v3 symbol set) that
+supplies only the Private Use Area codepoints Share Tech Mono lacks, so a
+starship/p10k prompt's git, branch and folder glyphs draw as icons instead of
+tofu. The font is bundled from the `@azurity/pure-nerd-font` dependency and
+imported in `frontend/src/main.tsx` beside the two `@fontsource` imports — never
+a CDN, because the UI is embedded in the binary and must render offline; Vite
+emits the hashed `.woff2` into `frontend/dist/assets/`, where rust-embed picks
+it up like the other font files. Font *size* is unrelated and stays the
+CSS-driven `--pty-font-size` breakpoint (`docs/mobile.md`).
+
 **Cross-nav persistence.** `TerminalPage` is mounted exactly once in
 `App.tsx`, as a permanent sibling of `<main>`'s router outlet (not a branch of
 the route-conditional `page` variable that resolves into `<main>` and

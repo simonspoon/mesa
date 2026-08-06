@@ -4,6 +4,8 @@ import { createRoot } from 'react-dom/client'
 // offline (spec Requirement 10).
 import '@fontsource/orbitron/700.css'
 import '@fontsource/share-tech-mono/400.css'
+// Icons-only Nerd Font: the PUA-glyph fallback layer for terminal panes.
+import '@azurity/pure-nerd-font/pure-nerd-font.css'
 import './index.css'
 import App from './App.tsx'
 

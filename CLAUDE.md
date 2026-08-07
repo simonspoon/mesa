@@ -93,13 +93,12 @@ The code is the source of truth. These are the invariants you must not break:
 - **Frontend unit tests cover the pure logic modules, not components.** vitest
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
-  (`agentProject`, `agentSidebarWidth`, `boardView`, `fileTabs`,
-  `filesTreeWidth`, `keyboardScope`, `lastView`, `layout`, `navCollapse`,
-  `navOrder`, `navWidth`, `newFile`, `openFiles`, `pricingDraft`,
-  `projectTree`, `sessionDetail`, `sessionGraph`, `sessionTimeline`,
-  `settingsDraft`, `syntaxHighlighter`, `time`) —
-  predicates that historically
-  shipped wrong.
+  (`agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
+  `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`, `layout`,
+  `navCollapse`, `navOrder`, `navWidth`, `newFile`, `openFiles`,
+  `pricingDraft`, `projectTree`, `sessionDetail`, `sessionGraph`,
+  `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`, `time`) —
+  predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
   in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).
   Anything needing a rendered tree, real focus routing, or a trusted event

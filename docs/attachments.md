@@ -58,5 +58,29 @@ itself persisted.
   link, delete) with an inline `<img>` preview for any attachment whose
   `content_type` starts with `image/`. Not a separate tab — it lives inside
   the same task detail view as tags/dependencies/hooks.
+- Web UI, **create** path (`CreateTaskPanel.tsx`): files can also be staged
+  *before* a task exists. There is no "stage before create" endpoint, so the
+  panel keeps them client-side in `pendingFiles: File[]` and, right after the
+  create succeeds, runs the same `POST /api/tasks/{id}/attachments` per file.
+  Partial failure keeps the task and re-stages only the failed files, so
+  submitting again retries those instead of creating a duplicate task.
+- **Pasting an image** into that form stages it as one more `File` — the point
+  is that a screenshot no longer has to be saved to disk first. The `onPaste`
+  handler is on the `<form>` (not `window`), and a paste carrying no image is
+  left alone entirely — no `preventDefault()` — so text paste into the
+  description or tags input is unaffected. The decision lives in the pure
+  module `frontend/src/clipboardFiles.ts` (unit-tested; nothing testable goes
+  in the `.tsx`).
+  **The filename is the load-bearing part.** Clipboard images arrive named
+  `""` or `image.png`, and `guess_content_type` above is extension-only — a
+  name with no recognised extension is stored `content_type: null`, which is
+  exactly the case where the `<img>` preview does not render. So a pasted image
+  is renamed `pasted-<Date.now()>[-<i>].<ext>`, with `<ext>` derived from the
+  MIME type the clipboard *does* supply against the extensions the Rust guesser
+  knows (`image/png`→`png`, `image/jpeg`→`jpg`, `image/gif`→`gif`,
+  `image/webp`→`webp`, `image/svg+xml`→`svg`; any other `image/*` falls back to
+  its subtype, which lands as `content_type: null` — acceptable, and already
+  what an unknown upload does). A supplied name that *already* ends in a
+  recognised image extension is kept as-is.
 - Gate: `scripts/attachments-check.sh` (CLI + API JSON contract, including
   cascade-delete-removes-the-file).

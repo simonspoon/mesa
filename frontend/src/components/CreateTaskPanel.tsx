@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { createAttachment, createTask } from '../api'
+import { imageFilesFromClipboard } from '../clipboardFiles'
 import { parseTags } from '../tags'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
@@ -30,6 +31,8 @@ function readFileAsBase64(file: File): Promise<string> {
  * "stage before create" endpoint). If some uploads fail, the task itself
  * still exists: the form stays open with only the failed files staged so
  * submitting again retries just those, instead of creating a duplicate task.
+ * A clipboard image pasted anywhere in the form stages the same way — see
+ * `clipboardFiles.ts` for why it arrives renamed.
  *
  * The primary submit button omits `status`, so the API defaults new tasks to
  * `backlog` (spec 302). The secondary "create + move to refine" button passes
@@ -57,6 +60,20 @@ export function CreateTaskPanel({
     const files = Array.from(e.target.files ?? [])
     e.target.value = ''
     if (files.length > 0) setPendingFiles((prev) => [...prev, ...files])
+  }
+
+  // Clipboard images stage exactly like picked files (task 775). The handler
+  // lives on the <form>, not window/document, so it only fires while the modal
+  // has focus and never touches the global keyboard machinery
+  // (`keyboardScope.ts` / `shouldIgnoreShortcut()`).
+  function pasteFiles(e: React.ClipboardEvent<HTMLFormElement>) {
+    if (submitting || createdTaskId !== null) return
+    const files = imageFilesFromClipboard(e.clipboardData, Date.now())
+    // No image -> no preventDefault, so a text paste into the description or
+    // the tags input still inserts text.
+    if (files.length === 0) return
+    e.preventDefault()
+    setPendingFiles((prev) => [...prev, ...files])
   }
 
   function removeFile(index: number) {
@@ -128,6 +145,7 @@ export function CreateTaskPanel({
           e.preventDefault()
           submit()
         }}
+        onPaste={pasteFiles}
       >
         {/* The one identity field (task 660). It keeps the autoFocus the
             title input used to hold: the `a` shortcut and the command

@@ -83,8 +83,9 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
  * Persistent left nav: four top-level entries sharing one `.nav-item` style —
  * the CC Dashboard, the global Inbox, Terminal, and Projects. The CC Dashboard
  * owns a fixed subnav of its sub-pages; Projects owns a subnav (the project
- * list + create form), so its row is a disclosure header that collapses its
- * subnav. `ccTab` is the active CC sub-page (or null when off the dashboard)
+ * list + create form). Both collapse: Projects' row *is* the disclosure header,
+ * while the CC Dashboard keeps its link and pairs it with a caret button
+ * (mesa task 776). `ccTab` is the active CC sub-page (or null when off the dashboard)
  * and drives which CC link is highlighted. `terminalActive` highlights the
  * Terminal link the same way `inboxActive` does — the page itself is a
  * permanent sibling mount in `App.tsx` (mesa task 396), not rendered here.
@@ -306,6 +307,10 @@ export function Sidebar({
     }
   }
   const [creatingProject, setCreatingProject] = useState(false)
+  // Ephemeral collapse of the CC Dashboard subnav — same non-persisted pattern
+  // as the two section headers below; `navCollapse.ts` localStorage is
+  // reserved for the project subtrees the user curated themselves.
+  const [ccCollapsed, setCcCollapsed] = useState(false)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
   // Ephemeral collapse of the archived group, same non-persisted pattern as
@@ -560,21 +565,39 @@ export function Sidebar({
         >
           «
         </button>
-        <a
-          className={`nav-item${ccTab !== null ? ' active' : ''}`}
-          href={ccHref()}
-        >
-          <span className="nav-item-label">CC Dashboard</span>
-        </a>
-        <ul className="nav-projects nav-subnav">
-          {CC_SUBNAV.map((s) => (
-            <li key={s.tab}>
-              <a className={ccTab === s.tab ? 'active' : ''} href={s.hash}>
-                {s.label}
-              </a>
-            </li>
-          ))}
-        </ul>
+        {/* Unlike the Projects header this row stays an <a>: its href is the
+            user's remembered CC tab (task 694), so the caret is a sibling
+            button rather than the row itself. */}
+        <div className="nav-item-row">
+          <a
+            className={`nav-item${ccTab !== null ? ' active' : ''}`}
+            href={ccHref()}
+          >
+            <span className="nav-item-label">CC Dashboard</span>
+          </a>
+          <button
+            type="button"
+            className="nav-subtree-caret"
+            aria-expanded={!ccCollapsed}
+            aria-label={
+              ccCollapsed ? 'Expand CC Dashboard pages' : 'Collapse CC Dashboard pages'
+            }
+            onClick={() => setCcCollapsed((c) => !c)}
+          >
+            {ccCollapsed ? '▸' : '▾'}
+          </button>
+        </div>
+        {!ccCollapsed && (
+          <ul className="nav-projects nav-subnav">
+            {CC_SUBNAV.map((s) => (
+              <li key={s.tab}>
+                <a className={ccTab === s.tab ? 'active' : ''} href={s.hash}>
+                  {s.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
         <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
           <span className="nav-item-label">Inbox</span>
           {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}

@@ -190,6 +190,32 @@ header {
   color: var(--muted);
 }
 
+/* A top-level nav entry that keeps its link AND carries a disclosure caret
+   (CC Dashboard). The caret can't be the row itself the way it is for the
+   Projects header, because the label has to stay navigable. The caret takes
+   over the row's 0.5rem right inset and right-aligns its glyph, which lands it
+   exactly over the `.nav-caret` of the Projects header below. */
+.nav-item-row {
+  display: flex;
+  align-items: center;
+}
+
+.nav-item-row > .nav-item {
+  flex: 1;
+  min-width: 0;
+  /* The caret supplies the row's right inset, so the link gives its own back
+     to the label — without this "CC Dashboard" ellipsises at the default nav
+     width. */
+  padding-right: 0;
+}
+
+.nav-item-row > .nav-subtree-caret {
+  width: 1rem;
+  padding-right: 0.5rem;
+  font-size: 0.85rem;
+  text-align: right;
+}
+
 .inbox-badge {
   flex: none;
   min-width: 1.4em;

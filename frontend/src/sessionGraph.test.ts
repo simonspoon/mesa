@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  PROMPT_COLOR,
   RESPONSE_COLOR,
   formatTokens,
   shortModel,
@@ -181,5 +182,58 @@ describe('RESPONSE_COLOR', () => {
     // Mirrored from App.css's `.cc-tl-row.kind-*` left borders (session /
     // agent / skill).
     expect(['#00e5ff', '#ff2bd6', '#7c5cff']).not.toContain(RESPONSE_COLOR)
+  })
+})
+
+describe('PROMPT_COLOR', () => {
+  it('is reserved — no tool can reach it, by table or by hash', () => {
+    // Same coverage as the RESPONSE_COLOR block: one name per fixed slot
+    // (0-17) plus a spread of unknown names to exercise every hashed fallback
+    // slot. A prompt node is not a tool and has no name to key on, so if
+    // `toolColor` could ever return this hue the kind would stop being
+    // distinguishable.
+    const named = [
+      'Bash',
+      'Read',
+      'Edit',
+      'Write',
+      'WebFetch',
+      'WebSearch',
+      'Skill',
+      'Agent',
+      'Glob',
+      'ToolSearch',
+      'StructuredOutput',
+      'AskUserQuestion',
+      'EnterWorktree',
+      'TaskCreate',
+      'Monitor',
+      'Workflow',
+      'SendMessage',
+      'ScheduleWakeup',
+    ]
+    const hashed = Array.from({ length: 300 }, (_, i) => `mcp__unknown__tool_${i}`)
+    for (const name of [...named, ...hashed]) {
+      expect(toolColor(name)).not.toBe(PROMPT_COLOR)
+    }
+  })
+
+  it('is distinct from the structural kinds, and from a response', () => {
+    // The response pairing matters most of all: prompt and response are the
+    // two prose kinds, sitting adjacent down the whole column.
+    expect(['#00e5ff', '#ff2bd6', '#7c5cff']).not.toContain(PROMPT_COLOR)
+    expect(PROMPT_COLOR).not.toBe(RESPONSE_COLOR)
+  })
+})
+
+describe('shortTarget on a prompt', () => {
+  it('passes a prompt preview through untouched, path-like or not', () => {
+    // A bare slash command is the common case, and is exactly what the
+    // "looks like a path" heuristic would mangle: `/clear` into `clear`.
+    const prompt = (target: string) => shortTarget({ kind: 'prompt', name: 'Prompt', target })
+    expect(prompt('/clear')).toBe('/clear')
+    expect(prompt('/execute-todo 774')).toBe('/execute-todo 774')
+    expect(prompt('~/src/store.rs')).toBe('~/src/store.rs')
+    expect(prompt('rewrite the ingest predicate')).toBe('rewrite the ingest predicate')
   })
 })

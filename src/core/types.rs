@@ -1084,6 +1084,13 @@ pub enum CcGraphNodeKind {
     /// `msg:<message uuid>`. A flat sibling of the tool nodes that same message
     /// issued — never their parent.
     Response,
+    /// One human turn (`cc_prompts`) — what the user typed, or the slash
+    /// command they ran. Its `target` holds the sanitized, capped preview and
+    /// its id is `prompt:<line uuid>`. Always a direct child of the session
+    /// root: only main-thread prompts are ingested (a sidechain user line is a
+    /// subagent's task prompt, already carried by the agent node's
+    /// `description`). Carries no model and no usage of its own.
+    Prompt,
 }
 
 /// One node of a session's call tree.
@@ -1099,15 +1106,15 @@ pub enum CcGraphNodeKind {
 pub struct CcGraphNode {
     /// Stable within one graph, and namespaced by kind so a `tool_use_id` can
     /// never collide with an `agent_id`: `"session"`, `"agent:<agent_id>"`,
-    /// `"tool:<tool_use_id>"`, `"msg:<message uuid>"`.
+    /// `"tool:<tool_use_id>"`, `"msg:<message uuid>"`, `"prompt:<line uuid>"`.
     pub id: String,
     pub kind: CcGraphNodeKind,
     /// Tool name, skill name, subagent name, the session's short id, or the
-    /// constant `"Response"`.
+    /// constants `"Response"` / `"Prompt"`.
     pub name: String,
-    /// `tool` and `response` only: what the call acted on — a Bash command, a
-    /// file path, a URL — or, on a `response` node, the message's prose
-    /// preview. Sanitized and capped at
+    /// `tool`, `response` and `prompt` only: what the call acted on — a Bash
+    /// command, a file path, a URL — or, on a `response`/`prompt` node, the
+    /// message's prose preview. Sanitized and capped at
     /// [`crate::core::cc::TARGET_MAX_CHARS`]. `None` on every other kind, on
     /// tools with no meaningful target, and on calls ingested before migration
     /// 22 that no `cc sync --rebuild` has revisited. A `skill` node carries its
@@ -1177,9 +1184,9 @@ pub struct CcSessionGraph {
     /// Root first, then the rest oldest-first.
     pub nodes: Vec<CcGraphNode>,
     pub edges: Vec<CcGraphEdge>,
-    /// True when `limit` dropped tool **or** response nodes. Subagent nodes and
-    /// the tool calls that spawned them are never dropped, so the tree stays
-    /// connected.
+    /// True when `limit` dropped tool, response **or** prompt nodes. Subagent
+    /// nodes and the tool calls that spawned them are never dropped, so the
+    /// tree stays connected.
     pub truncated: bool,
     /// How many tool nodes were dropped.
     #[ts(type = "number")]
@@ -1188,6 +1195,12 @@ pub struct CcSessionGraph {
     /// from tool calls, so `omitted_tool_calls` keeps counting tool calls only.
     #[ts(type = "number")]
     pub omitted_responses: i64,
+    /// How many prompt nodes were dropped by `limit`. A third independent
+    /// budget, for the same reason responses got the second one: prompts are
+    /// their own unbounded population, so riding either existing budget would
+    /// make that budget's counter report something other than what it names.
+    #[ts(type = "number")]
+    pub omitted_prompts: i64,
 }
 
 /// One session's aggregate detail — `GET /api/cc/sessions/{id}` and

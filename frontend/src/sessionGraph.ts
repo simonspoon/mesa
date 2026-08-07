@@ -149,6 +149,23 @@ export function toolColor(name: string): string {
  *  else can reach, hashed or otherwise. */
 export const RESPONSE_COLOR = 'hsl(36, 30%, 76%)'
 
+/** Reserved colour for `kind: prompt` — the human turns, and so the spine a
+ *  reader scans a session by.
+ *
+ *  Reserved for the same reason `RESPONSE_COLOR` is: a prompt has no tool name
+ *  for `toolColor()` to key on, so asking it would mean a hashed fallback onto
+ *  some low-traffic tool's hue.
+ *
+ *  A cool pale neutral, mirroring the response's warm one: the two kinds that
+ *  carry prose are a matched pair — one side of the conversation each — and the
+ *  eye should sort them apart at a glance without either shouting over the
+ *  saturated tool column. 214° is far from the response's 36°, and at 28%
+ *  saturation it is below every `TOOL_PALETTE` entry's 35% floor, so no tool
+ *  can reach it hashed or otherwise. The blue *band* is spent on `blue` (206°)
+ *  and `slate-cyan` (190°), but those sit at 80%/45% saturation and 62%/55%
+ *  lightness — nothing at 28%/78% is within reach. */
+export const PROMPT_COLOR = 'hsl(214, 28%, 78%)'
+
 /** Tools whose `target` is a path, so the caller shows its last segment. The
  *  server stores the full path (it is the unambiguous thing to store); which
  *  part of it fits a one-line cell is a rendering question, decided here. */
@@ -168,13 +185,14 @@ const FILE_TOOLS = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Artifact']
  *  The full value stays available as the caller's hover title: this returns the
  *  display form only, and never claims to round-trip.
  *
- *  A `response`'s target is prose, not a target, and is passed through
- *  untouched: the "looks like a path" heuristic would otherwise mangle a
- *  one-word reply such as `/clear` into a path segment. */
+ *  A `response`'s or `prompt`'s target is prose, not a target, and is passed
+ *  through untouched: the "looks like a path" heuristic would otherwise mangle
+ *  a one-word reply — or a bare slash command such as `/clear`, which is
+ *  exactly what a prompt row often holds — into a path segment. */
 export function shortTarget(node: Pick<CcGraphNode, 'kind' | 'name' | 'target'>): string | null {
   const t = node.target
   if (!t) return null
-  if (node.kind === 'response') return t
+  if (node.kind === 'response' || node.kind === 'prompt') return t
   const pathLike = FILE_TOOLS.has(node.name) || (/^[~./]/.test(t) && !/\s/.test(t))
   if (!pathLike) return t
   // `filter(Boolean)` so a trailing slash yields the directory name rather

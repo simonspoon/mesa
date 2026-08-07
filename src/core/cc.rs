@@ -12,9 +12,12 @@
 //! (`mesa cc`) and the API (`GET /api/cc`) so the two surfaces never diverge.
 //!
 //! Each transcript line is one event. Only `assistant` events carry a `model`
-//! and a `usage` block, so those drive token/cost/model/skill/agent rollups;
-//! every line with a timestamp contributes to a session's start/end span. Lines
-//! that don't parse, or aren't telemetry, are skipped.
+//! and a `usage` block, so those drive token/cost/model/skill/agent rollups.
+//! One other kind of line produces a row of its own: a `user` line that
+//! [`human_prompt`] judges to be a real human turn becomes a `cc_prompts` row —
+//! a bounded preview and nothing else, no usage, its own table. Every other
+//! line with a timestamp merely contributes to the session's start/end span,
+//! and lines that don't parse, or aren't telemetry, are skipped.
 //!
 //! One API response is written as SEVERAL transcript lines — typically a
 //! `thinking` line then the `text`/`tool_use` line — and every one of them
@@ -50,8 +53,8 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PriceTable;
 use super::store::{
-    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcSessionRecord, CcSessionUpsert,
-    CcToolCallRow, Result, Store,
+    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcPromptRow, CcSessionRecord,
+    CcSessionUpsert, CcToolCallRow, Result, Store,
 };
 use super::types::{
     CcAgentStat, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
@@ -89,6 +92,34 @@ struct RawLine {
     attribution_agent: Option<String>,
     #[serde(default)]
     message: Option<RawMessage>,
+    /// The line's own type tag (`"user"`, `"assistant"`, `"system"`, …). Only
+    /// [`human_prompt`] reads it: every other path keys off the shape of
+    /// `message` instead, which is why it went unparsed until task 774.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    /// Set by Claude Code on a `user` line it synthesized rather than received:
+    /// hook output, an injected skill body, an image stub, a caveat banner.
+    #[serde(default)]
+    is_meta: Option<bool>,
+    /// Present on the `user` line that *carries* a tool's result back into the
+    /// conversation — a transport frame, never a human turn.
+    #[serde(default)]
+    tool_use_result: Option<serde_json::Value>,
+    // `userType` is deliberately NOT parsed: the resolved predicate never
+    // consults it (`origin.type` is the authority, with a prefix fallback for
+    // legacy lines), and a field no code reads is a `dead_code` failure under
+    // the `-D warnings` clippy gate.
+    /// Where the turn came from (Claude Code ≥ v2.1.187). Authoritative for
+    /// [`human_prompt`] when present.
+    #[serde(default)]
+    origin: Option<RawOrigin>,
+}
+
+/// The `origin` block of a `user` line. Only its `type` is read.
+#[derive(Deserialize)]
+struct RawOrigin {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +298,134 @@ pub fn sanitize_capped(raw: &str) -> Option<String> {
         chars += 1;
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Text prefixes that mark a `user` line as machinery rather than a human
+/// turn. **The pre-`origin` fallback only**: Claude Code ≥ v2.1.187 stamps
+/// every user line with an `origin` block, which is authoritative and skips
+/// this list entirely. Older transcripts have nothing but the text to go on,
+/// and these are the shapes observed carrying injected content — command
+/// echoes, local command output, caveat banners, interrupt markers, image
+/// stubs, notifications, hook feedback, skill preambles and cross-session
+/// messages.
+const NON_HUMAN_PREFIXES: &[&str] = &[
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-caveat>",
+    "Caveat: The messages below were generated",
+    "<system-reminder>",
+    "[Request interrupted by user]",
+    "[Image:",
+    "[SYSTEM NOTIFICATION",
+    "Stop hook feedback:",
+    "Base directory for this skill:",
+    "<teammate-message",
+    "Another Claude session sent a message:",
+];
+
+/// The preview of a real human turn, or `None` for every other `user` line.
+///
+/// Claude Code writes far more `user` lines than the user ever typed: tool
+/// results ride back in on one, so do hook output, injected skill bodies,
+/// system reminders and image stubs, and a subagent's task prompt is a `user`
+/// line on a sidechain. This is the single place that decides which of them a
+/// human actually authored — pure, so the decision is unit-testable against a
+/// synthetic line rather than only through a whole `sync`.
+///
+/// Two things are worth spelling out:
+///
+/// * **Slash commands count.** A `/execute-todo 774` turn is what the user
+///   typed, even though Claude Code rewrites it into a command envelope before
+///   the model sees it; the envelope is unwrapped back to `name args`. In
+///   skill-driven use, free-typed turns are ~1% of user lines and whole
+///   sessions have none, so dropping these would leave the feature showing
+///   almost nothing.
+/// * **`origin.type` is the authority, `promptSource` is not** —
+///   `claude-desktop` human turns carry `promptSource: "sdk"`. Lines predating
+///   `origin` fall back to [`NON_HUMAN_PREFIXES`].
+///
+/// The result is sanitized and capped by the shared [`sanitize_capped`], the
+/// same policy every other transcript-derived string mesa stores goes through:
+/// what lands in the db is a bounded preview, never the prompt body.
+fn human_prompt(line: &RawLine) -> Option<String> {
+    if line.kind.as_deref() != Some("user") {
+        return None;
+    }
+    if line.is_meta == Some(true) {
+        return None;
+    }
+    // A sidechain user line is a *subagent's task prompt*, already carried by
+    // the agent node's `description`. Main thread only.
+    if line.is_sidechain == Some(true) {
+        return None;
+    }
+    if line.tool_use_result.is_some() {
+        return None;
+    }
+
+    let content = line.message.as_ref()?.content.as_ref()?;
+    let text = match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            // ~794 tool-result carriers in the real corpus lack
+            // `toolUseResult`, so the guard above is not enough on its own:
+            // one `tool_result` block condemns the whole line.
+            if blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            {
+                return None;
+            }
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !t.trim_start().starts_with("<system-reminder>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        _ => return None,
+    };
+
+    if let Some(cmd) = slash_command(&text) {
+        return sanitize_capped(&cmd);
+    }
+    let accepted = match line.origin.as_ref() {
+        Some(o) => o.kind.as_deref() == Some("human"),
+        None => {
+            let trimmed = text.trim_start();
+            !NON_HUMAN_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+        }
+    };
+    if !accepted {
+        return None;
+    }
+    sanitize_capped(&text)
+}
+
+/// The `/name args` a `<command-name>` envelope stands for, or `None` when the
+/// text is not one. Claude Code rewrites a typed slash command into this
+/// envelope, so reconstructing it is what keeps a skill-driven session's human
+/// turns visible at all.
+fn slash_command(text: &str) -> Option<String> {
+    let name = tagged(text, "command-name")?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match tagged(text, "command-args").map(|a| a.trim().to_string()) {
+        Some(args) if !args.is_empty() => Some(format!("{name} {args}")),
+        _ => Some(name.to_string()),
+    }
+}
+
+/// The body of the first `<tag>…</tag>` pair in `text`.
+fn tagged<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let start = text.find(&open)? + open.len();
+    let rest = &text[start..];
+    let end = rest.find(&format!("</{tag}>"))?;
+    Some(&rest[..end])
 }
 
 #[derive(Deserialize, Default)]
@@ -876,6 +1035,17 @@ fn fold_line(
     let (Some(uuid), Some(msg)) = (raw.uuid.as_ref(), raw.message.as_ref()) else {
         return;
     };
+    // A human turn is a `user` line, so it carries neither a model nor a usage
+    // block and produces none of the rows below — it gets its own row, in its
+    // own table, and leaves every other path untouched.
+    if let Some(preview) = human_prompt(&raw) {
+        batch.prompts.push(CcPromptRow {
+            uuid: uuid.clone(),
+            session_id: sid.clone(),
+            ts,
+            preview,
+        });
+    }
     for (tool_use_id, name, caller, target) in msg.tool_uses() {
         batch.tool_calls.push(CcToolCallRow {
             tool_use_id,
@@ -1428,6 +1598,10 @@ pub const GRAPH_NODE_LIMIT: usize = 600;
 /// A message that emitted prose also gets a `response` node (`msg:<uuid>`),
 /// hung off the same parent as that message's tool nodes and emitted before
 /// them when they share a timestamp.
+///
+/// Each ingested human turn gets a `prompt` node (`prompt:<uuid>`), always a
+/// direct child of the root, and sorts ahead of both at an equal timestamp —
+/// it is the cause of what follows it.
 pub fn session_graph(
     store: &Store,
     session_id: &str,
@@ -1440,6 +1614,7 @@ pub fn session_graph(
     let messages = store.cc_session_messages(session_id)?;
     let tool_calls = store.cc_session_tool_calls(session_id)?;
     let runs = store.cc_session_agent_runs(session_id)?;
+    let prompts = store.cc_session_prompts(session_id)?;
 
     // ---- per-thread rollups, keyed by agent_id (None = the main thread) ----
     #[derive(Default)]
@@ -1542,13 +1717,24 @@ pub fn session_graph(
     let prose_total = prose.clone().count();
     let omitted_responses = prose_total.saturating_sub(limit) as i64;
 
-    // Tool and response nodes are emitted in ONE merged, ts-ordered pass. They
-    // routinely share a `ts` (one assistant message emits prose and its calls
-    // at the same instant) and the frontend tie-breaks equal `ts` by server
+    // ---- prompt budget: the same again, a third time ----
+    //
+    // Human turns are a third unbounded population, and the same reasoning
+    // applies: sharing either budget above would make its counter report
+    // something other than what it names. `prompts` is ordered by (ts, uuid),
+    // so `take` keeps the oldest.
+    let omitted_prompts = prompts.len().saturating_sub(limit) as i64;
+
+    // Prompt, tool and response nodes are emitted in ONE merged, ts-ordered
+    // pass. They routinely share a `ts` (one assistant message emits prose and
+    // its calls at the same instant; a prompt is stamped the same second the
+    // reply to it starts) and the frontend tie-breaks equal `ts` by server
     // order, so the ordering must be deterministic here, not an artifact of
     // which loop happened to push first: sort by (ts, kind_rank, id) with
-    // response = 0, tool = 1. Emitting all responses in a pass of their own
-    // would instead break `nodes`' documented "oldest first" for every reader.
+    // prompt = 0, response = 1, tool = 2. A prompt causes what follows it, so
+    // it sorts first; response-before-tool is unchanged, just shifted up.
+    // Emitting all responses in a pass of their own would instead break
+    // `nodes`' documented "oldest first" for every reader.
     struct Pending {
         ts: i64,
         rank: u8,
@@ -1611,7 +1797,7 @@ pub fn session_graph(
         };
         pending.push(Pending {
             ts: c.ts,
-            rank: 1,
+            rank: 2,
             node,
             edge,
         });
@@ -1654,6 +1840,44 @@ pub fn session_graph(
         };
         pending.push(Pending {
             ts: m.ts,
+            rank: 1,
+            node,
+            edge,
+        });
+    }
+
+    // ---- prompt nodes: one per ingested human turn ----
+    //
+    // Always a direct child of the root — `cc_prompts` holds main-thread lines
+    // only. No model and no usage: a user turn is billed as part of the reply
+    // it provokes, so any number here would be invented. `tokens_are_rollup`
+    // is nonetheless `true`, which is the flag the UI reads as "this is not
+    // one message's usage shared with siblings" and so never prefixes `≈`.
+    for p in prompts.iter().take(limit) {
+        let node = CcGraphNode {
+            id: format!("prompt:{}", p.uuid),
+            kind: CcGraphNodeKind::Prompt,
+            name: "Prompt".into(),
+            target: Some(p.preview.clone()),
+            model: None,
+            tokens: Tok::default().to_cc(),
+            total_tokens: 0,
+            tokens_are_rollup: true,
+            est_cost_usd: 0.0,
+            ts: Some(fmt_ts(p.ts)),
+            skill: None,
+            description: None,
+            spawn_depth: None,
+            messages: 0,
+            tool_calls: 0,
+            caller: None,
+        };
+        let edge = CcGraphEdge {
+            from: "session".into(),
+            to: format!("prompt:{}", p.uuid),
+        };
+        pending.push(Pending {
+            ts: p.ts,
             rank: 0,
             node,
             edge,
@@ -1740,9 +1964,10 @@ pub fn session_graph(
         est_cost_usd: round4(cost),
         nodes,
         edges,
-        truncated: omitted > 0 || omitted_responses > 0,
+        truncated: omitted > 0 || omitted_responses > 0 || omitted_prompts > 0,
         omitted_tool_calls: omitted,
         omitted_responses,
+        omitted_prompts,
     }))
 }
 
@@ -3321,6 +3546,276 @@ mod tests {
         assert_eq!(by("u2"), None);
     }
 
+    /// One transcript line, as `human_prompt` sees it.
+    fn prompt_of(json: &str) -> Option<String> {
+        human_prompt(&serde_json::from_str::<RawLine>(json).unwrap())
+    }
+
+    #[test]
+    fn human_prompt_accepts_a_typed_turn_and_a_slash_command() {
+        // The authoritative modern shape: `origin.type == "human"`.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"type":"human"},
+                    "message":{"content":"add a prompts row to the timeline"}}"#
+            )
+            .as_deref(),
+            Some("add a prompts row to the timeline")
+        );
+        // An array of text blocks flattens the same way, in order.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"type":"human"},
+                    "message":{"content":[{"type":"text","text":"first"},
+                                          {"type":"text","text":"second"}]}}"#
+            )
+            .as_deref(),
+            Some("first second")
+        );
+        // A typed slash command: Claude Code rewrites it into a command
+        // envelope, and the envelope is unwrapped back to what was typed.
+        // Accepted whatever `origin` says — this IS human input.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":"<command-message>execute-refine</command-message><command-name>/execute-refine</command-name><command-args>774</command-args>"}}"#
+            )
+            .as_deref(),
+            Some("/execute-refine 774")
+        );
+        // No args, or blank args: the bare command name.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":"<command-name>/clear</command-name><command-args></command-args>"}}"#
+            )
+            .as_deref(),
+            Some("/clear")
+        );
+        // Legacy line — no `origin` at all — whose text hits nothing on the
+        // fallback list.
+        assert_eq!(
+            prompt_of(r#"{"type":"user","message":{"content":"ship it"}}"#).as_deref(),
+            Some("ship it")
+        );
+        // The shared cap, not a second one: 250 chars in, 200 + `…` out.
+        let long = "x".repeat(250);
+        let capped = prompt_of(&format!(
+            r#"{{"type":"user","origin":{{"type":"human"}},"message":{{"content":"{long}"}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(capped.chars().count(), TARGET_MAX_CHARS + 1);
+        assert!(capped.ends_with('…'));
+    }
+
+    #[test]
+    fn human_prompt_rejects_every_machine_authored_user_line() {
+        // Not a user line at all.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#
+            ),
+            None
+        );
+        // Claude Code's own injections are flagged `isMeta`.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","isMeta":true,"origin":{"type":"human"},
+                    "message":{"content":"Caveat: …"}}"#
+            ),
+            None
+        );
+        // A sidechain user line is a subagent's task prompt — already the
+        // agent node's `description`, and not the main thread.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","isSidechain":true,"origin":{"type":"human"},
+                    "message":{"content":"Research the store layer"}}"#
+            ),
+            None
+        );
+        // A tool result riding back in, flagged.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","toolUseResult":{"stdout":"ok"},
+                    "message":{"content":"ok"}}"#
+            ),
+            None
+        );
+        // …and the ~794 carriers in the real corpus that have no
+        // `toolUseResult` — one `tool_result` block condemns the line, even
+        // alongside a `text` block.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"},
+                                                        {"type":"text","text":"and some prose"}]}}"#
+            ),
+            None
+        );
+        // Legacy prefix fallback, one per shape that matters.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":"<local-command-stdout>total 8</local-command-stdout>"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":"<system-reminder>be brief</system-reminder>"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            prompt_of(r#"{"type":"user","message":{"content":"[Image: screenshot.png]"}}"#),
+            None
+        );
+        // A `<system-reminder>` block inside an array is dropped rather than
+        // condemning the line — the human's own text beside it survives.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"type":"human"},
+                    "message":{"content":[{"type":"text","text":"<system-reminder>ctx</system-reminder>"},
+                                          {"type":"text","text":"do the thing"}]}}"#
+            )
+            .as_deref(),
+            Some("do the thing")
+        );
+        // With `origin` present it is authoritative: a non-human origin is
+        // rejected however innocuous the text reads.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"type":"hook"},"message":{"content":"plain text"}}"#
+            ),
+            None
+        );
+        // Nothing to preview.
+        assert_eq!(
+            prompt_of(r#"{"type":"user","message":{"content":"   "}}"#),
+            None
+        );
+        assert_eq!(
+            prompt_of(r#"{"type":"user","message":{"content":42}}"#),
+            None
+        );
+        assert_eq!(prompt_of(r#"{"type":"user"}"#), None);
+    }
+
+    #[test]
+    fn ingest_stores_main_thread_prompts_only_and_is_idempotent() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                r#"{"type":"user","uuid":"p1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","origin":{"type":"human"},"message":{"content":"read\tthe file"}}"#,
+                r#"{"type":"user","uuid":"p2","sessionId":"s1","timestamp":"2026-06-15T01:00:05.000Z","message":{"content":"<command-name>/execute-todo</command-name><command-args>774</command-args>"}}"#,
+                // Rejected: meta, sidechain, tool-result carrier — and a line
+                // with no uuid, which the existing guard already drops.
+                r#"{"type":"user","uuid":"p3","sessionId":"s1","timestamp":"2026-06-15T01:00:06.000Z","isMeta":true,"message":{"content":"hook fired"}}"#,
+                r#"{"type":"user","uuid":"p4","sessionId":"s1","timestamp":"2026-06-15T01:00:07.000Z","isSidechain":true,"origin":{"type":"human"},"message":{"content":"subagent task"}}"#,
+                r#"{"type":"user","uuid":"p5","sessionId":"s1","timestamp":"2026-06-15T01:00:08.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]}}"#,
+                r#"{"type":"user","sessionId":"s1","timestamp":"2026-06-15T01:00:09.000Z","origin":{"type":"human"},"message":{"content":"no uuid, no row"}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        // A second walk from byte 0 must change nothing.
+        sync(&mut store, true).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        let rows = store.cc_session_prompts("s1").unwrap();
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.uuid.as_str(), r.preview.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("p1", "read the file"), ("p2", "/execute-todo 774")]
+        );
+        // Prompts are their own table: no message row was invented for them.
+        assert!(store.cc_session_messages("s1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_graph_emits_prompt_nodes_first_at_an_equal_ts() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                // Prompt, response and tool call all stamped the same second:
+                // the tie the rank must break, prompt → response → tool.
+                r#"{"type":"user","uuid":"p1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","origin":{"type":"human"},"message":{"content":"read the file"}}"#,
+                r#"{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"Reading it."},{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/a"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"user","uuid":"p2","sessionId":"s1","timestamp":"2026-06-15T01:00:01.000Z","origin":{"type":"human"},"message":{"content":"now commit"}}"#,
+            ],
+        );
+        let db = tmp.path().join("mesa.db");
+        let mut store = Store::open(&db).unwrap();
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        let g = session_graph(&store, "s1", GRAPH_NODE_LIMIT)
+            .unwrap()
+            .unwrap();
+        let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["session", "prompt:p1", "msg:u1", "tool:tu1", "prompt:p2"]
+        );
+
+        let p = g.nodes.iter().find(|n| n.id == "prompt:p1").unwrap();
+        assert_eq!(p.kind, CcGraphNodeKind::Prompt);
+        assert_eq!(p.name, "Prompt");
+        assert_eq!(p.target.as_deref(), Some("read the file"));
+        // No model, no usage of its own — a user turn is billed as part of the
+        // reply it provokes, so any number here would be invented.
+        assert_eq!(p.model, None);
+        assert_eq!(p.total_tokens, 0);
+        assert_eq!(p.est_cost_usd, 0.0);
+        assert!(p.tokens_are_rollup);
+
+        // Always a direct child of the root, and never a parent itself.
+        let parent = |to: &str| {
+            g.edges
+                .iter()
+                .find(|e| e.to == to)
+                .map(|e| e.from.as_str())
+                .unwrap()
+        };
+        assert_eq!(parent("prompt:p1"), "session");
+        assert_eq!(parent("prompt:p2"), "session");
+        assert!(!g.edges.iter().any(|e| e.from.starts_with("prompt:")));
+
+        assert!(!g.truncated);
+        assert_eq!(g.omitted_prompts, 0);
+
+        // A third budget, peer to the other two: room for one node of each
+        // population, and each counter reports only its own drops.
+        let g1 = session_graph(&store, "s1", 1).unwrap().unwrap();
+        let ids1: Vec<&str> = g1.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids1, vec!["session", "prompt:p1", "msg:u1", "tool:tu1"]);
+        assert!(g1.truncated);
+        assert_eq!(g1.omitted_prompts, 1);
+        assert_eq!(g1.omitted_responses, 0);
+        assert_eq!(g1.omitted_tool_calls, 0);
+    }
+
     #[test]
     fn session_graph_labels_calls_and_promotes_skills() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3535,6 +4030,7 @@ mod tests {
                     }],
                     messages: vec![msg("u1", None, 1000, 200), msg("u2", Some("a1"), 1400, 20)],
                     tool_calls,
+                    prompts: Vec::new(),
                 },
             )
             .unwrap();

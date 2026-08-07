@@ -4,7 +4,7 @@ An **analytics surface** over Claude Code's own session transcripts — the
 newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
 subagent transcripts in `<session>/subagents/*.jsonl`). Transcripts are
 **ingested** into `cc_*` tables (sessions, agent runs, messages, tool calls,
-per-file cursors — migration index 10) through `Store` — the single-write-path
+prompts, per-file cursors — migration index 10, plus `cc_prompts` at index 30) through `Store` — the single-write-path
 invariant holds here too — and **the dashboard reads only the db**, never the
 files, so history survives Claude Code's own transcript cleanup and nothing is
 ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
@@ -12,9 +12,12 @@ CLI and API share it and never diverge.
 
 - Each transcript line is one event. Only `assistant` events carry a `model` and
   a `usage` block (`{input, output, cache_read, cache_creation}` tokens), so
-  those drive token/cost/model/skill/agent/tool rollups; every timestamped line
-  widens its session's start/end span. Unparseable or non-telemetry lines are
-  skipped. Subagent lines carry the **parent's** `sessionId` plus an `agentId`,
+  those drive token/cost/model/skill/agent/tool rollups. One other kind of line
+  produces a row of its own: a `user` line that `cc::human_prompt` judges to be
+  a **real human turn** becomes a `cc_prompts` row (migration 31) — a bounded
+  preview and nothing else, in its own table, contributing to no total (see
+  *Human prompts* below). Every other timestamped line merely widens its
+  session's start/end span. Unparseable or non-telemetry lines are skipped. Subagent lines carry the **parent's** `sessionId` plus an `agentId`,
   so their usage rolls into the parent session. An event's `uuid` (and a tool
   call's `tool_use_id`) is the idempotency key: all ingest writes are upserts,
   so re-ingesting any line is a no-op.
@@ -134,6 +137,70 @@ CLI and API share it and never diverge.
   and 2,097 `thinking`-only against 1,501 carrying any `text`, so the excluded
   population is larger than the kept one and a low fill rate is the expected
   shape, not a miss.
+- **Human prompts are ingested too, as their own bounded rows** —
+  `cc_prompts (uuid, session_id, ts, preview)` (migration 31), the third
+  derived `cc_*` store and the same relaxation of "bulk keys are never stored"
+  that `preview` is: one sanitized, `sanitize_capped`-bounded ≤200-char string
+  per turn, never the prompt body. Without it a session read as a wall of
+  effects with no causes — the *agent's* every move was recorded and the human
+  turns that provoked them were invisible.
+
+  **Its own table, not a `role` column on `cc_messages`.** Every row of that
+  table is an assistant *usage* event; a user line carries neither `model` nor
+  `usage`, so it would leave most of those columns empty and land in every read
+  that sums them. There is deliberately **no `agent_id`** either (see
+  main-thread-only below), and no `CcSyncReport` counter — no reader reports
+  prompt volume, so a field there would ripple into the TS type and several
+  `cc-check.sh` count assertions for nothing.
+
+  **The predicate is the whole problem.** Claude Code writes far more `user`
+  lines than the user ever typed, so `cc::human_prompt(&RawLine) -> Option<String>`
+  is the single place that decides which of them a human authored — a pure
+  function, so the decision is unit-testable against a synthetic line rather
+  than only through a whole `sync`. In order:
+  1. `type == "user"`.
+  2. Not `isMeta` — that flag marks Claude Code's own injections: hook output,
+     skill bodies, image stubs, caveat banners.
+  3. Not `isSidechain`. A sidechain user line is a **subagent's task prompt**,
+     already carried by the agent node's `description`; prompts are
+     **main-thread only**, which is what makes "always a child of the session
+     root" true and why the table needs no `agent_id`.
+  4. No `toolUseResult`, **and** no `tool_result` block anywhere in
+     `message.content` — ~794 result carriers in the real corpus lack the
+     `toolUseResult` field, so the flag alone is not enough. One such block
+     condemns the whole line.
+  5. Flatten `content`: a bare string as-is; an array as its `type: "text"`
+     blocks joined in order with a single space, **skipping** any block opening
+     with `<system-reminder>` (context injected beside what the human wrote —
+     dropping the block keeps the human's own text rather than losing the line).
+  6. **Slash commands count as human input.** Claude Code rewrites a typed
+     `/execute-todo 774` into a `<command-name>`/`<command-args>` envelope; the
+     envelope is reconstructed back to `name args` and accepted *regardless of
+     `origin`*. This is load-bearing, not a nicety: in skill-driven use
+     free-typed turns are ~1% of user lines and whole sessions have **zero**,
+     so without it the feature would show almost nothing.
+  7. Otherwise, if the line has an `origin` block (Claude Code ≥ v2.1.187) it
+     is **authoritative**: accept iff `origin.type == "human"`. Note it is
+     `origin`, **not** `promptSource` — `claude-desktop` human turns carry
+     `promptSource: "sdk"`, so keying off that would drop them.
+  8. Otherwise — a legacy line with no `origin`, where the text is all there is
+     to go on — reject anything opening with one of `cc::NON_HUMAN_PREFIXES`
+     (`<command-message>`, `<local-command-stdout>`, `<local-command-caveat>`,
+     `Caveat: The messages below were generated`, `<system-reminder>`,
+     `[Request interrupted by user]`, `[Image:`, `[SYSTEM NOTIFICATION`,
+     `Stop hook feedback:`, `Base directory for this skill:`,
+     `<teammate-message`, `Another Claude session sent a message:`). The list
+     is the pre-`origin` fallback and nothing else.
+  9. Finally `sanitize_capped` — the same shared policy, not a second cap
+     constant. Nothing left means no row.
+
+  Ingest keys on the transcript line `uuid`, so re-ingesting is a no-op like
+  every other row here; the line still passes through `fold_line`'s existing
+  uuid/message guard first, so a `user` line with no `uuid` produces nothing
+  (which is why `cc-check.sh`'s original `-demo` fixture is unaffected). As
+  with every derived `cc_*` column, the extraction ships with its **own cursor
+  clear** (`DELETE FROM cc_files;`, migration 32) in the same binary, so the
+  next ordinary `cc sync` re-walks every transcript once and fills the table.
 - A call to the built-in **`advisor`** tool doesn't get its own transcript
   line/file the way a Task-tool subagent does (no `subagents/*.jsonl`, no
   `isSidechain`): it's a `server_tool_use` content block (read like
@@ -189,8 +256,8 @@ CLI and API share it and never diverge.
   the `CcSyncReport` (`{files_scanned, files_ingested, sessions,
   messages_added, tool_calls_added}`; a no-change re-run adds zeros).
 - **Reset is the corrective one** (mesa task 698): `cc::reset_and_sync` =
-  `Store::cc_reset` (one transaction deleting `cc_messages`, `cc_tool_calls`,
-  `cc_agent_runs`, `cc_sessions`, `cc_files`) followed by a plain sync. It is
+  `Store::cc_reset` (one transaction deleting `cc_messages`, `cc_prompts`,
+  `cc_tool_calls`, `cc_agent_runs`, `cc_sessions`, `cc_files`) followed by a plain sync. It is
   what fixes rows whose stored *values* are wrong — the inflated cost/tokens
   recorded before task 693's usage dedupe — which no rebuild can do. It is
   **destructive of history**: a session whose transcript file Claude Code has
@@ -265,8 +332,8 @@ CLI and API share it and never diverge.
   session; the `Store::cc_session_*` reads filter on `session_id`, never `ts`).
   Returns a `CcSessionGraph`: one `session` root, one `agent` node per
   `cc_agent_runs` row, one `tool`-or-`skill` node per `cc_tool_calls` row, one
-  `response` node per `cc_messages` row whose `preview` is non-`NULL`, plus
-  parent→child edges. **Guaranteed a tree** — every node but the root has exactly
+  `response` node per `cc_messages` row whose `preview` is non-`NULL`, one
+  `prompt` node per `cc_prompts` row, plus parent→child edges. **Guaranteed a tree** — every node but the root has exactly
   one parent — so a client lays it out with no cycle-breaking. Parent of an
   agent, in descending exactness: its `tool_use_id` (the sidecar's spawning
   call), else `parent_agent_id`, else the root.
@@ -280,8 +347,8 @@ CLI and API share it and never diverge.
     subagent it spawned. The promotion keys on the target being present, so a
     row ingested before migration 22 stays a plain `tool` node named `Skill`
     rather than becoming a `skill` node with nothing to call itself.
-    `target` is `None` on `session`, `agent` and `skill` nodes; `tool` and
-    `response` are the two kinds that carry it.
+    `target` is `None` on `session`, `agent` and `skill` nodes; `tool`,
+    `response` and `prompt` are the three kinds that carry it.
   - **A `response` node is what the assistant *said*.** One per message with a
     stored `preview`, id **`msg:<message uuid>`** — a fourth id namespace,
     disjoint from `session` / `agent:` / `tool:`, and unique within a graph
@@ -301,14 +368,31 @@ CLI and API share it and never diverge.
       message emits its prose and its calls at the same instant, and the
       frontend's `childrenByParent` tie-breaks an equal `ts` by *server node
       order* — so the order cannot be an artifact of which loop pushed first.
-      Tool and response nodes are built into one pending list and sorted by
-      `(ts, kind_rank, id)` with `kind_rank` response = 0, tool = 1, `id` the
-      final tie-break, then pushed in that order. Deliberately **not** a
+      Prompt, tool and response nodes are built into one pending list and
+      sorted by `(ts, kind_rank, id)` with `kind_rank` **prompt = 0,
+      response = 1, tool = 2**, `id` the final tie-break, then pushed in that
+      order. A prompt is the *cause* of what follows it, so it sorts ahead of
+      both; response-before-tool is unchanged, just shifted up a rank.
+      Deliberately **not** a
       responses-first pass: `nodes` is documented "root first, then the rest
       oldest first" and `mesa cc graph` is read as a time-ordered column, which
       a two-pass emission would silently break for every CLI reader. Since
       `cc_session_tool_calls` already returns `ORDER BY ts, tool_use_id`, the
       `id` tie-break reproduces the previous tool order byte-for-byte.
+  - **A `prompt` node is what the *user* asked for.** One per `cc_prompts` row,
+    id **`prompt:<line uuid>`** — a fifth id namespace, disjoint from the other
+    four. Named the constant `"Prompt"`, and it reuses `target` for the preview
+    exactly as `response` does. Always a **direct child of the root**: only
+    main-thread turns are ingested, so no prompt ever hangs off an `agent:`
+    node, and nothing is ever `from` a `prompt:` id.
+
+    It carries **no model and no usage**: `model: None`, zero `tokens`,
+    `total_tokens: 0`, `est_cost_usd: 0.0`. A user turn is billed as part of
+    the reply it provokes, so any number here would be invented, and no
+    aggregate anywhere moves. `tokens_are_rollup` is nonetheless `true` — the
+    flag means "this is not one message's usage shared with siblings", which is
+    what stops the UI prefixing a meaningless `≈` (the timeline suppresses the
+    cell entirely; see the page section below).
   - `target` is only on rows ingested since migration 22; migration 23 (a bare
     `DELETE FROM cc_files`) is what delivers it to the rows that predate it,
     by clearing the ingest cursors so the *next automatic* `cc::sync` re-walks
@@ -345,9 +429,11 @@ CLI and API share it and never diverge.
     is applied to them **independently**, oldest-first, and what it drops is
     reported by its own `omitted_responses`. Sharing the tool budget would make
     `omitted_tool_calls` count non-tools; exempting responses would leave the
-    payload unbounded. `omitted_tool_calls` therefore keeps its exact previous
-    meaning and value, and `truncated` now means "**either** population was
-    cut".
+    payload unbounded. Prompts are a **third** such population and take the
+    **third independent budget** of the same `limit`, reported by its own
+    `omitted_prompts`, for exactly the same reasons. Each counter therefore
+    keeps its exact meaning and value, and `truncated` means "**any** of the
+    three populations was cut".
   - CLI `mesa cc graph <SESSION_ID> [--limit N]`; API
     `GET /api/cc/sessions/{id}/graph?limit=`. A never-ingested session is
     `not_found` (CLI exit 1, HTTP 404) — distinct from an empty graph, which is
@@ -422,7 +508,7 @@ CLI and API share it and never diverge.
   survives a malformed cyclic payload; `timelineRows` drops the `session` root
   (its data is the page header) and otherwise **preserves payload order** — the
   server already emits "root first, then oldest first" with equal-`ts` ties
-  fixed as response-before-tool, so nothing client-side re-sorts. Its one
+  fixed as prompt-before-response-before-tool, so nothing client-side re-sorts. Its one
   exception is placement, not sorting: `cc::session_graph` appends every
   **agent** node after the whole tool/response block, so at its literal payload
   position a subagent's header row lands at the bottom of the page, hundreds of
@@ -458,16 +544,35 @@ CLI and API share it and never diverge.
   `sessionGraph.ts` and mirrored into `.cc-tl-row.kind-response` in `App.css`.
   A pale warm neutral is the one free band — every `TOOL_PALETTE` entry sits at
   35%+ saturation and agent/skill own the neon hues — so a reply can never be
-  mistaken for a call. `sessionGraph.ts` is now only these shared presentation
+  mistaken for a call.
+  A **prompt** row is its matched pair, and the same reasoning: a reserved
+  `PROMPT_COLOR` (`hsl(214, 28%, 78%)`), a pale *cool* neutral — one side of
+  the conversation each, far apart in hue (214° vs 36°) and below every tool's
+  saturation floor, so neither can be reached by `toolColor()` hashed or
+  otherwise. `.cc-tl-row.kind-prompt` in `App.css` gives it more than a border:
+  a thicker left edge and a raised background, because a human turn is the
+  spine a reader scans a session by and has to be findable while scrolling past
+  a few hundred tool calls; its body is clamped at 6 lines rather than 3, since
+  the preview *is* the row. Prompt rows need **no** code in
+  `sessionTimeline.ts`: they parent to `session`, so `threadOf` returns `null`
+  and `timelineRows` passes them through at indent 0 like any other main-thread
+  row (vitest pins this, so a future change can't quietly special-case it), and
+  `threadOptions` still counts only `kind === 'tool'` for `calls`.
+  The **Prompts** kind filter is listed **first** — the causes before the
+  effects — and a prompt row's **model and token cells render empty** rather
+  than the `0` the payload carries, which would read as a real measurement of
+  nothing.
+  `sessionGraph.ts` is now only these shared presentation
   helpers (`formatTokens`, `shortModel`, `toolColor`, `RESPONSE_COLOR`,
-  `shortTarget`, all still used by the dashboard and detail pages); the tidy-tree
+  `PROMPT_COLOR`, `shortTarget`, all still used by the dashboard and detail
+  pages); the tidy-tree
   layout, the `NODE_W`/`NODE_H` box and `minimapStrokeWidth` went with the
   canvas. `@xyflow/react` stays a dependency — the storyboard canvas uses it.
-  The truncation banner gates each of its two sentences on its own counter
-  (`omitted_tool_calls` / `omitted_responses`), since `truncated` means either
-  population was cut and a response-only truncation would otherwise read
-  "0 omitted" tool calls. Zero states are quiet muted lines — "This session
-  recorded no tool calls or subagent runs." and, when a filter excludes
+  The truncation banner gates each of its three sentences on its own counter
+  (`omitted_prompts` / `omitted_tool_calls` / `omitted_responses`), since
+  `truncated` means any population was cut and a response-only truncation would
+  otherwise read "0 omitted" tool calls. Zero states are quiet muted lines —
+  "This session recorded no prompts, tool calls or subagent runs." and, when a filter excludes
   everything, "No rows match this filter." — never errors. Every
   model/transcript-authored string (`target`/preview, `name`, `caller`,
   `description`, `skill`, `project`, `cwd`) renders as a text child or a

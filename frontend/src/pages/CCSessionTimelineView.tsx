@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { getCcSessionGraph } from '../api'
-import { RESPONSE_COLOR, formatTokens, shortModel, toolColor } from '../sessionGraph'
+import { PROMPT_COLOR, RESPONSE_COLOR, formatTokens, shortModel, toolColor } from '../sessionGraph'
 import { filterRows, threadOptions, timelineRows } from '../sessionTimeline'
 import type { TimelineRow } from '../sessionTimeline'
 import type { CcGraphNodeKind } from '../types/CcGraphNodeKind'
@@ -18,8 +18,10 @@ import { useFetch } from '../useFetch'
 // content is a subagent run, and that reads fine as indentation under its
 // thread's header row.
 
-/** The kind toggles, in the order they read as a sentence about a session. */
+/** The kind toggles, in the order they read as a sentence about a session.
+ *  Prompts lead: they are the causes, and everything after them is an effect. */
 const KIND_FILTERS: { kind: CcGraphNodeKind; label: string }[] = [
+  { kind: 'prompt', label: 'Prompts' },
   { kind: 'response', label: 'Responses' },
   { kind: 'tool', label: 'Tool calls' },
   { kind: 'skill', label: 'Skills' },
@@ -86,12 +88,18 @@ export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
         )}
       </header>
 
-      {/* Two populations, two budgets, two counts: `truncated` is "either was
-          cut", so each sentence is shown only when its own counter fired —
-          otherwise a response-only truncation would report "0 omitted" tool
-          calls. Neither count is folded into the other. */}
+      {/* Three populations, three budgets, three counts: `truncated` is "any
+          of them was cut", so each sentence is shown only when its own counter
+          fired — otherwise a response-only truncation would report "0 omitted"
+          tool calls. No count is folded into another. */}
       {data?.truncated && (
         <p className="cc-graph-note">
+          {data.omitted_prompts > 0 && (
+            <>
+              Showing the first {data.nodes.filter((n) => n.kind === 'prompt').length} prompts —{' '}
+              {data.omitted_prompts.toLocaleString()} omitted.{' '}
+            </>
+          )}
           {data.omitted_tool_calls > 0 && (
             <>
               Showing the first {data.nodes.filter((n) => n.kind === 'tool').length} tool calls —{' '}
@@ -113,7 +121,7 @@ export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
       ) : !data ? (
         <p className="muted">Loading…</p>
       ) : rows.length === 0 ? (
-        <p className="muted">This session recorded no tool calls or subagent runs.</p>
+        <p className="muted">This session recorded no prompts, tool calls or subagent runs.</p>
       ) : (
         <>
           <div className="cc-tl-filters">
@@ -183,8 +191,19 @@ function Row({ row }: { row: TimelineRow }) {
   // names is open-ended, so the tint can only come from JS; the other kinds
   // have fixed colours in App.css.
   const tint =
-    n.kind === 'tool' ? toolColor(n.name) : n.kind === 'response' ? RESPONSE_COLOR : undefined
+    n.kind === 'tool'
+      ? toolColor(n.name)
+      : n.kind === 'response'
+        ? RESPONSE_COLOR
+        : n.kind === 'prompt'
+          ? PROMPT_COLOR
+          : undefined
   const model = shortModel(n.model)
+  // A human turn has no model and no usage of its own — it is billed as part of
+  // the reply it provoked. The model cell empties itself (the payload's `model`
+  // is null); the token cell has to be told, or it would print the `0` the
+  // payload carries, which reads as a real measurement of nothing.
+  const prompt = n.kind === 'prompt'
   // A tool or response row's tokens are the issuing assistant message's, shared
   // with every other row that message produced — never this row's own. Say so
   // rather than printing a number that looks additive but is not.
@@ -206,16 +225,16 @@ function Row({ row }: { row: TimelineRow }) {
       <span className="cc-tl-name" style={tint ? { color: tint } : undefined}>
         {n.name}
       </span>
-      {/* Untrusted: a Bash command, a path, a URL, or an assistant prose
-          preview — verbatim model-authored input. Rendered as a text child and
-          a `title`, never as markup, a link or any attribute that acts on it. */}
+      {/* Untrusted: a Bash command, a path, a URL, an assistant prose preview,
+          or a prompt preview — verbatim model- or transcript-authored input.
+          Rendered as a text child and a `title`, never as markup, a link or any
+          attribute that acts on it. */}
       <span className="cc-tl-body" title={body ?? undefined}>
         {body}
       </span>
       <span className="cc-tl-model">{model}</span>
-      <span className="cc-tl-tokens" title={tokenTitle}>
-        {n.tokens_are_rollup ? '' : '≈'}
-        {formatTokens(n.total_tokens)}
+      <span className="cc-tl-tokens" title={prompt ? undefined : tokenTitle}>
+        {prompt ? '' : `${n.tokens_are_rollup ? '' : '≈'}${formatTokens(n.total_tokens)}`}
       </span>
     </div>
   )

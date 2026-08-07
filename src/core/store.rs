@@ -391,6 +391,29 @@ const MIGRATIONS: &[&str] = &[
     // NULL and never get a second chance. One-shot and additive: `cc_files`
     // holds cursors, not data.
     "DELETE FROM cc_files;",
+    // Task 774: the human turns of a session. Kept in their own table rather
+    // than as a `role` column on `cc_messages`, whose every row is an
+    // assistant usage event — a user line carries neither `model` nor `usage`,
+    // so it has nothing to put in most of that table's columns and would
+    // corrupt every read that sums them. Same bounded-preview posture as
+    // `cc_messages.preview`: one sanitized ≤200-char string, never the prompt
+    // body. No `agent_id` — only main-thread prompts are ingested, so a prompt
+    // always hangs off the session root.
+    "CREATE TABLE cc_prompts (\
+        uuid TEXT PRIMARY KEY, \
+        session_id TEXT NOT NULL, \
+        ts INTEGER NOT NULL, \
+        preview TEXT NOT NULL); \
+     CREATE INDEX idx_cc_prompts_session ON cc_prompts(session_id, ts);",
+    // The cursor clear that fills the table above from transcripts already
+    // read, exactly as migrations 25 and 30 did for `cc_messages.preview` and
+    // `message_id`: ingest is cursor-driven, so without this an unchanged
+    // transcript is skipped unread and not one prompt of it is ever extracted.
+    // Ships in the SAME binary as the extraction — a bare table release would
+    // spend the one-shot re-walk under a binary that writes no prompt rows and
+    // never get a second chance. One-shot and additive: `cc_files` holds
+    // cursors, not data.
+    "DELETE FROM cc_files;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -902,6 +925,7 @@ pub struct CcFileBatch {
     pub agent_runs: Vec<CcAgentRunUpsert>,
     pub messages: Vec<CcMessageRow>,
     pub tool_calls: Vec<CcToolCallRow>,
+    pub prompts: Vec<CcPromptRow>,
 }
 
 /// Session-level facts folded from a file's lines. Merge semantics on
@@ -973,6 +997,23 @@ pub struct CcMessageRow {
     /// no prose (tool-use only, or text that sanitized to empty), which is
     /// also how every row ingested before migration 24 reads.
     pub preview: Option<String>,
+}
+
+/// One human turn on a session's main thread. Keyed by the transcript line
+/// `uuid`; re-inserting is a no-op.
+///
+/// `preview` is the whole payload: a sanitized, character-capped rendering of
+/// what the user typed (or the slash command they ran), produced by
+/// [`crate::core::cc::human_prompt`]. The prompt body itself is never stored —
+/// the same bounded posture as [`CcMessageRow::preview`]. There is no
+/// `agent_id`: sidechain (subagent) user lines are not prompts, so every row
+/// here belongs to the main thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcPromptRow {
+    pub uuid: String,
+    pub session_id: String,
+    pub ts: i64,
+    pub preview: String,
 }
 
 /// One tool_use block. Keyed by `tool_use_id`; re-inserting is a no-op.
@@ -2869,8 +2910,8 @@ impl Store {
     }
 
     /// Purges ALL persisted Claude Code telemetry — every row of `cc_messages`,
-    /// `cc_tool_calls`, `cc_agent_runs`, `cc_sessions` and the `cc_files`
-    /// cursors — in one transaction, so a crash leaves either the whole index
+    /// `cc_prompts`, `cc_tool_calls`, `cc_agent_runs`, `cc_sessions` and the
+    /// `cc_files` cursors — in one transaction, so a crash leaves either the whole index
     /// or none of it. The corrective counterpart to `cc_clear_cursors`, which
     /// is additive-only: re-ingest can never *change* an existing row's values
     /// (task 693's usage dedupe), so fixing already-stored rows means deleting
@@ -2881,6 +2922,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         for table in [
             "cc_messages",
+            "cc_prompts",
             "cc_tool_calls",
             "cc_agent_runs",
             "cc_sessions",
@@ -3052,6 +3094,21 @@ impl Store {
                 }
             }
 
+            // Prompts need no backfill twin: `preview` is NOT NULL and is the
+            // only non-key column, so a conflicting row already holds the one
+            // value this insert could supply. Deliberately uncounted in
+            // `CcIngestCounts` — no reader reports prompt volume, and a new
+            // field there would ripple into the TS type and the cc-check count
+            // assertions for nothing.
+            let mut prompt = tx.prepare(
+                "INSERT INTO cc_prompts (uuid, session_id, ts, preview) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(uuid) DO NOTHING",
+            )?;
+            for p in &batch.prompts {
+                prompt.execute((&p.uuid, &p.session_id, p.ts, &p.preview))?;
+            }
+
             tx.execute(
                 "INSERT INTO cc_files (path, mtime, size, byte_offset) \
                  VALUES (?1, ?2, ?3, ?4) \
@@ -3194,6 +3251,25 @@ impl Store {
                 agent: r.get(10)?,
                 preview: r.get(11)?,
                 message_id: r.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every prompt row for one session, oldest first. Unwindowed, like its
+    /// message and tool-call siblings: the session graph is a whole-session
+    /// read and applies its own `limit` budget.
+    pub fn cc_session_prompts(&self, session_id: &str) -> Result<Vec<CcPromptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, session_id, ts, preview \
+             FROM cc_prompts WHERE session_id = ?1 ORDER BY ts, uuid",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok(CcPromptRow {
+                uuid: r.get(0)?,
+                session_id: r.get(1)?,
+                ts: r.get(2)?,
+                preview: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -6879,6 +6955,12 @@ mod tests {
                 ts: 1500,
                 target: Some("ls -la".into()),
             }],
+            prompts: vec![CcPromptRow {
+                uuid: "uuid-0".into(),
+                session_id: "sess-1".into(),
+                ts: 1400,
+                preview: "read the store".into(),
+            }],
         }
     }
 
@@ -7048,6 +7130,7 @@ mod tests {
             .unwrap();
         assert!(store.cc_stamp().unwrap() > 0);
         assert!(!store.cc_cursors().unwrap().is_empty());
+        assert!(!store.cc_session_prompts("sess-1").unwrap().is_empty());
 
         store.cc_reset().unwrap();
 
@@ -7063,6 +7146,7 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(store.cc_session_prompts("sess-1").unwrap().is_empty());
     }
 
     #[test]

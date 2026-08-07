@@ -16,18 +16,18 @@ export type CcGraphNode = {
 /**
  * Stable within one graph, and namespaced by kind so a `tool_use_id` can
  * never collide with an `agent_id`: `"session"`, `"agent:<agent_id>"`,
- * `"tool:<tool_use_id>"`, `"msg:<message uuid>"`.
+ * `"tool:<tool_use_id>"`, `"msg:<message uuid>"`, `"prompt:<line uuid>"`.
  */
 id: string, kind: CcGraphNodeKind, 
 /**
  * Tool name, skill name, subagent name, the session's short id, or the
- * constant `"Response"`.
+ * constants `"Response"` / `"Prompt"`.
  */
 name: string, 
 /**
- * `tool` and `response` only: what the call acted on — a Bash command, a
- * file path, a URL — or, on a `response` node, the message's prose
- * preview. Sanitized and capped at
+ * `tool`, `response` and `prompt` only: what the call acted on — a Bash
+ * command, a file path, a URL — or, on a `response`/`prompt` node, the
+ * message's prose preview. Sanitized and capped at
  * [`crate::core::cc::TARGET_MAX_CHARS`]. `None` on every other kind, on
  * tools with no meaningful target, and on calls ingested before migration
  * 22 that no `cc sync --rebuild` has revisited. A `skill` node carries its

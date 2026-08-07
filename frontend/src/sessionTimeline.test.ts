@@ -44,6 +44,7 @@ const graph = (nodes: CcGraphNode[], edges: { from: string; to: string }[]): CcS
   truncated: false,
   omitted_tool_calls: 0,
   omitted_responses: 0,
+  omitted_prompts: 0,
 })
 
 // session ─ t1
@@ -245,5 +246,69 @@ describe('threadOptions', () => {
       'fix the thing',
       'Subagent',
     ])
+  })
+})
+
+// A prompt node needs no code of its own here: it parents to `session`, so
+// `threadOf` gives it `null` and `timelineRows` passes it through at indent 0
+// like any other main-thread row. These tests are what says so — the behaviour
+// is load-bearing for the timeline's whole point (a human turn is the spine a
+// reader scans by), and nothing in this module would fail visibly if a future
+// change started special-casing it wrong.
+describe('prompt rows', () => {
+  //           ┌ p1 (prompt)
+  // session ─ ┼ m1 (response)
+  //           ├ t1 (tool)
+  //           └ a1 (agent) ─ t2
+  const withPrompt = () =>
+    graph(
+      [
+        node('session', 'session'),
+        node('prompt:p1', 'prompt', { name: 'Prompt', target: '/execute-todo 774' }),
+        node('msg:m1', 'response', { name: 'Response', target: 'Reading the file.' }),
+        node('t1', 'tool', { name: 'Bash', target: 'ls -la' }),
+        node('a1', 'agent', { name: 'Explore' }),
+        node('t2', 'tool', { name: 'Read', target: '/src/store.rs' }),
+      ],
+      [
+        { from: 'session', to: 'prompt:p1' },
+        { from: 'session', to: 'msg:m1' },
+        { from: 'session', to: 't1' },
+        { from: 'session', to: 'a1' },
+        { from: 'a1', to: 't2' },
+      ],
+    )
+
+  it('is a main-thread row at indent 0, in payload order', () => {
+    const rows = timelineRows(withPrompt())
+    expect(rows.map((r) => r.node.id)).toEqual(['prompt:p1', 'msg:m1', 't1', 'a1', 't2'])
+    const p = rows[0]
+    expect(p.threadId).toBeNull()
+    expect(p.indent).toBe(0)
+  })
+
+  it('is kept or dropped by the kinds filter like any other kind', () => {
+    const rows = timelineRows(withPrompt())
+    expect(filterRows(rows, { kinds: new Set(['prompt' as const]) }).map((r) => r.node.id)).toEqual([
+      'prompt:p1',
+    ])
+    expect(
+      filterRows(rows, { kinds: new Set(['tool' as const, 'response' as const]) }).map(
+        (r) => r.node.id,
+      ),
+    ).toEqual(['msg:m1', 't1', 't2'])
+  })
+
+  it('is matched by a query against its target', () => {
+    const rows = timelineRows(withPrompt())
+    // The preview is the only thing a prompt row is identifiable by — `name`
+    // is the constant "Prompt" on every one of them.
+    expect(filterRows(rows, { query: 'execute-todo' }).map((r) => r.node.id)).toEqual(['prompt:p1'])
+    expect(filterRows(rows, { query: '774' }).map((r) => r.node.id)).toEqual(['prompt:p1'])
+  })
+
+  it('does not count toward a thread’s call count', () => {
+    // `calls` means tool calls; a prompt is not one.
+    expect(threadOptions(withPrompt()).map((o) => o.calls)).toEqual([1, 1])
   })
 })

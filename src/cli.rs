@@ -918,11 +918,12 @@ EXAMPLES
     Graph {
         /// The session id (as printed by `mesa cc sessions`)
         session_id: String,
-        /// Cap on tool nodes, applied a second time to `response` nodes as
-        /// their own separate budget; what each one dropped is reported as
-        /// `omitted_tool_calls` / `omitted_responses`. Subagent runs and the
-        /// calls that spawned them never count against it and are always
-        /// kept, so the tree stays connected.
+        /// Cap on tool nodes, applied again — as its own independent budget —
+        /// to `response` nodes and to `prompt` nodes: three populations, three
+        /// budgets, and what each one dropped is reported separately as
+        /// `omitted_tool_calls` / `omitted_responses` / `omitted_prompts`.
+        /// Subagent runs and the calls that spawned them never count against
+        /// it and are always kept, so the tree stays connected.
         #[arg(long, default_value_t = crate::core::cc::GRAPH_NODE_LIMIT)]
         limit: usize,
     },

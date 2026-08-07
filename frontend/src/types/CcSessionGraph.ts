@@ -23,9 +23,9 @@ tokens: CcTokens, total_tokens: number, est_cost_usd: number,
  */
 nodes: Array<CcGraphNode>, edges: Array<CcGraphEdge>, 
 /**
- * True when `limit` dropped tool **or** response nodes. Subagent nodes and
- * the tool calls that spawned them are never dropped, so the tree stays
- * connected.
+ * True when `limit` dropped tool, response **or** prompt nodes. Subagent
+ * nodes and the tool calls that spawned them are never dropped, so the
+ * tree stays connected.
  */
 truncated: boolean, 
 /**
@@ -36,4 +36,11 @@ omitted_tool_calls: number,
  * How many response nodes were dropped by `limit`. Budgeted separately
  * from tool calls, so `omitted_tool_calls` keeps counting tool calls only.
  */
-omitted_responses: number, };
+omitted_responses: number, 
+/**
+ * How many prompt nodes were dropped by `limit`. A third independent
+ * budget, for the same reason responses got the second one: prompts are
+ * their own unbounded population, so riding either existing budget would
+ * make that budget's counter report something other than what it names.
+ */
+omitted_prompts: number, };

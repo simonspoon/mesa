@@ -419,6 +419,76 @@ assert g["omitted_responses"]==1 and g["omitted_tool_calls"]==3, g
 print("cc graph: omitted responses counted ok")
 ' || fail "cc graph --limit 0 did not count the dropped response"
 
+# ---- cc graph: human prompt nodes (mesa task 774) ----
+#
+# A third project, appended after every whole-dashboard count above (the same
+# trick `-prose-project` uses) so it perturbs none of them — and `-demo`'s own
+# `user` line stays uningested regardless, since it carries no `uuid` and the
+# existing guard drops it.
+#
+# The fixture is the predicate's whole surface in five lines: a typed human
+# turn, a slash command (Claude Code rewrites what the user typed into a
+# `<command-name>` envelope, and skill-driven sessions are almost nothing but
+# these), an `isMeta` injection, a `tool_result` carrier with no
+# `toolUseResult` — and an assistant message stamped the SAME second as the
+# first prompt, which is the equal-ts tie the prompt -> response -> tool rank
+# has to break.
+mkdir -p "$TMP/tree/-prompt-project"
+cat > "$TMP/tree/-prompt-project/h.jsonl" <<'JSONL'
+{"type":"user","uuid":"hp1","sessionId":"h","timestamp":"2026-06-19T01:00:00.000Z","cwd":"/home/me/prompts","origin":{"type":"human"},"message":{"role":"user","content":"read\tthe file"}}
+{"type":"assistant","uuid":"hu1","sessionId":"h","timestamp":"2026-06-19T01:00:00.000Z","cwd":"/home/me/prompts","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Reading it."},{"type":"tool_use","id":"hu_1","name":"Read","input":{"file_path":"/home/me/prompts/a.rs"}}]}}
+{"type":"user","uuid":"hp2","sessionId":"h","timestamp":"2026-06-19T01:00:01.000Z","cwd":"/home/me/prompts","message":{"role":"user","content":"<command-message>execute-todo</command-message><command-name>/execute-todo</command-name><command-args>774</command-args>"}}
+{"type":"user","uuid":"hp3","sessionId":"h","timestamp":"2026-06-19T01:00:02.000Z","cwd":"/home/me/prompts","isMeta":true,"message":{"role":"user","content":"Stop hook feedback: all good"}}
+{"type":"user","uuid":"hp4","sessionId":"h","timestamp":"2026-06-19T01:00:03.000Z","cwd":"/home/me/prompts","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"hu_1","content":"fn main() {}"}]}}
+JSONL
+"$BIN" cc sync >/dev/null || fail "cc sync did not ingest the prompt transcript"
+
+"$BIN" cc graph h | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+ids=[n["id"] for n in g["nodes"]]
+# Exact list, in order: root, then the equal-ts tie broken prompt -> response
+# -> tool, then the slash command a second later. The two rejected user lines
+# (isMeta, tool_result carrier) contribute nothing at all.
+assert ids==["session","prompt:hp1","msg:hu1","tool:hu_1","prompt:hp2"], ids
+by={n["id"]:n for n in g["nodes"]}
+p1,p2=by["prompt:hp1"],by["prompt:hp2"]
+assert p1["kind"]=="prompt" and p2["kind"]=="prompt", (p1,p2)
+assert p1["name"]=="Prompt" and p2["name"]=="Prompt", (p1,p2)
+# Sanitized and capped by the one shared policy: the fixture`s tab is a single
+# space, so a stored preview can never span rows when this JSON is catted.
+assert p1["target"]=="read the file", repr(p1["target"])
+# A slash command is reconstructed from the envelope back to what was typed.
+assert p2["target"]=="/execute-todo 774", repr(p2["target"])
+# No model, no usage of its own — a user turn is billed as part of the reply.
+assert p1["model"] is None and p1["total_tokens"]==0 and p1["est_cost_usd"]==0.0, p1
+assert p1["tokens_are_rollup"] is True, p1
+# Always a direct child of the root, and never a parent.
+parents={e["to"]:e["from"] for e in g["edges"]}
+assert len(parents)==len(g["edges"]), g["edges"]
+assert parents=={"prompt:hp1":"session","prompt:hp2":"session",
+                 "msg:hu1":"session","tool:hu_1":"session"}, parents
+assert not any(e["from"].startswith("prompt:") for e in g["edges"]), g["edges"]
+# Prompts change no total: the session rollup is the assistant message alone.
+assert g["total_tokens"]==30, g
+assert g["truncated"] is False and g["omitted_prompts"]==0, g
+print("cc graph: prompt nodes ok")
+' || fail "cc graph did not return the expected prompt nodes"
+
+# The prompt budget is a third peer of the other two, not a tenant of either:
+# with room for one node of each population, each counter reports only its own
+# drops.
+"$BIN" cc graph h --limit 1 | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+ids=[n["id"] for n in g["nodes"]]
+assert ids==["session","prompt:hp1","msg:hu1","tool:hu_1"], ids
+assert g["truncated"] is True, g
+assert g["omitted_prompts"]==1, g
+assert g["omitted_responses"]==0 and g["omitted_tool_calls"]==0, g
+print("cc graph: prompt budget is separate ok")
+' || fail "cc graph --limit did not budget prompts separately"
+
 # Unknown session is not_found (exit 1), never an empty graph — an empty graph
 # is a real answer for a session that made no calls.
 if "$BIN" cc graph no-such-session >"$TMP/graph-err" 2>&1; then

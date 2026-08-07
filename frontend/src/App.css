@@ -5167,6 +5167,32 @@ button:focus-visible,
   border-left-color: hsl(36, 30%, 76%);
 }
 
+/* One human turn — the cause of everything under it, and the spine a reader
+   scans a long session by. So it gets more than a border: a raised background
+   and a thicker edge, the only row treatment loud enough to find while
+   scrolling past a few hundred tool calls. Pale cool neutral, the matched pair
+   to the response's pale warm one — same reasoning, opposite side of the
+   conversation, and equally out of reach of any tool hue. Mirrored as
+   PROMPT_COLOR in sessionGraph.ts, which is where the row's inline tint comes
+   from. */
+.cc-tl-row.kind-prompt {
+  border-left-color: hsl(214, 28%, 78%);
+  border-left-width: 5px;
+  background: var(--panel-raised);
+}
+
+.cc-tl-row.kind-prompt .cc-tl-name {
+  font-weight: 600;
+}
+
+/* The preview is the whole content of a prompt row, and it is the row a reader
+   is looking for — never clamp it away to make room for the effects it caused. */
+.cc-tl-row.kind-prompt .cc-tl-body {
+  color: var(--text);
+  -webkit-line-clamp: 6;
+  line-clamp: 6;
+}
+
 /* Fallback only. A tool row's real colour is per tool *name* and arrives as an
    inline style from `toolColor()` — the name set is open-ended, so it can never
    live in a stylesheet. This is what shows if that ever returns nothing. */

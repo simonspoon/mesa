@@ -345,6 +345,11 @@ fn inbox_watcher_tick(state: &AppState) {
 /// An epic therefore gets dispatched only once its subtree is exhausted —
 /// which is exactly the roll-up moment its acceptance describes.
 ///
+/// Still mandatory now that the ceiling is configurable (mesa task 777), and
+/// for the same reason: an umbrella counts toward *nothing*, so a claimed
+/// batch would be a slot the limit's accounting never sees — one agent over
+/// the limit, every tick, forever.
+///
 /// Bounded, so a malformed `parent_id` cycle can only cost a few queries
 /// rather than spinning the tick forever; real task trees are a few levels
 /// deep at most.
@@ -359,8 +364,8 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
     Ok(task)
 }
 
-/// One todo-watcher pass: for every project with a live `local_path` and no
-/// `in_progress` **leaf** task, pick the next actionable task and dispatch a
+/// One todo-watcher pass: for every project with a live `local_path` and a
+/// free dispatch slot, pick the next actionable task and dispatch a
 /// background `claude` agent on it. Marks the task `in_progress`
 /// itself *before* spawning — closing the race window between dispatch and
 /// the agent's own `/execute-mesa-task` pickup step, so a second tick can't
@@ -371,25 +376,47 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// and leaves that project quiet until someone intervenes — an accepted v1
 /// tradeoff over polling `claude agents` for every project every tick.
 ///
-/// "Busy" is per-project but not per-`in_progress`-row: an `in_progress` task
-/// that has subtasks is an **umbrella**, not a worker, so it does not wedge
-/// the project (mesa task 570). A project whose only `in_progress` tasks are
-/// umbrellas stays dispatchable, but the pick narrows from
+/// "Busy" is a **count**, not a flag (mesa task 777): a project's occupied
+/// slots are its `in_progress` **leaf** tasks, and the tick fills it up to
+/// `config::todo_concurrency()` — the user's per-project ceiling, default 1,
+/// so an unconfigured install behaves exactly as before. The limit is read
+/// once at the top of every tick rather than at startup, the same
+/// read-per-use rule the spawn templates follow, which is what makes an edit
+/// land on the next tick with no restart. Lowering it never touches work in
+/// flight: those tasks stay `in_progress` and the tick simply picks nothing
+/// new for that project until the count falls back under the limit.
+///
+/// An `in_progress` task that has subtasks is an **umbrella**, not a worker,
+/// so it occupies no slot (mesa task 570). A project whose only `in_progress`
+/// tasks are umbrellas is fully idle by the count, but the pick narrows from
 /// `Store::next_task` (any actionable todo in the project) to
 /// `Store::next_subtask` (an actionable todo *under* one of those umbrellas)
 /// — an open umbrella unblocks its own children and nothing else, so the
 /// watcher never starts unrelated work alongside a parent someone is still
-/// holding.
+/// holding. That narrowing is decided once per project, before the fill loop:
+/// a leaf claimed inside the loop is nobody's parent, so it cannot change the
+/// answer mid-loop.
 ///
-/// The invariant that keeps this to one watcher-spawned agent per project is
-/// [`deepest_actionable`]: whatever the pick, the watcher claims an
-/// actionable *leaf*, which re-marks the project busy on the next tick. It
+/// The invariant that keeps this to *at most* `limit` watcher-spawned agents
+/// per project is [`deepest_actionable`]: whatever the pick, the watcher
+/// claims an actionable *leaf*, which occupies a slot on the next tick. It
 /// never claims a task that still has actionable subtasks — that task would
-/// otherwise read as an umbrella one tick later and get a second agent
-/// spawned on its own child. (Residual, inherent to the status-not-liveness
-/// signal: a *new* subtask created under an already-`in_progress` task
-/// mid-run does turn it into an umbrella, and the next tick dispatches that
-/// child alongside whoever holds the parent.)
+/// otherwise read as an umbrella one tick later, count toward nothing, and
+/// get a further agent spawned on its own child *outside* the limit's
+/// accounting. (Residual, inherent to the status-not-liveness signal: a *new*
+/// subtask created under an already-`in_progress` task mid-run does turn it
+/// into an umbrella, and the next tick dispatches that child alongside
+/// whoever holds the parent.)
+///
+/// Claiming before the next pick is also what terminates the fill loop:
+/// both picks filter `status = 'todo'`, so a just-claimed task is invisible
+/// to the following iteration. (Residual of filling more than one slot at a
+/// time: a parent whose *last* actionable child this loop just claimed is
+/// itself actionable to the next iteration, so a limit above 1 can put an
+/// agent on the roll-up while its child is still running. It stays inside
+/// the limit and inside the umbrella rule — the parent counts as an umbrella
+/// from the next tick on — and is the cost of "fill to the limit now"
+/// rather than "one per tick".)
 ///
 /// Two-phase, like `spawn_project_agent`: the store lock is held only long
 /// enough to decide and claim (phase 1), then dropped before the blocking
@@ -398,6 +425,16 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// `claude --bg` takes to start (node startup, ~0.5s+, per the Agents-tab
 /// comments) times however many projects this tick dispatches.
 fn todo_watcher_tick(state: &AppState) {
+    // Read once per tick, before the lock. An unreadable/malformed config is
+    // a skipped tick, never a dispatch under a guessed limit — the spawn
+    // would fail on the same file a moment later anyway.
+    let limit = match config::todo_concurrency() {
+        Ok(limit) => limit as usize,
+        Err(e) => {
+            eprintln!("todo-watcher: {e}");
+            return;
+        }
+    };
     let claimed: Vec<(i64, String, String)> = {
         let mut store = match state.store.lock() {
             Ok(s) => s,
@@ -418,17 +455,17 @@ fn todo_watcher_tick(state: &AppState) {
             }
         };
         // A task that is somebody's parent is an umbrella; only a *leaf*
-        // in_progress task means "an agent is working this project".
+        // in_progress task occupies one of the project's dispatch slots.
         let parents: std::collections::HashSet<i64> =
             tasks.iter().filter_map(|t| t.parent_id).collect();
-        let mut busy_projects: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut busy_counts: HashMap<i64, usize> = HashMap::new();
         let mut umbrellas: std::collections::HashMap<i64, Vec<i64>> =
             std::collections::HashMap::new();
         for task in tasks.iter().filter(|t| t.status == Status::InProgress) {
             if parents.contains(&task.id) {
                 umbrellas.entry(task.project_id).or_default().push(task.id);
             } else {
-                busy_projects.insert(task.project_id);
+                *busy_counts.entry(task.project_id).or_default() += 1;
             }
         }
         let mut claimed = Vec::new();
@@ -439,55 +476,62 @@ fn todo_watcher_tick(state: &AppState) {
             if !std::path::Path::new(local_path).is_dir() {
                 continue;
             }
-            if busy_projects.contains(&project.id) {
+            // Free slots, never negative: a limit lowered below what is
+            // already running dispatches nothing and cancels nothing.
+            let slots = limit.saturating_sub(busy_counts.get(&project.id).copied().unwrap_or(0));
+            if slots == 0 {
                 continue;
             }
             // Open umbrella(s) → dispatch only from under them; otherwise the
-            // project is idle and the whole backlog is fair game.
-            let picked = match umbrellas.get(&project.id) {
-                Some(parent_ids) => match store.next_subtask(parent_ids) {
-                    Ok(Some(task)) => task,
-                    Ok(None) => continue,
+            // project is idle and the whole backlog is fair game. Decided
+            // once: a leaf claimed below is nobody's parent.
+            let parent_ids = umbrellas.get(&project.id);
+            for _ in 0..slots {
+                let picked = match parent_ids {
+                    Some(parent_ids) => match store.next_subtask(parent_ids) {
+                        Ok(Some(task)) => task,
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!(
+                                "todo-watcher: next_subtask failed for project {}: {e}",
+                                project.id
+                            );
+                            break;
+                        }
+                    },
+                    None => match store.next_task(Some(project.id)) {
+                        Ok(NextResult::Task(task)) => *task,
+                        Ok(NextResult::None { .. }) => break,
+                        Err(e) => {
+                            eprintln!(
+                                "todo-watcher: next_task failed for project {}: {e}",
+                                project.id
+                            );
+                            break;
+                        }
+                    },
+                };
+                let task = match deepest_actionable(&store, picked) {
+                    Ok(task) => task,
                     Err(e) => {
                         eprintln!(
                             "todo-watcher: next_subtask failed for project {}: {e}",
                             project.id
                         );
-                        continue;
+                        break;
                     }
-                },
-                None => match store.next_task(Some(project.id)) {
-                    Ok(NextResult::Task(task)) => *task,
-                    Ok(NextResult::None { .. }) => continue,
-                    Err(e) => {
-                        eprintln!(
-                            "todo-watcher: next_task failed for project {}: {e}",
-                            project.id
-                        );
-                        continue;
-                    }
-                },
-            };
-            let task = match deepest_actionable(&store, picked) {
-                Ok(task) => task,
-                Err(e) => {
-                    eprintln!(
-                        "todo-watcher: next_subtask failed for project {}: {e}",
-                        project.id
-                    );
-                    continue;
+                };
+                let in_progress = TaskPatch {
+                    status: Some(Status::InProgress),
+                    ..Default::default()
+                };
+                if let Err(e) = store.update_task(task.id, &in_progress) {
+                    eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
+                    break;
                 }
-            };
-            let in_progress = TaskPatch {
-                status: Some(Status::InProgress),
-                ..Default::default()
-            };
-            if let Err(e) = store.update_task(task.id, &in_progress) {
-                eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
-                continue;
+                let session_name = format!("{}: {}", project.name, task.name);
+                claimed.push((task.id, local_path.to_string(), session_name));
             }
-            let session_name = format!("{}: {}", project.name, task.name);
-            claimed.push((task.id, local_path.to_string(), session_name));
         }
         claimed
     };
@@ -932,6 +976,13 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/config/pricing",
             get(get_config_pricing).put(update_config_pricing),
+        )
+        // The same file's `watchers` section — the todo-watcher's per-project
+        // agent ceiling. A third route for the same reason as `pricing`:
+        // `/api/config` keeps its bare ConfigCommand[] shape.
+        .route(
+            "/api/config/watchers",
+            get(get_config_watchers).put(update_config_watchers),
         )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
@@ -3419,6 +3470,84 @@ async fn update_config_pricing(
     get_config_pricing(State(state), ConnectInfo(addr), headers).await
 }
 
+/// `GET /api/config/watchers` — the watcher settings the Settings page edits:
+/// today the todo-watcher's per-project agent ceiling, with the built-in
+/// default beside it (`docs/config.md`, mesa task 777).
+///
+/// Gated like `get_config_pricing` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`, so the editor never renders
+/// a blank box over a file it couldn't read.
+async fn get_config_watchers(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::watchers() {
+        Ok(watchers) => Ok(Json(watchers).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct WatchersUpdate {
+    /// Absent leaves the key alone; `null` removes it (restoring the built-in
+    /// 1). The value stays raw JSON so `0`, `-1` and `2.5` are the config
+    /// layer's named 422 rather than a deserializer rejection.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    todo_concurrency: Option<Option<serde_json::Value>>,
+}
+
+/// Distinguishes an absent key from an explicit `null` — the difference
+/// between "don't touch this setting" and "put it back to the default".
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// `PUT /api/config/watchers` — writes the watcher settings and echoes them.
+///
+/// **Loopback-only in both modes**, like `update_config` and
+/// `update_config_pricing`: it is the same file mesa's own argv comes out of,
+/// and the section a write lands in is not the distinction that matters.
+async fn update_config_watchers(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<WatchersUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    let mut updates = HashMap::new();
+    if let Some(value) = body.todo_concurrency {
+        updates.insert(config::TODO_CONCURRENCY.to_string(), value);
+    }
+    config::save_watchers(&updates).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_watchers(State(state), ConnectInfo(addr), headers).await
+}
+
 async fn restart_server(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -5838,6 +5967,231 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             log.lines().count(),
             2,
             "an epic holding its own claim parks the project: {log:?}"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    // --- the configurable per-project concurrency limit (mesa task 777) ----
+
+    /// Points `MESA_CONFIG_FILE` at a real file holding `body`. Callers run
+    /// after `stub_claude_bg` (which pins the var at a *nonexistent* path) and
+    /// hold `ENV_LOCK`, so this is the one place a watcher test opts into a
+    /// config that exists. Only the `watchers` section is set — the spawn
+    /// command stays the built-in default the stub understands.
+    fn config_with(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("config.json");
+        std::fs::write(&path, body).unwrap();
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", &path) };
+        path
+    }
+
+    #[test]
+    fn todo_watcher_tick_fills_up_to_the_configured_limit() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let first = new_task(&state, project);
+        let second = new_task(&state, project);
+        let third = new_task(&state, project);
+
+        // One tick fills both slots — the limit is a ceiling on concurrent
+        // agents, not a rate of one per tick.
+        todo_watcher_tick(&state);
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "two dispatches in one tick: {log:?}"
+        );
+        assert_eq!(get(first), Status::InProgress);
+        assert_eq!(get(second), Status::InProgress);
+        assert_eq!(get(third), Status::Todo, "the third waits for a free slot");
+
+        // Full: further ticks dispatch nothing.
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 2, "the project is full: {log:?}");
+
+        // Freeing one slot releases exactly one more.
+        set_status(&state, first, Status::Done);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            3,
+            "the freed slot is refilled: {log:?}"
+        );
+        assert_eq!(get(third), Status::InProgress);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn todo_watcher_tick_with_no_config_still_dispatches_exactly_one() {
+        // The whole point of the default: an install that never touched
+        // `~/.mesa/config.json` behaves exactly as mesa did before task 777.
+        //
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        // `stub_claude_bg` pins MESA_CONFIG_FILE at a path that does not exist.
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let first = new_task(&state, project);
+        let second = new_task(&state, project);
+
+        todo_watcher_tick(&state);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 1, "one agent per project: {log:?}");
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(first), Status::InProgress);
+        assert_eq!(get(second), Status::Todo);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn lowering_the_limit_never_touches_work_in_flight() {
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        let config = config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 3}}"#);
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let ids: Vec<i64> = (0..4).map(|_| new_task(&state, project)).collect();
+
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 3, "three slots filled: {log:?}");
+
+        // Lowered under the in-flight count, mid-run, with no restart: the
+        // next tick reads the new value, dispatches nothing, and de-claims
+        // nothing.
+        std::fs::write(&config, r#"{"watchers": {"todo-concurrency": 1}}"#).unwrap();
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 3, "nothing new is picked: {log:?}");
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        for id in &ids[..3] {
+            assert_eq!(get(*id), Status::InProgress, "in-flight work is untouched");
+        }
+        assert_eq!(get(ids[3]), Status::Todo);
+
+        // Only once the count falls back under the new limit does it move.
+        for id in &ids[..3] {
+            set_status(&state, *id, Status::Done);
+        }
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            4,
+            "one more, at the new limit: {log:?}"
+        );
+        assert_eq!(get(ids[3]), Status::InProgress);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn a_malformed_config_skips_the_tick_rather_than_guessing_a_limit() {
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        config_with(stub_dir.path(), "not json");
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let task = new_task(&state, project);
+
+        todo_watcher_tick(&state);
+        assert!(
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .is_empty(),
+            "a config mesa cannot parse dispatches nothing"
+        );
+        assert_eq!(
+            state.store.lock().unwrap().get_task(task).unwrap().status,
+            Status::Todo,
+            "and claims nothing"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn the_limit_counts_leaves_only_and_the_umbrella_still_narrows_the_pick() {
+        // The two rules composed: an in_progress umbrella occupies no slot
+        // (mesa task 570) but still confines the fill to its own children.
+        //
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let epic = new_task(&state, project);
+        let child_a = new_subtask(&state, project, epic, "a");
+        let child_b = new_subtask(&state, project, epic, "b");
+        let outsider = new_task(&state, project);
+        set_status(&state, epic, Status::InProgress);
+
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "the umbrella occupies no slot, so both fill from under it: {log:?}"
+        );
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(child_a), Status::InProgress);
+        assert_eq!(get(child_b), Status::InProgress);
+        assert_eq!(
+            get(outsider),
+            Status::Todo,
+            "an open umbrella unblocks its own children and nothing else"
         );
 
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };

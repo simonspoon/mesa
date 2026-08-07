@@ -319,8 +319,9 @@ all-or-nothing: a prefix must be non-empty after trimming, whitespace-free and
 ≤ 64 characters, and every rate must be finite and ≥ 0. A rejected save leaves
 the file byte-identical.
 
-The two sections are siblings over one document: saving `pricing` preserves
-`commands` (and any section mesa doesn't know) and vice versa. Nothing is
+`pricing` is a sibling of `commands` (and, below, `watchers`) over one
+document: saving one preserves the others (and any section mesa doesn't
+know). Nothing is
 cached — the table is loaded **once per dashboard request** and a save applies
 to the next read, past sessions included, with no restart. Cost is derived on
 every read, so there is no stored figure to migrate.
@@ -351,6 +352,57 @@ See `docs/cc-dashboard.md` for the permanent-loss property.
 `/api/config`'s own shape is unchanged — a bare `ConfigCommand[]` and
 `{commands: {…}}` — because that is what agents and `config-check.sh` assert.
 
+## Watchers
+
+A third, independent section holds per-watcher tuning knobs — currently one:
+the todo-watcher's per-project concurrency limit (mesa task 777,
+`docs/todo-watcher.md`).
+
+```json
+{
+  "watchers": {
+    "todo-concurrency": 3
+  }
+}
+```
+
+- `todo-concurrency` bounds how many `in_progress` **leaf** tasks a single
+  project may hold at once. **Absent or `null` ⇒ the built-in default, 1** —
+  today's one-agent-per-project behavior, unchanged for anyone who never
+  touches this key. The editor (`PUT`) requires an integer in `1..=20`; zero,
+  negative, non-integer or over 20 is `422 validation`, writing nothing. The
+  upper bound is a sanity cap against a typo, not a policy — there is no
+  larger "unlimited" escape hatch. A hand-edited value outside that range
+  (found in the file, not written through `PUT`) is **clamped** into it on
+  read rather than failing the tick — a stray `0` obviously means "one at a
+  time", and refusing to dispatch at all over a typo would be the worse
+  answer. Only the write path is strict.
+- **Read at the top of every tick, not cached** — the same rule `commands`
+  and `pricing` follow: edit the file and the very next tick uses it, no
+  restart. A malformed file is `unavailable` here exactly as it is on the
+  other two routes — never a silent fall back to the default.
+- Lowering the limit never touches work already dispatched: an
+  already-`in_progress` leaf stays `in_progress` regardless of what the limit
+  now says. It only narrows what the *next* tick is willing to start.
+
+### Routes
+
+- `GET /api/config/watchers` → `ConfigWatchers`:
+  `{todo_concurrency, todo_concurrency_default}`, where `todo_concurrency` is
+  the override (`null` when unset) and `todo_concurrency_default` is the
+  built-in, 1. Gated like `GET /api/config`/`GET /api/config/pricing`
+  (`require_agent_access`); a malformed config is **502 `unavailable`**.
+- `PUT /api/config/watchers`, body `{"todo_concurrency": <1..=20> | null}` →
+  echoes the getter. `null` removes the key, restoring the default. An
+  out-of-range or non-integer value is **422 `validation`**, writing nothing.
+  Gated with `require_local_path_write` — **loopback-only in both serve
+  modes**, the same posture as the other two config writes: it is the same
+  file, and which file a LAN peer may rewrite is not a per-section question.
+
+The three sections are siblings over one document: saving `watchers`
+preserves `commands`, `pricing` and any section mesa doesn't know about, and
+vice versa.
+
 ## Gate
 
 `scripts/config-check.sh` — all four commands driven by a configured template
@@ -365,7 +417,12 @@ driving each of the four actions, the per-action variables present/absent, the
 unset-not-empty rule, a hostile `{name}` proven not to reach a shell, and the
 422s for `{}`-in-a-script and a bash syntax error. It writes a real
 `~/.mesa/config.json` under a throwaway `HOME` rather than using
-`MESA_CONFIG_FILE`, so the default path resolution is covered too.
+`MESA_CONFIG_FILE`, so the default path resolution is covered too. For
+watchers it also covers the round trip (`GET` reporting the default with a
+`null` override, `PUT` setting/clearing `todo_concurrency`), 0 and a
+non-integer rejected as 422 writing nothing, 502 on a malformed file, and
+`commands`/`pricing`/an unknown section surviving a watchers write and vice
+versa.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

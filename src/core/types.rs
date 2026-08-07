@@ -217,6 +217,23 @@ pub struct ConfigPrice {
     pub default: Option<ModelRates>,
 }
 
+/// The watcher settings as the Settings page sees them (`core::config`,
+/// `docs/config.md`, mesa task 777). A third view of `~/.mesa/config.json`
+/// beside [`ConfigCommand`] and [`ConfigPrice`], with the same
+/// null-means-fallback rule: an absent value is the built-in default, and
+/// writing `null` back is how the user restores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigWatchers {
+    /// How many watcher agents the todo-watcher may have running per project,
+    /// or `null` when the config says nothing — then `todo_concurrency_default`
+    /// is what applies.
+    pub todo_concurrency: Option<u32>,
+    /// The built-in limit mesa ships (1), so the editor can show what blank
+    /// means without hardcoding it.
+    pub todo_concurrency_default: u32,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

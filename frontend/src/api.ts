@@ -13,6 +13,7 @@ import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
 import type { ConfigPrice } from './types/ConfigPrice'
+import type { ConfigWatchers } from './types/ConfigWatchers'
 import type { DiagramType } from './types/DiagramType'
 import type { DirEntry } from './types/DirEntry'
 import type { DirListing } from './types/DirListing'
@@ -809,4 +810,27 @@ export function updatePricing(
   pricing: Record<string, ModelRates | null>,
 ): Promise<ConfigPrice[]> {
   return request('/api/config/pricing', jsonInit('PUT', { pricing }))
+}
+
+/**
+ * The watcher settings in `~/.mesa/config.json`: today, how many todo-watcher
+ * agents a project may run at once (mesa task 777). `todo_concurrency: null`
+ * means the config says nothing, so the shipped `todo_concurrency_default`
+ * applies. 502 `unavailable` means the config file itself is unreadable,
+ * exactly as for `getConfig`.
+ */
+export function getWatchers(): Promise<ConfigWatchers> {
+  return request('/api/config/watchers')
+}
+
+/**
+ * Writes watcher settings and echoes them as re-read from disk. Only the keys
+ * passed are touched; `null` removes one, restoring the built-in default. 422
+ * `validation` is a value outside the accepted range or not a whole number,
+ * and nothing is written in that case.
+ */
+export function updateWatchers(
+  watchers: Record<string, number | null>,
+): Promise<ConfigWatchers> {
+  return request('/api/config/watchers', jsonInit('PUT', watchers))
 }

@@ -314,7 +314,14 @@ const NON_HUMAN_PREFIXES: &[&str] = &[
     "<local-command-caveat>",
     "Caveat: The messages below were generated",
     "<system-reminder>",
-    "[Request interrupted by user]",
+    // Both the bare marker and the `… for tool use]` variant, so the entry
+    // deliberately stops before the closing bracket.
+    "[Request interrupted by user",
+    // Ctrl-B bash mode writes the command the user typed AND its output back
+    // as `user` lines. The command is human input and is kept; its captured
+    // output is not. (Found by ingesting the real corpus: 4 rows in 2,312.)
+    "<bash-stdout>",
+    "<bash-stderr>",
     "[Image:",
     "[SYSTEM NOTIFICATION",
     "Stop hook feedback:",
@@ -3665,6 +3672,25 @@ mod tests {
         );
         assert_eq!(
             prompt_of(r#"{"type":"user","message":{"content":"[Image: screenshot.png]"}}"#),
+            None
+        );
+        // Both interrupt variants — the entry stops before the `]` for this.
+        assert_eq!(
+            prompt_of(r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#),
+            None
+        );
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":"[Request interrupted by user for tool use]"}}"#
+            ),
+            None
+        );
+        // Ctrl-B bash mode: the captured output is machine text, the command
+        // above it is what the user typed and is kept.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","message":{"content":"<bash-stdout>total 8</bash-stdout><bash-stderr></bash-stderr>"}}"#
+            ),
             None
         );
         // A `<system-reminder>` block inside an array is dropped rather than

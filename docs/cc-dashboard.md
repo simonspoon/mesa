@@ -187,10 +187,16 @@ CLI and API share it and never diverge.
      to go on — reject anything opening with one of `cc::NON_HUMAN_PREFIXES`
      (`<command-message>`, `<local-command-stdout>`, `<local-command-caveat>`,
      `Caveat: The messages below were generated`, `<system-reminder>`,
-     `[Request interrupted by user]`, `[Image:`, `[SYSTEM NOTIFICATION`,
-     `Stop hook feedback:`, `Base directory for this skill:`,
-     `<teammate-message`, `Another Claude session sent a message:`). The list
-     is the pre-`origin` fallback and nothing else.
+     `[Request interrupted by user` — no closing bracket, so the
+     `… for tool use]` variant matches too — `[Image:`,
+     `[SYSTEM NOTIFICATION`, `Stop hook feedback:`,
+     `Base directory for this skill:`, `<teammate-message`,
+     `Another Claude session sent a message:`, `<bash-stdout>`,
+     `<bash-stderr>`). The list is the pre-`origin` fallback and nothing else.
+     Its two `bash-*` entries and the interrupt truncation came from ingesting
+     the real 3,329-transcript corpus and reading what leaked: ctrl-B bash mode
+     writes both the typed command and its captured output back as `user`
+     lines, and only the output is machinery.
   9. Finally `sanitize_capped` — the same shared policy, not a second cap
      constant. Nothing left means no row.
 

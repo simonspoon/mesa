@@ -5475,6 +5475,13 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* A watcher setting is one small number, not a command line — sized to what it
+   holds so the box doesn't advertise room for an argv. */
+.settings-watcher-input {
+  width: 6rem;
+  font-size: 0.8rem;
+}
+
 /* Model pricing: a prefix, four rates and one action per row. The grid is
    declared once on the container so the header labels and every row share
    their columns — the header is the only thing naming what the boxes are. */

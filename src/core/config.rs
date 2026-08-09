@@ -59,6 +59,19 @@
 //! overlays them and may add prefixes the binary has never heard of, which is
 //! the point — a new model family gets priced without a rebuild. See
 //! [`PriceTable`].
+//!
+//! ## Watchers
+//!
+//! A third, equally independent section tunes the watchers (mesa task 777):
+//!
+//! ```json
+//! { "watchers": { "todo-concurrency": 3 } }
+//! ```
+//!
+//! Today that is one key — how many agents `serve --watch-todo` may have
+//! running **per project** ([`todo_concurrency`]), default
+//! [`DEFAULT_TODO_CONCURRENCY`]. Read per tick rather than at startup, so an
+//! edit lands on the next tick with no restart. See `docs/todo-watcher.md`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,7 +79,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::core::types::{ConfigCommand, ConfigPrice, ModelRates};
+use crate::core::types::{ConfigCommand, ConfigPrice, ConfigWatchers, ModelRates};
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
 pub const TODO_WATCHER: &str = "todo-watcher";
@@ -929,6 +942,186 @@ fn validate_rates(prefix: &str, rates: &ModelRates) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Watchers
+// ---------------------------------------------------------------------------
+
+/// The config key holding the todo-watcher's per-project agent ceiling.
+pub const TODO_CONCURRENCY: &str = "todo-concurrency";
+
+/// Every key the `watchers` section understands, for the unknown-key error.
+const WATCHER_KEYS: &[&str] = &[TODO_CONCURRENCY];
+
+/// How many watcher agents one project may run at once with no config — the
+/// value that keeps an unconfigured install byte-identical to mesa before
+/// task 777, when the ceiling was hardcoded at one.
+pub const DEFAULT_TODO_CONCURRENCY: u32 = 1;
+
+/// The largest limit the editor will write. A **sanity bound, not a policy**:
+/// nothing about the dispatch loop breaks above it, but every slot is a real
+/// `claude` process on this machine, and a fat-fingered `200` would fork the
+/// box rather than the backlog. Raise it here if a real workload wants more.
+pub const MAX_TODO_CONCURRENCY: u32 = 20;
+
+/// The `watchers` map, deserialized on its own so a broken watcher value can
+/// never take the spawn path (`commands`) or the dashboard (`pricing`) down
+/// with it, and vice versa — three independent features sharing one file
+/// ([`PricingConfig`] is the model).
+#[derive(Debug, Default, Deserialize)]
+struct WatchersConfig {
+    #[serde(default)]
+    watchers: WatchersSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WatchersSection {
+    #[serde(default, rename = "todo-concurrency")]
+    todo_concurrency: Option<u32>,
+}
+
+fn read_watchers(path: &Path) -> Result<WatchersSection, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WatchersSection::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: WatchersConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.watchers)
+}
+
+/// How many agents the todo-watcher may have running per project.
+///
+/// Read **on every tick**, like [`command_for`] is read on every spawn: that
+/// is what makes a change take effect without restarting `mesa serve`. An
+/// absent file or key is [`DEFAULT_TODO_CONCURRENCY`]; a file that exists but
+/// can't be read or parsed is `Err`, never a silent fall back to 1 — same rule
+/// as [`read_pricing`], and the caller (`todo_watcher_tick`) skips the tick
+/// rather than dispatch under a guessed limit.
+///
+/// A hand-edited value outside `1..=MAX_TODO_CONCURRENCY` is **clamped** into
+/// it rather than rejected: the bound exists to stop a typo forking the
+/// machine, and refusing to dispatch at all would be a worse answer to `0`
+/// than treating it as the one-at-a-time it obviously means. The editor still
+/// refuses to *write* such a value.
+pub fn todo_concurrency() -> Result<u32, String> {
+    todo_concurrency_in(&config_file())
+}
+
+fn todo_concurrency_in(path: &Path) -> Result<u32, String> {
+    Ok(read_watchers(path)?
+        .todo_concurrency
+        .map(|n| n.clamp(1, MAX_TODO_CONCURRENCY))
+        .unwrap_or(DEFAULT_TODO_CONCURRENCY))
+}
+
+/// The watcher settings for the Settings page (`GET /api/config/watchers`):
+/// the configured value (verbatim, or `null` when the file says nothing) plus
+/// the built-in default behind it — the `{value, default}` idiom
+/// [`ConfigPrice`] and [`ConfigCommand`] already use.
+pub fn watchers() -> Result<ConfigWatchers, String> {
+    watchers_in(&config_file())
+}
+
+fn watchers_in(path: &Path) -> Result<ConfigWatchers, String> {
+    Ok(ConfigWatchers {
+        todo_concurrency: read_watchers(path)?.todo_concurrency,
+        todo_concurrency_default: DEFAULT_TODO_CONCURRENCY,
+    })
+}
+
+/// Writes the `watchers` entries named in `updates` into the config file.
+///
+/// - `None` **removes** the key, restoring the built-in default — the same
+///   meaning blank has for a command and `null` for a price row.
+/// - Values arrive as raw JSON so `2.5` and `-1` are *this* layer's
+///   [`SaveError::Validation`] with a sentence naming the mistake, rather than
+///   a deserializer rejection the API would have to render as a 400.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_commands`] and [`save_pricing`]: one read-modify-write
+///   over the whole document, so all three sections (and any mesa doesn't
+///   know) survive each other's edits.
+pub fn save_watchers(
+    updates: &HashMap<String, Option<serde_json::Value>>,
+) -> Result<(), SaveError> {
+    save_watchers_in(&config_file(), updates)
+}
+
+fn save_watchers_in(
+    path: &Path,
+    updates: &HashMap<String, Option<serde_json::Value>>,
+) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        // Nothing named, nothing to do — and in particular no empty
+        // `"watchers": {}` written into a file the user never configured.
+        return Ok(());
+    }
+    let mut keys: Vec<&String> = updates.keys().collect();
+    keys.sort();
+    for key in &keys {
+        if !WATCHER_KEYS.contains(&key.as_str()) {
+            return Err(SaveError::Validation(format!(
+                "unknown watcher setting {key:?}; mesa configures {}",
+                WATCHER_KEYS.join(", ")
+            )));
+        }
+        if let Some(value) = &updates[*key] {
+            validate_limit(key, value).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("watchers")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"watchers\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for key in keys {
+        match &updates[key] {
+            None => {
+                section.remove(key);
+            }
+            Some(value) => {
+                section.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// A watcher limit has to be a whole number of agents inside the sanity
+/// bound: `0` (which would stop the watcher rather than configure it), a
+/// negative, a fraction and anything over [`MAX_TODO_CONCURRENCY`] are all
+/// named rather than silently coerced.
+fn validate_limit(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    let Some(n) = value.as_u64() else {
+        return Err(format!(
+            "{key} must be a whole number between 1 and {MAX_TODO_CONCURRENCY}, got {value}"
+        ));
+    };
+    if n < 1 || n > u64::from(MAX_TODO_CONCURRENCY) {
+        return Err(format!(
+            "{key} must be between 1 and {MAX_TODO_CONCURRENCY}, got {n}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1744,6 +1937,144 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    fn watcher(pairs: &[(&str, Option<u64>)]) -> HashMap<String, Option<serde_json::Value>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(|n| serde_json::json!(n))))
+            .collect()
+    }
+
+    #[test]
+    fn todo_concurrency_defaults_to_one_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file at all, and a file with no watchers section: the shipped 1.
+        assert_eq!(
+            todo_concurrency_in(&dir.path().join("nope.json")).unwrap(),
+            DEFAULT_TODO_CONCURRENCY
+        );
+        let path = write_config(dir.path(), r#"{"commands": {}}"#);
+        assert_eq!(todo_concurrency_in(&path).unwrap(), 1);
+        assert_eq!(watchers_in(&path).unwrap().todo_concurrency, None);
+
+        save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(3))])).unwrap();
+        assert_eq!(todo_concurrency_in(&path).unwrap(), 3);
+        let view = watchers_in(&path).unwrap();
+        assert_eq!(view.todo_concurrency, Some(3));
+        assert_eq!(view.todo_concurrency_default, DEFAULT_TODO_CONCURRENCY);
+    }
+
+    #[test]
+    fn removing_todo_concurrency_restores_the_built_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"watchers": {"todo-concurrency": 5}}"#);
+        save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, None)])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Removed, not stored as 1: the default is expressed by absence.
+        assert!(written["watchers"].get(TODO_CONCURRENCY).is_none());
+        assert_eq!(todo_concurrency_in(&path).unwrap(), 1);
+        assert_eq!(watchers_in(&path).unwrap().todo_concurrency, None);
+    }
+
+    #[test]
+    fn each_saver_preserves_the_other_two_sections_and_unknown_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{
+                 "commands": {"inbox-watcher": "mytool triage {id}"},
+                 "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}},
+                 "watchers": {"todo-concurrency": 4},
+                 "future": {"x": 1}
+               }"#,
+        );
+        let survives = |label: &str| {
+            let root: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                root["commands"]["inbox-watcher"], "mytool triage {id}",
+                "{label}"
+            );
+            assert_eq!(root["pricing"]["claude-opus"]["output"], 2.0, "{label}");
+            assert_eq!(root["future"]["x"], 1, "{label}");
+            root
+        };
+
+        // Saving watchers leaves commands, pricing and the unknown section alone.
+        save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(7))])).unwrap();
+        assert_eq!(survives("watchers")["watchers"][TODO_CONCURRENCY], 7);
+        // …and each of the other two savers leaves `watchers` alone.
+        save_commands_in(&path, &update(&[("todo-watcher", "mytool run {id}")])).unwrap();
+        assert_eq!(survives("commands")["watchers"][TODO_CONCURRENCY], 7);
+        save_pricing_in(
+            &path,
+            &price(&[("claude-sonnet", Some(rates(1.0, 1.0, 1.0, 1.0)))]),
+        )
+        .unwrap();
+        assert_eq!(survives("pricing")["watchers"][TODO_CONCURRENCY], 7);
+        assert_eq!(todo_concurrency_in(&path).unwrap(), 7);
+    }
+
+    #[test]
+    fn save_watchers_rejects_a_bad_limit_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"watchers": {"todo-concurrency": 2}}"#;
+        let path = write_config(dir.path(), before);
+        for (label, value) in [
+            ("zero", serde_json::json!(0)),
+            ("negative", serde_json::json!(-1)),
+            ("fraction", serde_json::json!(2.5)),
+            ("over the bound", serde_json::json!(21)),
+            ("a string", serde_json::json!("3")),
+            ("null-ish text", serde_json::json!("")),
+        ] {
+            let mut updates = HashMap::new();
+            updates.insert(TODO_CONCURRENCY.to_string(), Some(value));
+            let err = save_watchers_in(&path, &updates).unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "{label}: {err:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{label}");
+        }
+        // An unknown key in the section is a validation error too, not a
+        // silently stored row.
+        let err = save_watchers_in(&path, &watcher(&[("todo-cadence", Some(2))])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unknown watcher setting")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // The bounds themselves are inclusive.
+        for ok in [1u64, u64::from(MAX_TODO_CONCURRENCY)] {
+            save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(ok))])).unwrap();
+            assert_eq!(todo_concurrency_in(&path).unwrap(), ok as u32);
+        }
+    }
+
+    #[test]
+    fn watchers_refuse_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = todo_concurrency_in(&path).unwrap_err();
+        assert!(err.contains("malformed mesa config"), "{err}");
+        assert!(watchers_in(&path).is_err());
+        let err = save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(2))])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn a_hand_edited_limit_is_clamped_into_the_sanity_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"watchers": {"todo-concurrency": 0}}"#);
+        assert_eq!(todo_concurrency_in(&path).unwrap(), 1);
+        // The raw value still reaches the editor, which is what refuses it.
+        assert_eq!(watchers_in(&path).unwrap().todo_concurrency, Some(0));
+        let path = write_config(dir.path(), r#"{"watchers": {"todo-concurrency": 500}}"#);
+        assert_eq!(todo_concurrency_in(&path).unwrap(), MAX_TODO_CONCURRENCY);
     }
 
     #[test]

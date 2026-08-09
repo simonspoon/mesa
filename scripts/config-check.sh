@@ -475,6 +475,81 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused pricing PUT must not touch the file"
 ok "both pricing verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
+# ---- the watchers section: GET/PUT /api/config/watchers (mesa task 777) ----
+
+# Same file, same sibling-section rules as pricing, a different route.
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}, "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}}}
+EOF
+api GET /api/config/watchers
+[ "$CODE" = "200" ] || fail "GET watchers: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.todo_concurrency' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured todo_concurrency must report null, got $STDOUT"
+[ "$(jq -r '.todo_concurrency_default' <<<"$STDOUT")" = "1" ] ||
+  fail "GET watchers: built-in default wrong: $STDOUT"
+ok "GET /api/config/watchers reports todo_concurrency: null (no override) and todo_concurrency_default: 1 on a fresh config"
+
+api PUT /api/config/watchers '{"todo_concurrency": 3}'
+[ "$CODE" = "200" ] || fail "PUT watchers: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.todo_concurrency' <<<"$STDOUT")" = "3" ] ||
+  fail "PUT must echo the stored override: $STDOUT"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "PUT watchers did not write todo-concurrency: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "a watchers write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
+  fail "a watchers write clobbered the pricing section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "a watchers write dropped a section it doesn't own: $(cat "$CONFIG")"
+ok "PUT /api/config/watchers sets todo_concurrency, leaving commands, pricing and an unknown section untouched"
+
+# The other two savers have to be just as careful toward watchers.
+api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
+[ "$CODE" = "200" ] || fail "PUT commands after watchers: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "a commands write clobbered the watchers section: $(cat "$CONFIG")"
+api PUT /api/config/pricing '{"pricing": {"claude-opus": null}}'
+[ "$CODE" = "200" ] || fail "PUT pricing after watchers: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "a pricing write clobbered the watchers section: $(cat "$CONFIG")"
+ok "saving commands or pricing preserves the watchers section, exactly as watchers preserves them"
+
+api PUT /api/config/watchers '{"todo_concurrency": null}'
+[ "$CODE" = "200" ] || fail "PUT watchers null: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.todo_concurrency' <<<"$STDOUT")" = "null" ] ||
+  fail "null must restore the default, got $STDOUT"
+[ "$(jq -r '.watchers | has("todo-concurrency")' < "$CONFIG")" = "false" ] ||
+  fail "null must remove the key, never store it: $(cat "$CONFIG")"
+ok "PUT null on todo_concurrency removes the key, restoring the built-in default"
+
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config/watchers '{"todo_concurrency": 0}'
+[ "$CODE" = "422" ] || fail "todo_concurrency 0: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "todo_concurrency 0: expected code validation, got $STDOUT"
+api PUT /api/config/watchers '{"todo_concurrency": 2.5}'
+[ "$CODE" = "422" ] || fail "todo_concurrency 2.5: expected 422, got $CODE: $STDOUT"
+api PUT /api/config/watchers '{"todo_concurrency": "abc"}'
+[ "$CODE" = "422" ] || fail "todo_concurrency \"abc\": expected 422, got $CODE: $STDOUT"
+api PUT /api/config/watchers '{"todo_concurrency": 21}'
+[ "$CODE" = "422" ] || fail "todo_concurrency 21: expected 422, got $CODE: $STDOUT"
+api PUT /api/config/watchers '{"todo_concurrency": -1}'
+[ "$CODE" = "422" ] || fail "todo_concurrency -1: expected 422, got $CODE: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected watchers PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT /api/config/watchers rejects 0, a non-integer, and a value outside 1..=20 as 422 validation, writing nothing"
+
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/watchers")
+[ "$CODE" = "403" ] || fail "GET watchers with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
+  -H 'Content-Type: application/json' \
+  --data '{"todo_concurrency": 5}' \
+  "http://127.0.0.1:$PORT/api/config/watchers")
+[ "$CODE" = "403" ] || fail "PUT watchers with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused watchers PUT must not touch the file"
+ok "both watchers verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"
@@ -486,9 +561,13 @@ api GET /api/config/pricing
 [ "$CODE" = "502" ] || fail "malformed config pricing GET: expected 502, got $CODE: $STDOUT"
 api PUT /api/config/pricing '{"pricing": {"claude-opus": null}}'
 [ "$CODE" = "502" ] || fail "malformed config pricing PUT: expected 502, got $CODE: $STDOUT"
+api GET /api/config/watchers
+[ "$CODE" = "502" ] || fail "malformed config watchers GET: expected 502, got $CODE: $STDOUT"
+api PUT /api/config/watchers '{"todo_concurrency": 5}'
+[ "$CODE" = "502" ] || fail "malformed config watchers PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
-ok "a malformed config is 502 unavailable on all four config verbs, and a PUT never overwrites a file it could not read"
+ok "a malformed config is 502 unavailable on all six config verbs, and a PUT never overwrites a file it could not read"
 
 # ---- an unconfigured command falls back to the built-in claude argv ----
 

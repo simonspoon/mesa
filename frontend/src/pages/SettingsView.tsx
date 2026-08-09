@@ -2,11 +2,13 @@ import { useState } from 'react'
 import {
   getConfig,
   getPricing,
+  getWatchers,
   listProjects,
   resetCcIndex,
   restartServer,
   updateConfig,
   updatePricing,
+  updateWatchers,
   type CcResetReport,
 } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
@@ -39,6 +41,16 @@ import {
 } from '../settingsDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
 import { useFetch } from '../useFetch'
+import {
+  MAX_CONCURRENCY,
+  MIN_CONCURRENCY,
+  changedWatchers,
+  draftFrom as watchersDraftFrom,
+  isDirty as isWatchersDirty,
+  isSavable as isWatchersSavable,
+  valueError,
+  type WatchersDraft,
+} from '../watchersDraft'
 
 /**
  * Human copy for each config key. The server sends the key, the default and
@@ -244,8 +256,120 @@ export function SettingsView() {
       </div>
       {saveError && <p className="error">{saveError}</p>}
 
+      <WatchersSection />
       <PricingSection />
     </div>
+  )
+}
+
+/**
+ * Watchers: how the background loops behave (mesa task 777) — today, how many
+ * todo-watcher agents one project may have running at once. Its own section,
+ * its own draft and its own save button, for the same reason pricing has one:
+ * a separate endpoint, so one form's rejection must not strand the other's
+ * edits.
+ *
+ * Blank is the built-in default, exactly as a blank command box is — clearing
+ * the box PUTs `null`, which removes the key rather than writing a 1.
+ */
+function WatchersSection() {
+  const { data: watchers, error, refetch } = useFetch(() => getWatchers(), 'watchers')
+  const [draft, setDraft] = useState<WatchersDraft | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const seeded: WatchersDraft =
+    draft ?? (watchers ? watchersDraftFrom(watchers) : { todo_concurrency: '' })
+
+  function edit(value: string) {
+    setDraft({ ...seeded, todo_concurrency: value })
+    setSaved(false)
+  }
+
+  function save() {
+    if (!watchers) return
+    setSaving(true)
+    setSaveError(null)
+    updateWatchers(changedWatchers(watchers, seeded)).then(
+      (fresh) => {
+        // Re-seed from what the server read back, so the box shows what landed.
+        setDraft(watchersDraftFrom(fresh))
+        setSaving(false)
+        setSaved(true)
+        refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Watchers</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!watchers) {
+    return (
+      <>
+        <h2>Watchers</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isWatchersDirty(watchers, seeded)
+  const savable = isWatchersSavable(seeded)
+  const fieldError = valueError(seeded.todo_concurrency)
+
+  return (
+    <>
+      <h2>Watchers</h2>
+      <section className="settings-command">
+        <label htmlFor="watch-todo-concurrency">
+          <span className="settings-command-title">
+            Todo watcher: max concurrent agents per project
+          </span>
+          <code className="settings-command-key">todo_concurrency</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          blank = {watchers.todo_concurrency_default} (the default); lowering it
+          never stops work already in flight
+        </p>
+        <input
+          id="watch-todo-concurrency"
+          type="number"
+          min={MIN_CONCURRENCY}
+          max={MAX_CONCURRENCY}
+          step="1"
+          className="settings-watcher-input"
+          value={seeded.todo_concurrency}
+          placeholder={String(watchers.todo_concurrency_default)}
+          onChange={(e) => edit(e.target.value)}
+        />
+        {fieldError && <p className="error">{fieldError}</p>}
+      </section>
+
+      <div className="settings-actions">
+        <button
+          type="button"
+          disabled={!dirty || !savable || saving}
+          onClick={save}
+        >
+          {saving ? 'saving…' : 'save watchers'}
+        </button>
+        {dirty && savable && !saving && (
+          <span className="muted">unsaved changes</span>
+        )}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {saveError && <p className="error">{saveError}</p>}
+    </>
   )
 }
 

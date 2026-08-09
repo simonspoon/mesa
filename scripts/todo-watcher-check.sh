@@ -443,4 +443,73 @@ ok "an exhausted epic is dispatched last (its roll-up) and parks the project whi
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
+# ---- configured `watchers.todo-concurrency` (mesa task 777): a limit above 1
+# fills to the limit in ONE tick, a task beyond it waits, and finishing one
+# lets the next tick pick up the one that waited. Fully isolated -- own db,
+# port, stub log and its own MESA_CONFIG_FILE (the top-of-file export pins it
+# to a nonexistent path for every block above; this one points it at a real
+# file so the concurrency section actually loads). ----
+
+CONC_DB="$TMP/concurrency.db"
+CONC_LOG="$TMP/concurrency-bg.log"
+touch "$CONC_LOG"
+CONC_STUB="$STUB_DIR/claude-concurrency"
+sed "s#$ARCH_LOG#$CONC_LOG#" "$ARCH_STUB" > "$CONC_STUB"
+chmod +x "$CONC_STUB"
+
+CONC_CONFIG="$TMP/concurrency-config.json"
+cat > "$CONC_CONFIG" <<'EOF'
+{"watchers": {"todo-concurrency": 2}}
+EOF
+
+mkdir -p "$TMP/concDir"
+CONC_DIR=$(cd "$TMP/concDir" && pwd -P)
+
+export MESA_DB="$CONC_DB"
+run 0 "$MESA" project create "Conc" --no-git
+CONC=$(jqs .id)
+run 0 "$MESA" project update "$CONC" --path "$CONC_DIR"
+run 0 "$MESA" task create "$CONC" "task one"
+CONC_T1=$(jqs .id)
+run 0 "$MESA" task create "$CONC" "task two"
+CONC_T2=$(jqs .id)
+run 0 "$MESA" task create "$CONC" "task three"
+CONC_T3=$(jqs .id)
+
+CONC_PORT=17786
+MESA_CLAUDE_BIN="$CONC_STUB" MESA_WATCH_TODO_TICK_MS=150 MESA_CONFIG_FILE="$CONC_CONFIG" \
+  "$MESA" serve --port "$CONC_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$CONC_PORT"
+
+conc_task_status() { curl -sf "http://127.0.0.1:$CONC_PORT/api/tasks/$1" | jq -r .status; }
+wait_conc_bg_lines() { # wait_conc_bg_lines <n>
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$CONC_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n concurrency-check bg dispatch(es); log:\n$(cat "$CONC_LOG")"
+}
+
+wait_conc_bg_lines 2
+sleep 1
+[ "$(wc -l < "$CONC_LOG")" -eq 2 ] ||
+  fail "a limit of 2 must dispatch exactly two tasks in one tick, got $(wc -l < "$CONC_LOG")"
+[ "$(conc_task_status "$CONC_T1")" = "in_progress" ] || fail "task one must be dispatched under a limit of 2"
+[ "$(conc_task_status "$CONC_T2")" = "in_progress" ] || fail "task two must be dispatched under a limit of 2"
+[ "$(conc_task_status "$CONC_T3")" = "todo" ] || fail "task three must stay todo once the limit of 2 is filled"
+ok "a configured todo-concurrency of 2 fills the project to the limit in one tick, leaving the excess task todo"
+
+run 0 "$MESA" task update "$CONC_T1" --status done
+wait_conc_bg_lines 3
+LINE=$(sed -n '3p' "$CONC_LOG")
+[ "$LINE" = "$CONC_DIR|Conc: task three|/execute-mesa-task $CONC_T3" ] ||
+  fail "expected '$CONC_DIR|Conc: task three|/execute-mesa-task $CONC_T3', got '$LINE'"
+[ "$(conc_task_status "$CONC_T3")" = "in_progress" ] ||
+  fail "finishing task one must free a slot under the limit for task three"
+ok "finishing one in-progress leaf frees a slot and the next tick dispatches the task that was waiting"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
 echo "ALL OK ($CHECKS checks)"

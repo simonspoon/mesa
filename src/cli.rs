@@ -8,8 +8,9 @@
 //! - `--quiet` (opt-in, long form only) swaps that full object for the compact
 //!   projection — the record minus its unbounded free-text fields, the same
 //!   bounded shape `task list` already emits. Accepted on every mutation and
-//!   `show`/`get` in `project`, `task`, `storyboard` (+ `frame`, `edge`) and
-//!   `inbox`; composites keep their key structure and compact their members.
+//!   `show`/`get` in `project`, `task`, `storyboard` (+ `frame`, `edge`),
+//!   `inbox` and `script`; composites keep their key structure and compact
+//!   their members.
 //!   Default output is unchanged. On a `delete` it waives the full echo, which
 //!   is mesa's recovery transcript.
 //! - Errors are `{"error": {"code", "message"}}` on stderr; clap usage errors
@@ -24,8 +25,9 @@ use serde_json::json;
 
 use crate::core::{
     DiagramType, EdgePatch, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    InboxItem, NextResult, Priority, Project, ProjectPatch, Result, Status, Store, Storyboard,
-    StoryboardPatch, StoryboardView, Task, TaskPatch,
+    InboxItem, NextResult, Priority, Project, ProjectPatch, Result, Script, ScriptArg,
+    ScriptArgKind, ScriptPatch, Status, Store, Storyboard, StoryboardPatch, StoryboardView, Task,
+    TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -40,7 +42,7 @@ OUTPUT
   instead — the record minus its unbounded free-text fields; for a task that
   is exactly the bounded shape `task list` already emits. Accepted on every
   mutation and `show`/`get` in `project`, `task`, `storyboard` (+ `frame`,
-  `edge`) and `inbox`; composite payloads keep their key structure and
+  `edge`), `inbox` and `script`; composite payloads keep their key structure and
   compact their members. It changes stdout only — never exit codes, stderr or
   stored data — and default output is byte-identical to before the flag
   existed. On a `delete` it waives the full echo, which is mesa's recovery
@@ -93,6 +95,9 @@ enum Command {
     /// Send and triage global inbox items (project-update requests)
     #[command(subcommand)]
     Inbox(InboxCmd),
+    /// Author and run user-written shell scripts with declared arguments
+    #[command(subcommand)]
+    Script(ScriptCmd),
     /// Attach local files to tasks; list, inspect, fetch, and delete them
     #[command(subcommand)]
     Attachment(AttachmentCmd),
@@ -795,6 +800,184 @@ EXAMPLES
 }
 
 #[derive(Subcommand)]
+enum ScriptCmd {
+    /// Create a script; prints the full created script (`--quiet`: without
+    /// `body` and `description`)
+    ///
+    /// The body is opaque shell source, handed to `bash -c` verbatim at run
+    /// time — mesa never inspects, rewrites or splices anything into it. Give
+    /// it positionally, with --body, or from a file (`-` = stdin), so a
+    /// multi-line script can arrive from a heredoc.
+    ///
+    /// Declared arguments reach the body twice over: positionally in declared
+    /// order (`"$1"`, `"$2"`, …; `$0` is the script name) and as
+    /// MESA_ARG_<NAME> in the environment. Declaring them is mandatory — the
+    /// list is what the web form renders and what `script run` validates
+    /// against; nothing is ever parsed out of the body.
+    #[command(after_help = "\
+ARGUMENTS
+  --arg NAME:KIND[:required|:optional][=DEFAULT]   (repeatable)
+    KIND is text|number|bool|choice. Without `:required` an argument is
+    optional. A `choice` argument needs its choices, so it can only be
+    declared with --arg-json.
+  --arg-json JSON                                  (repeatable)
+    One ScriptArg object, or an array of them, in full:
+      {\"name\":\"mode\",\"kind\":\"choice\",\"required\":true,\"choices\":[\"fast\",\"slow\"]}
+    Conflicts with --arg.
+
+EXAMPLES
+  mesa script create deploy 'set -eu; echo \"deploying $MESA_ARG_ENV\"' \\
+    --arg env:text:required=staging
+  mesa script create --name tidy --body-file - < tidy.sh --project mesa
+  mesa script create fmt 'cargo fmt' --arg-json '[{\"name\":\"mode\",\
+\"kind\":\"choice\",\"required\":true,\"choices\":[\"check\",\"write\"]}]'")]
+    Create {
+        /// Unique script name (case-insensitive); how `run`/`show` resolve it
+        #[arg(value_name = "NAME", required_unless_present = "name")]
+        name_pos: Option<String>,
+        /// The shell source, run verbatim under `bash -c`
+        #[arg(
+            value_name = "BODY",
+            required_unless_present_any = ["body", "body_file"],
+        )]
+        body_pos: Option<String>,
+        /// Script name (flag form of NAME)
+        #[arg(long, conflicts_with = "name_pos")]
+        name: Option<String>,
+        /// The shell source (flag form of BODY)
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "body_pos")]
+        body: Option<String>,
+        /// Read the body from a file (`-` = stdin); conflicts with BODY/--body
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["body", "body_pos"])]
+        body_file: Option<String>,
+        /// Bind the script to a project, by id or name (default: global)
+        ///
+        /// A bound script runs in that project's `local_path`; a global one
+        /// runs in $HOME. Deleting the project un-binds rather than deletes.
+        #[arg(long)]
+        project: Option<String>,
+        /// What the script is for; free text
+        #[arg(long)]
+        description: Option<String>,
+        /// Declare one argument: NAME:KIND[:required|:optional][=DEFAULT]
+        #[arg(long = "arg", value_name = "SPEC", value_parser = parse_script_arg)]
+        args: Vec<ScriptArg>,
+        /// Declare arguments as JSON (one ScriptArg object or an array)
+        #[arg(
+            long = "arg-json",
+            value_name = "JSON",
+            value_parser = parse_script_args_json,
+            conflicts_with = "args",
+        )]
+        args_json: Vec<Vec<ScriptArg>>,
+        /// Print the script without `body`/`description` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// List scripts as a bare JSON array, by name
+    List {
+        /// Only scripts bound to this project (id or name)
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Only scripts bound to this project (id or name); flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+    },
+    /// Print one script as a full JSON object (includes body)
+    #[command(visible_alias = "get")]
+    Show {
+        /// Script id or name
+        script: String,
+        /// Print the script without `body`/`description` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Update a script; at least one field flag is required
+    ///
+    /// `--description ""` clears the description; `--project ""` un-binds the
+    /// script (making it global). `--name` and `--body` are replace-only: both
+    /// are required and non-empty, so an empty value is a validation error, not
+    /// an erasure. `--arg`/`--arg-json` REPLACE the whole declared arg list.
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Script id or name
+        script: String,
+        /// New unique name
+        #[arg(long, group = "fields")]
+        name: Option<String>,
+        /// New shell source
+        #[arg(long, allow_hyphen_values = true, group = "fields")]
+        body: Option<String>,
+        /// Read the new body from a file (`-` = stdin); conflicts with --body
+        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "body")]
+        body_file: Option<String>,
+        /// New description; pass "" to clear it
+        #[arg(long, group = "fields")]
+        description: Option<String>,
+        /// Bind to this project (id or name); pass "" to un-bind
+        #[arg(long, group = "fields")]
+        project: Option<String>,
+        /// Replace the declared arguments: NAME:KIND[:required|:optional][=DEFAULT]
+        #[arg(long = "arg", value_name = "SPEC", group = "fields", value_parser = parse_script_arg)]
+        args: Vec<ScriptArg>,
+        /// Replace the declared arguments with JSON (object or array)
+        #[arg(
+            long = "arg-json",
+            value_name = "JSON",
+            group = "fields",
+            value_parser = parse_script_args_json,
+            conflicts_with = "args",
+        )]
+        args_json: Vec<Vec<ScriptArg>>,
+        /// Print the script without `body`/`description` instead of in full
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Delete a script (no confirmation); echoes the destroyed record
+    Delete {
+        /// Script id or name
+        script: String,
+        /// Echo the destroyed script without `body`/`description`
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Run a script and print the captured run as JSON
+    ///
+    /// Prints {script_id, exit_code, stdout, stderr, truncated}. The script's
+    /// own nonzero exit is DATA: this command still exits 0, exactly like
+    /// `task execute`. Exit 1 is reserved for mesa-side failure — unknown
+    /// script, invalid values, an unusable working directory, or bash not
+    /// starting. Output is captured (not streamed) and capped at 64 KiB per
+    /// stream, with `truncated` saying so.
+    ///
+    /// The working directory is the bound project's `local_path`, or $HOME for
+    /// a global script. It is never caller-supplied.
+    ///
+    /// A value is never interpolated into a string a shell parses: it arrives
+    /// as one positional argument and as MESA_ARG_<NAME>. A declared argument
+    /// with no value on this call is genuinely unset, so `set -u` fires rather
+    /// than the body reading an empty string.
+    #[command(after_help = "\
+EXAMPLES
+  mesa script run deploy --set env=production
+  mesa script run 4 --set target=./src --set dry-run=true")]
+    Run {
+        /// Script id or name
+        script: String,
+        /// Supply one declared argument: NAME=VALUE (repeatable)
+        #[arg(long = "set", value_name = "NAME=VALUE", allow_hyphen_values = true)]
+        set: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AttachmentCmd {
     /// Attach a local file to a task; prints the full created attachment
     ///
@@ -1343,6 +1526,70 @@ fn parse_frame_shape(s: &str) -> std::result::Result<FrameShape, String> {
 }
 
 /// Comma-separated tags; empty string yields the empty set (clears tags).
+/// Parses one `--arg` spec: `NAME:KIND[:required|:optional][=DEFAULT]`.
+///
+/// Shape only. The NAME is passed through untouched — its charset and
+/// uniqueness are `Store`'s rules, so a bad name is a `validation` error at
+/// write time (exit 1) rather than a usage error here. `=` splits first, so a
+/// default may itself contain `:` or `=`.
+///
+/// A `choice` argument cannot be fully expressed here (it needs its choices);
+/// `--arg-json` is the form that can.
+fn parse_script_arg(s: &str) -> std::result::Result<ScriptArg, String> {
+    let (head, default) = match s.split_once('=') {
+        Some((head, default)) => (head, Some(default.to_string())),
+        None => (s, None),
+    };
+    let mut parts = head.split(':');
+    let name = parts.next().unwrap_or("").to_string();
+    let kind = parts
+        .next()
+        .ok_or_else(|| format!("{s:?}: expected NAME:KIND[:required][=DEFAULT]"))?;
+    let kind = ScriptArgKind::parse(kind)
+        .ok_or_else(|| format!("{kind:?} is not a script arg kind (text|number|bool|choice)"))?;
+    let required = match parts.next() {
+        None => false,
+        Some("required") => true,
+        Some("optional") => false,
+        Some(other) => return Err(format!("{other:?}: expected 'required' or 'optional'")),
+    };
+    if parts.next().is_some() {
+        return Err(format!("{s:?}: too many ':' segments"));
+    }
+    Ok(ScriptArg {
+        name,
+        label: None,
+        kind,
+        required,
+        default,
+        choices: None,
+    })
+}
+
+/// Parses one `--arg-json` value: a `ScriptArg` object, or an array of them.
+/// Deserialized straight into the real type — never a hand-written shadow of
+/// it — so the accepted shape cannot drift from `ScriptArg`.
+fn parse_script_args_json(s: &str) -> std::result::Result<Vec<ScriptArg>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(s).map_err(|e| format!("--arg-json is not valid JSON: {e}"))?;
+    if value.is_array() {
+        serde_json::from_value(value).map_err(|e| format!("--arg-json: {e}"))
+    } else {
+        serde_json::from_value(value)
+            .map(|a: ScriptArg| vec![a])
+            .map_err(|e| format!("--arg-json: {e}"))
+    }
+}
+
+/// Parses one `--set NAME=VALUE` pair. The value is everything after the first
+/// `=`, verbatim: it is data the script may read, never syntax.
+fn parse_set_value(s: &str) -> Result<(String, String)> {
+    let (name, value) = s
+        .split_once('=')
+        .ok_or_else(|| Error::Validation(format!("--set {s:?}: expected NAME=VALUE")))?;
+    Ok((name.to_string(), value.to_string()))
+}
+
 fn parse_tags(s: String) -> Vec<String> {
     s.split(',')
         .map(str::trim)
@@ -1524,6 +1771,10 @@ const QUIET_DROP_STORYBOARD: &[&str] = &["description"];
 const QUIET_DROP_FRAME: &[&str] = &["body"];
 /// Keys dropped from an `InboxItem` under `--quiet`.
 const QUIET_DROP_INBOX_ITEM: &[&str] = &["body"];
+/// Keys dropped from a `Script` under `--quiet`: both of its unbounded
+/// free-text fields. `args` stays — it is the bounded declaration the caller
+/// needs to build the next `script run`.
+const QUIET_DROP_SCRIPT: &[&str] = &["body", "description"];
 /// A `FrameEdge` has no unbounded field: quiet output equals full output.
 /// The flag is still accepted on edge subcommands, for uniformity.
 const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
@@ -1618,6 +1869,11 @@ fn print_inbox_item(item: &InboxItem, is_quiet: bool) {
     print_record(item, is_quiet, QUIET_DROP_INBOX_ITEM);
 }
 
+/// Print one script: the full record, or the record minus `body`/`description`.
+fn print_script(script: &Script, is_quiet: bool) {
+    print_record(script, is_quiet, QUIET_DROP_SCRIPT);
+}
+
 /// Print a `{storyboard, frames, edges}` view (`storyboard show`/`delete`).
 ///
 /// Under `--quiet` the container KEY SET is unchanged — only the members are
@@ -1693,6 +1949,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Task(cmd) => run_task(cmd),
         Command::Storyboard(cmd) => run_storyboard(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
+        Command::Script(cmd) => run_script_cmd(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
         Command::Serve {
@@ -2381,13 +2638,151 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
     Ok(())
 }
 
+/// Resolves a script argument — a numeric id or a script name — to the record.
+/// The same id-or-name rule every project argument follows; a script's name is
+/// unique case-insensitively precisely so this is unambiguous.
+fn resolve_script(store: &Store, arg: &str) -> Result<Script> {
+    match arg.parse::<i64>() {
+        Ok(id) => store.get_script(id),
+        Err(_) => store.find_script_by_name(arg),
+    }
+}
+
+/// The working directory for a run: the bound project's `local_path`, or
+/// `$HOME` for a global script. Never caller-supplied, and the same four-step
+/// ladder the API's terminal route walks — an unset or vanished `local_path`
+/// is a `validation` error, not a silent fallback to some other directory.
+fn script_run_cwd(store: &Store, script: &Script) -> Result<Option<String>> {
+    let Some(id) = script.project_id else {
+        return Ok(std::env::var("HOME").ok());
+    };
+    let Some(path) = store.get_project(id)?.local_path else {
+        return Err(Error::Validation(format!(
+            "project {id} has no local_path; run `mesa project resolve` in its repo \
+             or `mesa project update {id} --path <dir>`"
+        )));
+    };
+    if !Path::new(&path).is_dir() {
+        return Err(Error::Validation(format!(
+            "project {id} local_path {path:?} is not a directory on this machine"
+        )));
+    }
+    Ok(Some(path))
+}
+
+/// Collects the declared arg list from `--arg`/`--arg-json`. Empty from both
+/// means "not given" (an update leaves the list alone); `--arg-json '[]'` is
+/// how an explicit empty list is expressed.
+fn collect_script_args(
+    args: Vec<ScriptArg>,
+    args_json: Vec<Vec<ScriptArg>>,
+) -> Option<Vec<ScriptArg>> {
+    if !args.is_empty() {
+        return Some(args);
+    }
+    if !args_json.is_empty() {
+        return Some(args_json.into_iter().flatten().collect());
+    }
+    None
+}
+
+fn run_script_cmd(cmd: ScriptCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        ScriptCmd::Create {
+            name_pos,
+            body_pos,
+            name,
+            body,
+            body_file,
+            project,
+            description,
+            args,
+            args_json,
+            quiet,
+        } => {
+            // clap guarantees exactly one of each positional/flag pair, and
+            // exactly one of the three body forms.
+            let name = name.or(name_pos).unwrap();
+            let mut stdin_used = false;
+            let body =
+                resolve_field(body.or(body_pos), body_file, &mut stdin_used)?.unwrap_or_default();
+            let project = resolve_project_opt(&store, project.as_deref())?;
+            let args = collect_script_args(args, args_json).unwrap_or_default();
+            print_script(
+                &store.create_script(project, &name, description.as_deref(), &body, &args)?,
+                quiet,
+            );
+        }
+        ScriptCmd::List {
+            project_pos,
+            project,
+        } => {
+            let project = resolve_project_opt(&store, project.or(project_pos).as_deref())?;
+            print_json(&store.list_scripts(project)?);
+        }
+        ScriptCmd::Show { script, quiet } => print_script(&resolve_script(&store, &script)?, quiet),
+        ScriptCmd::Update {
+            script,
+            name,
+            body,
+            body_file,
+            description,
+            project,
+            args,
+            args_json,
+            quiet,
+        } => {
+            let id = resolve_script(&store, &script)?.id;
+            let mut stdin_used = false;
+            let body = resolve_field(body, body_file, &mut stdin_used)?;
+            // `--project ""` un-binds, the same "empty clears it" shape as
+            // `project update --parent ""`; any other value is an id or a name.
+            let project_id = match project.as_deref() {
+                None => None,
+                Some("") => Some(None),
+                Some(p) => Some(Some(resolve_project(&store, p)?)),
+            };
+            let patch = ScriptPatch {
+                project_id,
+                name,
+                description: description.map(clear_if_empty),
+                body,
+                args: collect_script_args(args, args_json),
+            };
+            print_script(&store.update_script(id, patch)?, quiet);
+        }
+        ScriptCmd::Delete { script, quiet } => {
+            let id = resolve_script(&store, &script)?.id;
+            print_script(&store.delete_script(id)?, quiet);
+        }
+        ScriptCmd::Run { script, set } => {
+            let script = resolve_script(&store, &script)?;
+            let mut values = std::collections::BTreeMap::new();
+            for pair in &set {
+                let (name, value) = parse_set_value(pair)?;
+                values.insert(name, value);
+            }
+            let cwd = script_run_cwd(&store, &script)?;
+            // The script's own exit code is DATA: a nonzero one is reported in
+            // the payload and this command still exits 0, exactly like
+            // `task execute`. Only a mesa-side failure (bad values, bash not
+            // starting) is an error.
+            let run = crate::core::scripts::run(&script, &values, cwd.as_deref())
+                .map_err(Error::Validation)?;
+            print_json(&run);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Key-set parity for the CLI's output projections.
     //!
     //! Each projection is pinned against an explicit expected key list for its
     //! record type. That list is the tripwire: add a field to `Project`,
-    //! `Storyboard`, `Frame`, `FrameEdge`, `InboxItem` or `Task` and the
+    //! `Storyboard`, `Frame`, `FrameEdge`, `InboxItem`, `Script` or `Task` and the
     //! corresponding test goes red, forcing a decision about whether the new
     //! field belongs in the quiet shape — instead of it silently appearing
     //! (derived projections) or silently vanishing (`compact`'s literal).
@@ -2537,6 +2932,26 @@ mod tests {
             project_id: Some(2),
             author: Some("user".into()),
             body: "b".into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+        }
+    }
+
+    fn sample_script() -> Script {
+        Script {
+            id: 1,
+            project_id: Some(2),
+            name: "deploy".into(),
+            description: Some("d".into()),
+            body: "echo hi".into(),
+            args: vec![ScriptArg {
+                name: "env".into(),
+                label: None,
+                kind: ScriptArgKind::Text,
+                required: true,
+                default: None,
+                choices: None,
+            }],
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
         }
@@ -2729,6 +3144,89 @@ mod tests {
             ))),
             minus(&full, QUIET_DROP_INBOX_ITEM),
         );
+    }
+
+    #[test]
+    fn script_quiet_drops_body() {
+        let full = keys(&sample_script());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "project_id",
+                "name",
+                "description",
+                "body",
+                "args",
+                "created_at",
+                "updated_at",
+            ]),
+            "Script gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(&sample_script(), QUIET_DROP_SCRIPT))),
+            minus(&full, QUIET_DROP_SCRIPT),
+        );
+    }
+
+    /// `--arg` is shape-only: the NAME passes through untouched so `Store`
+    /// stays the one place an arg name is judged.
+    #[test]
+    fn script_arg_spec_parses_kind_required_and_default() {
+        let a = parse_script_arg("env:text:required=staging").unwrap();
+        assert_eq!(a.name, "env");
+        assert_eq!(a.kind, ScriptArgKind::Text);
+        assert!(a.required);
+        assert_eq!(a.default.as_deref(), Some("staging"));
+
+        let bare = parse_script_arg("note:number").unwrap();
+        assert!(!bare.required);
+        assert_eq!(bare.default, None);
+        assert_eq!(bare.choices, None);
+
+        // A default may contain the separators — `=` splits first.
+        let tricky = parse_script_arg("cmd:text=a:b=c").unwrap();
+        assert_eq!(tricky.default.as_deref(), Some("a:b=c"));
+
+        // Shape errors are usage; a hostile NAME is not — it reaches `Store`.
+        assert!(parse_script_arg("env").is_err());
+        assert!(parse_script_arg("env:sql").is_err());
+        assert!(parse_script_arg("env:text:maybe").is_err());
+        assert_eq!(parse_script_arg("bad name:text").unwrap().name, "bad name");
+    }
+
+    /// `--arg-json` deserializes the real `ScriptArg`, so it accepts exactly
+    /// what the type does — including `choices`, which `--arg` cannot express.
+    #[test]
+    fn script_arg_json_accepts_one_object_or_an_array() {
+        let one = parse_script_args_json(
+            r#"{"name":"mode","kind":"choice","required":true,"choices":["a","b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].kind, ScriptArgKind::Choice);
+        assert_eq!(
+            one[0].choices.as_deref(),
+            Some(["a".into(), "b".into()].as_slice())
+        );
+
+        let many =
+            parse_script_args_json(r#"[{"name":"a","kind":"text","required":false}]"#).unwrap();
+        assert_eq!(many.len(), 1);
+        assert!(parse_script_args_json("[]").unwrap().is_empty());
+        assert!(parse_script_args_json("not json").is_err());
+    }
+
+    /// `--set` splits on the FIRST `=`, so a value carrying `=` survives.
+    #[test]
+    fn set_value_splits_on_the_first_equals() {
+        assert_eq!(
+            parse_set_value("q=a=b&c").unwrap(),
+            ("q".to_string(), "a=b&c".to_string())
+        );
+        assert_eq!(parse_set_value("t=; rm -rf / #").unwrap().1, "; rm -rf / #",);
+        assert!(parse_set_value("novalue").is_err());
     }
 
     /// Kept values must be untouched — `quiet` removes keys, never rewrites.

@@ -32,6 +32,9 @@ import type { ProjectGitView } from './types/ProjectGitView'
 import type { ProjectVersion } from './types/ProjectVersion'
 import type { Priority } from './types/Priority'
 import type { Project } from './types/Project'
+import type { Script } from './types/Script'
+import type { ScriptArg } from './types/ScriptArg'
+import type { ScriptRun } from './types/ScriptRun'
 import type { Status } from './types/Status'
 import type { Storyboard } from './types/Storyboard'
 import type { StoryboardEvent } from './types/StoryboardEvent'
@@ -809,4 +812,60 @@ export function updatePricing(
   pricing: Record<string, ModelRates | null>,
 ): Promise<ConfigPrice[]> {
   return request('/api/config/pricing', jsonInit('PUT', { pricing }))
+}
+
+// ---- scripts (user-authored shell) ----
+
+/** The create/patch body. A `PATCH` sends only the keys it changes; `null` on
+ * `project_id`/`description` clears that field, and `body` is sent verbatim —
+ * it is shell source, so nothing on this path may rewrite it. */
+export interface ScriptWrite {
+  project_id?: number | null
+  name?: string
+  description?: string | null
+  body?: string
+  args?: ScriptArg[]
+}
+
+/** Every script, or just one project's. Ordered by name, server-side. */
+export function listScripts(project?: number): Promise<Script[]> {
+  const qs = project !== undefined ? `?project=${project}` : ''
+  return request(`/api/scripts${qs}`)
+}
+
+export function getScript(id: number): Promise<Script> {
+  return request(`/api/scripts/${id}`)
+}
+
+/**
+ * Authoring a script is authoring a program mesa will execute, so all three
+ * mutations are loopback-only in *both* serve modes (docs/scripts.md) — a 403
+ * here is a LAN peer, not a bug. A duplicate name is 409 `conflict`.
+ */
+export function createScript(body: ScriptWrite): Promise<Script> {
+  return request('/api/scripts', jsonInit('POST', body))
+}
+
+export function updateScript(id: number, body: ScriptWrite): Promise<Script> {
+  return request(`/api/scripts/${id}`, jsonInit('PATCH', body))
+}
+
+/** Returns the destroyed record — the recoverable delete echo. */
+export function deleteScript(id: number): Promise<Script> {
+  return request(`/api/scripts/${id}`, jsonDelete())
+}
+
+/**
+ * Runs the script with `values` (declared arguments only; a blank one is
+ * omitted so its default fills in — see `scriptDraft.ts::valuesFor`). Resolves
+ * for a **failing** script too: a nonzero `exit_code` is the script's own
+ * result, carried in the record, not a rejected promise. Rejects only for a
+ * validation error, a missing script, or bash failing to spawn (502
+ * `unavailable`). Runs are not persisted.
+ */
+export function runScript(
+  id: number,
+  values: Record<string, string>,
+): Promise<ScriptRun> {
+  return request(`/api/scripts/${id}/run`, jsonInit('POST', { values }))
 }

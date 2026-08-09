@@ -40,8 +40,9 @@ use crate::core::{
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, MesaVersion, ModelRates, NextResult, Priority,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    ProjectVersion, Status, Store, StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, config, files, git, hooks, version,
+    ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, StoryboardPatch, Task,
+    TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, scripts,
+    version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -813,6 +814,18 @@ fn router(state: AppState) -> Router {
             "/api/inbox/{id}",
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
+        // Scripts: user-authored shell run from a generated form. A script
+        // body is a program mesa executes, so authoring is the strictest gate
+        // in the file (`require_local_path_write`, loopback-only in BOTH
+        // modes) while reading and *running* share the agents' code-execution
+        // gate — a LAN peer may trigger a run but must never choose the
+        // program. See `docs/scripts.md`.
+        .route("/api/scripts", get(list_scripts).post(create_script))
+        .route(
+            "/api/scripts/{id}",
+            get(show_script).patch(update_script).delete(delete_script),
+        )
+        .route("/api/scripts/{id}/run", post(run_script))
         // Agents: live Claude Code sessions under a project's folder. All
         // four routes share `require_agent_access` (terminal access = code
         // execution): loopback-only in default mode, LAN-page-authenticated
@@ -1950,6 +1963,242 @@ async fn assign_inbox(
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_inbox_item(id)?).into_response())
+}
+
+// ---- scripts (user-authored shell) ----
+
+#[derive(Deserialize)]
+struct ScriptQuery {
+    #[serde(default)]
+    project: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ScriptCreate {
+    name: String,
+    /// The shell source. Required — a script without a body is not a script.
+    body: String,
+    #[serde(default)]
+    project_id: Option<i64>,
+    #[serde(default)]
+    description: Option<String>,
+    /// Declared arguments, in the order they reach the body as `$1`, `$2`, ….
+    /// Absent means none.
+    #[serde(default)]
+    args: Vec<ScriptArg>,
+}
+
+#[derive(Deserialize)]
+struct ScriptUpdate {
+    /// `null` un-binds the script from its project (making it global); an
+    /// omitted key leaves the binding alone — the `double_option` convention
+    /// every other PATCH body here uses.
+    #[serde(default, deserialize_with = "double_option")]
+    project_id: Option<Option<i64>>,
+    /// Replace-only, same `double_option` treatment as `body`: a script's name
+    /// is how the CLI resolves it, so `null` is an error, not an erasure.
+    #[serde(default, deserialize_with = "double_option")]
+    name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    description: Option<Option<String>>,
+    /// Replace-only. A `double_option` like `TaskUpdate::description` and for
+    /// the same reason: the body *is* the script, so an explicit `null` must
+    /// be *rejected* rather than silently read as "omitted".
+    #[serde(default, deserialize_with = "double_option")]
+    body: Option<Option<String>>,
+    /// Replaces the whole declared arg list.
+    #[serde(default)]
+    args: Option<Vec<ScriptArg>>,
+}
+
+#[derive(Deserialize)]
+struct ScriptRunBody {
+    /// The form's values, keyed by declared arg name. Absent means none —
+    /// `core::scripts::validate_values` decides whether that is valid.
+    #[serde(default)]
+    values: std::collections::BTreeMap<String, String>,
+}
+
+async fn list_scripts(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<ScriptQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_scripts(q.project)?).into_response())
+}
+
+/// Authoring a script is choosing a program mesa will run, so this and its two
+/// sibling mutations are loopback-only in **both** serve modes — the
+/// `/api/config` posture (see `update_config`), for the same reason.
+async fn create_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<ScriptCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let script = store.create_script(
+        body.project_id,
+        &body.name,
+        body.description.as_deref(),
+        &body.body,
+        &body.args,
+    )?;
+    Ok((StatusCode::CREATED, Json(script)).into_response())
+}
+
+async fn show_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_script(id)?).into_response())
+}
+
+async fn update_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<ScriptUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    let Json(body) = body?;
+    // `name` and `body` are the script's identity and its whole point; an
+    // explicit `null` for either is rejected rather than read as "omitted",
+    // the same way `update_task` treats a task's description — so the API and
+    // `mesa script update --body ""` fail identically.
+    let (name, source) = match (body.name, body.body) {
+        (Some(None), _) => {
+            return Err(Error::Validation(
+                "name cannot be cleared; it is how a script is resolved".into(),
+            )
+            .into());
+        }
+        (_, Some(None)) => {
+            return Err(
+                Error::Validation("body cannot be cleared; it is the script".into()).into(),
+            );
+        }
+        (name, source) => (name.flatten(), source.flatten()),
+    };
+    let patch = ScriptPatch {
+        project_id: body.project_id,
+        name,
+        description: body.description,
+        body: source,
+        args: body.args,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_script(id, patch)?).into_response())
+}
+
+async fn delete_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    let mut store = state.store.lock().unwrap();
+    // The full destroyed record is the echo that stands in for the
+    // confirmation prompt mesa deliberately does not have.
+    Ok(Json(store.delete_script(id)?).into_response())
+}
+
+/// Runs one script with the supplied values and returns the captured outcome.
+///
+/// Triggering local code execution is the agents' capability class, so this
+/// shares `require_agent_access` with them (and with `execute_task`) rather
+/// than the authoring gate: a LAN peer may run what is already stored, it just
+/// cannot decide what that is.
+///
+/// The script's own nonzero exit is **data** in a 200 response, exactly like a
+/// `HookRun`; a value that fails validation is 422, and a bash that cannot be
+/// spawned is 502 `unavailable`.
+async fn run_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<ScriptRunBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let script = {
+        let store = state.store.lock().unwrap();
+        store.get_script(id)?
+    };
+    let cwd = script_cwd(&state, &script)?;
+    // `run` validates too (it is the same pure `core` function the CLI calls,
+    // so the two cannot diverge), but its `Err` channel is "bash would not
+    // start" → 502. Calling it here first is what separates a client mistake
+    // about the declared args (422) from an execution failure.
+    scripts::validate_values(&script.args, &body.values).map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message,
+    })?;
+    // An arbitrary blocking subprocess with no timeout; keep it off the async
+    // workers, like the hook and agents shell-outs.
+    let run =
+        tokio::task::spawn_blocking(move || scripts::run(&script, &body.values, cwd.as_deref()))
+            .await
+            .map_err(|e| agents_unavailable(format!("script run panicked: {e}")))?
+            .map_err(agents_unavailable)?;
+    Ok(Json(run).into_response())
+}
+
+/// The message every script mutation refuses a non-loopback peer with. One
+/// constant so the three cannot drift apart.
+const SCRIPT_AUTHORING_LOOPBACK: &str =
+    "authoring scripts is loopback-only; connect from this machine";
+
+/// The working directory a run happens in, resolved **server-side** from the
+/// script's own project binding — never client-supplied. A bound project uses
+/// its `local_path` (the terminal/agents ladder: no path, or a path that is not
+/// a directory here, is 422 `validation`); an unbound script runs in `$HOME`,
+/// like an inbox-watcher dispatch.
+fn script_cwd(state: &AppState, script: &Script) -> Result<Option<String>, ApiError> {
+    let Some(project_id) = script.project_id else {
+        return Ok(
+            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+        );
+    };
+    let local_path = state
+        .store
+        .lock()
+        .unwrap()
+        .get_project(project_id)?
+        .local_path;
+    let Some(path) = local_path else {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "project {project_id} has no local_path; run `mesa project resolve` in its repo \
+                 or `mesa project update {project_id} --path <dir>`"
+            ),
+        });
+    };
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "project {project_id} local_path {path:?} is not a directory on this machine"
+            ),
+        });
+    }
+    Ok(Some(path))
 }
 
 // ---- agents (live Claude Code sessions under a project's folder) ----
@@ -6140,5 +6389,301 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         );
 
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    // --- scripts: /api/scripts (mesa task 785) ------------------------------
+    //
+    // CRUD and run semantics over HTTP are `scripts/scripts-check.sh`'s job.
+    // What only lives here is the peer-address-sensitive half: the gate
+    // *asymmetry* (a LAN page may run a stored script but may never author
+    // one), which a same-machine curl cannot exercise, plus the server-side
+    // cwd resolution and the body shapes serde decides.
+
+    fn new_script(state: &AppState, project_id: Option<i64>, body: &str) -> Script {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_script(project_id, "s", None, body, &[])
+            .unwrap()
+    }
+
+    async fn run_one(state: &AppState, id: i64) -> ApiResult<Response> {
+        run_script(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Ok(Json(ScriptRunBody {
+                values: std::collections::BTreeMap::new(),
+            })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn script_mutations_reject_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        assert!(!state.lan);
+        let script = new_script(&state, None, "true");
+
+        let created = create_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Ok(Json(ScriptCreate {
+                name: "evil".into(),
+                body: "echo pwned".into(),
+                project_id: None,
+                description: None,
+                args: vec![],
+            })),
+        )
+        .await;
+        assert!(created.unwrap_err().status.is_client_error());
+        let updated = update_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+            Ok(Json(ScriptUpdate {
+                project_id: None,
+                name: None,
+                description: None,
+                body: Some(Some("echo pwned".into())),
+                args: None,
+            })),
+        )
+        .await;
+        assert!(updated.unwrap_err().status.is_client_error());
+        let deleted = delete_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+        )
+        .await;
+        assert!(deleted.unwrap_err().status.is_client_error());
+
+        // None of the three may have touched the store.
+        let stored = state.store.lock().unwrap().list_scripts(None).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].body, "true");
+    }
+
+    /// The load-bearing asymmetry: under `--lan`, a legitimate LAN page passes
+    /// `require_agent_access` and may *run* a stored script, but authoring is
+    /// loopback-only in both modes — a LAN peer must never choose the program.
+    #[tokio::test]
+    async fn lan_page_may_run_a_script_but_may_never_author_one() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let script = new_script(&state, None, "exit 0");
+
+        let ran = run_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(script.id),
+            Ok(Json(ScriptRunBody {
+                values: std::collections::BTreeMap::new(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.status(), StatusCode::OK);
+
+        let authored = create_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers,
+            Ok(Json(ScriptCreate {
+                name: "evil".into(),
+                body: "echo pwned".into(),
+                project_id: None,
+                description: None,
+                args: vec![],
+            })),
+        )
+        .await;
+        assert!(authored.unwrap_err().status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn script_reads_and_run_reject_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        let script = new_script(&state, None, "true");
+        let listed = list_scripts(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Query(ScriptQuery { project: None }),
+        )
+        .await;
+        assert!(listed.unwrap_err().status.is_client_error());
+        let shown = show_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+        )
+        .await;
+        assert!(shown.unwrap_err().status.is_client_error());
+        let ran = run_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+            Ok(Json(ScriptRunBody {
+                values: std::collections::BTreeMap::new(),
+            })),
+        )
+        .await;
+        assert!(ran.unwrap_err().status.is_client_error());
+    }
+
+    /// A script's own nonzero exit is data in a 200, exactly like a `HookRun`.
+    #[tokio::test]
+    async fn run_script_reports_a_nonzero_exit_as_data() {
+        let (_dir, state) = test_state();
+        let script = new_script(&state, None, "echo out; echo err >&2; exit 3");
+        let resp = run_one(&state, script.id).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["exit_code"], 3);
+        assert_eq!(body["stdout"], "out\n");
+        assert_eq!(body["stderr"], "err\n");
+        assert_eq!(body["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn run_script_rejects_bad_values_with_422_not_502() {
+        let (_dir, state) = test_state();
+        let script = state
+            .store
+            .lock()
+            .unwrap()
+            .create_script(
+                None,
+                "needy",
+                None,
+                "true",
+                &[ScriptArg {
+                    name: "target".into(),
+                    label: None,
+                    kind: crate::core::ScriptArgKind::Text,
+                    required: true,
+                    default: None,
+                    choices: None,
+                }],
+            )
+            .unwrap();
+
+        // Missing a required argument, and an undeclared key: both are the
+        // client's mistake about the declared args, not a spawn failure.
+        for values in [
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([("nope".to_string(), "x".to_string())]),
+        ] {
+            let err = run_script(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(script.id),
+                Ok(Json(ScriptRunBody { values })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.code, "validation");
+        }
+    }
+
+    /// cwd comes from the script's own project binding, resolved server-side;
+    /// an unbound script runs in `$HOME`.
+    #[tokio::test]
+    async fn run_script_cwd_is_the_bound_projects_local_path_else_home() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = new_project(&state, Some(root.to_str().unwrap()));
+        let canon_root = std::fs::canonicalize(&root).unwrap();
+
+        let bound = new_script(&state, Some(project), "pwd");
+        let body = json_body(run_one(&state, bound.id).await.unwrap()).await;
+        assert_eq!(
+            std::fs::canonicalize(body["stdout"].as_str().unwrap().trim()).unwrap(),
+            canon_root
+        );
+
+        state.store.lock().unwrap().delete_script(bound.id).unwrap();
+        let unbound = new_script(&state, None, "pwd");
+        let body = json_body(run_one(&state, unbound.id).await.unwrap()).await;
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_owned();
+        assert_eq!(
+            std::fs::canonicalize(body["stdout"].as_str().unwrap().trim()).unwrap(),
+            std::fs::canonicalize(home).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_script_is_422_when_the_bound_project_has_no_usable_local_path() {
+        let (dir, state) = test_state();
+        let unset = new_project(&state, None);
+        let gone = new_project(&state, Some(dir.path().join("gone").to_str().unwrap()));
+        for project in [unset, gone] {
+            let script = state
+                .store
+                .lock()
+                .unwrap()
+                .create_script(Some(project), &format!("s{project}"), None, "pwd", &[])
+                .unwrap();
+            let err = run_one(&state, script.id).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{project}");
+            assert_eq!(err.code, "validation", "{project}");
+        }
+    }
+
+    /// The PATCH body's three-state fields: `null` un-binds a project and
+    /// clears a description, while an omitted key changes nothing. An
+    /// incomplete `ScriptArg` is a serde error, so it lands as 422 without
+    /// reaching `Store`.
+    #[test]
+    fn script_update_body_distinguishes_absent_null_and_value() {
+        let parsed: ScriptUpdate =
+            serde_json::from_str(r#"{"project_id":null,"description":null}"#).unwrap();
+        assert_eq!(parsed.project_id, Some(None));
+        assert_eq!(parsed.description, Some(None));
+        assert_eq!(parsed.body, None);
+        let parsed: ScriptUpdate = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.project_id, None);
+        assert_eq!(parsed.description, None);
+        assert_eq!(parsed.name, None);
+        assert!(serde_json::from_str::<ScriptUpdate>(r#"{"args":[{"name":"a"}]}"#).is_err());
+    }
+
+    /// Clearing the two identity fields is a `validation` error, not an
+    /// erasure — and it is rejected before the store is touched.
+    #[tokio::test]
+    async fn script_update_refuses_to_clear_name_or_body() {
+        let (_dir, state) = test_state();
+        let script = new_script(&state, None, "true");
+        for payload in [r#"{"name":null}"#, r#"{"body":null}"#] {
+            let body: ScriptUpdate = serde_json::from_str(payload).unwrap();
+            let err = update_script(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(script.id),
+                Ok(Json(body)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{payload}");
+            assert_eq!(err.code, "validation", "{payload}");
+        }
+        let stored = state.store.lock().unwrap().get_script(script.id).unwrap();
+        assert_eq!(stored, script);
     }
 }

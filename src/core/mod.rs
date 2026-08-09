@@ -5,14 +5,15 @@ pub mod config;
 pub mod files;
 pub mod git;
 pub mod hooks;
+pub mod scripts;
 mod store;
 mod types;
 pub mod usage;
 pub mod version;
 
 pub use store::{
-    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, ProjectPatch, Result, Store,
-    StoryboardPatch, TaskPatch, default_db_path,
+    EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, ProjectPatch, Result,
+    ScriptPatch, Store, StoryboardPatch, TaskPatch, default_db_path,
 };
 pub use types::{
     AgentSession, AgentSpawned, AnchorSide, Attachment, CcAgentStat, CcDashboard, CcDayPoint,
@@ -22,6 +23,7 @@ pub use types::{
     DiagramType, DirEntry, DirListing, FileContentView, FileTreeEntry, Frame, FrameEdge,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
     HookRun, InboxItem, MesaVersion, ModelRates, Priority, Project, ProjectAgents, ProjectFileTree,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Status, Storyboard,
-    StoryboardEvent, StoryboardView, Task, TaskSummary, Waypoint, task_name,
+    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Script, ScriptArg,
+    ScriptArgKind, ScriptRun, Status, Storyboard, StoryboardEvent, StoryboardView, Task,
+    TaskSummary, Waypoint, task_name,
 };

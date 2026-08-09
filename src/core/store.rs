@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
     AnchorSide, Attachment, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Priority,
-    Project, Status, Storyboard, StoryboardEvent, StoryboardView, Task, TaskEvent, Waypoint,
-    task_name,
+    Project, Script, ScriptArg, ScriptArgKind, Status, Storyboard, StoryboardEvent, StoryboardView,
+    Task, TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -414,6 +414,21 @@ const MIGRATIONS: &[&str] = &[
     // never get a second chance. One-shot and additive: `cc_files` holds
     // cursors, not data.
     "DELETE FROM cc_files;",
+    // Task 785: user-authored shell scripts. `project_id` is `ON DELETE SET
+    // NULL` (as the inbox's is, deliberately not CASCADE): deleting a project
+    // must un-bind the user's scripts, never destroy them. `args` holds a JSON
+    // array of `ScriptArg` — the column is a `Store` implementation detail, the
+    // struct exposes a typed `Vec`.
+    "CREATE TABLE scripts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        name        TEXT NOT NULL,
+        description TEXT,
+        body        TEXT NOT NULL,
+        args        TEXT NOT NULL DEFAULT '[]',
+        created_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z',
+        updated_at  TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'
+    );",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -532,6 +547,104 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
+}
+
+const SCRIPT_COLUMNS: &str =
+    "id, project_id, name, description, body, args, created_at, updated_at";
+
+/// The `args` column is stored JSON; the struct exposes the typed list, so the
+/// encode/decode pair lives here and nowhere else. A row whose JSON is
+/// unreadable is a corrupt db, surfaced as a conversion failure rather than
+/// silently becoming an empty arg list (which would make the run form wrong).
+fn row_to_script(row: &rusqlite::Row<'_>) -> rusqlite::Result<Script> {
+    let args: String = row.get(5)?;
+    let args: Vec<ScriptArg> = serde_json::from_str(&args).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(Script {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        description: row.get(3)?,
+        body: row.get(4)?,
+        args,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+/// Longest allowed [`ScriptArg::name`]. It becomes an `MESA_ARG_*` env-var
+/// suffix, so it is bounded for the same reason its charset is.
+const SCRIPT_ARG_NAME_MAX: usize = 64;
+
+fn validate_script_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Validation(
+            "script name is required and may not be empty".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_script_body(body: &str) -> Result<String> {
+    if body.trim().is_empty() {
+        return Err(Error::Validation(
+            "script body is required and may not be empty".into(),
+        ));
+    }
+    // Stored verbatim (leading indentation and trailing newline included) —
+    // trimming is only how emptiness is judged, never what gets saved.
+    Ok(body.to_string())
+}
+
+/// An arg name has to survive becoming an environment-variable suffix, so it
+/// is constrained here rather than at the point of use: `^[A-Za-z_][A-Za-z0-9_-]*$`,
+/// bounded length, unique within the script (case-insensitively — `-`→`_` and
+/// upper-casing make `a-b` and `A_B` the same variable).
+fn validate_script_args(args: &[ScriptArg]) -> Result<()> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for arg in args {
+        let name = &arg.name;
+        let mut chars = name.chars();
+        let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
+        let tail_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !head_ok || !tail_ok || name.len() > SCRIPT_ARG_NAME_MAX {
+            return Err(Error::Validation(format!(
+                "invalid script argument name {name:?}: use up to {SCRIPT_ARG_NAME_MAX} \
+                 characters matching ^[A-Za-z_][A-Za-z0-9_-]*$"
+            )));
+        }
+        let key = name.to_ascii_uppercase().replace('-', "_");
+        if !seen.insert(key) {
+            return Err(Error::Validation(format!(
+                "duplicate script argument name {name:?}: names are unique within a script"
+            )));
+        }
+        match arg.kind {
+            ScriptArgKind::Choice => {
+                if arg.choices.as_ref().is_none_or(|c| c.is_empty()) {
+                    return Err(Error::Validation(format!(
+                        "script argument {name:?} is a choice and needs a non-empty choices list"
+                    )));
+                }
+            }
+            _ => {
+                if arg.choices.is_some() {
+                    return Err(Error::Validation(format!(
+                        "script argument {name:?} is a {} and may not carry choices",
+                        arg.kind.as_str()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_script_args(args: &[ScriptArg]) -> Result<String> {
+    serde_json::to_string(args)
+        .map_err(|e| Error::Validation(format!("cannot encode script arguments: {e}")))
 }
 
 const ATTACHMENT_COLUMNS: &str =
@@ -804,6 +917,23 @@ pub struct StoryboardPatch {
     pub title: Option<String>,
     /// `Some(None)` clears the description.
     pub description: Option<Option<String>>,
+}
+
+/// Fields to change on a script; `None` means leave unchanged (task 785).
+#[derive(Debug, Default, Clone)]
+pub struct ScriptPatch {
+    /// `Some(None)` un-binds the script from its project (making it global);
+    /// `Some(Some(id))` binds it. An unknown id is a `validation` error.
+    pub project_id: Option<Option<i64>>,
+    /// Replace-only: a script's name is how the CLI resolves it, so an empty
+    /// replacement is a `validation` error, not an erasure.
+    pub name: Option<String>,
+    /// `Some(None)` clears the description.
+    pub description: Option<Option<String>>,
+    /// Replace-only and non-empty — the body *is* the script.
+    pub body: Option<String>,
+    /// Replaces the full declared arg list.
+    pub args: Option<Vec<ScriptArg>>,
 }
 
 /// A new frame to add to a storyboard. Coordinates and size are caller-supplied
@@ -2872,6 +3002,179 @@ impl Store {
         let item = self.get_inbox_item(id)?;
         self.conn.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
         Ok(item)
+    }
+
+    // ---- scripts (user-authored shell) ----
+
+    /// Stores a new script. The single write path for scripts: `name` and
+    /// `body` are required and non-empty, the name is unique
+    /// (case-insensitively — it is a CLI selector, so two scripts differing
+    /// only in case would be unresolvable), the declared args are checked for
+    /// shape, and an unknown `project_id` is a `validation` error (mirroring
+    /// `assign_inbox_item`). Nothing about the body is inspected: it is opaque
+    /// shell source that `core::scripts` hands to `bash` verbatim.
+    pub fn create_script(
+        &mut self,
+        project_id: Option<i64>,
+        name: &str,
+        description: Option<&str>,
+        body: &str,
+        args: &[ScriptArg],
+    ) -> Result<Script> {
+        let name = validate_script_name(name)?;
+        let body = validate_script_body(body)?;
+        validate_script_args(args)?;
+        self.ensure_script_project(project_id)?;
+        self.ensure_script_name_free(&name, None)?;
+        let encoded = encode_script_args(args)?;
+        self.conn.execute(
+            "INSERT INTO scripts (project_id, name, description, body, args, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))",
+            (project_id, &name, description, &body, &encoded),
+        )?;
+        self.get_script(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_script(&self, id: i64) -> Result<Script> {
+        self.conn
+            .query_row(
+                &format!("SELECT {SCRIPT_COLUMNS} FROM scripts WHERE id = ?1"),
+                [id],
+                row_to_script,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("script {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Case-insensitive exact match, mirroring [`Store::find_project_by_name`]
+    /// — this is how `mesa script <id-or-name>` resolves a name. The `conflict`
+    /// arm cannot fire while the uniqueness rule holds; it is kept so a db that
+    /// somehow carries duplicates says so instead of picking one silently.
+    pub fn find_script_by_name(&self, name: &str) -> Result<Script> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SCRIPT_COLUMNS} FROM scripts WHERE name = ?1 COLLATE NOCASE ORDER BY id"
+        ))?;
+        let matches = stmt
+            .query_map([name], row_to_script)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match matches.len() {
+            0 => Err(Error::NotFound(format!(
+                "no script named {name:?}; pass a script id or an existing name \
+                 (see `mesa script list`)"
+            ))),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            _ => Err(Error::Conflict(format!(
+                "{} scripts are named {name:?} (ids {}); use the id",
+                matches.len(),
+                matches
+                    .iter()
+                    .map(|s| s.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// Lists scripts by name (case-insensitively), `id` breaking ties. With
+    /// `project` given, only that project's scripts; otherwise every script,
+    /// global and bound alike.
+    pub fn list_scripts(&self, project: Option<i64>) -> Result<Vec<Script>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SCRIPT_COLUMNS} FROM scripts \
+             WHERE (?1 IS NULL OR project_id = ?1) ORDER BY name COLLATE NOCASE, id"
+        ))?;
+        let rows = stmt.query_map([project], row_to_script)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Applies a patch. Every rule `create_script` enforces is re-enforced
+    /// here — an update is the other way a bad record could get in.
+    pub fn update_script(&mut self, id: i64, patch: ScriptPatch) -> Result<Script> {
+        let current = self.get_script(id)?;
+        let mut next = current.clone();
+        if let Some(project_id) = patch.project_id {
+            self.ensure_script_project(project_id)?;
+            next.project_id = project_id;
+        }
+        if let Some(name) = &patch.name {
+            next.name = validate_script_name(name)?;
+            self.ensure_script_name_free(&next.name, Some(id))?;
+        }
+        if let Some(description) = &patch.description {
+            next.description = description.clone();
+        }
+        if let Some(body) = &patch.body {
+            next.body = validate_script_body(body)?;
+        }
+        if let Some(args) = &patch.args {
+            validate_script_args(args)?;
+            next.args = args.clone();
+        }
+        let encoded = encode_script_args(&next.args)?;
+        self.conn.execute(
+            "UPDATE scripts SET project_id = ?1, name = ?2, description = ?3, body = ?4, \
+             args = ?5, updated_at = datetime('now') WHERE id = ?6",
+            (
+                next.project_id,
+                &next.name,
+                &next.description,
+                &next.body,
+                &encoded,
+                id,
+            ),
+        )?;
+        self.get_script(id)
+    }
+
+    /// Deletes a script; returns the destroyed record (the recoverable echo —
+    /// there is no history table for scripts, and deletes carry no prompt).
+    pub fn delete_script(&mut self, id: i64) -> Result<Script> {
+        let script = self.get_script(id)?;
+        self.conn
+            .execute("DELETE FROM scripts WHERE id = ?1", [id])?;
+        Ok(script)
+    }
+
+    /// A script may be global (`None`) or bound to a project that exists;
+    /// an unknown id is `validation`, not `not_found`, because it arrives as a
+    /// field of the record being written.
+    fn ensure_script_project(&self, project_id: Option<i64>) -> Result<()> {
+        let Some(project_id) = project_id else {
+            return Ok(());
+        };
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(format!("project {project_id} not found")));
+        }
+        Ok(())
+    }
+
+    /// Name uniqueness, case-insensitive to match the lookup. `except` is the
+    /// row being updated, so re-saving a script under its own name is a no-op
+    /// rather than a conflict with itself.
+    fn ensure_script_name_free(&self, name: &str, except: Option<i64>) -> Result<()> {
+        let clash: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM scripts WHERE name = ?1 COLLATE NOCASE AND id IS NOT ?2 LIMIT 1",
+                (name, except),
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = clash {
+            return Err(Error::Conflict(format!(
+                "script {other} is already named {name:?}; script names are unique"
+            )));
+        }
+        Ok(())
     }
 
     // ---- cc telemetry (the single write path for `cc_*` tables) ----
@@ -6880,6 +7183,301 @@ mod tests {
         assert!(err.to_string().contains("999"));
         // The failed assignment left the item untouched in the inbox.
         assert!(store.get_inbox_item(item.id).is_ok());
+    }
+
+    // ---- scripts (user-authored shell) ----
+
+    fn script_arg(name: &str, kind: ScriptArgKind) -> ScriptArg {
+        ScriptArg {
+            name: name.to_string(),
+            label: None,
+            kind,
+            required: false,
+            default: None,
+            choices: match kind {
+                ScriptArgKind::Choice => Some(vec!["a".into(), "b".into()]),
+                _ => None,
+            },
+        }
+    }
+
+    #[test]
+    fn script_create_show_delete_round_trip() {
+        let (mut store, _dir) = temp_store();
+        let args = vec![
+            script_arg("target", ScriptArgKind::Text),
+            script_arg("mode", ScriptArgKind::Choice),
+        ];
+        let s = store
+            .create_script(None, "deploy", Some("ship it"), "echo \"$1\"\n", &args)
+            .unwrap();
+        assert_eq!(s.name, "deploy");
+        assert_eq!(s.project_id, None);
+        assert_eq!(s.body, "echo \"$1\"\n");
+        // The args round-trip through the JSON column as a typed list.
+        assert_eq!(s.args, args);
+        assert_eq!(store.get_script(s.id).unwrap(), s);
+
+        // Delete echoes the full destroyed record.
+        let destroyed = store.delete_script(s.id).unwrap();
+        assert_eq!(destroyed, s);
+        assert!(matches!(store.get_script(s.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn script_requires_a_name_and_a_body() {
+        let (mut store, _dir) = temp_store();
+        for name in ["", "   "] {
+            assert!(matches!(
+                store.create_script(None, name, None, "echo hi", &[]),
+                Err(Error::Validation(_))
+            ));
+        }
+        for body in ["", "  \n "] {
+            assert!(matches!(
+                store.create_script(None, "s", None, body, &[]),
+                Err(Error::Validation(_))
+            ));
+        }
+        // The name is stored trimmed; the body is stored verbatim.
+        let s = store
+            .create_script(None, "  spaced  ", None, "  echo hi\n", &[])
+            .unwrap();
+        assert_eq!(s.name, "spaced");
+        assert_eq!(s.body, "  echo hi\n");
+    }
+
+    #[test]
+    fn script_names_are_unique_case_insensitively() {
+        let (mut store, _dir) = temp_store();
+        let first = store
+            .create_script(None, "deploy", None, "true", &[])
+            .unwrap();
+        assert!(matches!(
+            store.create_script(None, "Deploy", None, "true", &[]),
+            Err(Error::Conflict(_))
+        ));
+        // A second script cannot take the name; the first can keep its own.
+        let other = store
+            .create_script(None, "other", None, "true", &[])
+            .unwrap();
+        assert!(matches!(
+            store.update_script(
+                other.id,
+                ScriptPatch {
+                    name: Some("DEPLOY".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Conflict(_))
+        ));
+        let same = store
+            .update_script(
+                first.id,
+                ScriptPatch {
+                    name: Some("deploy".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(same.name, "deploy");
+    }
+
+    #[test]
+    fn script_arg_names_are_constrained_and_unique() {
+        let (mut store, _dir) = temp_store();
+        for bad in ["", "1st", "has space", "a$b", &"x".repeat(65)] {
+            let args = vec![script_arg(bad, ScriptArgKind::Text)];
+            let err = store
+                .create_script(None, "s", None, "true", &args)
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{bad:?} was accepted");
+        }
+        // `a-b` and `A_B` collapse onto the same MESA_ARG_A_B variable.
+        let dupes = vec![
+            script_arg("a-b", ScriptArgKind::Text),
+            script_arg("A_B", ScriptArgKind::Text),
+        ];
+        assert!(matches!(
+            store.create_script(None, "s", None, "true", &dupes),
+            Err(Error::Validation(_))
+        ));
+        let ok = vec![
+            script_arg("_leading", ScriptArgKind::Text),
+            script_arg("dry-run", ScriptArgKind::Text),
+        ];
+        assert!(store.create_script(None, "s", None, "true", &ok).is_ok());
+    }
+
+    #[test]
+    fn script_choice_args_need_choices_and_others_may_not_carry_them() {
+        let (mut store, _dir) = temp_store();
+        let mut choice = script_arg("mode", ScriptArgKind::Choice);
+        choice.choices = None;
+        assert!(matches!(
+            store.create_script(None, "s", None, "true", &[choice.clone()]),
+            Err(Error::Validation(_))
+        ));
+        choice.choices = Some(vec![]);
+        assert!(matches!(
+            store.create_script(None, "s", None, "true", &[choice]),
+            Err(Error::Validation(_))
+        ));
+        for kind in [
+            ScriptArgKind::Text,
+            ScriptArgKind::Number,
+            ScriptArgKind::Bool,
+        ] {
+            let mut arg = script_arg("x", kind);
+            arg.choices = Some(vec!["a".into()]);
+            assert!(
+                matches!(
+                    store.create_script(None, "s", None, "true", &[arg]),
+                    Err(Error::Validation(_))
+                ),
+                "{kind:?} was allowed to carry choices"
+            );
+        }
+    }
+
+    #[test]
+    fn script_project_must_exist_and_unbinds_on_project_delete() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        assert!(matches!(
+            store.create_script(Some(999), "s", None, "true", &[]),
+            Err(Error::Validation(_))
+        ));
+        let s = store
+            .create_script(Some(p.id), "s", None, "true", &[])
+            .unwrap();
+        assert_eq!(s.project_id, Some(p.id));
+        // ON DELETE SET NULL, not CASCADE: the script survives its project.
+        store.delete_project(p.id).unwrap();
+        assert_eq!(store.get_script(s.id).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn find_script_by_name_is_case_insensitive_and_hints_on_a_miss() {
+        let (mut store, _dir) = temp_store();
+        let s = store
+            .create_script(None, "Deploy", None, "true", &[])
+            .unwrap();
+        assert_eq!(store.find_script_by_name("deploy").unwrap().id, s.id);
+        assert_eq!(store.find_script_by_name("DEPLOY").unwrap().id, s.id);
+        let err = store.find_script_by_name("nope").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+        assert!(err.to_string().contains("mesa script list"), "{err}");
+    }
+
+    #[test]
+    fn list_scripts_orders_by_name_and_scopes_to_a_project() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        store
+            .create_script(None, "zeta", None, "true", &[])
+            .unwrap();
+        store
+            .create_script(Some(p.id), "Alpha", None, "true", &[])
+            .unwrap();
+        store.create_script(None, "mid", None, "true", &[]).unwrap();
+        let names = |v: Vec<Script>| v.into_iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(
+            names(store.list_scripts(None).unwrap()),
+            vec!["Alpha", "mid", "zeta"]
+        );
+        assert_eq!(
+            names(store.list_scripts(Some(p.id)).unwrap()),
+            vec!["Alpha"]
+        );
+    }
+
+    #[test]
+    fn update_script_patches_only_what_it_names() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let s = store
+            .create_script(
+                Some(p.id),
+                "s",
+                Some("desc"),
+                "true",
+                &[script_arg("a", ScriptArgKind::Text)],
+            )
+            .unwrap();
+
+        // An empty patch changes nothing.
+        let same = store.update_script(s.id, ScriptPatch::default()).unwrap();
+        assert_eq!(same.name, s.name);
+        assert_eq!(same.body, s.body);
+        assert_eq!(same.args, s.args);
+        assert_eq!(same.project_id, Some(p.id));
+
+        // Some(None) clears the clearable fields; the rest are untouched.
+        let cleared = store
+            .update_script(
+                s.id,
+                ScriptPatch {
+                    project_id: Some(None),
+                    description: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.project_id, None);
+        assert_eq!(cleared.description, None);
+        assert_eq!(cleared.body, "true");
+
+        // The replace-only fields re-run every create rule.
+        assert!(matches!(
+            store.update_script(
+                s.id,
+                ScriptPatch {
+                    body: Some("  ".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.update_script(
+                s.id,
+                ScriptPatch {
+                    args: Some(vec![script_arg("bad name", ScriptArgKind::Text)]),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.update_script(
+                s.id,
+                ScriptPatch {
+                    project_id: Some(Some(999)),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+
+        let updated = store
+            .update_script(
+                s.id,
+                ScriptPatch {
+                    name: Some("renamed".into()),
+                    body: Some("echo two".into()),
+                    args: Some(vec![]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.body, "echo two");
+        assert!(updated.args.is_empty());
+        assert!(matches!(
+            store.update_script(999, ScriptPatch::default()),
+            Err(Error::NotFound(_))
+        ));
     }
 
     // ---- cc telemetry ----

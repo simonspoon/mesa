@@ -6632,6 +6632,125 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
     }
 
+    // --- live shells / subagents park a slot (mesa task 802) --------------
+
+    /// A stub `claude` that answers **both** subcommands: `agents --json` from
+    /// `sessions` (or nonzero when it doesn't exist, the fail-open case) and
+    /// `--bg` by logging the dispatch. The other watcher stubs only speak
+    /// `--bg`; a nonzero `agents` exit is exactly the failure path.
+    fn stub_claude_agents(
+        dir: &std::path::Path,
+        sessions: &std::path::Path,
+        log_path: &std::path::Path,
+    ) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", dir.join("no-such-config.json")) };
+        let path = dir.join("claude");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "agents" ]; then
+  [ -f "{sessions}" ] || {{ echo "no session service" >&2; exit 1; }}
+  cat "{sessions}"
+  exit 0
+fi
+[ "$1" = "--bg" ] || exit 1
+echo dispatched >> "{log}"
+echo "backgrounded · deadbeef (idle — send a prompt to start)"
+"#,
+                sessions = sessions.display(),
+                log = log_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn todo_watcher_tick_treats_a_live_subagent_as_an_occupied_slot() {
+        // The whole point of task 802: `claude agents` calls this session
+        // `done`, but it still has a subagent transcript being written, so a
+        // second agent must not be dropped into the same checkout.
+        //
+        // SAFETY: ENV_LOCK, as above — this one also owns
+        // MESA_CC_PROJECTS_DIR, which is where the liveness probe looks.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let sessions = stub_dir.path().join("sessions.json");
+        let bin = stub_claude_agents(stub_dir.path(), &sessions, &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let local_path = proj_dir.path().to_str().unwrap().to_string();
+        let project = new_project(&state, Some(&local_path));
+        let first = new_task(&state, project);
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+
+        // A `done` session in this project's folder, with a subagent
+        // transcript written just now.
+        let session_id = "e34b8ed9-d391-4797-9d39-546d5b463357";
+        std::fs::write(
+            &sessions,
+            serde_json::json!([{
+                "pid": 4242, "id": "e34b8ed9", "cwd": local_path,
+                "kind": "background", "startedAt": 1, "sessionId": session_id,
+                "status": "idle", "state": "done",
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let cc_dir = tempfile::tempdir().unwrap();
+        let subagents = cc_dir
+            .path()
+            .join("-proj")
+            .join(session_id)
+            .join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-1.jsonl"), "{}").unwrap();
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", cc_dir.path()) };
+
+        todo_watcher_tick(&state);
+        assert!(
+            std::fs::read_to_string(&log_path).is_err(),
+            "a session with work in flight parks the project's only slot"
+        );
+        assert_eq!(get(first), Status::Todo);
+
+        // The session finishes: nothing live, and the slot refills.
+        std::fs::write(&sessions, "[]").unwrap();
+        todo_watcher_tick(&state);
+        assert_eq!(
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "dispatch resumes once the work is gone"
+        );
+        assert_eq!(get(first), Status::InProgress);
+
+        // And the probe fails **open**: with no session service at all the
+        // watcher still dispatches rather than parking forever.
+        set_status(&state, first, Status::Done);
+        let second = new_task(&state, project);
+        std::fs::remove_file(&sessions).unwrap();
+        todo_watcher_tick(&state);
+        assert_eq!(
+            get(second),
+            Status::InProgress,
+            "a broken `claude agents` must not park the watcher"
+        );
+
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
     #[test]
     fn lowering_the_limit_never_touches_work_in_flight() {
         // SAFETY: ENV_LOCK, as above.

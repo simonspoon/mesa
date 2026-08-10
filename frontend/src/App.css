@@ -4011,8 +4011,10 @@ body.files-tree-resizing {
 .markdown-body :where(a) {
   color: var(--cyan);
 }
-/* An inline markdown image never widens its surface — every markdown host here
-   (Files pane, task modal, storyboard card) is a fixed-width column. */
+/* An inline markdown image never widens its surface — the Files pane and the
+   task modal are fixed-width columns. Storyboard cards render into .frame-body,
+   not here, and are deliberately left alone: nothing resolves their images, so
+   the only ones they can show are remote. */
 .markdown-body :where(img) {
   max-width: 100%;
   height: auto;

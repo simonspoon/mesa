@@ -3089,6 +3089,14 @@ async fn download_project_file(
 /// this URL as the `src` of an `<img>`, which does not execute script in an
 /// SVG document at all. Navigating to the URL directly is what the CSP is for.
 ///
+/// One asymmetry worth naming: the type comes from the REQUESTED path while
+/// the `filename` comes from the resolved one, so an in-repo symlink
+/// `logo.png -> page.html` answers `image/png` with `filename="page.html"`.
+/// Harmless — `nosniff` means the declared type is what the browser honours,
+/// and those bytes were already reachable through `/files/download` — but the
+/// two halves of the response can disagree, and the type is the load-bearing
+/// half.
+///
 /// Gate: the standard `guard` only, like both sibling reads. It reads a file
 /// the tree route already lists and writes nothing.
 async fn raw_project_file(

@@ -43,6 +43,7 @@ isolation.
 | `storyboard-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
 | `attachments-check` | CLI + API contract incl. cascade-delete | |
+| `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, and the read/write gate pairing in default *and* `--lan` | |
 | `agents-check` | `local_path` plumbing + `/api/projects/{id}/agents` | `MESA_CLAUDE_BIN` (stub) |
 | `todo-watcher-check` | `serve --watch-todo` dispatch loop | `MESA_WATCH_TODO_TICK_MS` |
 | `refine-watcher-check` | `serve --watch-refine` refinement loop | `MESA_WATCH_REFINE_TICK_MS` |
@@ -95,11 +96,11 @@ The code is the source of truth. These are the invariants you must not break:
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
-  `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`, `layout`,
-  `navCollapse`, `navOrder`, `navWidth`, `newFile`, `openFiles`,
-  `pricingDraft`, `projectTree`, `sessionDetail`, `sessionGraph`,
-  `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`, `time`,
-  `watchersDraft`) —
+  `fileImage`, `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
+  `layout`, `markdownAssets`, `navCollapse`, `navOrder`, `navWidth`,
+  `newFile`, `openFiles`, `pricingDraft`, `projectTree`, `sessionDetail`,
+  `sessionGraph`, `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`,
+  `time`, `watchersDraft`) —
   predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
   in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).

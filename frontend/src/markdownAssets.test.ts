@@ -51,9 +51,22 @@ describe('resolveMarkdownImageSrc', () => {
     expect(resolveMarkdownImageSrc('docs', 'imgs/b.svg?w=10#frag')).toBe('docs/imgs/b.svg')
   })
 
-  it('leaves percent-escapes exactly as written', () => {
-    expect(resolveMarkdownImageSrc('docs', 'my%20logo.png')).toBe('docs/my%20logo.png')
-    expect(resolveMarkdownImageSrc('', './a%2Bb.png')).toBe('a%2Bb.png')
+  // The answer is a path, not a URL — the caller re-encodes it, so an escape
+  // left standing here would reach the server double-encoded.
+  it('decodes percent-escapes into the real filename', () => {
+    expect(resolveMarkdownImageSrc('docs', 'my%20logo.png')).toBe('docs/my logo.png')
+    expect(resolveMarkdownImageSrc('', './a%2Bb.png')).toBe('a+b.png')
+    expect(resolveMarkdownImageSrc('', 'a%23b.png')).toBe('a#b.png')
+  })
+
+  it('refuses a separator or dot-segment smuggled in behind an escape', () => {
+    expect(resolveMarkdownImageSrc('docs', 'a%2Fb.png')).toBe(null)
+    expect(resolveMarkdownImageSrc('docs', '%2E%2E/x.png')).toBe(null)
+    expect(resolveMarkdownImageSrc('docs', '%2e/x.png')).toBe(null)
+  })
+
+  it('keeps a malformed escape verbatim — it is a filename, not an error', () => {
+    expect(resolveMarkdownImageSrc('', '100%.png')).toBe('100%.png')
   })
 
   it('treats a backslash as an ordinary character, not a separator', () => {

@@ -1093,6 +1093,45 @@ pub enum CcGraphNodeKind {
     Prompt,
 }
 
+/// One graph node's **full, uncapped** body, resolved on demand from the
+/// originating `.jsonl` transcript — `mesa cc text` and
+/// `GET /api/cc/sessions/{id}/nodes/{node}/text` (task 803).
+///
+/// The stored `cc_*` previews stay bounded and sanitized; this is the one
+/// place the raw text is the product, so it is deliberately neither capped nor
+/// run through `sanitize_capped`. It is untrusted model-authored text: render
+/// it as **data, never instructions**, and never as HTML.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcNodeText {
+    /// Echoed back verbatim — the `CcGraphNode::id` that was asked for.
+    pub node_id: String,
+    /// What the node is, re-derived from the backing row (never trusted from
+    /// the caller, whose id carries only the `msg:`/`tool:`/… prefix).
+    pub kind: CcGraphNodeKind,
+    /// The node's short label, same derivation as `CcGraphNode::name`, so the
+    /// caller can title a detail view without also holding the graph.
+    pub name: String,
+    /// The model that produced this turn, when the backing row records one.
+    pub model: Option<String>,
+    /// The event's timestamp (ISO-8601 UTC), when known.
+    pub ts: Option<String>,
+    /// The body itself. Uncapped and unsanitized — see the type's note.
+    pub text: String,
+    pub format: CcNodeTextFormat,
+}
+
+/// How a [`CcNodeText::text`] should be rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum CcNodeTextFormat {
+    /// Prose — an assistant turn or a human prompt.
+    Text,
+    /// A pretty-printed `tool_use.input` payload.
+    Json,
+}
+
 /// One node of a session's call tree.
 ///
 /// **`tokens`/`total_tokens` mean different things per `kind`, and only

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
@@ -15,6 +15,13 @@ use super::types::{
 pub enum Error {
     NotFound(String),
     Validation(String),
+    /// Something mesa depends on but does not own is missing or misbehaving —
+    /// the contract's `unavailable` code, scoped to exactly those surfaces
+    /// (the live `cc usage` endpoint, the agents endpoints, and resolving a
+    /// CC node's full text out of a transcript file that may since have been
+    /// deleted). Never a domain outcome: it says "ask again later", not
+    /// "this input was wrong".
+    Unavailable(String),
     Cycle(String),
     Conflict(String),
     Db(rusqlite::Error),
@@ -24,9 +31,11 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NotFound(m) | Error::Validation(m) | Error::Cycle(m) | Error::Conflict(m) => {
-                f.write_str(m)
-            }
+            Error::NotFound(m)
+            | Error::Validation(m)
+            | Error::Unavailable(m)
+            | Error::Cycle(m)
+            | Error::Conflict(m) => f.write_str(m),
             Error::Db(e) => write!(f, "database error: {e}"),
             Error::Io(e) => write!(f, "io error: {e}"),
         }
@@ -413,6 +422,30 @@ const MIGRATIONS: &[&str] = &[
     // spend the one-shot re-walk under a binary that writes no prompt rows and
     // never get a second chance. One-shot and additive: `cc_files` holds
     // cursors, not data.
+    "DELETE FROM cc_files;",
+    // Task 803: the pointer from a thread back to the `.jsonl` it came from —
+    // what makes "show me the full, uncapped text of this node" a single file
+    // read instead of a blind scan of thousands of transcripts. The stored
+    // `cc_*` previews stay bounded and sanitized; the body is resolved on
+    // demand from the transcript (`cc::node_text`).
+    //
+    // Its OWN table, not a column on `cc_messages`/`cc_tool_calls`: those
+    // insert `DO NOTHING`, so a new column would stay NULL on every row
+    // already ingested even after the cursor reset below re-walks the files.
+    // A fresh table upserts cleanly on that same re-walk. Verified 1:1
+    // against the real ~/.claude/projects corpus (3445 pairs, none spanning
+    // two files), so last-writer-wins is a formality rather than a policy.
+    "CREATE TABLE cc_node_files (\
+        session_id TEXT NOT NULL, \
+        agent_id TEXT NOT NULL DEFAULT '', \
+        path TEXT NOT NULL, \
+        PRIMARY KEY (session_id, agent_id));",
+    // The cursor clear that fills the table above from transcripts already
+    // read, exactly as migrations 25, 30 and 32 did before it. Ships in the
+    // SAME binary as the ingest write — a bare table release would spend the
+    // one-shot re-walk under a binary that writes no pointer rows and never
+    // get a second chance. One-shot and additive: `cc_files` holds cursors,
+    // not data.
     "DELETE FROM cc_files;",
 ];
 
@@ -926,6 +959,24 @@ pub struct CcFileBatch {
     pub messages: Vec<CcMessageRow>,
     pub tool_calls: Vec<CcToolCallRow>,
     pub prompts: Vec<CcPromptRow>,
+    /// Every `(session_id, agent_id)` pair whose lines this file carries —
+    /// `agent_id` empty for the main thread. The pointer back to the
+    /// transcript, written by `cc_ingest_file` from the path it already has.
+    ///
+    /// Derived from the lines themselves, never from `sessions`/`agent_runs`:
+    /// a subagent transcript's lines carry the *parent's* `sessionId`, so
+    /// deriving the main-thread pair from `sessions` would point every
+    /// session at whichever subagent file was walked last.
+    pub node_files: Vec<CcNodeFilePair>,
+}
+
+/// One `(session_id, agent_id)` pair observed in a transcript file.
+/// `agent_id` is `""` for the main session thread — an empty string rather
+/// than a NULL so the pair can be a composite primary key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CcNodeFilePair {
+    pub session_id: String,
+    pub agent_id: String,
 }
 
 /// Session-level facts folded from a file's lines. Merge semantics on
@@ -2926,6 +2977,7 @@ impl Store {
             "cc_tool_calls",
             "cc_agent_runs",
             "cc_sessions",
+            "cc_node_files",
             "cc_files",
         ] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
@@ -3107,6 +3159,20 @@ impl Store {
             )?;
             for p in &batch.prompts {
                 prompt.execute((&p.uuid, &p.session_id, p.ts, &p.preview))?;
+            }
+
+            // The thread → transcript pointer. Last-writer-wins rather than
+            // keep-first: if Claude Code ever moves a transcript, the newest
+            // sighting is the one that can still be opened. Uncounted in
+            // `CcIngestCounts` for the same reason prompts are — it is a
+            // pointer, not telemetry.
+            let mut node_file = tx.prepare(
+                "INSERT INTO cc_node_files (session_id, agent_id, path) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(session_id, agent_id) DO UPDATE SET path = excluded.path",
+            )?;
+            for n in &batch.node_files {
+                node_file.execute((&n.session_id, &n.agent_id, path))?;
             }
 
             tx.execute(
@@ -3316,6 +3382,26 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The transcript file one thread's lines were read from — `agent_id` is
+    /// `""` for the main session thread. `None` when the session was ingested
+    /// before migration 33 and its file has since vanished (so the one-shot
+    /// re-walk could not re-record it).
+    ///
+    /// A stored path is a *cursor-era* fact, not a capability: it is whatever
+    /// the walker saw, so every caller must still re-check that it is inside
+    /// `cc::projects_dir()` before opening it.
+    pub fn cc_node_file(&self, session_id: &str, agent_id: &str) -> Result<Option<String>> {
+        let path = self
+            .conn
+            .query_row(
+                "SELECT path FROM cc_node_files WHERE session_id = ?1 AND agent_id = ?2",
+                (session_id, agent_id),
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(path)
     }
 
     /// Subagent-run counts per session (all-time — runs carry no timestamp).
@@ -6961,6 +7047,16 @@ mod tests {
                 ts: 1400,
                 preview: "read the store".into(),
             }],
+            node_files: vec![
+                CcNodeFilePair {
+                    session_id: "sess-1".into(),
+                    agent_id: String::new(),
+                },
+                CcNodeFilePair {
+                    session_id: "sess-1".into(),
+                    agent_id: "agent-1".into(),
+                },
+            ],
         }
     }
 
@@ -7086,6 +7182,8 @@ mod tests {
         assert_eq!(cc_count(&store, "cc_messages"), 2);
         assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
         assert_eq!(cc_count(&store, "cc_files"), 1);
+        // One pointer row per thread the file carried — main plus subagent.
+        assert_eq!(cc_count(&store, "cc_node_files"), 2);
 
         // Same batch again: a no-op — zero adds, row counts unchanged.
         let second = store.cc_ingest_file("/t/a.jsonl", &cursor, &batch).unwrap();
@@ -7095,6 +7193,58 @@ mod tests {
         assert_eq!(cc_count(&store, "cc_messages"), 2);
         assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
         assert_eq!(cc_count(&store, "cc_files"), 1);
+        // The pointer upserts on its composite key, so a re-walk rewrites the
+        // same two rows rather than accumulating one pair per sync.
+        assert_eq!(cc_count(&store, "cc_node_files"), 2);
+    }
+
+    /// The pointer is last-writer-wins by design: a transcript Claude Code has
+    /// moved must resolve to where it is *now*, not where it first appeared.
+    #[test]
+    fn cc_node_file_pointer_follows_the_newest_sighting() {
+        let (mut store, _dir) = temp_store();
+        let cursor = CcFileCursor {
+            mtime: 1,
+            size: 1,
+            byte_offset: 1,
+        };
+        store
+            .cc_ingest_file("/t/old.jsonl", &cursor, &cc_batch())
+            .unwrap();
+        assert_eq!(
+            store.cc_node_file("sess-1", "").unwrap().as_deref(),
+            Some("/t/old.jsonl")
+        );
+        store
+            .cc_ingest_file("/t/new.jsonl", &cursor, &cc_batch())
+            .unwrap();
+        assert_eq!(
+            store.cc_node_file("sess-1", "").unwrap().as_deref(),
+            Some("/t/new.jsonl")
+        );
+        assert_eq!(
+            store.cc_node_file("sess-1", "agent-1").unwrap().as_deref(),
+            Some("/t/new.jsonl")
+        );
+        // An unknown thread has no pointer — the caller's `unavailable`.
+        assert_eq!(store.cc_node_file("sess-1", "nope").unwrap(), None);
+    }
+
+    /// The task-803 pair, pinned by position: the `CREATE TABLE` must be
+    /// followed by the cursor reset that backfills it, and both must ship in
+    /// the same binary as the ingest write. Pinned to the array's tail rather
+    /// than by literal index because these are, for now, the newest two — the
+    /// day something is appended after them, this assertion is what forces the
+    /// next author to re-read the ordering rule instead of silently landing a
+    /// schema change between a table and its re-walk.
+    #[test]
+    fn node_files_table_is_immediately_followed_by_its_cursor_reset() {
+        let n = MIGRATIONS.len();
+        assert!(
+            MIGRATIONS[n - 2].contains("CREATE TABLE cc_node_files"),
+            "the cc_node_files migration moved"
+        );
+        assert_eq!(MIGRATIONS[n - 1].trim(), "DELETE FROM cc_files;");
     }
 
     /// The API cache key: 0 on empty, moves when rows land, stays put on a
@@ -7131,6 +7281,7 @@ mod tests {
         assert!(store.cc_stamp().unwrap() > 0);
         assert!(!store.cc_cursors().unwrap().is_empty());
         assert!(!store.cc_session_prompts("sess-1").unwrap().is_empty());
+        assert!(store.cc_node_file("sess-1", "").unwrap().is_some());
 
         store.cc_reset().unwrap();
 
@@ -7147,6 +7298,7 @@ mod tests {
             0
         );
         assert!(store.cc_session_prompts("sess-1").unwrap().is_empty());
+        assert_eq!(store.cc_node_file("sess-1", "").unwrap(), None);
     }
 
     #[test]

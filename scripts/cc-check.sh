@@ -7,6 +7,9 @@
 # re-walking without duplicating rows, `cc reset` purging + re-adding them,
 # tool-call and subagent rows, persistence
 # across transcript deletion, and auto-ingest on a plain dashboard read.
+# `cc text` is the one read that leaves the db, so it is driven against bodies
+# deliberately longer than the stored 200-char preview (the difference IS the
+# assertion) plus its three-way validation/not_found/unavailable split.
 # `cc live` stays a direct file parse (no db) and is checked last.
 set -euo pipefail
 
@@ -489,6 +492,172 @@ assert g["omitted_responses"]==0 and g["omitted_tool_calls"]==0, g
 print("cc graph: prompt budget is separate ok")
 ' || fail "cc graph --limit did not budget prompts separately"
 
+# ---- cc text: one node's FULL, uncapped body (mesa task 803) ----
+#
+# A fourth appended project, same trick as the two above, so it perturbs no
+# whole-dashboard count. Every body here is deliberately well over
+# TARGET_MAX_CHARS (200) and ends in a sentinel the stored 200-char preview can
+# never reach, which is what makes "this is the full text, not the preview"
+# provable rather than asserted by eye. The subagent's `.meta.json` points at
+# the `Task` call, whose whole `input` — including the unbounded `prompt` key
+# that is deliberately never stored — is the agent node's body.
+mkdir -p "$TMP/tree/-text-project/x/subagents"
+cat > "$TMP/tree/-text-project/x.jsonl" <<'JSONL'
+{"type":"user","uuid":"tp1","sessionId":"tx","timestamp":"2026-06-20T01:00:00.000Z","cwd":"/home/me/text","origin":{"type":"human"},"message":{"role":"user","content":"PROMPT-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat PROMPT-TAIL"}}
+{"type":"assistant","uuid":"tm1","sessionId":"tx","timestamp":"2026-06-20T01:00:01.000Z","cwd":"/home/me/text","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"RESPONSE-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea RESPONSE-TAIL"},{"type":"tool_use","id":"tt_1","name":"Bash","input":{"command":"echo BASH-HEAD && grep -rn 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation' src/ && echo BASH-TAIL","description":"a long one"}},{"type":"tool_use","id":"tt_2","name":"Write","input":{"file_path":"/home/me/text/out.txt","content":"WRITE-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip WRITE-TAIL"}},{"type":"tool_use","id":"tt_3","name":"Task","input":{"subagent_type":"Explore","description":"deep dive","prompt":"TASK-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut TASK-TAIL"}}]}}
+JSONL
+cat > "$TMP/tree/-text-project/x/subagents/a.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"ta1","isSidechain":true,"sessionId":"tx","agentId":"x2","timestamp":"2026-06-20T01:00:02.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+JSONL
+cat > "$TMP/tree/-text-project/x/subagents/a.meta.json" <<'JSON'
+{"agentType":"Explore","description":"deep dive","toolUseId":"tt_3","spawnDepth":1}
+JSON
+"$BIN" cc sync >/dev/null || fail "cc sync did not ingest the node-text transcript"
+
+# Every happy case is checked AGAINST THE GRAPH's stored preview of the same
+# node, not against a literal: the assertion is that the two differ in the one
+# way that matters — the preview is the capped 200-char column, the text is the
+# whole thing off disk.
+GRAPH_TX=$("$BIN" cc graph tx) || fail "cc graph tx exited nonzero"
+
+# prompt: the uncapped human turn.
+"$BIN" cc text tx prompt:tp1 | GRAPH="$GRAPH_TX" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+for k in ["node_id","kind","name","model","ts","text","format"]:
+    assert k in d, f"missing key {k}"
+assert d["node_id"]=="prompt:tp1" and d["kind"]=="prompt" and d["name"]=="Prompt", d
+assert d["format"]=="text", d["format"]
+assert d["model"] is None and d["ts"] is not None, d
+t=d["text"]
+prev=[n for n in json.loads(os.environ["GRAPH"])["nodes"] if n["id"]=="prompt:tp1"][0]["target"]
+# The stored preview really is at the cap — 200 characters, plus the cut
+# marker when the cut landed mid-word — and really does stop before the
+# sentinel, so a full read is the only way to see the end of this turn.
+cut=prev[:-1] if prev.endswith("…") else prev
+assert len(cut)==200, (len(prev),prev)
+assert "PROMPT-TAIL" not in prev, prev
+assert len(t)>200 and t.startswith(cut), (len(t),t[:80],prev[:80])
+assert t.startswith("PROMPT-HEAD") and t.endswith("PROMPT-TAIL"), (t[:40],t[-40:])
+print("cc text: prompt node full body ok")
+' || fail "cc text did not return the full prompt body"
+
+# msg: the uncapped assistant prose.
+"$BIN" cc text tx msg:tm1 | GRAPH="$GRAPH_TX" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+assert d["kind"]=="response" and d["name"]=="Response" and d["format"]=="text", d
+assert d["model"]=="claude-opus-4-8", d
+t=d["text"]
+prev=[n for n in json.loads(os.environ["GRAPH"])["nodes"] if n["id"]=="msg:tm1"][0]["target"]
+cut=prev[:-1] if prev.endswith("…") else prev
+assert len(cut)==200 and "RESPONSE-TAIL" not in prev, prev
+assert len(t)>200 and t.startswith(cut), (len(t),t[:80],prev[:80])
+assert t.startswith("RESPONSE-HEAD") and t.endswith("RESPONSE-TAIL"), (t[:40],t[-40:])
+print("cc text: response node full body ok")
+' || fail "cc text did not return the full response body"
+
+# tool: the WHOLE `tool_use.input` as JSON — not the one bounded scalar the
+# graph lifted out of it. The Bash command is long enough that the preview cuts
+# it, and `description` is a second key the column could never have carried.
+"$BIN" cc text tx tool:tt_1 | GRAPH="$GRAPH_TX" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+assert d["kind"]=="tool" and d["name"]=="Bash" and d["format"]=="json", d
+inp=json.loads(d["text"])   # the payload really is JSON, pretty-printed
+assert set(inp)=={"command","description"}, inp
+assert inp["command"].startswith("echo BASH-HEAD"), inp["command"][:40]
+assert inp["command"].endswith("BASH-TAIL"), inp["command"][-40:]
+assert inp["description"]=="a long one", inp
+prev=[n for n in json.loads(os.environ["GRAPH"])["nodes"] if n["id"]=="tool:tt_1"][0]["target"]
+cut=prev[:-1] if prev.endswith("…") else prev
+assert len(cut)==200 and "BASH-TAIL" not in prev, prev
+assert len(inp["command"])>200 and inp["command"].startswith(cut), inp["command"][:80]
+print("cc text: tool node whole input ok")
+' || fail "cc text did not return the tool call's whole input"
+
+# The bulk keys ingest deliberately never lifts (`content`) come back whole —
+# the graph node for this call carries only the file path, so this is the one
+# read that can show what was written.
+"$BIN" cc text tx tool:tt_2 | GRAPH="$GRAPH_TX" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+assert d["kind"]=="tool" and d["name"]=="Write" and d["format"]=="json", d
+inp=json.loads(d["text"])
+assert inp["file_path"]=="/home/me/text/out.txt", inp
+assert inp["content"].startswith("WRITE-HEAD") and inp["content"].endswith("WRITE-TAIL"), inp["content"][:40]
+assert len(inp["content"])>200, len(inp["content"])
+# The stored preview is the path and nothing else: `content` is not in the db.
+prev=[n for n in json.loads(os.environ["GRAPH"])["nodes"] if n["id"]=="tool:tt_2"][0]["target"]
+assert prev=="/home/me/text/out.txt", prev
+print("cc text: bulk tool input ok")
+' || fail "cc text did not return a Write call's unbounded content"
+
+# agent: the body is the `Task` call that SPAWNED the run — a row in the parent
+# thread — while the answer keeps the agent`s own kind and name.
+"$BIN" cc text tx agent:x2 | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["node_id"]=="agent:x2" and d["kind"]=="agent" and d["name"]=="Explore", d
+assert d["format"]=="json", d["format"]
+inp=json.loads(d["text"])
+assert inp["subagent_type"]=="Explore" and inp["description"]=="deep dive", inp
+assert inp["prompt"].startswith("TASK-HEAD") and inp["prompt"].endswith("TASK-TAIL"), inp["prompt"][:40]
+assert len(inp["prompt"])>200, len(inp["prompt"])
+print("cc text: agent node spawn prompt ok")
+' || fail "cc text did not return the subagent's spawning input"
+
+# The `session` node exists and is a real id — it just has no turn of its own,
+# which is a different answer from "no such node": validation (exit 1), not
+# not_found.
+if "$BIN" cc text tx session >"$TMP/text-session" 2>&1; then
+  fail "cc text on the session node should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-session"))
+assert d["error"]["code"]=="validation", d
+' || fail "cc text on the session node did not return error.code=validation"
+echo "cc text: session node -> validation ok"
+
+# An id whose prefix is not one the graph mints is the same class of mistake.
+if "$BIN" cc text tx bogus:1 >"$TMP/text-prefix" 2>&1; then
+  fail "cc text on an unknown id prefix should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-prefix"))
+assert d["error"]["code"]=="validation", d
+' || fail "cc text on an unknown id prefix did not return error.code=validation"
+echo "cc text: unknown id prefix -> validation ok"
+
+# A well-formed id with no backing row is not_found — distinct from both of the
+# above and from unavailable.
+if "$BIN" cc text tx tool:no-such-call >"$TMP/text-404" 2>&1; then
+  fail "cc text on an unknown node should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-404"))
+assert d["error"]["code"]=="not_found", d
+' || fail "cc text on an unknown node did not return error.code=not_found"
+echo "cc text: unknown node -> not_found ok"
+
+# The deleted-transcript case, on session `a`, whose files were removed above:
+# the ROW is still in the db (every aggregate over it still answers), so this is
+# not not_found — the body simply cannot be re-read. `unavailable` is the code
+# scoped to depending on something outside mesa.
+"$BIN" cc graph a >/dev/null || fail "session a rows should still be readable"
+if "$BIN" cc text a tool:toolu_2 >"$TMP/text-503" 2>&1; then
+  fail "cc text on a deleted transcript should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-503"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "cc text on a deleted transcript did not return error.code=unavailable"
+echo "cc text: deleted transcript -> unavailable ok"
+
 # Unknown session is not_found (exit 1), never an empty graph — an empty graph
 # is a real answer for a session that made no calls.
 if "$BIN" cc graph no-such-session >"$TMP/graph-err" 2>&1; then
@@ -678,6 +847,46 @@ d=json.load(open("'"$TMP"'/detail-404"))
 assert d["error"]["code"]=="not_found", d
 ' || fail "api cc session: unknown session did not return error.code=not_found"
 echo "api cc session: unknown session -> 404 not_found ok"
+
+# ---- cc text over HTTP: same payload as the CLI, plus the three statuses ----
+curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/tx/nodes/tool:tt_1/text" >"$TMP/text-http" \
+  || fail "GET /api/cc/sessions/{id}/nodes/{node}/text failed"
+"$BIN" cc text tx tool:tt_1 >"$TMP/text-cli" || fail "cc text tx tool:tt_1 exited nonzero"
+python3 -c '
+import json
+h=json.load(open("'"$TMP"'/text-http")); c=json.load(open("'"$TMP"'/text-cli"))
+# One `core` reader, two surfaces: the same object, not merely a similar one.
+assert h==c, (h,c)
+assert json.loads(h["text"])["command"].endswith("BASH-TAIL"), h["text"][-60:]
+print("api cc text: payload matches the CLI ok")
+' || fail "GET /api/cc/sessions/{id}/nodes/{node}/text did not match the CLI payload"
+
+# The three error codes map to three distinct statuses, the same split the CLI
+# reports as one exit code with three `error.code` values.
+STATUS=$(curl -s -o "$TMP/text-http-404" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/tx/nodes/tool:no-such-call/text")
+[ "$STATUS" = "404" ] || fail "api cc text: unknown node expected 404, got $STATUS ($(cat "$TMP/text-http-404"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-http-404"))
+assert d["error"]["code"]=="not_found", d
+' || fail "api cc text: unknown node did not return error.code=not_found"
+
+STATUS=$(curl -s -o "$TMP/text-http-422" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/tx/nodes/session/text")
+[ "$STATUS" = "422" ] || fail "api cc text: session node expected 422, got $STATUS ($(cat "$TMP/text-http-422"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-http-422"))
+assert d["error"]["code"]=="validation", d
+' || fail "api cc text: session node did not return error.code=validation"
+
+STATUS=$(curl -s -o "$TMP/text-http-503" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/a/nodes/tool:toolu_2/text")
+[ "$STATUS" = "503" ] || fail "api cc text: deleted transcript expected 503, got $STATUS ($(cat "$TMP/text-http-503"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/text-http-503"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "api cc text: deleted transcript did not return error.code=unavailable"
+echo "api cc text: 404 / 422 / 503 split ok"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

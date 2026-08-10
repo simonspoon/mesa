@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { filterRows, threadOf, threadOptions, timelineRows } from './sessionTimeline'
+import {
+  filterRows,
+  nodeTextTarget,
+  threadOf,
+  threadOptions,
+  timelineRows,
+} from './sessionTimeline'
 import type { CcGraphNode } from './types/CcGraphNode'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 
@@ -310,5 +316,36 @@ describe('prompt rows', () => {
   it('does not count toward a thread’s call count', () => {
     // `calls` means tool calls; a prompt is not one.
     expect(threadOptions(withPrompt()).map((o) => o.calls)).toEqual([1, 1])
+  })
+})
+
+describe('nodeTextTarget', () => {
+  it('answers null for the session root — a thread, not a turn', () => {
+    expect(nodeTextTarget(node('session', 'session'))).toBeNull()
+  })
+
+  it('answers the id and kind for every fetchable namespace', () => {
+    expect(nodeTextTarget(node('prompt:p1', 'prompt'))).toEqual({
+      nodeId: 'prompt:p1',
+      kind: 'prompt',
+    })
+    expect(nodeTextTarget(node('msg:m1', 'response'))).toEqual({
+      nodeId: 'msg:m1',
+      kind: 'response',
+    })
+    expect(nodeTextTarget(node('tool:tu1', 'tool'))).toEqual({ nodeId: 'tool:tu1', kind: 'tool' })
+    expect(nodeTextTarget(node('agent:a1', 'agent'))).toEqual({ nodeId: 'agent:a1', kind: 'agent' })
+  })
+
+  it('keeps a skill row openable — it is a promoted tool row, `tool:` id and all', () => {
+    expect(nodeTextTarget(node('tool:tu2', 'skill', { name: 'inaros-swe:refine' }))).toEqual({
+      nodeId: 'tool:tu2',
+      kind: 'skill',
+    })
+  })
+
+  it('answers null for an id in a namespace the server cannot resolve', () => {
+    expect(nodeTextTarget(node('whatever', 'tool'))).toBeNull()
+    expect(nodeTextTarget(node('', 'response'))).toBeNull()
   })
 })

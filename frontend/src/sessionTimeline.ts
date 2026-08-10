@@ -120,6 +120,27 @@ export function timelineRows(graph: CcSessionGraph): TimelineRow[] {
   return rows
 }
 
+/** Node id namespaces `GET /api/cc/sessions/{id}/nodes/{node}/text` can resolve
+ *  (`cc::resolve_node`). `session` is deliberately absent — it is a thread, not
+ *  a turn, and the server answers `validation` for it. A `skill` node keeps the
+ *  `tool:` prefix, so it is covered by that entry rather than one of its own. */
+const TEXT_ID_PREFIXES = ['prompt:', 'msg:', 'tool:', 'agent:']
+
+/** What a timeline row would ask the full-text endpoint for, or `null` when the
+ *  row has nothing to fetch — the `session` root (whose data is the page
+ *  header) and any id in a namespace the server cannot resolve.
+ *
+ *  A predicate rather than an inline check in the view, per CLAUDE.md: the
+ *  decision of which rows are openable is exactly the kind of thing that
+ *  historically shipped wrong, so it lives here where vitest can pin it. */
+export function nodeTextTarget(
+  node: CcGraphNode,
+): { nodeId: string; kind: CcGraphNodeKind } | null {
+  if (node.kind === 'session') return null
+  if (!TEXT_ID_PREFIXES.some((p) => node.id.startsWith(p))) return null
+  return { nodeId: node.id, kind: node.kind }
+}
+
 export type TimelineFilter = {
   /** Case-insensitive substring over `name` + `target`. Blank = everything. */
   query?: string

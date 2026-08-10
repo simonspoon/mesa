@@ -53,14 +53,15 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PriceTable;
 use super::store::{
-    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcPromptRow, CcSessionRecord,
-    CcSessionUpsert, CcToolCallRow, Result, Store,
+    CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcNodeFilePair, CcPromptRow,
+    CcSessionRecord, CcSessionUpsert, CcToolCallRow, Error, Result, Store,
 };
 use super::types::{
     CcAgentStat, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
-    CcLiveSession, CcLiveSubagent, CcModelStat, CcOverview, CcProjectStat, CcSessionBucket,
-    CcSessionDetail, CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat,
-    CcSessionThreadStat, CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
+    CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview,
+    CcProjectStat, CcSessionBucket, CcSessionDetail, CcSessionGraph, CcSessionModelStat,
+    CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat,
+    CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -197,6 +198,14 @@ impl RawMessage {
     /// to tell it from the reply, and thinking routinely dwarfs the response —
     /// it would win the cap and push the actual reply out.
     fn assistant_text(&self) -> Option<String> {
+        sanitize_capped(&self.assistant_text_raw()?)
+    }
+
+    /// The same prose, **uncapped and unsanitized** — the body
+    /// [`node_text`] returns for a `msg:` node. Split out rather than
+    /// duplicated so the two can never disagree about *which* blocks count:
+    /// the only difference between them is the cap.
+    fn assistant_text_raw(&self) -> Option<String> {
         let blocks = self.content.as_ref()?.as_array()?;
         let joined = blocks
             .iter()
@@ -204,7 +213,11 @@ impl RawMessage {
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join(" ");
-        sanitize_capped(&joined)
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
     }
 }
 
@@ -355,6 +368,14 @@ const NON_HUMAN_PREFIXES: &[&str] = &[
 /// same policy every other transcript-derived string mesa stores goes through:
 /// what lands in the db is a bounded preview, never the prompt body.
 fn human_prompt(line: &RawLine) -> Option<String> {
+    sanitize_capped(&human_prompt_raw(line)?)
+}
+
+/// The same human turn, **uncapped and unsanitized** — the body
+/// [`node_text`] returns for a `prompt:` node. Split out rather than
+/// duplicated so the two can never disagree about which `user` lines count as
+/// a human turn at all; the only difference between them is the cap.
+fn human_prompt_raw(line: &RawLine) -> Option<String> {
     if line.kind.as_deref() != Some("user") {
         return None;
     }
@@ -395,7 +416,7 @@ fn human_prompt(line: &RawLine) -> Option<String> {
     };
 
     if let Some(cmd) = slash_command(&text) {
-        return sanitize_capped(&cmd);
+        return Some(cmd);
     }
     let accepted = match line.origin.as_ref() {
         Some(o) => o.kind.as_deref() == Some("human"),
@@ -407,7 +428,7 @@ fn human_prompt(line: &RawLine) -> Option<String> {
     if !accepted {
         return None;
     }
-    sanitize_capped(&text)
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// The `/name args` a `<command-name>` envelope stands for, or `None` when the
@@ -937,6 +958,10 @@ fn parse_batch(bytes: &[u8]) -> (CcFileBatch, usize) {
     // BTreeMaps so the batch order is deterministic for a given input.
     let mut sessions: BTreeMap<String, CcSessionUpsert> = BTreeMap::new();
     let mut agent_runs: BTreeMap<(String, String), CcAgentRunUpsert> = BTreeMap::new();
+    // Every `(sessionId, agentId)` pair whose lines are in this file — the
+    // pointer back to the transcript. A BTreeSet, so it is deduped and
+    // deterministic like the two maps above.
+    let mut node_files: BTreeSet<(String, String)> = BTreeSet::new();
     let mut batch = CcFileBatch::default();
     let mut pos = 0usize;
     let mut consumed = 0usize;
@@ -945,11 +970,24 @@ fn parse_batch(bytes: &[u8]) -> (CcFileBatch, usize) {
         pos += nl + 1;
         consumed = pos;
         if let Ok(line) = std::str::from_utf8(line) {
-            fold_line(line, &mut sessions, &mut agent_runs, &mut batch);
+            fold_line(
+                line,
+                &mut sessions,
+                &mut agent_runs,
+                &mut node_files,
+                &mut batch,
+            );
         }
     }
     batch.sessions = sessions.into_values().collect();
     batch.agent_runs = agent_runs.into_values().collect();
+    batch.node_files = node_files
+        .into_iter()
+        .map(|(session_id, agent_id)| CcNodeFilePair {
+            session_id,
+            agent_id,
+        })
+        .collect();
     (batch, consumed)
 }
 
@@ -969,6 +1007,7 @@ fn fold_line(
     line: &str,
     sessions: &mut BTreeMap<String, CcSessionUpsert>,
     agent_runs: &mut BTreeMap<(String, String), CcAgentRunUpsert>,
+    node_files: &mut BTreeSet<(String, String)>,
     batch: &mut CcFileBatch,
 ) {
     let line = line.trim();
@@ -985,6 +1024,12 @@ fn fold_line(
     let Some(ts) = parse_ts(ts_str) else {
         return;
     };
+
+    // This line's thread → this file. Recorded from the line's own ids rather
+    // than from the accumulators below, because a subagent transcript's lines
+    // carry the *parent's* `sessionId`: deriving the main-thread pair from
+    // `sessions` would point every session at a subagent's file.
+    node_files.insert((sid.clone(), raw.agent_id.clone().unwrap_or_default()));
 
     let s = sessions
         .entry(sid.clone())
@@ -2263,6 +2308,313 @@ fn short_session(session_id: &str) -> String {
         .next()
         .unwrap_or(session_id)
         .to_string()
+}
+
+// ---- node full text (`mesa cc text`,
+//      `GET /api/cc/sessions/{id}/nodes/{node}/text`) ----
+
+/// One graph node's full, uncapped body, read on demand from the transcript
+/// the node came from (task 803).
+///
+/// **The one read that leaves the db.** Every other dashboard surface answers
+/// from `cc_*` alone, and the previews stored there are deliberately bounded
+/// and sanitized (`sanitize_capped`, [`TARGET_MAX_CHARS`]) — the whole Bash
+/// command, the whole `Write` content, the whole subagent prompt are not in
+/// the database and never were. So "show me all of it" has to reopen the
+/// `.jsonl`, exactly the carve-out [`live`] already takes.
+///
+/// The pointer that makes it one file read instead of a scan of thousands is
+/// `cc_node_files`, written at ingest from the path the walker already had.
+///
+/// Errors, deliberately distinct:
+/// * `validation` — `"session"` (a thread, not a turn: nothing to show), or an
+///   id whose prefix is not one this graph mints.
+/// * `not_found` — the id parses but no row in this session backs it.
+/// * `unavailable` — the row is there but its transcript is not: no
+///   `cc_node_files` pointer, a file since deleted, or a line no longer in it.
+///   The code scoped to "depends on something outside mesa".
+///
+/// The returned `text` is **untrusted model-authored text**, uncapped and
+/// unsanitized because raw is the entire point here. Every caller must render
+/// it as data, never as instructions and never as markup.
+pub fn node_text(store: &Store, session_id: &str, node_id: &str) -> Result<CcNodeText> {
+    let target = resolve_node(store, session_id, node_id)?;
+    let body = read_node_body(store, session_id, &target)?;
+    Ok(CcNodeText {
+        node_id: node_id.to_string(),
+        kind: target.kind,
+        name: target.name,
+        model: target.model,
+        ts: target.ts,
+        text: body,
+        format: match target.kind {
+            CcGraphNodeKind::Response | CcGraphNodeKind::Prompt => CcNodeTextFormat::Text,
+            _ => CcNodeTextFormat::Json,
+        },
+    })
+}
+
+/// What a node id resolved to: which thread's transcript holds it, which
+/// identifier to scan that file for, and the metadata the graph would have
+/// shown beside it.
+struct NodeTarget {
+    kind: CcGraphNodeKind,
+    name: String,
+    model: Option<String>,
+    ts: Option<String>,
+    /// `""` for the main thread — the `cc_node_files` key.
+    agent_id: String,
+    /// What to look for in the transcript.
+    ident: NodeIdent,
+}
+
+/// The identifier [`read_node_body`] scans a transcript line for.
+enum NodeIdent {
+    /// A line `uuid`, whose assistant prose is the body.
+    Message(String),
+    /// A line `uuid`, whose human turn is the body.
+    Prompt(String),
+    /// A `tool_use` block id, whose whole `input` is the body.
+    ToolUse(String),
+}
+
+/// Parse `node_id` and find the row backing it. Session-scoped reads only —
+/// an id from another session is `not_found` here, so a node id can never be
+/// used to read across sessions.
+fn resolve_node(store: &Store, session_id: &str, node_id: &str) -> Result<NodeTarget> {
+    // `session` is a real node kind and a real id — it just has no turn of its
+    // own to show, which is a different answer from "no such node".
+    if node_id == "session" {
+        return Err(Error::Validation(
+            "the session node has no text of its own; pick a prompt, response, tool or agent node"
+                .into(),
+        ));
+    }
+    let Some((prefix, rest)) = node_id.split_once(':') else {
+        return Err(Error::Validation(format!(
+            "unknown node id {node_id}: expected one of session, prompt:<uuid>, \
+             msg:<uuid>, tool:<tool_use_id>, agent:<agent_id>"
+        )));
+    };
+    match prefix {
+        "msg" => {
+            let m = store
+                .cc_session_messages(session_id)?
+                .into_iter()
+                .find(|m| m.uuid == rest)
+                .ok_or_else(|| {
+                    Error::NotFound(format!("no node {node_id} in session {session_id}"))
+                })?;
+            Ok(NodeTarget {
+                kind: CcGraphNodeKind::Response,
+                name: "Response".into(),
+                model: Some(m.model.clone()),
+                ts: Some(fmt_ts(m.ts)),
+                agent_id: m.agent_id.clone().unwrap_or_default(),
+                ident: NodeIdent::Message(m.uuid),
+            })
+        }
+        "prompt" => {
+            let p = store
+                .cc_session_prompts(session_id)?
+                .into_iter()
+                .find(|p| p.uuid == rest)
+                .ok_or_else(|| {
+                    Error::NotFound(format!("no node {node_id} in session {session_id}"))
+                })?;
+            Ok(NodeTarget {
+                kind: CcGraphNodeKind::Prompt,
+                name: "Prompt".into(),
+                model: None,
+                ts: Some(fmt_ts(p.ts)),
+                // `cc_prompts` is main-thread only, by construction.
+                agent_id: String::new(),
+                ident: NodeIdent::Prompt(p.uuid),
+            })
+        }
+        "tool" => tool_target_node(store, session_id, node_id, rest),
+        "agent" => {
+            // A subagent's body is the `Task` call that spawned it: the whole
+            // prompt it was given. That call is a tool row in the *parent*
+            // thread, so this hands off to the tool path rather than opening
+            // the subagent's own transcript.
+            let run = store
+                .cc_session_agent_runs(session_id)?
+                .into_iter()
+                .find(|r| r.agent_id == rest)
+                .ok_or_else(|| {
+                    Error::NotFound(format!("no node {node_id} in session {session_id}"))
+                })?;
+            let tool_use_id = run.tool_use_id.ok_or_else(|| {
+                Error::Unavailable(format!(
+                    "subagent {rest} has no recorded spawning tool call \
+                     (its `.meta.json` sidecar was missing or unreadable)"
+                ))
+            })?;
+            let mut t = tool_target_node(store, session_id, node_id, &tool_use_id)?;
+            // Keep the *agent's* identity on the answer — the body is the
+            // spawn call, but the node the caller asked about is the run.
+            t.kind = CcGraphNodeKind::Agent;
+            t.name = run
+                .agent
+                .or(run.skill)
+                .unwrap_or_else(|| format!("agent {rest}"));
+            Ok(t)
+        }
+        _ => Err(Error::Validation(format!(
+            "unknown node id {node_id}: expected one of session, prompt:<uuid>, \
+             msg:<uuid>, tool:<tool_use_id>, agent:<agent_id>"
+        ))),
+    }
+}
+
+/// The `tool:`-backed half of [`resolve_node`], shared by a tool/skill node
+/// and by the agent node that borrows its spawning call.
+fn tool_target_node(
+    store: &Store,
+    session_id: &str,
+    node_id: &str,
+    tool_use_id: &str,
+) -> Result<NodeTarget> {
+    let c = store
+        .cc_session_tool_calls(session_id)?
+        .into_iter()
+        .find(|c| c.tool_use_id == tool_use_id)
+        .ok_or_else(|| Error::NotFound(format!("no node {node_id} in session {session_id}")))?;
+    // Same promotion rule as the graph: a `Skill` call is its own kind,
+    // labelled with the skill rather than the word "Skill".
+    let is_skill = c.name == "Skill" && c.target.is_some();
+    Ok(NodeTarget {
+        kind: if is_skill {
+            CcGraphNodeKind::Skill
+        } else {
+            CcGraphNodeKind::Tool
+        },
+        name: if is_skill {
+            c.target.clone().unwrap_or_default()
+        } else {
+            c.name.clone()
+        },
+        model: None,
+        ts: Some(fmt_ts(c.ts)),
+        agent_id: c.agent_id.clone().unwrap_or_default(),
+        ident: NodeIdent::ToolUse(c.tool_use_id),
+    })
+}
+
+/// Open the transcript this thread was read from and pull the full body out.
+///
+/// Two files may be tried: the thread's own pointer, then the session's
+/// main-thread pointer. The fallback covers a row whose thread predates
+/// `cc_node_files` (or whose file moved) while the session's main transcript
+/// is still on disk — cheap, bounded at two reads, and it can only ever widen
+/// what resolves, never what is allowed.
+fn read_node_body(store: &Store, session_id: &str, target: &NodeTarget) -> Result<String> {
+    let mut tried: Vec<String> = Vec::new();
+    for agent_id in [target.agent_id.as_str(), ""] {
+        if tried.iter().any(|a| a == agent_id) {
+            continue;
+        }
+        tried.push(agent_id.to_string());
+        let Some(path) = store.cc_node_file(session_id, agent_id)? else {
+            continue;
+        };
+        let path = transcript_path(&path)?;
+        let Ok(bytes) = fs::read(&path) else { continue };
+        if let Some(body) = scan_for_body(&bytes, &target.ident) {
+            return Ok(body);
+        }
+    }
+    Err(Error::Unavailable(format!(
+        "the transcript backing this node is no longer readable \
+         (session {session_id}); Claude Code may have deleted it"
+    )))
+}
+
+/// The sole chokepoint for turning a stored `cc_node_files.path` into a file
+/// mesa will open. A path is a *cursor-era observation*, not a capability: it
+/// is whatever the walker recorded, under whatever `MESA_CC_PROJECTS_DIR` /
+/// `CLAUDE_CONFIG_DIR` was set at the time. Anything that does not canonicalize
+/// to a descendant of the CURRENT [`projects_dir`] is refused rather than read
+/// — the same posture as `files::safe_path`, and the reason this route cannot
+/// be turned into an arbitrary-file reader by a doctored row.
+fn transcript_path(stored: &str) -> Result<PathBuf> {
+    let root = projects_dir()
+        .and_then(|r| fs::canonicalize(r).ok())
+        .ok_or_else(|| Error::Unavailable("no readable Claude Code transcript directory".into()))?;
+    let candidate = fs::canonicalize(stored)
+        .map_err(|_| Error::Unavailable(format!("transcript {stored} is no longer on disk")))?;
+    if !candidate.starts_with(&root) {
+        return Err(Error::Validation(format!(
+            "refusing to read {stored}: outside the transcript directory"
+        )));
+    }
+    Ok(candidate)
+}
+
+/// Scan a transcript's bytes line by line for `ident` and return the full
+/// body. Line-at-a-time and short-circuiting: a transcript runs to tens of
+/// megabytes, and only one of its lines matters.
+fn scan_for_body(bytes: &[u8], ident: &NodeIdent) -> Option<String> {
+    for line in bytes.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Cheap pre-filter: the identifier is a literal substring of any line
+        // that could match, so the JSON parse (the expensive half) only runs
+        // on the handful of lines that mention it.
+        let needle = match ident {
+            NodeIdent::Message(u) | NodeIdent::Prompt(u) => u,
+            NodeIdent::ToolUse(t) => t,
+        };
+        if !line.contains(needle.as_str()) {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
+        match ident {
+            NodeIdent::Message(uuid) => {
+                if raw.uuid.as_deref() != Some(uuid.as_str()) {
+                    continue;
+                }
+                if let Some(t) = raw.message.as_ref().and_then(|m| m.assistant_text_raw()) {
+                    return Some(t);
+                }
+            }
+            NodeIdent::Prompt(uuid) => {
+                if raw.uuid.as_deref() != Some(uuid.as_str()) {
+                    continue;
+                }
+                if let Some(t) = human_prompt_raw(&raw) {
+                    return Some(t);
+                }
+            }
+            NodeIdent::ToolUse(id) => {
+                let Some(content) = raw.message.as_ref().and_then(|m| m.content.as_ref()) else {
+                    continue;
+                };
+                let Some(blocks) = content.as_array() else {
+                    continue;
+                };
+                for b in blocks {
+                    if b.get("id").and_then(|i| i.as_str()) != Some(id.as_str()) {
+                        continue;
+                    }
+                    let input = b.get("input")?;
+                    // The whole payload, pretty-printed: this is the payoff —
+                    // the entire Bash command, the entire `Write` content, the
+                    // entire `Task` prompt, none of which is in the db.
+                    return serde_json::to_string_pretty(input).ok();
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---- small helpers ----
@@ -4057,6 +4409,7 @@ mod tests {
                     messages: vec![msg("u1", None, 1000, 200), msg("u2", Some("a1"), 1400, 20)],
                     tool_calls,
                     prompts: Vec::new(),
+                    node_files: Vec::new(),
                 },
             )
             .unwrap();
@@ -4228,5 +4581,230 @@ mod tests {
         assert_eq!(n.kind, CcGraphNodeKind::Tool);
         assert_eq!(n.name, "Skill");
         assert_eq!(n.target, None);
+    }
+
+    // ---- node_text: the one read that leaves the db (task 803) ----
+
+    /// A body far past `TARGET_MAX_CHARS`, so "uncapped" is provable rather
+    /// than merely plausible: an assertion against a short string would pass
+    /// whether or not the cap was applied.
+    fn long_body(tag: &str) -> String {
+        format!("{tag} {}", "x".repeat(400))
+    }
+
+    /// A projects tree with one session: a human turn, an assistant turn that
+    /// emits prose *and* a Bash call, the `Task` call that spawns a subagent,
+    /// a `Skill` call, and the subagent's own transcript (+ its sidecar, which
+    /// is what links the run back to its spawning tool call).
+    ///
+    /// Returns `(tempdir, projects_root, store)` — the tempdir must outlive
+    /// the store, and the caller keeps `MESA_CC_PROJECTS_DIR` pointed at the
+    /// root for as long as it wants reads to resolve.
+    fn seed_transcripts() -> (tempfile::TempDir, PathBuf, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-demo");
+        fs::create_dir_all(proj.join("s1").join("subagents")).unwrap();
+
+        let prompt = long_body("please");
+        let prose = long_body("here is the answer");
+        let command = long_body("echo");
+        let task_prompt = long_body("go and look at");
+        let sub_prose = long_body("subagent says");
+
+        write_jsonl(
+            &proj,
+            "s1.jsonl",
+            &[
+                &format!(
+                    r#"{{"type":"user","uuid":"u0","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/w","origin":{{"type":"human"}},"message":{{"role":"user","content":[{{"type":"text","text":{}}}]}}}}"#,
+                    serde_json::to_string(&prompt).unwrap()
+                ),
+                &format!(
+                    r#"{{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T01:01:00.000Z","cwd":"/w","message":{{"model":"claude-opus-4-8","content":[{{"type":"text","text":{}}},{{"type":"tool_use","id":"tu1","name":"Bash","input":{{"command":{},"description":"list"}}}}],"usage":{{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#,
+                    serde_json::to_string(&prose).unwrap(),
+                    serde_json::to_string(&command).unwrap()
+                ),
+                &format!(
+                    r#"{{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-06-15T01:02:00.000Z","cwd":"/w","message":{{"model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"tu2","name":"Task","input":{{"description":"look around","prompt":{}}}}}],"usage":{{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#,
+                    serde_json::to_string(&task_prompt).unwrap()
+                ),
+                r#"{"type":"assistant","uuid":"u3","sessionId":"s1","timestamp":"2026-06-15T01:03:00.000Z","cwd":"/w","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu3","name":"Skill","input":{"skill":"inaros-swe:refine","args":"803"}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        write_jsonl(
+            &proj.join("s1").join("subagents"),
+            "agent-a1.jsonl",
+            &[&format!(
+                r#"{{"type":"assistant","uuid":"u5","sessionId":"s1","agentId":"a1","isSidechain":true,"timestamp":"2026-06-15T01:04:00.000Z","cwd":"/w","attributionAgent":"Explore","message":{{"model":"claude-opus-4-8","content":[{{"type":"text","text":{}}}],"usage":{{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#,
+                serde_json::to_string(&sub_prose).unwrap()
+            )],
+        );
+        fs::write(
+            proj.join("s1").join("subagents").join("agent-a1.meta.json"),
+            r#"{"toolUseId":"tu2","description":"look around","spawnDepth":1}"#,
+        )
+        .unwrap();
+
+        // SAFETY: every caller holds ENV_LOCK for this window.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &root) };
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        sync(&mut store, false).unwrap();
+        (tmp, root, store)
+    }
+
+    /// The pointer table, which is what makes any of this one file read: the
+    /// main thread points at the session transcript and the subagent at its
+    /// own — *not* both at whichever file the walker happened to reach last.
+    /// A subagent's lines carry the parent's `sessionId`, so deriving the pair
+    /// from the session upsert rather than from the line would get exactly
+    /// this wrong.
+    #[test]
+    fn ingest_points_each_thread_at_its_own_transcript() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_tmp, _root, store) = seed_transcripts();
+
+        let main = store.cc_node_file("s1", "").unwrap().unwrap();
+        assert!(main.ends_with("-demo/s1.jsonl"), "{main}");
+        let sub = store.cc_node_file("s1", "a1").unwrap().unwrap();
+        assert!(sub.ends_with("subagents/agent-a1.jsonl"), "{sub}");
+    }
+
+    #[test]
+    fn node_text_returns_the_uncapped_body_for_every_kind() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_tmp, _root, store) = seed_transcripts();
+
+        // A human turn: the whole prompt, not the 200-char preview.
+        let p = node_text(&store, "s1", "prompt:u0").unwrap();
+        assert_eq!(p.kind, CcGraphNodeKind::Prompt);
+        assert_eq!(p.format, CcNodeTextFormat::Text);
+        assert_eq!(p.text, long_body("please"));
+        assert!(p.text.chars().count() > TARGET_MAX_CHARS);
+
+        // Assistant prose, likewise uncapped and with no trailing ellipsis.
+        let m = node_text(&store, "s1", "msg:u1").unwrap();
+        assert_eq!(m.kind, CcGraphNodeKind::Response);
+        assert_eq!(m.format, CcNodeTextFormat::Text);
+        assert_eq!(m.text, long_body("here is the answer"));
+        assert!(!m.text.ends_with('…'));
+        assert_eq!(m.model.as_deref(), Some("claude-opus-4-8"));
+
+        // A tool call: the WHOLE input as pretty JSON, including the bulk
+        // keys `TARGET_KEYS` deliberately never lifts.
+        let t = node_text(&store, "s1", "tool:tu1").unwrap();
+        assert_eq!(t.kind, CcGraphNodeKind::Tool);
+        assert_eq!(t.name, "Bash");
+        assert_eq!(t.format, CcNodeTextFormat::Json);
+        let parsed: serde_json::Value = serde_json::from_str(&t.text).unwrap();
+        assert_eq!(parsed["command"], serde_json::json!(long_body("echo")));
+        assert_eq!(parsed["description"], serde_json::json!("list"));
+        assert!(t.text.contains('\n'), "pretty-printed, not compact");
+
+        // A `Skill` call keeps the graph's promotion: its own kind, named for
+        // the skill rather than the word "Skill".
+        let s = node_text(&store, "s1", "tool:tu3").unwrap();
+        assert_eq!(s.kind, CcGraphNodeKind::Skill);
+        assert_eq!(s.name, "inaros-swe:refine");
+        assert_eq!(s.format, CcNodeTextFormat::Json);
+
+        // A subagent's body is the `Task` call that spawned it — the whole
+        // prompt it was handed, which lives in the PARENT's transcript.
+        let a = node_text(&store, "s1", "agent:a1").unwrap();
+        assert_eq!(a.kind, CcGraphNodeKind::Agent);
+        assert_eq!(a.name, "Explore");
+        assert_eq!(a.format, CcNodeTextFormat::Json);
+        let parsed: serde_json::Value = serde_json::from_str(&a.text).unwrap();
+        assert_eq!(
+            parsed["prompt"],
+            serde_json::json!(long_body("go and look at"))
+        );
+
+        // A message inside the subagent's own transcript resolves through the
+        // subagent's pointer, not the session's.
+        let sub = node_text(&store, "s1", "msg:u5").unwrap();
+        assert_eq!(sub.text, long_body("subagent says"));
+    }
+
+    /// The three failure modes are deliberately distinct codes, and the CLI
+    /// and the API both key off them.
+    #[test]
+    fn node_text_separates_validation_not_found_and_unavailable() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, root, store) = seed_transcripts();
+
+        // The session node is a thread, not a turn: nothing to show, which is
+        // a different answer from "no such node".
+        assert!(matches!(
+            node_text(&store, "s1", "session"),
+            Err(Error::Validation(_))
+        ));
+        // A prefix this graph never mints, and a bare id with no prefix.
+        assert!(matches!(
+            node_text(&store, "s1", "file:/etc/passwd"),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            node_text(&store, "s1", "u1"),
+            Err(Error::Validation(_))
+        ));
+        // Parses, but nothing backs it.
+        assert!(matches!(
+            node_text(&store, "s1", "msg:nope"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            node_text(&store, "s1", "tool:nope"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            node_text(&store, "s1", "agent:nope"),
+            Err(Error::NotFound(_))
+        ));
+        // A node id cannot be used to read across sessions.
+        assert!(matches!(
+            node_text(&store, "other", "msg:u1"),
+            Err(Error::NotFound(_))
+        ));
+
+        // The row survives, the transcript does not: `unavailable`, the code
+        // scoped to "depends on something outside mesa". Both files go, so
+        // the main-thread fallback cannot rescue it either.
+        fs::remove_file(root.join("-demo").join("s1.jsonl")).unwrap();
+        fs::remove_file(
+            root.join("-demo")
+                .join("s1")
+                .join("subagents")
+                .join("agent-a1.jsonl"),
+        )
+        .unwrap();
+        assert!(matches!(
+            node_text(&store, "s1", "msg:u1"),
+            Err(Error::Unavailable(_))
+        ));
+        drop(tmp);
+    }
+
+    /// The path guard. A stored path is a cursor-era observation, not a
+    /// capability: once `projects_dir()` moves, yesterday's path is outside
+    /// the tree mesa is willing to open, and is refused rather than read.
+    #[test]
+    fn node_text_refuses_a_path_outside_the_projects_dir() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tmp, _root, store) = seed_transcripts();
+
+        // Same db, same rows, different transcript root — the stored paths
+        // now escape it.
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &elsewhere) };
+        let refused = node_text(&store, "s1", "msg:u1");
+        // SAFETY: same window, same lock.
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+        assert!(
+            matches!(refused, Err(Error::Validation(_))),
+            "a path outside the transcript root must be refused, not read"
+        );
     }
 }

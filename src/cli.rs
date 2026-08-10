@@ -927,6 +927,29 @@ EXAMPLES
         #[arg(long, default_value_t = crate::core::cc::GRAPH_NODE_LIMIT)]
         limit: usize,
     },
+    /// Print one graph node's own text as one JSON object
+    ///
+    /// The body behind a node the call tree only names: a prompt's or
+    /// response's prose, or a tool call's / subagent spawn's full `input`.
+    /// Unlike every other `cc` verb this reads the transcript file on disk
+    /// rather than the `cc_*` rows — bodies are deliberately not stored — so a
+    /// node whose transcript Claude Code has since deleted is `unavailable`
+    /// (exit 1), distinct from a node that never existed (`not_found`). The
+    /// `session` node is `validation`: it exists but has no turn of its own.
+    /// `format` says how to render `text`: `json` for tool/agent inputs,
+    /// `text` for prose.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc text <SESSION_ID> tool:toolu_01abc
+  mesa cc text <SESSION_ID> msg:6f0e...      # an assistant response
+  mesa cc text <SESSION_ID> prompt:6f0e...   # the human turn")]
+    Text {
+        /// The session id (as printed by `mesa cc sessions`)
+        session_id: String,
+        /// The node id (as printed by `mesa cc graph`): prompt:<uuid> |
+        /// msg:<uuid> | tool:<tool_use_id> | agent:<agent_id>
+        node_id: String,
+    },
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
         /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
@@ -1654,6 +1677,7 @@ fn error_code(err: &Error) -> &'static str {
     match err {
         Error::NotFound(_) => "not_found",
         Error::Validation(_) => "validation",
+        Error::Unavailable(_) => "unavailable",
         Error::Cycle(_) => "cycle",
         Error::Conflict(_) => "conflict",
         Error::Db(_) | Error::Io(_) => "conflict",
@@ -2248,7 +2272,9 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
 /// Dashboard reads (`summary`/`sessions`/`skills`) auto-ingest new transcript
 /// lines first (`cc::sync`) and are then served from the persisted `cc_*`
 /// tables, so they open the database like every other handler; `live`/`usage`
-/// read external state directly and stay store-less (spec W3/W4).
+/// read external state directly and stay store-less (spec W3/W4). `text` is
+/// the one hybrid: it opens the store to locate the node, then reads the body
+/// from the transcript file, which is why it alone can answer `unavailable`.
 fn run_cc(cmd: CcCmd) -> Result<()> {
     match cmd {
         CcCmd::Summary { window } => {
@@ -2288,6 +2314,19 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
                     )));
                 }
             }
+        }
+        CcCmd::Text {
+            session_id,
+            node_id,
+        } => {
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store, false)?;
+            // No `Option` to unwrap here, unlike `session`/`graph`: every miss
+            // is already a typed `Error` from the core (`not_found` for an
+            // unknown node, `validation` for the bodyless `session` node,
+            // `unavailable` for a transcript deleted off disk), so the `?`
+            // carries the right code out.
+            print_json(&crate::core::cc::node_text(&store, &session_id, &node_id)?)
         }
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;

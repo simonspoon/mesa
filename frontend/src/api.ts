@@ -8,6 +8,7 @@ import type { AnchorSide } from './types/AnchorSide'
 import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
+import type { CcNodeText } from './types/CcNodeText'
 import type { CcSessionDetail } from './types/CcSessionDetail'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
@@ -717,6 +718,21 @@ export function getCcLive(minutes: number): Promise<CcLive> {
 export function getCcSessionGraph(sessionId: string, limit?: number): Promise<CcSessionGraph> {
   const q = limit === undefined ? '' : `?limit=${limit}`
   return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/graph${q}`)
+}
+
+/**
+ * The body behind one node of that call tree — a prompt's or response's prose,
+ * or a tool call's / subagent spawn's full input. Read on demand, never part
+ * of the graph payload: bodies are not stored in the db, so this one route
+ * goes back to the transcript on disk. Hence a third failure mode beyond 404
+ * (unknown node) and 422 (the `session` node has no text of its own): 503
+ * `unavailable` when Claude Code has since deleted the transcript. `format`
+ * says how to render `text` — `json` for tool/agent inputs, `text` for prose.
+ */
+export function getCcNodeText(sessionId: string, nodeId: string): Promise<CcNodeText> {
+  return request(
+    `/api/cc/sessions/${encodeURIComponent(sessionId)}/nodes/${encodeURIComponent(nodeId)}/text`,
+  )
 }
 
 /**

@@ -4,11 +4,22 @@ An **analytics surface** over Claude Code's own session transcripts — the
 newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
 subagent transcripts in `<session>/subagents/*.jsonl`). Transcripts are
 **ingested** into `cc_*` tables (sessions, agent runs, messages, tool calls,
-prompts, per-file cursors — migration index 10, plus `cc_prompts` at index 30) through `Store` — the single-write-path
+prompts, per-file cursors — migration 12, plus `cc_prompts` at 31 and
+`cc_node_files` at 33) through `Store` — the single-write-path
 invariant holds here too — and **the dashboard reads only the db**, never the
 files, so history survives Claude Code's own transcript cleanup and nothing is
 ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
 CLI and API share it and never diverge.
+
+**Two reads carve out of "db only", and only two**: `cc live` (a direct parse of
+the last few minutes, where the files are by definition still present) and
+`cc text` (one node's full body, which is deliberately not in the db — see
+*Node text* below). Everything else answers from `cc_*` alone.
+
+Migration numbers in this file are the **resulting `user_version`**, i.e.
+1-based: `MIGRATIONS` in `src/core/store.rs` is a 0-indexed array, so
+"migration 33" is `MIGRATIONS[32]`. Enumerate the array rather than counting the
+comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
 
 - Each transcript line is one event. Only `assistant` events carry a `model` and
   a `usage` block (`{input, output, cache_read, cache_creation}` tokens), so
@@ -243,9 +254,14 @@ CLI and API share it and never diverge.
   commits in its own transaction (`Store::cc_ingest_file`). The cursor is only
   an optimization — correctness comes from the upsert keys. It runs
   automatically (`rebuild = false`) before `mesa cc summary|sessions|skills|sync`
-  and `GET /api/cc`, but deliberately NOT in `cc live` / `GET /api/cc/live` (hot
+  and `GET /api/cc` — and before `cc text`, whose file read needs the
+  `cc_node_files` pointer to exist for a session ingested moments ago — but
+  deliberately NOT in `cc live` / `GET /api/cc/live` (hot
   3s poll; live keeps parsing recent files directly — they're by definition
-  still present) nor `cc usage` (network path, no transcripts). `mesa cc sync
+  still present) nor `cc usage` (network path, no transcripts). Live and
+  `cc text` are the **only** two reads that open a transcript at all: live
+  because the data is younger than any ingest, node text because the body it
+  returns was never stored. `mesa cc sync
   --rebuild` (`rebuild = true`) clears every `cc_files` cursor first
   (`Store::cc_clear_cursors`) so the walk re-parses every transcript from byte
   0 regardless of mtime/size — safe any time, never truncates `cc_*` data, but
@@ -263,7 +279,8 @@ CLI and API share it and never diverge.
   messages_added, tool_calls_added}`; a no-change re-run adds zeros).
 - **Reset is the corrective one** (mesa task 698): `cc::reset_and_sync` =
   `Store::cc_reset` (one transaction deleting `cc_messages`, `cc_prompts`,
-  `cc_tool_calls`, `cc_agent_runs`, `cc_sessions`, `cc_files`) followed by a plain sync. It is
+  `cc_tool_calls`, `cc_agent_runs`, `cc_sessions`, `cc_node_files`,
+  `cc_files`) followed by a plain sync. It is
   what fixes rows whose stored *values* are wrong — the inflated cost/tokens
   recorded before task 693's usage dedupe — which no rebuild can do. It is
   **destructive of history**: a session whose transcript file Claude Code has
@@ -445,7 +462,76 @@ CLI and API share it and never diverge.
     `not_found` (CLI exit 1, HTTP 404) — distinct from an empty graph, which is
     the right answer for a session that made no calls. Unlike `GET /api/cc`
     this response is **not** cached: it is an on-demand drill-down, not a poll.
-- CLI: `mesa cc {summary,sessions,skills,session,graph,sync}` (JSON only; `summary` prints the
+- **Node text** — `cc::node_text(store, session_id, node_id) -> CcNodeText`
+  (task 803), the answer to "show me all of it" for a node the graph can only
+  name. Everything stored is a bounded preview by design — 200 sanitized
+  characters of a `target`, a `preview`, a prompt — so the whole `Bash` command,
+  the whole `Write` content, the whole subagent spawn prompt are **not in the
+  database and never were**. The only place they exist is the `.jsonl`, so this
+  read reopens it: the second carve-out from "the dashboard reads only the db",
+  and the reason the surface is a separate on-demand verb rather than a fatter
+  graph payload (a graph that inlined bodies would carry megabytes to render a
+  column of 40-char labels).
+  - **`cc_node_files (session_id, agent_id, path)`, PK `(session_id, agent_id)`,
+    migration 33** — the pointer from one *thread* back to the transcript file
+    it was read from, `agent_id = ''` meaning the session's main thread. It is
+    what makes the body a single file read instead of a scan of thousands of
+    transcripts; the walker already holds the path at ingest, so writing it
+    costs nothing (`CcFileBatch::node_files`, filled by `cc::fold_line` from
+    each line's own `sessionId`/`agentId`, written by `Store::cc_ingest_file`).
+    **Its own table, not a column on `cc_messages`/`cc_tool_calls`.** Those
+    insert `ON CONFLICT DO NOTHING`, so an added column would stay `NULL` on
+    every already-ingested row *even after* the cursor clear re-walked the file
+    — the same trap `preview` and `message_id` each needed a guarded `UPDATE`
+    to escape. A fresh table has no such rows to leave behind: the re-walk
+    upserts it clean. It ships with its own **`DELETE FROM cc_files;` cursor
+    clear as migration 34**, in the same binary as the write, per the
+    add-a-derived-store rule above.
+    The pair really is 1:1 with a file: measured over the real
+    `~/.claude/projects` corpus, **3,445 `(session_id, agent_id)` pairs, none
+    spanning two files**. So the upsert's last-writer-wins, and the fallback
+    below, are belt-and-braces against a shape that does not occur — not a
+    policy for one that does.
+  - **Resolution is session-scoped and re-derived, never trusted from the
+    caller.** The id is parsed for its prefix only; the `kind`, `name`, `model`
+    and `ts` on the answer come from the backing row, and every lookup filters
+    on `session_id`, so a node id from another session is `not_found` rather
+    than a way to read across sessions. `msg:` and `prompt:` return the uncapped
+    prose (`format: "text"`); `tool:` and a promoted `skill` return the **whole
+    `tool_use.input`** pretty-printed (`format: "json"`), which is the payoff —
+    the bulk keys ingest deliberately never lifts (`content`, `new_string`,
+    `prompt`, `script`) are exactly what a reader came for. An `agent:` node
+    borrows the **`Task` call that spawned it** (a row in the *parent* thread,
+    found through the sidecar's `tool_use_id`), so its body is the full prompt
+    the subagent was given, while `kind`/`name` stay the run's own.
+  - **Reading the file.** `read_node_body` tries the thread's own pointer, then
+    the session's `agent_id = ''` row — bounded at two reads, and it can only
+    widen what resolves (a thread ingested before the table existed, or a file
+    that moved), never what is allowed. A stored path is a *cursor-era
+    observation, not a capability*: `transcript_path` canonicalizes it and
+    refuses anything outside the **current** `cc::projects_dir()`, the same
+    posture as `files::safe_path` and the reason a doctored row cannot turn this
+    route into an arbitrary-file reader. The scan is line-at-a-time with a
+    literal-substring pre-filter before the JSON parse, since a transcript runs
+    to tens of megabytes and exactly one line matters.
+  - **Three error codes, deliberately distinct**, because they mean three
+    different things to a caller: `validation` — the `session` node (it exists;
+    it just has no turn of its own) or an id whose prefix the graph never mints;
+    `not_found` — the id parses but no row in this session backs it;
+    `unavailable` — the row is there and every aggregate over it still answers,
+    but its transcript is not (no pointer, file deleted, or the line is gone
+    from it). `unavailable` is the code already scoped to "depends on something
+    outside mesa", which is exactly what a Claude-Code-managed file is.
+  - CLI `mesa cc text <SESSION_ID> <NODE_ID>`; API
+    `GET /api/cc/sessions/{session_id}/nodes/{node_id}/text`, same gate as the
+    sibling graph route, syncing first and **not** cached. Mapping:
+    `validation` → exit 1 / **422**, `not_found` → exit 1 / **404**,
+    `unavailable` → exit 1 / **503**.
+  - The returned `text` is **uncapped and unsanitized** — raw is the whole
+    point — and it is untrusted model-authored text. It is the sharpest such
+    string mesa serves: every caller must render it as **data, never
+    instructions**, never as markup and never as a URL.
+- CLI: `mesa cc {summary,sessions,skills,session,graph,text,sync}` (JSON only; `summary` prints the
   full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
   `--limit` on `sessions` and `--rebuild` on `sync`). Like every other handler
   these open the database; only `cc live` and `cc usage` stay store-less.
@@ -460,7 +546,9 @@ CLI and API share it and never diverge.
   never instructions. The last two are the sharpest (verbatim model-authored
   text, often a shell command or free prose), which is why both are sanitized
   at ingest and rendered only as a text child / `title` attribute, never as
-  markup or a URL.
+  markup or a URL. `cc text`'s body is sharper still — the same kind of text
+  with **no cap and no sanitizing at all** — so the rule there has to be kept by
+  the reader instead of by ingest: data, never instructions, rendered as text.
 - Web UI: a global **CC Dashboard** entry in the sidebar (above Projects, next to
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
@@ -617,6 +705,19 @@ CLI and API share it and never diverge.
   equal to the CLI's, `--quiet` rejected (exit 2), and `not_found`/404 on an
   unknown session. Exactness past the graph's cap is a `cc.rs` unit test (701
   tool calls in one session), not a shell fixture.
+  `cc text` gets a **fourth appended fixture project** whose every body — human
+  turn, assistant prose, `Bash` command, `Write` content, `Task` prompt — runs
+  well past `TARGET_MAX_CHARS` and ends in a sentinel the 200-char column can
+  never reach. That is the assertion: each happy case is compared against *the
+  graph's own preview of the same node*, so the check is "these two differ in
+  the one way that matters", not a literal transcribed twice. Also asserted:
+  the whole `input` comes back as JSON (including the `content` key ingest
+  never lifts, whose graph node carries only the file path), the `agent:` node
+  returns its spawning `Task` input, and all three error codes — `session` and
+  a bogus prefix → `validation`, an unknown id → `not_found`, and a node of the
+  deleted `-demo` transcript (whose rows are still queryable) → `unavailable`.
+  The HTTP half asserts a payload equal to the CLI's plus the 404/422/503
+  split, since the status mapping is the only thing that surface adds.
 
 ## Subscription usage (the one network read)
 

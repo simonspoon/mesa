@@ -1,8 +1,10 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { getCcSessionGraph } from '../api'
+import { CcNodeTextModal } from '../components/CcNodeTextModal'
 import { PROMPT_COLOR, RESPONSE_COLOR, formatTokens, shortModel, toolColor } from '../sessionGraph'
-import { filterRows, threadOptions, timelineRows } from '../sessionTimeline'
+import { filterRows, nodeTextTarget, threadOptions, timelineRows } from '../sessionTimeline'
 import type { TimelineRow } from '../sessionTimeline'
+import type { CcGraphNode } from '../types/CcGraphNode'
 import type { CcGraphNodeKind } from '../types/CcGraphNodeKind'
 import { useFetch } from '../useFetch'
 
@@ -47,6 +49,11 @@ export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
   const [query, setQuery] = useState('')
   const [kinds, setKinds] = useState<CcGraphNodeKind[]>(ALL_KINDS)
   const [thread, setThread] = useState<string>(ALL_THREADS)
+  // The row whose full text is open, if any. Holding the node itself (not just
+  // its id) is what lets the modal show the metadata and the stored preview
+  // without a second read of the graph.
+  const [openNode, setOpenNode] = useState<CcGraphNode | null>(null)
+  const closeNode = useCallback(() => setOpenNode(null), [])
 
   const rows = useMemo(() => (data ? timelineRows(data) : []), [data])
   const threads = useMemo(() => (data ? threadOptions(data) : []), [data])
@@ -175,17 +182,23 @@ export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
           ) : (
             <div className="cc-tl-rows">
               {shown.map((r) => (
-                <Row key={r.node.id} row={r} />
+                <Row key={r.node.id} row={r} onOpen={setOpenNode} />
               ))}
             </div>
           )}
         </>
       )}
+
+      {/* Mounted only once a row is opened, which is what makes the full-text
+          read lazy — a few hundred rows cost nothing until one is asked for. */}
+      {openNode && (
+        <CcNodeTextModal sessionId={sessionId} node={openNode} onClose={closeNode} />
+      )}
     </div>
   )
 }
 
-function Row({ row }: { row: TimelineRow }) {
+function Row({ row, onOpen }: { row: TimelineRow; onOpen: (n: CcGraphNode) => void }) {
   const n = row.node
   // Tool colours key on the tool *name* only (never the target) and the set of
   // names is open-ended, so the tint can only come from JS; the other kinds
@@ -213,12 +226,44 @@ function Row({ row }: { row: TimelineRow }) {
   // A subagent's spawn description takes the target column; no node ever has
   // both (`description` is agent-only).
   const body = n.description ?? n.target
+  // Which rows have a full body to fetch is `sessionTimeline.ts`'s decision,
+  // not this file's. A row with nothing to show stays exactly what it was: no
+  // role, no tab stop, no handlers.
+  const openable = nodeTextTarget(n) !== null
+  const open = () => onOpen(n)
 
   return (
     <div
-      className={`cc-tl-row kind-${n.kind}`}
+      className={`cc-tl-row kind-${n.kind}${openable ? ' is-openable' : ''}`}
       data-indent={row.indent}
       style={tint ? { borderLeftColor: tint } : undefined}
+      role={openable ? 'button' : undefined}
+      tabIndex={openable ? 0 : undefined}
+      onClick={
+        openable
+          ? (e) => {
+              // A link inside the row owns its own click, and a drag that
+              // ended in a text selection is not a click — the same two
+              // carve-outs the Sessions table's row handler makes.
+              if ((e.target as HTMLElement).closest('a')) return
+              if (window.getSelection()?.toString()) return
+              open()
+            }
+          : undefined
+      }
+      onKeyDown={
+        openable
+          ? (e) => {
+              // Keyboard-reachable and Enter-activatable, per docs/keyboard.md:
+              // the spatial nav focuses whatever is in the tab order and lets
+              // the browser activate it, which a plain <div> would not do.
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                open()
+              }
+            }
+          : undefined
+      }
     >
       <span className="cc-tl-clock">{n.ts ? n.ts.slice(11, 19) : ''}</span>
       {/* Untrusted: `name` is model/transcript-authored. Text child only. */}

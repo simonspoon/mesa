@@ -5226,6 +5226,81 @@ button:focus-visible,
   border-left-color: var(--border);
 }
 
+/* A row that has a full body to open (mesa task 803). Every row but the session
+   root does, so this is a whole-column affordance: it has to be quiet at rest
+   and unambiguous on hover/focus, not a per-row decoration. `outline` rather
+   than a border on focus, so the 5-track grid never reflows. */
+.cc-tl-row.is-openable {
+  cursor: pointer;
+}
+
+.cc-tl-row.is-openable:hover {
+  background: var(--panel-raised);
+}
+
+.cc-tl-row.is-openable:focus-visible {
+  outline: 1px solid var(--cyan);
+  outline-offset: -1px;
+}
+
+/* ---- One node's full text (mesa task 803) ----
+   Reuses `.create-task-backdrop` / `.create-task-modal` — the backdrop class is
+   what `shouldIgnoreShortcut()` matches to suppress global single-key shortcuts
+   while a modal is open (docs/keyboard.md), so this modal inherits that for
+   free. Only the box's reading width and its body differ. */
+.cc-nodetext-modal {
+  width: min(64rem, 92vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.cc-nodetext-title {
+  margin: 0 0 0.2rem;
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+
+.cc-nodetext-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.7rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.cc-nodetext-model {
+  font-family: var(--font-mono);
+}
+
+/* The body is verbatim, uncapped, model-authored text: it wraps rather than
+   scrolling sideways (a shell heredoc or a whole file is unreadable in a
+   one-line-per-command strip), and it scrolls on its own so the metadata above
+   it stays on screen. */
+.cc-nodetext-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+/* `format: 'json'` — a tool call's raw input object. Same box, tinted so a
+   reader can tell a structured payload from prose at a glance. */
+.cc-nodetext-body.is-json {
+  color: var(--text-h);
+}
+
 /* ---- CC session detail (#/cc/sessions/:id) — the default drill-down ----
    Reuses the dashboard's panels, KPI cards and `.cc-table-wrap` (so the phone
    rules in docs/mobile.md keep applying); only the bits that page has no
@@ -5514,4 +5589,41 @@ button:focus-visible,
 
 .settings-price-note {
   font-size: 0.7rem;
+}
+
+/* ── Node full-text modal, narrow + phone tiers (mesa task 803) ────────────
+   docs/mobile.md's two width tiers, but as their own blocks at the very end
+   of the file rather than inside the main ones above: the CC-timeline section
+   this modal belongs to is written *after* those blocks, so a tier rule placed
+   up there would lose the later-wins tie to `.cc-nodetext-modal`'s own
+   declarations. Same tiers, same meanings — only the position differs, and
+   the position is what makes them apply at all. */
+
+/* Tablet / split-screen: 92vw of a 780px window still leaves a margin nobody
+   is reading in, and the body is monospace — give it the width. */
+@media (max-width: 860px) {
+  .cc-nodetext-modal {
+    width: min(64rem, 96vw);
+  }
+}
+
+/* Phone: back to the full-screen sheet `.create-task-modal` / `.task-modal`
+   already become at this tier. The desktop box above only overrode their
+   width/height, so only those need restating; the border, notch and glow the
+   sheet drops are still handled by the rule up in the phone block. */
+@media (max-width: 600px) {
+  .cc-nodetext-modal {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+  }
+
+  /* The sheet supplies its own horizontal padding, and the body is the only
+     thing on screen — so it spans it, and drops a size step: a monospace line
+     at 0.74rem wraps every few words in a 390px column. */
+  .cc-nodetext-body {
+    font-size: 0.7rem;
+    padding: 0.4rem;
+  }
 }

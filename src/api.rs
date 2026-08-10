@@ -906,6 +906,11 @@ fn router(state: AppState) -> Router {
             "/api/cc/sessions/{session_id}/graph",
             get(get_cc_session_graph),
         )
+        // …and the body behind one node of that tree, read on click.
+        .route(
+            "/api/cc/sessions/{session_id}/nodes/{node_id}/text",
+            get(get_cc_node_text),
+        )
         // The one CC *write*: purge the stored telemetry and re-ingest from
         // the transcripts on disk. An explicit operator action (Settings →
         // Model pricing), never something a read can trigger — so it is a
@@ -1011,6 +1016,9 @@ impl From<Error> for ApiError {
         let (status, code) = match &err {
             Error::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Error::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            // "Ask again later", not "your input was wrong": the thing mesa
+            // depends on (a transcript file it does not own) is not there.
+            Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
             Error::Cycle(_) => (StatusCode::CONFLICT, "cycle"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Error::Db(_) | Error::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "conflict"),
@@ -3976,6 +3984,32 @@ async fn get_cc_session_graph(
         Some(g) => Ok(Json(g).into_response()),
         None => Err(Error::NotFound(format!("no ingested session {session_id}")).into()),
     }
+}
+
+/// Returns one graph node's own text (`CcNodeText`) — the body the call tree
+/// only names. Syncs first and is uncached for the same reason as
+/// `get_cc_session_graph`: an on-demand drill-down, not a poll.
+///
+/// **Gate:** exactly `get_cc_session_graph`'s — the router-wide `guard` layer
+/// and nothing else. No per-route auth helper, deliberately: this returns a
+/// strict subset of what the graph beside it already exposes for the same
+/// session, so a stricter gate here would be theatre and a looser one
+/// impossible. Do not add one without moving the graph route too.
+///
+/// Every failure mode is a typed `Error` from the core, so the shared
+/// `From<Error>` mapping produces the right status without a match here:
+/// unknown node → 404 `not_found`, the bodyless `session` node → 422
+/// `validation`, a transcript deleted off disk → 503 `unavailable`.
+async fn get_cc_node_text(
+    State(state): State<AppState>,
+    Path((session_id, node_id)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let text = {
+        let mut store = state.store.lock().unwrap();
+        crate::core::cc::sync(&mut store, false)?;
+        crate::core::cc::node_text(&store, &session_id, &node_id)?
+    };
+    Ok(Json(text).into_response())
 }
 
 /// Returns one session's aggregate detail (`CcSessionDetail`) — the default

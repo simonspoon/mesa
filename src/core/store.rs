@@ -462,6 +462,12 @@ const MIGRATIONS: &[&str] = &[
     // get a second chance. One-shot and additive: `cc_files` holds cursors,
     // not data.
     "DELETE FROM cc_files;",
+    // Task 804: the `refine` status is gone — no column renders it and no query
+    // selects it, so a row left in it would simply vanish from every surface.
+    // `backlog` is where it lands: a refine task was explicitly *not* ready to
+    // be handed out. There is no status CHECK constraint, so this is a plain
+    // data rewrite.
+    "UPDATE tasks SET status = 'backlog' WHERE status = 'refine';",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -549,7 +555,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 ///
 /// Prefix for a query that then filters on [`NOT_HIDDEN_PROJECT`]; defined
 /// once and shared by every unscoped site (`list_projects`, `list_tasks`,
-/// `next_task`, `list_refine_tasks`, `list_storyboards`) so they cannot drift
+/// `next_task`, `list_storyboards`) so they cannot drift
 /// apart on what "archived" means. `UNION` (not `UNION ALL`) so a malformed
 /// parent cycle terminates instead of recursing forever — the same guard
 /// `next_subtask` uses on the task tree.
@@ -2123,31 +2129,6 @@ impl Store {
             in_progress: count("t.status = 'in_progress'")?,
             todo: count(&format!("t.status = 'todo' AND NOT {blocked_expr}"))?,
         })
-    }
-
-    /// Every task sitting in the `refine` column, in the same
-    /// priority-then-id order [`Store::next_task`] dispatches in, and with the
-    /// same archived-project rule (excluded when unscoped, honored when the
-    /// caller names a project).
-    ///
-    /// Unlike `next_task` this does **not** filter on `blocked`: refinement
-    /// rewrites a task's description and acceptance, which is text work a
-    /// blocker doesn't gate — the point of the column is to get the wording
-    /// right *before* the work is up. The refine-watcher
-    /// (`docs/refine-watcher.md`) is the only caller; it takes the head of
-    /// each project's list per tick.
-    pub fn list_refine_tasks(&self, project: Option<i64>) -> Result<Vec<Task>> {
-        let sql = format!(
-            "{HIDDEN_PROJECTS_CTE}SELECT {TASK_COLUMNS} FROM tasks t \
-             JOIN projects p ON p.id = t.project_id \
-             WHERE t.status = 'refine' \
-             AND (?1 IS NULL OR t.project_id = ?1) \
-             AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
-             ORDER BY {PRIORITY_RANK}, t.id"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([project], row_to_task)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Selects the next actionable task from among the **descendants** of
@@ -4336,43 +4317,6 @@ mod tests {
         assert_eq!(store.get_project(child.id).unwrap(), child);
     }
 
-    /// The refine listing reads through the same shared predicate, so an
-    /// archived ancestor hides a child's refine work from the watcher too.
-    #[test]
-    fn list_refine_tasks_unscoped_excludes_child_of_archived_parent() {
-        let (mut store, _dir) = temp_store();
-        let root = store
-            .create_project("root", None, None, None, None)
-            .unwrap();
-        let child = store
-            .create_project("child", None, None, None, Some(root.id))
-            .unwrap();
-        let t = add_task(&mut store, child.id, "refine me");
-        store
-            .update_task(
-                t.id,
-                &TaskPatch {
-                    status: Some(Status::Refine),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(store.list_refine_tasks(None).unwrap().len(), 1);
-
-        store.archive_project(root.id).unwrap();
-        assert!(store.list_refine_tasks(None).unwrap().is_empty());
-        // Scoped to the child itself, byte-identical to before.
-        assert_eq!(
-            store
-                .list_refine_tasks(Some(child.id))
-                .unwrap()
-                .iter()
-                .map(|t| t.id)
-                .collect::<Vec<_>>(),
-            vec![t.id],
-        );
-    }
-
     /// Deleting a project takes its whole subtree — and the echo carries every
     /// destroyed row, since it is the recovery transcript.
     #[test]
@@ -5862,139 +5806,6 @@ mod tests {
             NextResult::Task(t) => assert_eq!(t.id, plain_todo.id),
             NextResult::None { .. } => panic!("expected the plain todo task"),
         }
-    }
-
-    #[test]
-    fn refine_tasks_are_listed_by_rank_and_never_dispatched_as_todo() {
-        let (mut store, _dir) = temp_store();
-        let p = store.create_project("p", None, None, None, None).unwrap();
-        let refine = |store: &mut Store, name: &str, priority: Priority| {
-            store
-                .create_task(
-                    p.id,
-                    name,
-                    priority,
-                    &[],
-                    None,
-                    None,
-                    None,
-                    Some(Status::Refine),
-                )
-                .unwrap()
-        };
-        let low = refine(&mut store, "low", Priority::Low);
-        let high = refine(&mut store, "high", Priority::High);
-
-        // Refine is *before* todo: `next_task` only ever picks `todo`, so a
-        // refine task is invisible to the todo-watcher on both paths and
-        // counts in none of the None-result buckets.
-        match store.next_task(None).unwrap() {
-            NextResult::Task(_) => panic!("refine task must not be picked as next"),
-            NextResult::None {
-                blocked,
-                in_progress,
-                todo,
-            } => {
-                assert_eq!((blocked, in_progress, todo), (0, 0, 0));
-            }
-        }
-
-        // The refine-watcher's own pick: priority then id, same as next_task.
-        let listed = store.list_refine_tasks(Some(p.id)).unwrap();
-        assert_eq!(
-            listed.iter().map(|t| t.id).collect::<Vec<_>>(),
-            [high.id, low.id]
-        );
-
-        // A blocker does not hide a task from refinement — clarifying the
-        // wording is exactly what you do while the work is still gated.
-        let blocker = add_task(&mut store, p.id, "blocker");
-        store.add_dependency(low.id, blocker.id).unwrap();
-        let listed = store.list_refine_tasks(Some(p.id)).unwrap();
-        assert_eq!(listed.len(), 2);
-        assert!(listed.iter().any(|t| t.id == low.id && t.blocked));
-
-        // Moving one on to `todo` empties it out of the column and hands it
-        // to the todo-watcher — the whole point of the refine pass.
-        store
-            .update_task(
-                high.id,
-                &TaskPatch {
-                    status: Some(Status::Todo),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .list_refine_tasks(Some(p.id))
-                .unwrap()
-                .iter()
-                .map(|t| t.id)
-                .collect::<Vec<_>>(),
-            [low.id]
-        );
-        match store.next_task(Some(p.id)).unwrap() {
-            NextResult::Task(t) => assert_eq!(t.id, high.id),
-            NextResult::None { .. } => panic!("the refined task should now be actionable"),
-        }
-    }
-
-    #[test]
-    fn list_refine_tasks_unscoped_excludes_archived_project() {
-        let (mut store, _dir) = temp_store();
-        let archived = store
-            .create_project("archived", None, None, None, None)
-            .unwrap();
-        let live = store
-            .create_project("live", None, None, None, None)
-            .unwrap();
-        let hidden = store
-            .create_task(
-                archived.id,
-                "hidden",
-                Priority::High,
-                &[],
-                None,
-                None,
-                None,
-                Some(Status::Refine),
-            )
-            .unwrap();
-        let shown = store
-            .create_task(
-                live.id,
-                "shown",
-                Priority::Low,
-                &[],
-                None,
-                None,
-                None,
-                Some(Status::Refine),
-            )
-            .unwrap();
-        store.archive_project(archived.id).unwrap();
-        // Unscoped: archived is invisible, so the refine-watcher never
-        // dispatches onto it (the todo-watcher's rule, same reason).
-        assert_eq!(
-            store
-                .list_refine_tasks(None)
-                .unwrap()
-                .iter()
-                .map(|t| t.id)
-                .collect::<Vec<_>>(),
-            [shown.id]
-        );
-        // Scoped to it by id, the read is unchanged — the archiving rule.
-        assert_eq!(
-            store
-                .list_refine_tasks(Some(archived.id))
-                .unwrap()
-                .iter()
-                .map(|t| t.id)
-                .collect::<Vec<_>>(),
-            [hidden.id]
-        );
     }
 
     #[test]
@@ -7828,21 +7639,18 @@ mod tests {
         assert_eq!(store.cc_node_file("sess-1", "nope").unwrap(), None);
     }
 
-    /// The task-803 pair, pinned by position: the `CREATE TABLE` must be
-    /// followed by the cursor reset that backfills it, and both must ship in
-    /// the same binary as the ingest write. Pinned to the array's tail rather
-    /// than by literal index because these are, for now, the newest two — the
-    /// day something is appended after them, this assertion is what forces the
-    /// next author to re-read the ordering rule instead of silently landing a
-    /// schema change between a table and its re-walk.
+    /// The task-803 pair, pinned by adjacency: the `CREATE TABLE` must be
+    /// immediately followed by the cursor reset that backfills it, and both
+    /// must ship in the same binary as the ingest write. Located by content
+    /// rather than by literal index — migrations append, so the pair drifts
+    /// down the array — but nothing may ever land *between* the two.
     #[test]
     fn node_files_table_is_immediately_followed_by_its_cursor_reset() {
-        let n = MIGRATIONS.len();
-        assert!(
-            MIGRATIONS[n - 2].contains("CREATE TABLE cc_node_files"),
-            "the cc_node_files migration moved"
-        );
-        assert_eq!(MIGRATIONS[n - 1].trim(), "DELETE FROM cc_files;");
+        let i = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("CREATE TABLE cc_node_files"))
+            .expect("the cc_node_files migration is gone");
+        assert_eq!(MIGRATIONS[i + 1].trim(), "DELETE FROM cc_files;");
     }
 
     /// The API cache key: 0 on empty, moves when rows land, stays put on a

@@ -17,10 +17,10 @@ its own account stays archived, because its own flag still says so.
 
 One shared recursive-CTE predicate (`HIDDEN_PROJECTS_CTE` /
 `NOT_HIDDEN_PROJECT` in `src/core/store.rs`) implements it at every unscoped
-site — `list_projects`, `list_tasks`, `next_task`, `list_refine_tasks`,
-`list_storyboards`, and so the todo/refine watchers and `GET /api/git-status`
-that read through them. It is defined once on purpose: five hand-copied CTEs
-would be five chances for "archived" to mean something slightly different.
+site — `list_projects`, `list_tasks`, `next_task`, `list_storyboards`, and so
+the todo watcher and `GET /api/git-status` that read through them. It is
+defined once on purpose: four hand-copied CTEs would be four chances for
+"archived" to mean something slightly different.
 
 The web UI re-derives the same rule client-side
 (`projectTree.ts::effectivelyArchivedIds`), because the sidebar fetches with

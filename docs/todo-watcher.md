@@ -141,12 +141,6 @@ because someone ran `mesa serve`.
     unlike a stuck `in_progress` row it is **self-clearing**: the slot frees
     itself the moment the process dies, with no db edit. Killing the agent (or
     just its shell) is the escape hatch.
-- **`refine` is invisible here too, and that is the whole point of the
-  column.** Both picks filter `status = 'todo'`, so a task parked in `refine`
-  (`docs/refine-watcher.md`) is no more actionable than a `backlog` one. The
-  two watchers therefore never contend: `--watch-refine` empties the refine
-  column by moving tasks to `todo`, at which point this watcher may dispatch
-  them as ordinary work.
 - **Lowering the limit never touches in-flight work.** The config is read at
   the top of every tick, but a lower value only narrows how many *new* tasks
   the tick is willing to pick — an already-`in_progress` leaf stays

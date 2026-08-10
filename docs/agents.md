@@ -459,13 +459,11 @@ stored status. The signal is the same `listAllAgents()` feed the sidebar polls
 `frontend/src/boardView.ts`.
 
 Deliberately **not** a stored status: `in_progress` is already conveyed by the
-column, it goes stale when an agent crashes, and it misses `refine` entirely —
-refine-watcher dispatch is not a status claim (`docs/refine-watcher.md`). So
-the marker fires in every column, and an `in_progress` row whose agent is gone
-does not animate.
+column, and it goes stale when an agent crashes. So the marker fires in every
+column, and an `in_progress` row whose agent is gone does not animate.
 
 - **Match rule:** a session belongs to a task when its `name` is exactly
-  `"{project.name}: {task.name}"` — the string both watchers spawn with
+  `"{project.name}: {task.name}"` — the string the todo watcher spawns with
   (`src/api.rs`). The frontend holds both halves and reconstructs it.
 - **Liveness** is the existing `isRunningAgent()` (`agentProject.ts`), the same
   predicate the sidebar's bucketing uses — `done`/`failed`/`stopped`, `pid:
@@ -474,7 +472,7 @@ does not animate.
 - **Best-effort by construction**, and it must always degrade to *no
   animation*: sidebar `+ agent` sessions carry no `--name`
   (`DEFAULT_AGENT_SPAWN` has no `{name}`) and never match; a replaced
-  `todo-watcher`/`refine-watcher` template without `{name}` loses the marker
+  `todo-watcher` template without `{name}` loses the marker
   and nothing else; editing a task's `description` after dispatch changes the
   derived `name` and lapses the match; and two tasks in one project sharing
   their first 50 chars both animate. There is no task↔session column,

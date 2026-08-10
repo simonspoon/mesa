@@ -1,9 +1,9 @@
 //! User config: the command lines mesa uses when it starts a coding agent,
 //! and the per-model price table the CC Dashboard estimates cost from.
 //!
-//! mesa spawns an agent from exactly four places — the todo-watcher's
-//! dispatch, the refine-watcher's refinement pass, the inbox-watcher's triage,
-//! and the Agents surface's "add agent" button. Each used to be a hardcoded
+//! mesa spawns an agent from exactly three places — the todo-watcher's
+//! dispatch, the inbox-watcher's triage, and the Agents surface's "add agent"
+//! button. Each used to be a hardcoded
 //! `claude --bg …` argv, so swapping the binary, the persona, or the slash
 //! command meant a rebuild. Each is now a **command template** in
 //! `~/.mesa/config.json`:
@@ -12,7 +12,6 @@
 //! {
 //!   "commands": {
 //!     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
-//!     "refine-watcher": "claude --bg --agent swe --name {name} -- \"Refine mesa task {id} …\"",
 //!     "inbox-watcher":  "claude --bg --agent swe --name {name} -- \"/inbox-triage {id}\"",
 //!     "agent-spawn":    "claude --bg --agent swe -- {prompt}"
 //!   }
@@ -83,8 +82,6 @@ use crate::core::types::{ConfigCommand, ConfigPrice, ConfigWatchers, ModelRates}
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
 pub const TODO_WATCHER: &str = "todo-watcher";
-/// The refine-watcher's refinement command (`docs/refine-watcher.md`).
-pub const REFINE_WATCHER: &str = "refine-watcher";
 /// The inbox-watcher's triage command (`docs/inbox-watcher.md`).
 pub const INBOX_WATCHER: &str = "inbox-watcher";
 /// The Agents surface's "add agent" command (`docs/agents.md`).
@@ -93,7 +90,7 @@ pub const AGENT_SPAWN: &str = "agent-spawn";
 /// Every configurable command, in the order the docs and the Settings page
 /// list them. The single source of truth for "which keys mesa configures" —
 /// [`default_command`] answers the same question one key at a time.
-pub const ACTIONS: [&str; 4] = [TODO_WATCHER, REFINE_WATCHER, INBOX_WATCHER, AGENT_SPAWN];
+pub const ACTIONS: [&str; 3] = [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
 /// config file existed, spelled as a template. `{bin}`/`{agent}` carry the
@@ -106,14 +103,6 @@ pub const ACTIONS: [&str; 4] = [TODO_WATCHER, REFINE_WATCHER, INBOX_WATCHER, AGE
 /// arrive as two arguments and the id would be lost.
 pub const DEFAULT_TODO_WATCHER: &str =
     r#"{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}""#;
-/// Built-in default for [`REFINE_WATCHER`] — the only default that is a plain
-/// prompt rather than a slash command, because refinement needs no repo-side
-/// skill: the agent reads the task with the `mesa` CLI, rewrites its
-/// `description`/`acceptance`, and moves it to `todo` itself, which is what
-/// takes it out of the refine column (`docs/refine-watcher.md`). Quoted for
-/// the same reason as the others — the prompt is **one** argv entry, and
-/// tokenization is by whitespace.
-pub const DEFAULT_REFINE_WATCHER: &str = r#"{bin} --bg --agent {agent} --name {name} -- "First use `mesa` to get the task info from id {id}. Then refine the task: clarify anything ambiguous and rewrite its description and acceptance fields. When you are done change the status to 'todo'.""#;
 /// Built-in default for [`INBOX_WATCHER`]; see [`DEFAULT_TODO_WATCHER`].
 pub const DEFAULT_INBOX_WATCHER: &str =
     r#"{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}""#;
@@ -128,7 +117,6 @@ pub const DEFAULT_AGENT_SPAWN: &str = "{bin} --bg --agent {agent} -- {prompt}";
 pub fn default_command(action: &str) -> Option<&'static str> {
     match action {
         TODO_WATCHER => Some(DEFAULT_TODO_WATCHER),
-        REFINE_WATCHER => Some(DEFAULT_REFINE_WATCHER),
         INBOX_WATCHER => Some(DEFAULT_INBOX_WATCHER),
         AGENT_SPAWN => Some(DEFAULT_AGENT_SPAWN),
         _ => None,
@@ -1193,19 +1181,16 @@ mod tests {
         assert_eq!(settings[0].value.as_deref(), Some("mytool run {id}"));
         assert_eq!(settings[0].default, DEFAULT_TODO_WATCHER);
         // An unconfigured action is `None` — "falling back", not "empty".
-        assert_eq!(settings[1].action, REFINE_WATCHER);
+        assert_eq!(settings[1].action, INBOX_WATCHER);
         assert_eq!(settings[1].value, None);
-        assert_eq!(settings[1].default, DEFAULT_REFINE_WATCHER);
-        assert_eq!(settings[2].action, INBOX_WATCHER);
-        assert_eq!(settings[2].value, None);
-        assert_eq!(settings[2].default, DEFAULT_INBOX_WATCHER);
+        assert_eq!(settings[1].default, DEFAULT_INBOX_WATCHER);
         // The placeholder vocabulary is per-action, matching `Vars::lookup`.
         assert_eq!(
             settings[0].placeholders,
             ["{bin}", "{agent}", "{id}", "{name}"]
         );
-        assert_eq!(settings[3].action, AGENT_SPAWN);
-        assert_eq!(settings[3].placeholders, ["{bin}", "{agent}", "{prompt}"]);
+        assert_eq!(settings[2].action, AGENT_SPAWN);
+        assert_eq!(settings[2].placeholders, ["{bin}", "{agent}", "{prompt}"]);
     }
 
     #[test]
@@ -1419,37 +1404,6 @@ mod tests {
                 "look at the tests"
             ]
         );
-    }
-
-    #[test]
-    fn default_refine_watcher_keeps_its_prompt_in_one_argv_entry() {
-        // The prompt is prose, not a slash command — spaces, backticks and
-        // single quotes and all. It still has to arrive as exactly one
-        // argument with `{id}` substituted, or the agent gets the first word
-        // of an instruction and a pile of stray positionals.
-        let vars = Vars {
-            bin: Some("claude"),
-            agent: Some("swe"),
-            id: Some(661),
-            name: Some("mesa: refine me"),
-            ..Default::default()
-        };
-        let argv = expand(REFINE_WATCHER, DEFAULT_REFINE_WATCHER, &vars).unwrap();
-        assert_eq!(
-            argv[..6],
-            [
-                "claude",
-                "--bg",
-                "--agent",
-                "swe",
-                "--name",
-                "mesa: refine me"
-            ]
-        );
-        assert_eq!(argv[6], "--");
-        assert_eq!(argv.len(), 8);
-        assert!(argv[7].contains("id 661"), "{}", argv[7]);
-        assert!(argv[7].contains("'todo'"), "{}", argv[7]);
     }
 
     #[test]
@@ -1705,7 +1659,7 @@ mod tests {
             ["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"]
         );
         assert_eq!(
-            settings[3].env_vars,
+            settings[2].env_vars,
             ["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"]
         );
         // The two vocabularies line up one-for-one, in the same order.
@@ -2079,7 +2033,7 @@ mod tests {
 
     #[test]
     fn every_default_names_a_known_action() {
-        for action in [TODO_WATCHER, REFINE_WATCHER, INBOX_WATCHER, AGENT_SPAWN] {
+        for action in [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN] {
             assert!(default_command(action).is_some(), "{action}");
         }
         assert_eq!(default_command("task-execute"), None);

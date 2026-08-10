@@ -1,13 +1,12 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly four places. Each one's command line
+mesa starts a coding agent from exactly three places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
 persona and the slash command can all change without rebuilding mesa:
 
 | Key | Used by | Built-in default |
 | --- | --- | --- |
 | `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}"` |
-| `refine-watcher` | `serve --watch-refine` refinement pass (`docs/refine-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "First use \`mesa\` to get the task info from id {id}. …"` |
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"` |
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `{bin} --bg --agent {agent} -- {prompt}` |
 
@@ -15,7 +14,6 @@ persona and the slash command can all change without rebuilding mesa:
 {
   "commands": {
     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
-    "refine-watcher": "claude --bg --agent planner --name {name} -- \"/refine-mesa-task {id}\"",
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
     "agent-spawn":    "claude --bg -- {prompt}"
   }
@@ -58,12 +56,9 @@ The consequences of having no shell:
 - `|`, `>`, `&&`, `$VAR`, `~` are ordinary characters. No pipes, no
   redirection, no environment expansion, no globbing. Write absolute paths.
 - Quote an argument that contains spaces: `'…'` (literal) or `"…"`
-  (backslash-escapable). **The prompt in all three watcher defaults is quoted
+  (backslash-escapable). **The prompt in both watcher defaults is quoted
   for exactly this reason** — `-- "/execute-mesa-task {id}"` is one argument;
-  unquoted, it would be two and the id would be lost. The refine-watcher's
-  default is a whole *sentence* of prompt inside those quotes; it is one argv
-  entry for the same reason, and nothing about it is re-split after `{id}` is
-  substituted.
+  unquoted, it would be two and the id would be lost.
 - An unterminated quote or a trailing backslash is an error, not a
   silently-mangled argv.
 - Need a shell? Write a second line — see script mode below. (`sh -c "…"` as a
@@ -77,10 +72,10 @@ what that spawn actually knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{bin}` | all four | `MESA_CLAUDE_BIN`, else `claude` |
-| `{agent}` | all four | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
+| `{bin}` | all three | `MESA_CLAUDE_BIN`, else `claude` |
+| `{agent}` | all three | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
 | `{id}` | watchers | the task id / inbox item id |
-| `{name}` | watchers | the session name mesa derives — `<project>: <task name>` (todo- and refine-watcher), or `inbox <id>: <first body line>` (**untrusted text**) |
+| `{name}` | watchers | the session name mesa derives — `<project>: <task name>` (todo-watcher), or `inbox <id>: <first body line>` (**untrusted text**) |
 | `{prompt}` | `agent-spawn` | the POST body's `prompt`; unavailable when omitted |
 
 Two rules cover the edges:
@@ -136,8 +131,8 @@ variable, offered on exactly the commands its `{}` twin is:
 
 | Placeholder | Variable | Where |
 | --- | --- | --- |
-| `{bin}` | `MESA_BIN` | all four |
-| `{agent}` | `MESA_AGENT` | all four |
+| `{bin}` | `MESA_BIN` | all three |
+| `{agent}` | `MESA_AGENT` | all three |
 | `{id}` | `MESA_ID` | watchers |
 | `{name}` | `MESA_NAME` | watchers |
 | `{prompt}` | `MESA_PROMPT` | `agent-spawn` |
@@ -205,7 +200,7 @@ paths don't know which mode ran.
 ## What a replacement command owes mesa
 
 Only its **exit code**. Nonzero is a failed spawn (the todo-watcher reverts the
-task to `todo`; the refine- and inbox-watchers drop the id from their
+task to `todo`; the inbox-watcher drops the id from its
 in-memory dispatched set, so a later tick retries).
 
 Printing `backgrounded · <id>` is optional. mesa parses that line when it is
@@ -405,7 +400,7 @@ vice versa.
 
 ## Gate
 
-`scripts/config-check.sh` — all four commands driven by a configured template
+`scripts/config-check.sh` — all three commands driven by a configured template
 (placeholders, quoting, the drop rule), the built-in argv proven unused while
 they are set and byte-for-byte unchanged when they aren't, the `id: null`
 no-receipt path, hot reload with no restart, and the malformed /
@@ -413,7 +408,7 @@ unsupported-placeholder failures — plus `GET`/`PUT /api/config`: the round
 trip, the blank-clears-the-key rule, untouched keys and unknown sections
 preserved, a just-saved template driving the very next spawn, and the 422/502
 refusals leaving the file byte-identical — and, for script mode, a script
-driving each of the four actions, the per-action variables present/absent, the
+driving each of the three actions, the per-action variables present/absent, the
 unset-not-empty rule, a hostile `{name}` proven not to reach a shell, and the
 422s for `{}`-in-a-script and a bash syntax error. It writes a real
 `~/.mesa/config.json` under a throwaway `HOME` rather than using

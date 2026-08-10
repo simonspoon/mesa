@@ -3,7 +3,6 @@ import { createAttachment, createTask } from '../api'
 import { imageFilesFromClipboard } from '../clipboardFiles'
 import { parseTags } from '../tags'
 import type { Priority } from '../types/Priority'
-import type { Status } from '../types/Status'
 
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 
@@ -34,10 +33,8 @@ function readFileAsBase64(file: File): Promise<string> {
  * A clipboard image pasted anywhere in the form stages the same way — see
  * `clipboardFiles.ts` for why it arrives renamed.
  *
- * The primary submit button omits `status`, so the API defaults new tasks to
- * `backlog` (spec 302). The secondary "create + move to refine" button passes
- * `status: 'refine'` explicitly, a fast path around that triage step that
- * hands the rough description straight to the refine watcher (task 661).
+ * The submit button sends no `status`, so the API defaults new tasks to
+ * `backlog` (spec 302).
  */
 export function CreateTaskPanel({
   projectId,
@@ -80,7 +77,7 @@ export function CreateTaskPanel({
     setPendingFiles((prev) => prev.filter((_, i) => i !== index))
   }
 
-  async function submit(status?: Status) {
+  async function submit() {
     setSubmitting(true)
     setError(null)
     try {
@@ -91,7 +88,6 @@ export function CreateTaskPanel({
           description,
           priority,
           tags: parseTags(tags),
-          ...(status ? { status } : {}),
         })
         taskId = task.id
         setCreatedTaskId(taskId)
@@ -202,15 +198,6 @@ export function CreateTaskPanel({
                 ? `retry ${pendingFiles.length} attachment(s)`
                 : 'done'}
           </button>
-          {createdTaskId === null && (
-            <button
-              type="button"
-              disabled={submitting || description.trim() === ''}
-              onClick={() => submit('refine')}
-            >
-              create + move to refine
-            </button>
-          )}
         </div>
         {error && <span className="error">{error}</span>}
       </form>

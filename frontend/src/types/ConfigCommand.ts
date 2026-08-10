@@ -7,8 +7,7 @@
  */
 export type ConfigCommand = { 
 /**
- * The config key: `todo-watcher`, `refine-watcher`, `inbox-watcher`
- * or `agent-spawn`.
+ * The config key: `todo-watcher`, `inbox-watcher` or `agent-spawn`.
  */
 action: string, 
 /**

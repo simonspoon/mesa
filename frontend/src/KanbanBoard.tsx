@@ -19,7 +19,7 @@ import type { AgentSession } from './types/AgentSession'
 import type { Status } from './types/Status'
 import type { TaskSummary } from './types/TaskSummary'
 
-const COLUMNS: Status[] = ['backlog', 'refine', 'todo', 'in_progress', 'done']
+const COLUMNS: Status[] = ['backlog', 'todo', 'in_progress', 'done']
 
 function CardBody({ task, liveAgents }: { task: TaskSummary; liveAgents: number }) {
   return (
@@ -53,7 +53,7 @@ function CardBody({ task, liveAgents }: { task: TaskSummary; liveAgents: number 
         )}
         {/* Live-agent marker (mesa task 663): a *running* Claude Code session
             whose name matches this project+task, not a stored status — so it
-            fires in every column, `refine` included, and an `in_progress` row
+            fires in every column, and an `in_progress` row
             whose agent crashed stops pulsing. Best-effort by construction; see
             `liveAgentCount`. It lives in `CardBody` so the DragOverlay copy
             carries it too. */}

@@ -62,7 +62,7 @@ describe('capColumn', () => {
   })
 
   it('returns every other column uncapped', () => {
-    for (const status of ['backlog', 'refine', 'todo', 'in_progress']) {
+    for (const status of ['backlog', 'todo', 'in_progress']) {
       const { visible, hidden } = capColumn(status, rows(266), DONE_INITIAL)
       expect(visible).toHaveLength(266)
       expect(hidden).toBe(0)

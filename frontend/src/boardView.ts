@@ -17,7 +17,7 @@ import type { TaskSummary } from './types/TaskSummary'
  * animation":
  * - sessions started from the Agents sidebar's "add agent" button carry no
  *   `--name` at all (`DEFAULT_AGENT_SPAWN` has no `{name}`) and never match;
- * - a user-replaced `todo-watcher`/`refine-watcher` command template that
+ * - a user-replaced `todo-watcher` command template that
  *   drops `{name}` loses the animation and nothing else;
  * - if a task's `description` (and so its derived `name`) changed after
  *   dispatch, the match lapses;

@@ -6,7 +6,6 @@ use ts_rs::TS;
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum Status {
     Backlog,
-    Refine,
     Todo,
     InProgress,
     Done,
@@ -17,7 +16,6 @@ impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
             Status::Backlog => "backlog",
-            Status::Refine => "refine",
             Status::Todo => "todo",
             Status::InProgress => "in_progress",
             Status::Done => "done",
@@ -28,7 +26,6 @@ impl Status {
     pub fn parse(s: &str) -> Option<Status> {
         match s {
             "backlog" => Some(Status::Backlog),
-            "refine" => Some(Status::Refine),
             "todo" => Some(Status::Todo),
             "in_progress" => Some(Status::InProgress),
             "done" => Some(Status::Done),
@@ -180,8 +177,7 @@ pub struct ProjectAgents {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct ConfigCommand {
-    /// The config key: `todo-watcher`, `refine-watcher`, `inbox-watcher`
-    /// or `agent-spawn`.
+    /// The config key: `todo-watcher`, `inbox-watcher` or `agent-spawn`.
     pub action: String,
     /// The configured template, or `null` when the key is absent or blank.
     /// Null is "falling back to `default`", never "run nothing".

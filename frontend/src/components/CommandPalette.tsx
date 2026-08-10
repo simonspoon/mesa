@@ -28,6 +28,12 @@ function buildCommands(projects: Project[]): Command[] {
   const commands: Command[] = [
     { id: 'cc', label: 'CC Dashboard', search: 'cc dashboard', run: () => navigate('#/cc') },
     { id: 'inbox', label: 'Inbox', search: 'inbox', run: () => navigate('#/inbox') },
+    {
+      id: 'scripts',
+      label: 'Scripts',
+      search: 'scripts shell run',
+      run: () => navigate('#/scripts'),
+    },
   ]
   for (const p of projects) {
     const name = p.name.toLowerCase()

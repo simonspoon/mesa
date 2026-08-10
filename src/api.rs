@@ -40,8 +40,9 @@ use crate::core::{
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, MesaVersion, ModelRates, NextResult, Priority,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    ProjectVersion, Status, Store, StoryboardPatch, Task, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, config, files, git, hooks, version,
+    ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, StoryboardPatch, Task,
+    TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, scripts,
+    version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -345,6 +346,11 @@ fn inbox_watcher_tick(state: &AppState) {
 /// An epic therefore gets dispatched only once its subtree is exhausted —
 /// which is exactly the roll-up moment its acceptance describes.
 ///
+/// Still mandatory now that the ceiling is configurable (mesa task 777), and
+/// for the same reason: an umbrella counts toward *nothing*, so a claimed
+/// batch would be a slot the limit's accounting never sees — one agent over
+/// the limit, every tick, forever.
+///
 /// Bounded, so a malformed `parent_id` cycle can only cost a few queries
 /// rather than spinning the tick forever; real task trees are a few levels
 /// deep at most.
@@ -359,8 +365,8 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
     Ok(task)
 }
 
-/// One todo-watcher pass: for every project with a live `local_path` and no
-/// `in_progress` **leaf** task, pick the next actionable task and dispatch a
+/// One todo-watcher pass: for every project with a live `local_path` and a
+/// free dispatch slot, pick the next actionable task and dispatch a
 /// background `claude` agent on it. Marks the task `in_progress`
 /// itself *before* spawning — closing the race window between dispatch and
 /// the agent's own `/execute-mesa-task` pickup step, so a second tick can't
@@ -371,25 +377,47 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// and leaves that project quiet until someone intervenes — an accepted v1
 /// tradeoff over polling `claude agents` for every project every tick.
 ///
-/// "Busy" is per-project but not per-`in_progress`-row: an `in_progress` task
-/// that has subtasks is an **umbrella**, not a worker, so it does not wedge
-/// the project (mesa task 570). A project whose only `in_progress` tasks are
-/// umbrellas stays dispatchable, but the pick narrows from
+/// "Busy" is a **count**, not a flag (mesa task 777): a project's occupied
+/// slots are its `in_progress` **leaf** tasks, and the tick fills it up to
+/// `config::todo_concurrency()` — the user's per-project ceiling, default 1,
+/// so an unconfigured install behaves exactly as before. The limit is read
+/// once at the top of every tick rather than at startup, the same
+/// read-per-use rule the spawn templates follow, which is what makes an edit
+/// land on the next tick with no restart. Lowering it never touches work in
+/// flight: those tasks stay `in_progress` and the tick simply picks nothing
+/// new for that project until the count falls back under the limit.
+///
+/// An `in_progress` task that has subtasks is an **umbrella**, not a worker,
+/// so it occupies no slot (mesa task 570). A project whose only `in_progress`
+/// tasks are umbrellas is fully idle by the count, but the pick narrows from
 /// `Store::next_task` (any actionable todo in the project) to
 /// `Store::next_subtask` (an actionable todo *under* one of those umbrellas)
 /// — an open umbrella unblocks its own children and nothing else, so the
 /// watcher never starts unrelated work alongside a parent someone is still
-/// holding.
+/// holding. That narrowing is decided once per project, before the fill loop:
+/// a leaf claimed inside the loop is nobody's parent, so it cannot change the
+/// answer mid-loop.
 ///
-/// The invariant that keeps this to one watcher-spawned agent per project is
-/// [`deepest_actionable`]: whatever the pick, the watcher claims an
-/// actionable *leaf*, which re-marks the project busy on the next tick. It
+/// The invariant that keeps this to *at most* `limit` watcher-spawned agents
+/// per project is [`deepest_actionable`]: whatever the pick, the watcher
+/// claims an actionable *leaf*, which occupies a slot on the next tick. It
 /// never claims a task that still has actionable subtasks — that task would
-/// otherwise read as an umbrella one tick later and get a second agent
-/// spawned on its own child. (Residual, inherent to the status-not-liveness
-/// signal: a *new* subtask created under an already-`in_progress` task
-/// mid-run does turn it into an umbrella, and the next tick dispatches that
-/// child alongside whoever holds the parent.)
+/// otherwise read as an umbrella one tick later, count toward nothing, and
+/// get a further agent spawned on its own child *outside* the limit's
+/// accounting. (Residual, inherent to the status-not-liveness signal: a *new*
+/// subtask created under an already-`in_progress` task mid-run does turn it
+/// into an umbrella, and the next tick dispatches that child alongside
+/// whoever holds the parent.)
+///
+/// Claiming before the next pick is also what terminates the fill loop:
+/// both picks filter `status = 'todo'`, so a just-claimed task is invisible
+/// to the following iteration. (Residual of filling more than one slot at a
+/// time: a parent whose *last* actionable child this loop just claimed is
+/// itself actionable to the next iteration, so a limit above 1 can put an
+/// agent on the roll-up while its child is still running. It stays inside
+/// the limit and inside the umbrella rule — the parent counts as an umbrella
+/// from the next tick on — and is the cost of "fill to the limit now"
+/// rather than "one per tick".)
 ///
 /// Two-phase, like `spawn_project_agent`: the store lock is held only long
 /// enough to decide and claim (phase 1), then dropped before the blocking
@@ -398,6 +426,16 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// `claude --bg` takes to start (node startup, ~0.5s+, per the Agents-tab
 /// comments) times however many projects this tick dispatches.
 fn todo_watcher_tick(state: &AppState) {
+    // Read once per tick, before the lock. An unreadable/malformed config is
+    // a skipped tick, never a dispatch under a guessed limit — the spawn
+    // would fail on the same file a moment later anyway.
+    let limit = match config::todo_concurrency() {
+        Ok(limit) => limit as usize,
+        Err(e) => {
+            eprintln!("todo-watcher: {e}");
+            return;
+        }
+    };
     let claimed: Vec<(i64, String, String)> = {
         let mut store = match state.store.lock() {
             Ok(s) => s,
@@ -418,17 +456,17 @@ fn todo_watcher_tick(state: &AppState) {
             }
         };
         // A task that is somebody's parent is an umbrella; only a *leaf*
-        // in_progress task means "an agent is working this project".
+        // in_progress task occupies one of the project's dispatch slots.
         let parents: std::collections::HashSet<i64> =
             tasks.iter().filter_map(|t| t.parent_id).collect();
-        let mut busy_projects: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut busy_counts: HashMap<i64, usize> = HashMap::new();
         let mut umbrellas: std::collections::HashMap<i64, Vec<i64>> =
             std::collections::HashMap::new();
         for task in tasks.iter().filter(|t| t.status == Status::InProgress) {
             if parents.contains(&task.id) {
                 umbrellas.entry(task.project_id).or_default().push(task.id);
             } else {
-                busy_projects.insert(task.project_id);
+                *busy_counts.entry(task.project_id).or_default() += 1;
             }
         }
         let mut claimed = Vec::new();
@@ -439,55 +477,62 @@ fn todo_watcher_tick(state: &AppState) {
             if !std::path::Path::new(local_path).is_dir() {
                 continue;
             }
-            if busy_projects.contains(&project.id) {
+            // Free slots, never negative: a limit lowered below what is
+            // already running dispatches nothing and cancels nothing.
+            let slots = limit.saturating_sub(busy_counts.get(&project.id).copied().unwrap_or(0));
+            if slots == 0 {
                 continue;
             }
             // Open umbrella(s) → dispatch only from under them; otherwise the
-            // project is idle and the whole backlog is fair game.
-            let picked = match umbrellas.get(&project.id) {
-                Some(parent_ids) => match store.next_subtask(parent_ids) {
-                    Ok(Some(task)) => task,
-                    Ok(None) => continue,
+            // project is idle and the whole backlog is fair game. Decided
+            // once: a leaf claimed below is nobody's parent.
+            let parent_ids = umbrellas.get(&project.id);
+            for _ in 0..slots {
+                let picked = match parent_ids {
+                    Some(parent_ids) => match store.next_subtask(parent_ids) {
+                        Ok(Some(task)) => task,
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!(
+                                "todo-watcher: next_subtask failed for project {}: {e}",
+                                project.id
+                            );
+                            break;
+                        }
+                    },
+                    None => match store.next_task(Some(project.id)) {
+                        Ok(NextResult::Task(task)) => *task,
+                        Ok(NextResult::None { .. }) => break,
+                        Err(e) => {
+                            eprintln!(
+                                "todo-watcher: next_task failed for project {}: {e}",
+                                project.id
+                            );
+                            break;
+                        }
+                    },
+                };
+                let task = match deepest_actionable(&store, picked) {
+                    Ok(task) => task,
                     Err(e) => {
                         eprintln!(
                             "todo-watcher: next_subtask failed for project {}: {e}",
                             project.id
                         );
-                        continue;
+                        break;
                     }
-                },
-                None => match store.next_task(Some(project.id)) {
-                    Ok(NextResult::Task(task)) => *task,
-                    Ok(NextResult::None { .. }) => continue,
-                    Err(e) => {
-                        eprintln!(
-                            "todo-watcher: next_task failed for project {}: {e}",
-                            project.id
-                        );
-                        continue;
-                    }
-                },
-            };
-            let task = match deepest_actionable(&store, picked) {
-                Ok(task) => task,
-                Err(e) => {
-                    eprintln!(
-                        "todo-watcher: next_subtask failed for project {}: {e}",
-                        project.id
-                    );
-                    continue;
+                };
+                let in_progress = TaskPatch {
+                    status: Some(Status::InProgress),
+                    ..Default::default()
+                };
+                if let Err(e) = store.update_task(task.id, &in_progress) {
+                    eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
+                    break;
                 }
-            };
-            let in_progress = TaskPatch {
-                status: Some(Status::InProgress),
-                ..Default::default()
-            };
-            if let Err(e) = store.update_task(task.id, &in_progress) {
-                eprintln!("todo-watcher: failed to claim task {}: {e}", task.id);
-                continue;
+                let session_name = format!("{}: {}", project.name, task.name);
+                claimed.push((task.id, local_path.to_string(), session_name));
             }
-            let session_name = format!("{}: {}", project.name, task.name);
-            claimed.push((task.id, local_path.to_string(), session_name));
         }
         claimed
     };
@@ -813,6 +858,18 @@ fn router(state: AppState) -> Router {
             "/api/inbox/{id}",
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
+        // Scripts: user-authored shell run from a generated form. A script
+        // body is a program mesa executes, so authoring is the strictest gate
+        // in the file (`require_local_path_write`, loopback-only in BOTH
+        // modes) while reading and *running* share the agents' code-execution
+        // gate — a LAN peer may trigger a run but must never choose the
+        // program. See `docs/scripts.md`.
+        .route("/api/scripts", get(list_scripts).post(create_script))
+        .route(
+            "/api/scripts/{id}",
+            get(show_script).patch(update_script).delete(delete_script),
+        )
+        .route("/api/scripts/{id}/run", post(run_script))
         // Agents: live Claude Code sessions under a project's folder. All
         // four routes share `require_agent_access` (terminal access = code
         // execution): loopback-only in default mode, LAN-page-authenticated
@@ -938,6 +995,13 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/config/pricing",
             get(get_config_pricing).put(update_config_pricing),
+        )
+        // The same file's `watchers` section — the todo-watcher's per-project
+        // agent ceiling. A third route for the same reason as `pricing`:
+        // `/api/config` keeps its bare ConfigCommand[] shape.
+        .route(
+            "/api/config/watchers",
+            get(get_config_watchers).put(update_config_watchers),
         )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
@@ -1965,6 +2029,242 @@ async fn assign_inbox(
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_inbox_item(id)?).into_response())
+}
+
+// ---- scripts (user-authored shell) ----
+
+#[derive(Deserialize)]
+struct ScriptQuery {
+    #[serde(default)]
+    project: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ScriptCreate {
+    name: String,
+    /// The shell source. Required — a script without a body is not a script.
+    body: String,
+    #[serde(default)]
+    project_id: Option<i64>,
+    #[serde(default)]
+    description: Option<String>,
+    /// Declared arguments, in the order they reach the body as `$1`, `$2`, ….
+    /// Absent means none.
+    #[serde(default)]
+    args: Vec<ScriptArg>,
+}
+
+#[derive(Deserialize)]
+struct ScriptUpdate {
+    /// `null` un-binds the script from its project (making it global); an
+    /// omitted key leaves the binding alone — the `double_option` convention
+    /// every other PATCH body here uses.
+    #[serde(default, deserialize_with = "double_option")]
+    project_id: Option<Option<i64>>,
+    /// Replace-only, same `double_option` treatment as `body`: a script's name
+    /// is how the CLI resolves it, so `null` is an error, not an erasure.
+    #[serde(default, deserialize_with = "double_option")]
+    name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    description: Option<Option<String>>,
+    /// Replace-only. A `double_option` like `TaskUpdate::description` and for
+    /// the same reason: the body *is* the script, so an explicit `null` must
+    /// be *rejected* rather than silently read as "omitted".
+    #[serde(default, deserialize_with = "double_option")]
+    body: Option<Option<String>>,
+    /// Replaces the whole declared arg list.
+    #[serde(default)]
+    args: Option<Vec<ScriptArg>>,
+}
+
+#[derive(Deserialize)]
+struct ScriptRunBody {
+    /// The form's values, keyed by declared arg name. Absent means none —
+    /// `core::scripts::validate_values` decides whether that is valid.
+    #[serde(default)]
+    values: std::collections::BTreeMap<String, String>,
+}
+
+async fn list_scripts(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<ScriptQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_scripts(q.project)?).into_response())
+}
+
+/// Authoring a script is choosing a program mesa will run, so this and its two
+/// sibling mutations are loopback-only in **both** serve modes — the
+/// `/api/config` posture (see `update_config`), for the same reason.
+async fn create_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<ScriptCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let script = store.create_script(
+        body.project_id,
+        &body.name,
+        body.description.as_deref(),
+        &body.body,
+        &body.args,
+    )?;
+    Ok((StatusCode::CREATED, Json(script)).into_response())
+}
+
+async fn show_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_script(id)?).into_response())
+}
+
+async fn update_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<ScriptUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    let Json(body) = body?;
+    // `name` and `body` are the script's identity and its whole point; an
+    // explicit `null` for either is rejected rather than read as "omitted",
+    // the same way `update_task` treats a task's description — so the API and
+    // `mesa script update --body ""` fail identically.
+    let (name, source) = match (body.name, body.body) {
+        (Some(None), _) => {
+            return Err(Error::Validation(
+                "name cannot be cleared; it is how a script is resolved".into(),
+            )
+            .into());
+        }
+        (_, Some(None)) => {
+            return Err(
+                Error::Validation("body cannot be cleared; it is the script".into()).into(),
+            );
+        }
+        (name, source) => (name.flatten(), source.flatten()),
+    };
+    let patch = ScriptPatch {
+        project_id: body.project_id,
+        name,
+        description: body.description,
+        body: source,
+        args: body.args,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_script(id, patch)?).into_response())
+}
+
+async fn delete_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    let mut store = state.store.lock().unwrap();
+    // The full destroyed record is the echo that stands in for the
+    // confirmation prompt mesa deliberately does not have.
+    Ok(Json(store.delete_script(id)?).into_response())
+}
+
+/// Runs one script with the supplied values and returns the captured outcome.
+///
+/// Triggering local code execution is the agents' capability class, so this
+/// shares `require_agent_access` with them (and with `execute_task`) rather
+/// than the authoring gate: a LAN peer may run what is already stored, it just
+/// cannot decide what that is.
+///
+/// The script's own nonzero exit is **data** in a 200 response, exactly like a
+/// `HookRun`; a value that fails validation is 422, and a bash that cannot be
+/// spawned is 502 `unavailable`.
+async fn run_script(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<ScriptRunBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let script = {
+        let store = state.store.lock().unwrap();
+        store.get_script(id)?
+    };
+    let cwd = script_cwd(&state, &script)?;
+    // `run` validates too (it is the same pure `core` function the CLI calls,
+    // so the two cannot diverge), but its `Err` channel is "bash would not
+    // start" → 502. Calling it here first is what separates a client mistake
+    // about the declared args (422) from an execution failure.
+    scripts::validate_values(&script.args, &body.values).map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message,
+    })?;
+    // An arbitrary blocking subprocess with no timeout; keep it off the async
+    // workers, like the hook and agents shell-outs.
+    let run =
+        tokio::task::spawn_blocking(move || scripts::run(&script, &body.values, cwd.as_deref()))
+            .await
+            .map_err(|e| agents_unavailable(format!("script run panicked: {e}")))?
+            .map_err(agents_unavailable)?;
+    Ok(Json(run).into_response())
+}
+
+/// The message every script mutation refuses a non-loopback peer with. One
+/// constant so the three cannot drift apart.
+const SCRIPT_AUTHORING_LOOPBACK: &str =
+    "authoring scripts is loopback-only; connect from this machine";
+
+/// The working directory a run happens in, resolved **server-side** from the
+/// script's own project binding — never client-supplied. A bound project uses
+/// its `local_path` (the terminal/agents ladder: no path, or a path that is not
+/// a directory here, is 422 `validation`); an unbound script runs in `$HOME`,
+/// like an inbox-watcher dispatch.
+fn script_cwd(state: &AppState, script: &Script) -> Result<Option<String>, ApiError> {
+    let Some(project_id) = script.project_id else {
+        return Ok(
+            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+        );
+    };
+    let local_path = state
+        .store
+        .lock()
+        .unwrap()
+        .get_project(project_id)?
+        .local_path;
+    let Some(path) = local_path else {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "project {project_id} has no local_path; run `mesa project resolve` in its repo \
+                 or `mesa project update {project_id} --path <dir>`"
+            ),
+        });
+    };
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "project {project_id} local_path {path:?} is not a directory on this machine"
+            ),
+        });
+    }
+    Ok(Some(path))
 }
 
 // ---- agents (live Claude Code sessions under a project's folder) ----
@@ -3526,6 +3826,84 @@ async fn update_config_pricing(
         },
     })?;
     get_config_pricing(State(state), ConnectInfo(addr), headers).await
+}
+
+/// `GET /api/config/watchers` — the watcher settings the Settings page edits:
+/// today the todo-watcher's per-project agent ceiling, with the built-in
+/// default beside it (`docs/config.md`, mesa task 777).
+///
+/// Gated like `get_config_pricing` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`, so the editor never renders
+/// a blank box over a file it couldn't read.
+async fn get_config_watchers(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::watchers() {
+        Ok(watchers) => Ok(Json(watchers).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct WatchersUpdate {
+    /// Absent leaves the key alone; `null` removes it (restoring the built-in
+    /// 1). The value stays raw JSON so `0`, `-1` and `2.5` are the config
+    /// layer's named 422 rather than a deserializer rejection.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    todo_concurrency: Option<Option<serde_json::Value>>,
+}
+
+/// Distinguishes an absent key from an explicit `null` — the difference
+/// between "don't touch this setting" and "put it back to the default".
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// `PUT /api/config/watchers` — writes the watcher settings and echoes them.
+///
+/// **Loopback-only in both modes**, like `update_config` and
+/// `update_config_pricing`: it is the same file mesa's own argv comes out of,
+/// and the section a write lands in is not the distinction that matters.
+async fn update_config_watchers(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<WatchersUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    let mut updates = HashMap::new();
+    if let Some(value) = body.todo_concurrency {
+        updates.insert(config::TODO_CONCURRENCY.to_string(), value);
+    }
+    config::save_watchers(&updates).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_watchers(State(state), ConnectInfo(addr), headers).await
 }
 
 async fn restart_server(
@@ -6103,6 +6481,231 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
     }
 
+    // --- the configurable per-project concurrency limit (mesa task 777) ----
+
+    /// Points `MESA_CONFIG_FILE` at a real file holding `body`. Callers run
+    /// after `stub_claude_bg` (which pins the var at a *nonexistent* path) and
+    /// hold `ENV_LOCK`, so this is the one place a watcher test opts into a
+    /// config that exists. Only the `watchers` section is set — the spawn
+    /// command stays the built-in default the stub understands.
+    fn config_with(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("config.json");
+        std::fs::write(&path, body).unwrap();
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", &path) };
+        path
+    }
+
+    #[test]
+    fn todo_watcher_tick_fills_up_to_the_configured_limit() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let first = new_task(&state, project);
+        let second = new_task(&state, project);
+        let third = new_task(&state, project);
+
+        // One tick fills both slots — the limit is a ceiling on concurrent
+        // agents, not a rate of one per tick.
+        todo_watcher_tick(&state);
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "two dispatches in one tick: {log:?}"
+        );
+        assert_eq!(get(first), Status::InProgress);
+        assert_eq!(get(second), Status::InProgress);
+        assert_eq!(get(third), Status::Todo, "the third waits for a free slot");
+
+        // Full: further ticks dispatch nothing.
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 2, "the project is full: {log:?}");
+
+        // Freeing one slot releases exactly one more.
+        set_status(&state, first, Status::Done);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            3,
+            "the freed slot is refilled: {log:?}"
+        );
+        assert_eq!(get(third), Status::InProgress);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn todo_watcher_tick_with_no_config_still_dispatches_exactly_one() {
+        // The whole point of the default: an install that never touched
+        // `~/.mesa/config.json` behaves exactly as mesa did before task 777.
+        //
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        // `stub_claude_bg` pins MESA_CONFIG_FILE at a path that does not exist.
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let first = new_task(&state, project);
+        let second = new_task(&state, project);
+
+        todo_watcher_tick(&state);
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 1, "one agent per project: {log:?}");
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(first), Status::InProgress);
+        assert_eq!(get(second), Status::Todo);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn lowering_the_limit_never_touches_work_in_flight() {
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        let config = config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 3}}"#);
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let ids: Vec<i64> = (0..4).map(|_| new_task(&state, project)).collect();
+
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 3, "three slots filled: {log:?}");
+
+        // Lowered under the in-flight count, mid-run, with no restart: the
+        // next tick reads the new value, dispatches nothing, and de-claims
+        // nothing.
+        std::fs::write(&config, r#"{"watchers": {"todo-concurrency": 1}}"#).unwrap();
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 3, "nothing new is picked: {log:?}");
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        for id in &ids[..3] {
+            assert_eq!(get(*id), Status::InProgress, "in-flight work is untouched");
+        }
+        assert_eq!(get(ids[3]), Status::Todo);
+
+        // Only once the count falls back under the new limit does it move.
+        for id in &ids[..3] {
+            set_status(&state, *id, Status::Done);
+        }
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            4,
+            "one more, at the new limit: {log:?}"
+        );
+        assert_eq!(get(ids[3]), Status::InProgress);
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn a_malformed_config_skips_the_tick_rather_than_guessing_a_limit() {
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        config_with(stub_dir.path(), "not json");
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let task = new_task(&state, project);
+
+        todo_watcher_tick(&state);
+        assert!(
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .is_empty(),
+            "a config mesa cannot parse dispatches nothing"
+        );
+        assert_eq!(
+            state.store.lock().unwrap().get_task(task).unwrap().status,
+            Status::Todo,
+            "and claims nothing"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn the_limit_counts_leaves_only_and_the_umbrella_still_narrows_the_pick() {
+        // The two rules composed: an in_progress umbrella occupies no slot
+        // (mesa task 570) but still confines the fill to its own children.
+        //
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let epic = new_task(&state, project);
+        let child_a = new_subtask(&state, project, epic, "a");
+        let child_b = new_subtask(&state, project, epic, "b");
+        let outsider = new_task(&state, project);
+        set_status(&state, epic, Status::InProgress);
+
+        todo_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "the umbrella occupies no slot, so both fill from under it: {log:?}"
+        );
+        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+        assert_eq!(get(child_a), Status::InProgress);
+        assert_eq!(get(child_b), Status::InProgress);
+        assert_eq!(
+            get(outsider),
+            Status::Todo,
+            "an open umbrella unblocks its own children and nothing else"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
     // --- refine watcher (mesa task 661) -----------------------------------
 
     fn new_refine_task(state: &AppState, project_id: i64, description: &str) -> i64 {
@@ -6400,5 +7003,301 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         );
 
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    // --- scripts: /api/scripts (mesa task 785) ------------------------------
+    //
+    // CRUD and run semantics over HTTP are `scripts/scripts-check.sh`'s job.
+    // What only lives here is the peer-address-sensitive half: the gate
+    // *asymmetry* (a LAN page may run a stored script but may never author
+    // one), which a same-machine curl cannot exercise, plus the server-side
+    // cwd resolution and the body shapes serde decides.
+
+    fn new_script(state: &AppState, project_id: Option<i64>, body: &str) -> Script {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_script(project_id, "s", None, body, &[])
+            .unwrap()
+    }
+
+    async fn run_one(state: &AppState, id: i64) -> ApiResult<Response> {
+        run_script(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Ok(Json(ScriptRunBody {
+                values: std::collections::BTreeMap::new(),
+            })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn script_mutations_reject_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        assert!(!state.lan);
+        let script = new_script(&state, None, "true");
+
+        let created = create_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Ok(Json(ScriptCreate {
+                name: "evil".into(),
+                body: "echo pwned".into(),
+                project_id: None,
+                description: None,
+                args: vec![],
+            })),
+        )
+        .await;
+        assert!(created.unwrap_err().status.is_client_error());
+        let updated = update_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+            Ok(Json(ScriptUpdate {
+                project_id: None,
+                name: None,
+                description: None,
+                body: Some(Some("echo pwned".into())),
+                args: None,
+            })),
+        )
+        .await;
+        assert!(updated.unwrap_err().status.is_client_error());
+        let deleted = delete_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+        )
+        .await;
+        assert!(deleted.unwrap_err().status.is_client_error());
+
+        // None of the three may have touched the store.
+        let stored = state.store.lock().unwrap().list_scripts(None).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].body, "true");
+    }
+
+    /// The load-bearing asymmetry: under `--lan`, a legitimate LAN page passes
+    /// `require_agent_access` and may *run* a stored script, but authoring is
+    /// loopback-only in both modes — a LAN peer must never choose the program.
+    #[tokio::test]
+    async fn lan_page_may_run_a_script_but_may_never_author_one() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let script = new_script(&state, None, "exit 0");
+
+        let ran = run_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(script.id),
+            Ok(Json(ScriptRunBody {
+                values: std::collections::BTreeMap::new(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.status(), StatusCode::OK);
+
+        let authored = create_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers,
+            Ok(Json(ScriptCreate {
+                name: "evil".into(),
+                body: "echo pwned".into(),
+                project_id: None,
+                description: None,
+                args: vec![],
+            })),
+        )
+        .await;
+        assert!(authored.unwrap_err().status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn script_reads_and_run_reject_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        let script = new_script(&state, None, "true");
+        let listed = list_scripts(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Query(ScriptQuery { project: None }),
+        )
+        .await;
+        assert!(listed.unwrap_err().status.is_client_error());
+        let shown = show_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+        )
+        .await;
+        assert!(shown.unwrap_err().status.is_client_error());
+        let ran = run_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(script.id),
+            Ok(Json(ScriptRunBody {
+                values: std::collections::BTreeMap::new(),
+            })),
+        )
+        .await;
+        assert!(ran.unwrap_err().status.is_client_error());
+    }
+
+    /// A script's own nonzero exit is data in a 200, exactly like a `HookRun`.
+    #[tokio::test]
+    async fn run_script_reports_a_nonzero_exit_as_data() {
+        let (_dir, state) = test_state();
+        let script = new_script(&state, None, "echo out; echo err >&2; exit 3");
+        let resp = run_one(&state, script.id).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["exit_code"], 3);
+        assert_eq!(body["stdout"], "out\n");
+        assert_eq!(body["stderr"], "err\n");
+        assert_eq!(body["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn run_script_rejects_bad_values_with_422_not_502() {
+        let (_dir, state) = test_state();
+        let script = state
+            .store
+            .lock()
+            .unwrap()
+            .create_script(
+                None,
+                "needy",
+                None,
+                "true",
+                &[ScriptArg {
+                    name: "target".into(),
+                    label: None,
+                    kind: crate::core::ScriptArgKind::Text,
+                    required: true,
+                    default: None,
+                    choices: None,
+                }],
+            )
+            .unwrap();
+
+        // Missing a required argument, and an undeclared key: both are the
+        // client's mistake about the declared args, not a spawn failure.
+        for values in [
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([("nope".to_string(), "x".to_string())]),
+        ] {
+            let err = run_script(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(script.id),
+                Ok(Json(ScriptRunBody { values })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.code, "validation");
+        }
+    }
+
+    /// cwd comes from the script's own project binding, resolved server-side;
+    /// an unbound script runs in `$HOME`.
+    #[tokio::test]
+    async fn run_script_cwd_is_the_bound_projects_local_path_else_home() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = new_project(&state, Some(root.to_str().unwrap()));
+        let canon_root = std::fs::canonicalize(&root).unwrap();
+
+        let bound = new_script(&state, Some(project), "pwd");
+        let body = json_body(run_one(&state, bound.id).await.unwrap()).await;
+        assert_eq!(
+            std::fs::canonicalize(body["stdout"].as_str().unwrap().trim()).unwrap(),
+            canon_root
+        );
+
+        state.store.lock().unwrap().delete_script(bound.id).unwrap();
+        let unbound = new_script(&state, None, "pwd");
+        let body = json_body(run_one(&state, unbound.id).await.unwrap()).await;
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_owned();
+        assert_eq!(
+            std::fs::canonicalize(body["stdout"].as_str().unwrap().trim()).unwrap(),
+            std::fs::canonicalize(home).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_script_is_422_when_the_bound_project_has_no_usable_local_path() {
+        let (dir, state) = test_state();
+        let unset = new_project(&state, None);
+        let gone = new_project(&state, Some(dir.path().join("gone").to_str().unwrap()));
+        for project in [unset, gone] {
+            let script = state
+                .store
+                .lock()
+                .unwrap()
+                .create_script(Some(project), &format!("s{project}"), None, "pwd", &[])
+                .unwrap();
+            let err = run_one(&state, script.id).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{project}");
+            assert_eq!(err.code, "validation", "{project}");
+        }
+    }
+
+    /// The PATCH body's three-state fields: `null` un-binds a project and
+    /// clears a description, while an omitted key changes nothing. An
+    /// incomplete `ScriptArg` is a serde error, so it lands as 422 without
+    /// reaching `Store`.
+    #[test]
+    fn script_update_body_distinguishes_absent_null_and_value() {
+        let parsed: ScriptUpdate =
+            serde_json::from_str(r#"{"project_id":null,"description":null}"#).unwrap();
+        assert_eq!(parsed.project_id, Some(None));
+        assert_eq!(parsed.description, Some(None));
+        assert_eq!(parsed.body, None);
+        let parsed: ScriptUpdate = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.project_id, None);
+        assert_eq!(parsed.description, None);
+        assert_eq!(parsed.name, None);
+        assert!(serde_json::from_str::<ScriptUpdate>(r#"{"args":[{"name":"a"}]}"#).is_err());
+    }
+
+    /// Clearing the two identity fields is a `validation` error, not an
+    /// erasure — and it is rejected before the store is touched.
+    #[tokio::test]
+    async fn script_update_refuses_to_clear_name_or_body() {
+        let (_dir, state) = test_state();
+        let script = new_script(&state, None, "true");
+        for payload in [r#"{"name":null}"#, r#"{"body":null}"#] {
+            let body: ScriptUpdate = serde_json::from_str(payload).unwrap();
+            let err = update_script(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(script.id),
+                Ok(Json(body)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{payload}");
+            assert_eq!(err.code, "validation", "{payload}");
+        }
+        let stored = state.store.lock().unwrap().get_script(script.id).unwrap();
+        assert_eq!(stored, script);
     }
 }

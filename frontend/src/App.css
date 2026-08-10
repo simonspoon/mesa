@@ -5523,6 +5523,13 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* A watcher setting is one small number, not a command line — sized to what it
+   holds so the box doesn't advertise room for an argv. */
+.settings-watcher-input {
+  width: 6rem;
+  font-size: 0.8rem;
+}
+
 /* Model pricing: a prefix, four rates and one action per row. The grid is
    declared once on the container so the header labels and every row share
    their columns — the header is the only thing naming what the boxes are. */
@@ -5562,4 +5569,183 @@ button:focus-visible,
 
 .settings-price-note {
   font-size: 0.7rem;
+}
+
+/* --- Scripts page (mesa task 785) --- */
+
+/* The page borrows the Inbox's shape: a global list above projects,
+   `.card-list` rows, `.panel-form` for the editor. Only the two things the
+   Inbox has no equivalent of are new — the declared-argument editor and the
+   captured run output. */
+.script-item-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.script-name {
+  font-family: var(--font-mono);
+  color: var(--cyan);
+}
+
+.script-meta,
+.script-arg-hint {
+  font-size: 0.75rem;
+}
+
+.script-description {
+  margin: 0.25rem 0;
+}
+
+.script-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+/* The editor opens inside the row it belongs to, so it needs a rule off the
+   card above it — otherwise the form and the list item read as one block. */
+.script-form {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.script-form h2,
+.script-args-editor h3 {
+  margin: 0;
+}
+
+/* The body box is the one place a stored script is a *program* rather than a
+   record, so it gets the shared syntax-highlighting editor (CodeEditor) and a
+   border fencing it off from the plain fields around it. */
+.script-body-editor .files-editor-stack {
+  height: 18rem;
+  border: 1px solid var(--border);
+  padding: 0.25rem;
+}
+
+/* One declared argument, mid-edit. Wrapping (rather than a grid) is what keeps
+   the row honest: `choices` only exists for a choice, so the control count
+   genuinely varies per row and a fixed track set would leave a hole in every
+   other one. */
+.script-arg-fields {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.script-arg-fields input[type='text'],
+.script-arg-fields select {
+  flex: 1 1 8rem;
+  min-width: 0;
+  font-size: 0.8rem;
+}
+
+.script-arg-required-box {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: center;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+/* One generated field on the run form: the label and its control, with the
+   env var the value lands in underneath — so what the body reads is visible
+   while the value is being typed. */
+.script-arg {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.script-arg-label {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.script-arg-label input[type='text'],
+.script-arg-label input[type='number'],
+.script-arg-label select {
+  flex: 1 1 10rem;
+  min-width: 0;
+}
+
+.script-arg-required {
+  color: var(--amber);
+}
+
+/* A finished run. The exit code is DATA — a nonzero one is the script's own
+   answer, so it is a red badge here and never the page's `.error` state. */
+.script-run-output {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.script-run-output h4 {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.script-run-status {
+  margin: 0;
+}
+
+.badge.script-exit-ok {
+  color: var(--green);
+  border-color: rgba(43, 255, 156, 0.5);
+}
+
+.badge.script-exit-fail {
+  color: var(--red);
+  border-color: rgba(255, 59, 92, 0.5);
+}
+
+.badge.script-truncated {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
+/* Captured output is untrusted text: kept verbatim and scrolled inside its own
+   box rather than wrapped, the same treatment `.files-content-text` gives a
+   file's contents. */
+.script-stream {
+  margin: 0;
+  max-height: 16rem;
+  overflow: auto;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre;
+}
+
+/* Phone tier: the run modal is already full-bleed (`.create-task-modal`
+   above), so the only thing left is stopping the two multi-control rows from
+   forcing a horizontal scroll — each control takes the full width instead of
+   sharing one. No new matchMedia: `phoneTier.ts` owns both tiers. */
+@media (max-width: 600px) {
+  .script-arg-fields input[type='text'],
+  .script-arg-fields select,
+  .script-arg-label input[type='text'],
+  .script-arg-label input[type='number'],
+  .script-arg-label select {
+    flex: 1 1 100%;
+  }
+
+  .script-body-editor .files-editor-stack {
+    height: 12rem;
+  }
 }

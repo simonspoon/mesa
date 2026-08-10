@@ -217,6 +217,23 @@ pub struct ConfigPrice {
     pub default: Option<ModelRates>,
 }
 
+/// The watcher settings as the Settings page sees them (`core::config`,
+/// `docs/config.md`, mesa task 777). A third view of `~/.mesa/config.json`
+/// beside [`ConfigCommand`] and [`ConfigPrice`], with the same
+/// null-means-fallback rule: an absent value is the built-in default, and
+/// writing `null` back is how the user restores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigWatchers {
+    /// How many watcher agents the todo-watcher may have running per project,
+    /// or `null` when the config says nothing — then `todo_concurrency_default`
+    /// is what applies.
+    pub todo_concurrency: Option<u32>,
+    /// The built-in limit mesa ships (1), so the editor can show what blank
+    /// means without hardcoding it.
+    pub todo_concurrency_default: u32,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.
@@ -883,6 +900,115 @@ pub struct InboxItem {
     pub created_at: String,
     /// When the item was last changed — e.g. assigned (SQLite `datetime`, UTC).
     pub updated_at: String,
+}
+
+// ---- scripts (user-authored shell) ----
+//
+// A script is user *data* with CRUD and a project binding, stored in the
+// `scripts` table — deliberately not a `~/.mesa/config.json` section, which is
+// reserved for hand-edited settings. Its arguments are **declared**, never
+// parsed out of the body: the form the web UI renders and the validation the
+// run path applies both read this list, so a body full of `$1`/`${FOO}` can
+// never make the form silently wrong. Execution passes the body to `bash -c`
+// verbatim and supplies values positionally and through the environment, so no
+// value is ever interpolated into a string a shell parses (`core::scripts`).
+
+/// What kind of value a [`ScriptArg`] accepts. Exactly four kinds — the form
+/// renders one control per kind and the run path validates against it, so a
+/// fifth kind is a change to both surfaces, never a free addition here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum ScriptArgKind {
+    Text,
+    Number,
+    Bool,
+    Choice,
+}
+
+impl ScriptArgKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScriptArgKind::Text => "text",
+            ScriptArgKind::Number => "number",
+            ScriptArgKind::Bool => "bool",
+            ScriptArgKind::Choice => "choice",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ScriptArgKind> {
+        match s {
+            "text" => Some(ScriptArgKind::Text),
+            "number" => Some(ScriptArgKind::Number),
+            "bool" => Some(ScriptArgKind::Bool),
+            "choice" => Some(ScriptArgKind::Choice),
+            _ => None,
+        }
+    }
+}
+
+/// One declared argument of a [`Script`]. Every value crossing into the shell
+/// is a string: `Number` and `Bool` describe the *control* and the validation,
+/// not a parsed Rust type, so a half-typed value survives a keystroke in the
+/// form and the run path has exactly one representation to pass along.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ScriptArg {
+    /// Identifier: `^[A-Za-z_][A-Za-z0-9_-]*$`, ≤64 chars, unique within the
+    /// script. Constrained because it becomes an `MESA_ARG_*` env-var suffix.
+    pub name: String,
+    /// Human label for the form; the `name` is used when absent.
+    pub label: Option<String>,
+    pub kind: ScriptArgKind,
+    pub required: bool,
+    /// Fills in for an absent optional argument at run time.
+    pub default: Option<String>,
+    /// Required and non-empty for `Choice`, and `None` for every other kind.
+    pub choices: Option<Vec<String>>,
+}
+
+/// A user-authored shell script stored in mesa, run from the web UI's
+/// generated form or from `mesa script run`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct Script {
+    #[ts(type = "number")]
+    pub id: i64,
+    /// The project this script belongs to, or null for a global script. Also
+    /// the run's working directory (the project's `local_path`; `$HOME` when
+    /// null). Deleting the project un-binds rather than destroys the script —
+    /// the FK is `ON DELETE SET NULL`, as the inbox's is.
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    /// Unique (case-insensitively), non-empty: the CLI resolves a script by id
+    /// **or** name.
+    pub name: String,
+    pub description: Option<String>,
+    /// The shell source, handed to `bash -c` verbatim. Required, non-empty.
+    pub body: String,
+    /// Declared arguments, in the order they reach the body as `$1`, `$2`, …
+    pub args: Vec<ScriptArg>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The captured outcome of one script run — the [`HookRun`] twin. A nonzero
+/// `exit_code` is the script's own result, not a transport failure: the CLI
+/// exits 0 and the API returns 200 with this object either way. Runs are not
+/// persisted; this is a request/response record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ScriptRun {
+    #[ts(type = "number")]
+    pub script_id: i64,
+    /// Process exit code; -1 when the script was killed by a signal.
+    pub exit_code: i32,
+    /// Captured stdout, truncated to 64 KiB.
+    pub stdout: String,
+    /// Captured stderr, truncated to 64 KiB.
+    pub stderr: String,
+    /// True when either stream hit the 64 KiB cap and was cut.
+    pub truncated: bool,
 }
 
 // ---- CC Dashboard (Claude Code telemetry) ----

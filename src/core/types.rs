@@ -148,6 +148,19 @@ pub struct AgentSession {
     /// What a blocked session is waiting on (e.g. "permission prompt").
     #[serde(default)]
     pub waiting_for: Option<String>,
+    /// **mesa-derived, not from the CLI payload** (hence `serde(default)`, so
+    /// parsing `claude agents --json` still works): how many shell children
+    /// this session's process currently has. Claude Code runs one
+    /// `/bin/zsh -c …` child per Bash tool call, so a nonzero count means a
+    /// Bash call is in flight *right now* — even when `state` says `done`.
+    #[serde(default)]
+    pub live_shells: u32,
+    /// **mesa-derived, not from the CLI payload.** How many of this session's
+    /// subagent transcripts were written within `cc::ACTIVE_SECS`. Subagents
+    /// run in-process (no child process), so their jsonl mtimes are the only
+    /// available liveness signal.
+    #[serde(default)]
+    pub live_subagents: u32,
 }
 
 /// The Agents view for one project: the folder sessions are matched under

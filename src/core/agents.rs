@@ -6,8 +6,11 @@
 //! `unavailable` (the claude CLI missing or misbehaving is an upstream
 //! problem, like a dead usage endpoint).
 
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
+use crate::core::cc;
 use crate::core::config;
 use crate::core::types::AgentSession;
 
@@ -68,7 +71,7 @@ pub fn list_under(dir: &str) -> Result<Vec<AgentSession>, String> {
 /// True if `cwd` is `dir` itself or a path strictly inside it — boundary-safe
 /// (`/tmp/mesa-31` must not match `/tmp/mesa-313`), unlike a plain
 /// `str::starts_with`.
-fn is_under(cwd: &str, dir: &str) -> bool {
+pub fn is_under(cwd: &str, dir: &str) -> bool {
     let cwd = cwd.trim_end_matches('/');
     let dir = dir.trim_end_matches('/');
     cwd == dir
@@ -96,13 +99,139 @@ fn list_sessions(bin: &str) -> Result<Vec<AgentSession>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    parse_sessions(&out.stdout)
+    let mut sessions = parse_sessions(&out.stdout)?;
+    // Enrichment is a separate step from parsing, and happens here rather than
+    // in `list_under` so a project-scoped read costs the same one `ps` as the
+    // global one — and so both surfaces (and the `agents_cache` TTL in
+    // `src/api.rs`, which caches whatever this returns) see the same numbers.
+    enrich_liveness(&mut sessions);
+    Ok(sessions)
 }
 
 /// Kept pure (bytes in, sessions out) so the payload contract is unit-testable
 /// without a claude binary, like usage.rs's `parse`.
 fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("unexpected claude agents payload: {e}"))
+}
+
+/// Programs a Claude Code Bash tool call runs as, by basename of `comm`.
+///
+/// An **allowlist**, deliberately not an "any child" rule: every working
+/// session also carries a `caffeinate` child, which is not work. Claude Code
+/// spawns one `/bin/zsh -c 'source …/shell-snapshots/… && eval …'` child per
+/// Bash invocation — it is not a persistent shell — so a live shell child *is*
+/// a Bash call in flight.
+const SHELL_COMMS: [&str; 4] = ["zsh", "bash", "sh", "dash"];
+
+/// One row of the process table: `(pid, ppid, comm)`.
+type ProcRow = (i64, i64, String);
+
+/// Fills in the two mesa-derived liveness counts on a parsed session list.
+///
+/// **Fails open in every direction**: no `ps`, no projects dir, an unreadable
+/// folder or an unparseable row all leave the counts at `0`. This is a
+/// best-effort liveness probe hanging off the agents endpoints and the todo
+/// watcher — it must never turn either into an error or park a watcher.
+fn enrich_liveness(sessions: &mut [AgentSession]) {
+    if sessions.is_empty() {
+        return;
+    }
+    let table = read_proc_table();
+    let root = cc::projects_dir();
+    let now = SystemTime::now();
+    for session in sessions.iter_mut() {
+        session.live_shells = match session.pid {
+            Some(pid) => count_shell_children(pid, &table),
+            None => 0,
+        };
+        session.live_subagents = match root.as_deref() {
+            Some(root) => count_live_subagents(root, &session.session_id, now),
+            None => 0,
+        };
+    }
+}
+
+/// One `ps -A` for the whole session list, not one call per pid. An absent or
+/// failing `ps` (or a Windows box, which has none) yields an empty table, and
+/// therefore zero shells everywhere.
+fn read_proc_table() -> Vec<ProcRow> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,comm="])
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => parse_proc_table(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Pure half of [`read_proc_table`]: `pid ppid comm` per line, unparseable
+/// lines skipped. `comm` may itself contain spaces, so it is the *rest* of the
+/// line rather than a third whitespace token.
+fn parse_proc_table(stdout: &str) -> Vec<ProcRow> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim_start().splitn(3, char::is_whitespace);
+            let pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.trim_start().parse().ok()?;
+            let comm = parts.next()?.trim();
+            (!comm.is_empty()).then(|| (pid, ppid, comm.to_string()))
+        })
+        .collect()
+}
+
+/// Direct children of `pid` whose command is one of [`SHELL_COMMS`], compared
+/// by **basename** (`ps` reports `/bin/zsh` on macOS, `zsh` on Linux).
+fn count_shell_children(pid: i64, table: &[ProcRow]) -> u32 {
+    table
+        .iter()
+        .filter(|(child, ppid, comm)| {
+            *ppid == pid && *child != pid && SHELL_COMMS.contains(&basename(comm))
+        })
+        .count() as u32
+}
+
+fn basename(comm: &str) -> &str {
+    comm.rsplit('/').next().unwrap_or(comm)
+}
+
+/// Subagent transcripts for `session_id` touched within [`cc::ACTIVE_SECS`].
+///
+/// Subagents run in-process, so there is no child to count; each one writes
+/// `<projects_dir>/<slug>/<session_id>/subagents/agent-*.jsonl`, and a recent
+/// mtime on one of those is the liveness signal. The project slug is unknown
+/// here, so every slug directory is checked for the session — the same
+/// glob-by-session-id shape `cc.rs` uses.
+fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
+    let Ok(slugs) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut live = 0u32;
+    for slug in slugs.flatten() {
+        let dir = slug.path().join(session_id).join("subagents");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let fresh = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .is_some_and(|mtime| match now.duration_since(mtime) {
+                    Ok(age) => age.as_secs() as i64 <= cc::ACTIVE_SECS,
+                    // mtime in the future (clock skew) is as live as it gets.
+                    Err(_) => true,
+                });
+            if fresh {
+                live += 1;
+            }
+        }
+    }
+    live
 }
 
 /// Resolves what to run for one spawn `action` (`config::TODO_WATCHER`,
@@ -787,6 +916,113 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
             std::fs::read_to_string(&log).unwrap(),
             "yes|look at the tests\n"
         );
+    }
+
+    // ---- liveness enrichment (mesa task 802) ----------------------------
+
+    /// macOS-style `ps -A -o pid=,ppid=,comm=`: right-aligned pids and an
+    /// absolute `comm`. Linux prints a bare `zsh`; both must count.
+    const PS_OUTPUT: &str = "\
+  501     1 /sbin/launchd
+86593     1 /Applications/Claude.app/Contents/MacOS/claude
+86601 86593 /usr/bin/caffeinate
+86602 86593 /bin/zsh
+86603 86593 /bin/zsh
+86610 86593 node
+90001     1 bash
+";
+
+    #[test]
+    fn counts_only_allowlisted_shell_children() {
+        let table = parse_proc_table(PS_OUTPUT);
+        // Two zsh children; caffeinate (every working session has one) and
+        // node are not work, and an unrelated top-level bash is not a child.
+        assert_eq!(count_shell_children(86593, &table), 2);
+        // A session with no children at all, and a pid nothing reports.
+        assert_eq!(count_shell_children(86610, &table), 0);
+        assert_eq!(count_shell_children(4242, &table), 0);
+    }
+
+    #[test]
+    fn proc_table_parse_is_lenient_and_basename_matched() {
+        // Garbage lines are skipped rather than failing the whole probe, and
+        // a bare `bash` (Linux `comm`) counts the same as `/bin/bash`.
+        let table = parse_proc_table("nope\n\n123 456 /bin/bash\n789 456 bash\nx y zsh\n");
+        assert_eq!(table.len(), 2);
+        assert_eq!(count_shell_children(456, &table), 2);
+        assert_eq!(parse_proc_table(""), Vec::new());
+    }
+
+    #[test]
+    fn a_process_is_not_its_own_shell_child() {
+        // A self-parenting row (pid 1's ppid is itself on some systems) must
+        // not make a session look busy.
+        let table = parse_proc_table("7 7 /bin/zsh\n");
+        assert_eq!(count_shell_children(7, &table), 0);
+    }
+
+    #[test]
+    fn counts_subagent_transcripts_by_recent_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let session = "e34b8ed9-d391-4797-9d39-546d5b463357";
+        let subagents = root.join("-Users-x-proj").join(session).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-1.jsonl"), "{}").unwrap();
+        std::fs::write(subagents.join("agent-2.jsonl"), "{}").unwrap();
+        // Not a transcript, and a *different* session's transcript.
+        std::fs::write(subagents.join("notes.txt"), "x").unwrap();
+        let other = root
+            .join("-Users-x-other")
+            .join("someone-else")
+            .join("subagents");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent-9.jsonl"), "{}").unwrap();
+
+        let now = SystemTime::now();
+        assert_eq!(count_live_subagents(root, session, now), 2);
+        // Same files, read from far enough in the future that every mtime is
+        // older than the shared cc::ACTIVE_SECS window: nothing is live.
+        let later = now + std::time::Duration::from_secs(cc::ACTIVE_SECS as u64 + 10);
+        assert_eq!(count_live_subagents(root, session, later), 0);
+        // Unknown session, and a projects dir that isn't there at all.
+        assert_eq!(count_live_subagents(root, "no-such-session", now), 0);
+        assert_eq!(count_live_subagents(&root.join("gone"), session, now), 0);
+    }
+
+    #[test]
+    fn enrichment_fails_open_and_never_errors() {
+        // No projects dir on disk and pids that don't exist: the counts are
+        // simply 0 and the session list is still returned intact.
+        let _guard = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", dir.path().join("absent")) };
+        let bin = stub_claude(dir.path(), &format!("cat <<'JSON'\n{SESSIONS_JSON}\nJSON"));
+        let sessions = list_sessions(&bin);
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+        let sessions = sessions.unwrap();
+        assert_eq!(sessions.len(), 2);
+        // A missing projects dir is 0 subagents, not an Err. (`live_shells`
+        // is asserted only through the pure counter above — these synthetic
+        // pids could belong to anything on the machine running the tests.)
+        assert!(sessions.iter().all(|s| s.live_subagents == 0));
+    }
+
+    #[test]
+    fn liveness_counts_serialize_camel_case_and_default_when_absent() {
+        // The CLI payload never carries these — parsing must not require them
+        // — but the web UI reads them as `liveShells`/`liveSubagents`.
+        let sessions = parse_sessions(SESSIONS_JSON.as_bytes()).unwrap();
+        assert_eq!(sessions[0].live_shells, 0);
+        assert_eq!(sessions[0].live_subagents, 0);
+        let mut session = sessions[1].clone();
+        session.live_shells = 3;
+        session.live_subagents = 1;
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["liveShells"], 3);
+        assert_eq!(json["liveSubagents"], 1);
     }
 
     #[test]

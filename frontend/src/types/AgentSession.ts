@@ -35,4 +35,19 @@ state: string | null,
 /**
  * What a blocked session is waiting on (e.g. "permission prompt").
  */
-waitingFor: string | null, };
+waitingFor: string | null, 
+/**
+ * **mesa-derived, not from the CLI payload** (hence `serde(default)`, so
+ * parsing `claude agents --json` still works): how many shell children
+ * this session's process currently has. Claude Code runs one
+ * `/bin/zsh -c …` child per Bash tool call, so a nonzero count means a
+ * Bash call is in flight *right now* — even when `state` says `done`.
+ */
+liveShells: number, 
+/**
+ * **mesa-derived, not from the CLI payload.** How many of this session's
+ * subagent transcripts were written within `cc::ACTIVE_SECS`. Subagents
+ * run in-process (no child process), so their jsonl mtimes are the only
+ * available liveness signal.
+ */
+liveSubagents: number, };

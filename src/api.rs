@@ -377,8 +377,20 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// and leaves that project quiet until someone intervenes — an accepted v1
 /// tradeoff over polling `claude agents` for every project every tick.
 ///
-/// "Busy" is a **count**, not a flag (mesa task 777): a project's occupied
-/// slots are its `in_progress` **leaf** tasks, and the tick fills it up to
+/// "Busy" is a **count**, not a flag (mesa task 777), and is the **max** of
+/// two independent signals (mesa task 802):
+/// `max(in_progress leaf count, live-work session count)`. The second is the
+/// number of `claude` sessions running under this project's `local_path` that
+/// hold a live shell child or a live subagent — a session `claude agents`
+/// reports as `done` while a Bash call is still running is not done, and
+/// filling its slot would put a second agent in the same checkout. `max`
+/// rather than a sum because a session working a genuinely `in_progress` leaf
+/// is both signals at once. It is deliberately one-directional: live work can
+/// only *withhold* dispatch, and an unavailable `claude` counts as zero live
+/// sessions, so the task-status signal below still stands on its own.
+///
+/// A project's `in_progress` **leaf** tasks occupy slots, and the tick fills
+/// up to
 /// `config::todo_concurrency()` — the user's per-project ceiling, default 1,
 /// so an unconfigured install behaves exactly as before. The limit is read
 /// once at the top of every tick rather than at startup, the same
@@ -436,6 +448,22 @@ fn todo_watcher_tick(state: &AppState) {
             return;
         }
     };
+    // Live sessions, listed before the lock — it is a `claude` shell-out, and
+    // holding the store lock across it would freeze every other request.
+    // A failure here **fails open**: an unavailable `claude` means "no session
+    // is live", never a skipped tick, because the whole point of this signal
+    // is to *withhold* dispatch and a broken probe must not park the watcher.
+    let live_cwds: Vec<String> = match agents::list_all() {
+        Ok(sessions) => sessions
+            .into_iter()
+            .filter(|s| s.pid.is_some() && s.live_shells + s.live_subagents > 0)
+            .map(|s| s.cwd)
+            .collect(),
+        Err(e) => {
+            eprintln!("todo-watcher: agents list failed, assuming nothing live: {e}");
+            Vec::new()
+        }
+    };
     let claimed: Vec<(i64, String, String)> = {
         let mut store = match state.store.lock() {
             Ok(s) => s,
@@ -477,9 +505,25 @@ fn todo_watcher_tick(state: &AppState) {
             if !std::path::Path::new(local_path).is_dir() {
                 continue;
             }
+            // A session running in this project's folder with a shell or a
+            // subagent in flight occupies a slot too, whatever `claude agents`
+            // says its `state` is (mesa task 802): a session bucketed `done`
+            // while it still holds live children is not done.
+            let live_work = live_cwds
+                .iter()
+                .filter(|cwd| agents::is_under(cwd, local_path))
+                .count();
+            // **max, not a sum**: a session working a genuinely `in_progress`
+            // leaf is both signals at once, and adding them would count it
+            // twice and halve the effective limit.
+            let busy = busy_counts
+                .get(&project.id)
+                .copied()
+                .unwrap_or(0)
+                .max(live_work);
             // Free slots, never negative: a limit lowered below what is
             // already running dispatches nothing and cancels nothing.
-            let slots = limit.saturating_sub(busy_counts.get(&project.id).copied().unwrap_or(0));
+            let slots = limit.saturating_sub(busy);
             if slots == 0 {
                 continue;
             }

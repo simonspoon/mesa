@@ -151,7 +151,8 @@ The code is the source of truth. These are the invariants you must not break:
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Codes: `not_found | validation | cycle | conflict | usage`, plus
   `unavailable`, scoped to surfaces depending on something outside mesa — the
-  live `cc usage` endpoint and the agents endpoints.
+  live `cc usage` endpoint, the agents endpoints, and `cc text` (the transcript
+  file a node's body lives in may have been deleted).
 - **Every CLI project argument takes an id or a name** (task/storyboard
   create+list, task next, inbox list/assign, `project update` and its
   `--parent`): a non-numeric value resolves via
@@ -280,7 +281,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Hooks | User-configured shell commands on events (`task-execute`); a nonzero exit is **data**, not a failure | `docs/hooks.md` |
 | Config | `~/.mesa/config.json`: the 4 agent-spawn command templates (todo-watcher, refine-watcher, inbox-watcher, add-agent). **A value is never spliced into a string a shell parses** — one line is argv (substitution happens after tokenizing, so an untrusted name is one argument); a value with a **newline** is a `bash -c` script whose values arrive as `MESA_*` env vars, never substituted into the body (so `{}` in a script is a save-time error). Edited from the **Settings** page (`#/settings`, sticky at the bottom of the left nav) over `GET`/`PUT /api/config`; blank = the built-in default, and the write is loopback-only in **both** serve modes. A second, independent `pricing` section prices model families for the CC Dashboard (prefix match, longest wins; absent/`null` = the built-in rate; an unknown prefix is allowed, which is how a new family gets priced without a rebuild) over `GET`/`PUT /api/config/pricing`, same gates. A third, independent `watchers` section tunes the todo-watcher's per-project concurrency limit (`todo-concurrency`, integer 1..=20, absent/`null` = built-in default 1) over `GET`/`PUT /api/config/watchers`, same gates, read fresh every tick — and each section's save preserves the other two | `docs/config.md` |
 | Scripts | User-authored shell in the db (`scripts` table, `project_id` **`ON DELETE SET NULL`**), each declaring a typed arg list the web form is generated from — arguments are **declared, never parsed out of the body**. `bash -c` gets the body verbatim and the values positionally + as `MESA_ARG_*`, so **no value is ever interpolated into a string a shell parses**; the `env_remove`-then-`env` sweep makes "not supplied" genuinely unset. A nonzero exit is **data** (CLI exits 0, API 200), runs are never persisted, cwd is server-side from the project binding. Reads and `run` are `require_agent_access`; all three **mutations are loopback-only in both serve modes** — a LAN peer may trigger a run but must never choose the program | `docs/scripts.md` |
-| CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files. A session drills into an aggregate detail page, and that into the call tree | `docs/cc-dashboard.md` |
+| CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files, with exactly **two** carve-outs — `cc live` and `cc text` (one node's full, uncapped body, deliberately not stored). A session drills into an aggregate detail page, that into the call tree, and a timeline row into its own text | `docs/cc-dashboard.md` |
 
 ## Untrusted input
 

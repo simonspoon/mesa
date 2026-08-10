@@ -3,6 +3,7 @@ import { createAttachment, createTask } from '../api'
 import { imageFilesFromClipboard } from '../clipboardFiles'
 import { parseTags } from '../tags'
 import type { Priority } from '../types/Priority'
+import type { Status } from '../types/Status'
 
 const PRIORITIES: Priority[] = ['low', 'medium', 'high']
 
@@ -33,8 +34,10 @@ function readFileAsBase64(file: File): Promise<string> {
  * A clipboard image pasted anywhere in the form stages the same way — see
  * `clipboardFiles.ts` for why it arrives renamed.
  *
- * The submit button sends no `status`, so the API defaults new tasks to
- * `backlog` (spec 302).
+ * The primary submit button sends no `status`, so the API defaults new tasks
+ * to `backlog` (spec 302). The secondary "create + send to todo" button passes
+ * `status: 'todo'` explicitly, a fast path around that triage step for a task
+ * that is already ready to be picked up (task 806).
  */
 export function CreateTaskPanel({
   projectId,
@@ -77,7 +80,7 @@ export function CreateTaskPanel({
     setPendingFiles((prev) => prev.filter((_, i) => i !== index))
   }
 
-  async function submit() {
+  async function submit(status?: Status) {
     setSubmitting(true)
     setError(null)
     try {
@@ -88,6 +91,7 @@ export function CreateTaskPanel({
           description,
           priority,
           tags: parseTags(tags),
+          ...(status ? { status } : {}),
         })
         taskId = task.id
         setCreatedTaskId(taskId)
@@ -198,6 +202,15 @@ export function CreateTaskPanel({
                 ? `retry ${pendingFiles.length} attachment(s)`
                 : 'done'}
           </button>
+          {createdTaskId === null && (
+            <button
+              type="button"
+              disabled={submitting || description.trim() === ''}
+              onClick={() => submit('todo')}
+            >
+              create + send to todo
+            </button>
+          )}
         </div>
         {error && <span className="error">{error}</span>}
       </form>

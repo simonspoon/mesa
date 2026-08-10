@@ -102,13 +102,16 @@ function CcNodeTextPanel({
 
   return (
     <>
+      {/* `.panel-head` is a right-aligned flex row holding the ✕ and nothing
+          else — every other panel in the app puts its heading *after* it, and
+          a title dropped inside would be pushed against the button. */}
       <div className="panel-head">
         <button type="button" className="panel-close" onClick={onClose}>
           ✕
         </button>
-        {/* Untrusted: `name` is model/transcript-authored. Text child only. */}
-        <h2 className="cc-nodetext-title">{data?.name ?? node.name}</h2>
       </div>
+      {/* Untrusted: `name` is model/transcript-authored. Text child only. */}
+      <h2 className="cc-nodetext-title">{data?.name ?? node.name}</h2>
 
       <div className="cc-nodetext-meta">
         <span className="cc-badge">{data?.kind ?? node.kind}</span>

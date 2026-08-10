@@ -21,6 +21,8 @@ function session(over: Partial<AgentSession> = {}): AgentSession {
     status: 'busy',
     state: 'working',
     waitingFor: null,
+    liveShells: 0,
+    liveSubagents: 0,
     ...over,
   }
 }

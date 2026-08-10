@@ -239,24 +239,34 @@ function CommitFileList({
  * The History sub-view: commit list → changed files → diff, in the same
  * two-column git-layout the Working-tree mode uses. Fetches the commit log
  * lazily (only once mounted, i.e. only once History mode is first opened —
- * GitView conditionally mounts this component). Empty-state ladder mirrors
- * ProjectGitView's exactly, one level deeper (M9).
+ * GitView conditionally mounts this component). Follows the tab's worktree
+ * selection: a worktree has its own HEAD, so its history is its own branch's,
+ * not the project `local_path` checkout's (mesa task 805). Empty-state ladder
+ * mirrors ProjectGitView's exactly, one level deeper (M9).
  */
-function HistoryPane({ projectId }: { projectId: number }) {
+function HistoryPane({
+  projectId,
+  worktree,
+}: {
+  projectId: number
+  worktree: string | null
+}) {
   const { data: log, error: logError } = useFetch(
-    () => getProjectGitLog(projectId),
-    `git-log-${projectId}`,
+    () => getProjectGitLog(projectId, worktree ?? undefined),
+    `git-log-${projectId}-${worktree ?? ''}`,
   )
   const [selectedCommit, setSelectedCommit] = useState<GitCommit | null>(null)
   const [selectedCommitPath, setSelectedCommitPath] = useState<string | null>(
     null,
   )
   // Same prevProject-during-render reset pattern as GitView itself: this
-  // component is not remounted on project change while History mode stays
-  // open, so a stale commit selection from project A must not leak into B.
-  const [prevProject, setPrevProject] = useState(projectId)
-  if (projectId !== prevProject) {
-    setPrevProject(projectId)
+  // component is not remounted on project change (nor on a worktree switch)
+  // while History mode stays open, so a stale commit selection from one scope
+  // must not leak into the next.
+  const scope = `${projectId} ${worktree ?? ''}`
+  const [prevScope, setPrevScope] = useState(scope)
+  if (scope !== prevScope) {
+    setPrevScope(scope)
     setSelectedCommit(null)
     setSelectedCommitPath(null)
   }
@@ -370,9 +380,9 @@ function WorktreeList({
  * re-points the branch header, file list, and diff pane at that worktree's
  * directory instead of the project's own `local_path` (server-validated —
  * `getProjectGit`/`getProjectGitDiff`'s `worktree` param only ever accepts a
- * path from this same repo's own worktree list). History stays scoped to
- * the project's `local_path` regardless of the selected worktree — all
- * worktrees of one repo share the same commit history. Rendered in place
+ * path from this same repo's own worktree list) — History included, since a
+ * worktree's HEAD is its own and so is the history behind it (mesa task 805).
+ * Rendered in place
  * inside ProjectTasksPage's frame. Read-only; refetches on
  * window focus (no poll — git state changes from terminal work outside the
  * app, and the server caches the status call for 5s anyway).
@@ -467,7 +477,7 @@ export function GitView({ projectId }: { projectId: number }) {
       </div>
 
       {mode === 'history' ? (
-        <HistoryPane projectId={projectId} />
+        <HistoryPane projectId={projectId} worktree={selectedWorktree} />
       ) : files.length === 0 ? (
         <p className="muted">Working tree clean — no changed files.</p>
       ) : (

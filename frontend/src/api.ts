@@ -339,11 +339,17 @@ export function getProjectGitDiff(
   )
 }
 
-/** Recent commit log for the project's local_path repo. Empty states are
+/** Recent commit log for the project's local_path repo, or for one of its
+ * worktrees when `worktree` selects one (same selector as getProjectGit — a
+ * worktree has its own HEAD, so its log is its own branch's). Empty states are
  * data, never errors: path null = no local_path; path set + commits null =
  * folder gone / not a repo; commits = [] = a real repo with no commits yet. */
-export function getProjectGitLog(id: number): Promise<ProjectGitLog> {
-  return request(`/api/projects/${id}/git/log`)
+export function getProjectGitLog(
+  id: number,
+  worktree?: string,
+): Promise<ProjectGitLog> {
+  const q = worktree ? `?worktree=${encodeURIComponent(worktree)}` : ''
+  return request(`/api/projects/${id}/git/log${q}`)
 }
 
 /** Commit history for ONE file under the project's local_path — backs the
@@ -351,8 +357,8 @@ export function getProjectGitLog(id: number): Promise<ProjectGitLog> {
  * as `getProjectGitLog` above, with one extra reading: `commits = []` here
  * means the file itself has no commits yet (untracked / never committed),
  * not that the repo is empty. 404s on a path that doesn't resolve inside
- * local_path. Takes no worktree — history is shared across a repo's
- * worktrees, like the whole-repo log. */
+ * local_path. Takes no worktree — unlike the whole-repo log, since the Files
+ * tab browses local_path's own tree. */
 export function getProjectGitFileLog(
   id: number,
   path: string,

@@ -34,15 +34,26 @@ nothing.
   the same way as the view route above) — traversal/absolute/unlisted paths
   are 404 `not_found`. Untracked files (status `??`) diff via the
   `--no-index` route.
-- The History routes below (`log`, `file-log`, `commits/{sha}/files`,
-  `commits/{sha}/diff`) take no `?worktree=` — commit history is shared
-  across every worktree of one repo, so they always read `local_path`.
-- `GET /api/projects/{id}/git/log` → `ProjectGitLog` via `git::commit_log_of`
+- Of the History routes below, only `log` takes a `?worktree=`. A worktree has
+  its **own HEAD**, so `git log` run there walks that worktree's branch — only
+  the *object store* is shared, not the history (mesa task 805). The per-commit
+  routes (`commits/{sha}/files`, `commits/{sha}/diff`) therefore need no
+  selector: a sha reachable only from a linked worktree's branch still resolves
+  from `local_path`, since it's content in that shared store. `file-log` takes
+  none either — its caller is the Files tab, browsing `local_path`'s own tree.
+- `GET /api/projects/{id}/git/log[?worktree=<path>]` → `ProjectGitLog` via
+  `git::commit_log_of`
   (`git log`, newest first, capped at `LOG_CAP` = 100 — browsing, not a full
   walk, no pagination). Same three-rung empty-state ladder one level deeper:
   no `local_path` → `{path: null, commits: null}`; dead folder/non-repo →
   `{path, commits: null}`; real repo → `{path, commits: Some(vec)}` (`[]` on
-  an unborn HEAD). Cached 5s per folder (`AppState.git_log_cache`).
+  an unborn HEAD). `?worktree=` reads the log from that worktree's directory
+  instead of `local_path`'s, validated by the same `worktrees` allowlist as
+  the view/diff routes (`resolve_git_dir`) — an unlisted value is 404
+  `not_found`, the one error this route can return. `path` in the response is
+  always the project's own `local_path`, unaffected by `?worktree=`, like the
+  view route's. Cached 5s per folder — the folder actually read
+  (`AppState.git_log_cache`).
 - `GET /api/projects/{id}/git/file-log?path=<rel>` → `ProjectGitLog` (the same
   type and empty-state ladder as `/git/log`) via `git::file_log_of` — the
   whole-repo log narrowed by a pathspec (`git log … -- <rel>`), same `LOG_CAP`

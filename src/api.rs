@@ -114,7 +114,9 @@ struct AppState {
     /// the git tab's worktree selector and the `?worktree=` allowlist on the
     /// view/diff routes below. Same TTL/shape rationale as `git_view_cache`.
     git_worktrees_cache: Arc<Mutex<HashMap<String, (Instant, Option<Vec<GitWorktree>>)>>>,
-    /// Recent commit log per project folder, keyed by `local_path`. Cached
+    /// Recent commit log per folder, keyed by the directory the log was read
+    /// from — `local_path`, or a selected worktree of it (each worktree has
+    /// its own HEAD, so its log differs). Cached
     /// (S3) so refetch-on-focus doesn't respawn `git log` every render; same
     /// GIT_TTL/eviction-cap pattern as `git_view_cache`.
     git_log_cache: Arc<Mutex<HashMap<String, (Instant, Vec<GitCommit>)>>>,
@@ -2318,8 +2320,9 @@ async fn get_project_version(
 /// `(Some(path), None)` when the folder is gone or not a git repo — quiet
 /// empty shapes, never an error (agents-endpoint posture). Unknown project
 /// id still surfaces as `not_found` via `get_project`. Always reads
-/// `local_path` itself — the History routes below never take a `?worktree=`
-/// override (commit history is shared across worktrees of one repo).
+/// `local_path` itself — callers that honour a `?worktree=` selection
+/// (`/git`, `/git/diff`, `/git/log`) use this only as the "is there a live
+/// repo here at all" gate and read the selected directory separately.
 async fn project_git_view(
     state: &AppState,
     id: i64,
@@ -2528,25 +2531,35 @@ async fn get_project_git_diff(
     Ok(Json(GitFileDiff { path: wanted, diff }).into_response())
 }
 
-/// Recent commit log for the project's `local_path` repo. Reuses
-/// `project_git_view` purely as the path/repo validity gate (it already runs
-/// `git status`, which is exactly "does `local_path` point at a live git
-/// repo") — ladder: `path == None` -> `{path: None, commits: None}`; `path`
-/// set + `repo == None` (folder gone / not a repo) -> `{path, commits:
-/// None}`; `repo == Some(_)` (valid repo, possibly unborn HEAD) -> fetch the
-/// log through `git_log_cache` -> `{path, commits: Some(vec)}` (`[]` on
-/// unborn HEAD). Never an error.
+/// Recent commit log for the project's `local_path` repo, or for one of its
+/// worktrees when `?worktree=` selects one — a worktree has its **own**
+/// HEAD, so `git log` there walks that worktree's branch, not `local_path`'s
+/// (only the object store is shared). Same selector and allowlist as the
+/// view/diff routes (`resolve_git_dir`); `path` in the response stays the
+/// project's own `local_path`, like the view route's.
+///
+/// Reuses `project_git_view` purely as the path/repo validity gate (it
+/// already runs `git status`, which is exactly "does `local_path` point at a
+/// live git repo") — ladder: `path == None` -> `{path: None, commits:
+/// None}`; `path` set + `repo == None` (folder gone / not a repo) ->
+/// `{path, commits: None}`; `repo == Some(_)` (valid repo, possibly unborn
+/// HEAD) -> fetch the log through `git_log_cache` (keyed by the resolved
+/// directory) -> `{path, commits: Some(vec)}` (`[]` on unborn HEAD). Only an
+/// unlisted `?worktree=` is an error (404, from `resolve_git_dir`).
 async fn get_project_git_log(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(q): Query<GitViewQuery>,
 ) -> ApiResult<Response> {
     let (path, repo) = project_git_view(&state, id).await?;
     let commits = match (&path, &repo) {
-        (Some(dir), Some(_)) => {
+        (Some(local_path), Some(_)) => {
+            let (dir, _worktrees) =
+                resolve_git_dir(&state, local_path, q.worktree.as_deref()).await?;
             let cached = {
                 let cache = state.git_log_cache.lock().unwrap();
                 cache
-                    .get(dir)
+                    .get(&dir)
                     .filter(|(at, _)| at.elapsed() < GIT_TTL)
                     .map(|(_, c)| c.clone())
             };
@@ -2579,7 +2592,8 @@ struct GitFileLogQuery {
 
 /// Commit history for ONE file under the project's `local_path` — the Files
 /// tab's History pane (mesa task 542). Deliberately carries no `?worktree=`,
-/// like its `/git/log` sibling: every worktree of a repo shares one history.
+/// unlike its `/git/log` sibling: the Files tab browses `local_path`'s own
+/// tree, so the file this narrows the log to is a path in that worktree.
 ///
 /// `?path=` is required (missing -> 422 `validation`, matching the diff
 /// routes) and is a path relative to `local_path`, resolved through
@@ -2659,6 +2673,12 @@ async fn get_project_git_file_log(
 /// invalid or git couldn't resolve the commit. Bad-sha and no-repo collapse
 /// to the same `not_found`: from the caller's perspective both mean "can't
 /// show you that commit."
+///
+/// Takes no `?worktree=` even though `/git/log` now does: a commit is content
+/// in the repo's shared object store, so a sha only *reachable* from a linked
+/// worktree's branch still resolves from `local_path` — unlike `git log`,
+/// which walks the per-worktree HEAD (covered by
+/// `commit_files_of_resolves_a_commit_made_in_a_linked_worktree`).
 async fn project_commit_files(
     state: &AppState,
     id: i64,

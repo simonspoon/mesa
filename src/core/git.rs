@@ -775,6 +775,104 @@ mod tests {
         assert!(log.len() <= LOG_CAP);
     }
 
+    /// The bug behind mesa task 805: a linked worktree has its OWN HEAD, so
+    /// its log is not the main checkout's — which is why the `/git/log` route
+    /// honours the tab's `?worktree=` selection instead of always reading
+    /// `local_path`.
+    #[test]
+    fn commit_log_of_reads_the_selected_worktrees_own_head() {
+        let (dir, _root_sha, second_sha) = synthetic_history_repo();
+        let path = dir.path().to_str().unwrap();
+        let git = |cwd: &str, args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        let linked_dir = tempfile::tempdir().unwrap();
+        let linked = linked_dir.path().join("linked");
+        git(
+            path,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        let linked_path = linked.to_str().unwrap();
+        std::fs::write(linked.join("w.txt"), "worktree only\n").unwrap();
+        git(linked_path, &["add", "w.txt"]);
+        git(linked_path, &["commit", "-m", "worktree commit"]);
+        let wt_sha = String::from_utf8(
+            Command::new("git")
+                .args(["-C", linked_path, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // The main checkout never saw that commit...
+        let main_log = commit_log_of(path);
+        assert_eq!(main_log.len(), 2);
+        assert_eq!(main_log[0].hash, second_sha);
+        // ...but the worktree's own log leads with it.
+        let linked_log = commit_log_of(linked_path);
+        assert_eq!(linked_log.len(), 3);
+        assert_eq!(linked_log[0].hash, wt_sha);
+        assert_eq!(linked_log[0].subject, "worktree commit");
+        assert_eq!(linked_log[1].hash, second_sha);
+    }
+
+    /// Why the per-commit routes need no worktree selector: commits live in
+    /// the repo's shared object store, so a sha only reachable from a linked
+    /// worktree's branch still resolves — files and diff — from the main
+    /// checkout the project's `local_path` points at.
+    #[test]
+    fn commit_files_of_resolves_a_commit_made_in_a_linked_worktree() {
+        let (dir, _root_sha, _second_sha) = synthetic_history_repo();
+        let path = dir.path().to_str().unwrap();
+        let git = |cwd: &str, args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        let linked_dir = tempfile::tempdir().unwrap();
+        let linked = linked_dir.path().join("linked");
+        git(
+            path,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        let linked_path = linked.to_str().unwrap();
+        std::fs::write(linked.join("w.txt"), "worktree only\n").unwrap();
+        git(linked_path, &["add", "w.txt"]);
+        git(linked_path, &["commit", "-m", "worktree commit"]);
+        let wt_sha = String::from_utf8(
+            Command::new("git")
+                .args(["-C", linked_path, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let files = commit_files_of(path, &wt_sha).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "w.txt");
+        assert_eq!(files[0].status, "A");
+        let d = commit_file_diff_of(path, &wt_sha, "w.txt").unwrap();
+        assert!(d.contains("+worktree only"), "diff was: {d}");
+    }
+
     #[test]
     fn file_log_of_lists_only_commits_touching_that_path() {
         let (dir, root_sha, second_sha) = synthetic_history_repo();

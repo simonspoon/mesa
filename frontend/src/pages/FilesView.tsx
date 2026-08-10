@@ -1,11 +1,6 @@
-import { useDeferredValue, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties, DragEvent as ReactDragEvent } from 'react'
-import {
-  SyntaxHighlighter,
-  vscDarkPlus,
-  highlightOverlaySource,
-  prismGrammar,
-} from '../syntaxHighlighter'
+import { SyntaxHighlighter, vscDarkPlus, prismGrammar } from '../syntaxHighlighter'
 import {
   activateTab,
   closeTab,
@@ -32,9 +27,12 @@ import {
   saveFilesTreeWidth,
 } from '../filesTreeWidth'
 import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
+import { CodeEditor } from '../components/CodeEditor'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
+import { isImagePath } from '../fileImage'
+import { resolveMarkdownImageSrc } from '../markdownAssets'
 import { newFilePath } from '../newFile'
 import { loadOpenFiles, saveOpenFiles } from '../openFiles'
 import {
@@ -45,6 +43,7 @@ import {
   getProjectGitCommitDiff,
   getProjectGitFileLog,
   projectFileDownloadUrl,
+  projectFileRawUrl,
   updateProjectFilesContent,
 } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
@@ -97,6 +96,7 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   bash: 'shell',
   html: 'html',
   css: 'css',
+  svg: 'svg',
   go: 'go',
   rb: 'ruby',
   c: 'c',
@@ -304,17 +304,28 @@ function ContentPane({
   // because history mode renders it in a narrower column beside the commit
   // list — and swaps it for a commit's diff once one is picked.
   const body = editing ? (
-    <FileEditor
+    <CodeEditor
       value={draft}
       language={data.language}
       onChange={(next) => onUi({ draft: next })}
       onCancel={cancelEdit}
       onSave={save}
     />
+  ) : isImagePath(data.path) ? (
+    // Ahead of the binary branch, so the one image test covers both halves of
+    // the allowlist uniformly: a raster arrives as `is_binary` with blank
+    // content, an `.svg` arrives as ordinary text. Neither is displayable as
+    // its bytes; both are displayable as an image. Keyed on the path so the
+    // load-error state below can't leak from one file into the next.
+    <FileImageBody key={data.path} projectId={projectId} path={data.path} />
   ) : data.is_binary ? (
     <p className="muted">Binary file — cannot display.</p>
   ) : data.language === 'markdown' ? (
-    <MarkdownBody content={data.content} />
+    <MarkdownBody
+      projectId={projectId}
+      path={data.path}
+      content={data.content}
+    />
   ) : (
     <FileCode content={data.content} language={data.language} />
   )
@@ -512,8 +523,30 @@ function CommitSideBySidePane({
  * react-markdown — untouched, it renders as two stray `<hr>`s around plain
  * paragraph text (`---` is a thematic break, not a block react-markdown
  * knows). */
-function MarkdownBody({ content }: { content: string }) {
+function MarkdownBody({
+  projectId,
+  path,
+  content,
+}: {
+  projectId: number
+  path: string
+  content: string
+}) {
   const { frontmatter, body } = splitFrontmatter(content)
+  // A relative `![alt](img/x.png)` in a repo file means "beside this file", so
+  // resolution is anchored on the md file's own directory ("" at the root) and
+  // the result goes through the raw route rather than the SPA's own URL space.
+  // `resolveMarkdownImageSrc` answers null for everything that must not be
+  // fetched (remote/data/protocol-relative sources, or a path escaping the
+  // project root) — Markdown then renders the alt text inert.
+  const dir = path.slice(0, Math.max(0, path.lastIndexOf('/')))
+  const resolveImageSrc = useCallback(
+    (src: string) => {
+      const rel = resolveMarkdownImageSrc(dir, src)
+      return rel === null ? null : projectFileRawUrl(projectId, rel)
+    },
+    [dir, projectId],
+  )
   return (
     <div className="markdown-body">
       {frontmatter !== null && (
@@ -522,7 +555,41 @@ function MarkdownBody({ content }: { content: string }) {
           <FileCode content={frontmatter} language="yaml" />
         </div>
       )}
-      <Markdown text={body} />
+      <Markdown text={body} resolveImageSrc={resolveImageSrc} />
+    </div>
+  )
+}
+
+/** An image file, rendered as the image itself rather than as its bytes
+ * (task 801) — the one file kind whose content view is not text. The bytes
+ * come from the raw route via a plain `<img src>`, never through `fetch`: the
+ * route is the only place they are served with an image mime, and keeping the
+ * load in the element means the browser's own decoder is what interprets
+ * them.
+ *
+ * `onError` covers everything the element cannot show — a file the server
+ * refused, or bytes with an image extension that are not a decodable image —
+ * with the same muted line the non-image binary branch uses, so a failure
+ * reads as a state rather than as a broken-image icon. The parent keys this
+ * component on the path, which is what resets the flag when the tab switches
+ * files. */
+function FileImageBody({
+  projectId,
+  path,
+}: {
+  projectId: number
+  path: string
+}) {
+  const [failed, setFailed] = useState(false)
+  if (failed) return <p className="muted">Binary file — cannot display.</p>
+  return (
+    <div className="files-content-image-wrap">
+      <img
+        className="files-content-image"
+        src={projectFileRawUrl(projectId, path)}
+        alt={basename(path)}
+        onError={() => setFailed(true)}
+      />
     </div>
   )
 }
@@ -554,87 +621,6 @@ function FileCode({
     >
       {content}
     </SyntaxHighlighter>
-  )
-}
-
-/** The edit-mode twin of `FileCode` (task 658): the same Prism colouring, but
- * live under the caret.
- *
- * A `<textarea>` can only paint one colour, so the highlighted copy is a
- * separate, inert layer *behind* a transparent-text textarea — the standard
- * overlay editor. Everything that keeps the two aligned is load-bearing:
- * identical font metrics and zero padding on both (`.files-editor-*` in
- * App.css), `wrap="off"` so the textarea never soft-wraps where the `<pre>`
- * would not, `highlightOverlaySource` for the trailing-newline mismatch, and
- * scroll mirrored from the textarea onto the layer on every scroll event.
- * Only the textarea is a real control: the layer is `aria-hidden` and
- * pointer-transparent, so selection, the caret and the accessibility tree all
- * still come from the one element that holds the text.
- *
- * A language we carry no grammar for falls back to the plain textarea this
- * pane shipped with in task 327 — same rule as `FileCode`'s plain `<pre>`. */
-function FileEditor({
-  value,
-  language,
-  onChange,
-  onCancel,
-  onSave,
-}: {
-  value: string
-  language: string | null
-  onChange: (next: string) => void
-  onCancel: () => void
-  onSave: () => void
-}) {
-  const highlightRef = useRef<HTMLDivElement>(null)
-  // Re-tokenising a 256 KiB file on every keystroke would sit between the key
-  // and the caret. Deferring lets React paint the typed character first and
-  // recolour behind it, so the colours can lag a frame but the caret never
-  // does.
-  const deferred = useDeferredValue(value)
-  const prismLanguage = prismGrammar(language)
-
-  const textarea = (
-    <textarea
-      autoFocus
-      className="files-content-editor"
-      value={value}
-      spellCheck={false}
-      wrap="off"
-      onChange={(e) => onChange(e.target.value)}
-      onScroll={(e) => {
-        const layer = highlightRef.current
-        if (layer === null) return
-        layer.scrollTop = e.currentTarget.scrollTop
-        layer.scrollLeft = e.currentTarget.scrollLeft
-      }}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') onCancel()
-        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSave()
-      }}
-    />
-  )
-
-  if (prismLanguage === undefined) return textarea
-
-  return (
-    <div className="files-editor-stack">
-      <div className="files-editor-highlight" ref={highlightRef} aria-hidden="true">
-        <SyntaxHighlighter
-          language={prismLanguage}
-          style={vscDarkPlus}
-          customStyle={{
-            margin: 0,
-            padding: 0,
-            background: 'transparent',
-          }}
-          codeTagProps={{ className: 'files-content-text' }}
-        >
-          {highlightOverlaySource(deferred)}
-        </SyntaxHighlighter>
-      </div>
-      {textarea}
-    </div>
   )
 }
 

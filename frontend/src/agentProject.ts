@@ -35,6 +35,17 @@ export function isStaleWorking(a: AgentSession): boolean {
   return a.kind === 'background' && a.status === 'idle' && a.state === 'working'
 }
 
+/** The session still holds work in flight *right now*: a Bash tool call
+ * running as a shell child, or a subagent whose transcript is still being
+ * written. Both counts are mesa-derived (see `AgentSession`), not upstream
+ * `state` — which is exactly why they can disagree with it (mesa task 802).
+ *
+ * Lives beside `isStaleWorking` for the same reason: the sidebar's bucketing
+ * and `isRunningAgent` must answer it identically. */
+export function hasLiveWork(a: AgentSession): boolean {
+  return (a.liveShells ?? 0) > 0 || (a.liveSubagents ?? 0) > 0
+}
+
 /** A session still under way — excludes ones `claude agents --json` reports
  * with a terminal `state` (finished, failed, or stopped), ones stuck at a
  * stale `working` (above), and ones whose process has already exited
@@ -44,13 +55,33 @@ export function isStaleWorking(a: AgentSession): boolean {
  * Note a terminal `state` does NOT imply the process is gone: `claude agents
  * --json` lists live processes, and every session it reports as `done` is
  * still running (measured, mesa task 571 — 33 of 33). The `pid` test is for
- * the separate case where upstream reports the field as null. */
+ * the separate case where upstream reports the field as null.
+ *
+ * `hasLiveWork` overrides every `state`-derived verdict (mesa task 802):
+ * upstream reports a session `done` the moment its turn ends, but a Bash call
+ * or subagent it launched can still be running — mesa observes those directly,
+ * so an observed-live session outranks a reported-done one, and the todo
+ * watcher does not refill the slot underneath it. `pid !== null` still gates
+ * everything: no process, no work. */
 export function isRunningAgent(a: AgentSession): boolean {
   return (
     a.pid !== null &&
-    a.state !== 'done' &&
-    a.state !== 'failed' &&
-    a.state !== 'stopped' &&
-    !isStaleWorking(a)
+    (hasLiveWork(a) ||
+      (a.state !== 'done' &&
+        a.state !== 'failed' &&
+        a.state !== 'stopped' &&
+        !isStaleWorking(a)))
   )
+}
+
+/** The Agent sidebar's badge for a session kept ACTIVE by `hasLiveWork` —
+ * e.g. `2 shells`, `1 subagent`, `2 shells · 1 subagent`. `null` when there
+ * is nothing live to report, so the caller renders no badge. */
+export function liveWorkLabel(a: AgentSession): string | null {
+  const parts: string[] = []
+  const shells = a.liveShells ?? 0
+  const subagents = a.liveSubagents ?? 0
+  if (shells > 0) parts.push(`${shells} shell${shells === 1 ? '' : 's'}`)
+  if (subagents > 0) parts.push(`${subagents} subagent${subagents === 1 ? '' : 's'}`)
+  return parts.length > 0 ? parts.join(' · ') : null
 }

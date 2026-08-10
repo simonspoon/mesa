@@ -370,6 +370,7 @@ scripts/refine-watcher-check.sh # `serve --watch-refine` refinement loop against
 scripts/inbox-watcher-check.sh  # `serve --watch-inbox` triage loop against a stub `claude`
 scripts/config-check.sh     # the 4 configurable spawn commands in ~/.mesa/config.json
 scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts
+scripts/scripts-check.sh    # user-authored script contract over CLI + API, incl. the injection + gate proofs
 
 # Frontend (Vite dev server proxies /api -> 127.0.0.1:7770; needs `mesa serve`)
 npm --prefix frontend run dev

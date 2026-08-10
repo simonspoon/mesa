@@ -633,7 +633,7 @@ pub const DEFAULT_LIVE_MINUTES: i64 = 15;
 pub const MAX_LIVE_MINUTES: i64 = 1440;
 /// Within this gap since its newest event, a live session is "active" (working);
 /// beyond it the session is merely "idle" but still live.
-const ACTIVE_SECS: i64 = 90;
+pub(crate) const ACTIVE_SECS: i64 = 90;
 /// Width of one `spark` bucket — one bar per minute.
 const LIVE_BUCKET_SECS: i64 = 60;
 
@@ -2696,7 +2696,7 @@ fn file_size(path: &Path) -> Option<i64> {
 
 /// Where Claude Code stores transcripts. `MESA_CC_PROJECTS_DIR` overrides it
 /// (used by tests); otherwise `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`.
-fn projects_dir() -> Option<PathBuf> {
+pub(crate) fn projects_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MESA_CC_PROJECTS_DIR") {
         return Some(PathBuf::from(p));
     }

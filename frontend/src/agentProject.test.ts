@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { isRunningAgent, isStaleWorking, projectForCwd } from './agentProject'
+import {
+  hasLiveWork,
+  isRunningAgent,
+  isStaleWorking,
+  liveWorkLabel,
+  projectForCwd,
+} from './agentProject'
 import type { AgentSession } from './types/AgentSession'
 import type { Project } from './types/Project'
 
@@ -30,8 +36,19 @@ function session(over: Partial<AgentSession> = {}): AgentSession {
     status: 'busy',
     state: 'working',
     waitingFor: null,
+    liveShells: 0,
+    liveSubagents: 0,
     ...over,
   }
+}
+
+/** A session with the two mesa-derived liveness counts missing entirely —
+ *  what an older payload (or a hand-built mock) looks like. */
+function sessionWithoutCounts(over: Partial<AgentSession> = {}): AgentSession {
+  const s: Record<string, unknown> = { ...session(over) }
+  delete s.liveShells
+  delete s.liveSubagents
+  return s as unknown as AgentSession
 }
 
 describe('projectForCwd', () => {
@@ -134,5 +151,79 @@ describe('isRunningAgent', () => {
     expect(
       isRunningAgent(session({ pid: null, status: 'busy', state: 'working' })),
     ).toBe(false)
+  })
+
+  // mesa task 802: observed live work outranks upstream's `state`.
+  it('keeps a done session that still holds a running shell', () => {
+    expect(
+      isRunningAgent(session({ status: 'idle', state: 'done', liveShells: 2 })),
+    ).toBe(true)
+  })
+
+  it('keeps a stale-working session that still holds a subagent', () => {
+    expect(
+      isRunningAgent(
+        session({ status: 'idle', state: 'working', liveSubagents: 1 }),
+      ),
+    ).toBe(true)
+  })
+
+  it('drops a done session once both counts are zero', () => {
+    expect(
+      isRunningAgent(
+        session({ status: 'idle', state: 'done', liveShells: 0, liveSubagents: 0 }),
+      ),
+    ).toBe(false)
+  })
+
+  it('drops a done session when the counts are absent entirely', () => {
+    expect(
+      isRunningAgent(sessionWithoutCounts({ status: 'idle', state: 'done' })),
+    ).toBe(false)
+  })
+
+  it('still drops an exited process however much work it appears to hold', () => {
+    expect(
+      isRunningAgent(
+        session({ pid: null, state: 'done', liveShells: 3, liveSubagents: 2 }),
+      ),
+    ).toBe(false)
+  })
+})
+
+describe('hasLiveWork', () => {
+  it('is false with both counts at zero', () => {
+    expect(hasLiveWork(session())).toBe(false)
+  })
+
+  it('is true on either count alone', () => {
+    expect(hasLiveWork(session({ liveShells: 1 }))).toBe(true)
+    expect(hasLiveWork(session({ liveSubagents: 1 }))).toBe(true)
+  })
+
+  it('treats absent counts as zero', () => {
+    expect(hasLiveWork(sessionWithoutCounts())).toBe(false)
+  })
+})
+
+describe('liveWorkLabel', () => {
+  it('is null with nothing live', () => {
+    expect(liveWorkLabel(session())).toBeNull()
+  })
+
+  it('singularizes a count of one', () => {
+    expect(liveWorkLabel(session({ liveShells: 1 }))).toBe('1 shell')
+    expect(liveWorkLabel(session({ liveSubagents: 1 }))).toBe('1 subagent')
+  })
+
+  it('pluralizes above one', () => {
+    expect(liveWorkLabel(session({ liveShells: 2 }))).toBe('2 shells')
+    expect(liveWorkLabel(session({ liveSubagents: 3 }))).toBe('3 subagents')
+  })
+
+  it('joins both when both are live', () => {
+    expect(liveWorkLabel(session({ liveShells: 2, liveSubagents: 1 }))).toBe(
+      '2 shells · 1 subagent',
+    )
   })
 })

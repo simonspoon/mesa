@@ -5,7 +5,7 @@ newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
 subagent transcripts in `<session>/subagents/*.jsonl`). Transcripts are
 **ingested** into `cc_*` tables (sessions, agent runs, messages, tool calls,
 prompts, per-file cursors — migration 12, plus `cc_prompts` at 31 and
-`cc_node_files` at 33) through `Store` — the single-write-path
+`cc_node_files` at 34) through `Store` — the single-write-path
 invariant holds here too — and **the dashboard reads only the db**, never the
 files, so history survives Claude Code's own transcript cleanup and nothing is
 ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
@@ -18,7 +18,7 @@ the last few minutes, where the files are by definition still present) and
 
 Migration numbers in this file are the **resulting `user_version`**, i.e.
 1-based: `MIGRATIONS` in `src/core/store.rs` is a 0-indexed array, so
-"migration 33" is `MIGRATIONS[32]`. Enumerate the array rather than counting the
+"migration 34" is `MIGRATIONS[33]`. Enumerate the array rather than counting the
 comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
 
 - Each transcript line is one event. Only `assistant` events carry a `model` and
@@ -473,7 +473,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   graph payload (a graph that inlined bodies would carry megabytes to render a
   column of 40-char labels).
   - **`cc_node_files (session_id, agent_id, path)`, PK `(session_id, agent_id)`,
-    migration 33** — the pointer from one *thread* back to the transcript file
+    migration 34** — the pointer from one *thread* back to the transcript file
     it was read from, `agent_id = ''` meaning the session's main thread. It is
     what makes the body a single file read instead of a scan of thousands of
     transcripts; the walker already holds the path at ingest, so writing it
@@ -485,7 +485,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     — the same trap `preview` and `message_id` each needed a guarded `UPDATE`
     to escape. A fresh table has no such rows to leave behind: the re-walk
     upserts it clean. It ships with its own **`DELETE FROM cc_files;` cursor
-    clear as migration 34**, in the same binary as the write, per the
+    clear as migration 35**, in the same binary as the write, per the
     add-a-derived-store rule above.
     The pair really is 1:1 with a file: measured over the real
     `~/.claude/projects` corpus, **3,445 `(session_id, agent_id)` pairs, none

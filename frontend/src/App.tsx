@@ -12,6 +12,7 @@ import { CCSessionDetailView } from './pages/CCSessionDetailView'
 import { CCSessionTimelineView } from './pages/CCSessionTimelineView'
 import { InboxView } from './pages/InboxView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
+import { ScriptsView } from './pages/ScriptsView'
 import { SettingsView } from './pages/SettingsView'
 import { TerminalPage } from './pages/TerminalPage'
 import { isPhone, onPhoneTierChange } from './phoneTier'
@@ -33,7 +34,9 @@ import { useVisualViewportHeightVar } from './visualViewport'
 // closing/saving it returns to the plain project URL — see
 // ProjectTasksPage's `createTask` prop), #/terminal (global shell pane-tree;
 // TerminalPage is a permanent sibling mount, not resolved into `page` — see
-// the render below).
+// the render below), #/scripts (the global store of user-authored shell
+// scripts and their generated run forms — global like #/inbox, since a script
+// may bind a project but does not have to).
 //
 // Every project-tab and #/cc route is *recorded* browser-local as the last
 // view (`lastView.ts`), so the nav's project and CC Dashboard links reopen it.
@@ -164,6 +167,10 @@ function App() {
   // Settings: global, above projects like the Inbox — the config file it edits
   // is per-machine, not per-project.
   const settingsMatch = /^\/settings$/.exec(path)
+  // Scripts: global too. A script may bind a project (whose `local_path` is
+  // then the run's cwd), but it is not a project tab — an unbound one runs in
+  // $HOME and belongs to no project at all.
+  const scriptsMatch = /^\/scripts$/.exec(path)
   // Terminal is not resolved into `page` (see below) — it's a permanent
   // sibling mount alongside `main`/`AgentSidebar` (mesa task 396,
   // .scratch/arch.md §4.3), toggled via `visibility` so panes and their
@@ -241,6 +248,10 @@ function App() {
   if (settingsMatch) {
     // ~/.mesa/config.json editor: no project frame, no active project.
     page = <SettingsView />
+  } else if (scriptsMatch) {
+    // Stored shell scripts + their run forms: global, so no project frame and
+    // no active project, exactly like the inbox below.
+    page = <ScriptsView />
   } else if (inboxMatch) {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
@@ -442,6 +453,7 @@ function App() {
           activeProjectId={activeProjectId}
           inboxActive={inboxMatch !== null}
           settingsActive={settingsMatch !== null}
+          scriptsActive={scriptsMatch !== null}
           terminalActive={terminalActive}
           ccTab={ccTab}
           version={navVersion}

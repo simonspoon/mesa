@@ -217,6 +217,7 @@ export function Sidebar({
   activeProjectId,
   inboxActive,
   settingsActive,
+  scriptsActive,
   terminalActive,
   ccTab,
   version,
@@ -227,6 +228,7 @@ export function Sidebar({
   activeProjectId: number | null
   inboxActive: boolean
   settingsActive: boolean
+  scriptsActive: boolean
   terminalActive: boolean
   ccTab: CcTab | null
   version: number
@@ -604,6 +606,12 @@ export function Sidebar({
         </a>
         <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
           <span className="nav-item-label">Terminal</span>
+        </a>
+        {/* Flat, like Inbox and Terminal: Scripts is a global page, not a
+            project subtree, so `navCollapse.ts` (which is project-only) is
+            deliberately untouched. */}
+        <a className={`nav-item${scriptsActive ? ' active' : ''}`} href="#/scripts">
+          <span className="nav-item-label">Scripts</span>
         </a>
         <button
           type="button"

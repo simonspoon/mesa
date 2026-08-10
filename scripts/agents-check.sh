@@ -145,6 +145,16 @@ api 200 GET "/api/projects/$P/agents"
 [ "$(jqb '.agents[0].waitingFor')" = "permission prompt" ] || fail "GET agents: camelCase passthrough"
 ok "GET /api/projects/{id}/agents lists sessions under local_path"
 
+# liveShells/liveSubagents are mesa-derived (mesa task 802), absent from the
+# CLI payload the stub emits — they must still be present on the wire, as
+# camelCase numbers. The stub's pids don't exist and there is no projects dir
+# here, so both probes fail open to 0; the counting logic itself is pinned by
+# the Rust unit tests in src/core/agents.rs (faking a process tree from bash
+# would test the fake, not the probe).
+[ "$(jqb '.agents[0].liveShells')" = "0" ] || fail "GET agents: liveShells must be present and 0"
+[ "$(jqb '.agents[0].liveSubagents')" = "0" ] || fail "GET agents: liveSubagents must be present and 0"
+ok "sessions carry mesa-derived liveShells/liveSubagents, failing open to 0"
+
 api 200 GET "/api/projects/$D/agents"
 [ "$(jqb .path)" = "null" ] || fail "GET agents (no path): path null"
 [ "$(jqb '.agents | length')" = "0" ] || fail "GET agents (no path): empty list"
@@ -181,7 +191,9 @@ api 200 GET "/api/agents"
 [ "$(jqb '.[0].cwd')" = "/one/project" ] || fail "GET /api/agents: first session cwd"
 [ "$(jqb '.[1].cwd')" = "/another/project" ] || fail "GET /api/agents: second session cwd"
 [ "$(jqb '.[2].cwd')" = "$TOPLEVEL" ] || fail "GET /api/agents: third session cwd"
-ok "GET /api/agents lists sessions across every folder (bare array, no --cwd)"
+[ "$(jqb '[.[] | select(.liveShells == 0 and .liveSubagents == 0)] | length')" = "3" ] ||
+  fail "GET /api/agents: every session must carry both liveness counts, 0 here"
+ok "GET /api/agents lists sessions across every folder (bare array, no --cwd), each enriched with the liveness counts"
 
 # Cross-site defense: list/spawn reject a foreign browser Origin (like the
 # attach socket), while an Origin-less client (curl default) passes.

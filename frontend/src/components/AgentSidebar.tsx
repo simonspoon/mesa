@@ -18,7 +18,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
-import { isStaleWorking, projectForCwd } from '../agentProject'
+import { hasLiveWork, isStaleWorking, liveWorkLabel, projectForCwd } from '../agentProject'
 import {
   clampAgentSidebarWidth,
   DEFAULT_AGENT_SIDEBAR_WIDTH,
@@ -129,9 +129,13 @@ type Bucket = 'BLOCKED' | 'ACTIVE' | 'DONE'
 // (see `agentProject.ts` for the measured upstream behavior behind it) also
 // routes a finished-but-idle background session here (mesa task 571).
 // `blocked` is tested first so an idle session that is genuinely *waiting*
-// keeps its own bucket.
+// keeps its own bucket — a permission prompt is blocked no matter what else
+// the session holds. `hasLiveWork` then outranks every `state`-derived DONE:
+// mesa observed a Bash call or subagent still running, which beats upstream's
+// report that the turn ended (mesa task 802).
 function bucketOf(a: AgentSession): Bucket {
   if (a.state === 'blocked') return 'BLOCKED'
+  if (hasLiveWork(a)) return 'ACTIVE'
   if (a.state === 'done' || a.state === 'failed' || a.state === 'stopped') return 'DONE'
   if (isStaleWorking(a)) return 'DONE'
   return 'ACTIVE' // 'working', or no state at all (interactive sessions)
@@ -146,6 +150,15 @@ const STALE_WORKING_HINT =
   'claude reports this session as "working", but it is idle with its turn ended — ' +
   'upstream `state` can stick at "working" after a background session finishes. ' +
   'mesa treats idle+working as done.'
+
+// The counterpart hint for the opposite disagreement: upstream says the turn
+// ended, but mesa can see the session's own work still running. Same job as
+// STALE_WORKING_HINT — keep a badge that contradicts `state` from reading as
+// a mesa bug (mesa task 802).
+const LIVE_WORK_HINT =
+  'claude reports this session as finished, but it still holds a running Bash call ' +
+  'or subagent — mesa counts those directly, so it keeps the session active and the ' +
+  'todo watcher will not refill its slot yet.'
 
 const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE', 'DONE']
 
@@ -345,6 +358,11 @@ function AgentListContent({
                               title={isStaleWorking(a) ? STALE_WORKING_HINT : undefined}
                             >
                               {a.state}
+                            </span>
+                          )}
+                          {liveWorkLabel(a) && (
+                            <span className="badge agent-live-work" title={LIVE_WORK_HINT}>
+                              {liveWorkLabel(a)}
                             </span>
                           )}
                           {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}

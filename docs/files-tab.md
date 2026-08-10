@@ -147,6 +147,23 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   `require_agent_access` applies and the Content-Type gate doesn't fire on a
   GET. Adding a download does not make this surface a delete, rename or move:
   it still has none of those.
+- `GET /api/projects/{id}/files/raw?path=<relpath>` (task 801) → the file's
+  raw bytes with a **real image mime type**, for an `<img src>`. Same `?path=`
+  contract and the same `files::read_file_download` read as the download route
+  above — missing `?path=` is 422 `validation`, `TooLarge` is 422, and no
+  `local_path` / dead folder / anything `safe_path` rejects is 404
+  `not_found`. What is new is a gate between the path resolve and the read:
+  the extension allowlist (`files::image_mime`), which is the only thing that
+  decides a content type on this API and answers 422 `validation`
+  (`not a previewable image: <path>`) for everything else — see the section
+  below. Response headers are fixed: `Content-Type: <the allowlisted mime>`,
+  `Content-Disposition: inline; filename="…"` (the **same**
+  `content_disposition()` helper the download and attachments routes use, with
+  `inline` in place of `attachment`), `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+  sandbox`. Gate: the standard `guard` only, like the tree/content/download
+  reads — it is a read, reachable in default mode and under `--lan`, and the
+  Content-Type gate doesn't fire on a GET.
 - `PATCH /api/projects/{id}/files/content` (task 327; same path as the GET
   above, body `{path, content}` — JSON, not a query string, so this mutating
   call stays inside the Content-Type CSRF gate, same reasoning as the
@@ -577,3 +594,81 @@ intermediate directories — `create_file` is one `fs::write`, never
   ordinary focusable controls, no global single-key shortcut. The naming row
   lives inside `.files-tree-pane`, so the pane's width/collapse (task 671) and
   the phone tier's stack (task 559) apply to it unchanged.
+
+## Inline images (task 801)
+
+An image in the tree used to be "Binary file — cannot display", and a
+`![](./logo.png)` in a rendered `.md` was a broken-image icon: the content GET
+returns `content: ""` for a binary file, and nothing on this API would hand a
+browser bytes it would paint. `GET .../files/raw` is that one route, and its
+whole design is about giving up as little as possible to get it.
+
+**The extension allowlist is the boundary.** `files::image_mime` maps a
+path's lowercased final extension to one of exactly eight types — `image/png`,
+`image/jpeg`, `image/gif`, `image/webp`, `image/bmp`, `image/x-icon`,
+`image/svg+xml` — and answers `None` for everything else, which the route
+turns into 422 before it reads a single byte. There is no sniff, no
+fallback type and no `text/html` anywhere on this API: an extension not on
+that list cannot come back from this route *at all*, so "which content types
+can mesa emit for repo bytes" is answerable by reading one `match`. Only the
+final extension counts, so `foo.png.html` is an `.html` file and is refused.
+
+The allowlist is checked **after** `safe_path` and before the read, so the two
+refusals never blur: anything that escapes the root is 404 `not_found`
+(`?path=../../etc/passwd` and `?path=../logo.png` alike, image extension or
+not), exactly like every other read on this tab, and 422 means only "inside
+the repo, not an image". Ordering it this way keeps the route from becoming an
+oracle that tells a caller which of the two it got wrong, and resolving a path
+is cheap — the allowlist still stands between a non-image and any file read.
+
+**`/files/download` is deliberately not relaxed.** It keeps its fixed
+`application/octet-stream` + `Content-Disposition: attachment` and serves
+every file; raw serves only images and always `inline`. Two routes, two
+postures — merging them would mean either sniffing types on the download (the
+thing its own docs above rule out) or letting the inline route serve
+arbitrary bytes. The gate script asserts the download's headers precisely
+because raw is the change that could have tempted a relaxation.
+
+**An SVG gets a real mime only because of how it is consumed.** `image/svg+xml`
+is same-origin markup that can carry script, so it is the one entry on the
+list that would be dangerous served naively. Three things hold it: it is only
+ever loaded through an `<img>` element (which never runs script in an SVG),
+`X-Content-Type-Options: nosniff` stops a browser re-deciding the type, and
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+sandbox` neuters the document if it is ever opened directly — no fetches, no
+script, no same-origin identity. Removing any one of the three is what would
+make this unsafe; they ship together or not at all. (`style-src
+'unsafe-inline'` is the single concession, so a legitimate SVG's inline
+`<style>` still paints.) The content GET's `language_of` also learned `"svg"`,
+so an `.svg` opened in the editor is still ordinary text with syntax colour —
+raw is about how it is *rendered*, not about reclassifying it.
+
+**Markdown image resolution is client-side and refuses more than it
+resolves.** `frontend/src/markdownAssets.ts`'s `resolveMarkdownImageSrc(fileDir,
+src)` answers the repo-relative path to load, or `null` for "render no image".
+Relative sources resolve against the **markdown file's own directory**
+(`fileDir`, `""` at the root), a leading `/` against the repo root, and the
+result is served through the raw route. `null` — rendered as inert muted alt
+text (`.markdown-img-missing`), never a broken-image icon — covers `http:`/
+`https:`/`data:`/any other scheme, protocol-relative `//host/…`, a bare
+`#anchor`, and any `..` chain that walks above the repo root, so the browser
+never issues a request mesa would have to refuse. `Markdown.tsx` gained one
+optional `resolveImageSrc` prop for this; every other caller omits it and
+keeps react-markdown's own `img` untouched. `frontend/src/fileImage.ts` holds
+the client's mirror of the server allowlist (same relationship
+`syntaxHighlighter.ts` has to `language_of`) and decides when the *content
+pane itself* shows an image instead of the binary placeholder.
+
+Relative markdown **links** (`<a href>`) are still **not** rewritten — a
+`[see](./other.md)` remains whatever react-markdown makes of it. Resolving
+those means navigating the SPA into another file tab, a different feature with
+its own questions (which pane, does it open a tab, what about a link out of
+the repo); images are a render, links are a navigation.
+
+`scripts/files-check.sh` is the gate: it seeds a throwaway project folder (a
+real PNG, an SVG in a subdirectory, an `.html`, an `.md` and an extensionless
+file), asserts the mime/`inline`/`nosniff`/CSP headers and byte-identical
+bodies for both image types, the 422 for every non-image, the traversal and
+missing-`?path=` cases, the download route's unchanged headers, and — in
+**both** serve modes — that raw is reachable while the PATCH write keeps its
+`require_agent_access` + Content-Type gate.

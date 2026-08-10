@@ -44,8 +44,26 @@ import {
  * language falls back to a plain `<pre>` — still a literal block, just
  * uncoloured. Inline code (no enclosing `pre`) is untouched and keeps the
  * default `<code>` chip.
+ *
+ * `resolveImageSrc` lets a caller rewrite `![alt](src)` sources (task 801).
+ * It receives the source text verbatim and returns the URL to actually load,
+ * or `null` for "render no image at all" — in which case the alt text renders
+ * as inert muted text rather than a broken-image icon. Only the Files tab
+ * passes it, to turn a relative path in a repo file into that repo's raw-file
+ * route; every other caller omits it and keeps react-markdown's default
+ * `<img>` (an absolute `http(s)` src renders exactly as it does today).
+ * react-markdown's URL sanitisation runs before this hook either way, so an
+ * unsafe scheme never reaches the resolver.
  */
-export function Markdown({ text, breaks }: { text: string; breaks?: boolean }) {
+export function Markdown({
+  text,
+  breaks,
+  resolveImageSrc,
+}: {
+  text: string
+  breaks?: boolean
+  resolveImageSrc?: (src: string) => string | null
+}) {
   return (
     <ReactMarkdown
       remarkPlugins={breaks ? [remarkGfm, remarkBreaks] : [remarkGfm]}
@@ -56,6 +74,19 @@ export function Markdown({ text, breaks }: { text: string; breaks?: boolean }) {
           </a>
         ),
         pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+        // Added only when a caller passes a resolver, so every existing caller
+        // keeps react-markdown's own `img` element byte for byte.
+        ...(resolveImageSrc
+          ? {
+              img: ({ src, alt, title }: ComponentPropsWithoutRef<'img'>) => {
+                const resolved =
+                  typeof src === 'string' ? resolveImageSrc(src) : null
+                if (resolved === null)
+                  return <span className="markdown-img-missing">{alt ?? ''}</span>
+                return <img src={resolved} alt={alt ?? ''} title={title} />
+              },
+            }
+          : {}),
       }}
     >
       {text}

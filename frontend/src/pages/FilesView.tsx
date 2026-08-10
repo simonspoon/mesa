@@ -1,4 +1,10 @@
-import { useDeferredValue, useEffect, useRef, useState } from 'react'
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 import type { CSSProperties, DragEvent as ReactDragEvent } from 'react'
 import {
   SyntaxHighlighter,
@@ -35,6 +41,8 @@ import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
+import { isImagePath } from '../fileImage'
+import { resolveMarkdownImageSrc } from '../markdownAssets'
 import { newFilePath } from '../newFile'
 import { loadOpenFiles, saveOpenFiles } from '../openFiles'
 import {
@@ -45,6 +53,7 @@ import {
   getProjectGitCommitDiff,
   getProjectGitFileLog,
   projectFileDownloadUrl,
+  projectFileRawUrl,
   updateProjectFilesContent,
 } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
@@ -97,6 +106,7 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   bash: 'shell',
   html: 'html',
   css: 'css',
+  svg: 'svg',
   go: 'go',
   rb: 'ruby',
   c: 'c',
@@ -311,10 +321,21 @@ function ContentPane({
       onCancel={cancelEdit}
       onSave={save}
     />
+  ) : isImagePath(data.path) ? (
+    // Ahead of the binary branch, so the one image test covers both halves of
+    // the allowlist uniformly: a raster arrives as `is_binary` with blank
+    // content, an `.svg` arrives as ordinary text. Neither is displayable as
+    // its bytes; both are displayable as an image. Keyed on the path so the
+    // load-error state below can't leak from one file into the next.
+    <FileImageBody key={data.path} projectId={projectId} path={data.path} />
   ) : data.is_binary ? (
     <p className="muted">Binary file — cannot display.</p>
   ) : data.language === 'markdown' ? (
-    <MarkdownBody content={data.content} />
+    <MarkdownBody
+      projectId={projectId}
+      path={data.path}
+      content={data.content}
+    />
   ) : (
     <FileCode content={data.content} language={data.language} />
   )
@@ -512,8 +533,30 @@ function CommitSideBySidePane({
  * react-markdown — untouched, it renders as two stray `<hr>`s around plain
  * paragraph text (`---` is a thematic break, not a block react-markdown
  * knows). */
-function MarkdownBody({ content }: { content: string }) {
+function MarkdownBody({
+  projectId,
+  path,
+  content,
+}: {
+  projectId: number
+  path: string
+  content: string
+}) {
   const { frontmatter, body } = splitFrontmatter(content)
+  // A relative `![alt](img/x.png)` in a repo file means "beside this file", so
+  // resolution is anchored on the md file's own directory ("" at the root) and
+  // the result goes through the raw route rather than the SPA's own URL space.
+  // `resolveMarkdownImageSrc` answers null for everything that must not be
+  // fetched (remote/data/protocol-relative sources, or a path escaping the
+  // project root) — Markdown then renders the alt text inert.
+  const dir = path.slice(0, Math.max(0, path.lastIndexOf('/')))
+  const resolveImageSrc = useCallback(
+    (src: string) => {
+      const rel = resolveMarkdownImageSrc(dir, src)
+      return rel === null ? null : projectFileRawUrl(projectId, rel)
+    },
+    [dir, projectId],
+  )
   return (
     <div className="markdown-body">
       {frontmatter !== null && (
@@ -522,7 +565,41 @@ function MarkdownBody({ content }: { content: string }) {
           <FileCode content={frontmatter} language="yaml" />
         </div>
       )}
-      <Markdown text={body} />
+      <Markdown text={body} resolveImageSrc={resolveImageSrc} />
+    </div>
+  )
+}
+
+/** An image file, rendered as the image itself rather than as its bytes
+ * (task 801) — the one file kind whose content view is not text. The bytes
+ * come from the raw route via a plain `<img src>`, never through `fetch`: the
+ * route is the only place they are served with an image mime, and keeping the
+ * load in the element means the browser's own decoder is what interprets
+ * them.
+ *
+ * `onError` covers everything the element cannot show — a file the server
+ * refused, or bytes with an image extension that are not a decodable image —
+ * with the same muted line the non-image binary branch uses, so a failure
+ * reads as a state rather than as a broken-image icon. The parent keys this
+ * component on the path, which is what resets the flag when the tab switches
+ * files. */
+function FileImageBody({
+  projectId,
+  path,
+}: {
+  projectId: number
+  path: string
+}) {
+  const [failed, setFailed] = useState(false)
+  if (failed) return <p className="muted">Binary file — cannot display.</p>
+  return (
+    <div className="files-content-image-wrap">
+      <img
+        className="files-content-image"
+        src={projectFileRawUrl(projectId, path)}
+        alt={basename(path)}
+        onError={() => setFailed(true)}
+      />
     </div>
   )
 }

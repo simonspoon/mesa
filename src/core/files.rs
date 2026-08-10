@@ -64,12 +64,36 @@ fn language_of(ext: &str) -> Option<&'static str> {
         "toml" => "toml",
         "sh" | "bash" => "shell",
         "html" => "html",
+        "svg" => "svg",
         "css" => "css",
         "go" => "go",
         "rb" => "ruby",
         "c" | "h" => "c",
         "cpp" | "hpp" | "cc" => "cpp",
         "cs" => "csharp",
+        _ => return None,
+    })
+}
+
+/// Extension allowlist for the inline image route
+/// (`GET /api/projects/{id}/files/raw`). An extension NOT on this list yields
+/// `None`, which the route turns into a 422 — so the allowlist, not any
+/// content sniffing, is what decides whether a file may come back with a
+/// non-`octet-stream` type at all. Hand-rolled (no new crate), mirroring
+/// `attachments::guess_content_type`; deliberately narrower than that one —
+/// images only, never `text/html` and never a generic fallback. Only the
+/// lowercased extension is consulted, so `foo.png.html` is `.html` and is
+/// rejected.
+pub fn image_mime(path: &str) -> Option<&'static str> {
+    let ext = extension_of(Path::new(path))?;
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "svg" => "image/svg+xml",
         _ => return None,
     })
 }
@@ -985,6 +1009,55 @@ mod tests {
         fs::write(dir.path().join("notes.xyz"), "plain text").unwrap();
         let v = read_file(root, "notes.xyz").unwrap();
         assert_eq!(v.language, None);
+    }
+
+    // --- image_mime (mesa task 801) ------------------------------------------
+
+    #[test]
+    fn image_mime_accepts_every_allowlisted_extension_case_insensitively() {
+        for (name, mime) in [
+            ("a.png", "image/png"),
+            ("A.PNG", "image/png"),
+            ("a.jpg", "image/jpeg"),
+            ("x.JPEG", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.gif", "image/gif"),
+            ("a.GIF", "image/gif"),
+            ("a.webp", "image/webp"),
+            ("a.WebP", "image/webp"),
+            ("a.bmp", "image/bmp"),
+            ("a.ico", "image/x-icon"),
+            ("a.svg", "image/svg+xml"),
+            ("a.SVG", "image/svg+xml"),
+            ("deep/nested/dir/photo.PnG", "image/png"),
+        ] {
+            assert_eq!(image_mime(name), Some(mime), "{name}");
+        }
+    }
+
+    #[test]
+    fn image_mime_rejects_markup_source_and_extensionless_names() {
+        // `.html`/`.htm` above all: the route must never be able to return
+        // same-origin markup. A double extension is judged by its LAST one.
+        for name in [
+            "a.html",
+            "a.htm",
+            "a.md",
+            "a.rs",
+            "a.json",
+            "noext",
+            "foo.png.html",
+            ".gitignore",
+            "a.pdf",
+            "a.txt",
+        ] {
+            assert_eq!(image_mime(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn language_of_tags_svg() {
+        assert_eq!(language_of("svg"), Some("svg"));
     }
 
     // --- read_file_download -------------------------------------------------

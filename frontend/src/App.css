@@ -3937,6 +3937,41 @@ body.files-tree-resizing {
   padding: 0;
 }
 
+/* An image file shown as itself (task 801). The wrapper scrolls rather than
+   stretching the pane, the twin of how .files-content-text lets long lines
+   scroll; the image is capped to the pane width and keeps its aspect ratio.
+
+   The checkerboard is not decoration: this theme is a single very dark one, so
+   a transparent PNG whose art is dark reads as an empty pane and one whose art
+   is light reads as if it had an opaque background. Two neutral greys —
+   deliberately NOT the --panel/--bg tokens, which are near-black — put every
+   transparent pixel against both a lighter and a darker square, so the alpha
+   channel is visible whichever way the art is drawn, and stay legible if a
+   lighter theme is ever added. */
+.files-content-image-wrap {
+  overflow: auto;
+  padding: 0.5rem 0;
+}
+
+.files-content-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  background-color: #8a8a8a;
+  background-image:
+    linear-gradient(45deg, #5c5c5c 25%, transparent 25%),
+    linear-gradient(-45deg, #5c5c5c 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #5c5c5c 75%),
+    linear-gradient(-45deg, transparent 75%, #5c5c5c 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+}
+
 /* Rendered markdown prose (task 281) — same react-markdown output as
    .frame-body, but normal prose measure/spacing instead of the card's tight
    layout; code spans/blocks stay monospace. Shared by the Files content pane
@@ -3975,6 +4010,19 @@ body.files-tree-resizing {
 }
 .markdown-body :where(a) {
   color: var(--cyan);
+}
+/* An inline markdown image never widens its surface — every markdown host here
+   (Files pane, task modal, storyboard card) is a fixed-width column. */
+.markdown-body :where(img) {
+  max-width: 100%;
+  height: auto;
+}
+/* The stand-in for an image that must not be loaded (a remote or escaping src,
+   see Markdown.tsx's `resolveImageSrc`): the alt text, marked as inert rather
+   than passed off as prose. Never a broken-image icon. */
+.markdown-img-missing {
+  color: var(--muted);
+  font-style: italic;
 }
 /* GFM tables (task 432). Browser defaults render them borderless and cramped,
    which reads as broken next to the rest of the prose. Wide tables scroll

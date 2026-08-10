@@ -451,6 +451,19 @@ export function projectFileDownloadUrl(id: number, path: string): string {
 }
 
 /**
+ * Inline-image URL for one file of the project's tree (mesa task 801) — used
+ * directly as an `<img src>`, never fetched as JSON, so no further encoding is
+ * needed beyond the query escape here. The route serves only the allowlisted
+ * image types (`isImagePath` in `fileImage.ts` mirrors that allowlist), with
+ * `Content-Disposition: inline`, `nosniff` and a strict CSP; anything else it
+ * refuses. Distinct from `projectFileDownloadUrl`, which is a save-to-disk
+ * attachment fetched through `fetch` so its errors render in the pane.
+ */
+export function projectFileRawUrl(id: number, path: string): string {
+  return `/api/projects/${id}/files/raw?path=${encodeURIComponent(path)}`
+}
+
+/**
  * Saves a file's full content, overwriting it on disk. Path and content ride
  * the JSON body (matches the request wrapper's Content-Type header, keeping
  * this mutating call inside the API's CSRF gate). A binary/truncated target,

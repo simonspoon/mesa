@@ -889,6 +889,12 @@ fn router(state: AppState) -> Router {
             "/api/projects/{id}/files/download",
             get(download_project_file),
         )
+        // The same file again, inline and typed, for previewing an image in
+        // the Files tab (task 801). A THIRD route rather than a flag on
+        // either sibling: the download route's fixed octet-stream +
+        // `attachment` is a boundary that must not be relaxed. Still a plain
+        // read — standard guard only, like both siblings' GETs.
+        .route("/api/projects/{id}/files/raw", get(raw_project_file))
         // New-project folder picker: unscoped (not one project's local_path)
         // server-side directory listing, plus creating one folder to pick.
         // Loopback-only in BOTH serve modes, reusing `require_local_path_write`
@@ -1576,6 +1582,15 @@ async fn download_attachment(
 /// extended parameter, which RFC 6266-aware clients (and browsers) prefer
 /// over the plain `filename` when both are present.
 fn content_disposition(filename: &str) -> String {
+    disposition("attachment", filename)
+}
+
+/// The body of [`content_disposition`], parameterized by disposition kind so
+/// the inline image route (`raw_project_file`) reuses the exact same quoting
+/// and RFC 5987 escaping rather than growing a second, subtly different
+/// header builder. `kind` is a fixed literal at every call site — never
+/// request-derived.
+fn disposition(kind: &str, filename: &str) -> String {
     let ascii_fallback: String = filename
         .chars()
         .map(|c| if c.is_ascii() { c } else { '_' })
@@ -1583,7 +1598,7 @@ fn content_disposition(filename: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
     let encoded = percent_encode_rfc5987(filename);
-    format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
+    format!("{kind}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 /// Percent-encodes `s` per RFC 5987's `attr-char` set (used by the `filename*`
@@ -2744,6 +2759,100 @@ async fn download_project_file(
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (header::CONTENT_DISPOSITION, content_disposition(&filename)),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Files tab inline image bytes (task 801) — the same `?path=` contract as
+/// [`download_project_file`] above (missing `path` 422 `validation`, anything
+/// `safe_path` rejects 404 `not_found` with the identical message, over-cap
+/// 422), differing only in how the bytes are labelled: the file's real image
+/// type and `inline` rather than a fixed `application/octet-stream` +
+/// `attachment`.
+///
+/// It is a SEPARATE route precisely so that difference stays contained.
+/// `/files/download` deliberately serves every file as an opaque attachment
+/// and must never be relaxed to sniff or derive a type — a repo's own `.html`
+/// would then be servable as same-origin markup. Here the boundary is
+/// [`files::image_mime`]'s extension allowlist, checked BEFORE a single byte
+/// is read: nothing but an image can come back, and no route may ever return
+/// `text/html`. It is checked AFTER `safe_path`, so a path that escapes the
+/// root is 404 like everywhere else rather than a 422 that would tell a
+/// caller its extension was the only thing wrong with it.
+///
+/// The residual risk is SVG: an SVG served same-origin can carry script. The
+/// mitigation is threefold — a `sandbox` + `default-src 'none'` CSP on the
+/// response, `X-Content-Type-Options: nosniff` so a mislabelled body is not
+/// re-guessed into markup, and the fact that the frontend only ever loads
+/// this URL as the `src` of an `<img>`, which does not execute script in an
+/// SVG document at all. Navigating to the URL directly is what the CSP is for.
+///
+/// Gate: the standard `guard` only, like both sibling reads. It reads a file
+/// the tree route already lists and writes nothing.
+async fn raw_project_file(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FilesContentQuery>,
+) -> ApiResult<Response> {
+    let wanted = q.path.ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {wanted}"),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    // `safe_path` first, THEN the allowlist. A path that escapes the root is
+    // 404 — the same answer the sibling reads give, so this route never
+    // becomes an oracle that distinguishes "outside the repo" from "inside
+    // but not an image". It is a resolve, not a read: the allowlist still
+    // rejects a non-image before a single byte is loaded.
+    if files::safe_path(&root, &wanted).is_none() {
+        return Err(not_found());
+    }
+    let mime = files::image_mime(&wanted).ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: format!("not a previewable image: {wanted}"),
+    })?;
+    let rel = wanted.clone();
+    // Reading a whole file isn't free; keep it off the async workers, same
+    // rationale as the download route's own read.
+    let read = tokio::task::spawn_blocking(move || files::read_file_download(&root, &rel))
+        .await
+        .unwrap_or(Err(files::DownloadFileError::NotFound));
+    let (filename, bytes) = match read {
+        Ok(v) => v,
+        Err(files::DownloadFileError::NotFound) => return Err(not_found()),
+        Err(files::DownloadFileError::TooLarge) => {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: "file is larger than mesa can download".into(),
+            });
+        }
+    };
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                disposition("inline", &filename),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox".to_string(),
+            ),
         ],
         bytes,
     )
@@ -4663,6 +4772,157 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Files tab: GET /files/raw (mesa task 801) -------------------------
+
+    fn header_str(resp: &Response, name: header::HeaderName) -> String {
+        resp.headers()
+            .get(name)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn files_raw_serves_an_image_inline_with_its_type_and_hardening_headers() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let raw: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x0a];
+        std::fs::write(root.join("src/img.png"), &raw).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = raw_project_file(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("src/img.png".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_str(&resp, header::CONTENT_TYPE), "image/png");
+        let disp = header_str(&resp, header::CONTENT_DISPOSITION);
+        assert!(disp.starts_with("inline; "), "{disp}");
+        assert!(disp.contains("filename=\"img.png\""), "{disp}");
+        assert!(disp.contains("filename*=UTF-8''img.png"), "{disp}");
+        assert_eq!(header_str(&resp, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        assert_eq!(
+            header_str(&resp, header::CONTENT_SECURITY_POLICY),
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        );
+        assert_eq!(body_bytes(resp).await, raw);
+    }
+
+    #[tokio::test]
+    async fn files_raw_refuses_anything_off_the_image_allowlist() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // Both exist and are readable — only the extension decides.
+        std::fs::write(root.join("page.html"), "<script>alert(1)</script>").unwrap();
+        std::fs::write(root.join("LICENSE"), "text").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for bad in ["page.html", "LICENSE"] {
+            let err = raw_project_file(
+                State(state.clone()),
+                Path(id),
+                Query(FilesContentQuery {
+                    path: Some(bad.to_string()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "path {bad:?}");
+            assert_eq!(err.code, "validation", "path {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn files_raw_traversal_is_not_found() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.path().join("secret.png"), "top secret").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        // Both an image-extensioned escape and a plain one: `safe_path` runs
+        // before the allowlist, so neither leaks a 422 "wrong extension".
+        for bad in [
+            "../../etc/passwd.png",
+            "/etc/passwd.png",
+            "../secret.png",
+            "../../etc/passwd",
+            "/etc/passwd",
+        ] {
+            let err = raw_project_file(
+                State(state.clone()),
+                Path(id),
+                Query(FilesContentQuery {
+                    path: Some(bad.to_string()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::NOT_FOUND, "path {bad:?}");
+            assert_eq!(err.code, "not_found", "path {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn files_raw_missing_query_is_validation_error() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let err = raw_project_file(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery { path: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "validation");
+    }
+
+    /// The new route must not have relaxed the old one: `/files/download`
+    /// still hands back every file as an opaque attachment, image or not.
+    #[tokio::test]
+    async fn files_download_still_serves_an_image_as_an_octet_stream_attachment() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("img.png"), [0x89u8, 0x50]).unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = download_project_file(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("img.png".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            header_str(&resp, header::CONTENT_TYPE),
+            "application/octet-stream"
+        );
+        assert!(
+            header_str(&resp, header::CONTENT_DISPOSITION).starts_with("attachment; "),
+            "download must stay an attachment"
+        );
     }
 
     // --- Files tab: PATCH /files/content (mesa task 327) -------------------

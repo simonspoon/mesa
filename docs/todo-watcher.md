@@ -25,8 +25,9 @@ because someone ran `mesa serve`.
   fails (malformed file), the tick `eprintln!`s and returns without
   dispatching anything, rather than guessing a limit. For every
   project with a `local_path` that still exists as a directory, the tick
-  counts that project's `in_progress` **leaf** tasks (see the umbrella rule
-  below) and, if the count is under the limit, dispatches
+  counts that project's occupied slots — `max(in_progress leaves,
+  live-work sessions)`, see below — and, if the count is under the limit,
+  dispatches
   actionable tasks to fill the gap — up to `limit - count` in that one tick,
   not just one. Each dispatch calls `Store::next_task` for that project and, on an
   actionable task, immediately flips that task to `in_progress` itself —
@@ -111,12 +112,35 @@ because someone ran `mesa serve`.
   task is reverted back to `todo` so the project isn't wedged — an
   unrecoverable spawn must not silently stop that project from ever being
   picked up again.
-- The "in process" signal is task status, not a live-session check (no
-  `claude agents` call here) — cheaper, and consistent with how a human
-  would read the board. The accepted tradeoff: if a dispatched agent crashes
-  before finishing, its task stays `in_progress` and that project goes quiet
-  until someone intervenes; the watcher does not detect or recover from a
-  dead agent.
+- **A project's occupied slots are `max(in_progress leaves, live-work
+  sessions)`** (mesa task 802). The second signal is the number of `claude`
+  sessions whose `cwd` is under this project's `local_path` (the same
+  `agents::is_under` the agents endpoints use) that hold a live shell child or
+  a live subagent — `pid.is_some() && liveShells + liveSubagents > 0`,
+  `docs/agents.md`. Upstream buckets a session `done` as soon as its turn ends,
+  while the Bash call that turn started is still running; mesa believed it, and
+  filled the slot with a second agent in the same checkout. The session list is
+  fetched **before** the store lock is taken — it is a `claude` shell-out, and
+  holding the lock across it would freeze every other request.
+  - **`max`, not a sum.** A session working a genuinely `in_progress` leaf is
+    both signals at once, so adding them would count it twice and halve the
+    effective limit.
+  - The signal is deliberately **one-directional**: live work can only
+    *withhold* dispatch, never authorize it. So a failing `claude agents`
+    **fails open** — it `eprintln!`s and counts as *zero* live sessions rather
+    than skipping the tick, because a broken liveness probe must not park the
+    watcher, and the task-status half still stands on its own.
+- Residual risks, both inherent to the two signals above:
+  - Task status is a **status**, not a liveness check: if a dispatched agent
+    crashes before finishing, its task stays `in_progress` and that project
+    goes quiet until someone edits the row.
+  - A genuinely long-running background shell (a `sleep`, a watch loop, a
+    server an agent left running under its session) parks that project's slot
+    until the process exits. That is intended — there really is work in
+    flight, and the alternative is a second agent in the same checkout — and
+    unlike a stuck `in_progress` row it is **self-clearing**: the slot frees
+    itself the moment the process dies, with no db edit. Killing the agent (or
+    just its shell) is the escape hatch.
 - **`refine` is invisible here too, and that is the whole point of the
   column.** Both picks filter `status = 'todo'`, so a task parked in `refine`
   (`docs/refine-watcher.md`) is no more actionable than a `backlog` one. The
@@ -141,7 +165,9 @@ because someone ran `mesa serve`.
   at-the-limit skip, path-less/stale-path skip, spawn-failure revert,
   archived-project skip + unarchive-resumes-dispatch, umbrella
   subtask-dispatch lifecycle, a configured `todo-concurrency` filling to the
-  limit in one tick and picking up the next task once one finishes) against a
-  stub `claude`
+  limit in one tick and picking up the next task once one finishes, a real
+  process holding a real shell child parking the slot until it is killed, and
+  the fail-open path where an erroring `agents` probe still dispatches)
+  against a stub `claude`
   binary — no CLI surface of its own beyond the `serve` flag, matching the
   agents surface's "no `mesa agent` CLI" precedent.

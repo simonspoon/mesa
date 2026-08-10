@@ -168,6 +168,41 @@ already use.
   Because it is upstream behavior, the residue is worth re-checking against
   future `claude` releases: if `state` becomes trustworthy, this override
   becomes dead code rather than wrong code.
+- **Two mesa-derived counts override `state` in the other direction**
+  (mesa task 802): `liveShells` and `liveSubagents` on every `AgentSession`.
+  Upstream buckets a session `done` the moment its turn ends, while the work
+  that turn started is still running — mesa computes the liveness upstream
+  doesn't report, so a session with either count nonzero is bucketed **ACTIVE**
+  whatever its `state` says (`blocked` still wins: a session waiting on a
+  permission prompt is waiting, not working).
+  - `liveShells` counts the session pid's **direct** children whose `comm`
+    basename is in `{zsh, bash, sh, dash}`, from **one** `ps -A -o
+    pid=,ppid=,comm=` per list refresh — not one `ps` per session. Claude Code
+    spawns one `/bin/zsh -c 'source …/shell-snapshots/… && eval …'` child per
+    Bash tool call (it is *not* a persistent shell), so a live shell child *is*
+    a Bash call in flight right now. The allowlist is why it is not an
+    "any child" rule: every working session also carries a `caffeinate` child,
+    which is not work — counting it would mark every session busy forever.
+  - `liveSubagents` counts `<projects_dir>/*/<sessionId>/subagents/*.jsonl`
+    whose mtime is within `cc::ACTIVE_SECS` (90s, shared with the CC
+    dashboard's own liveness window). Subagents run **in-process** — there is
+    no child to count — so a freshly written transcript is the only signal
+    available. The project slug is unknown at this point, so every slug
+    directory is checked for the session id, the same glob shape `cc.rs` uses.
+  - Both probes **fail open to `0`**: no `ps` (or a platform without one), no
+    projects dir, an unreadable folder or an unparseable row all yield `0`,
+    never an `Err`. This is a best-effort liveness probe hanging off the agents
+    endpoints and the todo watcher (`docs/todo-watcher.md`), and it must never
+    turn either into a failure. Enrichment happens in `list_sessions`, so the
+    per-project route, the global route and the `agents_cache` TTL all see the
+    same numbers for the same one `ps`.
+  - Neither field comes from the CLI payload, so both are `#[serde(default)]`
+    (parsing `claude agents --json` must not require them) and both cross the
+    wire camelCase. Regressions: the pure counters have Rust unit tests in
+    `src/core/agents.rs` (a synthetic `ps` table, mtime windows, fail-open);
+    `scripts/agents-check.sh` only pins that both fields are on the wire and
+    `0` for the stub's nonexistent pids — faking a process tree from bash
+    would test the fake.
 - The stale-`working` test is `isStaleWorking` in `frontend/src/agentProject.ts`,
   **not** a local helper in `AgentSidebar.tsx`, because two surfaces ask the
   same question and must not drift: the sidebar's `bucketOf` above, and

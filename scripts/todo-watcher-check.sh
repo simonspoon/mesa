@@ -12,7 +12,7 @@ cargo build --quiet
 MESA=target/debug/mesa
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"; [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
+trap 'rm -rf "$TMP"; for p in "${SERVER_PID:-}" "${HOLDER_CHILD:-}" "${HOLDER:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; true' EXIT
 export MESA_DB="$TMP/mesa.db"
 # Pin the user config away from the real ~/.mesa/config.json: this gate
 # asserts the BUILT-IN spawn command, so a configured one must not leak in.
@@ -510,6 +510,163 @@ LINE=$(sed -n '3p' "$CONC_LOG")
   fail "finishing task one must free a slot under the limit for task three"
 ok "finishing one in-progress leaf frees a slot and the next tick dispatches the task that was waiting"
 
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
+# ---- live shell children park the project's slot (mesa task 802). A session
+# `claude agents` reports as `done` while it still holds a running Bash call is
+# not done: busy is max(in_progress leaves, live-work sessions), so that
+# session occupies the slot until its shell child exits. Isolated db/port/log/
+# stub, same reason as the blocks above. MESA_CONFIG_FILE stays pinned at the
+# top-of-file nonexistent path, so the limit is the built-in 1; MESA_CC_
+# PROJECTS_DIR is pinned at an empty dir so the *subagent* half of the signal
+# is deterministically 0 here and the shell half is what's under test. ----
+
+command -v zsh >/dev/null || { echo "zsh is required" >&2; exit 1; }
+
+LIVE_DB="$TMP/live.db"
+LIVE_LOG="$TMP/live-bg.log"
+touch "$LIVE_LOG"
+LIVE_PID_FILE="$TMP/live-session.pid"
+LIVE_CHILD_FILE="$TMP/live-holder-child.pid"
+LIVE_CC_DIR="$TMP/live-cc-projects"
+mkdir -p "$LIVE_CC_DIR"
+
+# A real parent process with a real shell child — the exact shape Claude Code
+# has while a Bash tool call is in flight. `; true` stops zsh from exec'ing
+# `sleep` in its own place (zsh replaces itself with the last command of a -c
+# script), which would leave the parent with a `sleep` child the shell
+# allowlist correctly ignores.
+cat > "$TMP/holder.sh" <<'EOF'
+#!/usr/bin/env bash
+zsh -c 'sleep 300; true' &
+echo $! > "$1"
+wait
+EOF
+
+start_holder() { # start_holder -> a live (parent, zsh child) pair; parent pid -> LIVE_PID_FILE
+  : > "$LIVE_CHILD_FILE"
+  bash "$TMP/holder.sh" "$LIVE_CHILD_FILE" &
+  HOLDER=$!
+  for _ in $(seq 1 50); do [ -s "$LIVE_CHILD_FILE" ] && break; sleep 0.1; done
+  HOLDER_CHILD=$(cat "$LIVE_CHILD_FILE")
+  [ -n "$HOLDER_CHILD" ] || fail "holder did not report its shell child"
+  # The pid handed to the stub must be the one that actually parents the
+  # shell: $! is the bash wrapper, and only its child may be a zsh.
+  [ "$(ps -o ppid= -p "$HOLDER_CHILD" | tr -d ' ')" = "$HOLDER" ] ||
+    fail "holder pid $HOLDER does not parent the shell child $HOLDER_CHILD"
+  case "$(ps -o comm= -p "$HOLDER_CHILD")" in
+    *zsh) ;;
+    *) fail "holder child must still be a zsh, got '$(ps -o comm= -p "$HOLDER_CHILD")'" ;;
+  esac
+  echo "$HOLDER" > "$LIVE_PID_FILE"
+}
+stop_holder() { # kills the whole pair, so the reported pid has no shell child left
+  kill "$HOLDER_CHILD" 2>/dev/null || true
+  kill "$HOLDER" 2>/dev/null || true
+  wait "$HOLDER" 2>/dev/null || true
+  HOLDER=""; HOLDER_CHILD=""
+}
+
+mkdir -p "$TMP/liveDir"
+LIVE_DIR=$(cd "$TMP/liveDir" && pwd -P)
+
+# Unlike every stub above, this one answers `agents --json`: one background
+# session whose pid is the live holder and whose cwd is the project folder.
+# `state: done` / `status: idle` is the whole point — mesa must disbelieve it
+# while the process still holds a shell child. `--bg` logs like the others.
+write_live_stub() { # write_live_stub <path> <agents-exit-code>
+  cat > "$1" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "--bg" ]; then
+  shift
+  if [ "\$1" = "--agent" ]; then shift; shift; fi
+  NAME=""
+  if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
+  PROMPT=""
+  if [ "\$1" = "--" ]; then shift; PROMPT="\$1"; fi
+  echo "\$(pwd)|\$NAME|\$PROMPT" >> "$LIVE_LOG"
+  echo "backgrounded · deadbeef (idle — send a prompt to start)"
+  exit 0
+fi
+if [ "\$1" = "agents" ]; then
+  [ "$2" -ne 0 ] && { echo "stub claude agents is down" >&2; exit $2; }
+  printf '[{"pid":%s,"id":"live0001","cwd":"$LIVE_DIR","kind":"background","startedAt":1783000000000,"sessionId":"live0001-0000-0000-0000-000000000000","name":"holder","status":"idle","state":"done"}]\n' "\$(cat "$LIVE_PID_FILE")"
+  exit 0
+fi
+exit 2
+EOF
+  chmod +x "$1"
+}
+LIVE_STUB="$STUB_DIR/claude-live"
+LIVE_FAIL_STUB="$STUB_DIR/claude-live-agentsfail"
+write_live_stub "$LIVE_STUB" 0
+write_live_stub "$LIVE_FAIL_STUB" 1
+
+export MESA_DB="$LIVE_DB"
+run 0 "$MESA" project create "Live" --no-git
+LIVE_P=$(jqs .id)
+run 0 "$MESA" project update "$LIVE_P" --path "$LIVE_DIR"
+run 0 "$MESA" task create "$LIVE_P" "task live"
+LIVE_T1=$(jqs .id)
+
+start_holder
+
+LIVE_PORT=17787
+MESA_CLAUDE_BIN="$LIVE_STUB" MESA_WATCH_TODO_TICK_MS=150 MESA_CC_PROJECTS_DIR="$LIVE_CC_DIR" \
+  "$MESA" serve --port "$LIVE_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$LIVE_PORT"
+
+live_task_status() { curl -sf "http://127.0.0.1:$LIVE_PORT/api/tasks/$1" | jq -r .status; }
+wait_live_bg_lines() { # wait_live_bg_lines <n>
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$LIVE_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n live-check bg dispatch(es); log:\n$(cat "$LIVE_LOG")"
+}
+
+sleep 1.5
+[ "$(wc -l < "$LIVE_LOG")" -eq 0 ] ||
+  fail "a session holding a live shell child must park the slot, got $(wc -l < "$LIVE_LOG") dispatch(es)"
+[ "$(live_task_status "$LIVE_T1")" = "todo" ] || fail "parked project's task must stay todo"
+ok "a 'done' session that still holds a live shell child occupies its project's slot: no dispatch, task stays todo"
+
+stop_holder
+wait_live_bg_lines 1
+LINE=$(head -1 "$LIVE_LOG")
+[ "$LINE" = "$LIVE_DIR|Live: task live|/execute-mesa-task $LIVE_T1" ] ||
+  fail "expected '$LIVE_DIR|Live: task live|/execute-mesa-task $LIVE_T1', got '$LINE'"
+[ "$(live_task_status "$LIVE_T1")" = "in_progress" ] ||
+  fail "the freed slot must be dispatched into and the task claimed"
+ok "the shell child exiting frees the slot and the next tick dispatches normally"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
+# The probe FAILS OPEN: a `claude agents` that errors counts as zero live
+# sessions, never a skipped tick. Same live holder as above -- the only
+# difference is the stub's `agents` branch exiting nonzero -- so a watcher that
+# treated the failure as "unknown, hold off" would dispatch nothing here.
+run 0 "$MESA" task update "$LIVE_T1" --status done
+run 0 "$MESA" task create "$LIVE_P" "task live two"
+LIVE_T2=$(jqs .id)
+start_holder
+
+MESA_CLAUDE_BIN="$LIVE_FAIL_STUB" MESA_WATCH_TODO_TICK_MS=150 MESA_CC_PROJECTS_DIR="$LIVE_CC_DIR" \
+  "$MESA" serve --port "$LIVE_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$LIVE_PORT"
+
+wait_live_bg_lines 2
+LINE=$(sed -n '2p' "$LIVE_LOG")
+[ "$LINE" = "$LIVE_DIR|Live: task live two|/execute-mesa-task $LIVE_T2" ] ||
+  fail "expected '$LIVE_DIR|Live: task live two|/execute-mesa-task $LIVE_T2', got '$LINE'"
+[ "$(live_task_status "$LIVE_T2")" = "in_progress" ] ||
+  fail "a failing agents probe must not stop the claim"
+ok "a failing 'claude agents' counts as zero live sessions and dispatch still happens (fails open)"
+
+stop_holder
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
 echo "ALL OK ($CHECKS checks)"

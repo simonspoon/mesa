@@ -166,17 +166,24 @@ fn read_proc_table() -> Vec<ProcRow> {
 }
 
 /// Pure half of [`read_proc_table`]: `pid ppid comm` per line, unparseable
-/// lines skipped. `comm` may itself contain spaces, so it is the *rest* of the
-/// line rather than a third whitespace token.
+/// lines skipped.
+///
+/// Split on **runs** of whitespace, not single characters: `ps` right-aligns
+/// the numeric columns (`"  501     1 /sbin/launchd"`), so a per-character
+/// split reads the gap as an empty second field and silently drops every
+/// padded row — which is most of them, and would leave the probe reporting
+/// zero shells on a real machine while a single-spaced test fixture passed.
 fn parse_proc_table(stdout: &str) -> Vec<ProcRow> {
     stdout
         .lines()
         .filter_map(|line| {
-            let mut parts = line.trim_start().splitn(3, char::is_whitespace);
+            let mut parts = line.split_whitespace();
             let pid = parts.next()?.parse().ok()?;
-            let ppid = parts.next()?.trim_start().parse().ok()?;
-            let comm = parts.next()?.trim();
-            (!comm.is_empty()).then(|| (pid, ppid, comm.to_string()))
+            let ppid = parts.next()?.parse().ok()?;
+            // `comm` is whatever is left, so a path with a space in it stays
+            // one command rather than becoming a truncated prefix.
+            let comm = parts.collect::<Vec<_>>().join(" ");
+            (!comm.is_empty()).then_some((pid, ppid, comm))
         })
         .collect()
 }
@@ -941,6 +948,12 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // A session with no children at all, and a pid nothing reports.
         assert_eq!(count_shell_children(86610, &table), 0);
         assert_eq!(count_shell_children(4242, &table), 0);
+        // Every row survived the padded numeric columns `ps` actually emits —
+        // a per-character split drops the padded ones and reports 0 shells on
+        // a real machine while a single-spaced fixture passes (caught by
+        // todo-watcher-check.sh, not by this test's shell rows).
+        assert_eq!(table.len(), 7);
+        assert_eq!(count_shell_children(1, &table), 1); // the top-level bash
     }
 
     #[test]

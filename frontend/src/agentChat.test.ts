@@ -4,6 +4,7 @@ import {
   chatGroups,
   chatToolLabel,
   chatToolSummary,
+  chatToolTarget,
   isNearBottom,
 } from './agentChat'
 import type { CcChatTurn } from './types/CcChatTurn'
@@ -61,6 +62,31 @@ describe('chatToolLabel', () => {
 
   it('falls back to a generic name rather than rendering null', () => {
     expect(chatToolLabel(turn({ id: 't', kind: 'tool', text: 'x' }))).toBe('tool · x')
+  })
+})
+
+describe('chatToolTarget', () => {
+  it('elides a bare path from the FRONT, so the basename survives', () => {
+    // CSS truncates from the end, which would cut the only part of these two
+    // rows that differs.
+    expect(chatToolTarget('/Users/me/inaros/projects/tools/mesa/src/core/cc.rs')).toBe(
+      '…/src/core/cc.rs',
+    )
+    expect(chatToolTarget('~/inaros/projects/tools/mesa/frontend/src/App.css')).toBe(
+      '…/frontend/src/App.css',
+    )
+  })
+
+  it('leaves a short path alone', () => {
+    expect(chatToolTarget('/etc/hosts')).toBe('/etc/hosts')
+    expect(chatToolTarget('/a/b/c')).toBe('/a/b/c')
+  })
+
+  it('leaves a command alone even when it contains a path', () => {
+    // End-truncation is correct here: `cargo test …` is the useful prefix.
+    expect(chatToolTarget('cargo test --all -- /Users/me/x')).toBe('cargo test --all -- /Users/me/x')
+    expect(chatToolTarget('grep -rn foo /Users/me/src')).toBe('grep -rn foo /Users/me/src')
+    expect(chatToolTarget('')).toBe('')
   })
 })
 

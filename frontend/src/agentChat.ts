@@ -57,6 +57,28 @@ export function chatToolLabel(turn: CcChatTurn): string {
 }
 
 /**
+ * How a tool call's target is shown in a row.
+ *
+ * A row's width is a few hundred pixels and CSS truncates from the *end* —
+ * which is right for a command (you want to know it was `cargo test …`) and
+ * exactly wrong for a path, whose leading directories are the part every row
+ * shares and whose basename is the only part that distinguishes it. So a
+ * target that is a single absolute path is elided from the front instead,
+ * keeping its last three segments; everything else is returned verbatim for
+ * CSS to truncate normally. The full value is always in the row's `title`.
+ *
+ * "A single path" is deliberately narrow — no whitespace, leading `/` or `~/`
+ * — so a shell command that merely *contains* a path is untouched.
+ */
+export function chatToolTarget(text: string): string {
+  const isPath = /^(\/|~\/)/.test(text) && !/\s/.test(text)
+  if (!isPath) return text
+  const parts = text.split('/').filter((p) => p !== '')
+  if (parts.length <= 3) return text
+  return `…/${parts.slice(-3).join('/')}`
+}
+
+/**
  * A collapsed tool run's summary: each distinct tool name in first-use order,
  * with a `×n` only when it repeats — `Bash ×3 · Read · Edit ×2`. Capped at
  * four names plus a `+n` tail so one run can never outgrow its own header.

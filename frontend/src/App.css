@@ -2542,6 +2542,10 @@ main {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  /* The title and the actions must not abut: `space-between` alone lets a
+     long session name run right up against the first button's border once
+     the title fills its track (task 814). */
+  gap: 0.6rem;
   padding: 0.3rem 0.6rem;
   border-bottom: 1px solid var(--border);
   font-family: var(--font-mono);
@@ -3025,6 +3029,19 @@ body.files-tree-resizing {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  /* Shrinkable, but never to nothing: with two panes open the session name is
+     the only thing telling them apart, so it keeps a floor rather than being
+     squeezed out by the actions beside it (task 814). */
+  min-width: 4rem;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* `text-overflow` does NOT apply to a flex container, and `.agent-sidebar-pane-title`
+   is one — so the ellipsis has to live on the label itself, which is an
+   ordinary inline box. Without this the name is hard-clipped mid-word and
+   reads as a rendering fault rather than a truncation. */
+.agent-sidebar-pane-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3060,7 +3077,10 @@ body.files-tree-resizing {
 .agent-pane-view-toggle button {
   background: rgba(6, 10, 16, 0.85);
   font-size: 0.7rem;
-  padding: 0.05rem 0.4rem;
+  /* 24px tall minimum (WCAG 2.2 SC 2.5.8). This is the control the feature's
+     own phone argument depends on, so it may not be a 17px sliver. */
+  padding: 0.2rem 0.5rem;
+  min-height: 24px;
   color: var(--muted);
 }
 
@@ -3175,9 +3195,19 @@ body.files-tree-resizing {
   align-items: baseline;
   gap: 0.5rem;
   font-family: var(--font-mono);
-  font-size: 0.65rem;
-  color: var(--muted);
+  /* `--muted` on `--panel` is 4.4:1 — under AA for text this small. The meta
+     row carries who said it and when, so it takes the body colour. */
+  font-size: 0.68rem;
+  color: var(--text);
   margin-bottom: 0.25rem;
+}
+
+/* A long model id must not push the clock out of the row. */
+.agent-chat-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-chat-who {
@@ -3195,6 +3225,7 @@ body.files-tree-resizing {
 
 .agent-chat-clock {
   margin-left: auto;
+  flex: none;
 }
 
 /* Transcript prose carries bare URLs and long paths that no soft-wrap
@@ -3207,10 +3238,16 @@ body.files-tree-resizing {
 /* A run of tool calls: the agent working between two things it said. Muted
    and collapsible, because it is context for the conversation, not the
    conversation. */
+/* A tool run belongs to the reply above it, so it hugs that turn and keeps
+   its distance from the next one — a uniform gap made the whole column read
+   as one flat list. The rule is `--border-bright`: at 2px on the near-black
+   background `--border` is effectively invisible, so the block had no
+   container at all. */
 .agent-chat-tools {
   align-self: stretch;
-  border-left: 2px solid var(--border);
+  border-left: 2px solid var(--border-bright);
   padding-left: 0.5rem;
+  margin: -0.25rem 0 0.25rem 0.5rem;
 }
 
 .agent-chat-tools-head {
@@ -3220,7 +3257,9 @@ body.files-tree-resizing {
   width: 100%;
   background: none;
   border: none;
-  padding: 0.1rem 0;
+  /* 24px minimum: this is the primary interaction of the chat view. */
+  padding: 0.25rem 0;
+  min-height: 24px;
   font-family: var(--font-mono);
   font-size: 0.68rem;
   color: var(--muted);
@@ -3237,9 +3276,10 @@ body.files-tree-resizing {
   flex: none;
 }
 
+/* Which tools ran is why you would open the block; how many is trivia. The
+   emphasis goes to the summary, not the count. */
 .agent-chat-tools-count {
   flex: none;
-  color: var(--text);
 }
 
 .agent-chat-tools-summary {
@@ -3247,6 +3287,29 @@ body.files-tree-resizing {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text);
+}
+
+/* Pinned to the pane's own bottom-right rather than sitting in the column:
+   the reader has scrolled away from the tail, so a control that scrolls with
+   the content would be somewhere else entirely. */
+.agent-chat-jump {
+  position: sticky;
+  bottom: 0;
+  align-self: flex-end;
+  background: var(--panel-raised);
+  border: 1px solid var(--cyan-dim);
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  padding: 0.25rem 0.6rem;
+  min-height: 24px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.agent-chat-jump:hover {
+  border-color: var(--cyan);
 }
 
 .agent-chat-tool {

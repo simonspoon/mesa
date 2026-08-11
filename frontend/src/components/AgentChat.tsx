@@ -7,6 +7,7 @@ import {
   chatGroups,
   chatToolLabel,
   chatToolSummary,
+  chatToolTarget,
   isNearBottom,
 } from '../agentChat'
 import type { CcChatTurn } from '../types/CcChatTurn'
@@ -46,6 +47,14 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
   // lands at the newest turn; goes false the moment they scroll up to read
   // something older, so the next poll never yanks them back down.
   const followRef = useRef(true)
+  // Mirrors `followRef` for rendering only — the jump-to-latest button exists
+  // *because* the follow releases when you scroll up, and without it there is
+  // no way back to the tail but scrolling by hand. Two holders rather than one
+  // piece of state so the scroll effect below keeps reading a ref and doesn't
+  // re-run every time the reader crosses the threshold.
+  const [adrift, setAdrift] = useState(false)
+  // Explicit per-run open/closed choices. An absent entry takes the default
+  // below, so the reader's own click always wins over it.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
 
   // Layout effect, not an effect: scroll after the DOM has the new turns but
@@ -75,7 +84,9 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
       ref={scrollRef}
       onScroll={(e) => {
         const el = e.currentTarget
-        followRef.current = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
+        const near = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
+        followRef.current = near
+        setAdrift(!near)
       }}
     >
       {data.truncated && (
@@ -91,30 +102,53 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
       {groups.length === 0 && (
         <p className="agent-chat-hint">This session has not said anything yet.</p>
       )}
-      {groups.map((g) =>
-        g.kind === 'tools' ? (
+      {groups.map((g, i) => {
+        if (g.kind !== 'tools') return <Bubble key={g.id} kind={g.kind} turn={g.turns[0]} />
+        // Closed by default — a session puts tens of calls between two
+        // replies, and expanded they are a wall of shell that buries the
+        // conversation this view exists to show; the summary line says what
+        // ran. The exception is the run at the very end, which on a live
+        // session is what the agent is doing *right now* and is the one thing
+        // a watcher is here for.
+        const isOpen = collapsed[g.id] === undefined ? i === groups.length - 1 : !collapsed[g.id]
+        return (
           <div key={g.id} className="agent-chat-tools">
             <button
               type="button"
               className="agent-chat-tools-head"
-              aria-expanded={!collapsed[g.id]}
-              onClick={() => setCollapsed((c) => ({ ...c, [g.id]: !c[g.id] }))}
+              aria-expanded={isOpen}
+              onClick={() => setCollapsed((c) => ({ ...c, [g.id]: isOpen }))}
             >
-              <span className="agent-chat-caret">{collapsed[g.id] ? '▸' : '▾'}</span>
-              <span className="agent-chat-tools-count">{g.turns.length} step{g.turns.length === 1 ? '' : 's'}</span>
+              <span className="agent-chat-caret">{isOpen ? '▾' : '▸'}</span>
+              <span className="agent-chat-tools-count">
+                {g.turns.length} step{g.turns.length === 1 ? '' : 's'}
+              </span>
               <span className="agent-chat-tools-summary">{chatToolSummary(g.turns)}</span>
             </button>
-            {!collapsed[g.id] &&
+            {isOpen &&
               g.turns.map((t) => (
                 <div key={t.id} className="agent-chat-tool" title={chatToolLabel(t)}>
                   <span className="agent-chat-tool-name">{t.name ?? 'tool'}</span>
-                  <span className="agent-chat-tool-target">{t.text}</span>
+                  <span className="agent-chat-tool-target">{chatToolTarget(t.text)}</span>
                 </div>
               ))}
           </div>
-        ) : (
-          <Bubble key={g.id} kind={g.kind} turn={g.turns[0]} />
-        ),
+        )
+      })}
+      {adrift && (
+        <button
+          type="button"
+          className="agent-chat-jump"
+          onClick={() => {
+            const el = scrollRef.current
+            if (!el) return
+            el.scrollTop = el.scrollHeight
+            followRef.current = true
+            setAdrift(false)
+          }}
+        >
+          ↓ latest
+        </button>
       )}
     </div>
   )

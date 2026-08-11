@@ -133,7 +133,9 @@ function PaneViewToggle({
   chatAvailable: boolean
 }) {
   return (
-    <span className="agent-pane-view-toggle">
+    // A mutually exclusive choice, so it is announced as one group rather
+    // than as two unrelated toggles.
+    <span className="agent-pane-view-toggle" role="group" aria-label="pane view">
       <button
         type="button"
         className={view === 'term' ? 'active' : undefined}
@@ -337,7 +339,12 @@ function PaneShell({
           <span className="agent-sidebar-pane-grip" {...listeners} {...attributes}>
             ⠿
           </span>
-          <span>{label}</span>
+          {/* Its own class, and its own box: `text-overflow` does not apply to
+              a flex container, so an ellipsis on the title itself never
+              renders and a long session name is hard-clipped mid-word. */}
+          <span className="agent-sidebar-pane-label" title={label}>
+            {label}
+          </span>
         </span>
         <span className="agent-sidebar-pane-actions">
           {headerExtra}
@@ -425,7 +432,11 @@ function SoloAgentPane({
   return (
     <div className="agent-sidebar-pane">
       <div className="agent-terminal-header">
-        <span className="agent-sidebar-pane-title">{label}</span>
+        <span className="agent-sidebar-pane-title">
+          <span className="agent-sidebar-pane-label" title={label}>
+            {label}
+          </span>
+        </span>
         <span className="agent-sidebar-pane-actions">
           <PaneViewToggle view={view} onChange={onViewChange} chatAvailable={sessionId !== null} />
           <button onClick={onClose}>close</button>

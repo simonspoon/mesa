@@ -339,7 +339,24 @@ already use.
   human prompts and assistant replies as markdown bubbles, with each run of
   tool calls between them collapsed into one muted, expandable block. A
   terminal is a screen buffer — it cannot be scrolled back past its scrollback,
-  searched, or read on a phone; the chat view is the same session as text.
+  selected across a reflow, or read on a phone; the chat view is the same
+  session as ordinary text, which is what makes the phone tier work at all.
+  - **Tool runs are collapsed by default**, except the run at the very end.
+    Expanded, a session's tens of calls between two replies are a wall of
+    shell that buries the conversation the view exists to show, and the
+    summary line (`6 steps · EnterWorktree · Bash ×4 · Read`) already says
+    what ran; the last run is the exception because on a live session it is
+    what the agent is doing *right now*. An explicit click always wins over
+    the default, which is why the state is `undefined`-means-default rather
+    than a boolean.
+  - **Known gaps, deliberate for now.** A tool call shows its *input* target
+    and not its **result**, so the view answers "what is it doing" and not
+    "how did that go" — the honest half of the conversation this does not
+    carry. Adding results needs its own bounding policy (a result is
+    unbounded and routinely megabytes, and the whole payload is a 3s poll),
+    which is a design decision in its own right, not a widening of this one.
+    There is likewise no in-pane **search** and no **subagent** turns (the
+    read is main-thread-only, so a fanned-out `Task` is a dead end here).
   - **Data: `GET /api/cc/sessions/{sessionId}/chat`** (`docs/cc-dashboard.md`
     → *Session chat*), polled at 3s. That route reads the transcript file
     directly — no ingest, no store lock — which is what makes it pollable and

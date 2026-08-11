@@ -97,7 +97,8 @@ The code is the source of truth. These are the invariants you must not break:
   (`agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
   `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
   `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
-  `layout`, `markdownAssets`, `navCollapse`, `navOrder`, `navWidth`,
+  `layout`, `markdownAssets`, `modalDrag`, `navCollapse`, `navOrder`,
+  `navWidth`,
   `newFile`, `openFiles`, `pricingDraft`, `projectTree`, `sessionDetail`,
   `sessionGraph`, `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`,
   `time`, `watchersDraft`, `wordWrap`) —

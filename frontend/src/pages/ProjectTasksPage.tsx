@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   getProject,
   getProjectVersion,
@@ -20,27 +20,37 @@ import { ProjectSettingsView } from './ProjectSettingsView'
 import { StoryboardListView } from './StoryboardListView'
 import { TerminalPage } from './TerminalPage'
 
-// 'a' opens the create-task form via the existing #/projects/:id/create-task
-// route (spec req 1) — a hash navigation, no new form plumbing;
-// ProjectTasksPage's own `createTask` prop handling opens the panel on
-// arrival. Board-scoped by construction — `active` is false whenever a
-// non-Board view (Storyboards/Git/Files/Terminal/Dashboard/Settings) is
-// showing, so the
-// listener is a no-op there without a route string check
-// (.scratch/arch-449-keyboard.md §3). `shouldIgnoreShortcut`
-// (keyboardScope.ts) covers modifiers, text-editing contexts, terminals, the
-// storyboard canvas and open modals.
-function useCreateTaskShortcut(active: boolean, projectId: number) {
+// 'a' opens the create-task form, on every view of a project page and not
+// just the Board (mesa task 811): a task is most often written *about* what is
+// currently on screen — a file, a diff, a storyboard frame — so the view you
+// are on is the reason to create one, never a reason to have to leave first.
+//
+// It opens the panel in place rather than navigating to
+// #/projects/:id/create-task (which renders the Board underneath, and would
+// throw away the very view the task is about). The route still exists for the
+// command palette's "Create task in <project>" entry, unchanged.
+//
+// `shouldIgnoreShortcut` (keyboardScope.ts) is what makes app-wide scope safe:
+// it already covers modifiers, text-editing contexts, xterm panes, the
+// storyboard canvas and open modals — i.e. every place on these views where
+// 'a' means the letter a. The remaining views have no key handling of their
+// own to collide with.
+//
+// `onOpen` is read through a ref so the listener is bound once, not
+// re-subscribed on every render by a caller-side closure.
+function useCreateTaskShortcut(onOpen: () => void) {
+  const latest = useRef(onOpen)
   useEffect(() => {
-    if (!active) return
+    latest.current = onOpen
+  })
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (shouldIgnoreShortcut(e)) return
-      if (e.key === 'a')
-        window.location.hash = `#/projects/${projectId}/create-task`
+      if (e.key === 'a') latest.current()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active, projectId])
+  }, [])
 }
 
 export function ProjectTasksPage({
@@ -162,11 +172,10 @@ export function ProjectTasksPage({
   // not block them; only surface it on the Board view.
   const error = projectError ?? (onBoard ? tasksError : null)
 
-  // Same board-vs-other-view condition the tabs use below (spec req 2: 'a'
-  // is inert on non-Board pages). Called unconditionally, ahead of the
-  // early error return, per the rules of hooks; `active` gates the listener
-  // itself, not this call.
-  useCreateTaskShortcut(onBoard, projectId)
+  // Called unconditionally, ahead of the early error return, per the rules of
+  // hooks. `openCreate` is a hoisted function declaration, so referencing it
+  // from here is fine.
+  useCreateTaskShortcut(openCreate)
 
   if (error) return <p className="error">{error}</p>
 
@@ -322,16 +331,17 @@ export function ProjectTasksPage({
           >
             Settings
           </button>
+          {/* Create action lives where the user is working — which is every
+              view, not just the Board (mesa task 811). It sits in the tab
+              strip rather than in a row of its own below it because the
+              view-filling tabs (Files/Git/Terminal/Storyboards) size their
+              body off `--tab-viewport-height`, whose chrome allowance has no
+              room for an extra row; the strip already exists on every one of
+              them and has the vertical space spare. */}
+          <button className="tabs-action" onClick={openCreate}>
+            add task
+          </button>
         </div>
-
-        {/* Create action lives where the user is working: below the tabs, on
-            the Board view only (spec S5), not on Storyboards/
-            Git/Files/Dashboard (those carry their own content). */}
-        {onBoard && (
-          <p className="task-actions">
-            <button onClick={openCreate}>add task</button>
-          </p>
-        )}
 
         {settings ? (
           !project ? (

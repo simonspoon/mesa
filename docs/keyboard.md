@@ -1,14 +1,14 @@
 # Keyboard shortcuts
 
-Global keyboard control of the web UI: a create-task shortcut on the Board,
-and an app-wide spatial focus layer driven by `h/j/k/l` and the arrow keys.
-Frontend-only — no CLI, API, or Rust surface.
+Global keyboard control of the web UI: a create-task shortcut on any project
+view, and an app-wide spatial focus layer driven by `h/j/k/l` and the arrow
+keys. Frontend-only — no CLI, API, or Rust surface.
 
 ## Bindings
 
 | Key | Scope | Effect |
 |---|---|---|
-| `a` | project **Board** view only | Opens the create-task form (navigates to `#/projects/:id/create-task`) |
+| `a` | any project view | Opens the create-task modal **in place**, over the view you are on (task 811) |
 | `h` `j` `k` `l` | global | Move native DOM focus left / down / up / right |
 | `←` `↓` `↑` `→` | global | Same as `hjkl` |
 | `Enter` | global | Activates the focused element (native browser behavior) |
@@ -23,6 +23,23 @@ elements, so the browser's own activation does the right thing: a link
 navigates, a button clicks, an `InlineEdit` label opens its editor. "Does
 nothing on a non-actionable element" falls out for free — non-interactive
 elements are never focusable, so they never receive focus to begin with.
+
+`a` was Board-only until task 811, and gaining the other views changed *how* it
+opens, not just *where*: it now sets `ProjectTasksPage`'s own `creating` state
+instead of navigating to `#/projects/:id/create-task`. That route renders the
+**Board** underneath the form, which is the right landing place for the command
+palette's "Create task in &lt;project&gt;" entry (its only remaining caller) and
+exactly the wrong one for this shortcut — a task written while reading a file,
+a diff or a storyboard would have thrown away the thing it was about. The
+in-place modal leaves the view untouched, and is draggable and lightly dimmed
+for the same reason (`modalDrag.ts`, `CreateTaskModal.tsx`).
+
+The listener is bound app-wide with no view check, because
+`shouldIgnoreShortcut` already answers the question every non-Board view would
+have asked: the Files editor and the new-file row are text controls (rule 2),
+the Terminal tab's panes are xterm (rule 3), a storyboard canvas suppresses
+everything (rule 4). Do not re-add a per-view gate on top of it — that is the
+divergent second suppression check the chokepoint exists to prevent.
 
 ## The suppression chokepoint
 

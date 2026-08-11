@@ -98,9 +98,9 @@ The code is the source of truth. These are the invariants you must not break:
   `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
   `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
   `layout`, `markdownAssets`, `modalDrag`, `navCollapse`, `navOrder`,
-  `navWidth`,
-  `newFile`, `openFiles`, `pricingDraft`, `projectTree`, `sessionDetail`,
-  `sessionGraph`, `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`,
+  `navWidth`, `newFile`, `openFiles`, `pricingDraft`, `projectTree`,
+  `scriptDraft`, `sessionDetail`, `sessionGraph`, `sessionTimeline`,
+  `settingsDraft`, `syntaxHighlighter`,
   `time`, `watchersDraft`, `wordWrap`) —
   predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
@@ -274,7 +274,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE` | `docs/inbox.md` |
 | Agents | Live Claude Code sessions per project. Terminal access is code execution → all four routes share one mode-dependent gate stronger than task CRUD; `local_path` writes loopback-only in both modes | `docs/agents.md` |
 | Terminal | Shell panes (`portable-pty`, not `claude attach`), same `require_agent_access` stack. Global page + per-project tab (cwd resolved **server-side** from `?project=<id>`, never client-supplied) | `docs/terminal.md` |
-| Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `shouldIgnoreShortcut()` is the sole suppression chokepoint — every new global single-key shortcut must call it | `docs/keyboard.md` |
+| Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `keyboardScope.ts` is the sole suppression chokepoint, in two exports: `shouldIgnoreShortcut()` — every new global single-key shortcut must call it — and its chord sibling `shouldIgnoreFilesShortcut()`, which the Files tab's Cmd/Ctrl+F and Alt+W / Alt+`[` / Alt+`]` bindings call because the first rule of the former is "a modifier chord belongs to its existing owner" | `docs/keyboard.md` |
 | Mobile | Two width tiers (860px narrow, 600px phone) at the end of `App.css`; the app has exactly **one** `MediaQueryList` (`phoneTier.ts`) and tier-dependent state is edge-triggered, never derived | `docs/mobile.md` |
 | Todo watcher | `serve --watch-todo` auto-dispatch, off by default. "Busy" = a **count** — `max(in_progress **leaves**, sessions under the project holding a live shell/subagent)`, max not a sum, an unavailable `claude` counting as zero — against a per-project limit (config `watchers.todo-concurrency`, default 1, read every tick); an umbrella counts toward nothing and narrows the tick to its descendants | `docs/todo-watcher.md` |
 | Inbox watcher | `serve --watch-inbox` auto-triage, off by default and independent of `--watch-todo`; re-dispatch guard is an **in-memory** set, not a db write | `docs/inbox-watcher.md` |

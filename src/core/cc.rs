@@ -2825,23 +2825,43 @@ fn find_transcript(session_id: &str) -> Option<PathBuf> {
 fn read_tail(path: &Path) -> Result<(String, bool)> {
     let mut f = fs::File::open(path)?;
     let len = f.metadata()?.len();
-    let mut window = CHAT_TAIL_BYTES;
-    loop {
-        if len <= window {
-            let mut buf = Vec::with_capacity(len as usize);
-            f.seek(SeekFrom::Start(0))?;
-            f.read_to_end(&mut buf)?;
-            return Ok((String::from_utf8_lossy(&buf).into_owned(), false));
-        }
-        // Seek one byte EARLY, so the buffer opens with the byte preceding the
-        // window. That byte is the whole difference between "the cut landed
-        // mid-line" and "the cut landed exactly on a line start": without it a
-        // boundary that happens to fall on a newline discards a line that was
-        // complete, which `truncated` then reports as if it were the ordinary
-        // partial-line loss.
-        f.seek(SeekFrom::Start(len - window - 1))?;
-        let mut buf = Vec::with_capacity(window as usize + 1);
+    let read_all = |f: &mut fs::File| -> Result<(String, bool)> {
+        let mut buf = Vec::with_capacity(len as usize);
+        f.seek(SeekFrom::Start(0))?;
         f.read_to_end(&mut buf)?;
+        Ok((String::from_utf8_lossy(&buf).into_owned(), false))
+    };
+    let mut window = CHAT_TAIL_BYTES;
+    // `buf` holds the bytes from `have_from` to EOF, and **grows downward**:
+    // widening reads only the newly exposed prefix and prepends it, never the
+    // whole window again. This is a poll, and the widening case is by
+    // definition the one with megabyte lines in it — re-reading from scratch
+    // would make 2+8+32 MiB of I/O out of what should be 32.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut have_from = len;
+    loop {
+        if len <= window + 1 {
+            return read_all(&mut f);
+        }
+        // Start one byte EARLY, so the buffer opens with the byte preceding
+        // the window. That byte is the whole difference between "the cut
+        // landed mid-line" and "the cut landed exactly on a line start":
+        // without it a boundary that happens to fall on a newline discards a
+        // line that was complete, which `truncated` then reports as if it were
+        // the ordinary partial-line loss.
+        let from = len - window - 1;
+        let mut head = Vec::with_capacity((have_from - from) as usize);
+        f.seek(SeekFrom::Start(from))?;
+        // `take` rather than an exact read: a transcript only ever grows, but
+        // a rotation between the `metadata` above and this read must degrade
+        // to a short answer, not to a 500.
+        std::io::Read::by_ref(&mut f)
+            .take(have_from - from)
+            .read_to_end(&mut head)?;
+        head.extend_from_slice(&buf);
+        buf = head;
+        have_from = from;
+
         let start = buf
             .iter()
             .position(|&b| b == b'\n')

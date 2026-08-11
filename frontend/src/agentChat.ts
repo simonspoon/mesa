@@ -19,16 +19,22 @@ import type { CcChatTurn } from './types/CcChatTurn'
 export type ChatGroup = {
   /** The first turn's id — unique within a payload, so it keys a React list. */
   id: string
-  kind: 'prompt' | 'response' | 'tools'
+  /** `other` is a turn kind this build does not know — see `chatGroups`. */
+  kind: 'prompt' | 'response' | 'tools' | 'other'
   turns: CcChatTurn[]
 }
 
 /**
  * Group a payload's turns into render blocks, preserving order. Consecutive
- * `tool` turns merge; everything else stands alone. An unknown `kind` (a
- * server that has learned a fourth one) is passed through as its own block
- * rather than dropped — a chat that silently omits turns is worse than one
- * showing a row it has no special styling for.
+ * `tool` turns merge; everything else stands alone.
+ *
+ * A `kind` this build does not know — an older UI against a server that has
+ * learned a fourth one — becomes `other`, **not** `response`. It is shown
+ * (dropping turns silently is worse than an unstyled row) but it is not
+ * attributed to anyone: labelling an unknown turn "agent" is exactly the
+ * mis-attribution the server side guards against when it refuses to read an
+ * injected `user` line as something the assistant said, and a version skew is
+ * the one situation where that guard would otherwise be undone here.
  */
 export function chatGroups(turns: CcChatTurn[]): ChatGroup[] {
   const out: ChatGroup[] = []
@@ -38,11 +44,15 @@ export function chatGroups(turns: CcChatTurn[]): ChatGroup[] {
       last.turns.push(turn)
       continue
     }
-    out.push({
-      id: turn.id,
-      kind: turn.kind === 'tool' ? 'tools' : turn.kind === 'prompt' ? 'prompt' : 'response',
-      turns: [turn],
-    })
+    const kind =
+      turn.kind === 'tool'
+        ? 'tools'
+        : turn.kind === 'prompt'
+          ? 'prompt'
+          : turn.kind === 'response'
+            ? 'response'
+            : 'other'
+    out.push({ id: turn.id, kind, turns: [turn] })
   }
   return out
 }
@@ -115,14 +125,18 @@ export function chatClock(ts: string | null): string {
  *
  * The slack absorbs the sub-pixel rounding a zoomed/fractional-DPI viewport
  * gives `scrollHeight - clientHeight`, which otherwise makes an apparently
- * bottomed-out box read as "scrolled up" and freeze the follow. It is a
- * *fraction* of the box rather than a flat 80px because a pane in a 2x2
- * auto-tile is often only 150-250px tall, where a flat 80px would mean the
- * reader has to scroll up a third of everything they can see before the follow
- * lets go — and anything less gets snapped back by the next poll. The 80px
- * floor keeps the behaviour identical on any pane large enough for it to have
- * been right in the first place.
+ * bottomed-out box read as "scrolled up" and freeze the follow.
+ *
+ * It is **capped** at a quarter of the box, not floored at one. A pane in a
+ * 2x2 auto-tile is often 150-250px tall, where a flat 80px is a third of
+ * everything the reader can see: they nudge up to re-read a line, are still
+ * "near the bottom", and the next poll snaps them back. Scaling *down* on a
+ * small pane is the fix; scaling up on a large one would be the same bug in
+ * the other direction, so 80px is the ceiling and a large pane behaves
+ * exactly as it did. The 16px floor is the rounding allowance, which is all
+ * the slack was ever for.
  */
 export function isNearBottom(scrollTop: number, scrollHeight: number, clientHeight: number): boolean {
-  return scrollHeight - clientHeight - scrollTop <= Math.max(80, clientHeight * 0.25)
+  const slack = Math.max(16, Math.min(80, clientHeight * 0.25))
+  return scrollHeight - clientHeight - scrollTop <= slack
 }

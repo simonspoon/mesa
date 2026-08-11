@@ -628,7 +628,10 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
 - CLI: `mesa cc {summary,sessions,skills,session,graph,text,chat,sync}` (JSON only; `summary` prints the
   full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
   `--limit` on `sessions` and `--rebuild` on `sync`). Like every other handler
-  these open the database; only `cc live` and `cc usage` stay store-less.
+  these open the database; only `cc live`, `cc usage` and `cc chat` stay
+  store-less — and `cc chat`'s being so is load-bearing, not incidental (see
+  *Session chat* above; `scripts/cc-check.sh` pins it with a fixture that is
+  never ingested).
 - API: `GET /api/cc?window=<w>` syncs, then serves the dashboard from an
   in-memory cache in `AppState.cc_cache` keyed per-window by `Store::cc_stamp()`
   — a monotone count over the cc tables (rows are never deleted), so it sees

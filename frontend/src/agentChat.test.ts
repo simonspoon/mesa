@@ -38,13 +38,14 @@ describe('chatGroups', () => {
     expect(groups.map((g) => g.id)).toEqual(['t1', 'r1', 't2'])
   })
 
-  it('keeps order and drops nothing, including an unknown kind', () => {
+  it('shows an unknown kind without attributing it to the agent', () => {
     const odd = { id: 'x1', kind: 'thinking', ts: null, model: null, name: null, text: 'hm' }
     const groups = chatGroups([odd as unknown as CcChatTurn])
     expect(groups).toHaveLength(1)
-    // Unknown kinds fall to the response side rather than vanishing — a chat
-    // that silently omits turns is worse than one with an unstyled row.
-    expect(groups[0].kind).toBe('response')
+    // Shown, because silently omitting turns is worse than an unstyled row —
+    // but `other`, never `response`: labelling an unknown turn "agent" is the
+    // same mis-attribution the server refuses to make for an injected line.
+    expect(groups[0].kind).toBe('other')
   })
 
   it('is empty for an empty payload', () => {
@@ -122,29 +123,33 @@ describe('chatClock', () => {
 })
 
 describe('isNearBottom', () => {
-  it('follows while at or near the end', () => {
-    expect(isNearBottom(900, 1000, 100)).toBe(true)
-    // Slack absorbs the sub-pixel rounding a fractional-DPI viewport gives,
-    // which would otherwise freeze the follow on an apparently bottomed box.
-    expect(isNearBottom(820, 1000, 100)).toBe(true)
+  it('follows at the end, and through rounding slack', () => {
+    expect(isNearBottom(2000, 3000, 1000)).toBe(true)
+    expect(isNearBottom(1990, 3000, 1000)).toBe(true)
   })
 
   it('stops following once the reader has scrolled up to read', () => {
-    expect(isNearBottom(400, 1000, 100)).toBe(false)
+    expect(isNearBottom(1500, 3000, 1000)).toBe(false)
   })
 
   it('follows when there is nothing to scroll', () => {
     expect(isNearBottom(0, 100, 100)).toBe(true)
   })
 
-  it('scales the slack to the box, so a short tiled pane is not snapped back', () => {
-    // A 200px-tall pane: a quarter of it (50px) is under the 80px floor, so
-    // the floor still governs and the behaviour is the flat one.
-    expect(isNearBottom(2820, 3000, 200)).toBe(true)
-    expect(isNearBottom(2000, 3000, 200)).toBe(false)
-    // A 1000px-tall pane: 250px of slack, so a reader who nudged up 200px is
-    // still following rather than being frozen out by a flat threshold.
-    expect(isNearBottom(1800, 3000, 1000)).toBe(true)
-    expect(isNearBottom(1000, 3000, 1000)).toBe(false)
+  it('caps the slack at 80px, so a large pane is unchanged', () => {
+    // 1000px pane: a quarter would be 250px, which would keep "following" a
+    // reader who deliberately scrolled up 200px and yank them back on the
+    // next poll. The cap is what stops the fix for small panes becoming the
+    // same bug for large ones.
+    expect(isNearBottom(1940, 3000, 1000)).toBe(true)
+    expect(isNearBottom(1800, 3000, 1000)).toBe(false)
+  })
+
+  it('shrinks the slack on a short tiled pane, which is the case it exists for', () => {
+    // 200px pane (a 2x2 auto-tile): slack is 50px, not 80 — a reader who
+    // nudged up 60px to re-read a line has genuinely stopped following, and a
+    // flat 80px would have snapped them back to the tail.
+    expect(isNearBottom(2760, 3000, 200)).toBe(true)
+    expect(isNearBottom(2740, 3000, 200)).toBe(false)
   })
 })

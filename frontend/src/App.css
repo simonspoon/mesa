@@ -3190,6 +3190,13 @@ body.files-tree-resizing {
   background: var(--panel);
 }
 
+/* A turn kind this build doesn't know: shown, but claimed by neither side —
+   neutral rule, neutral label (see `chatGroups`). */
+.agent-chat-other {
+  border-left-color: var(--border-bright);
+  background: var(--panel);
+}
+
 .agent-chat-meta {
   display: flex;
   align-items: baseline;

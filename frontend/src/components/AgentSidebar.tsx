@@ -181,23 +181,19 @@ function PaneViewToggle({
 function PaneBody({
   agentId,
   sessionId,
-  view,
+  showChat,
   paused,
 }: {
   agentId: string
   sessionId: string | null
-  view: PaneView
+  /** Decided once by the pane and passed to the header too, so the toggle can
+   *  never claim a view the body isn't showing. */
+  showChat: boolean
   /** True while nobody can see this pane (the whole sidebar is collapsed) —
    *  the chat stops polling, exactly as the session list does. */
   paused: boolean
 }) {
   const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
-  // One decision, used by both halves. Deriving it twice is how a pane goes
-  // blank: `chat` mode with no session id (its session aged out of the list
-  // between polls) would hide the terminal and render no chat, leaving an
-  // empty box whose only escape is noticing the greyed-out toggle. Losing the
-  // session id falls back to the terminal, which is still attached.
-  const showChat = view === 'chat' && sessionId !== null
   return (
     <div className="agent-pane-views">
       <div className={`agent-pane-view${showChat ? ' hidden' : ''}`}>
@@ -385,6 +381,12 @@ function AgentPane({
   onClose: () => void
   dropEdge?: DropEdge | null
 }) {
+  // The one decision, made once and used by the header and the body alike. A
+  // pane in `chat` mode whose session has aged out of the list falls back to
+  // its still-attached terminal — deriving that separately in the two places
+  // is how the body goes blank, or how the header insists on `chat` while the
+  // terminal is what's on screen.
+  const showChat = view === 'chat' && sessionId !== null
   return (
     <PaneShell
       dragId={agentId}
@@ -394,13 +396,13 @@ function AgentPane({
       dropEdge={dropEdge}
       headerExtra={
         <PaneViewToggle
-          view={view}
+          view={showChat ? 'chat' : 'term'}
           onChange={onViewChange}
           chatAvailable={sessionId !== null}
         />
       }
     >
-      <PaneBody agentId={agentId} sessionId={sessionId} view={view} paused={paused} />
+      <PaneBody agentId={agentId} sessionId={sessionId} showChat={showChat} paused={paused} />
     </PaneShell>
   )
 }
@@ -429,6 +431,7 @@ function SoloAgentPane({
   paused: boolean
   onClose: () => void
 }) {
+  const showChat = view === 'chat' && sessionId !== null
   return (
     <div className="agent-sidebar-pane">
       <div className="agent-terminal-header">
@@ -438,11 +441,15 @@ function SoloAgentPane({
           </span>
         </span>
         <span className="agent-sidebar-pane-actions">
-          <PaneViewToggle view={view} onChange={onViewChange} chatAvailable={sessionId !== null} />
+          <PaneViewToggle
+            view={showChat ? 'chat' : 'term'}
+            onChange={onViewChange}
+            chatAvailable={sessionId !== null}
+          />
           <button onClick={onClose}>close</button>
         </span>
       </div>
-      <PaneBody agentId={agentId} sessionId={sessionId} view={view} paused={paused} />
+      <PaneBody agentId={agentId} sessionId={sessionId} showChat={showChat} paused={paused} />
     </div>
   )
 }

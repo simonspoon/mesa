@@ -154,13 +154,19 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
   )
 }
 
-/** One side of the conversation. */
-function Bubble({ kind, turn }: { kind: 'prompt' | 'response'; turn: CcChatTurn }) {
+/**
+ * One side of the conversation — or, for `other`, a turn kind this build does
+ * not know. That case is labelled with the server's own word for it rather
+ * than "agent": an unrecognised turn is precisely the one that must not be
+ * attributed to anybody (see `chatGroups`).
+ */
+function Bubble({ kind, turn }: { kind: 'prompt' | 'response' | 'other'; turn: CcChatTurn }) {
   const clock = chatClock(turn.ts)
+  const who = kind === 'prompt' ? 'you' : kind === 'response' ? 'agent' : turn.kind
   return (
     <div className={`agent-chat-bubble agent-chat-${kind}`}>
       <div className="agent-chat-meta">
-        <span className="agent-chat-who">{kind === 'prompt' ? 'you' : 'agent'}</span>
+        <span className="agent-chat-who">{who}</span>
         {turn.model && <span className="agent-chat-model">{turn.model}</span>}
         {clock && <span className="agent-chat-clock">{clock}</span>}
       </div>

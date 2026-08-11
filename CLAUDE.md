@@ -43,7 +43,7 @@ isolation.
 | `storyboard-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
 | `attachments-check` | CLI + API contract incl. cascade-delete | |
-| `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, and the read/write gate pairing in default *and* `--lan` | |
+| `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, `/files/search` (hits grouped by file, excluded/binary files skipped, both toggles, the `?q=` contract), and the read/write gate pairing in default *and* `--lan` | |
 | `agents-check` | `local_path` plumbing + `/api/projects/{id}/agents` | `MESA_CLAUDE_BIN` (stub) |
 | `todo-watcher-check` | `serve --watch-todo` dispatch loop | `MESA_WATCH_TODO_TICK_MS` |
 | `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME` — use a throwaway) | `MESA_WATCH_INBOX_TICK_MS` |
@@ -96,7 +96,7 @@ The code is the source of truth. These are the invariants you must not break:
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
   `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
-  `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
+  `fileSearch`, `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
   `layout`, `markdownAssets`, `modalDrag`, `navCollapse`, `navOrder`,
   `navWidth`, `newFile`, `openFiles`, `pricingDraft`, `projectTree`,
   `scriptDraft`, `sessionDetail`, `sessionGraph`, `sessionTimeline`,
@@ -268,13 +268,13 @@ The code is the source of truth. These are the invariants you must not break:
 | Attachments | Files/images on a task, stored outside the DB; 25 MiB cap, base64-in-JSON upload to stay inside the CSRF gate | `docs/attachments.md` |
 | Git tab | Read-only working-tree + history per project; external `git` shell-outs only | `docs/git-tab.md` |
 | Project version | The app version in a project's `local_path`, read from its manifest and shown beside the name; derived on every read, never stored, quiet-empty on any miss | `docs/project-version.md` |
-| Files tab | Project file browser + editor; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
+| Files tab | Project file browser + editor + project-wide search; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
 | Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |
 | Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE` | `docs/inbox.md` |
 | Agents | Live Claude Code sessions per project. Terminal access is code execution → all four routes share one mode-dependent gate stronger than task CRUD; `local_path` writes loopback-only in both modes | `docs/agents.md` |
 | Terminal | Shell panes (`portable-pty`, not `claude attach`), same `require_agent_access` stack. Global page + per-project tab (cwd resolved **server-side** from `?project=<id>`, never client-supplied) | `docs/terminal.md` |
-| Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `keyboardScope.ts` is the sole suppression chokepoint, in two exports: `shouldIgnoreShortcut()` — every new global single-key shortcut must call it — and its chord sibling `shouldIgnoreFilesShortcut()`, which the Files tab's Cmd/Ctrl+F and Alt+W / Alt+`[` / Alt+`]` bindings call because the first rule of the former is "a modifier chord belongs to its existing owner" | `docs/keyboard.md` |
+| Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `keyboardScope.ts` is the sole suppression chokepoint, in two exports: `shouldIgnoreShortcut()` — every new global single-key shortcut must call it — and its chord sibling `shouldIgnoreFilesShortcut()`, which the Files tab's Cmd/Ctrl+F, Cmd/Ctrl+Shift+F and Alt+W / Alt+`[` / Alt+`]` bindings call because the first rule of the former is "a modifier chord belongs to its existing owner" | `docs/keyboard.md` |
 | Mobile | Two width tiers (860px narrow, 600px phone) at the end of `App.css`; the app has exactly **one** `MediaQueryList` (`phoneTier.ts`) and tier-dependent state is edge-triggered, never derived | `docs/mobile.md` |
 | Todo watcher | `serve --watch-todo` auto-dispatch, off by default. "Busy" = a **count** — `max(in_progress **leaves**, sessions under the project holding a live shell/subagent)`, max not a sum, an unavailable `claude` counting as zero — against a per-project limit (config `watchers.todo-concurrency`, default 1, read every tick); an umbrella counts toward nothing and narrows the tick to its descendants | `docs/todo-watcher.md` |
 | Inbox watcher | `serve --watch-inbox` auto-triage, off by default and independent of `--watch-todo`; re-dispatch guard is an **in-memory** set, not a db write | `docs/inbox-watcher.md` |

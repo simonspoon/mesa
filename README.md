@@ -334,7 +334,8 @@ creating a duplicate. (`--no-git` skips binding; `project update --root-commit
 working folder — which powers the web UI's git status, the per-project **Git**
 tab (working-tree file list + per-file diff plus history, read-only), the
 per-project **Files** tab (a file browser and an editor with a line-number
-gutter, find-in-file, IDE editing keys and dirty-tab guards), the per-project
+gutter, find-in-file, project-wide search, IDE editing keys and dirty-tab
+guards), the per-project
 **Terminal** tab (real shells opened in that folder), and project labels and
 start locations in the global Agents sidebar.
 
@@ -396,7 +397,7 @@ scripts/api-check.sh        # HTTP task-route contract + the security boundary, 
 scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
 scripts/attachments-check.sh    # attachment contract over CLI + API, including cascade-delete
-scripts/files-check.sh      # Files-tab reads, the image allowlist, and both write gates
+scripts/files-check.sh      # Files-tab reads, the image allowlist, search, both write gates
 scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
 scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`

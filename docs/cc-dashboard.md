@@ -196,9 +196,15 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
      is **authoritative**: accept iff it says `human`. Note it is `origin`,
      **not** `promptSource` — `claude-desktop` human turns carry
      `promptSource: "sdk"`, so keying off that would drop them.
-     **Upstream has spelled the key both ways** and mesa reads both: `type`
-     when the block was introduced, `kind` on current releases (observed on
-     v2.1.227, task 814). Reading only one spelling fails *closed and silently*
+     **Upstream has spelled the key both ways** and mesa reads both, as **two
+     fields, not one field with `#[serde(alias)]`**: `type` when the block was
+     introduced, `kind` on current releases (observed on v2.1.227, task 814).
+     An alias maps both keys onto one field, so a line carrying *both* — the
+     ordinary way to ship a rename — becomes a serde duplicate-field error,
+     and every parse site skips an unparseable line, dropping it from the
+     ingest entirely along with its usage, tool calls and session span. The
+     fix must never fail worse than the bug. Reading only one spelling fails
+     *closed and silently*
      — an `origin` object whose one key is unknown parses as "origin present,
      not human", which is the accept-nothing branch rather than the prefix
      fallback, so every human turn of every session written by that release is
@@ -570,11 +576,27 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     protects `cc text` protects this too.
   - **Two bounds, one honest flag.** `limit` caps turns, **newest kept** (a
     chat window is read at its end), and `CHAT_TAIL_BYTES` (2 MiB) caps how
-    much of the file is parsed at all — the byte window is what actually bounds
-    the cost, since dropping turns after parsing them saves nothing, and a real
-    transcript reaches 21 MB. A cut lands mid-line, so the first partial line
-    is dropped. `truncated` is a single boolean covering both: the byte window
-    drops an *unknown* number of turns, so a count would be invented.
+    much of the file is parsed at all. The byte window is what actually bounds
+    the cost, since dropping turns after parsing them saves nothing — and on a
+    long session it is also the **operative** bound by a wide margin, because
+    transcript bytes are dominated by tool *results*, which produce no turn:
+    measured over the six largest real transcripts (21.2 down to 8.2 MB), 2 MiB
+    yielded 18-84 turns, never close to 200. So the view shows the last few
+    dozen exchanges of a long session whatever `limit` says. Reading back by
+    turn count instead would mean re-reading most of a 21 MB file every 3
+    seconds, which is the cost the window exists to avoid.
+    `truncated` is a single boolean covering both bounds: the byte window drops
+    an *unknown* number of turns, so a count would be invented.
+    Two properties the window has to have, both regression-tested:
+    **it never lands inside a single line and answers nothing** — a transcript
+    line can itself be megabytes (the real corpus holds a 2.59 MB tool result),
+    and a window holding no complete line would blank the pane for a session
+    that is talking fine, so it widens (to `CHAT_TAIL_MAX_BYTES`, 32 MiB —
+    above every transcript observed, i.e. "read it all rather than say
+    nothing") until it captures one; and **a boundary that lands exactly on a
+    line start keeps that line**, which is why the read seeks one byte *early*
+    — that byte is the whole difference between a cut that was mid-line and one
+    that was not.
   - **What a line becomes.** A human turn is `human_prompt_raw` — the same
     predicate `cc_prompts` ingests on, uncapped — so main-thread only, no
     injections, no tool-result carriers. An assistant turn is

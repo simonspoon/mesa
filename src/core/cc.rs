@@ -117,20 +117,40 @@ struct RawLine {
     origin: Option<RawOrigin>,
 }
 
-/// The `origin` block of a `user` line. Only its `type` is read.
+/// The `origin` block of a `user` line. Only what it calls the turn is read.
+///
+/// **Upstream has spelled that key both ways** — `type` when the block was
+/// introduced (v2.1.187), `kind` on current releases (v2.1.227, task 814) — so
+/// both are parsed. Reading only one fails *silent and total*: an `origin`
+/// object whose single key mesa doesn't know deserializes to an all-`None`
+/// `RawOrigin`, which is not "no origin" (the branch that falls back to the
+/// prefix list) but "origin says not-human", so every human turn of every
+/// session is rejected and `cc_prompts` quietly stops growing. Found by live
+/// QA of the chat view, whose whole left side was missing.
+///
+/// They are **two fields, not one field with `#[serde(alias)]`**. An alias
+/// maps two JSON keys onto one field, which makes a line carrying *both*
+/// spellings a serde duplicate-field error — and every parse site here is
+/// `let Ok(raw) = … else { continue }`, so that line would be dropped from
+/// the ingest entirely, taking its usage, tool calls and session span with
+/// it. Emitting both keys through a rename is the most ordinary thing
+/// upstream could do next, and it must degrade to "read either", never to a
+/// worse failure than the bug this fixes.
 #[derive(Deserialize)]
 struct RawOrigin {
-    /// Upstream has spelled this key **both** ways: `type` when the block was
-    /// introduced (v2.1.187), `kind` on current releases (observed on
-    /// v2.1.227, task 814). Read both, because the miss is silent and total —
-    /// an `origin` object whose one key mesa doesn't know deserializes to
-    /// `Some(RawOrigin { kind: None })`, which is not "no origin" (the branch
-    /// that falls back to the prefix list) but "origin says not-human", so
-    /// EVERY human turn of every session is rejected and `cc_prompts` quietly
-    /// stops recording. Found by live QA of the chat view, whose whole left
-    /// side was missing.
-    #[serde(rename = "type", alias = "kind", default)]
-    kind: Option<String>,
+    #[serde(rename = "type", default)]
+    type_key: Option<String>,
+    #[serde(rename = "kind", default)]
+    kind_key: Option<String>,
+}
+
+impl RawOrigin {
+    /// What this block calls the turn, under either spelling. `type` wins when
+    /// both are present and disagree — it is the original, so a line carrying
+    /// both is most likely a compatibility emission led by the old key.
+    fn says(&self) -> Option<&str> {
+        self.type_key.as_deref().or(self.kind_key.as_deref())
+    }
 }
 
 #[derive(Deserialize)]
@@ -429,7 +449,7 @@ fn human_prompt_raw(line: &RawLine) -> Option<String> {
         return Some(cmd);
     }
     let accepted = match line.origin.as_ref() {
-        Some(o) => o.kind.as_deref() == Some("human"),
+        Some(o) => o.says() == Some("human"),
         None => {
             let trimmed = text.trim_start();
             !NON_HUMAN_PREFIXES.iter().any(|p| trimmed.starts_with(p))
@@ -2639,9 +2659,26 @@ pub const CHAT_TURN_LIMIT: usize = 200;
 /// that cost by *bytes read* — which is the cost — where the turn limit alone
 /// could not: dropping turns after parsing them saves nothing.
 ///
-/// 2 MiB is far more than the `CHAT_TURN_LIMIT` turns the answer keeps, so on
-/// any transcript below it the window is invisible and the file is read whole.
+/// **On a long session this, not `CHAT_TURN_LIMIT`, is the operative bound**,
+/// and by a wide margin: transcript bytes are dominated by tool *results*,
+/// which produce no turn at all. Measured over the six largest real
+/// transcripts (21.2 down to 8.2 MB), 2 MiB yielded 18-84 turns — never
+/// close to 200. So the chat view shows roughly the last few dozen exchanges
+/// of a long session whatever `limit` says, and `truncated` is how it admits
+/// that. Reading back by turn count instead would mean reading most of a 21 MB
+/// file on every 3-second tick, which is the cost this exists to avoid.
+/// A transcript smaller than this is read whole and `truncated` is false.
 const CHAT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The ceiling [`read_tail`] will grow its window to when the window lands
+/// *inside a single line*. One transcript line can itself be megabytes (a
+/// large tool result; the real corpus holds a 2.59 MB one), and a window
+/// holding no complete line yields no turns at all — a blank chat pane for a
+/// session that is talking perfectly well. Above every transcript observed
+/// (21.2 MB), so in practice this means "read the whole file rather than
+/// answer nothing"; it is a bound, not a budget, and only a pathological tail
+/// ever reaches it.
+const CHAT_TAIL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// One session's conversation, read **live from its transcript file** rather
 /// than from the `cc_*` tables (task 814) — the third and last read to do so,
@@ -2788,19 +2825,35 @@ fn find_transcript(session_id: &str) -> Option<PathBuf> {
 fn read_tail(path: &Path) -> Result<(String, bool)> {
     let mut f = fs::File::open(path)?;
     let len = f.metadata()?.len();
-    if len <= CHAT_TAIL_BYTES {
-        let mut buf = Vec::with_capacity(len as usize);
+    let mut window = CHAT_TAIL_BYTES;
+    loop {
+        if len <= window {
+            let mut buf = Vec::with_capacity(len as usize);
+            f.seek(SeekFrom::Start(0))?;
+            f.read_to_end(&mut buf)?;
+            return Ok((String::from_utf8_lossy(&buf).into_owned(), false));
+        }
+        // Seek one byte EARLY, so the buffer opens with the byte preceding the
+        // window. That byte is the whole difference between "the cut landed
+        // mid-line" and "the cut landed exactly on a line start": without it a
+        // boundary that happens to fall on a newline discards a line that was
+        // complete, which `truncated` then reports as if it were the ordinary
+        // partial-line loss.
+        f.seek(SeekFrom::Start(len - window - 1))?;
+        let mut buf = Vec::with_capacity(window as usize + 1);
         f.read_to_end(&mut buf)?;
-        return Ok((String::from_utf8_lossy(&buf).into_owned(), false));
+        let start = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        if start < buf.len() || window >= CHAT_TAIL_MAX_BYTES {
+            return Ok((String::from_utf8_lossy(&buf[start..]).into_owned(), true));
+        }
+        // The window fell entirely inside one line, so it holds no complete
+        // line and parsing it would answer "this session has said nothing".
+        // Widen and retry rather than return that.
+        window = window.saturating_mul(4).min(CHAT_TAIL_MAX_BYTES);
     }
-    f.seek(SeekFrom::Start(len - CHAT_TAIL_BYTES))?;
-    let mut buf = Vec::with_capacity(CHAT_TAIL_BYTES as usize);
-    f.read_to_end(&mut buf)?;
-    let start = buf
-        .iter()
-        .position(|&b| b == b'\n')
-        .map_or(buf.len(), |i| i + 1);
-    Ok((String::from_utf8_lossy(&buf[start..]).into_owned(), true))
 }
 
 // ---- small helpers ----
@@ -4119,6 +4172,29 @@ mod tests {
             .as_deref(),
             Some("add a prompts row to the timeline")
         );
+        // A line carrying BOTH spellings must still parse. This is why
+        // `RawOrigin` has two fields rather than one `#[serde(alias)]`: an
+        // alias makes this a duplicate-field error, and every parse site skips
+        // an unparseable line — so emitting both keys (the ordinary way to ship
+        // a rename) would drop the whole line from the ingest, which is worse
+        // than the bug the second spelling fixes.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"type":"human","kind":"human"},
+                    "message":{"content":"both keys"}}"#
+            )
+            .as_deref(),
+            Some("both keys")
+        );
+        // Either key order, same answer.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"kind":"human","type":"human"},
+                    "message":{"content":"both keys, other order"}}"#
+            )
+            .as_deref(),
+            Some("both keys, other order")
+        );
         // An array of text blocks flattens the same way, in order.
         assert_eq!(
             prompt_of(
@@ -5125,5 +5201,89 @@ mod tests {
             matches!(missing, Err(Error::Unavailable(_))),
             "a session with no transcript on disk is unavailable, not not_found"
         );
+    }
+
+    /// Writes one transcript under a throwaway root and returns what
+    /// `session_chat` makes of it — the tail-window tests below control the
+    /// exact byte layout, so they need the file verbatim.
+    fn chat_of_file(body: &str) -> Result<CcSessionChat> {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-big-project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("sess-big.jsonl"), body).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &root) };
+        let out = session_chat("sess-big", 100);
+        // SAFETY: same window, same lock.
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+        out
+    }
+
+    /// One assistant line saying `text`, padded to exactly `len` bytes when
+    /// that is possible — the padding rides inside the prose so the line stays
+    /// valid JSON and the turn stays identifiable by `uuid`.
+    fn assistant_line(uuid: &str, text: &str, len: Option<usize>) -> String {
+        let line = |body: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","message":{{"model":"m","content":[{{"type":"text","text":"{body}"}}]}}}}"#
+            )
+        };
+        match len {
+            None => line(text),
+            Some(want) => {
+                let base = line(text).len();
+                assert!(want >= base, "cannot pad below the line's own length");
+                line(&format!("{text}{}", "y".repeat(want - base)))
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_line_larger_than_the_tail_window_does_not_blank_the_chat() {
+        // A multi-megabyte transcript line is ordinary — the real corpus holds
+        // a 2.59 MB one (a large tool result). If the window lands entirely
+        // inside one, a naive tail read finds no complete line at all and the
+        // pane renders "this session has not said anything yet" for a session
+        // that is talking perfectly well.
+        let body = format!(
+            "{}\n{}\n",
+            assistant_line("a1", "still here", None),
+            assistant_line("huge", "big", Some(CHAT_TAIL_BYTES as usize + 4096)),
+        );
+        let chat = chat_of_file(&body).unwrap();
+        assert_eq!(
+            chat.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "huge"],
+            "the window must widen past an oversized line rather than answer nothing"
+        );
+    }
+
+    #[test]
+    fn a_window_boundary_on_a_line_start_keeps_that_whole_line() {
+        // Lay the file out so `len - CHAT_TAIL_BYTES` falls EXACTLY on `keep`'s
+        // first byte: nothing there is partial, so nothing may be dropped.
+        // Without the one-byte lookbehind the first newline the buffer finds is
+        // `keep`'s own terminator, and a complete turn is silently discarded —
+        // and because `last` is still there the read looks successful.
+        let last = assistant_line("last", "the newest turn", None);
+        let keep_len = CHAT_TAIL_BYTES as usize - (last.len() + 1) - 1;
+        let keep = assistant_line("keep", "on the boundary", Some(keep_len));
+        let head = format!("{}\n", assistant_line("old", "before the window", None));
+        let body = format!("{head}{keep}\n{last}\n");
+        assert_eq!(
+            body.len() as u64 - CHAT_TAIL_BYTES,
+            head.len() as u64,
+            "the fixture must put the boundary exactly on `keep`'s first byte"
+        );
+
+        let chat = chat_of_file(&body).unwrap();
+        assert_eq!(
+            chat.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["keep", "last"],
+            "a line wholly inside the window is not a partial line and must survive"
+        );
+        assert!(chat.truncated, "`old` really was dropped, so say so");
     }
 }

@@ -674,7 +674,8 @@ echo "cc text: deleted transcript -> unavailable ok"
 # reader entirely.
 mkdir -p "$TMP/tree/-chat-project/cx/subagents"
 cat > "$TMP/tree/-chat-project/cx.jsonl" <<'JSONL'
-{"type":"user","uuid":"cp1","sessionId":"cx","timestamp":"2026-06-21T02:00:00.000Z","cwd":"/home/me/chat","origin":{"type":"human"},"message":{"role":"user","content":"CHAT-PROMPT-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat CHAT-PROMPT-TAIL"}}
+{"type":"user","uuid":"cp1","sessionId":"cx","timestamp":"2026-06-21T02:00:00.000Z","cwd":"/home/me/chat","origin":{"kind":"human"},"message":{"role":"user","content":"CHAT-PROMPT-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat CHAT-PROMPT-TAIL"}}
+{"type":"user","uuid":"cp2","sessionId":"cx","timestamp":"2026-06-21T02:00:01.000Z","cwd":"/home/me/chat","origin":{"type":"human","kind":"human"},"message":{"role":"user","content":"BOTH-SPELLINGS"}}
 {"type":"user","uuid":"cmeta","sessionId":"cx","timestamp":"2026-06-21T02:00:01.000Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}]}}
 {"type":"assistant","uuid":"cm1","sessionId":"cx","timestamp":"2026-06-21T02:00:02.000Z","cwd":"/home/me/chat","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"thinking","thinking":"THINKING-NEVER-SHOWN"},{"type":"text","text":"CHAT-RESPONSE-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip CHAT-RESPONSE-TAIL"},{"type":"tool_use","id":"ct_1","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","id":"ct_2","name":"advisor","input":{}}]}}
 {"type":"user","uuid":"cres","sessionId":"cx","timestamp":"2026-06-21T02:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ct_1","content":"ok"}]}}
@@ -700,8 +701,13 @@ assert d["session_id"]=="cx" and d["truncated"] is False, d
 shape=[(t["kind"], t["id"]) for t in d["turns"]]
 # An injected `user` line, a tool_result carrier and a subagent transcript all
 # produce nothing; one assistant line emits its prose BEFORE its own calls.
-assert shape==[("prompt","cp1"),("response","cm1"),("tool","ct_1"),("tool","ct_2")], shape
-p,r,t1,t2=d["turns"]
+assert shape==[("prompt","cp1"),("prompt","cp2"),("response","cm1"),("tool","ct_1"),("tool","ct_2")], shape
+p,p2,r,t1,t2=d["turns"]
+# The human-turn marker upstream renamed: `cp1` carries only the new spelling
+# (`origin.kind`) and `cp2` carries BOTH. Reading one spelling drops `cp1`;
+# aliasing them onto one field makes `cp2` an unparseable line, which drops it
+# from every cc read at once. Each is a regression this fixture would catch.
+assert p2["text"]=="BOTH-SPELLINGS", p2
 assert p["text"].startswith("CHAT-PROMPT-HEAD") and p["text"].endswith("CHAT-PROMPT-TAIL"), p["text"][:40]
 assert p["model"] is None and p["name"] is None, p
 # Prose is the product here: full body, not the 200-char stored preview.

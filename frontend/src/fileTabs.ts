@@ -104,6 +104,30 @@ export function activateTab(state: TabsState, side: PaneSide, path: string): Tab
   return { ...withPane(state, side, { ...pane, active: path }), focused: side }
 }
 
+/**
+ * Step one pane's active tab to its neighbour, wrapping at either end — what
+ * the Alt+[ / Alt+] chords do (mesa task 809).
+ *
+ * Wrapping rather than stopping at the ends, because that is what every editor
+ * with this binding does and because a strip is a ring the user cycles rather
+ * than a list they arrive at the end of. `null` — no change — when there is
+ * nothing to step *to*: a missing pane, an empty one, or a single tab, where
+ * wrapping would land back on the tab already showing and cost a render for
+ * nothing.
+ */
+export function cycleTab(
+  state: TabsState,
+  side: PaneSide,
+  forward: boolean,
+): TabsState | null {
+  const pane = paneOf(state, side)
+  if (pane === null || pane.active === null || pane.tabs.length < 2) return null
+  const i = pane.tabs.indexOf(pane.active)
+  const n = pane.tabs.length
+  const next = pane.tabs[(i + (forward ? 1 : n - 1)) % n]
+  return activateTab(state, side, next)
+}
+
 /** Clicking anywhere in a pane focuses it. A pane that isn't there can't be. */
 export function focusPane(state: TabsState, side: PaneSide): TabsState {
   if (side === 'right' && state.right === null) return state

@@ -3530,6 +3530,23 @@ body.files-tree-resizing {
   padding: 0 0.75rem 0.5rem;
 }
 
+/* ...and no bottom padding either wherever the status bar (task 809) is pinned
+   to the bottom of the pane, for the mirror of that reason. A sticky box pins
+   against the scroll container's *content* box, and its own negative bottom
+   margin does not move that pin — so with 0.5rem of padding here the bar stopped
+   8px short of the pane's bottom edge and the scrolled file painted through the
+   strip below it, a half row of code shifting as you scroll, which reads as a
+   rendering bug rather than a design. Giving the padding up in this one context
+   is what makes "flush against the scrollport" true, on the short-file half as
+   much as the long-file half: `.files-content` is `min-height: 100%`, so it grows
+   by the same 0.5rem and the bar it ends with lands on the pane's edge whether it
+   got there by flow or by sticking. `:has()` rather than a class on the pane,
+   because the bar is the thing that knows — it is not rendered for a binary, an
+   image or a commit's diff, and those keep the padding. */
+.files-pane-body:has(.files-status-bar) {
+  padding-bottom: 0;
+}
+
 /* Open files, one row, scrolling sideways rather than wrapping — a wrapped
    strip changes height as tabs are opened, which moves the file underneath
    it. `flex: none` on the row keeps it out of the pane's height fight. */
@@ -3604,6 +3621,56 @@ body.files-tree-resizing {
 .files-tab-close:hover {
   opacity: 1;
   color: var(--red);
+}
+
+/* Unsaved changes, the editor convention (task 809): the dot sits where the ×
+   goes, and the × comes back on hover — or on focus-within, so the keyboard
+   route to closing a dirty tab is not hover-only. Both elements are always in
+   the DOM; only the swap is CSS. */
+.files-tab-dirty {
+  padding: 0 0.2rem;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--amber);
+}
+
+.files-tab.dirty .files-tab-close {
+  display: none;
+}
+
+.files-tab.dirty:hover .files-tab-dirty,
+.files-tab.dirty:focus-within .files-tab-dirty {
+  display: none;
+}
+
+/* `inline-block`, the value a <button> has by default — restoring the
+   element's own display, not picking a new one for it. */
+.files-tab.dirty:hover .files-tab-close,
+.files-tab.dirty:focus-within .files-tab-close {
+  display: inline-block;
+}
+
+/* No hover to reveal it with: show both, side by side, exactly as the tree's
+   `+` is made permanent at this tier (task 672). Without this the only route to
+   a dirty tab's × on a phone is to tap the label — which *activates* the tab —
+   and then tap again, and closing is the one control whose whole job is to be
+   there when the user wants to stop. Alt+W is not a phone answer. */
+@media (hover: none) {
+  .files-tab.dirty .files-tab-close {
+    display: inline-block;
+  }
+}
+
+/* The close prompt, under the strip and above the file. Wears
+   `.confirm-delete` as well, so the confirm/cancel pair matches every other
+   two-step confirmation in the app; this rule only places the row. */
+.files-close-confirm {
+  flex: none;
+  flex-wrap: wrap;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  font-size: 0.8rem;
 }
 
 /* The drop indicator: a rule in the gap the drop would insert at. Drawn on
@@ -3689,17 +3756,50 @@ body.files-tree-resizing {
    margins cancel the pane's 0.75rem gutters and the matching padding puts the
    space back inside the header, so scrolled content is covered edge to edge
    instead of peeking through the sides; the top gap is closed from the other
-   end, by the pane giving up its top padding (above). */
-.files-content-header {
+   end, by the pane giving up its top padding (above).
+
+   The sticky half moved here (task 809) when the find bar became a second row
+   of the same block: two separately sticky rows would each need `top` set to
+   the other's height, which nothing can know. One sticky box holding both
+   stacks them for free, and with the bar closed it holds only the header and
+   renders exactly as before. */
+/* The one file's column inside the scrolling pane body (task 809). A flex
+   column at least as tall as the scrollport, because that is what the status
+   bar at its end needs to be *pinned* rather than merely sticky: `position:
+   sticky` only engages while the containing block is taller than the
+   scrollport, so on a file shorter than the pane the bar would otherwise sit in
+   normal flow directly under the last line with dead pane below it — a status
+   bar that moves up and down with file length. `min-height: 100%` gives the
+   column the full scrollport whatever the file is, and the bar's own
+   `margin-top: auto` takes the slack; sticky then handles the long-file half.
+   The 0.5rem that used to be `.files-content-top`'s bottom margin is the
+   column's `gap`, so the auto margin cannot eat it. */
+.files-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 100%;
+  /* It carries `tabIndex={-1}` only so closing the find bar has somewhere to
+     hand focus back to (see `closeFind`); it is not a control, and a ring
+     traced around the whole pane would read as one. The affordance the user
+     needs is the file itself, which is already on screen. */
+  outline: none;
+}
+
+.files-content-top {
   position: sticky;
   top: 0;
   z-index: 2;
+  margin: 0 -0.75rem;
+}
+
+.files-content-header {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   font-family: var(--font-mono);
   font-size: 0.85rem;
-  margin: 0 -0.75rem 0.5rem;
+  margin: 0;
   padding: 0.5rem 0.75rem;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
@@ -3724,6 +3824,51 @@ body.files-tree-resizing {
 
 .files-edit-btn {
   font-size: 0.8rem;
+}
+
+/* Find in file (task 809): the second row of the sticky block above, so it
+   stays with the header instead of scrolling away from the matches it is
+   counting. Its own background and border, because the header's border-bottom
+   is now the divider between the two rows rather than the bottom of the
+   block. */
+.files-find-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Takes the row's slack so the counter and the buttons keep their size — and
+   `min-width: 0`, without which a flex item refuses to shrink below its
+   intrinsic width and pushes the close button off a narrow pane. */
+.files-find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.files-find-count {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.files-find-toggle {
+  flex: none;
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+}
+
+/* The two option toggles are stateful buttons, so pressed has to *look*
+   pressed — the accent the rest of the theme uses for "this is on". */
+.files-find-toggle[aria-pressed='true'] {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 8px var(--cyan-dim);
 }
 
 /* File history (task 542): a commit list pinned beside the file, inside the
@@ -3861,8 +4006,30 @@ body.files-tree-resizing {
   line-height: 1.4;
 }
 
+/* In the Files tab the editor IS the pane, so it takes the pane's height rather
+   than a fixed 60vh (task 809). The status bar under it is what made the
+   difference conspicuous: `.files-content` is a full-height flex column and the
+   bar takes its slack with `margin-top: auto`, so on any window taller than
+   60vh the Ln/Col readout sat at the pane's bottom edge with a band of empty
+   pane between it and the last line of the file — and the textarea's own inner
+   scrollbar nested inside the pane's. `flex: 1` hands that slack to the box the
+   bar is describing instead. `resize` goes with the height: a grabber that can
+   only fight the flex line is a dead affordance. `min-height` (from the rule
+   above) is what still holds the box open on the stacked/narrow tier, where the
+   pane is sized by its content rather than the window.
+
+   Scoped to this context rather than changed on the base rule: the Scripts
+   page's body box is one field of a form, not a pane, and there 18rem and a
+   resize grabber are exactly right. */
+.files-content > .files-editor-stack {
+  flex: 1;
+  height: auto;
+  resize: none;
+}
+
 .files-editor-stack .files-content-editor,
-.files-editor-highlight {
+.files-editor-highlight,
+.files-editor-find {
   position: absolute;
   inset: 0;
   margin: 0;
@@ -3872,11 +4039,36 @@ body.files-tree-resizing {
   line-height: inherit;
   tab-size: 4;
   white-space: pre;
+  /* All three reserve the same scrollbar strip, whether or not they show one.
+     Only the textarea scrolls, so on any platform with classic (space-taking)
+     scrollbars — Windows, most Linux, macOS with "Show scroll bars: Always" —
+     it alone would lose ~15px of content width to one. With `wrap="off"` that
+     cost nothing (nothing wraps), which is why `wrap="off"` could be called
+     load-bearing; with soft wrap on it means the textarea breaks a line a
+     character or two earlier than the layers do, and from that line down the
+     colours and the find marks sit a whole visual row off the caret. Reserving
+     the gutter on every layer is what keeps "aligned by construction" true in
+     both wrap modes rather than only on machines with overlay scrollbars. */
+  scrollbar-gutter: stable;
 }
 
 .files-editor-highlight {
   overflow: hidden;
   pointer-events: none;
+}
+
+/* The find layer (task 809): the same construction as the highlight layer
+   above and stacked directly on top of it, so a match's background sits over
+   the colours and under the caret. Its own glyphs are transparent — the text
+   is only there to put the marks in the right place, and the readable copy is
+   the coloured layer beneath. Not `z-index`ed: the gutter is (z-index: 1), so
+   it still paints over this, which is what keeps a highlight from sliding out
+   from under the numbers on a sideways scroll. */
+.files-editor-find {
+  overflow: hidden;
+  color: transparent;
+  pointer-events: none;
+  user-select: none;
 }
 
 /* PrismLight puts white-space/overflow inline on BOTH its <pre> and the
@@ -3897,6 +4089,12 @@ body.files-tree-resizing {
   resize: none;
   overflow: auto;
   background: transparent;
+}
+
+/* Only when a highlight layer is actually behind the textarea (a language we
+   carry a grammar for). Without one — the plain fallback — transparent text
+   would be no text at all. */
+.files-editor-stack.overlay .files-content-editor {
   /* The glyphs come from the layer behind; the caret and the selection
      highlight are the two things a textarea alone can still draw. */
   color: transparent;
@@ -3907,9 +4105,96 @@ body.files-tree-resizing {
    would blank the selected region instead of highlighting it, since the
    glyphs live in the layer underneath. Translucent, and keep the text
    transparent so those glyphs still read through. */
-.files-editor-stack .files-content-editor::selection {
+.files-editor-stack.overlay .files-content-editor::selection {
   background: rgba(0, 229, 255, 0.3);
   color: transparent;
+}
+
+/* Line numbers beside the editor (task 809): a third layer of the same stack,
+   pinned to the left edge and scrolled vertically in step with the textarea.
+   Opaque, so a sideways scroll slides the code *under* it instead of past it,
+   and `user-select: none` + `aria-hidden` so a copied selection is code and
+   nothing else.
+
+   Alignment is by construction rather than by measurement: the gutter is a
+   single <pre> of newline-joined numbers inheriting the stack's font metrics,
+   so its rows are laid out by the same pass as the code's. `.gutter` on the
+   stack is what makes room for it — one padding value shared by BOTH text
+   layers, since a padding that differed between them would shear the colours
+   off the caret. Absent under `.wrap` (see CodeEditor's comment: a wrapped
+   logical line is several visual rows, so the gutter is hidden, not guessed
+   at).
+
+   The width is derived from the widest number it has to hold rather than
+   fixed: `--files-gutter-digits` is set on the stack by `CodeEditor` from
+   `gutterDigits(lineCount)`. A fixed 3.25rem held about five digits, and
+   FILE_CONTENT_CAP is 256 KiB — ~130k lines of a log or a generated fixture,
+   six — and with `text-align: right` plus `overflow: hidden` the sixth digit is
+   clipped on the LEFT, so line 131072 read as "31072": not a visibly truncated
+   number but a plausible wrong one sitting beside the code. `1ch` is exact
+   here because the box is monospace, and BOTH this width and the text layers'
+   padding below are calculated from that one property, so the numbers and the
+   code cannot end up sized against different counts. */
+.files-editor-gutter {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 1;
+  width: calc(var(--files-gutter-digits, 4) * 1ch + 1rem);
+  margin: 0;
+  padding: 0 0.5rem;
+  overflow: hidden;
+  font: inherit;
+  line-height: inherit;
+  text-align: right;
+  white-space: pre;
+  color: var(--muted);
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  user-select: none;
+  pointer-events: none;
+}
+
+/* The gutter's own width plus a 0.75rem channel, from the same custom property
+   it is sized by — one number, so the code can never start under the numbers
+   however many digits they run to. */
+.files-editor-stack.gutter .files-content-editor,
+.files-editor-stack.gutter .files-editor-highlight,
+.files-editor-stack.gutter .files-editor-find {
+  padding-left: calc(var(--files-gutter-digits, 4) * 1ch + 1.75rem);
+}
+
+/* ...and the same number again as `scroll-padding`, which is what keeps the
+   CARET out from under the numbers. The padding above is part of the
+   scrollable content, not a reserved strip of the scrollport, so at any
+   `scrollLeft > 0` the leftmost visible column is real text — and the caret
+   reveal is the browser's own, which scrolls the minimum amount: holding
+   ArrowLeft back along a line longer than the pane parks the caret flush at
+   the padding-box edge, i.e. behind the opaque gutter, and the user then types
+   and deletes text they cannot see. `scroll-padding` is the one hook a UA
+   scroll-into-view offers for exactly this ("this band of the scrollport is
+   covered"), so it is stated here rather than chased in JS on every caret move.
+   Only the textarea scrolls, so only the textarea needs it — and it is the full
+   padding rather than the gutter's own width, so the caret arrives with the
+   0.75rem channel of code beside it that the find reveal also lands in. */
+.files-editor-stack.gutter .files-content-editor {
+  scroll-padding-left: calc(var(--files-gutter-digits, 4) * 1ch + 1.75rem);
+}
+
+/* Soft wrap (task 809). The textarea's own `wrap="soft"` is the authority on
+   where a line breaks; the highlight layer has to break identically or the
+   colours shear, so it takes the same two properties the browser's UA
+   stylesheet gives a textarea (`pre-wrap` + `break-word`) — and, wrapping, it
+   has nothing left to scroll sideways. Same !important reasoning as the
+   `white-space: pre` rules above: PrismLight sets these inline. */
+.files-editor-stack.wrap .files-content-editor,
+.files-editor-stack.wrap .files-editor-highlight,
+.files-editor-stack.wrap .files-editor-find,
+.files-editor-stack.wrap .files-editor-highlight pre,
+.files-editor-stack.wrap .files-editor-highlight .files-content-text {
+  white-space: pre-wrap !important;
+  overflow-wrap: break-word;
 }
 
 .badge.files-lang-badge {
@@ -3937,6 +4222,225 @@ body.files-tree-resizing {
   background: none;
   border: none;
   padding: 0;
+}
+
+/* The sideways scroll of a long line, kept inside the code box (task 809).
+   Vertical scrolling stays where it was — .files-pane-body, this box's height
+   being its content's — so the gutter and the code still scroll down together
+   for the reason below; only the horizontal axis is caught here.
+
+   It is caught because the pane's sticky bars pin on one axis only. `top`/
+   `bottom` sticky does nothing sideways, so once `.files-code-layout`'s
+   `max-content` width overflowed the pane, scrolling right slid the header
+   (path, badges, Edit/History/Download), the find bar and the status bar
+   leftwards out from under the code and eventually off screen, leaving bare
+   pane above and below the text — and in history mode it dragged the commit
+   list along too. Making them stick sideways as well is not the fix it looks
+   like: a sticky box is clamped to its containing block, so `.files-content`
+   would have to be `max-content` wide as well, and every other thing that
+   column holds — rendered markdown, the history layout, an error line — would
+   then be laid out at the width of the file's longest line, prose included.
+
+   Containing the scroll is also the smaller change: vsc-dark-plus's inline
+   `overflow: auto` on the Prism <pre> already did exactly this for every
+   highlighted file before the gutter existed, so this restores that for the
+   plain-text and gutter cases rather than inventing a behaviour. */
+.files-code-scroll {
+  overflow-x: auto;
+}
+
+/* Line numbers beside a read-only file (task 809). The gutter and the code are
+   two children of one row, and the numbers are one <pre> of the same font
+   metrics as the code, laid out by the same line-breaking pass — so vertical
+   alignment is not something this has to maintain.
+   `position: sticky; left: 0` keeps the gutter on screen while a long line
+   scrolls the code sideways underneath it (opaque, so the code goes under
+   rather than through). No gutter at all under `.wrap` — see CodeEditor's
+   comment: a wrapped logical line spans several visual rows, and a gutter of
+   logical numbers cannot follow it.
+
+   The metrics live HERE, on the row, and every box in it inherits them — the
+   same single-source rule `.files-editor-stack` follows, and for the same
+   reason: a font-size or line-height that differs between the code, the
+   numbers and the find layer shears them apart by a fraction of a line each
+   row, which is invisible at the top of a file and a full line wrong forty
+   lines down.
+
+   `width: max-content` is what keeps the sticky gutter pinned: a sticky item is
+   clamped to its containing block, so a row only as wide as the scroller would
+   let the gutter detach once the code is scrolled further right than that.
+   Sizing the row to its content makes the containing block as wide as the
+   widest line, and the column then holds for the whole sideways scroll. That is
+   also why `.files-code-scroll` above is a separate box and not this one: a
+   scroller's own children are clamped to *its* width, so the row that overflows
+   and the box that scrolls it cannot be the same element. `min-width: 100%` so
+   a short file's gutter border still runs the pane's full width. */
+.files-code-layout {
+  display: flex;
+  align-items: flex-start;
+  width: max-content;
+  min-width: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  /* Stated here for the same single-source reason as the metrics above, and
+     it is NOT covered by them: `font: inherit` on the Prism <pre> below resets
+     the font shorthand's own properties and nothing else, so a tab left to
+     itself paints 4 columns wide inside the highlighted code (vsc-dark-plus
+     puts `tab-size: 4` inline on that <pre>) and 8 in the gutter and the find
+     layer beside it. One tab of indentation then lands every highlight half a
+     word right of the text it belongs to, three tabs twelve columns — on
+     exactly the tab-indented files (Go, shell) a grammar is registered for.
+     4 is also the editor stack's value, so clicking Edit no longer reflows
+     every indented line to half its width and back again on Cancel. */
+  tab-size: 4;
+}
+
+/* Sized to its content, not to the pane: a long line must overflow so the pane
+   scrolls sideways, exactly as the bare <pre> did before the gutter existed.
+   `relative` is what the find layer below is positioned against — it must be
+   this box and not the pane, so the highlights travel with the code when the
+   pane scrolls either way. */
+.files-code-main {
+  position: relative;
+  flex: none;
+  padding-left: 0.5rem;
+}
+
+/* PrismLight puts vsc-dark-plus's `pre[class*="language-"]` block INLINE on the
+   <pre> it emits — including `font-size: 13px` and `line-height: 1.5` — and
+   `customStyle` only overrides margin/padding/background. A block container's
+   strut governs the height of every line box inside it, so those two inline
+   values, not the .files-content-text class on the nested <code>, decide how
+   tall a code line is. Left alone they make the code 19.5px per line while the
+   gutter and the find layer beside it are 17.92px: the numbers and the
+   highlights slide a line and a half up the file by row 40.
+
+   So the inline metrics are overridden back to the row's, which is what makes
+   "aligned by construction, never by measurement" true on the highlighted path
+   as well as the plain-text one. `!important` is load-bearing and not stylistic
+   — an inline style beats any class selector otherwise. Exactly the treatment
+   `.files-editor-highlight pre` already gives the editor's stack. */
+.files-code-main pre,
+.files-code-main .files-content-text {
+  font: inherit !important;
+  line-height: inherit !important;
+}
+
+/* Find matches over the read-only file (task 809): a second copy of the same
+   text, laid over the Prism output with its own glyphs invisible, so only the
+   <mark> backgrounds show through. Never spliced into Prism's markup — see
+   FileCode's comment for why that is the one approach that cannot corrupt the
+   colouring.
+
+   Alignment is by construction, exactly as in the editor's stack: identical
+   text, identical font metrics (.files-content-text on both), zero padding of
+   its own, and `padding: inherit` so it starts where the code starts under the
+   gutter's 0.5rem — nothing here is measured, so nothing can drift. */
+.files-find-layer {
+  position: absolute;
+  inset: 0;
+  padding: inherit;
+  color: transparent;
+  white-space: pre;
+  pointer-events: none;
+  user-select: none;
+}
+
+.files-find-hit {
+  color: transparent;
+  background: rgba(255, 180, 68, 0.28);
+}
+
+/* The one being stepped to, distinct from the rest at a glance — the same
+   cyan the theme uses everywhere for "the current thing". */
+.files-find-hit.current {
+  background: rgba(0, 229, 255, 0.45);
+}
+
+/* `font: inherit` rather than a second copy of the metrics: a <pre> has its own
+   UA font, and the row above is the one place they are stated. */
+.files-code-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  flex: none;
+  margin: 0;
+  padding: 0 0.5rem 0 0;
+  font: inherit;
+  line-height: inherit;
+  text-align: right;
+  white-space: pre;
+  color: var(--muted);
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  user-select: none;
+}
+
+/* Wrapped: the code takes the pane's width and breaks inside it, so there is
+   nothing to scroll sideways. !important because PrismLight sets white-space
+   inline on its own <pre>/<code>, beating any class selector. */
+.files-code-layout.wrap {
+  /* Not `max-content`: wrapped, the code takes the pane's width, and a row
+     sized to its longest unbroken run would scroll sideways anyway. */
+  width: auto;
+}
+
+.files-code-layout.wrap .files-code-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-left: 0;
+}
+
+.files-code-layout.wrap .files-content-text,
+.files-code-layout.wrap pre {
+  white-space: pre-wrap !important;
+  overflow-wrap: break-word;
+}
+
+/* The find layer breaks where the code breaks or the highlights land on the
+   wrong words — same two properties, same reason the editor's overlay takes
+   them. It is already covered by the `pre` selector above; spelled out so a
+   later edit to that rule cannot quietly drop it. */
+.files-code-layout.wrap .files-find-layer {
+  white-space: pre-wrap !important;
+  overflow-wrap: break-word;
+}
+
+/* The status bar (task 809): caret, line count, language, wrap toggle — pinned
+   to the bottom of the pane the way .files-content-header is pinned to its top.
+   NOT by the same mechanism, though, and that asymmetry is the whole rule: the
+   header sticks at the *start* of the flow, so it is on screen from the first
+   paint whatever the file's length, while a sticky *bottom* only engages once
+   the column outgrows the scrollport. `.files-content` is therefore a
+   full-height flex column and this takes the slack with `margin-top: auto`;
+   sticky is what carries the other half, when the file is long enough to
+   scroll. The negative side margins cancel the pane's 0.75rem gutters so it
+   spans edge to edge. Vertically there is nothing to cancel: the pane gives up
+   its bottom padding wherever this bar is rendered (`.files-pane-body:has()`
+   above), which is the only thing that makes the bar sit flush — a sticky box
+   pins against the scroll container's content box, and a negative bottom margin
+   here would not have moved that pin, only let the file peek through under an
+   apparently-flush bar. */
+.files-status-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: auto -0.75rem 0;
+  padding: 0.25rem 0.75rem;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.files-status-bar button {
+  margin-left: auto;
+  font-size: 0.75rem;
 }
 
 /* An image file shown as itself (task 801). The wrapper scrolls rather than

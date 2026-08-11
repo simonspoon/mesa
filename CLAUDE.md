@@ -95,11 +95,12 @@ The code is the source of truth. These are the invariants you must not break:
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
   (`agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
-  `fileImage`, `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
+  `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
+  `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
   `layout`, `markdownAssets`, `navCollapse`, `navOrder`, `navWidth`,
   `newFile`, `openFiles`, `pricingDraft`, `projectTree`, `sessionDetail`,
   `sessionGraph`, `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`,
-  `time`, `watchersDraft`) —
+  `time`, `watchersDraft`, `wordWrap`) —
   predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
   in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).

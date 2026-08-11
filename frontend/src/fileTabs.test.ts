@@ -7,6 +7,7 @@ import {
   clampRatio,
   closeTab,
   collapseSplit,
+  cycleTab,
   dropIndex,
   emptyTabsState,
   focusPane,
@@ -294,5 +295,45 @@ describe('focusPane', () => {
     const s = three()
     expect(focusPane(s, 'right')).toBe(s)
     expect(focusPane(split(), 'left').focused).toBe('left')
+  })
+})
+
+describe('cycleTab', () => {
+  it('steps forward and back through the strip', () => {
+    const s = three() // 'c.md' active, last of three
+    expect(cycleTab(s, 'left', false)!.left.active).toBe('b.ts')
+    expect(cycleTab(s, 'left', true)!.left.active).toBe('a.rs')
+  })
+
+  it('wraps at both ends rather than stopping', () => {
+    const first = activateTab(three(), 'left', 'a.rs')
+    expect(cycleTab(first, 'left', false)!.left.active).toBe('c.md')
+    expect(cycleTab(first, 'left', true)!.left.active).toBe('b.ts')
+  })
+
+  it('steps the named pane only, and focuses it', () => {
+    const s: TabsState = {
+      left: { tabs: ['a.rs', 'b.ts'], active: 'a.rs' },
+      right: { tabs: ['c.md', 'd.go'], active: 'c.md' },
+      focused: 'left',
+      ratio: DEFAULT_RATIO,
+    }
+    const next = cycleTab(s, 'right', true)!
+    expect(next.right!.active).toBe('d.go')
+    expect(next.left.active).toBe('a.rs')
+    expect(next.focused).toBe('right')
+  })
+
+  it('is a no-op with nothing to step to', () => {
+    expect(cycleTab(emptyTabsState(), 'left', true)).toBeNull()
+    expect(cycleTab(three(), 'right', true)).toBeNull() // unsplit
+    // A one-tab pane would wrap onto the tab already showing.
+    expect(cycleTab(split(), 'right', true)).toBeNull()
+  })
+
+  it('leaves a well-formed state', () => {
+    const s = cycleTab(three(), 'left', true)!
+    assertWellFormed(s)
+    expect(s.left.tabs).toEqual(['a.rs', 'b.ts', 'c.md'])
   })
 })

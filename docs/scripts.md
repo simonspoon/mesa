@@ -128,7 +128,22 @@ request/response record, the `HookRun` twin.
   plus one Command Palette destination. `pages/ScriptsView.tsx` is the list and
   editor; the body editor reuses the Files tab's overlay editor
   (`components/CodeEditor.tsx`, lifted out of `FilesView.tsx` rather than
-  forked) with the already-registered `sh` grammar.
+  forked) with the already-registered `sh` grammar. Reuse means **everything**
+  that component grows lands here too, and task 809 grew three things worth
+  knowing about on this page (`docs/files-tab.md`): the box now always renders
+  inside `.files-editor-stack` — here an 18rem, vertically resizable box with a
+  line-number gutter (this page overrides the stack's own 60vh: a form field is
+  not a pane, and the Files tab overrides it the other way, to the pane's
+  height) — where the no-grammar fallback used to be a bare
+  `<textarea>`; Tab/Shift+Tab/Enter/brackets are **editing keys** rather than
+  focus moves; and, because they are, **Escape arms the next Tab as a plain
+  focus move**. That last one is not a nicety on this surface: this box is one
+  field of a form whose Arguments editor sits below it, nothing here passes
+  `onCancel`, and a shell body is indented essentially everywhere — so without
+  the hatch there is no keyboard route from the body to the rest of the form at
+  all. Escape is otherwise unbound here, so arming it costs this page nothing.
+  There is still no status bar, no find bar and no `onSave` (Cmd/Ctrl+S stays
+  the browser's).
   `components/ScriptRunModal.tsx` wraps `components/ScriptRunPanel.tsx`,
   reusing the `.create-task-backdrop`/`.create-task-modal` classes so
   `keyboardScope.ts::shouldIgnoreShortcut` keeps working unchanged. The panel

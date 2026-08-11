@@ -1,15 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CSSProperties, DragEvent as ReactDragEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  CSSProperties,
+  DragEvent as ReactDragEvent,
+  RefObject,
+} from 'react'
 import { SyntaxHighlighter, vscDarkPlus, prismGrammar } from '../syntaxHighlighter'
 import {
   activateTab,
   closeTab,
   collapseSplit,
+  cycleTab,
   dropIndex,
   focusPane,
   moveTab,
   openFile,
   openPaths,
+  paneOf,
   setRatio,
   splitPane,
   splitWithTab,
@@ -17,6 +23,12 @@ import {
   type TabSource,
   type TabsState,
 } from '../fileTabs'
+import {
+  closeLabel,
+  dirtyPaths,
+  needsCloseConfirm,
+  tabLabel,
+} from '../fileDirty'
 import {
   clampFilesTreeWidth,
   clearFilesTreeWidth,
@@ -26,8 +38,30 @@ import {
   saveFilesTreeCollapsed,
   saveFilesTreeWidth,
 } from '../filesTreeWidth'
+import {
+  gutterText,
+  lineAtScroll,
+  lineCount,
+  normalizeNewlines,
+  offsetForLine,
+  viewerLineCount,
+  type CaretPosition,
+} from '../editorStatus'
+import {
+  anchorAfterStep,
+  boxNeedsReveal,
+  findMatches,
+  matchIndexFrom,
+  matchLabel,
+  scrollLeftForBox,
+  stepMatch,
+  type FindMatch,
+} from '../fileFind'
+import { shouldIgnoreFilesShortcut } from '../keyboardScope'
+import { loadWordWrap, saveWordWrap } from '../wordWrap'
 import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
-import { CodeEditor } from '../components/CodeEditor'
+import { CodeEditor, type CodeEditorHandle } from '../components/CodeEditor'
+import { FindLayer } from '../components/FindLayer'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
@@ -193,6 +227,12 @@ function DeadFolderPlaceholder({ path }: { path: string }) {
 interface FileUiState {
   editing: boolean
   draft: string
+  /** The file's bytes as they were when this draft started — and again after a
+   * successful save (task 809, slice 4). Kept beside the draft rather than
+   * compared against the fetched content, because the tab strip that has to
+   * paint the unsaved-changes dot lives two components above the only one
+   * holding that response: `fileDirty.ts` can answer from this pair alone. */
+  baseline: string
   historyOpen: boolean
   /** The commit shown as a diff in place of the content, if any. */
   selectedCommit: GitCommit | null
@@ -201,8 +241,45 @@ interface FileUiState {
 const BLANK_FILE_UI: FileUiState = {
   editing: false,
   draft: '',
+  baseline: '',
   historyOpen: false,
   selectedCommit: null,
+}
+
+/**
+ * The find bar's whole state (task 809, slice 3).
+ *
+ * Deliberately *not* part of `FileUiState`: a search is a question about the
+ * bytes on screen right now, not an edit that would be a bug to lose, so it
+ * dies with the mounted pane exactly as `saving` and `caret` do — the same
+ * split `FileUiState`'s own doc draws.
+ *
+ * `anchor` is where the search runs from — the caret when the bar was opened
+ * over the editor, the first line on screen over the viewer. Kept rather than
+ * re-read per keystroke so that growing the query walks *forward from where the
+ * user was*, instead of the result jumping about as the caret follows each new
+ * selection. It moves on exactly one event, a step (`anchorAfterStep`), because
+ * a step is the user saying "here is where I am now": without that, narrowing a
+ * query after walking five matches down the file teleports back to the top of
+ * the original search.
+ */
+interface FindState {
+  open: boolean
+  query: string
+  caseSensitive: boolean
+  wholeWord: boolean
+  /** Index into the current match list, or -1 for none. */
+  index: number
+  anchor: number
+}
+
+const BLANK_FIND: FindState = {
+  open: false,
+  query: '',
+  caseSensitive: false,
+  wholeWord: false,
+  index: -1,
+  anchor: 0,
 }
 
 /** The selected file's content: monospace, with a language-tinted header,
@@ -215,11 +292,22 @@ function ContentPane({
   path,
   ui,
   onUi,
+  wrap,
+  onWrapChange,
+  focused,
 }: {
   projectId: number
   path: string
   ui: FileUiState
   onUi: (patch: Partial<FileUiState>) => void
+  /** Soft wrap — one preference for the whole tab, owned by `FilesView` and
+   * persisted there, so both panes and every tab agree on it. */
+  wrap: boolean
+  onWrapChange: (wrap: boolean) => void
+  /** Whether this is the pane a Files-tab keystroke belongs to. Only it binds
+   * Cmd/Ctrl+F — in a split, both panes are mounted, and two find bars racing
+   * for one keystroke is the bug that scoping avoids. */
+  focused: boolean
 }) {
   const { data, error, refetch } = useFetch(
     () => getProjectFilesContent(projectId, path),
@@ -230,6 +318,304 @@ function ContentPane({
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  // The caret the status bar reports (task 809). Local, and not in
+  // `FileUiState`: it describes where one live textarea's cursor is, so it dies
+  // with the mounted editor exactly as `saving` does. A freshly opened editor
+  // autofocuses at offset 0, which is where this starts.
+  const [caret, setCaret] = useState<CaretPosition>({ line: 1, col: 1 })
+  // Find-in-file (task 809). Same lifetime as `caret` above, for the reason
+  // `FindState` sets out.
+  const [find, setFind] = useState<FindState>(BLANK_FIND)
+  const editorRef = useRef<CodeEditorHandle>(null)
+  const findInputRef = useRef<HTMLInputElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  // Armed by `reveal` in view mode and consumed by the effect that measures the
+  // mark — a flag rather than a dependency list, for the reason stated at both.
+  const pendingReveal = useRef(false)
+
+  // Everything below is computed before the early returns, because hooks are:
+  // `data` is still loading on the first renders, and a search over "" is a
+  // search with no matches, which is exactly the right answer then.
+  const searchText = ui.editing ? ui.draft : (data?.content ?? '')
+  // Where a search is even meaningful: over text this pane is showing *as
+  // text*. A binary or an image has no offsets; a commit's diff is another
+  // revision's bytes, not these; and a markdown file in view mode is rendered
+  // prose whose paragraphs no longer correspond to source offsets — there the
+  // key is deliberately left to the browser's own find, which works on exactly
+  // what is painted. In edit mode a markdown file is source again, so it is
+  // findable like anything else.
+  const findable =
+    data != null &&
+    !data.is_binary &&
+    !isImagePath(data.path) &&
+    ui.selectedCommit === null &&
+    (ui.editing || data.language !== 'markdown')
+  // Whether the bar is actually *up*, which is what every reader below wants —
+  // `find.open` alone is not it. The two part company on their own: cancelling
+  // an edit turns a markdown file back into rendered prose, which is not
+  // findable, and the flag would otherwise stay set behind a bar that is no
+  // longer rendered. Deriving it once is what keeps the render, the Escape
+  // routing and the highlights from each answering that question differently.
+  const findOpen = findable && find.open
+  // A closed bar searches for nothing, which is how the highlights go away
+  // without a second flag deciding whether to paint them.
+  const { matches, capped } = useMemo(
+    () =>
+      findMatches(searchText, findOpen ? find.query : '', {
+        caseSensitive: find.caseSensitive,
+        wholeWord: find.wholeWord,
+      }),
+    [searchText, findOpen, find.query, find.caseSensitive, find.wholeWord],
+  )
+  // Clamped rather than trusted: the list shrinks under the index every time
+  // the query grows a character.
+  const current =
+    matches.length === 0 ? -1 : Math.min(Math.max(find.index, 0), matches.length - 1)
+
+  /** Search for `next`'s query/options from `anchor` and land on a match.
+   *
+   * Recomputes rather than reading the render's `matches`, because every caller
+   * is changing one of the three inputs and needs the answer for the value it
+   * is *setting*, not the one on screen. `findMatches` is a linear scan of a
+   * string that is already in memory, so this is cheaper than the re-render it
+   * triggers. */
+  function runFind(next: FindState, forward: boolean) {
+    const { matches: found } = findMatches(searchText, next.query, next)
+    const index = matchIndexFrom(found, next.anchor, forward)
+    setFind({ ...next, index })
+    reveal(found[index])
+  }
+
+  /** Show a match. Editing, the editor does it; in view mode the work is the
+   * effect below, because the highlight to measure does not exist in the DOM
+   * until React has painted the new `current`.
+   *
+   * The viewer's half is therefore *armed* here rather than performed — a flag,
+   * the same shape as `CodeEditor`'s own `pendingReveal`, and for the same
+   * reason: a step is an event, and no value the effect could list reports one.
+   * `matches` is a fresh array on every keystroke, so listing it scrolled the
+   * pane back on every character typed; and `current` alone misses the
+   * legitimate no-op step — `(0 + 1) % 1 === 0`, Enter on a one-match file —
+   * which leaves the counter stepping while the view sits still, the exact
+   * failure the reveal exists to prevent.
+   *
+   * Focus stays in the query box on purpose: Enter has to keep stepping, and a
+   * textarea that grabbed the caret on every step would swallow the next
+   * character of the query. Closing the bar is what hands focus back
+   * (`closeFind`), with this selection already in place and ready to be typed
+   * over. */
+  function reveal(match: FindMatch | undefined) {
+    if (match === undefined) return
+    if (ui.editing) editorRef.current?.reveal(match.start, match.end)
+    else pendingReveal.current = true
+  }
+
+  function openFind() {
+    if (findOpen) {
+      // Cmd+F on an open bar is "let me retype that", the browser's own
+      // behaviour for its find bar. `select()` sets a selection range and does
+      // NOT move focus, so the focus call is half of it and not a belt-and-
+      // braces extra: the chord is deliberately allowed while the caret is in
+      // the code (`shouldIgnoreFilesShortcut`), which is the case where the
+      // characters typed next would otherwise land in the file.
+      findInputRef.current?.focus()
+      findInputRef.current?.select()
+      return
+    }
+    runFind({ ...find, open: true, anchor: findAnchor() }, true)
+  }
+
+  // ...and the same selection when the bar comes *up*, which is the reopen the
+  // branch above cannot reach: `closeFind` keeps the query, so the second
+  // Cmd/Ctrl+F re-mounts the box with the previous one in it, and `autoFocus`
+  // focuses without selecting — so typing appended (`foofoobar`) instead of
+  // replacing. Cmd+F-then-type is the reflex the whole bar is for, and it is
+  // the browser's own behaviour for its find bar. An effect rather than a call
+  // in `openFind`, because on a fresh open the input does not exist until React
+  // has rendered it.
+  useEffect(() => {
+    if (findOpen) findInputRef.current?.select()
+  }, [findOpen])
+
+  /** Where a fresh search starts from: what the user is looking at.
+   *
+   * Editing, that is the caret. Read-only there is no caret, so it is the first
+   * line still on screen — measured off the pane's own scroll, since the code
+   * and the scroller are both real elements here. Without it Cmd+F halfway down
+   * a 2,000-line file lands on the first match at the *top* of the file and
+   * `scrollIntoView` yanks the pane there, which is the opposite of what the
+   * key was pressed for.
+   *
+   * "On screen" means *readable*, so the sticky block's own height counts as
+   * scrolled-away too: `.files-content-top` covers the top of the scrollport
+   * (two rows of code, more once the find bar itself is up), and without
+   * subtracting it the anchor is the first line in the scrollport rather than
+   * the first line the user can see — which is how a fresh Cmd+F could anchor
+   * on, and land on, a match hidden behind the header.
+   *
+   * Anchored at 0 under soft wrap, and that is deliberate rather than a gap: a
+   * wrapped logical line is several visual rows, so pixels-scrolled ÷
+   * line-height counts rows and would overshoot into the file — the same reason
+   * the gutter is hidden and the editor's reveal is measured rather than
+   * calculated when wrap is on. Landing at the top is a worse anchor; landing
+   * past what you were reading is a wrong one. */
+  function findAnchor(): number {
+    if (ui.editing) return editorRef.current?.caretOffset() ?? 0
+    const content = contentRef.current
+    const code = content?.querySelector<HTMLElement>('.files-code-main')
+    // `.files-content` is the scrolling pane body's only child (`FilePane`), so
+    // its parent is the scrollport the line is or is not inside.
+    const port = content?.parentElement
+    if (wrap || content == null || code == null || port == null) return 0
+    const header = content.querySelector<HTMLElement>('.files-content-top')
+    const hidden =
+      port.getBoundingClientRect().top -
+      code.getBoundingClientRect().top +
+      (header?.offsetHeight ?? 0)
+    const line = lineAtScroll(hidden, parseFloat(getComputedStyle(code).lineHeight))
+    return offsetForLine(searchText, line)
+  }
+
+  function closeFind() {
+    setFind({ ...find, open: false, index: -1 })
+    // Focus has to land somewhere deliberate: the query box is unmounted while
+    // it holds the caret, and a control that disappears focused drops focus on
+    // `<body>` — Tab then restarts at the top of the page and Escape reads as
+    // having done nothing at all. Editing, the code is where it belongs, with
+    // the last match still selected in it and ready to be typed over. In view
+    // mode there is no control to hand it to, so the content column takes it
+    // (`tabIndex={-1}`, focusable only programmatically) and Tab carries on
+    // from the file the user was reading. `preventScroll` because this is a
+    // hand-back, not a reveal — the pane is already where the reader left it.
+    if (ui.editing) editorRef.current?.focus()
+    else contentRef.current?.focus({ preventScroll: true })
+  }
+
+  function stepFind(forward: boolean) {
+    const index = stepMatch(matches, current, forward)
+    // The anchor follows the step (`anchorAfterStep`): refining a query after
+    // walking to the 5th match must narrow *there*, not throw the user back to
+    // wherever the bar was opened. Only a step moves it — a fresh open still
+    // anchors on what is on screen.
+    setFind({ ...find, index, anchor: anchorAfterStep(matches, index, find.anchor) })
+    reveal(matches[index])
+  }
+
+  // The one keystroke the Files tab takes off the browser. Scoped three ways
+  // before it is claimed: this pane must be the focused one, the file must be
+  // findable at all, and `shouldIgnoreFilesShortcut` must agree the caret is not
+  // somewhere with a better claim (a task modal's field, the tree's naming
+  // row). `preventDefault` fires only after all three pass, so everywhere else
+  // in the app Cmd/Ctrl+F still opens the browser's own find.
+  //
+  // No dependency array: the handler closes over the live query and anchor, and
+  // listing them would be listing most of this component's state. One
+  // add/remove of one cheap listener per render is the smaller price.
+  useEffect(() => {
+    if (!focused || !findable) return
+    const onKey = (e: KeyboardEvent) => {
+      // Escape closes the bar from anywhere in view mode, not only from the
+      // query box: the option and step buttons are focusable, and clicking one
+      // used to leave the key answered by nothing at all. In edit mode the
+      // editor's own `onCancel` already routes it by precedence (find first,
+      // then discard) and this must not race that.
+      if (e.key === 'Escape' && findOpen && !ui.editing) {
+        if (shouldIgnoreFilesShortcut(e, 'find')) return
+        e.preventDefault()
+        closeFind()
+        return
+      }
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return
+      // Cmd/Ctrl+**Shift**+F is "find in files" everywhere it is bound, and on
+      // some setups a browser or extension chord — swallowing it to open the
+      // in-file bar is claiming a key this tab was never offered.
+      if (e.shiftKey) return
+      if (e.key !== 'f' && e.key !== 'F') return
+      if (shouldIgnoreFilesShortcut(e, 'find')) return
+      e.preventDefault()
+      openFind()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  })
+
+  // The viewer's scroll-into-view, consuming what `reveal` armed — no
+  // dependency list, for the reason spelled out there and in `CodeEditor`'s
+  // twin of this effect.
+  //
+  // *Vertically* this one can be a real `scrollIntoView`, unlike the editor's:
+  // the current match is a real element in the highlight layer, so the browser
+  // is the thing that knows where it ended up — no line arithmetic, and it is
+  // correct with soft wrap on as much as off. What the browser will not do is
+  // *not* scroll: `block: 'center'` re-centres unconditionally, so stepping
+  // between two matches a screenful apart threw the file by half a pane on every
+  // Enter while the editor, whose `scrollTopForBox` returns the scroll it was
+  // given for a box already in view, sat still on the same keystroke. Asking
+  // first (`boxNeedsReveal`) is what makes the two panes answer alike. The band
+  // it is asked about is not the scrollport: `.files-content-top` is pinned over
+  // its top and the status bar over its bottom, and a match painted under either
+  // is not one the reader can see — the vertical twin of the gutter lead-in
+  // below. `block: 'nearest'` is not that answer, since it would land the match
+  // flush at the scrollport's top edge, i.e. behind the header.
+  //
+  // Sideways it cannot be a `scrollIntoView` at all, and that is not a second
+  // answer to the same question but the one thing the call does not know:
+  // `.files-code-gutter` is `position: sticky` over the left edge of
+  // `.files-code-scroll`, and `inline: 'nearest'` aligns a match lying left of
+  // the current view flush to that edge — under the numbers, with the counter
+  // and the `.current` class both reporting success. It is the same overlay the
+  // editor's `scrollLeftForBox` lead-in exists for, so it is the same call: the
+  // scroller has a real `scrollLeft`, the gutter a real `offsetWidth` and
+  // `.files-code-main` the same 0.5rem channel past it the editor's computed
+  // `padding-left` already includes — so a match revealed from the left arrives
+  // with a column of code beside it in *both* panes, rather than abutting the
+  // numbers in one of them. Measured off rects rather than `offsetLeft` because
+  // the mark's offset parent is `.files-code-main`, one box in from the
+  // scroller.
+  useEffect(() => {
+    if (!pendingReveal.current) return
+    pendingReveal.current = false
+    const content = contentRef.current
+    const mark = content?.querySelector<HTMLElement>('.files-find-hit.current')
+    if (content == null || mark == null || !findOpen || ui.editing || current < 0) {
+      return
+    }
+    // `.files-content` is the scrolling pane body's only child (`FilePane`), so
+    // its parent is the scrollport the sticky bars are pinned inside.
+    const port = content.parentElement
+    const band = port?.getBoundingClientRect()
+    if (band !== undefined) {
+      const head = content.querySelector<HTMLElement>('.files-content-top')
+      const status = content.querySelector<HTMLElement>('.files-status-bar')
+      const box = mark.getBoundingClientRect()
+      if (
+        boxNeedsReveal(
+          box.top,
+          box.height,
+          band.top + (head?.offsetHeight ?? 0),
+          band.bottom - (status?.offsetHeight ?? 0),
+        )
+      ) {
+        mark.scrollIntoView({ block: 'center', inline: 'nearest' })
+      }
+    }
+    const scroller = mark.closest<HTMLElement>('.files-code-scroll')
+    if (scroller === null) return
+    const gutter = scroller.querySelector<HTMLElement>('.files-code-gutter')
+    const main = mark.closest<HTMLElement>('.files-code-main')
+    const channel = main === null ? 0 : parseFloat(getComputedStyle(main).paddingLeft)
+    // After the call above, so the rect is read against the scroll position it
+    // left behind rather than the one before it.
+    const box = mark.getBoundingClientRect()
+    const rect = scroller.getBoundingClientRect()
+    scroller.scrollLeft = scrollLeftForBox(
+      box.left - rect.left + scroller.scrollLeft,
+      box.width,
+      scroller.clientWidth,
+      scroller.scrollLeft,
+      (gutter?.offsetWidth ?? 0) + (Number.isFinite(channel) ? channel : 0),
+    )
+  })
 
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
@@ -246,16 +632,39 @@ function ContentPane({
     // area — entering edit mode closes history rather than trying to show a
     // textarea and a commit diff in the same pane.
     setSaveError(null)
+    // The editor autofocuses at offset 0, so the status bar must start there
+    // too rather than keeping a caret from a previous edit of this file.
+    setCaret({ line: 1, col: 1 })
+    // LF, whatever the file on disk uses: a textarea hands its value back
+    // LF-normalised, so a CRLF draft would not be offset-for-offset the string
+    // the browser reports — find would paint its highlights correctly and
+    // select a range one character per line early in the textarea underneath.
+    // See `normalizeNewlines`.
+    const content = normalizeNewlines(data!.content)
+    // A find running over the viewer was running over the file's bytes; the
+    // draft is those bytes LF-normalised, so in a CRLF file every offset the
+    // bar is holding is one character per preceding line too large. The bar
+    // stays up (source is findable), but its anchor and its index are answers
+    // about the other string — same reason the caret above is reset rather than
+    // carried.
+    setFind((f) => ({ ...f, index: -1, anchor: 0 }))
     onUi({
       historyOpen: false,
       selectedCommit: null,
-      draft: data!.content,
+      draft: content,
+      // The baseline the dirty dot is measured from: what is on disk right
+      // now, which is what this draft starts as.
+      baseline: content,
       editing: true,
     })
   }
 
   function cancelEdit() {
     setSaveError(null)
+    // The crossing back is the same offset problem as `startEdit`'s, in the
+    // other direction: the viewer searches the bytes on disk, the draft was
+    // LF-normalised.
+    setFind((f) => ({ ...f, index: -1, anchor: 0 }))
     onUi({ editing: false })
   }
 
@@ -264,7 +673,18 @@ function ContentPane({
     setSaveError(null)
     try {
       await updateProjectFilesContent(projectId, path, draft)
-      onUi({ editing: false })
+      // The draft *is* the file now, so the baseline moves onto it, which is
+      // what makes the tab read clean (`fileDirty.ts`: dirty is `editing &&
+      // draft !== baseline`).
+      //
+      // Edit mode deliberately STAYS open. Cmd/Ctrl+S is bound to this, and in
+      // every editor that chord is the every-thirty-seconds reflex pressed
+      // mid-thought — swapping the textarea for the viewer on each press drops
+      // the caret, the scroll and the find bar, and on a markdown file lands
+      // the user in rendered prose instead of the source they were editing. The
+      // Save button shares the binding's meaning rather than the other way
+      // round; Cancel is how edit mode is left.
+      onUi({ baseline: draft })
       refetch()
     } catch (e) {
       setSaveError(e instanceof ApiError ? e.message : 'Failed to save file.')
@@ -308,8 +728,20 @@ function ContentPane({
       value={draft}
       language={data.language}
       onChange={(next) => onUi({ draft: next })}
-      onCancel={cancelEdit}
+      // Escape means two things here, and which one it gets is not decided by
+      // focus: the bar's own box handles the key when the caret is in it, but
+      // stepping matches deliberately leaves the caret in the code, so the
+      // editor is where Escape usually lands while a find is running. With the
+      // bar up it therefore closes the bar; only once it is gone does the key
+      // discard the edit. The other order would let one keystroke throw away a
+      // whole draft as the answer to "I'm done searching".
+      onCancel={findOpen ? closeFind : cancelEdit}
       onSave={save}
+      wrap={wrap}
+      onCaret={setCaret}
+      matches={matches}
+      current={current}
+      ref={editorRef}
     />
   ) : isImagePath(data.path) ? (
     // Ahead of the binary branch, so the one image test covers both halves of
@@ -325,61 +757,88 @@ function ContentPane({
       projectId={projectId}
       path={data.path}
       content={data.content}
+      wrap={wrap}
     />
   ) : (
-    <FileCode content={data.content} language={data.language} />
+    <FileCode
+      content={data.content}
+      language={data.language}
+      wrap={wrap}
+      numbered
+      matches={matches}
+      current={current}
+    />
   )
 
   return (
-    <div className="files-content">
-      <p className={`files-content-header ${accentClass(data.language)}`}>
-        <span className="files-content-path">{data.path}</span>
-        {data.language !== null && (
-          <span className="badge files-lang-badge">{data.language}</span>
-        )}
-        {data.truncated && (
-          <span className="badge files-truncated-badge">truncated</span>
-        )}
-        {!editing && (
-          <span className="files-header-actions">
-            {editable && (
-              <button className="files-edit-btn" onClick={startEdit}>
-                Edit
+    // `tabIndex={-1}`: not in the tab order, but a place `closeFind` can put
+    // focus back when the bar it was in disappears (see there).
+    <div className="files-content" ref={contentRef} tabIndex={-1}>
+      {/* Header and find bar in one sticky block, so the bar cannot scroll
+          away from the file it is searching — two independently sticky rows
+          would have to agree on each other's height to stack. */}
+      <div className="files-content-top">
+        <p className={`files-content-header ${accentClass(data.language)}`}>
+          <span className="files-content-path">{data.path}</span>
+          {data.language !== null && (
+            <span className="badge files-lang-badge">{data.language}</span>
+          )}
+          {data.truncated && (
+            <span className="badge files-truncated-badge">truncated</span>
+          )}
+          {!editing && (
+            <span className="files-header-actions">
+              {editable && (
+                <button className="files-edit-btn" onClick={startEdit}>
+                  Edit
+                </button>
+              )}
+              <button
+                className="files-edit-btn"
+                onClick={() =>
+                  historyOpen ? closeHistory() : onUi({ historyOpen: true })
+                }
+              >
+                {historyOpen ? 'Hide history' : 'History'}
               </button>
-            )}
-            <button
-              className="files-edit-btn"
-              onClick={() =>
-                historyOpen ? closeHistory() : onUi({ historyOpen: true })
-              }
-            >
-              {historyOpen ? 'Hide history' : 'History'}
-            </button>
-            {/* Unlike Edit, offered for EVERY file — a binary or truncated
-             * file is exactly the case the viewer can show nothing useful
-             * for. A real <button> because the app's button chrome hangs off
-             * the `button` element selector in index.css; an <a download>
-             * would need all of it duplicated. */}
-            <button
-              className="files-edit-btn"
-              onClick={download}
-              disabled={downloading}
-            >
-              {downloading ? 'Downloading…' : 'Download'}
-            </button>
-          </span>
+              {/* Unlike Edit, offered for EVERY file — a binary or truncated
+               * file is exactly the case the viewer can show nothing useful
+               * for. A real <button> because the app's button chrome hangs off
+               * the `button` element selector in index.css; an <a download>
+               * would need all of it duplicated. */}
+              <button
+                className="files-edit-btn"
+                onClick={download}
+                disabled={downloading}
+              >
+                {downloading ? 'Downloading…' : 'Download'}
+              </button>
+            </span>
+          )}
+          {editing && (
+            <span className="files-edit-actions">
+              <button onClick={save} disabled={saving}>
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+              <button onClick={cancelEdit} disabled={saving}>
+                Cancel
+              </button>
+            </span>
+          )}
+        </p>
+        {findOpen && (
+          <FindBar
+            query={find.query}
+            caseSensitive={find.caseSensitive}
+            wholeWord={find.wholeWord}
+            label={matchLabel(current, matches.length, capped)}
+            inputRef={findInputRef}
+            onSearch={(patch) => runFind({ ...find, ...patch }, true)}
+            onStep={stepFind}
+            onClose={closeFind}
+          />
         )}
-        {editing && (
-          <span className="files-edit-actions">
-            <button onClick={save} disabled={saving}>
-              {saving ? 'Saving…' : 'Save'}
-            </button>
-            <button onClick={cancelEdit} disabled={saving}>
-              Cancel
-            </button>
-          </span>
-        )}
-      </p>
+      </div>
       {saveError && <p className="error">{saveError}</p>}
       {historyOpen ? (
         <div className="files-history-layout">
@@ -405,6 +864,191 @@ function ContentPane({
       ) : (
         body
       )}
+      {/* Not over a commit's diff: the bar describes the file on disk, and
+          beside another revision's diff its counts would be a lie. Not for a
+          binary or an image either — neither has lines. */}
+      {selectedCommit === null && !data.is_binary && !isImagePath(data.path) && (
+        <FileStatusBar
+          editing={editing}
+          caret={caret}
+          lines={editing ? lineCount(draft) : viewerLineCount(data.content)}
+          language={data.language}
+          wrap={wrap}
+          onWrapChange={onWrapChange}
+        />
+      )}
+    </div>
+  )
+}
+
+/** The pane's status bar (task 809): where the caret is, how long the file is,
+ * what language it is being read as, and the wrap toggle.
+ *
+ * The caret is shown only while editing, because that is the only state where
+ * there is one — a read-only `<pre>` has a selection at most, and a "Ln 1, Col
+ * 1" that never moved would read as a broken indicator rather than an absent
+ * one. The line count is the one the gutter beside it was built from, so the
+ * bar and the last number in the gutter can never disagree. */
+function FileStatusBar({
+  editing,
+  caret,
+  lines,
+  language,
+  wrap,
+  onWrapChange,
+}: {
+  editing: boolean
+  caret: CaretPosition
+  lines: number
+  language: string | null
+  wrap: boolean
+  onWrapChange: (wrap: boolean) => void
+}) {
+  return (
+    <div className="files-status-bar">
+      {editing && (
+        <span>
+          Ln {caret.line}, Col {caret.col}
+        </span>
+      )}
+      <span>
+        {lines} {lines === 1 ? 'line' : 'lines'}
+      </span>
+      <span>{language ?? 'plain text'}</span>
+      <button
+        type="button"
+        className="files-edit-btn"
+        aria-pressed={wrap}
+        onClick={() => onWrapChange(!wrap)}
+      >
+        Wrap: {wrap ? 'on' : 'off'}
+      </button>
+    </div>
+  )
+}
+
+/** Find-in-file's controls (task 809): the query box, the counter, the two
+ * option toggles and the step/close buttons.
+ *
+ * Presentational on purpose — it decides nothing. Which match is current, what
+ * the counter says and where the view scrolls to are all `fileFind.ts` and
+ * `ContentPane`; this component turns a keystroke into one `onSearch`/`onStep`
+ * call. That split is what lets the whole feature be unit-tested without
+ * rendering a component.
+ *
+ * Enter/Shift+Enter step rather than submit: there is no form here, and Enter
+ * is the one key every editor's find box binds. Escape closes, which is also
+ * the textarea's own discard binding — but the bar is a separate control, so a
+ * keystroke aimed at it never reaches the editor underneath.
+ *
+ * **Every button hands the caret back to the query box** (`refocus`), which is
+ * what keeps those two keys meaning what they say. Left alone, clicking `Aa`
+ * moves focus to that button, and the next Enter re-toggles case sensitivity
+ * instead of stepping — with Shift+Enter and Enter suddenly identical, and
+ * Escape answered by nothing. VS Code keeps the caret in the box for exactly
+ * this reason. The close button is the one exception: it is *leaving*, and the
+ * caret it hands back belongs to the editor (`closeFind`). */
+function FindBar({
+  query,
+  caseSensitive,
+  wholeWord,
+  label,
+  inputRef,
+  onSearch,
+  onStep,
+  onClose,
+}: {
+  query: string
+  caseSensitive: boolean
+  wholeWord: boolean
+  /** Already-formatted "n of N" / "No results" — the arithmetic is
+   * `matchLabel`'s, not this component's. */
+  label: string
+  /** Held by the parent so a second Cmd/Ctrl+F can re-select the query. */
+  inputRef: RefObject<HTMLInputElement | null>
+  /** Any change that re-runs the search from the anchor. */
+  onSearch: (patch: { query?: string; caseSensitive?: boolean; wholeWord?: boolean }) => void
+  onStep: (forward: boolean) => void
+  onClose: () => void
+}) {
+  /** Do the thing, then put the caret back where the typing goes. */
+  function refocus<T>(act: (arg: T) => void): (arg: T) => void {
+    return (arg) => {
+      act(arg)
+      inputRef.current?.focus()
+    }
+  }
+  return (
+    <div className="files-find-bar">
+      <input
+        autoFocus
+        ref={inputRef}
+        className="files-find-input"
+        value={query}
+        placeholder="Find"
+        spellCheck={false}
+        aria-label="Find in file"
+        onChange={(e) => onSearch({ query: e.target.value })}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            onStep(!e.shiftKey)
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault()
+            onClose()
+          }
+        }}
+      />
+      <span className="files-find-count">{label}</span>
+      {/* `aria-pressed` rather than a checkbox: these are toggle buttons in
+          every editor that has them, and a checkbox would need a label the
+          strip has no room for. */}
+      <button
+        type="button"
+        className="files-find-toggle"
+        aria-pressed={caseSensitive}
+        title="Match case"
+        onClick={refocus(() => onSearch({ caseSensitive: !caseSensitive }))}
+      >
+        Aa
+      </button>
+      <button
+        type="button"
+        className="files-find-toggle"
+        aria-pressed={wholeWord}
+        title="Whole word"
+        onClick={refocus(() => onSearch({ wholeWord: !wholeWord }))}
+      >
+        |ab|
+      </button>
+      <button
+        type="button"
+        className="files-find-toggle"
+        aria-label="Previous match"
+        title="Previous match (Shift+Enter)"
+        onClick={refocus(() => onStep(false))}
+      >
+        ↑
+      </button>
+      <button
+        type="button"
+        className="files-find-toggle"
+        aria-label="Next match"
+        title="Next match (Enter)"
+        onClick={refocus(() => onStep(true))}
+      >
+        ↓
+      </button>
+      <button
+        type="button"
+        className="files-find-toggle"
+        aria-label="Close find"
+        title="Close (Escape)"
+        onClick={onClose}
+      >
+        ×
+      </button>
     </div>
   )
 }
@@ -527,10 +1171,17 @@ function MarkdownBody({
   projectId,
   path,
   content,
+  wrap,
 }: {
   projectId: number
   path: string
   content: string
+  /** The tab's soft-wrap preference, threaded through for the frontmatter
+   * panel alone: the prose below it wraps whatever the toggle says, so a
+   * frontmatter block scrolling sideways beside it is one pane rendering under
+   * two wrap rules. It is still `numbered={false}` — an excerpt has no line
+   * numbers — which is the one thing that stays asked-for explicitly here. */
+  wrap: boolean
 }) {
   const { frontmatter, body } = splitFrontmatter(content)
   // A relative `![alt](img/x.png)` in a repo file means "beside this file", so
@@ -552,7 +1203,7 @@ function MarkdownBody({
       {frontmatter !== null && (
         <div className="files-frontmatter">
           <p className="files-frontmatter-label muted">Frontmatter</p>
-          <FileCode content={frontmatter} language="yaml" />
+          <FileCode content={frontmatter} language="yaml" wrap={wrap} />
         </div>
       )}
       <Markdown text={body} resolveImageSrc={resolveImageSrc} />
@@ -596,31 +1247,95 @@ function FileImageBody({
 
 /** Non-markdown file content: Prism-highlighted for a recognized language,
  * plain monospace text otherwise (unknown extension or a language our
- * highlighter build doesn't carry a grammar for). */
+ * highlighter build doesn't carry a grammar for).
+ *
+ * `numbered` puts a line-number gutter beside it (task 809) — asked for
+ * explicitly rather than always, because the same component also renders a
+ * markdown file's frontmatter panel, which is an excerpt rather than a file and
+ * has no line numbers to speak of. The gutter is dropped while `wrap` is on for
+ * the reason `CodeEditor` sets out: a soft-wrapped logical line is several
+ * visual rows, so logical numbers cannot stay beside it.
+ *
+ * Find matches are painted as their **own inert layer over untouched Prism
+ * output**, never spliced into it (task 809, slice 3). Prism's markup is a tree
+ * of nested spans whose text nodes cut across match boundaries at will, so
+ * inserting `<mark>`s into it by offset would mean rewriting somebody else's
+ * DOM and getting every boundary right — one mistake and the colouring is
+ * corrupt, silently and for that file only. A second `<pre>` of the same text
+ * with the same metrics, absolutely positioned over the first with transparent
+ * glyphs, cannot corrupt anything: the worst a bug in it can do is misplace a
+ * background. It is the same trick, and the same alignment rules, as the
+ * editor's highlight layer — which is the precedent this follows rather than
+ * invents — and it is the same `FindLayer` the editor stack mounts, so the two
+ * panes cannot come to disagree about what a highlight means. */
 function FileCode({
   content,
   language,
+  wrap = false,
+  numbered = false,
+  matches = [],
+  current = -1,
 }: {
   content: string
   language: string | null
+  wrap?: boolean
+  numbered?: boolean
+  /** Offsets into `content`, from `fileFind.ts`. Empty means no find is
+   * running, and no layer is rendered at all. */
+  matches?: FindMatch[]
+  /** Which of them is the one being stepped to, or -1. */
+  current?: number
 }) {
   const prismLanguage = prismGrammar(language)
-  if (prismLanguage === undefined) {
-    return <pre className="files-content-text">{content}</pre>
-  }
+  const code =
+    prismLanguage === undefined ? (
+      <pre className="files-content-text">{content}</pre>
+    ) : (
+      <SyntaxHighlighter
+        language={prismLanguage}
+        style={vscDarkPlus}
+        customStyle={{
+          margin: 0,
+          padding: 0,
+          background: 'transparent',
+        }}
+        codeTagProps={{ className: 'files-content-text' }}
+      >
+        {content}
+      </SyntaxHighlighter>
+    )
+  if (!numbered && !wrap && matches.length === 0) return code
   return (
-    <SyntaxHighlighter
-      language={prismLanguage}
-      style={vscDarkPlus}
-      customStyle={{
-        margin: 0,
-        padding: 0,
-        background: 'transparent',
-      }}
-      codeTagProps={{ className: 'files-content-text' }}
-    >
-      {content}
-    </SyntaxHighlighter>
+    // Two boxes, not one: the row is sized to the file's longest line (so the
+    // sticky gutter stays pinned across the whole sideways scroll) and this
+    // wrapper is what scrolls it. They cannot be the same element — a
+    // scroller's children are clamped to its own width — and the scroll has to
+    // be caught here rather than left to the pane, or the pane's sticky
+    // header/find bar/status bar, which pin vertically only, slide out from
+    // under the code. See `.files-code-scroll` in App.css.
+    <div className="files-code-scroll">
+      <div className={`files-code-layout${wrap ? ' wrap' : ''}`}>
+        {numbered && !wrap && (
+          // Built from the count a <pre> actually paints, and inert to the
+          // accessibility tree and to selection — copying the file must never
+          // copy its line numbers.
+          <pre className="files-code-gutter" aria-hidden="true">
+            {gutterText(viewerLineCount(content))}
+          </pre>
+        )}
+        <div className="files-code-main">
+          {code}
+          {matches.length > 0 && (
+            <FindLayer
+              className="files-find-layer files-content-text"
+              text={content}
+              matches={matches}
+              current={current}
+            />
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -865,6 +1580,7 @@ function TabStrip({
   focused,
   canSplit,
   mark,
+  dirty,
   onActivate,
   onClose,
   onSplit,
@@ -880,7 +1596,12 @@ function TabStrip({
   focused: boolean
   canSplit: boolean
   mark: DropMark | null
+  /** Paths with unsaved edits, from `fileDirty.ts` — the whole tab's set, not
+   * this strip's, since a path may be open in both. */
+  dirty: ReadonlySet<string>
   onActivate: (path: string) => void
+  /** *Requests* a close: a dirty tab's is answered by the confirm bar rather
+   * than by the tab going away (`FilesView.requestClose`). */
   onClose: (path: string) => void
   onSplit: () => void
   onDragBegin: () => void
@@ -930,11 +1651,13 @@ function TabStrip({
         <div
           key={path}
           data-file-tab=""
-          title={path}
+          title={tabLabel(path, dirty.has(path))}
           draggable
           className={`files-tab ${accentClass(languageOfName(basename(path)))}${
             path === active ? ' active' : ''
-          }${mark !== null && mark.side === side && mark.index === i ? ' drop-before' : ''}`}
+          }${dirty.has(path) ? ' dirty' : ''}${
+            mark !== null && mark.side === side && mark.index === i ? ' drop-before' : ''
+          }`}
           onDragStart={(e) => {
             dragging = { side, path }
             e.dataTransfer.effectAllowed = 'move'
@@ -958,14 +1681,27 @@ function TabStrip({
           <button
             type="button"
             className="files-tab-label"
+            // The visible text is the basename, which collides constantly; the
+            // accessible name is the full path plus, when it applies, the
+            // unsaved-changes state the dot beside it shows sighted users.
+            aria-label={tabLabel(path, dirty.has(path))}
             onClick={() => onActivate(path)}
           >
             {basename(path)}
           </button>
+          {/* The editor convention: a dirty tab wears a dot where its × goes,
+              and hovering (or tabbing into) the tab swaps the two back — CSS
+              alone, App.css, since both elements are always rendered and only
+              one is ever shown. */}
+          {dirty.has(path) && (
+            <span className="files-tab-dirty" aria-hidden="true">
+              ●
+            </span>
+          )}
           <button
             type="button"
             className="files-tab-close"
-            aria-label={`Close ${path}`}
+            aria-label={closeLabel(path, dirty.has(path))}
             onClick={() => onClose(path)}
           >
             ×
@@ -990,6 +1726,69 @@ function TabStrip({
   )
 }
 
+/**
+ * The prompt a dirty tab's close puts up instead of going away (task 809).
+ *
+ * Deliberately the house two-step pattern, not `window.confirm`: mesa's
+ * confirmations are inline and non-modal everywhere else, and a native dialog
+ * here would also be the only thing in the app able to block the render loop.
+ *
+ * It reuses `ConfirmDelete`'s *classes* (`.confirm-delete`/`.confirm-message`,
+ * the red confirm button) but not the component. `ConfirmDelete` owns its own
+ * trigger — a labelled `danger` button that arms on the first click — and takes
+ * an async `onDelete` whose rejection it renders. Here the trigger already
+ * exists (the tab's ×, plus middle-click and Alt+W, three ways into the same
+ * state), the armed state must survive being raised from any of them, and
+ * closing a tab is synchronous local state that cannot fail. Wrapping that in a
+ * component built to own a button and await a promise would mean fighting both
+ * halves of it.
+ *
+ * The wording names what is lost rather than asking a yes/no question, and the
+ * discarding button is the red one: this is the one place in the Files tab
+ * where a click destroys work that was never on disk.
+ */
+function CloseConfirmBar({
+  path,
+  onDiscard,
+  onCancel,
+}: {
+  path: string
+  onDiscard: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div
+      className="files-close-confirm confirm-delete"
+      role="alert"
+      // Escape is the universal cancel, and this is the one modal-ish prompt in
+      // the tab — without it the bar answered Enter (the autofocused "keep
+      // editing") and nothing else, since the find bar's document-level Escape
+      // is scoped to view mode. It resolves the safe way, so there is no
+      // precedence question with the editor underneath; the event is stopped
+      // all the same, because that editor's own Escape discards the draft this
+      // bar exists to protect.
+      onKeyDown={(e) => {
+        if (e.key !== 'Escape') return
+        e.preventDefault()
+        e.stopPropagation()
+        onCancel()
+      }}
+    >
+      <span className="confirm-message">
+        {basename(path)} has unsaved changes.
+      </span>
+      <button className="danger" onClick={onDiscard}>
+        discard and close
+      </button>
+      {/* Autofocused so the keyboard route in (Alt+W) has a keyboard route
+          back out, and so Enter answers the safe way. */}
+      <button autoFocus onClick={onCancel}>
+        keep editing
+      </button>
+    </div>
+  )
+}
+
 /** A tab strip over the pane's active file — or, with nothing open, the same
  *  empty state the single pane showed before tabs existed. */
 function FilePane({
@@ -1000,11 +1799,17 @@ function FilePane({
   focused,
   canSplit,
   mark,
+  dirty,
+  pendingClose,
   fileUi,
   onUi,
+  wrap,
+  onWrapChange,
   onFocus,
   onActivate,
   onClose,
+  onConfirmClose,
+  onCancelClose,
   onSplit,
   onDragBegin,
   onDragFinish,
@@ -1020,11 +1825,18 @@ function FilePane({
   focused: boolean
   canSplit: boolean
   mark: DropMark | null
+  dirty: ReadonlySet<string>
+  /** The path in *this* pane awaiting a discard/keep answer, if any. */
+  pendingClose: string | null
   fileUi: Map<string, FileUiState>
   onUi: (path: string, patch: Partial<FileUiState>) => void
+  wrap: boolean
+  onWrapChange: (wrap: boolean) => void
   onFocus: () => void
   onActivate: (path: string) => void
   onClose: (path: string) => void
+  onConfirmClose: () => void
+  onCancelClose: () => void
   onSplit: () => void
   onDragBegin: () => void
   onDragFinish: () => void
@@ -1046,6 +1858,7 @@ function FilePane({
         focused={focused}
         canSplit={canSplit}
         mark={mark}
+        dirty={dirty}
         onActivate={onActivate}
         onClose={onClose}
         onSplit={onSplit}
@@ -1055,6 +1868,16 @@ function FilePane({
         onDropOnStrip={onDropOnStrip}
         onDragLeaveStrip={onDragLeaveStrip}
       />
+      {/* Under the strip rather than over the file: it answers a click on a
+          tab, and pushing the content down is what makes it impossible to
+          miss. */}
+      {pendingClose !== null && (
+        <CloseConfirmBar
+          path={pendingClose}
+          onDiscard={onConfirmClose}
+          onCancel={onCancelClose}
+        />
+      )}
       <div className="files-pane-body">
         {active !== null ? (
           // Only the *active* tab of each pane is mounted, so a dozen open
@@ -1068,6 +1891,9 @@ function FilePane({
             path={active}
             ui={fileUi.get(active) ?? BLANK_FILE_UI}
             onUi={(patch) => onUi(active, patch)}
+            wrap={wrap}
+            onWrapChange={onWrapChange}
+            focused={focused}
           />
         ) : (
           <p className="muted">Select a file to see its content.</p>
@@ -1155,6 +1981,19 @@ export function FilesView({ projectId }: { projectId: number }) {
   const [treeCollapsed, setTreeCollapsed] = useState(loadFilesTreeCollapsed)
   const [treeResizing, setTreeResizing] = useState(false)
   const treeRef = useRef<HTMLDivElement>(null)
+  // Soft wrap (mesa task 809), persisted globally for the Files tab like the
+  // tree width above. Held here rather than per pane so a split, and every tab
+  // in it, reads code the same way — the toggle in one pane's status bar is a
+  // statement about the tab, not about that file.
+  const [wrap, setWrap] = useState(loadWordWrap)
+  // The tab whose close is waiting on a discard/keep answer (task 809, slice
+  // 4), or null. One at a time and identified by pane *and* path, since the
+  // same file can be open in both panes of a split and only one of the two
+  // closes is the one being asked about.
+  const [pendingClose, setPendingClose] = useState<{
+    side: PaneSide
+    path: string
+  } | null>(null)
   // Whether a tab drag is in flight at all — what arms the right-edge split
   // zone. Distinct from `mark`, which is only set while the pointer is over a
   // strip: leaving the strip for the edge clears the indicator but must not
@@ -1234,6 +2073,88 @@ export function FilesView({ projectId }: { projectId: number }) {
     }
   }, [treeResizing])
 
+  // Which open files hold work that is not on disk. Derived, never stored: it
+  // is a function of the drafts `fileUi` already carries, and a second copy
+  // would be a second thing to keep true.
+  const dirty = useMemo(() => dirtyPaths(fileUi), [fileUi])
+
+  // Warn on a real page unload while any tab is dirty — a reload or a close is
+  // the one exit this app cannot intercept and put a confirm bar in front of.
+  // Armed and disarmed by the effect's own lifetime rather than by a flag
+  // inside the handler, so a clean tab set genuinely has no listener attached
+  // (a permanently registered `beforeunload` is also what disables the
+  // browser's back/forward cache).
+  //
+  // Keyed on *whether* anything is dirty, not on the set: `fileUi` is a fresh
+  // `Map` per keystroke, so `dirty` is a fresh `Set` per character typed and
+  // listing it tore the listener down and put it back on every one of them —
+  // which is also the one window in which the claim above is false.
+  const anyDirty = dirty.size > 0
+  useEffect(() => {
+    if (!anyDirty) return
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      // The browser writes the prompt; a page-supplied string has been ignored
+      // for years. `preventDefault` is the whole API that is left.
+      e.preventDefault()
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [anyDirty])
+
+  // The Files tab's tab-management chords (task 809, slice 4).
+  //
+  // **Not Cmd/Ctrl+W.** That chord closes the browser tab and no page can
+  // intercept it — Chrome and Safari deliver it to the browser, not to the
+  // document — so binding it would ship a shortcut that works nowhere and
+  // loses the window. Alt+W is the closest thing that is actually the page's
+  // to take, and Alt+[ / Alt+] cycle, in place of Ctrl+Tab and
+  // Cmd/Ctrl+Shift+[ / ], which are browser-tab switching for the same reason.
+  //
+  // Matched on `e.code`, not `e.key`: Alt+W on macOS *is* the character `∑`,
+  // and Alt+[ is `“` — the physical key is the only stable thing about these.
+  // `preventDefault` fires only once a binding has actually decided to act, so
+  // an Alt chord this tab does nothing with still reaches whatever else wants
+  // it.
+  //
+  // Which is the trade, and it is paid in the editor: `shouldIgnoreFilesShortcut`
+  // deliberately does NOT stand down in `.files-content-editor` — closing or
+  // cycling the file you are editing is what these are for — so with the caret in
+  // the code `∑`, `“` and `‘` do not type. Alt is the only chord space this page
+  // owns (Cmd/Ctrl+W and Ctrl+Tab are the browser's), and a curly quote lost in a
+  // code editor is the smaller loss; `docs/keyboard.md` names it rather than
+  // claiming the characters survive everywhere. The find bar's own query box is
+  // the one control these stand down in (`'tabs'`, not `'find'`): closing or
+  // cycling a tab unmounts that input while it holds focus, and unlike
+  // `closeFind` there is nowhere to hand the caret — the pane that would take it
+  // is about to be remounted.
+  //
+  // No dependency array, for the same reason the find effect above has none:
+  // the handler closes over the live tabs and dirty set, and listing them is
+  // listing most of this component's state.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.altKey || e.metaKey || e.ctrlKey) return
+      const side = tabs.focused
+      if (e.code === 'KeyW') {
+        const active = paneOf(tabs, side)?.active
+        if (active == null || shouldIgnoreFilesShortcut(e, 'tabs')) return
+        e.preventDefault()
+        requestClose(side, active)
+        return
+      }
+      if (e.code !== 'BracketLeft' && e.code !== 'BracketRight') return
+      const forward = e.code === 'BracketRight'
+      // Asked before claiming the key: a pane with nothing to step to leaves
+      // the chord alone rather than swallowing it to do nothing.
+      if (cycleTab(tabs, side, forward) === null) return
+      if (shouldIgnoreFilesShortcut(e, 'tabs')) return
+      e.preventDefault()
+      commit((prev) => cycleTab(prev, side, forward))
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  })
+
   // Persist the open set (never `fileUi`). Every tabs write funnels through
   // `commit()`, so this one effect covers open/close/activate/focus/split/
   // move/ratio — no save calls sprinkled through the handlers.
@@ -1244,6 +2165,19 @@ export function FilesView({ projectId }: { projectId: number }) {
   // route moves between projects, so a stale selection from project A must
   // not leak into project B. Tabs are the one thing that *restores* rather
   // than empties — the new project's own remembered set, never A's.
+  //
+  // This drops any unsaved draft with it, unprompted, and so does leaving the
+  // Files tab (which unmounts this component). That is a real limit on what the
+  // dirty dot promises and it is deliberate rather than pending: by the time
+  // this runs the route has already moved, and the app has no navigation guard
+  // to hold it — the nav click is in another component and the tab strip's
+  // confirm bar belongs to a pane that is about to show project B's files.
+  // Carrying the drafts across instead would be worse: `fileUi` is keyed by a
+  // path relative to the project, so the same `src/main.rs` in two projects
+  // would inherit the other one's unsaved text. What the dot does cover is
+  // stated in docs/files-tab.md, and it is the three exits this component
+  // actually owns: the tab's ×, a middle-click, Alt+W — plus `beforeunload`
+  // for a reload or a window close.
   const [prevProject, setPrevProject] = useState(projectId)
   if (projectId !== prevProject) {
     setPrevProject(projectId)
@@ -1253,6 +2187,23 @@ export function FilesView({ projectId }: { projectId: number }) {
     setTreeOpen(true)
     setNewFileParent(null)
     setNewFileError(null)
+    setPendingClose(null)
+  }
+
+  // Drop a pending close whose reason has gone — the file was saved from the
+  // pane underneath the bar, the tab was dragged to the other pane, or the
+  // other pane opened the same file so closing this one discards nothing.
+  // Hiding the bar (which `paneProps` does by re-asking the same predicate) is
+  // NOT clearing it: `needsCloseConfirm` is not monotonic, so a tab that goes
+  // clean and then dirty again would re-mount a prompt nobody raised — and its
+  // "keep editing" button is autofocused, so it would pull the caret out of the
+  // code mid-keystroke. `requestClose` is the only thing that arms this, and
+  // this is the only thing that disarms it without an answer.
+  if (
+    pendingClose !== null &&
+    !needsCloseConfirm(tabs, pendingClose.side, pendingClose.path, dirty)
+  ) {
+    setPendingClose(null)
   }
 
   /**
@@ -1277,6 +2228,34 @@ export function FilesView({ projectId }: { projectId: number }) {
       for (const p of stale) fileUi.delete(p)
       return { tabs: next, fileUi }
     })
+  }
+
+  /**
+   * The one way a tab is closed — the × , a middle-click and Alt+W all land
+   * here (task 809, slice 4).
+   *
+   * `closeTab` discards the draft with the tab, deliberately and with no
+   * confirmation (`fileTabs.ts`, and the app's no-prompt posture generally).
+   * That is right for a clean tab and wrong for unsaved work, so this is the
+   * one close that stops to ask — and only when the answer matters:
+   * `needsCloseConfirm` says no for a clean tab, and no for a dirty file the
+   * other pane still holds, where nothing is discarded at all.
+   */
+  function requestClose(side: PaneSide, path: string) {
+    if (needsCloseConfirm(tabs, side, path, dirty)) {
+      setPendingClose({ side, path })
+      return
+    }
+    setPendingClose(null)
+    commit((prev) => closeTab(prev, side, path))
+  }
+
+  /** "discard and close" — the prompt's one destructive answer. */
+  function confirmClose() {
+    const pending = pendingClose
+    if (pending === null) return
+    setPendingClose(null)
+    commit((prev) => closeTab(prev, pending.side, pending.path))
   }
 
   function patchUi(path: string, patch: Partial<FileUiState>) {
@@ -1397,6 +2376,14 @@ export function FilesView({ projectId }: { projectId: number }) {
     setEdgeArmed(false)
   }
 
+  // Written through on every flip rather than in an effect: this is one
+  // deliberate click, and storage should carry exactly what the status bar
+  // shows.
+  function toggleWrap(next: boolean) {
+    setWrap(next)
+    saveWordWrap(next)
+  }
+
   if (error && !data) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
 
@@ -1426,11 +2413,26 @@ export function FilesView({ projectId }: { projectId: number }) {
       // something to show in the second pane.
       canSplit: !split && !narrow && pane.active !== null,
       mark,
+      dirty,
+      // Re-asked every render rather than trusted: the prompt must vanish by
+      // itself if its own reason does — the file gets saved from the pane
+      // underneath, the tab is dragged to the other pane, or the other pane
+      // opens the same file and closing this one stops discarding anything.
+      // The same predicate that raised it is the one that keeps it up.
+      pendingClose:
+        pendingClose?.side === side &&
+        needsCloseConfirm(tabs, side, pendingClose.path, dirty)
+          ? pendingClose.path
+          : null,
       fileUi,
       onUi: patchUi,
+      wrap,
+      onWrapChange: toggleWrap,
       onFocus: () => commit((prev) => focusPane(prev, side)),
       onActivate: (path: string) => commit((prev) => activateTab(prev, side, path)),
-      onClose: (path: string) => commit((prev) => closeTab(prev, side, path)),
+      onClose: (path: string) => requestClose(side, path),
+      onConfirmClose: confirmClose,
+      onCancelClose: () => setPendingClose(null),
       onSplit: () => commit(splitPane),
       onDragBegin: () => setDragActive(true),
       onDragFinish: endDrag,

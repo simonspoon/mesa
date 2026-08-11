@@ -13,6 +13,10 @@ Frontend-only — no CLI, API, or Rust surface.
 | `←` `↓` `↑` `→` | global | Same as `hjkl` |
 | `Enter` | global | Activates the focused element (native browser behavior) |
 | `Cmd/Ctrl+Shift+P` | global | Command palette — **pre-existing**, untouched |
+| `Cmd/Ctrl+F` | Files tab, focused pane, findable file | Opens find-in-file, selecting the remembered query (task 809) |
+| `Cmd/Ctrl+S` | Files tab editor | Saves the file, staying in the editor (and swallows Save Page) |
+| `Alt+W` | Files tab | Closes the focused pane's active tab |
+| `Alt+[` `Alt+]` | Files tab | Previous / next tab in the focused pane |
 
 `Enter` is deliberately *not* special-cased. Focus lands on real interactive
 elements, so the browser's own activation does the right thing: a link
@@ -60,6 +64,86 @@ those surfaces is focusable, so the keydown target never lands inside them.
 > `create-task` route left the panel mounted on a board route. Fixed by
 > making the sync two-way. If shortcuts ever go dead app-wide, check for a
 > stale backdrop first.
+
+## The chord sibling (`shouldIgnoreFilesShortcut`, task 809)
+
+`shouldIgnoreShortcut`'s **first** rule is "a modifier chord belongs to its
+existing owner", so it answers `true` for every chord by construction — a chord
+shortcut cannot consult it, and must not be the reason someone weakens it. The
+Files tab's chords therefore call a *sibling* export in the same file,
+**`shouldIgnoreFilesShortcut(e, chord)`**, so there is still exactly one module
+deciding which surface may claim a keystroke.
+
+One predicate for all four chords, not one each: they ask nearly the same
+question. It returns `true` (stand down) when a modal that owns its own keys is
+open (`.create-task-backdrop`, `.command-palette-backdrop` — rule 5 above, same
+classes) or when the caret is in a text control that is not the tab's own; the
+two that *do* claim these chords are `.files-content-editor` and
+`.files-find-input`. The `chord` argument (`'find'` | `'tabs'`, required, never
+defaulted) is the one place the four part company, and only on that second
+control: Cmd/Ctrl+F acts *in* the find bar's query box, while Alt+W and
+Alt+[ / ] act by tearing it down — the pane's active path changes,
+`ContentPane` remounts, and the input is unmounted while it holds focus, which
+drops focus on `<body>` (Tab restarts at the top of the page, Escape answers
+nothing). `closeFind` hands the caret on for exactly that reason and the tab
+chords have nothing to hand it to, the pane that would take it not existing yet,
+so they stand down there instead. Everything else about scoping is the caller's:
+the
+listeners live in `FilesView`/`ContentPane`, so they exist only while the tab
+is mounted, and Cmd/Ctrl+F additionally requires that pane to be the focused
+one — in a split, both are mounted and two find bars racing for one keystroke
+is the bug scoping avoids.
+
+**`preventDefault` fires only after a binding has decided to act**, which is
+what keeps the browser's own Cmd+F everywhere else and leaves an Alt chord this
+tab does nothing with (a one-tab pane's `Alt+]`) alone. The tab chords match on
+**`e.code`**, not `e.key`: Alt+W on macOS *is* the character `∑`.
+
+**Which is also the price, and it is paid in the editor.** On macOS Option+W,
+Option+`[` and Option+`]` are `∑`, `“` and `‘`, and the predicate deliberately
+lets these chords through in `.files-content-editor` — closing or cycling the
+file you are *editing* is the case they exist for. So with the caret in the code
+and something for the chord to do, those three characters do not type; with one
+tab open `Alt+[`/`Alt+]` stand down (nothing to cycle to) and `“`/`‘` type
+normally, so the behaviour depends on how many tabs are open. That is the trade
+rather than an oversight: Alt is the only chord space this page owns (Cmd/Ctrl+W
+and Ctrl+Tab are the browser's, below), and losing a curly quote in a code
+editor is the smaller loss. Elsewhere in the app — and in any other text control,
+where the predicate stands down — all three still type.
+
+**Cmd/Ctrl+W is deliberately not bound.** Chrome and Safari deliver it to the
+browser, not the document, so binding it would ship a shortcut that works
+nowhere and loses the window; Ctrl+Tab and Cmd/Ctrl+Shift+`[`/`]` are skipped
+for the same reason, which is why the bindings are Alt-based.
+
+Inside the editor itself, Tab/Shift+Tab/Enter/brackets are *editing* keys
+rather than shortcuts and never reach either predicate — `CodeEditor` returns
+before consulting `editorInput.ts` the moment any of `meta`/`ctrl`/`alt` is
+held, and before anything at all while an IME composition is in flight
+(`isComposing`, the keydown that commits a candidate). Escape is claimed by both
+the find bar and the editor and is resolved by
+precedence, not by focus: with the bar up Escape closes the bar, and only once
+it is gone does it discard the edit. In **view** mode there is no editor to
+route it, so the pane binds Escape at the document level while the bar is up —
+otherwise clicking one of the bar's own buttons left the key answered by
+nothing. The close-confirm bar (task 809, the tab's one modal-ish prompt) binds
+Escape on itself for the same reason it autofocuses "keep editing": both keys a
+user reaches for to dismiss a prompt have to resolve it, and both resolve it the
+safe way. It stops the event rather than letting it bubble, since the editor
+underneath answers Escape by discarding the very draft the bar is protecting.
+
+**Escape also arms the next Tab as a plain focus move**, in either mode and in
+every mount of this editor (`tabEscapeAfter`). Taking Tab away from the browser
+takes the last keyboard route out of an indented line with it — Shift+Tab falls
+through only once there is nothing left to dedent — which is a WCAG 2.1.2 trap,
+and worst on the Scripts page, where the same component is one field of a form
+and nothing binds Escape at all. Any other typed key disarms it, so a user who
+presses Escape and keeps typing never sees it.
+
+**Cmd/Ctrl+Shift+F is not this tab's.** The find binding excludes Shift: that
+chord is "find in files" everywhere it is bound and a browser/extension chord on
+some setups, and swallowing it to open the in-file bar would be claiming a key
+this tab was never offered.
 
 ## Focus candidates
 

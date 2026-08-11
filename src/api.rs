@@ -874,6 +874,12 @@ fn router(state: AppState) -> Router {
             "/api/cc/sessions/{session_id}/nodes/{node_id}/text",
             get(get_cc_node_text),
         )
+        // The same session read as a conversation, straight off the
+        // transcript — the Agent sidebar's chat view (task 814).
+        .route(
+            "/api/cc/sessions/{session_id}/chat",
+            get(get_cc_session_chat),
+        )
         // The one CC *write*: purge the stored telemetry and re-ingest from
         // the transcripts on disk. An explicit operator action (Settings →
         // Model pricing), never something a read can trigger — so it is a
@@ -4487,6 +4493,50 @@ async fn get_cc_node_text(
         crate::core::cc::node_text(&store, &session_id, &node_id)?
     };
     Ok(Json(text).into_response())
+}
+
+#[derive(Deserialize)]
+struct CcChatQuery {
+    /// Cap on turns, newest kept; defaults to `cc::CHAT_TURN_LIMIT`.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Returns one session's conversation (`CcSessionChat`) — the Agent sidebar's
+/// chat view (task 814).
+///
+/// **Does not sync**, unlike every other cc read here, and holds no store lock
+/// at all: `cc::session_chat` parses the transcript directly. That is what
+/// makes it safe to poll — a `sync` is a walk of every transcript on disk
+/// under the one store mutex, which is fine before an on-demand drill-down and
+/// not fine every 3 seconds behind an open pane — and it is also what lets the
+/// view answer for a session mesa spawned moments ago, before any ingest.
+///
+/// **Gate:** the router-wide `guard` layer, exactly like the graph and
+/// node-text routes beside it. The bodies it returns are the same bodies
+/// `GET …/nodes/{node_id}/text` already serves for the same session, in bulk
+/// rather than one at a time, so it is that route's population and posture —
+/// not a new class of exposure. Do not gate one of the three without the
+/// others.
+///
+/// Failure modes are typed `Error`s from the core and map through the shared
+/// `From<Error>`: an id that is not a session id → 422 `validation`, no
+/// transcript on disk for it → 503 `unavailable`.
+async fn get_cc_session_chat(
+    Path(session_id): Path<String>,
+    Query(q): Query<CcChatQuery>,
+) -> ApiResult<Response> {
+    // Clamp: `limit` is arbitrary caller input and the response is linear in
+    // the turns it serializes — the same reason the graph route clamps.
+    let limit = q
+        .limit
+        .unwrap_or(crate::core::cc::CHAT_TURN_LIMIT)
+        .min(2_000);
+    let chat =
+        tokio::task::spawn_blocking(move || crate::core::cc::session_chat(&session_id, limit))
+            .await
+            .map_err(|e| Error::Unavailable(format!("reading the transcript failed: {e}")))??;
+    Ok(Json(chat).into_response())
 }
 
 /// Returns one session's aggregate detail (`CcSessionDetail`) — the default

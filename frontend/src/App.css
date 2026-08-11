@@ -3041,6 +3041,236 @@ body.files-tree-resizing {
   cursor: grabbing;
 }
 
+/* ---- agent pane: term/chat view switch + the chat view (task 814) ---- */
+
+/* The header's right-hand group. `.agent-terminal-header` is a
+   space-between row, so without this wrapper a second control would be
+   spread across the header instead of sitting beside `close`. */
+.agent-sidebar-pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex: none;
+}
+
+.agent-pane-view-toggle {
+  display: inline-flex;
+}
+
+.agent-pane-view-toggle button {
+  background: rgba(6, 10, 16, 0.85);
+  font-size: 0.7rem;
+  padding: 0.05rem 0.4rem;
+  color: var(--muted);
+}
+
+/* The two halves read as one control: only the outer corners round, and the
+   shared edge is drawn once. */
+.agent-pane-view-toggle button:first-child {
+  border-radius: 3px 0 0 3px;
+}
+
+.agent-pane-view-toggle button:last-child {
+  border-radius: 0 3px 3px 0;
+  border-left: none;
+}
+
+.agent-pane-view-toggle button.active {
+  color: var(--amber);
+  border-color: var(--amber);
+  box-shadow: 0 0 8px rgba(255, 180, 68, 0.25);
+}
+
+.agent-pane-view-toggle button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Both views occupy the same box. The inactive terminal is only made
+   invisible (never `display: none`) so its measured size — and therefore
+   xterm's fit and the attach socket's scrollback — survives a switch; see
+   `PaneBody`. */
+.agent-pane-views {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.agent-pane-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.agent-pane-view.hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.agent-chat {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  background: var(--bg);
+}
+
+.agent-chat-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.agent-chat-hint,
+.agent-chat-truncated {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  margin: 0;
+  text-align: center;
+}
+
+/* Full-width rows, NOT left/right-aligned bubbles. Two reasons, one of them
+   a bug: a pane is routinely 400-600px wide, where alternating alignment
+   spends most of the width on empty gutter; and a shrink-to-fit flex item
+   whose content sets `overflow-wrap: anywhere` can be sized at its
+   min-content — one character per line — which is exactly what a short
+   prompt did. The two sides are told apart by their accent instead, the same
+   warm/cool split the CC timeline's prompt and response rows use. */
+.agent-chat-bubble {
+  align-self: stretch;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  min-width: 0;
+}
+
+/* The human turn is the spine a reader scans a session by — it has to stay
+   findable while scrolling past a few hundred tool rows, so it is the one
+   that is raised and brightly accented. */
+.agent-chat-prompt {
+  border-left-color: var(--cyan);
+  background: var(--panel-raised);
+}
+
+.agent-chat-response {
+  border-left-color: var(--amber);
+  background: var(--panel);
+}
+
+.agent-chat-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.agent-chat-who {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.agent-chat-prompt .agent-chat-who {
+  color: var(--cyan);
+}
+
+.agent-chat-response .agent-chat-who {
+  color: var(--amber);
+}
+
+.agent-chat-clock {
+  margin-left: auto;
+}
+
+/* Transcript prose carries bare URLs and long paths that no soft-wrap
+   opportunity would break — the same reason `.inbox-body` sets it. */
+.agent-chat-body {
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+/* A run of tool calls: the agent working between two things it said. Muted
+   and collapsible, because it is context for the conversation, not the
+   conversation. */
+.agent-chat-tools {
+  align-self: stretch;
+  border-left: 2px solid var(--border);
+  padding-left: 0.5rem;
+}
+
+.agent-chat-tools-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0.1rem 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.agent-chat-tools-head:hover {
+  color: var(--text);
+}
+
+.agent-chat-caret {
+  flex: none;
+}
+
+.agent-chat-tools-count {
+  flex: none;
+  color: var(--text);
+}
+
+.agent-chat-tools-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chat-tool {
+  display: flex;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  padding: 0.05rem 0;
+  min-width: 0;
+}
+
+.agent-chat-tool-name {
+  flex: none;
+  color: var(--text);
+}
+
+.agent-chat-tool-target {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Divider between two adjacent children of one split node — drag to resize
    their relative share. Same straddle-the-border trick as the sidebar's
    own width handle. Shape/cursor is orientation-specific (below): a column

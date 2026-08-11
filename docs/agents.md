@@ -333,6 +333,55 @@ already use.
     Either gesture reuses the same per-leaf sortable drop targets — `over`
     is always another leaf's id, in whichever split it lives in, no
     separate `useDroppable` surface for the edge case.
+- **Every pane has two views: `term` and `chat`** (mesa task 814). `term` is
+  the attached terminal — the original, still the default, and the only one you
+  can type into. `chat` is the *same* session rendered as a conversation:
+  human prompts and assistant replies as markdown bubbles, with each run of
+  tool calls between them collapsed into one muted, expandable block. A
+  terminal is a screen buffer — it cannot be scrolled back past its scrollback,
+  searched, or read on a phone; the chat view is the same session as text.
+  - **Data: `GET /api/cc/sessions/{sessionId}/chat`** (`docs/cc-dashboard.md`
+    → *Session chat*), polled at 3s. That route reads the transcript file
+    directly — no ingest, no store lock — which is what makes it pollable and
+    what lets a session mesa spawned seconds ago have a chat view at all.
+  - **Two ids, and this is the one place both are needed.** A pane is keyed by
+    the short **background job id** (all `claude attach` takes), while a
+    transcript is keyed by the **session id**. The session list is the only
+    place they are carried together, so `sessionIdFor` resolves one from the
+    other and the `chat` button is **disabled** (with the reason in its title)
+    for a pane whose session has dropped out of the list.
+  - **The terminal is hidden, never unmounted, while chat is showing** — the
+    same choice, for the same reason, as the sidebar's own collapse below:
+    `display: none` would zero the pty's measured box, so xterm would refit to
+    nothing and the attach socket's scrollback would come back reflowed. Both
+    views are absolutely positioned over one area, and the inactive terminal is
+    `visibility: hidden`, so it keeps its real size. The **chat** is the
+    opposite: it owns no connection, so it *is* unmounted when not showing, and
+    while the whole sidebar is collapsed it stops polling — nobody polls a view
+    nobody can see, the same rule the session-list poll follows.
+  - The view mode lives in `AgentSidebar` state keyed by pane id, not in the
+    pane component and not on the tree leaf: a pane is remounted by any
+    reparent (a drag-to-edge split, a cross-split move, an auto-tile rebuild),
+    so pane-local state would snap back to the terminal on a layout change.
+    Closed panes keep their key, so reopening a session restores the view it
+    was last read in.
+  - **Untrusted text, rendered as markup — deliberately, and narrowly.** Every
+    body here is model-authored transcript text, which the CC surfaces
+    otherwise render only as a text child or a `title`. The chat view is the
+    one place it becomes formatted output, because that *is* the feature. It
+    is safe by construction, not by sanitizing: the shared `Markdown`
+    component passes **no raw HTML** through (there is no `rehype-raw`, so
+    embedded markup renders as inert text), react-markdown strips unsafe URL
+    schemes, links carry `rel="noreferrer"`, and `resolveImageSrc` is wired to
+    refuse **every** image — so an `![](https://tracker/…)` in a transcript can
+    never make the browser issue a request. Tool names and targets stay plain
+    text children. Do not add `rehype-raw` here, and do not resolve images.
+  - Pure logic (turn grouping, the tool-run summary, the clock, the
+    follow-the-tail predicate) is `frontend/src/agentChat.ts`, vitest-covered
+    per CLAUDE.md's frontend-test rule; `AgentChat.tsx` is a thin renderer over
+    it. The chat auto-scrolls to the newest turn **only while the reader is
+    already near the bottom**, so scrolling up to read something older is never
+    yanked back by the next poll.
 - **Collapse never unmounts anything.** `collapsed` (default `true`) toggles
   a CSS class on the `<aside>`; the list and any attached terminal stay
   mounted underneath, hidden via `visibility: hidden` on the inner

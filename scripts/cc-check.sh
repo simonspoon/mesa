@@ -658,6 +658,97 @@ assert d["error"]["code"]=="unavailable", d
 ' || fail "cc text on a deleted transcript did not return error.code=unavailable"
 echo "cc text: deleted transcript -> unavailable ok"
 
+# ---- cc chat: the conversation, read straight off the transcript ----
+#
+# Its own project/session, written AFTER the last `cc sync` above and never
+# ingested: that is the point of the fixture, not an accident. `cc chat` is the
+# one cc verb that opens no store and runs no sync, because it backs a poll
+# behind an open Agent-sidebar pane and must answer for a session mesa spawned
+# moments ago. If it ever grows a sync, this session would be the only thing
+# still proving it hasn't.
+#
+# The lines exercise the whole classification: a human turn, an assistant turn
+# carrying prose AND two calls, an `isMeta` injection whose content is an array
+# of text blocks (the shape an assistant turn has — it must NOT read as one),
+# a tool_result carrier, and a subagent transcript that belongs to another
+# reader entirely.
+mkdir -p "$TMP/tree/-chat-project/cx/subagents"
+cat > "$TMP/tree/-chat-project/cx.jsonl" <<'JSONL'
+{"type":"user","uuid":"cp1","sessionId":"cx","timestamp":"2026-06-21T02:00:00.000Z","cwd":"/home/me/chat","origin":{"type":"human"},"message":{"role":"user","content":"CHAT-PROMPT-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat CHAT-PROMPT-TAIL"}}
+{"type":"user","uuid":"cmeta","sessionId":"cx","timestamp":"2026-06-21T02:00:01.000Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}]}}
+{"type":"assistant","uuid":"cm1","sessionId":"cx","timestamp":"2026-06-21T02:00:02.000Z","cwd":"/home/me/chat","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"thinking","thinking":"THINKING-NEVER-SHOWN"},{"type":"text","text":"CHAT-RESPONSE-HEAD lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip CHAT-RESPONSE-TAIL"},{"type":"tool_use","id":"ct_1","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","id":"ct_2","name":"advisor","input":{}}]}}
+{"type":"user","uuid":"cres","sessionId":"cx","timestamp":"2026-06-21T02:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ct_1","content":"ok"}]}}
+JSONL
+cat > "$TMP/tree/-chat-project/cx/subagents/a.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"cs1","isSidechain":true,"sessionId":"cx","agentId":"cg1","timestamp":"2026-06-21T02:00:04.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"SUBAGENT-PROSE"}]}}
+JSONL
+
+# Never ingested (no `cc sync` since the file was written) — and the answer is
+# still complete, which no other cc verb can say.
+"$BIN" cc sessions | python3 -c '
+import json,sys
+assert not [s for s in json.load(sys.stdin) if s["session_id"]=="cx"], "cx must not be ingested yet"
+' || fail "the cc chat fixture was ingested before the no-sync assertion"
+
+"$BIN" cc chat cx >"$TMP/chat-cli" || fail "cc chat cx exited nonzero"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/chat-cli"))
+for k in ["session_id","turns","truncated"]:
+    assert k in d, f"missing key {k}"
+assert d["session_id"]=="cx" and d["truncated"] is False, d
+shape=[(t["kind"], t["id"]) for t in d["turns"]]
+# An injected `user` line, a tool_result carrier and a subagent transcript all
+# produce nothing; one assistant line emits its prose BEFORE its own calls.
+assert shape==[("prompt","cp1"),("response","cm1"),("tool","ct_1"),("tool","ct_2")], shape
+p,r,t1,t2=d["turns"]
+assert p["text"].startswith("CHAT-PROMPT-HEAD") and p["text"].endswith("CHAT-PROMPT-TAIL"), p["text"][:40]
+assert p["model"] is None and p["name"] is None, p
+# Prose is the product here: full body, not the 200-char stored preview.
+assert len(r["text"])>200 and r["text"].endswith("CHAT-RESPONSE-TAIL"), r["text"][-40:]
+assert "THINKING-NEVER-SHOWN" not in r["text"], "thinking must be excluded"
+assert r["model"]=="claude-opus-4-8" and r["ts"]=="2026-06-21T02:00:02.000Z", r
+# A tool turn is the bounded one-line summary, not the whole input.
+assert t1["name"]=="Bash" and t1["text"]=="cargo test", t1
+assert t2["name"]=="advisor" and t2["text"]=="", t2
+assert "SUBAGENT-PROSE" not in json.dumps(d), "a subagent transcript is not this conversation"
+print("cc chat: turn classification and full bodies ok")
+' || fail "cc chat did not classify the transcript correctly"
+
+# --limit keeps the NEWEST turns and says so: a chat window is read at its end.
+"$BIN" cc chat cx --limit 2 | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert [t["id"] for t in d["turns"]]==["ct_1","ct_2"], d["turns"]
+assert d["truncated"] is True, d
+print("cc chat: --limit keeps the newest turns ok")
+' || fail "cc chat --limit did not keep the newest turns"
+
+# An id that is not a session id never becomes a path: refused before any
+# filesystem access, and as `validation` rather than `unavailable`.
+if "$BIN" cc chat ../../etc/passwd >"$TMP/chat-422" 2>&1; then
+  fail "cc chat on a traversal-shaped id should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/chat-422"))
+assert d["error"]["code"]=="validation", d
+' || fail "cc chat on a traversal-shaped id did not return error.code=validation"
+echo "cc chat: non-session id -> validation ok"
+
+# A well-formed id with no transcript on disk is `unavailable` — the code
+# scoped to depending on a Claude-Code-managed file, the same one `cc text`
+# uses for a deleted transcript.
+if "$BIN" cc chat no-such-session >"$TMP/chat-503" 2>&1; then
+  fail "cc chat on a session with no transcript should have exited nonzero"
+fi
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/chat-503"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "cc chat on a missing transcript did not return error.code=unavailable"
+echo "cc chat: missing transcript -> unavailable ok"
+
 # Unknown session is not_found (exit 1), never an empty graph — an empty graph
 # is a real answer for a session that made no calls.
 if "$BIN" cc graph no-such-session >"$TMP/graph-err" 2>&1; then
@@ -887,6 +978,41 @@ d=json.load(open("'"$TMP"'/text-http-503"))
 assert d["error"]["code"]=="unavailable", d
 ' || fail "api cc text: deleted transcript did not return error.code=unavailable"
 echo "api cc text: 404 / 422 / 503 split ok"
+
+# ---- cc chat over HTTP: same payload as the CLI, plus its two statuses ----
+curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/cx/chat" >"$TMP/chat-http" \
+  || fail "GET /api/cc/sessions/{id}/chat failed"
+python3 -c '
+import json
+h=json.load(open("'"$TMP"'/chat-http")); c=json.load(open("'"$TMP"'/chat-cli"))
+# One `core` reader, two surfaces: the same object, not merely a similar one.
+assert h==c, (h,c)
+print("api cc chat: payload matches the CLI ok")
+' || fail "GET /api/cc/sessions/{id}/chat did not match the CLI payload"
+
+curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/cx/chat?limit=2" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert [t["id"] for t in d["turns"]]==["ct_1","ct_2"] and d["truncated"] is True, d
+print("api cc chat: ?limit= ok")
+' || fail "GET /api/cc/sessions/{id}/chat?limit= did not bound the turns"
+
+STATUS=$(curl -s -o "$TMP/chat-http-422" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/not%20a%20session/chat")
+[ "$STATUS" = "422" ] || fail "api cc chat: bad session id expected 422, got $STATUS ($(cat "$TMP/chat-http-422"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/chat-http-422"))
+assert d["error"]["code"]=="validation", d
+' || fail "api cc chat: bad session id did not return error.code=validation"
+
+STATUS=$(curl -s -o "$TMP/chat-http-503" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/no-such-session/chat")
+[ "$STATUS" = "503" ] || fail "api cc chat: missing transcript expected 503, got $STATUS ($(cat "$TMP/chat-http-503"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/chat-http-503"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "api cc chat: missing transcript did not return error.code=unavailable"
+echo "api cc chat: 422 / 503 split ok"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

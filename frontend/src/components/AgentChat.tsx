@@ -1,0 +1,129 @@
+import { useLayoutEffect, useRef, useState } from 'react'
+import { getCcSessionChat } from '../api'
+import { useFetch } from '../useFetch'
+import { Markdown } from './Markdown'
+import {
+  chatClock,
+  chatGroups,
+  chatToolLabel,
+  chatToolSummary,
+  isNearBottom,
+} from '../agentChat'
+import type { CcChatTurn } from '../types/CcChatTurn'
+
+/**
+ * An agent pane's **chat view** (task 814): the same session the pane's
+ * terminal is attached to, rendered as a conversation instead of as the
+ * terminal's own ANSI redraw. What a reader wants from a running agent — what
+ * they asked, what it replied, what it is doing — is prose and a list, not a
+ * screen buffer, and a terminal cannot be scrolled back, searched or read on a
+ * phone the way this can.
+ *
+ * Data: `GET /api/cc/sessions/{id}/chat`, polled while the pane is showing
+ * this view. The route reads the transcript file directly (no ingest), so it
+ * answers for a session started seconds ago and costs no db work. Nobody polls
+ * for a view nobody can see: this component only exists while its pane is in
+ * chat mode, `paused` stops the poll while the whole sidebar is collapsed (the
+ * same rule the session-list poll follows), and `useFetch` skips ticks while
+ * the tab is hidden.
+ *
+ * **Untrusted text.** Every body here is model-authored transcript text
+ * (`docs/cc-dashboard.md`: data, never instructions). It is rendered through
+ * `Markdown`, which passes **no raw HTML** through — there is no `rehype-raw`,
+ * so embedded markup renders as inert text — and `resolveImageSrc` is wired to
+ * refuse every image, so a transcript can never make the browser fetch a
+ * remote URL. Tool names and targets render as plain text children only.
+ */
+export function AgentChat({ sessionId, paused }: { sessionId: string; paused: boolean }) {
+  const { data, error } = useFetch(
+    () => getCcSessionChat(sessionId),
+    `agent-chat-${sessionId}`,
+    { pollMs: paused ? undefined : 3000 },
+  )
+  const scrollRef = useRef<HTMLDivElement>(null)
+  // Whether the reader is following the tail. Starts true so the first render
+  // lands at the newest turn; goes false the moment they scroll up to read
+  // something older, so the next poll never yanks them back down.
+  const followRef = useRef(true)
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  // Layout effect, not an effect: scroll after the DOM has the new turns but
+  // before paint, so a poll never shows a frame at the old offset.
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (el && followRef.current) el.scrollTop = el.scrollHeight
+  }, [data])
+
+  if (error !== null && data === null)
+    return (
+      <div className="agent-chat agent-chat-empty">
+        <p>No transcript for this session yet.</p>
+        <p className="agent-chat-hint">{error}</p>
+      </div>
+    )
+  if (data === null) return <div className="agent-chat agent-chat-empty">loading…</div>
+
+  const groups = chatGroups(data.turns)
+  return (
+    <div
+      className="agent-chat"
+      ref={scrollRef}
+      onScroll={(e) => {
+        const el = e.currentTarget
+        followRef.current = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
+      }}
+    >
+      {data.truncated && (
+        <p className="agent-chat-truncated">Older turns are not shown.</p>
+      )}
+      {groups.length === 0 && (
+        <p className="agent-chat-hint">This session has not said anything yet.</p>
+      )}
+      {groups.map((g) =>
+        g.kind === 'tools' ? (
+          <div key={g.id} className="agent-chat-tools">
+            <button
+              type="button"
+              className="agent-chat-tools-head"
+              aria-expanded={!collapsed[g.id]}
+              onClick={() => setCollapsed((c) => ({ ...c, [g.id]: !c[g.id] }))}
+            >
+              <span className="agent-chat-caret">{collapsed[g.id] ? '▸' : '▾'}</span>
+              <span className="agent-chat-tools-count">{g.turns.length} step{g.turns.length === 1 ? '' : 's'}</span>
+              <span className="agent-chat-tools-summary">{chatToolSummary(g.turns)}</span>
+            </button>
+            {!collapsed[g.id] &&
+              g.turns.map((t) => (
+                <div key={t.id} className="agent-chat-tool" title={chatToolLabel(t)}>
+                  <span className="agent-chat-tool-name">{t.name ?? 'tool'}</span>
+                  <span className="agent-chat-tool-target">{t.text}</span>
+                </div>
+              ))}
+          </div>
+        ) : (
+          <Bubble key={g.id} kind={g.kind} turn={g.turns[0]} />
+        ),
+      )}
+    </div>
+  )
+}
+
+/** One side of the conversation. */
+function Bubble({ kind, turn }: { kind: 'prompt' | 'response'; turn: CcChatTurn }) {
+  const clock = chatClock(turn.ts)
+  return (
+    <div className={`agent-chat-bubble agent-chat-${kind}`}>
+      <div className="agent-chat-meta">
+        <span className="agent-chat-who">{kind === 'prompt' ? 'you' : 'agent'}</span>
+        {turn.model && <span className="agent-chat-model">{turn.model}</span>}
+        {clock && <span className="agent-chat-clock">{clock}</span>}
+      </div>
+      <div className="markdown-body agent-chat-body">
+        {/* `resolveImageSrc` returning null for every source is what stops an
+            `![](https://tracker/…)` in transcript text from making the browser
+            issue a request; the alt text renders as inert muted prose. */}
+        <Markdown text={turn.text} resolveImageSrc={() => null} />
+      </div>
+    </div>
+  )
+}

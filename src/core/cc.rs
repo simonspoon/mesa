@@ -46,6 +46,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,11 +58,11 @@ use super::store::{
     CcSessionRecord, CcSessionUpsert, CcToolCallRow, Error, Result, Store,
 };
 use super::types::{
-    CcAgentStat, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
-    CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview,
-    CcProjectStat, CcSessionBucket, CcSessionDetail, CcSessionGraph, CcSessionModelStat,
-    CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat,
-    CcTokens, CcToolStat,
+    CcAgentStat, CcChatTurn, CcChatTurnKind, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode,
+    CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText,
+    CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket, CcSessionChat, CcSessionDetail,
+    CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat,
+    CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -119,7 +120,16 @@ struct RawLine {
 /// The `origin` block of a `user` line. Only its `type` is read.
 #[derive(Deserialize)]
 struct RawOrigin {
-    #[serde(rename = "type", default)]
+    /// Upstream has spelled this key **both** ways: `type` when the block was
+    /// introduced (v2.1.187), `kind` on current releases (observed on
+    /// v2.1.227, task 814). Read both, because the miss is silent and total —
+    /// an `origin` object whose one key mesa doesn't know deserializes to
+    /// `Some(RawOrigin { kind: None })`, which is not "no origin" (the branch
+    /// that falls back to the prefix list) but "origin says not-human", so
+    /// EVERY human turn of every session is rejected and `cc_prompts` quietly
+    /// stops recording. Found by live QA of the chat view, whose whole left
+    /// side was missing.
+    #[serde(rename = "type", alias = "kind", default)]
     kind: Option<String>,
 }
 
@@ -2617,6 +2627,182 @@ fn scan_for_body(bytes: &[u8], ident: &NodeIdent) -> Option<String> {
     None
 }
 
+// ---- session chat (the Agent sidebar's rendered view, task 814) ----
+
+/// Default cap on the turns one [`session_chat`] call returns, newest kept.
+pub const CHAT_TURN_LIMIT: usize = 200;
+
+/// How much of a transcript's **tail** [`session_chat`] parses. A transcript
+/// reaches tens of megabytes (21 MB, measured on the real corpus) and this
+/// read is a 3-second poll behind an open chat pane, so parsing whole files
+/// would burn CPU proportional to session age on every tick. A window bounds
+/// that cost by *bytes read* — which is the cost — where the turn limit alone
+/// could not: dropping turns after parsing them saves nothing.
+///
+/// 2 MiB is far more than the `CHAT_TURN_LIMIT` turns the answer keeps, so on
+/// any transcript below it the window is invisible and the file is read whole.
+const CHAT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// One session's conversation, read **live from its transcript file** rather
+/// than from the `cc_*` tables (task 814) — the third and last read to do so,
+/// beside [`live`] and [`node_text`], and for both of their reasons at once:
+/// the newest turns of a running session are younger than any ingest, and the
+/// bodies a chat window renders were deliberately never stored (a stored
+/// preview is 200 sanitized characters).
+///
+/// Consequently it takes no [`Store`] and runs no [`sync`] — a full tree walk
+/// under the API's store lock is not something a poll may do — and it answers
+/// for a session mesa spawned moments ago that has never been ingested.
+///
+/// `session_id` is caller input and is used to *build* a path, so it is
+/// validated to the id charset first ([`Error::Validation`]) and the result
+/// still goes through [`transcript_path`]. A session with no transcript on
+/// disk is [`Error::Unavailable`] — the code already scoped to "the row is
+/// fine, the Claude-Code-managed file is not".
+///
+/// Turns come out in **file order**, which is chronological: a transcript is
+/// append-only. Within one assistant line the prose is emitted before that
+/// line's tool calls — the same `response`-before-`tool` rule
+/// [`session_graph`] applies at an equal timestamp.
+pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::Validation(format!("not a session id: {session_id}")));
+    }
+    let path = find_transcript(session_id).ok_or_else(|| {
+        Error::Unavailable(format!("no transcript on disk for session {session_id}"))
+    })?;
+    let path = transcript_path(&path.to_string_lossy())?;
+    let (text, windowed) = read_tail(&path)?;
+
+    let mut turns = chat_turns(&text);
+    let dropped = turns.len().saturating_sub(limit);
+    if dropped > 0 {
+        turns.drain(..dropped);
+    }
+    Ok(CcSessionChat {
+        session_id: session_id.to_string(),
+        turns,
+        truncated: windowed || dropped > 0,
+    })
+}
+
+/// Fold one transcript's text into ordered chat turns. Split out from
+/// [`session_chat`] so the whole line-classification policy — which lines are
+/// a human turn, which are the assistant's, which are neither — is unit
+/// testable against literal transcript lines rather than only through a file.
+fn chat_turns(text: &str) -> Vec<CcChatTurn> {
+    let mut turns: Vec<CcChatTurn> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
+        // A subagent's turns belong to its own transcript and its own reader;
+        // the same main-thread-only rule `cc_prompts` keeps. (Sidechain lines
+        // are not written to this file, so this is a guard, not a filter.)
+        if raw.is_sidechain == Some(true) {
+            continue;
+        }
+        let Some(uuid) = raw.uuid.clone() else {
+            continue;
+        };
+        if let Some(text) = human_prompt_raw(&raw) {
+            turns.push(CcChatTurn {
+                id: uuid,
+                kind: CcChatTurnKind::Prompt,
+                ts: raw.timestamp.clone(),
+                model: None,
+                name: None,
+                text,
+            });
+            continue;
+        }
+        // Assistant turns are read off `type` rather than off the shape of
+        // `message`, which is not enough on its own: Claude Code writes its
+        // own injections (a skill body, hook output, a caveat banner) as
+        // `user` lines whose content is an array of `text` blocks — exactly
+        // what `assistant_text_raw` reads — so a shape test alone renders an
+        // injected skill body as something the assistant said.
+        if raw.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = raw.message.as_ref() else {
+            continue;
+        };
+        if let Some(text) = msg.assistant_text_raw() {
+            turns.push(CcChatTurn {
+                id: uuid,
+                kind: CcChatTurnKind::Response,
+                ts: raw.timestamp.clone(),
+                model: msg.model.clone(),
+                name: None,
+                text,
+            });
+        }
+        for (id, name, _caller, target) in msg.tool_uses() {
+            turns.push(CcChatTurn {
+                id,
+                kind: CcChatTurnKind::Tool,
+                ts: raw.timestamp.clone(),
+                model: None,
+                name: Some(name),
+                // Bounded on purpose: a chat row says *that* a call happened
+                // and what it acted on. The whole input is `cc text`'s job.
+                text: target.unwrap_or_default(),
+            });
+        }
+    }
+    turns
+}
+
+/// The main-thread transcript of `session_id`: `<projects_dir>/*/<id>.jsonl`.
+///
+/// The project slug is unknown here — it encodes the session's cwd, which the
+/// caller does not hold — so every slug directory is probed for the file, the
+/// same shape `agents::live_subagents` uses for the same reason. It is one
+/// `stat` per slug directory (98 on the real corpus), not a tree walk.
+fn find_transcript(session_id: &str) -> Option<PathBuf> {
+    let root = projects_dir()?;
+    let file = format!("{session_id}.jsonl");
+    for entry in fs::read_dir(&root).ok()?.flatten() {
+        let candidate = entry.path().join(&file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The last [`CHAT_TAIL_BYTES`] of `path` as text, plus whether the window
+/// actually cut anything. A cut lands mid-line, so the first (partial) line is
+/// dropped — losing at most one turn that a caller was told is truncated
+/// anyway. Lossy UTF-8 for the same reason the parsers elsewhere are lenient:
+/// one bad byte must not blank a whole conversation.
+fn read_tail(path: &Path) -> Result<(String, bool)> {
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len <= CHAT_TAIL_BYTES {
+        let mut buf = Vec::with_capacity(len as usize);
+        f.read_to_end(&mut buf)?;
+        return Ok((String::from_utf8_lossy(&buf).into_owned(), false));
+    }
+    f.seek(SeekFrom::Start(len - CHAT_TAIL_BYTES))?;
+    let mut buf = Vec::with_capacity(CHAT_TAIL_BYTES as usize);
+    f.read_to_end(&mut buf)?;
+    let start = buf
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(buf.len(), |i| i + 1);
+    Ok((String::from_utf8_lossy(&buf[start..]).into_owned(), true))
+}
+
 // ---- small helpers ----
 
 /// What a persisted message row is counted *under* when summing usage: its
@@ -3921,6 +4107,18 @@ mod tests {
             .as_deref(),
             Some("add a prompts row to the timeline")
         );
+        // …and the key upstream renamed it to. Both spellings are live in the
+        // corpus, and reading only one rejects every human turn written by the
+        // other (task 814) — not "no origin", which would fall back to the
+        // prefix list and accept this.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"kind":"human"},
+                    "message":{"content":"add a prompts row to the timeline"}}"#
+            )
+            .as_deref(),
+            Some("add a prompts row to the timeline")
+        );
         // An array of text blocks flattens the same way, in order.
         assert_eq!(
             prompt_of(
@@ -4805,6 +5003,127 @@ mod tests {
         assert!(
             matches!(refused, Err(Error::Validation(_))),
             "a path outside the transcript root must be refused, not read"
+        );
+    }
+
+    // ---- session chat (task 814) ----
+
+    /// One transcript, exercising every classification the chat read makes:
+    /// a human turn, an assistant turn carrying prose *and* two calls, one
+    /// injected `user` line that must not read as an assistant turn, one
+    /// `tool_result` carrier, and a sidechain line from a subagent.
+    const CHAT_LINES: &str = concat!(
+        r#"{"type":"user","uuid":"p1","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","origin":{"type":"human"},"message":{"role":"user","content":"ship it"}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"m1","sessionId":"s","timestamp":"2026-08-01T10:00:01.000Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-08-01T10:00:02.000Z","message":{"id":"msg_1","model":"claude-opus-5","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"On it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","id":"t2","name":"advisor","input":{}}]}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"r1","sessionId":"s","timestamp":"2026-08-01T10:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"sa1","isSidechain":true,"agentId":"g1","sessionId":"s","timestamp":"2026-08-01T10:00:04.000Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"subagent prose"}]}}"#,
+        "\n",
+        "not json at all\n",
+    );
+
+    #[test]
+    fn chat_turns_classify_a_transcript() {
+        let turns = chat_turns(CHAT_LINES);
+        let shape: Vec<(CcChatTurnKind, &str)> =
+            turns.iter().map(|t| (t.kind, t.id.as_str())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (CcChatTurnKind::Prompt, "p1"),
+                (CcChatTurnKind::Response, "a1"),
+                (CcChatTurnKind::Tool, "t1"),
+                (CcChatTurnKind::Tool, "t2"),
+            ],
+            "an injected `user` line, a tool_result carrier, a sidechain line \
+             and an unparseable line all produce no turn — and one assistant \
+             line emits its prose BEFORE its own calls"
+        );
+
+        assert_eq!(turns[0].text, "ship it");
+        assert_eq!(turns[0].model, None, "a human turn has no model");
+
+        // The response body is the prose only: `thinking` is excluded exactly
+        // as it is from a stored preview.
+        assert_eq!(turns[1].text, "On it.");
+        assert_eq!(turns[1].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(turns[1].ts.as_deref(), Some("2026-08-01T10:00:02.000Z"));
+
+        // A tool turn carries the tool's name and the bounded target; a call
+        // whose input has no summarizable key still appears, with none.
+        assert_eq!(turns[2].name.as_deref(), Some("Bash"));
+        assert_eq!(turns[2].text, "cargo test");
+        assert_eq!(turns[3].name.as_deref(), Some("advisor"));
+        assert_eq!(turns[3].text, "");
+    }
+
+    #[test]
+    fn chat_bodies_are_uncapped_but_a_tool_target_is_not() {
+        let long = "x".repeat(TARGET_MAX_CHARS * 3);
+        let line = format!(
+            r#"{{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","message":{{"model":"m","content":[{{"type":"text","text":"{long}"}},{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"{long}"}}}}]}}}}"#
+        );
+        let turns = chat_turns(&line);
+        assert_eq!(
+            turns[0].text.chars().count(),
+            TARGET_MAX_CHARS * 3,
+            "prose is the product here: no cap, no sanitizing"
+        );
+        assert_eq!(
+            turns[1].text.chars().count(),
+            TARGET_MAX_CHARS + 1,
+            "a tool target stays the same bounded summary the call tree shows              — 200 chars plus the ellipsis marking the cut"
+        );
+    }
+
+    #[test]
+    fn session_chat_refuses_an_id_that_is_not_a_session_id() {
+        // The id is used to BUILD a path, so it is validated before any
+        // filesystem access — no transcript root needs to exist for this.
+        for bogus in ["../../etc/passwd", "a/b", "", "sess id", "s.jsonl"] {
+            assert!(
+                matches!(session_chat(bogus, 10), Err(Error::Validation(_))),
+                "{bogus:?} must be refused as a session id"
+            );
+        }
+    }
+
+    #[test]
+    fn session_chat_reads_a_transcript_and_keeps_the_newest_turns() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-some-project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("sess-1.jsonl"), CHAT_LINES).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &root) };
+        let all = session_chat("sess-1", 100);
+        let tail = session_chat("sess-1", 2);
+        let missing = session_chat("sess-2", 100);
+        // SAFETY: same window, same lock.
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+
+        let all = all.unwrap();
+        assert_eq!(all.session_id, "sess-1");
+        assert_eq!(all.turns.len(), 4);
+        assert!(!all.truncated);
+
+        let tail = tail.unwrap();
+        assert_eq!(
+            tail.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["t1", "t2"],
+            "the limit keeps the NEWEST turns — a chat window is read at its end"
+        );
+        assert!(tail.truncated);
+
+        assert!(
+            matches!(missing, Err(Error::Unavailable(_))),
+            "a session with no transcript on disk is unavailable, not not_found"
         );
     }
 }

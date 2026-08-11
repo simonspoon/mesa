@@ -9,6 +9,7 @@ import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcNodeText } from './types/CcNodeText'
+import type { CcSessionChat } from './types/CcSessionChat'
 import type { CcSessionDetail } from './types/CcSessionDetail'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
@@ -778,6 +779,23 @@ export function getCcNodeText(sessionId: string, nodeId: string): Promise<CcNode
   return request(
     `/api/cc/sessions/${encodeURIComponent(sessionId)}/nodes/${encodeURIComponent(nodeId)}/text`,
   )
+}
+
+/**
+ * One session's conversation — the Agent sidebar's chat view (task 814): its
+ * main-thread prompts, replies and tool calls, oldest first, with full
+ * uncapped bodies on the prose. Read straight off the transcript, so unlike
+ * every other cc read it costs no ingest and answers for a session mesa
+ * spawned moments ago; that is also why it is safe to poll. 503 `unavailable`
+ * when the session has no transcript on disk.
+ *
+ * `text` on a prompt/response turn is **untrusted model-authored text**: it
+ * may be rendered as markdown (structure only — `Markdown` never passes raw
+ * HTML through) but never as HTML, and never as a URL.
+ */
+export function getCcSessionChat(sessionId: string, limit?: number): Promise<CcSessionChat> {
+  const q = limit === undefined ? '' : `?limit=${limit}`
+  return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/chat${q}`)
 }
 
 /**

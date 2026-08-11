@@ -24,6 +24,7 @@ import {
   DEFAULT_AGENT_SIDEBAR_WIDTH,
   MIN_MAIN_WIDTH,
 } from '../agentSidebarWidth'
+import { AgentChat } from './AgentChat'
 import * as ptyPool from '../lib/ptyPool'
 import {
   axisPos,
@@ -91,6 +92,116 @@ function insertLeaf(root: SplitNode, agentId: string): SplitNode {
 
 function agentLabel(a: AgentSession): string {
   return a.name ?? a.id ?? a.sessionId.slice(0, 8)
+}
+
+/**
+ * Which of a pane's two views is showing (task 814). `term` is the attached
+ * terminal — the original, and still the default, since it is the only one you
+ * can type into. `chat` is the same session's transcript rendered as a
+ * conversation (`AgentChat`).
+ */
+export type PaneView = 'term' | 'chat'
+
+/**
+ * The Claude Code session id behind an open pane, or `null` when the sidebar's
+ * current session list doesn't hold it.
+ *
+ * Panes are keyed by the **short background job id** (what `claude attach`
+ * takes, and the only thing an attach WebSocket needs), while the transcript a
+ * chat view reads is keyed by the **session id** — two different ids for the
+ * same session. The list is the one place both are carried together, so the
+ * chat toggle is offered only for a pane whose session is still listed.
+ */
+function sessionIdFor(agents: AgentSession[], leafId: string): string | null {
+  return agents.find((a) => a.id === leafId)?.sessionId ?? null
+}
+
+/**
+ * A pane header's view switch. Two radio-ish buttons rather than one toggling
+ * label, so the pane always states which view it is in — a single `chat`
+ * button is ambiguous about whether it names the current state or the action.
+ * Disabled (with a reason in the tooltip) when the pane's session isn't in the
+ * list, since without a session id there is no transcript to read.
+ */
+function PaneViewToggle({
+  view,
+  onChange,
+  chatAvailable,
+}: {
+  view: PaneView
+  onChange: (v: PaneView) => void
+  chatAvailable: boolean
+}) {
+  return (
+    <span className="agent-pane-view-toggle">
+      <button
+        type="button"
+        className={view === 'term' ? 'active' : undefined}
+        aria-pressed={view === 'term'}
+        title="The attached terminal"
+        onClick={() => onChange('term')}
+      >
+        term
+      </button>
+      <button
+        type="button"
+        className={view === 'chat' ? 'active' : undefined}
+        aria-pressed={view === 'chat'}
+        disabled={!chatAvailable}
+        title={
+          chatAvailable
+            ? 'The session transcript, rendered as a conversation'
+            : 'No session id for this pane — its session is no longer listed'
+        }
+        onClick={() => onChange('chat')}
+      >
+        chat
+      </button>
+    </span>
+  )
+}
+
+/**
+ * A pane's body: both views, with the inactive one hidden rather than
+ * unmounted where that matters.
+ *
+ * The terminal stays mounted and is hidden with `visibility` — the same choice
+ * (and the same reason) as the whole sidebar's collapse: `display: none` would
+ * zero the pty's measured box, so xterm would refit to nothing on the way out and
+ * back, and the attach WebSocket's scrollback would come back reflowed. Both
+ * views are absolutely positioned over the same area so the hidden terminal
+ * keeps its real size while the chat has the pane to itself.
+ *
+ * The chat, by contrast, IS unmounted when it isn't showing: it owns no
+ * connection to lose, and leaving it mounted would leave it polling a route
+ * nobody is looking at.
+ */
+function PaneBody({
+  agentId,
+  sessionId,
+  view,
+  paused,
+}: {
+  agentId: string
+  sessionId: string | null
+  view: PaneView
+  /** True while nobody can see this pane (the whole sidebar is collapsed) —
+   *  the chat stops polling, exactly as the session list does. */
+  paused: boolean
+}) {
+  const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
+  return (
+    <div className="agent-pane-views">
+      <div className={`agent-pane-view${view === 'term' ? '' : ' hidden'}`}>
+        <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
+      </div>
+      {view === 'chat' && sessionId !== null && (
+        <div className="agent-pane-view">
+          <AgentChat key={sessionId} sessionId={sessionId} paused={paused} />
+        </div>
+      )}
+    </div>
+  )
 }
 
 // Only projects with a linked folder can host a new session (`local_path`
@@ -177,12 +288,16 @@ function PaneShell({
   ratio,
   onClose,
   dropEdge,
+  headerExtra,
   children,
 }: {
   dragId: string
   label: string
   ratio: number
   onClose: () => void
+  /** Rendered in the header's right-hand group, before `close` — how a pane
+   *  adds its own control without `PaneShell` learning what a pane holds. */
+  headerExtra?: ReactNode
   // Set only while a drag is hovering an edge zone of THIS pane — renders
   // the split-preview overlay below. `null`/absent covers both "no drag in
   // progress" and "hovering this pane's own center zone" (reorder, no new
@@ -218,7 +333,10 @@ function PaneShell({
           </span>
           <span>{label}</span>
         </span>
-        <button onClick={onClose}>close</button>
+        <span className="agent-sidebar-pane-actions">
+          {headerExtra}
+          <button onClick={onClose}>close</button>
+        </span>
       </div>
       {children}
       {dropEdge && <div className={`agent-sidebar-pane-drop-indicator agent-sidebar-pane-drop-indicator-${dropEdge}`} />}
@@ -235,21 +353,41 @@ function PaneShell({
  */
 function AgentPane({
   agentId,
+  sessionId,
   label,
   ratio,
+  view,
+  onViewChange,
+  paused,
   onClose,
   dropEdge,
 }: {
   agentId: string
+  sessionId: string | null
   label: string
   ratio: number
+  view: PaneView
+  onViewChange: (v: PaneView) => void
+  paused: boolean
   onClose: () => void
   dropEdge?: DropEdge | null
 }) {
-  const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
   return (
-    <PaneShell dragId={agentId} label={label} ratio={ratio} onClose={onClose} dropEdge={dropEdge}>
-      <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
+    <PaneShell
+      dragId={agentId}
+      label={label}
+      ratio={ratio}
+      onClose={onClose}
+      dropEdge={dropEdge}
+      headerExtra={
+        <PaneViewToggle
+          view={view}
+          onChange={onViewChange}
+          chatAvailable={sessionId !== null}
+        />
+      }
+    >
+      <PaneBody agentId={agentId} sessionId={sessionId} view={view} paused={paused} />
     </PaneShell>
   )
 }
@@ -263,21 +401,31 @@ function AgentPane({
  */
 function SoloAgentPane({
   agentId,
+  sessionId,
   label,
+  view,
+  onViewChange,
+  paused,
   onClose,
 }: {
   agentId: string
+  sessionId: string | null
   label: string
+  view: PaneView
+  onViewChange: (v: PaneView) => void
+  paused: boolean
   onClose: () => void
 }) {
-  const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
   return (
     <div className="agent-sidebar-pane">
       <div className="agent-terminal-header">
         <span className="agent-sidebar-pane-title">{label}</span>
-        <button onClick={onClose}>close</button>
+        <span className="agent-sidebar-pane-actions">
+          <PaneViewToggle view={view} onChange={onViewChange} chatAvailable={sessionId !== null} />
+          <button onClick={onClose}>close</button>
+        </span>
       </div>
-      <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
+      <PaneBody agentId={agentId} sessionId={sessionId} view={view} paused={paused} />
     </div>
   )
 }
@@ -409,11 +557,21 @@ function SplitNodeView({
   onDividerMouseDown,
   onDividerToggle,
   dropZone,
+  views,
+  onViewChange,
+  paused,
 }: {
   node: SplitNode
   path: number[]
   agents: AgentSession[]
   onClose: (agentId: string) => void
+  /** Per-pane view mode, keyed by leaf id — threaded down exactly like
+   *  `dropZone`, and absent means the default (`term`). Owned by
+   *  `AgentSidebar` so it survives the reparenting a split/move does. */
+  views: Record<string, PaneView>
+  onViewChange: (agentId: string, v: PaneView) => void
+  /** Passed straight through to every pane — see `PaneBody`. */
+  paused: boolean
   onDividerMouseDown: (
     path: number[],
     i: number,
@@ -440,11 +598,15 @@ function SplitNodeView({
             {child.node.kind === 'leaf' ? (
               <AgentPane
                 agentId={child.node.id}
+                sessionId={sessionIdFor(agents, child.node.id)}
                 label={(() => {
                   const session = agents.find((a) => a.id === child.node.id)
                   return session ? agentLabel(session) : child.node.id
                 })()}
                 ratio={child.ratio}
+                view={views[child.node.id] ?? 'term'}
+                onViewChange={(v) => onViewChange(child.node.id, v)}
+                paused={paused}
                 onClose={() => onClose(child.node.id)}
                 dropEdge={dropZone && dropZone.id === child.node.id ? dropZone.edge : null}
               />
@@ -461,6 +623,9 @@ function SplitNodeView({
                   onDividerMouseDown={onDividerMouseDown}
                   onDividerToggle={onDividerToggle}
                   dropZone={dropZone}
+                  views={views}
+                  onViewChange={onViewChange}
+                  paused={paused}
                 />
               </div>
             )}
@@ -570,6 +735,17 @@ export function AgentSidebar({
     ACTIVE: false,
     DONE: true,
   })
+  // Which view each open pane is showing (task 814), keyed by leaf id; an
+  // absent key is the default `term`. Owned here rather than inside a pane
+  // because a pane component is remounted by any reparent (a drag-to-edge
+  // split, a cross-split move, an auto-tile rebuild) — pane-local state would
+  // silently snap back to the terminal on a layout change. Keys of closed
+  // panes are deliberately kept: reopening a session restores the view it was
+  // last read in, and the map is bounded by how many sessions one sidebar
+  // session ever opens.
+  const [paneViews, setPaneViews] = useState<Record<string, PaneView>>({})
+  const setPaneView = (agentId: string, v: PaneView) =>
+    setPaneViews((m) => ({ ...m, [agentId]: v }))
   const [width, setWidth] = useState(DEFAULT_AGENT_SIDEBAR_WIDTH)
   const [resizing, setResizing] = useState(false)
   // Maximized: the panel grows to fill the whole main content area (in place
@@ -1222,7 +1398,11 @@ export function AgentSidebar({
                 {soloId !== null && (
                   <SoloAgentPane
                     agentId={soloId}
+                    sessionId={sessionIdFor(agents, soloId)}
                     label={soloSession ? agentLabel(soloSession) : soloId}
+                    view={paneViews[soloId] ?? 'term'}
+                    onViewChange={(v) => setPaneView(soloId, v)}
+                    paused={collapsed}
                     onClose={() => closePane(soloId)}
                   />
                 )}
@@ -1254,6 +1434,9 @@ export function AgentSidebar({
                 onDividerMouseDown={startDivider}
                 onDividerToggle={toggleDividerAt}
                 dropZone={dropZone}
+                views={paneViews}
+                onViewChange={setPaneView}
+                paused={collapsed}
               />
             </DndContext>
             )}

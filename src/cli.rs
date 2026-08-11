@@ -1124,6 +1124,28 @@ EXAMPLES
         /// msg:<uuid> | tool:<tool_use_id> | agent:<agent_id>
         node_id: String,
     },
+    /// Print a session's conversation as one JSON object
+    ///
+    /// The human prompts, assistant replies and tool calls of the session's
+    /// main thread, oldest first, read **live from the transcript file** — so
+    /// unlike every other `cc` verb it needs no ingest and answers for a
+    /// session started moments ago. Prompt and response bodies are full and
+    /// uncapped (a tool call keeps the same bounded one-line target the call
+    /// tree shows). A session with no transcript on disk is `unavailable`
+    /// (exit 1). Backs the Agent sidebar's chat view.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc chat 72c9161c-16c9-47f4-8217-39fde068a39b
+  mesa cc chat <SESSION_ID> --limit 20   # just the last few turns")]
+    Chat {
+        /// The session id (as printed by `mesa cc sessions`, or the
+        /// `sessionId` of `claude agents --json`)
+        session_id: String,
+        /// Cap on turns, newest kept — `truncated` reports whether this (or
+        /// the read's own transcript-tail window) dropped anything
+        #[arg(long, default_value_t = crate::core::cc::CHAT_TURN_LIMIT)]
+        limit: usize,
+    },
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
         /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
@@ -2573,6 +2595,12 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
             // `unavailable` for a transcript deleted off disk), so the `?`
             // carries the right code out.
             print_json(&crate::core::cc::node_text(&store, &session_id, &node_id)?)
+        }
+        CcCmd::Chat { session_id, limit } => {
+            // No store and no sync, unlike every other `cc` verb: this one
+            // reads the transcript directly (like `cc live`), which is what
+            // makes it answer for a session that has never been ingested.
+            print_json(&crate::core::cc::session_chat(&session_id, limit)?)
         }
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;

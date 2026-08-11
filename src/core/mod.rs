@@ -6,6 +6,7 @@ pub mod files;
 pub mod git;
 pub mod hooks;
 pub mod scripts;
+pub mod speech;
 mod store;
 mod types;
 pub mod usage;

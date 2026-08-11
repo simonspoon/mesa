@@ -702,6 +702,16 @@ export function assignInboxItem(id: number, projectId: number): Promise<Task> {
   return request(`/api/inbox/${id}`, jsonInit('PATCH', { project_id: projectId }))
 }
 
+/**
+ * Spoken-audio URL for one inbox item (mesa task 815) — used directly as an
+ * `<audio src>`, never fetched as JSON. The route synthesises the item's body
+ * with `kokoro-rs` on the server and answers `audio/wav`; synthesis runs on
+ * every request, so treat the URL as a play action rather than a cheap read.
+ */
+export function inboxSpeakUrl(id: number): string {
+  return `/api/inbox/${id}/speak`
+}
+
 /** Returns the destroyed item. */
 export function deleteInboxItem(id: number): Promise<InboxItem> {
   return request(`/api/inbox/${id}`, jsonDelete())

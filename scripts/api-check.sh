@@ -19,8 +19,13 @@
 #      sidebar's drag-reorder writes, and the list order it drives, plus the
 #      `parent_id` surface added by task 668 (nesting, detach, cycle/unknown
 #      rejection, the archive cascade and the subtree delete echo);
+#   5b. GET /api/inbox/{id}/speak (task 815) — the audio contract, the patched
+#      streaming WAV sizes, the hostile body arriving as stdin data, the
+#      `unavailable` failure and the `require_agent_access` gate, driven
+#      against a stub `kokoro-rs` (`MESA_KOKORO_BIN`);
 #   6. LAN mode — the Host allowlist is skipped while the Content-Type gate
-#      still applies, the two halves of one posture (CLAUDE.md).
+#      still applies, the two halves of one posture (CLAUDE.md), and the speak
+#      route keeps its stronger gate through the flip.
 #
 # Attachment routes have their own gate (scripts/attachments-check.sh); the
 # agents/terminal/hook routes have theirs (agents-check.sh, hooks-check.sh).
@@ -51,6 +56,28 @@ ok() { CHECKS=$((CHECKS + 1)); echo "ok: $*"; }
 
 PROJ=$("$MESA" project create "API gate project" --no-git | jq -r .id)
 OTHER=$("$MESA" project create "API gate archived project" --no-git | jq -r .id)
+
+# ---- stub kokoro-rs (the inbox speak route, mesa task 815) ----
+#
+# A stub, not the real synthesiser: this gate asserts the audio contract and
+# the injection-proofness of the body handoff, neither of which needs a real
+# 45 KB-per-second TTS model. It logs its stdin verbatim (so the hostile-body
+# assertion can read it back) and emits the exact *streaming* WAV header
+# `kokoro-rs -o -` writes — both sizes 0xFFFFFFFF — so the response proves
+# mesa patched them.
+
+STUB_DIR="$TMP/stub"
+mkdir -p "$STUB_DIR"
+cat > "$STUB_DIR/kokoro-rs" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$STUB_DIR/last-argv"
+cat > "$STUB_DIR/last-stdin"
+[ -e "$STUB_DIR/fail" ] && { echo "stub kokoro is down" >&2; exit 1; }
+# RIFF ffffffff WAVE fmt (PCM/mono/24k) data ffffffff + 8 bytes of "audio".
+printf 'RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff\x01\x02\x03\x04\x05\x06\x07\x08'
+EOF
+chmod +x "$STUB_DIR/kokoro-rs"
+export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
 
 # ---- server ----
 
@@ -596,6 +623,87 @@ api 200 DELETE "/api/projects/$SL"
   fail "DELETE a leaf project: subprojects must be []"
 ok "DELETE /api/projects/{id} on a leaf: unchanged apart from an empty subprojects"
 
+# =====================================================================
+# 5b. GET /api/inbox/{id}/speak — reading an item aloud (mesa task 815)
+# =====================================================================
+#
+# The route runs an external synthesiser and answers audio bytes. Four things
+# must hold: the audio contract (type, nosniff, patched WAV sizes), the body
+# reaching the binary as *data* on stdin (never a shell string), the outside-
+# mesa failure being `unavailable` rather than a 500, and the gate — this is
+# `require_agent_access`, stricter than the task routes beside it.
+
+HOSTILE='$(touch '"$TMP"'/pwned); rm -rf / # spoken'
+SPEAK_ID=$("$MESA" inbox add "$HOSTILE" | jq -r .id)
+
+speak() { # speak <path> [curl args...] -> STATUS, $TMP/audio, $TMP/headers
+  local path=$1
+  shift
+  STATUS=$(curl -s -o "$TMP/audio" -D "$TMP/headers" -w '%{http_code}' "$@" "$BASE$path")
+}
+
+speak "/api/inbox/$SPEAK_ID/speak"
+[ "$STATUS" = "200" ] || fail "speak: expected 200, got $STATUS ($(cat "$TMP/audio"))"
+grep -qi '^content-type: audio/wav' "$TMP/headers" || fail "speak: Content-Type must be audio/wav"
+grep -qi '^x-content-type-options: nosniff' "$TMP/headers" || fail "speak: nosniff missing"
+ok "GET /api/inbox/{id}/speak: 200 audio/wav + nosniff"
+
+# The stub emits a 44-byte streaming header + 8 bytes of audio with BOTH sizes
+# 0xFFFFFFFF; mesa must hand back 52 bytes with RIFF=44 and data=8, so a
+# player that refuses the placeholder header (Safari) can play it.
+[ "$(wc -c <"$TMP/audio" | tr -d ' ')" = "52" ] || fail "speak: audio bytes not passed through"
+HEXED=$(od -An -tx1 -v "$TMP/audio" | tr -d ' \n')
+[ "${HEXED:8:8}" = "2c000000" ] || fail "speak: RIFF size not patched (got ${HEXED:8:8})"
+[ "${HEXED:80:8}" = "08000000" ] || fail "speak: data size not patched (got ${HEXED:80:8})"
+[ "${HEXED:88}" = "0102030405060708" ] || fail "speak: audio payload altered"
+ok "speak: the streaming 0xFFFFFFFF WAV sizes are patched, the samples are untouched"
+
+# Injection-proof: the body reaches the binary as stdin bytes, verbatim, and
+# no shell ever parses it.
+[ "$(cat "$STUB_DIR/last-stdin")" = "$HOSTILE" ] ||
+  fail "speak: body must reach the synthesiser verbatim on stdin (got $(cat "$STUB_DIR/last-stdin"))"
+[ ! -e "$TMP/pwned" ] || fail "speak: a hostile body was evaluated by a shell"
+# …and the body is on stdin *only*: argv must stay the fixed three flags, so a
+# regression that also passed the text as an argument fails here.
+[ "$(cat "$STUB_DIR/last-argv")" = "-q -o -" ] ||
+  fail "speak: argv must be the fixed flags, got $(cat "$STUB_DIR/last-argv")"
+ok "speak: a hostile body is stdin data, never syntax and never argv"
+
+api 404 GET "/api/inbox/999999/speak"
+[ "$(jqb .error.code)" = "not_found" ] || fail "speak: unknown id must be not_found"
+ok "speak: an unknown item is 404 not_found"
+
+touch "$STUB_DIR/fail"
+speak "/api/inbox/$SPEAK_ID/speak"
+[ "$STATUS" = "503" ] || fail "speak: a failing synthesiser must be 503, got $STATUS"
+[ "$(jq -r .error.code <"$TMP/audio")" = "unavailable" ] ||
+  fail "speak: a failing synthesiser must be code unavailable"
+rm -f "$STUB_DIR/fail"
+ok "speak: a failing synthesiser is 503 unavailable (an outside-mesa dependency)"
+
+# Gate, half one: require_agent_access refuses a cross-site Origin, while the
+# same item's JSON — on the plain guard — is served with that same Origin. The
+# contrast is the point, so BOTH calls must carry the header.
+speak "/api/inbox/$SPEAK_ID/speak" -H 'Origin: http://evil.example'
+[ "$STATUS" = "403" ] || fail "speak: a foreign Origin must be 403, got $STATUS"
+raw GET "/api/inbox/$SPEAK_ID" -H 'Origin: http://evil.example'
+[ "$STATUS" = "200" ] ||
+  fail "the item's JSON must stay on the plain guard (foreign Origin), got $STATUS"
+ok "speak: a foreign Origin is 403 while the item's JSON, on the plain guard, is not"
+
+# Gate, half two: a cross-site <img>/<audio> subresource sends NO Origin, so
+# the Origin checks would wave it through — `Sec-Fetch-Site` is what refuses
+# it. Absent (curl, an old browser) stays allowed; our own page is same-origin.
+speak "/api/inbox/$SPEAK_ID/speak" -H 'Sec-Fetch-Site: cross-site' -H 'Sec-Fetch-Dest: audio'
+[ "$STATUS" = "403" ] || fail "speak: a cross-site subresource must be 403, got $STATUS"
+[ "$(jq -r .error.code <"$TMP/audio")" = "validation" ] ||
+  fail "speak: the cross-site refusal must be code validation"
+speak "/api/inbox/$SPEAK_ID/speak" -H 'Sec-Fetch-Site: same-origin' -H 'Sec-Fetch-Dest: audio'
+[ "$STATUS" = "200" ] || fail "speak: our own page's <audio> must be served, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H 'Sec-Fetch-Site: none'
+[ "$STATUS" = "200" ] || fail "speak: a typed-in URL must be served, got $STATUS"
+ok "speak: Sec-Fetch-Site closes the no-Origin subresource hole (cross-site 403, same-origin/none 200)"
+
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
@@ -635,6 +743,17 @@ raw POST "/api/tasks" -H "Host: evil.example" -H 'Content-Type: application/json
   -d "{\"project_id\":$PROJ,\"description\":\"lan create\"}"
 [ "$STATUS" = "201" ] || fail "LAN mode: a JSON POST from any Host must work, got $STATUS ($BODY)"
 ok "--lan: a JSON mutating request from any Host is accepted"
+
+# The speak route does NOT follow the Host allowlist off: it carries the
+# stronger agent gate, so under --lan a DNS-name Host is still refused while
+# the IP-literal Host a real LAN browser sends is served (the pairing that
+# must not drift apart).
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "--lan speak: a DNS-name Host must still be 403, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: 127.0.0.1:$LAN_PORT"
+[ "$STATUS" = "200" ] || fail "--lan speak: an IP-literal Host must be served, got $STATUS"
+grep -qi '^content-type: audio/wav' "$TMP/headers" || fail "--lan speak: Content-Type"
+ok "--lan: speak keeps the agent gate (DNS Host 403, IP-literal Host 200)"
 
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true

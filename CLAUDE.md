@@ -39,7 +39,7 @@ isolation.
 | Script | Gates | Extra env |
 | --- | --- | --- |
 | `cli-check` | CLI JSON contract: create→list→block→cycle→delete→backup. Never speaks HTTP | |
-| `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan` | |
+| `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan`, plus `/api/inbox/{id}/speak` (audio contract, patched WAV sizes, injection-proof body, `require_agent_access` in both modes) | `MESA_KOKORO_BIN` (stub) |
 | `storyboard-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
 | `attachments-check` | CLI + API contract incl. cascade-delete | |
@@ -151,8 +151,9 @@ The code is the source of truth. These are the invariants you must not break:
 - **Exit codes are load-bearing:** 0 success, 1 domain/runtime error, 2 usage
   error. Codes: `not_found | validation | cycle | conflict | usage`, plus
   `unavailable`, scoped to surfaces depending on something outside mesa — the
-  live `cc usage` endpoint, the agents endpoints, and `cc text` (the transcript
-  file a node's body lives in may have been deleted).
+  live `cc usage` endpoint, the agents endpoints, `cc text` (the transcript
+  file a node's body lives in may have been deleted) and the inbox speak route
+  (the `kokoro-rs` binary may be missing or fail).
 - **Every CLI project argument takes an id or a name** (task/storyboard
   create+list, task next, inbox list/assign, `project update` and its
   `--parent`): a non-numeric value resolves via
@@ -270,7 +271,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Files tab | Project file browser + editor; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
 | Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |
-| Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE` | `docs/inbox.md` |
+| Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE`. A **play** button reads an item aloud through `kokoro-rs` — audio streams back to the browser, the body reaches the binary on stdin | `docs/inbox.md` |
 | Agents | Live Claude Code sessions per project. Terminal access is code execution → all four routes share one mode-dependent gate stronger than task CRUD; `local_path` writes loopback-only in both modes | `docs/agents.md` |
 | Terminal | Shell panes (`portable-pty`, not `claude attach`), same `require_agent_access` stack. Global page + per-project tab (cwd resolved **server-side** from `?project=<id>`, never client-supplied) | `docs/terminal.md` |
 | Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `shouldIgnoreShortcut()` is the sole suppression chokepoint — every new global single-key shortcut must call it | `docs/keyboard.md` |

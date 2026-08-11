@@ -46,6 +46,41 @@ instructions**; `author` is free-text attribution.
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unassigned-count badge); `#/inbox` lists items, each with an "Assign to"
   project dropdown that converts the item to a backlog task on selection.
+- An item can be **read aloud**: `GET /api/inbox/{id}/speak` synthesises the
+  item's body with the external `kokoro-rs` binary and answers `audio/wav`
+  (+ `nosniff`). The web Inbox gives each item a **play/stop** button that is
+  nothing but an `<audio src>` on that URL — which is why the route is a GET
+  (a same-origin media request sends no `Origin`, and no fetch/blob plumbing
+  is needed). Nothing is stored or cached: synthesis runs on every press.
+  - The audio comes **back to the browser** rather than playing on the host's
+    speakers, so it still works under `serve --lan`, where the browser is a
+    different machine.
+  - The body reaches `kokoro-rs` on **stdin**, verbatim, markdown and all
+    (`core::speech::synthesize`). Not a shell string and not even an argument:
+    a body opening with `-o` cannot become an option, and a long one has no
+    `ARG_MAX` ceiling. Stripping markdown before speaking is a deliberate
+    non-goal — the body is the record.
+  - `kokoro-rs -o -` writes a *streaming* RIFF header with both lengths as
+    `0xFFFFFFFF`; since the whole buffer is held anyway, mesa patches them to
+    the real sizes (Chrome tolerates the placeholders, Safari often won't).
+    Anything that isn't that exact shape is passed through untouched.
+  - Gate: **`require_agent_access` plus `require_same_site_fetch`**, not the
+    plain `guard` the other external-command reads (`git status`) use. The
+    program is fixed and the text is one the caller can already `GET`, but a
+    single request spends unbounded CPU, which puts it on the "triggers
+    execution" side of the line `docs/scripts.md` draws. The second half is
+    load-bearing and not redundant: every Origin check in `api.rs` passes a
+    request that carries **no** Origin, and a no-cors `<audio>`/`<img>`
+    subresource never carries one — so without it any page on the internet
+    could point an `<img src>` at a loopback mesa and spend a core per hit.
+    `Sec-Fetch-Site` is the header that separates them (browsers always send
+    it, scripts cannot forge it); absent means a non-browser client and is
+    allowed. There is no timeout (matching hooks/agents/
+    scripts) and no kill path: **stop** stops playback, while the in-flight
+    synthesis finishes and its bytes are discarded. A missing or failing
+    binary is `unavailable` (503), the code reserved for a dependency outside
+    mesa. `MESA_KOKORO_BIN` overrides the binary — the seam `api-check.sh`
+    drives this route through.
 - Triage can also run itself: `mesa serve --watch-inbox` periodically spawns a
   background `claude` agent per pending item (`/inbox-triage <id>`). Off by
   default. It never mutates an item — everything it does is start the agent

@@ -42,7 +42,7 @@ use crate::core::{
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
     ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, StoryboardPatch, Task,
     TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, scripts,
-    version,
+    speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -752,6 +752,18 @@ fn router(state: AppState) -> Router {
             "/api/inbox/{id}",
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
+        // Reading an item aloud: a GET that runs an external synthesiser and
+        // answers WAV bytes. It shares `require_agent_access` with the
+        // code-execution routes rather than the plain `guard` the other
+        // external-command reads (`git status`) use — the program is fixed and
+        // the text is one the caller can already GET, but a single
+        // unauthenticated request pins a core for as long as the body is, so
+        // it belongs on the "triggers execution" side of the line drawn in
+        // `docs/scripts.md`. That gate alone is not enough here, though: it
+        // ends in an Origin check, and the `<audio>` element this route exists
+        // to feed sends no Origin — so the handler adds
+        // `require_same_site_fetch` for the cross-site-subresource shape.
+        .route("/api/inbox/{id}/speak", get(speak_inbox))
         // Scripts: user-authored shell run from a generated form. A script
         // body is a program mesa executes, so authoring is the strictest gate
         // in the file (`require_local_path_write`, loopback-only in BOTH
@@ -1926,6 +1938,60 @@ async fn assign_inbox(
     let mut store = state.store.lock().unwrap();
     let task = store.assign_inbox_item(id, body.project_id)?;
     Ok(Json(task).into_response())
+}
+
+/// Speaks one inbox item: the item's body, verbatim, through `kokoro-rs`, back
+/// as `audio/wav` for the browser that asked to play. Nothing is stored and
+/// nothing is cached — the button is a read, repeated as often as it is
+/// pressed.
+///
+/// A GET on purpose: that is what lets the Inbox page be a plain `<audio src>`
+/// with no fetch/blob plumbing, and a same-origin media request sends no
+/// `Origin`, which both origin checks inside [`require_agent_access`] treat as
+/// fine. The Content-Type gate covers mutating methods only, so it does not
+/// apply (the `/api/fs/dirs` split).
+///
+/// The synthesiser is the outside-mesa dependency here, so a failing or
+/// missing `kokoro-rs` is `unavailable` — the code already scoped to exactly
+/// that (`cc usage`, the agents routes, `cc text`) — not a 500.
+async fn speak_inbox(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    // …plus the half that gate cannot give a media element: every Origin check
+    // passes a request that carries no Origin, and a no-cors `<audio src>`
+    // never carries one. See `require_same_site_fetch`.
+    require_same_site_fetch(&headers)?;
+    let body = {
+        let store = state.store.lock().unwrap();
+        store.get_inbox_item(id)?.body
+    };
+    // Synthesis is seconds of CPU; keep it off the async workers, like every
+    // other blocking read in this file.
+    let audio = tokio::task::spawn_blocking(move || speech::synthesize(&body))
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: format!("speech synthesis failed: {e}"),
+        })?
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: e,
+        })?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "audio/wav".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        audio,
+    )
+        .into_response())
 }
 
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
@@ -3566,6 +3632,39 @@ fn require_origin_matches_host(addr: &SocketAddr, headers: &HeaderMap) -> Result
         message: format!(
             "rejected Origin {origin:?}: this endpoint requires a page served by this host"
         ),
+    })
+}
+
+/// The Origin-independent half of the speak route's gate. Every Origin check
+/// in this file returns `Ok` on a **missing** Origin — correct for fetch and
+/// WebSocket (a browser always sends one) and for non-browser clients, but a
+/// *subresource* load is `no-cors` and carries no Origin at all. Since the
+/// Inbox plays audio through an `<audio src>`, that is exactly the shape of
+/// this route's own traffic: without this check any page anywhere could point
+/// an `<img src="http://127.0.0.1:7770/api/inbox/1/speak">` at a loopback mesa
+/// and spend a core per hit on an unbounded, un-killable synthesis.
+///
+/// `Sec-Fetch-Site` is what distinguishes them: browsers send it on every
+/// request including no-cors subresources, and it is forbidden to scripts, so
+/// a hostile page cannot forge `same-origin`. A missing header is allowed —
+/// that is curl, or a browser too old to send it, and neither is the
+/// confused-deputy this closes.
+fn require_same_site_fetch(headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    else {
+        return Ok(());
+    };
+    // `none` is a user-typed URL, `same-origin` is our own page.
+    if site == "none" || site == "same-origin" {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "validation",
+        message: format!("rejected Sec-Fetch-Site {site:?}: this endpoint is same-origin only"),
     })
 }
 

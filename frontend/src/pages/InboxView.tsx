@@ -3,6 +3,7 @@ import {
   assignInboxItem,
   createInboxItem,
   deleteInboxItem,
+  inboxSpeakUrl,
   listInbox,
   listProjects,
 } from '../api'
@@ -30,6 +31,22 @@ export function InboxView() {
   const [body, setBody] = useState('')
   const [author, setAuthorState] = useState(getAuthor())
   const [createError, setCreateError] = useState<string | null>(null)
+  // Which item is being read aloud, and whether its audio has started yet:
+  // synthesis takes seconds, so "asked for it" and "hearing it" are different
+  // states the button has to distinguish. One item at a time — a single
+  // <audio> element, keyed by the id, so picking another stops the first.
+  const [speakingId, setSpeakingId] = useState<number | null>(null)
+  const [speaking, setSpeaking] = useState(false)
+  // The failure belongs to the item whose button was pressed, so it carries the
+  // id — the <audio> is gone by the time the message renders.
+  const [speakError, setSpeakError] = useState<number | null>(null)
+
+  // Stops if this item is already the one playing, starts it otherwise.
+  function toggleSpeak(id: number) {
+    setSpeakError(null)
+    setSpeaking(false)
+    setSpeakingId((current) => (current === id ? null : id))
+  }
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -99,6 +116,21 @@ export function InboxView() {
                 <span>sent {item.created_at}</span>
               </div>
               <div className="inbox-actions">
+                <button
+                  type="button"
+                  title={
+                    speakingId === item.id
+                      ? 'stop reading this item'
+                      : 'read this item aloud'
+                  }
+                  onClick={() => toggleSpeak(item.id)}
+                >
+                  {speakingId !== item.id
+                    ? 'play'
+                    : speaking
+                      ? 'stop'
+                      : 'synthesising…'}
+                </button>
                 <label>
                   Assign to{' '}
                   <select
@@ -118,10 +150,48 @@ export function InboxView() {
                   message="Delete this item?"
                   onDelete={() => deleteInboxItem(item.id).then(refetch)}
                 />
+                {speakError === item.id && (
+                  <span className="error">could not play this item</span>
+                )}
               </div>
             </li>
           ))}
         </ul>
+      )}
+
+      {/* One player for the whole page. `key` restarts it when the selection
+          changes, and unmounting it (stop, ended, error) is what stops the
+          sound — the already-running synthesis on the server finishes and its
+          bytes are discarded, the same no-timeout posture as hooks and
+          scripts. It renders only while its item is still listed, so deleting
+          or assigning the item being read stops it too: otherwise the audio
+          would outlive the only button that can stop it. */}
+      {items?.some((item) => item.id === speakingId) && speakingId !== null && (
+        <audio
+          key={speakingId}
+          src={inboxSpeakUrl(speakingId)}
+          // Started here rather than with `autoPlay` so a refused play is
+          // visible: a browser that blocks autoplay rejects the promise and
+          // fires no `error` event, which would otherwise leave the button
+          // reading "synthesising…" forever. `AbortError` is not a refusal —
+          // it is this element being unmounted by stop, or by a switch to
+          // another item, so it must not report a failure or cancel whatever
+          // is playing by then.
+          ref={(el) => {
+            const id = speakingId
+            el?.play().catch((err: DOMException) => {
+              if (err.name === 'AbortError') return
+              setSpeakError(id)
+              setSpeakingId((current) => (current === id ? null : current))
+            })
+          }}
+          onPlaying={() => setSpeaking(true)}
+          onEnded={() => setSpeakingId(null)}
+          onError={() => {
+            setSpeakError(speakingId)
+            setSpeakingId(null)
+          }}
+        />
       )}
     </div>
   )

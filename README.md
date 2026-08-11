@@ -150,7 +150,8 @@ mesa backup /tmp/mesa-snap.db
   {"error": {"code": "not_found|validation|cycle|conflict|usage|unavailable", "message": "..."}}
   ```
   (`unavailable` is scoped to the surfaces that depend on something outside
-  mesa: live subscription usage and the agents endpoints.)
+  mesa: live subscription usage, the agents endpoints, and `cc text` — the
+  transcript file a node's body lives in may have been deleted.)
 - **Exit codes are load-bearing:** `0` success, `1` domain/runtime error,
   `2` usage error.
 - **Projects by name.** Every `--project` argument (and `inbox assign`) accepts
@@ -192,12 +193,17 @@ rejected just as it is by `task create` — a description is the task's identity
 ```bash
 mesa serve --port 7770     # HTTP API + web UI on http://127.0.0.1:7770
 mesa serve --lan           # opt-in: bind 0.0.0.0 and serve other LAN devices
+mesa serve --watch-todo    # opt-in: auto-dispatch agents onto actionable todos
+mesa serve --watch-inbox   # opt-in: auto-triage the global inbox
 ```
 
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
 `block`/`unblock`/`dependencies`/`dependents` actions, `/api/storyboards` with its
-`frames`/`edges`/`events`, `/api/inbox`, `/api/cc`, and
-per-project `git`/`agents` endpoints), with the React web UI served at `/`. The web
+`frames`/`edges`/`events`, `/api/inbox`, `/api/scripts`, `/api/cc`,
+`/api/config`, and per-project `git`/`files`/`agents` endpoints), with the React
+web UI served at `/`. Beside a project's board sit its **Files**, **Git** and
+**Terminal** tabs; **Scripts**, the **Agents** sidebar, the **CC Dashboard**,
+a global **Terminal** and **Settings** live above projects. The web
 UI does not live-sync; it refetches on window focus.
 
 **Security boundary** (there is no auth — it is a local tool):
@@ -258,6 +264,22 @@ UI does not live-sync; it refetches on window focus.
   `mesa inbox {add,list,show,assign,delete}`. `mesa serve --watch-inbox`
   triages the whole inbox for you, spawning a Claude Code agent per pending
   item; off by default.
+- **Attachment** — an arbitrary file (screenshot, PDF, notes) hung off one
+  task. The bytes live *outside* the database, in mesa's own data directory,
+  with a 25 MiB per-file cap; deleting the task (or an ancestor of it) removes
+  the rows and unlinks the files. `mesa attachment {add,list,show,fetch,delete}`;
+  in the web UI a task's detail panel uploads and previews them, and the
+  new-task form also takes a pasted clipboard image. See `docs/attachments.md`.
+- **Script** — a piece of shell *you* write and keep in mesa, together with an
+  explicitly declared argument list (`text | number | bool | choice`) that the
+  web form is generated from. Arguments are declared, never parsed out of the
+  body: `bash -c` receives the body verbatim and the values positionally *and*
+  as `MESA_ARG_<NAME>`, so no value is ever interpolated into a string a shell
+  parses. A nonzero exit is data, not a failure; runs are never persisted; the
+  working directory comes from the script's optional project binding (deleting
+  that project un-binds the script rather than destroying it).
+  `mesa script {create,list,show,update,delete,run}`, plus a global **Scripts**
+  page. See `docs/scripts.md`.
 
 ## Storyboards
 
@@ -310,7 +332,9 @@ so an agent dropped into a working directory finds the right project instead of
 creating a duplicate. (`--no-git` skips binding; `project update --root-commit
 ""` clears it.) The project also remembers its `local_path` — the last-known
 working folder — which powers the web UI's git status, the per-project **Git**
-tab (working-tree file list + per-file diff, read-only), the per-project
+tab (working-tree file list + per-file diff plus history, read-only), the
+per-project **Files** tab (a file browser and an editor with a line-number
+gutter, find-in-file, IDE editing keys and dirty-tab guards), the per-project
 **Terminal** tab (real shells opened in that folder), and project labels and
 start locations in the global Agents sidebar.
 
@@ -322,6 +346,14 @@ start locations in the global Agents sidebar.
   attach`, so it works from remote machines under `--lan`). There is
   deliberately no `mesa agent` CLI — an agent in a terminal uses `claude`
   directly.
+- **Todo watcher** (`mesa serve --watch-todo`, off by default): periodically
+  asks every unarchived project with a live `local_path` for its next
+  actionable task and starts a background agent on it, flipping the task to
+  `in_progress` before spawning. How many may run at once per project is
+  configurable (`watchers.todo-concurrency`, default 1) and re-read every tick;
+  a project counts as busy by its `in_progress` *leaves* and its sessions doing
+  live work, so an umbrella task parks nothing — it narrows the tick to its own
+  descendants. See `docs/todo-watcher.md`.
 - **Configurable spawn commands**: the three places mesa starts an agent — the
   todo-watcher's dispatch, the inbox-watcher's triage, and the sidebar's *add
   agent* — each read a command template from `~/.mesa/config.json`
@@ -329,9 +361,15 @@ start locations in the global Agents sidebar.
   change the binary, its flags, the persona or the slash command without
   rebuilding. Placeholders `{id}`, `{name}`, `{prompt}` (plus `{bin}`,
   `{agent}`). Templates are argv, not shell: no config file means the built-in
-  `claude --bg --agent swe …` command, unchanged. Editable from the web UI's
-  **Settings** page (pinned to the bottom of the left nav) or by hand. See
-  `docs/config.md`.
+  `claude --bg --agent swe …` command, unchanged. A multi-line value opts that
+  one command into a `bash -c` script instead, whose values arrive as `MESA_*`
+  environment variables rather than being substituted into the body — either
+  way, no mesa data is ever spliced into a string a shell parses. The same file
+  holds two other independent sections: `pricing` (per-model-family rates for
+  the CC Dashboard's cost estimates, longest prefix wins) and `watchers`
+  (the todo watcher's per-project concurrency). All three are editable from the
+  web UI's **Settings** page (pinned to the bottom of the left nav) or by hand,
+  and each section's save preserves the other two. See `docs/config.md`.
 - **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
   the database. One point so far — `task-execute`, fired by `mesa task execute
   <id>` or `POST /api/tasks/{id}/execute`, with the full task JSON on stdin and
@@ -350,12 +388,15 @@ start locations in the global Agents sidebar.
 ```bash
 cargo test                  # Rust tests; store logic lives in src/core/store.rs
 cargo test <name>           # single test by name substring
+cargo clippy --all-targets -- -D warnings   # CI-gated
+cargo fmt --check                           # CI-gated
 
 scripts/cli-check.sh        # CLI JSON-contract end-to-end gate
 scripts/api-check.sh        # HTTP task-route contract + the security boundary, over a live server
 scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
 scripts/attachments-check.sh    # attachment contract over CLI + API, including cascade-delete
+scripts/files-check.sh      # Files-tab reads, the image allowlist, and both write gates
 scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
 scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`

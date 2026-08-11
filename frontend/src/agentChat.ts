@@ -91,10 +91,16 @@ export function chatClock(ts: string | null): string {
  * conversation. The chat auto-scrolls on new turns only while this holds, so
  * scrolling up to read something older is never yanked back by the next poll.
  *
- * The 80px slack absorbs the sub-pixel rounding a zoomed/fractional-DPI
- * viewport gives `scrollHeight - clientHeight`, which otherwise makes an
- * apparently bottomed-out box read as "scrolled up" and freeze the follow.
+ * The slack absorbs the sub-pixel rounding a zoomed/fractional-DPI viewport
+ * gives `scrollHeight - clientHeight`, which otherwise makes an apparently
+ * bottomed-out box read as "scrolled up" and freeze the follow. It is a
+ * *fraction* of the box rather than a flat 80px because a pane in a 2x2
+ * auto-tile is often only 150-250px tall, where a flat 80px would mean the
+ * reader has to scroll up a third of everything they can see before the follow
+ * lets go — and anything less gets snapped back by the next poll. The 80px
+ * floor keeps the behaviour identical on any pane large enough for it to have
+ * been right in the first place.
  */
 export function isNearBottom(scrollTop: number, scrollHeight: number, clientHeight: number): boolean {
-  return scrollHeight - clientHeight - scrollTop <= 80
+  return scrollHeight - clientHeight - scrollTop <= Math.max(80, clientHeight * 0.25)
 }

@@ -190,12 +190,18 @@ function PaneBody({
   paused: boolean
 }) {
   const { endpoint, closedMessage } = agentTerminalDescriptor(agentId)
+  // One decision, used by both halves. Deriving it twice is how a pane goes
+  // blank: `chat` mode with no session id (its session aged out of the list
+  // between polls) would hide the terminal and render no chat, leaving an
+  // empty box whose only escape is noticing the greyed-out toggle. Losing the
+  // session id falls back to the terminal, which is still attached.
+  const showChat = view === 'chat' && sessionId !== null
   return (
     <div className="agent-pane-views">
-      <div className={`agent-pane-view${view === 'term' ? '' : ' hidden'}`}>
+      <div className={`agent-pane-view${showChat ? ' hidden' : ''}`}>
         <PtySlot id={agentId} endpoint={endpoint} closedMessage={closedMessage} />
       </div>
-      {view === 'chat' && sessionId !== null && (
+      {showChat && sessionId !== null && (
         <div className="agent-pane-view">
           <AgentChat key={sessionId} sessionId={sessionId} paused={paused} />
         </div>

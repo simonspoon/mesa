@@ -110,4 +110,15 @@ describe('isNearBottom', () => {
   it('follows when there is nothing to scroll', () => {
     expect(isNearBottom(0, 100, 100)).toBe(true)
   })
+
+  it('scales the slack to the box, so a short tiled pane is not snapped back', () => {
+    // A 200px-tall pane: a quarter of it (50px) is under the 80px floor, so
+    // the floor still governs and the behaviour is the flat one.
+    expect(isNearBottom(2820, 3000, 200)).toBe(true)
+    expect(isNearBottom(2000, 3000, 200)).toBe(false)
+    // A 1000px-tall pane: 250px of slack, so a reader who nudged up 200px is
+    // still following rather than being frozen out by a flat threshold.
+    expect(isNearBottom(1800, 3000, 1000)).toBe(true)
+    expect(isNearBottom(1000, 3000, 1000)).toBe(false)
+  })
 })

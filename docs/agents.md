@@ -374,8 +374,12 @@ already use.
     embedded markup renders as inert text), react-markdown strips unsafe URL
     schemes, links carry `rel="noreferrer"`, and `resolveImageSrc` is wired to
     refuse **every** image — so an `![](https://tracker/…)` in a transcript can
-    never make the browser issue a request. Tool names and targets stay plain
-    text children. Do not add `rehype-raw` here, and do not resolve images.
+    never make the browser issue a request *on its own*. A `[link](…)` still
+    becomes a real anchor (and remark-gfm autolinks a bare URL): that is a
+    click-gated navigation, not a fetch, and it is the deliberate line — prose
+    with working links is the point; prose that phones home on render is not.
+    Tool names and targets stay plain text children. Do not add `rehype-raw`
+    here, and do not resolve images.
   - Pure logic (turn grouping, the tool-run summary, the clock, the
     follow-the-tail predicate) is `frontend/src/agentChat.ts`, vitest-covered
     per CLAUDE.md's frontend-test rule; `AgentChat.tsx` is a thin renderer over

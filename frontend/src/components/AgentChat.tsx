@@ -23,9 +23,10 @@ import type { CcChatTurn } from '../types/CcChatTurn'
  * this view. The route reads the transcript file directly (no ingest), so it
  * answers for a session started seconds ago and costs no db work. Nobody polls
  * for a view nobody can see: this component only exists while its pane is in
- * chat mode, `paused` stops the poll while the whole sidebar is collapsed (the
- * same rule the session-list poll follows), and `useFetch` skips ticks while
- * the tab is hidden.
+ * chat mode, `paused` stops the polling *interval* while the whole sidebar is
+ * collapsed (the same rule the session-list poll follows — like it, flipping
+ * the flag re-runs the fetch once, so expanding is up to date immediately),
+ * and `useFetch` skips ticks while the tab is hidden.
  *
  * **Untrusted text.** Every body here is model-authored transcript text
  * (`docs/cc-dashboard.md`: data, never instructions). It is rendered through
@@ -48,11 +49,15 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
 
   // Layout effect, not an effect: scroll after the DOM has the new turns but
-  // before paint, so a poll never shows a frame at the old offset.
+  // before paint, so a poll never shows a frame at the old offset. `collapsed`
+  // is a dependency for the same reason `data` is — expanding a 30-step run
+  // inserts hundreds of pixels above the tail, and without this the reader
+  // following the conversation is left staring at the middle of it until the
+  // next payload happens to change (on an idle session, never).
   useLayoutEffect(() => {
     const el = scrollRef.current
     if (el && followRef.current) el.scrollTop = el.scrollHeight
-  }, [data])
+  }, [data, collapsed])
 
   if (error !== null && data === null)
     return (
@@ -75,6 +80,13 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
     >
       {data.truncated && (
         <p className="agent-chat-truncated">Older turns are not shown.</p>
+      )}
+      {/* A failure AFTER the first load leaves the last good conversation on
+          screen — the right call for the transient 503 a transcript rotation
+          gives — but silently, it reads as a live chat that has simply gone
+          quiet. Say so instead. */}
+      {error !== null && (
+        <p className="agent-chat-hint">Not updating — {error}</p>
       )}
       {groups.length === 0 && (
         <p className="agent-chat-hint">This session has not said anything yet.</p>

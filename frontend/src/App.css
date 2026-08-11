@@ -961,6 +961,19 @@ main {
   border-color: var(--border);
 }
 
+/* The create action rides at the far end of the tab strip (mesa task 811) —
+   in it for the vertical space, not of it: it switches no view, so it takes
+   the ordinary button colours back off `.tabs button`'s muted pair (it is not
+   an unselected tab) without the active tab's glow (it is not a selected one
+   either), and the auto margin holds the gap that says so. Wrapping tabs push
+   it onto the last row, where the same margin still parks it at the right
+   edge. */
+.tabs .tabs-action {
+  margin-left: auto;
+  color: var(--cyan);
+  border-color: var(--border-bright);
+}
+
 .tabs button.active {
   color: var(--cyan);
   border-color: var(--cyan);
@@ -2529,6 +2542,10 @@ main {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  /* The title and the actions must not abut: `space-between` alone lets a
+     long session name run right up against the first button's border once
+     the title fills its track (task 814). */
+  gap: 0.6rem;
   padding: 0.3rem 0.6rem;
   border-bottom: 1px solid var(--border);
   font-family: var(--font-mono);
@@ -3012,6 +3029,19 @@ body.files-tree-resizing {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  /* Shrinkable, but never to nothing: with two panes open the session name is
+     the only thing telling them apart, so it keeps a floor rather than being
+     squeezed out by the actions beside it (task 814). */
+  min-width: 4rem;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* `text-overflow` does NOT apply to a flex container, and `.agent-sidebar-pane-title`
+   is one — so the ellipsis has to live on the label itself, which is an
+   ordinary inline box. Without this the name is hard-clipped mid-word and
+   reads as a rendering fault rather than a truncation. */
+.agent-sidebar-pane-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3026,6 +3056,289 @@ body.files-tree-resizing {
 
 .agent-sidebar-pane-grip:active {
   cursor: grabbing;
+}
+
+/* ---- agent pane: term/chat view switch + the chat view (task 814) ---- */
+
+/* The header's right-hand group. `.agent-terminal-header` is a
+   space-between row, so without this wrapper a second control would be
+   spread across the header instead of sitting beside `close`. */
+.agent-sidebar-pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex: none;
+}
+
+.agent-pane-view-toggle {
+  display: inline-flex;
+}
+
+.agent-pane-view-toggle button {
+  background: rgba(6, 10, 16, 0.85);
+  font-size: 0.7rem;
+  /* 24px tall minimum (WCAG 2.2 SC 2.5.8). This is the control the feature's
+     own phone argument depends on, so it may not be a 17px sliver. */
+  padding: 0.2rem 0.5rem;
+  min-height: 24px;
+  color: var(--muted);
+}
+
+/* The two halves read as one control: only the outer corners round, and the
+   shared edge is drawn once. */
+.agent-pane-view-toggle button:first-child {
+  border-radius: 3px 0 0 3px;
+}
+
+.agent-pane-view-toggle button:last-child {
+  border-radius: 0 3px 3px 0;
+  border-left: none;
+}
+
+.agent-pane-view-toggle button.active {
+  color: var(--amber);
+  border-color: var(--amber);
+  box-shadow: 0 0 8px rgba(255, 180, 68, 0.25);
+}
+
+.agent-pane-view-toggle button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Both views occupy the same box. The inactive terminal is only made
+   invisible (never `display: none`) so its measured size — and therefore
+   xterm's fit and the attach socket's scrollback — survives a switch; see
+   `PaneBody`. */
+.agent-pane-views {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.agent-pane-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.agent-pane-view.hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.agent-chat {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  background: var(--bg);
+}
+
+.agent-chat-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.agent-chat-hint,
+.agent-chat-truncated {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  margin: 0;
+  text-align: center;
+}
+
+/* Full-width rows, NOT left/right-aligned bubbles. Two reasons, one of them
+   a bug: a pane is routinely 400-600px wide, where alternating alignment
+   spends most of the width on empty gutter; and a shrink-to-fit flex item
+   whose content sets `overflow-wrap: anywhere` can be sized at its
+   min-content — one character per line — which is exactly what a short
+   prompt did. The two sides are told apart by their accent instead, the same
+   warm/cool split the CC timeline's prompt and response rows use. */
+.agent-chat-bubble {
+  align-self: stretch;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  min-width: 0;
+}
+
+/* The human turn is the spine a reader scans a session by — it has to stay
+   findable while scrolling past a few hundred tool rows, so it is the one
+   that is raised and brightly accented. */
+.agent-chat-prompt {
+  border-left-color: var(--cyan);
+  background: var(--panel-raised);
+}
+
+.agent-chat-response {
+  border-left-color: var(--amber);
+  background: var(--panel);
+}
+
+/* A turn kind this build doesn't know: shown, but claimed by neither side —
+   neutral rule, neutral label (see `chatGroups`). */
+.agent-chat-other {
+  border-left-color: var(--border-bright);
+  background: var(--panel);
+}
+
+.agent-chat-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  /* `--muted` on `--panel` is 4.4:1 — under AA for text this small. The meta
+     row carries who said it and when, so it takes the body colour. */
+  font-size: 0.68rem;
+  color: var(--text);
+  margin-bottom: 0.25rem;
+}
+
+/* A long model id must not push the clock out of the row. */
+.agent-chat-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chat-who {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.agent-chat-prompt .agent-chat-who {
+  color: var(--cyan);
+}
+
+.agent-chat-response .agent-chat-who {
+  color: var(--amber);
+}
+
+.agent-chat-clock {
+  margin-left: auto;
+  flex: none;
+}
+
+/* Transcript prose carries bare URLs and long paths that no soft-wrap
+   opportunity would break — the same reason `.inbox-body` sets it. */
+.agent-chat-body {
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+/* A run of tool calls: the agent working between two things it said. Muted
+   and collapsible, because it is context for the conversation, not the
+   conversation. */
+/* A tool run belongs to the reply above it, so it hugs that turn and keeps
+   its distance from the next one — a uniform gap made the whole column read
+   as one flat list. The rule is `--border-bright`: at 2px on the near-black
+   background `--border` is effectively invisible, so the block had no
+   container at all. */
+.agent-chat-tools {
+  align-self: stretch;
+  border-left: 2px solid var(--border-bright);
+  padding-left: 0.5rem;
+  margin: -0.25rem 0 0.25rem 0.5rem;
+}
+
+.agent-chat-tools-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  width: 100%;
+  background: none;
+  border: none;
+  /* 24px minimum: this is the primary interaction of the chat view. */
+  padding: 0.25rem 0;
+  min-height: 24px;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.agent-chat-tools-head:hover {
+  color: var(--text);
+}
+
+.agent-chat-caret {
+  flex: none;
+}
+
+/* Which tools ran is why you would open the block; how many is trivia. The
+   emphasis goes to the summary, not the count. */
+.agent-chat-tools-count {
+  flex: none;
+}
+
+.agent-chat-tools-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* Pinned to the pane's own bottom-right rather than sitting in the column:
+   the reader has scrolled away from the tail, so a control that scrolls with
+   the content would be somewhere else entirely. */
+.agent-chat-jump {
+  position: sticky;
+  bottom: 0;
+  align-self: flex-end;
+  background: var(--panel-raised);
+  border: 1px solid var(--cyan-dim);
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  padding: 0.25rem 0.6rem;
+  min-height: 24px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.agent-chat-jump:hover {
+  border-color: var(--cyan);
+}
+
+.agent-chat-tool {
+  display: flex;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+  padding: 0.05rem 0;
+  min-width: 0;
+}
+
+.agent-chat-tool-name {
+  flex: none;
+  color: var(--text);
+}
+
+.agent-chat-tool-target {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Divider between two adjacent children of one split node — drag to resize
@@ -3311,7 +3624,15 @@ body.files-tree-resizing {
   }
 
   .files-tree-pane.collapsed .files-tree,
+  .files-tree-pane.collapsed .files-search-panel,
   .files-tree-pane.collapsed .files-tree-resize-handle {
+    display: none;
+  }
+
+  /* Collapsed, the rail is the expander and nothing else — the search toggle
+     goes with `+` below, since Cmd/Ctrl+Shift+F expands the pane on its way
+     in and the toggle would otherwise open a panel into a hidden column. */
+  .files-tree-pane.collapsed .files-tree-search-toggle {
     display: none;
   }
 
@@ -3460,6 +3781,32 @@ body.files-tree-resizing {
 
 .files-tree-pane.collapsed .files-tree-add {
   display: none;
+}
+
+/* The panel's own toggle (mesa task 813), beside `+` on the pane's header
+   rail: the mouse route to Cmd/Ctrl+Shift+F, and the control the panel hands
+   the caret back to when it closes. Always visible, unlike `+` — an
+   affordance nobody can find is a shortcut nobody knows about — and chromeless
+   like the collapse toggle it sits next to. */
+.files-tree-search-toggle {
+  margin-left: auto;
+  padding: 0 0.3rem;
+  border: none;
+  border-radius: 0;
+  clip-path: none;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.files-tree-search-toggle:hover,
+.files-tree-search-toggle[aria-pressed='true'] {
+  background: none;
+  box-shadow: none;
+  color: var(--cyan);
 }
 
 /* The inline naming row: an input shaped like the tree row it replaces, so
@@ -3869,6 +4216,169 @@ body.files-tree-resizing {
   color: var(--cyan);
   border-color: var(--cyan);
   box-shadow: inset 0 0 8px var(--cyan-dim);
+}
+
+/* Project search (mesa task 813): the panel takes the tree's place inside
+   `.files-tree-pane`, so it inherits that pane's width, collapse, drag handle
+   and phone-tier stack — every rule about where this column sits is already
+   written, and none of it is repeated here. Same box as `.files-tree`. */
+.files-search-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+/* The query row, `.files-find-bar`'s shape one column over. It does not
+   scroll with the results: a search you cannot retype without scrolling back
+   up is the same mistake the pinned pane header fixed. */
+.files-search-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  /* Wraps, unlike the find bar's row: this one lives in a column the user can
+     drag down to 160px, where a query box beside three buttons leaves about
+     two characters of query visible. Wrapping keeps the box usable at every
+     width and costs a row only where it has to. */
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* `8rem` is the basis it wraps at, not a floor it clips to — `min-width` below
+   the basis is what lets it still shrink on the row it ends up on. */
+.files-search-input {
+  flex: 1 1 8rem;
+  min-width: 6rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.files-search-summary {
+  flex: none;
+  margin: 0;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.files-search-panel .error {
+  flex: none;
+  margin: 0;
+  padding: 0 0.6rem 0.35rem;
+  font-size: 0.75rem;
+}
+
+/* The one scroller in the panel — the bar and the summary above it stay put
+   however long the result list is. */
+.files-search-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.files-search-results ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Both rows are real <button>s (one file heading, one per hit), so they are
+   Tab-reachable and Enter-activatable for free — the tab's standing rule that
+   focus candidates are just native ones. The app's button chrome hangs off the
+   element selector, so both strip it back to a row. */
+.files-search-file,
+.files-search-hit {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  clip-path: none;
+  box-shadow: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.files-search-file {
+  padding: 0.3rem 0.5rem;
+  border-left: 3px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--text-h);
+}
+
+.files-search-file:hover,
+.files-search-hit:hover {
+  background: var(--panel-raised);
+  box-shadow: none;
+}
+
+.files-search-file-name {
+  flex: none;
+  font-family: var(--font-mono);
+}
+
+/* The directory takes the slack and gives it up first: basenames collide, so
+   the path is what disambiguates, and the middle of it is the least useful
+   part to keep. */
+.files-search-file-dir {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.files-search-file-count {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+}
+
+.files-search-hit {
+  padding: 0.15rem 0.5rem 0.15rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.files-search-hit-line {
+  flex: none;
+  min-width: 2.5em;
+  text-align: right;
+  color: var(--muted);
+  opacity: 0.7;
+}
+
+/* One line per hit, clipped rather than wrapped: a wrapping row changes height
+   as the query changes, and the server already windowed the snippet around the
+   match. */
+.files-search-hit-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  color: var(--text);
+}
+
+/* NOT `.files-find-hit`: that mark is one layer of an overlay stack and paints
+   `color: transparent` so the text behind it shows through. Here the mark IS
+   the text. */
+.files-search-mark {
+  background: rgba(255, 180, 68, 0.28);
+  color: inherit;
 }
 
 /* File history (task 542): a commit list pinned beside the file, inside the
@@ -4772,6 +5282,15 @@ body.files-tree-resizing {
   justify-content: center;
 }
 
+/* The create-task modal's own, lighter dim (mesa task 811). It is the one
+   modal you fill in *while reading the view behind it* — a task written about
+   what is on screen — so the page underneath has to stay legible. Additive:
+   the base class above is still on the element, since that is the one
+   `shouldIgnoreShortcut()` matches. */
+.create-task-backdrop-soft {
+  background: rgba(6, 10, 16, 0.45);
+}
+
 .create-task-modal {
   width: min(26rem, 90vw);
   max-height: 85vh;
@@ -4781,6 +5300,34 @@ body.files-tree-resizing {
   clip-path: var(--cut);
   box-shadow: 0 0 32px rgba(0, 229, 255, 0.2);
   padding: 0.75rem 1rem 1.5rem;
+}
+
+/* Drag handle for the movable create-task modal (mesa task 811): the head bar
+   `CreateTaskPanel` already renders, turned into a title bar. The ✕ keeps its
+   right edge and the grip takes the left, so the bar reads as grabbable before
+   the cursor confirms it. `CreateTaskModal` excludes buttons from the drag, so
+   the ✕ still closes on a click. */
+.create-task-modal-movable .panel-head {
+  align-items: center;
+  cursor: move;
+  /* The box scrolls its own overflow, so on a touch screen a drag starting
+     here would be claimed as a scroll of it before `pointermove` ever ran —
+     this bar opts out of that so the gesture is the modal's. */
+  touch-action: none;
+}
+
+.create-task-modal-movable .panel-head::before {
+  content: '⠿';
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1;
+  /* The grip claims the left end by pushing everything after it right, rather
+     than by the bar switching to `space-between`. That is what lets the phone
+     tier drop the grip alone: `.panel-head`'s own `flex-end` is still in
+     force, so the ✕ returns to the right edge with no second override —
+     `space-between` left it stranded at the left, the only child of a bar
+     with nothing to space it against. */
+  margin-right: auto;
 }
 
 /* Task detail (mesa task 472): same shell as .create-task-modal, sized for
@@ -5130,6 +5677,20 @@ body.files-tree-resizing {
     padding: 0.4rem 0.75rem;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
+  }
+
+  /* The drag is already inert here — `modalDrag.ts` clamps a box against the
+     viewport, and this sheet *is* the viewport, so every drag resolves to no
+     movement. Drop the grip and the cursor rather than advertise a gesture
+     that cannot do anything, and hand the head bar's touches back to the
+     sheet's own scrolling (mesa task 811). */
+  .create-task-modal-movable .panel-head {
+    cursor: default;
+    touch-action: auto;
+  }
+
+  .create-task-modal-movable .panel-head::before {
+    content: none;
   }
 
   .create-task-modal .panel-close,

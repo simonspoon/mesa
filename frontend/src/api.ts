@@ -9,6 +9,7 @@ import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
 import type { CcNodeText } from './types/CcNodeText'
+import type { CcSessionChat } from './types/CcSessionChat'
 import type { CcSessionDetail } from './types/CcSessionDetail'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
@@ -27,6 +28,7 @@ import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { MesaVersion } from './types/MesaVersion'
 import type { ModelRates } from './types/ModelRates'
+import type { ProjectFileSearch } from './types/ProjectFileSearch'
 import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
@@ -515,6 +517,27 @@ export function createProjectFile(
   )
 }
 
+/**
+ * Every match of a literal `query` across the project's tree (mesa task 813) —
+ * the Files tab's Cmd/Ctrl+Shift+F panel. Grouped by file, capped server-side
+ * on every axis (matches per file, files, total, files opened), and searching
+ * exactly the tree the browser lists: excluded and binary files are skipped
+ * there, not filtered here.
+ *
+ * An empty query never reaches this (the panel refuses it) and would 422; a
+ * query that simply matches nothing is a 200 with no files.
+ */
+export function searchProjectFiles(
+  id: number,
+  query: string,
+  options: { caseSensitive: boolean; wholeWord: boolean },
+): Promise<ProjectFileSearch> {
+  const params = new URLSearchParams({ q: query })
+  if (options.caseSensitive) params.set('case', 'true')
+  if (options.wholeWord) params.set('word', 'true')
+  return request(`/api/projects/${id}/files/search?${params.toString()}`)
+}
+
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----
 
 /** Every live Claude Code session on the machine (no folder filter) — backs
@@ -766,6 +789,23 @@ export function getCcNodeText(sessionId: string, nodeId: string): Promise<CcNode
   return request(
     `/api/cc/sessions/${encodeURIComponent(sessionId)}/nodes/${encodeURIComponent(nodeId)}/text`,
   )
+}
+
+/**
+ * One session's conversation — the Agent sidebar's chat view (task 814): its
+ * main-thread prompts, replies and tool calls, oldest first, with full
+ * uncapped bodies on the prose. Read straight off the transcript, so unlike
+ * every other cc read it costs no ingest and answers for a session mesa
+ * spawned moments ago; that is also why it is safe to poll. 503 `unavailable`
+ * when the session has no transcript on disk.
+ *
+ * `text` on a prompt/response turn is **untrusted model-authored text**: it
+ * may be rendered as markdown (structure only — `Markdown` never passes raw
+ * HTML through) but never as HTML, and never as a URL.
+ */
+export function getCcSessionChat(sessionId: string, limit?: number): Promise<CcSessionChat> {
+  const q = limit === undefined ? '' : `?limit=${limit}`
+  return request(`/api/cc/sessions/${encodeURIComponent(sessionId)}/chat${q}`)
 }
 
 /**

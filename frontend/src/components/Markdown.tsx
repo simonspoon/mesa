@@ -107,6 +107,30 @@ export function Markdown({
 const CODE_TAG_CLASS = 'markdown-code-block'
 
 /**
+ * The slab both fenced-block paths paint (task 812). vscDarkPlus carries VS
+ * Code's own `#1e1e1e` warm grey on its `<pre>`, which reads as a foreign
+ * panel dropped into mesa's near-black/cyan theme — and it arrives as an
+ * INLINE style, so only `customStyle` can displace it (no class rule, at any
+ * specificity, wins against it). The whole-file viewer and the editor overlay
+ * already sidestep it by rendering on `background: transparent`; a markdown
+ * block is a slab inside prose, so it takes the theme's own raised-panel
+ * tokens instead — the same background/border pair as `.files-frontmatter`
+ * and every other inset panel. Token colours are untouched: they stay
+ * identical to the ones the Files viewer paints for the same language.
+ *
+ * The plain (no-grammar) path takes the same object rather than a CSS twin,
+ * so an unknown fence and a highlighted one are the same block — before this
+ * they disagreed twice over, one grey slab and one with no slab at all.
+ */
+const CODE_SLAB = {
+  margin: '0.5rem 0',
+  padding: '0.6rem 0.8rem',
+  background: 'var(--panel-raised)',
+  border: '1px solid var(--border)',
+  borderRadius: '6px',
+}
+
+/**
  * Renders one fenced code block. react-markdown always wraps a block in
  * `<pre><code class="language-xxx">…</code></pre>`, so `children` here is that
  * lone `<code>` element — we read its class + text rather than re-parsing.
@@ -121,7 +145,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   // `<code>` so it still picks up `.markdown-body`'s monospace rule.
   if (!grammar)
     return (
-      <pre>
+      <pre style={CODE_SLAB}>
         <code className={`${CODE_TAG_CLASS} ${className}`.trim()}>{source}</code>
       </pre>
     )
@@ -129,7 +153,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
     <SyntaxHighlighter
       language={grammar}
       style={vscDarkPlus}
-      customStyle={{ margin: '0.5rem 0', borderRadius: '4px' }}
+      customStyle={CODE_SLAB}
       codeTagProps={{ className: CODE_TAG_CLASS }}
     >
       {source}

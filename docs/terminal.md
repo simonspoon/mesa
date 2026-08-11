@@ -213,6 +213,9 @@ page's code unchanged.
   `local_path` that is set but no longer a directory is left to the server's
   own `validation` rejection (the pane shows its "shell closed" banner) —
   there's no tree/status call on this tab to read that rung from.
-- The `'a'` create-task shortcut is inert on this tab, like every other
-  non-Board view (`ProjectTasksPage`'s `useCreateTaskShortcut`), on top of
-  `shouldIgnoreShortcut`'s existing `.xterm`/`.agent-terminal` suppression.
+- The `'a'` create-task shortcut reaches this tab like every other project
+  view (task 811), and `shouldIgnoreShortcut`'s `.xterm`/`.agent-terminal`
+  rule is now the only thing standing between it and a keystroke meant for a
+  shell — it used to be the second of two, behind a Board-only listener. A
+  typed `a` still lands in the pane; `a` with focus outside every pane opens
+  the create-task modal over the tab, which is the point.

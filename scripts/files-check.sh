@@ -16,9 +16,14 @@
 #   4. `GET .../files/download` still being a fixed `application/octet-stream`
 #      + `attachment` — a regression guard, since raw is the route that added
 #      real mime types to this surface;
-#   5. both serve modes — raw is a read, reachable in default AND `--lan`,
-#      while the PATCH write keeps its `require_agent_access` + Content-Type
-#      gate in both.
+#   5. `GET /api/projects/{id}/files/search?q=` (task 813) — hits grouped by
+#      file over the SAME tree the browser lists (an excluded directory and a
+#      binary are skipped server-side, not filtered by the client), the two
+#      option toggles, a miss as a 200, and the `?q=` contract (missing, empty
+#      or over-long is 422 `validation`);
+#   6. both serve modes — raw and search are reads, reachable in default AND
+#      `--lan`, while the PATCH write keeps its `require_agent_access` +
+#      Content-Type gate in both.
 #
 # The tree/content/create/write contract at large is exercised by the Rust
 # unit tests in src/core/files.rs; this script is the HTTP-surface gate.
@@ -72,6 +77,20 @@ HTML
 
 printf 'plain notes\n' > "$REPO/notes.md"
 printf 'no extension here\n' > "$REPO/LICENSE"
+
+# Search fixtures (task 813): one hit in a nested source file, one in an
+# EXCLUDED directory, and one inside a binary — the last two must never come
+# back, and neither can be told apart from the first by the query alone.
+mkdir -p "$REPO/src" "$REPO/node_modules"
+cat > "$REPO/src/main.rs" <<'RS'
+fn main() {
+    let needle = 1; // needle again
+    let Needle = 2;
+    let needles = 3;
+}
+RS
+printf 'needle needle needle\n' > "$REPO/node_modules/dep.js"
+printf 'needle inside a binary\n\0\n' > "$REPO/blob.dat"
 
 STDOUT=$("$MESA" project create "Files project" --path "$REPO")
 PROJ=$(jq -r .id <<<"$STDOUT")
@@ -237,7 +256,57 @@ cmp -s "$TMP/out" "$REPO/logo.png" || fail "download png: bytes verbatim"
 ok "GET .../files/download on a PNG: still octet-stream + attachment (raw did not relax it)"
 
 # =====================================================================
-# 5. both serve modes
+# 5. project search (task 813) — the same tree the browser lists
+# =====================================================================
+
+api 200 GET "/api/projects/$PROJ/files/search?q=needle"
+[ "$(jqb '.files | length')" = "1" ] ||
+  fail "search: expected hits in exactly one file, got $(jqb '.files | length') ($BODY)"
+[ "$(jqb '.files[0].path')" = "src/main.rs" ] ||
+  fail "search: the one file must be src/main.rs, got $(jqb '.files[0].path')"
+[ "$(jqb .total_matches)" = "4" ] ||
+  fail "search: case-insensitive by default, expected 4 matches, got $(jqb .total_matches)"
+[ "$(jqb .truncated)" = "false" ] || fail "search: nothing here hits a cap"
+[ "$(jqb '.files[0].language')" = "rust" ] || fail "search: language must come with the group"
+[ "$(jqb '.files[0].matches[0].line')" = "2" ] ||
+  fail "search: first hit is on line 2, got $(jqb '.files[0].matches[0].line')"
+[ "$(jqb '.files[0].matches[0].text')" = "let needle = 1; // needle again" ] ||
+  fail "search: the snippet drops leading indentation, got '$(jqb '.files[0].matches[0].text')'"
+ok "GET .../files/search: hits grouped by file, node_modules and the binary absent"
+
+# The excluded directory and the NUL-carrying file are the two that must never
+# appear — asserted by name rather than only by the count above.
+grep -q 'node_modules' <<<"$BODY" && fail "search: an EXCLUDED_DIRS file must never appear"
+grep -q 'blob.dat' <<<"$BODY" && fail "search: a binary file must never be scanned"
+ok "GET .../files/search: excluded and binary files are skipped, not filtered client-side"
+
+api 200 GET "/api/projects/$PROJ/files/search?q=Needle&case=true"
+[ "$(jqb .total_matches)" = "1" ] ||
+  fail "search ?case=true: expected 1 match, got $(jqb .total_matches)"
+[ "$(jqb '.files[0].matches[0].line')" = "3" ] || fail "search ?case=true: wrong line"
+ok "GET .../files/search?case=true: matches case, and only case"
+
+api 200 GET "/api/projects/$PROJ/files/search?q=needle&word=true"
+[ "$(jqb .total_matches)" = "3" ] ||
+  fail "search ?word=true: expected 3 whole-word matches, got $(jqb .total_matches)"
+ok "GET .../files/search?word=true: whole word only (needles no longer counts)"
+
+api 200 GET "/api/projects/$PROJ/files/search?q=nothing-matches-this"
+[ "$(jqb '.files | length')" = "0" ] || fail "search: a miss must be an empty list"
+[ "$(jqb .total_matches)" = "0" ] || fail "search: a miss must be 0 matches"
+ok "GET .../files/search with no hits: 200 and an empty result, not an error"
+
+api 422 GET "/api/projects/$PROJ/files/search"
+[ "$(jqb .error.code)" = "validation" ] || fail "search no ?q=: error.code"
+api 422 GET "/api/projects/$PROJ/files/search?q="
+[ "$(jqb .error.code)" = "validation" ] || fail "search empty ?q=: error.code"
+LONG=$(head -c 201 < /dev/zero | tr '\0' 'n')
+api 422 GET "/api/projects/$PROJ/files/search?q=$LONG"
+[ "$(jqb .error.code)" = "validation" ] || fail "search over-long ?q=: error.code"
+ok "GET .../files/search with a missing, empty or over-long ?q=: 422 validation"
+
+# =====================================================================
+# 6. both serve modes
 # =====================================================================
 #
 # raw is a READ on the plain `guard`, so it is reachable in default mode and
@@ -251,6 +320,10 @@ check_modes() { # check_modes <label>
   [ "$STATUS" = "200" ] || fail "$label: raw must be reachable, got $STATUS"
   [ "$(hdr content-type)" = "image/png" ] || fail "$label: raw content-type"
   ok "$label: GET .../files/raw is reachable (a read on the standard guard)"
+
+  api 200 GET "/api/projects/$PROJ/files/search?q=needle"
+  [ "$(jqb '.files | length')" = "1" ] || fail "$label: search must be reachable"
+  ok "$label: GET .../files/search is reachable (a read on the standard guard)"
 
   local status
   status=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \

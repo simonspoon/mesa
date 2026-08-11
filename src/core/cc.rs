@@ -46,6 +46,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,11 +58,11 @@ use super::store::{
     CcSessionRecord, CcSessionUpsert, CcToolCallRow, Error, Result, Store,
 };
 use super::types::{
-    CcAgentStat, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
-    CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview,
-    CcProjectStat, CcSessionBucket, CcSessionDetail, CcSessionGraph, CcSessionModelStat,
-    CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat,
-    CcTokens, CcToolStat,
+    CcAgentStat, CcChatTurn, CcChatTurnKind, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode,
+    CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText,
+    CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket, CcSessionChat, CcSessionDetail,
+    CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat,
+    CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -116,11 +117,40 @@ struct RawLine {
     origin: Option<RawOrigin>,
 }
 
-/// The `origin` block of a `user` line. Only its `type` is read.
+/// The `origin` block of a `user` line. Only what it calls the turn is read.
+///
+/// **Upstream has spelled that key both ways** — `type` when the block was
+/// introduced (v2.1.187), `kind` on current releases (v2.1.227, task 814) — so
+/// both are parsed. Reading only one fails *silent and total*: an `origin`
+/// object whose single key mesa doesn't know deserializes to an all-`None`
+/// `RawOrigin`, which is not "no origin" (the branch that falls back to the
+/// prefix list) but "origin says not-human", so every human turn of every
+/// session is rejected and `cc_prompts` quietly stops growing. Found by live
+/// QA of the chat view, whose whole left side was missing.
+///
+/// They are **two fields, not one field with `#[serde(alias)]`**. An alias
+/// maps two JSON keys onto one field, which makes a line carrying *both*
+/// spellings a serde duplicate-field error — and every parse site here is
+/// `let Ok(raw) = … else { continue }`, so that line would be dropped from
+/// the ingest entirely, taking its usage, tool calls and session span with
+/// it. Emitting both keys through a rename is the most ordinary thing
+/// upstream could do next, and it must degrade to "read either", never to a
+/// worse failure than the bug this fixes.
 #[derive(Deserialize)]
 struct RawOrigin {
     #[serde(rename = "type", default)]
-    kind: Option<String>,
+    type_key: Option<String>,
+    #[serde(rename = "kind", default)]
+    kind_key: Option<String>,
+}
+
+impl RawOrigin {
+    /// What this block calls the turn, under either spelling. `type` wins when
+    /// both are present and disagree — it is the original, so a line carrying
+    /// both is most likely a compatibility emission led by the old key.
+    fn says(&self) -> Option<&str> {
+        self.type_key.as_deref().or(self.kind_key.as_deref())
+    }
 }
 
 #[derive(Deserialize)]
@@ -419,7 +449,7 @@ fn human_prompt_raw(line: &RawLine) -> Option<String> {
         return Some(cmd);
     }
     let accepted = match line.origin.as_ref() {
-        Some(o) => o.kind.as_deref() == Some("human"),
+        Some(o) => o.says() == Some("human"),
         None => {
             let trimmed = text.trim_start();
             !NON_HUMAN_PREFIXES.iter().any(|p| trimmed.starts_with(p))
@@ -2617,6 +2647,235 @@ fn scan_for_body(bytes: &[u8], ident: &NodeIdent) -> Option<String> {
     None
 }
 
+// ---- session chat (the Agent sidebar's rendered view, task 814) ----
+
+/// Default cap on the turns one [`session_chat`] call returns, newest kept.
+pub const CHAT_TURN_LIMIT: usize = 200;
+
+/// How much of a transcript's **tail** [`session_chat`] parses. A transcript
+/// reaches tens of megabytes (21 MB, measured on the real corpus) and this
+/// read is a 3-second poll behind an open chat pane, so parsing whole files
+/// would burn CPU proportional to session age on every tick. A window bounds
+/// that cost by *bytes read* — which is the cost — where the turn limit alone
+/// could not: dropping turns after parsing them saves nothing.
+///
+/// **On a long session this, not `CHAT_TURN_LIMIT`, is the operative bound**,
+/// and by a wide margin: transcript bytes are dominated by tool *results*,
+/// which produce no turn at all. Measured over the six largest real
+/// transcripts (21.2 down to 8.2 MB), 2 MiB yielded 18-84 turns — never
+/// close to 200. So the chat view shows roughly the last few dozen exchanges
+/// of a long session whatever `limit` says, and `truncated` is how it admits
+/// that. Reading back by turn count instead would mean reading most of a 21 MB
+/// file on every 3-second tick, which is the cost this exists to avoid.
+/// A transcript smaller than this is read whole and `truncated` is false.
+const CHAT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The ceiling [`read_tail`] will grow its window to when the window lands
+/// *inside a single line*. One transcript line can itself be megabytes (a
+/// large tool result; the real corpus holds a 2.59 MB one), and a window
+/// holding no complete line yields no turns at all — a blank chat pane for a
+/// session that is talking perfectly well. Above every transcript observed
+/// (21.2 MB), so in practice this means "read the whole file rather than
+/// answer nothing"; it is a bound, not a budget, and only a pathological tail
+/// ever reaches it.
+const CHAT_TAIL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// One session's conversation, read **live from its transcript file** rather
+/// than from the `cc_*` tables (task 814) — the third and last read to do so,
+/// beside [`live`] and [`node_text`], and for both of their reasons at once:
+/// the newest turns of a running session are younger than any ingest, and the
+/// bodies a chat window renders were deliberately never stored (a stored
+/// preview is 200 sanitized characters).
+///
+/// Consequently it takes no [`Store`] and runs no [`sync`] — a full tree walk
+/// under the API's store lock is not something a poll may do — and it answers
+/// for a session mesa spawned moments ago that has never been ingested.
+///
+/// `session_id` is caller input and is used to *build* a path, so it is
+/// validated to the id charset first ([`Error::Validation`]) and the result
+/// still goes through [`transcript_path`]. A session with no transcript on
+/// disk is [`Error::Unavailable`] — the code already scoped to "the row is
+/// fine, the Claude-Code-managed file is not".
+///
+/// Turns come out in **file order**, which is chronological: a transcript is
+/// append-only. Within one assistant line the prose is emitted before that
+/// line's tool calls — the same `response`-before-`tool` rule
+/// [`session_graph`] applies at an equal timestamp.
+pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::Validation(format!("not a session id: {session_id}")));
+    }
+    let path = find_transcript(session_id).ok_or_else(|| {
+        Error::Unavailable(format!("no transcript on disk for session {session_id}"))
+    })?;
+    let path = transcript_path(&path.to_string_lossy())?;
+    let (text, windowed) = read_tail(&path)?;
+
+    let mut turns = chat_turns(&text);
+    let dropped = turns.len().saturating_sub(limit);
+    if dropped > 0 {
+        turns.drain(..dropped);
+    }
+    Ok(CcSessionChat {
+        session_id: session_id.to_string(),
+        turns,
+        truncated: windowed || dropped > 0,
+    })
+}
+
+/// Fold one transcript's text into ordered chat turns. Split out from
+/// [`session_chat`] so the whole line-classification policy — which lines are
+/// a human turn, which are the assistant's, which are neither — is unit
+/// testable against literal transcript lines rather than only through a file.
+fn chat_turns(text: &str) -> Vec<CcChatTurn> {
+    let mut turns: Vec<CcChatTurn> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
+        // A subagent's turns belong to its own transcript and its own reader;
+        // the same main-thread-only rule `cc_prompts` keeps. (Sidechain lines
+        // are not written to this file, so this is a guard, not a filter.)
+        if raw.is_sidechain == Some(true) {
+            continue;
+        }
+        let Some(uuid) = raw.uuid.clone() else {
+            continue;
+        };
+        if let Some(text) = human_prompt_raw(&raw) {
+            turns.push(CcChatTurn {
+                id: uuid,
+                kind: CcChatTurnKind::Prompt,
+                ts: raw.timestamp.clone(),
+                model: None,
+                name: None,
+                text,
+            });
+            continue;
+        }
+        // Assistant turns are read off `type` rather than off the shape of
+        // `message`, which is not enough on its own: Claude Code writes its
+        // own injections (a skill body, hook output, a caveat banner) as
+        // `user` lines whose content is an array of `text` blocks — exactly
+        // what `assistant_text_raw` reads — so a shape test alone renders an
+        // injected skill body as something the assistant said.
+        if raw.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = raw.message.as_ref() else {
+            continue;
+        };
+        if let Some(text) = msg.assistant_text_raw() {
+            turns.push(CcChatTurn {
+                id: uuid,
+                kind: CcChatTurnKind::Response,
+                ts: raw.timestamp.clone(),
+                model: msg.model.clone(),
+                name: None,
+                text,
+            });
+        }
+        for (id, name, _caller, target) in msg.tool_uses() {
+            turns.push(CcChatTurn {
+                id,
+                kind: CcChatTurnKind::Tool,
+                ts: raw.timestamp.clone(),
+                model: None,
+                name: Some(name),
+                // Bounded on purpose: a chat row says *that* a call happened
+                // and what it acted on. The whole input is `cc text`'s job.
+                text: target.unwrap_or_default(),
+            });
+        }
+    }
+    turns
+}
+
+/// The main-thread transcript of `session_id`: `<projects_dir>/*/<id>.jsonl`.
+///
+/// The project slug is unknown here — it encodes the session's cwd, which the
+/// caller does not hold — so every slug directory is probed for the file, the
+/// same shape `agents::live_subagents` uses for the same reason. It is one
+/// `stat` per slug directory (98 on the real corpus), not a tree walk.
+fn find_transcript(session_id: &str) -> Option<PathBuf> {
+    let root = projects_dir()?;
+    let file = format!("{session_id}.jsonl");
+    for entry in fs::read_dir(&root).ok()?.flatten() {
+        let candidate = entry.path().join(&file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The last [`CHAT_TAIL_BYTES`] of `path` as text, plus whether the window
+/// actually cut anything. A cut lands mid-line, so the first (partial) line is
+/// dropped — losing at most one turn that a caller was told is truncated
+/// anyway. Lossy UTF-8 for the same reason the parsers elsewhere are lenient:
+/// one bad byte must not blank a whole conversation.
+fn read_tail(path: &Path) -> Result<(String, bool)> {
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let read_all = |f: &mut fs::File| -> Result<(String, bool)> {
+        let mut buf = Vec::with_capacity(len as usize);
+        f.seek(SeekFrom::Start(0))?;
+        f.read_to_end(&mut buf)?;
+        Ok((String::from_utf8_lossy(&buf).into_owned(), false))
+    };
+    let mut window = CHAT_TAIL_BYTES;
+    // `buf` holds the bytes from `have_from` to EOF, and **grows downward**:
+    // widening reads only the newly exposed prefix and prepends it, never the
+    // whole window again. This is a poll, and the widening case is by
+    // definition the one with megabyte lines in it — re-reading from scratch
+    // would make 2+8+32 MiB of I/O out of what should be 32.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut have_from = len;
+    loop {
+        if len <= window + 1 {
+            return read_all(&mut f);
+        }
+        // Start one byte EARLY, so the buffer opens with the byte preceding
+        // the window. That byte is the whole difference between "the cut
+        // landed mid-line" and "the cut landed exactly on a line start":
+        // without it a boundary that happens to fall on a newline discards a
+        // line that was complete, which `truncated` then reports as if it were
+        // the ordinary partial-line loss.
+        let from = len - window - 1;
+        let mut head = Vec::with_capacity((have_from - from) as usize);
+        f.seek(SeekFrom::Start(from))?;
+        // `take` rather than an exact read: a transcript only ever grows, but
+        // a rotation between the `metadata` above and this read must degrade
+        // to a short answer, not to a 500.
+        std::io::Read::by_ref(&mut f)
+            .take(have_from - from)
+            .read_to_end(&mut head)?;
+        head.extend_from_slice(&buf);
+        buf = head;
+        have_from = from;
+
+        let start = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        if start < buf.len() || window >= CHAT_TAIL_MAX_BYTES {
+            return Ok((String::from_utf8_lossy(&buf[start..]).into_owned(), true));
+        }
+        // The window fell entirely inside one line, so it holds no complete
+        // line and parsing it would answer "this session has said nothing".
+        // Widen and retry rather than return that.
+        window = window.saturating_mul(4).min(CHAT_TAIL_MAX_BYTES);
+    }
+}
+
 // ---- small helpers ----
 
 /// What a persisted message row is counted *under* when summing usage: its
@@ -3921,6 +4180,41 @@ mod tests {
             .as_deref(),
             Some("add a prompts row to the timeline")
         );
+        // …and the key upstream renamed it to. Both spellings are live in the
+        // corpus, and reading only one rejects every human turn written by the
+        // other (task 814) — not "no origin", which would fall back to the
+        // prefix list and accept this.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"kind":"human"},
+                    "message":{"content":"add a prompts row to the timeline"}}"#
+            )
+            .as_deref(),
+            Some("add a prompts row to the timeline")
+        );
+        // A line carrying BOTH spellings must still parse. This is why
+        // `RawOrigin` has two fields rather than one `#[serde(alias)]`: an
+        // alias makes this a duplicate-field error, and every parse site skips
+        // an unparseable line — so emitting both keys (the ordinary way to ship
+        // a rename) would drop the whole line from the ingest, which is worse
+        // than the bug the second spelling fixes.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"type":"human","kind":"human"},
+                    "message":{"content":"both keys"}}"#
+            )
+            .as_deref(),
+            Some("both keys")
+        );
+        // Either key order, same answer.
+        assert_eq!(
+            prompt_of(
+                r#"{"type":"user","origin":{"kind":"human","type":"human"},
+                    "message":{"content":"both keys, other order"}}"#
+            )
+            .as_deref(),
+            Some("both keys, other order")
+        );
         // An array of text blocks flattens the same way, in order.
         assert_eq!(
             prompt_of(
@@ -4806,5 +5100,210 @@ mod tests {
             matches!(refused, Err(Error::Validation(_))),
             "a path outside the transcript root must be refused, not read"
         );
+    }
+
+    // ---- session chat (task 814) ----
+
+    /// One transcript, exercising every classification the chat read makes:
+    /// a human turn, an assistant turn carrying prose *and* two calls, one
+    /// injected `user` line that must not read as an assistant turn, one
+    /// `tool_result` carrier, and a sidechain line from a subagent.
+    const CHAT_LINES: &str = concat!(
+        r#"{"type":"user","uuid":"p1","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","origin":{"type":"human"},"message":{"role":"user","content":"ship it"}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"m1","sessionId":"s","timestamp":"2026-08-01T10:00:01.000Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-08-01T10:00:02.000Z","message":{"id":"msg_1","model":"claude-opus-5","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"On it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","id":"t2","name":"advisor","input":{}}]}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"r1","sessionId":"s","timestamp":"2026-08-01T10:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"sa1","isSidechain":true,"agentId":"g1","sessionId":"s","timestamp":"2026-08-01T10:00:04.000Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"subagent prose"}]}}"#,
+        "\n",
+        "not json at all\n",
+    );
+
+    #[test]
+    fn chat_turns_classify_a_transcript() {
+        let turns = chat_turns(CHAT_LINES);
+        let shape: Vec<(CcChatTurnKind, &str)> =
+            turns.iter().map(|t| (t.kind, t.id.as_str())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (CcChatTurnKind::Prompt, "p1"),
+                (CcChatTurnKind::Response, "a1"),
+                (CcChatTurnKind::Tool, "t1"),
+                (CcChatTurnKind::Tool, "t2"),
+            ],
+            "an injected `user` line, a tool_result carrier, a sidechain line \
+             and an unparseable line all produce no turn — and one assistant \
+             line emits its prose BEFORE its own calls"
+        );
+
+        assert_eq!(turns[0].text, "ship it");
+        assert_eq!(turns[0].model, None, "a human turn has no model");
+
+        // The response body is the prose only: `thinking` is excluded exactly
+        // as it is from a stored preview.
+        assert_eq!(turns[1].text, "On it.");
+        assert_eq!(turns[1].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(turns[1].ts.as_deref(), Some("2026-08-01T10:00:02.000Z"));
+
+        // A tool turn carries the tool's name and the bounded target; a call
+        // whose input has no summarizable key still appears, with none.
+        assert_eq!(turns[2].name.as_deref(), Some("Bash"));
+        assert_eq!(turns[2].text, "cargo test");
+        assert_eq!(turns[3].name.as_deref(), Some("advisor"));
+        assert_eq!(turns[3].text, "");
+    }
+
+    #[test]
+    fn chat_bodies_are_uncapped_but_a_tool_target_is_not() {
+        let long = "x".repeat(TARGET_MAX_CHARS * 3);
+        let line = format!(
+            r#"{{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","message":{{"model":"m","content":[{{"type":"text","text":"{long}"}},{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"{long}"}}}}]}}}}"#
+        );
+        let turns = chat_turns(&line);
+        assert_eq!(
+            turns[0].text.chars().count(),
+            TARGET_MAX_CHARS * 3,
+            "prose is the product here: no cap, no sanitizing"
+        );
+        assert_eq!(
+            turns[1].text.chars().count(),
+            TARGET_MAX_CHARS + 1,
+            "a tool target stays the same bounded summary the call tree shows              — 200 chars plus the ellipsis marking the cut"
+        );
+    }
+
+    #[test]
+    fn session_chat_refuses_an_id_that_is_not_a_session_id() {
+        // The id is used to BUILD a path, so it is validated before any
+        // filesystem access — no transcript root needs to exist for this.
+        for bogus in ["../../etc/passwd", "a/b", "", "sess id", "s.jsonl"] {
+            assert!(
+                matches!(session_chat(bogus, 10), Err(Error::Validation(_))),
+                "{bogus:?} must be refused as a session id"
+            );
+        }
+    }
+
+    #[test]
+    fn session_chat_reads_a_transcript_and_keeps_the_newest_turns() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-some-project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("sess-1.jsonl"), CHAT_LINES).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &root) };
+        let all = session_chat("sess-1", 100);
+        let tail = session_chat("sess-1", 2);
+        let missing = session_chat("sess-2", 100);
+        // SAFETY: same window, same lock.
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+
+        let all = all.unwrap();
+        assert_eq!(all.session_id, "sess-1");
+        assert_eq!(all.turns.len(), 4);
+        assert!(!all.truncated);
+
+        let tail = tail.unwrap();
+        assert_eq!(
+            tail.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["t1", "t2"],
+            "the limit keeps the NEWEST turns — a chat window is read at its end"
+        );
+        assert!(tail.truncated);
+
+        assert!(
+            matches!(missing, Err(Error::Unavailable(_))),
+            "a session with no transcript on disk is unavailable, not not_found"
+        );
+    }
+
+    /// Writes one transcript under a throwaway root and returns what
+    /// `session_chat` makes of it — the tail-window tests below control the
+    /// exact byte layout, so they need the file verbatim.
+    fn chat_of_file(body: &str) -> Result<CcSessionChat> {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-big-project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("sess-big.jsonl"), body).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &root) };
+        let out = session_chat("sess-big", 100);
+        // SAFETY: same window, same lock.
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+        out
+    }
+
+    /// One assistant line saying `text`, padded to exactly `len` bytes when
+    /// that is possible — the padding rides inside the prose so the line stays
+    /// valid JSON and the turn stays identifiable by `uuid`.
+    fn assistant_line(uuid: &str, text: &str, len: Option<usize>) -> String {
+        let line = |body: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","message":{{"model":"m","content":[{{"type":"text","text":"{body}"}}]}}}}"#
+            )
+        };
+        match len {
+            None => line(text),
+            Some(want) => {
+                let base = line(text).len();
+                assert!(want >= base, "cannot pad below the line's own length");
+                line(&format!("{text}{}", "y".repeat(want - base)))
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_line_larger_than_the_tail_window_does_not_blank_the_chat() {
+        // A multi-megabyte transcript line is ordinary — the real corpus holds
+        // a 2.59 MB one (a large tool result). If the window lands entirely
+        // inside one, a naive tail read finds no complete line at all and the
+        // pane renders "this session has not said anything yet" for a session
+        // that is talking perfectly well.
+        let body = format!(
+            "{}\n{}\n",
+            assistant_line("a1", "still here", None),
+            assistant_line("huge", "big", Some(CHAT_TAIL_BYTES as usize + 4096)),
+        );
+        let chat = chat_of_file(&body).unwrap();
+        assert_eq!(
+            chat.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "huge"],
+            "the window must widen past an oversized line rather than answer nothing"
+        );
+    }
+
+    #[test]
+    fn a_window_boundary_on_a_line_start_keeps_that_whole_line() {
+        // Lay the file out so `len - CHAT_TAIL_BYTES` falls EXACTLY on `keep`'s
+        // first byte: nothing there is partial, so nothing may be dropped.
+        // Without the one-byte lookbehind the first newline the buffer finds is
+        // `keep`'s own terminator, and a complete turn is silently discarded —
+        // and because `last` is still there the read looks successful.
+        let last = assistant_line("last", "the newest turn", None);
+        let keep_len = CHAT_TAIL_BYTES as usize - (last.len() + 1) - 1;
+        let keep = assistant_line("keep", "on the boundary", Some(keep_len));
+        let head = format!("{}\n", assistant_line("old", "before the window", None));
+        let body = format!("{head}{keep}\n{last}\n");
+        assert_eq!(
+            body.len() as u64 - CHAT_TAIL_BYTES,
+            head.len() as u64,
+            "the fixture must put the boundary exactly on `keep`'s first byte"
+        );
+
+        let chat = chat_of_file(&body).unwrap();
+        assert_eq!(
+            chat.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["keep", "last"],
+            "a line wholly inside the window is not a partial line and must survive"
+        );
+        assert!(chat.truncated, "`old` really was dropped, so say so");
     }
 }

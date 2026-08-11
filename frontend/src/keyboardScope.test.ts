@@ -108,6 +108,26 @@ function ignoresFind(target: Element | Document = document.body) {
   return seen
 }
 
+/** The same, for the project-search chord: a real Cmd+Shift+F. */
+function ignoresSearch(target: Element | Document = document.body) {
+  let seen: boolean | undefined
+  const handler = (e: Event) => {
+    seen = shouldIgnoreFilesShortcut(e as KeyboardEvent, 'search')
+  }
+  document.addEventListener('keydown', handler)
+  target.dispatchEvent(
+    new KeyboardEvent('keydown', {
+      key: 'F',
+      metaKey: true,
+      shiftKey: true,
+      bubbles: true,
+    }),
+  )
+  document.removeEventListener('keydown', handler)
+  if (seen === undefined) throw new Error('keydown never reached document')
+  return seen
+}
+
 /** The same, for a tab chord: a real Alt+] (matched on `code`, since Alt+] is
  * the character `‘` on macOS). */
 function ignoresTabs(target: Element | Document = document.body) {
@@ -206,5 +226,36 @@ describe('shouldIgnoreFilesShortcut', () => {
     expect(ignoresTabs(mount('<input id="t" class="files-tree-new-input">'))).toBe(
       true,
     )
+  })
+
+  // The project-search chord (Cmd/Ctrl+Shift+F, mesa task 813) is the third
+  // caller: same gate, one more box it survives.
+  it('lets the search chord through from the editor and from either query box', () => {
+    for (const html of [
+      '<textarea id="t" class="files-content-editor"></textarea>',
+      '<input id="t" class="files-find-input">',
+      '<input id="t" class="files-search-input">',
+    ]) {
+      expect(ignoresSearch(mount(html))).toBe(false)
+    }
+  })
+
+  it('stands the find chord down in the search panel own box, and vice versa', () => {
+    // Each chord acts *in* its own input and would be typed *into* the other
+    // one — the same asymmetry `'tabs'` has against the find bar.
+    expect(ignoresFind(mount('<input id="t" class="files-search-input">'))).toBe(
+      true,
+    )
+    expect(ignoresTabs(mount('<input id="t" class="files-search-input">'))).toBe(
+      true,
+    )
+  })
+
+  it('ignores the search chord in someone else’s field', () => {
+    expect(
+      ignoresSearch(mount('<input id="t" class="files-tree-new-input">')),
+    ).toBe(true)
+    mount('<div class="command-palette-backdrop"></div><button id="t"></button>')
+    expect(ignoresSearch(document.getElementById('t')!)).toBe(true)
   })
 })

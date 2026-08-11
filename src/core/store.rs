@@ -468,6 +468,16 @@ const MIGRATIONS: &[&str] = &[
     // be handed out. There is no status CHECK constraint, so this is a plain
     // data rewrite.
     "UPDATE tasks SET status = 'backlog' WHERE status = 'refine';",
+    // Task 814: `cc::human_prompt` now reads `origin.kind` as well as
+    // `origin.type` — upstream renamed the key, and reading only the old
+    // spelling rejected EVERY human turn of every session written since
+    // (`RawOrigin` in `src/core/cc.rs` has the full account). Same shape as
+    // the cursor clears above, and for the same reason: the fix makes the
+    // parser emit `cc_prompts` rows it previously missed entirely, and an
+    // unchanged transcript is skipped unread, so without this the timeline's
+    // prompt rows would only ever appear for turns taken after the upgrade.
+    // One-shot and additive — `cc_files` holds cursors, not data.
+    "DELETE FROM cc_files;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.

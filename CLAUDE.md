@@ -43,7 +43,7 @@ isolation.
 | `storyboard-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
 | `attachments-check` | CLI + API contract incl. cascade-delete | |
-| `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, and the read/write gate pairing in default *and* `--lan` | |
+| `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, `/files/search` (hits grouped by file, excluded/binary files skipped, both toggles, the `?q=` contract), and the read/write gate pairing in default *and* `--lan` | |
 | `agents-check` | `local_path` plumbing + `/api/projects/{id}/agents` | `MESA_CLAUDE_BIN` (stub) |
 | `todo-watcher-check` | `serve --watch-todo` dispatch loop | `MESA_WATCH_TODO_TICK_MS` |
 | `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME` — use a throwaway) | `MESA_WATCH_INBOX_TICK_MS` |
@@ -94,12 +94,13 @@ The code is the source of truth. These are the invariants you must not break:
 - **Frontend unit tests cover the pure logic modules, not components.** vitest
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
-  (`agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
+  (`agentChat`, `agentProject`, `agentSidebarWidth`, `boardView`, `clipboardFiles`,
   `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
-  `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
-  `layout`, `markdownAssets`, `navCollapse`, `navOrder`, `navWidth`,
-  `newFile`, `openFiles`, `pricingDraft`, `projectTree`, `sessionDetail`,
-  `sessionGraph`, `sessionTimeline`, `settingsDraft`, `syntaxHighlighter`,
+  `fileSearch`, `fileTabs`, `filesTreeWidth`, `keyboardScope`, `lastView`,
+  `layout`, `markdownAssets`, `modalDrag`, `navCollapse`, `navOrder`,
+  `navWidth`, `newFile`, `openFiles`, `pricingDraft`, `projectTree`,
+  `scriptDraft`, `sessionDetail`, `sessionGraph`, `sessionTimeline`,
+  `settingsDraft`, `syntaxHighlighter`,
   `time`, `watchersDraft`, `wordWrap`) —
   predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
@@ -268,20 +269,20 @@ The code is the source of truth. These are the invariants you must not break:
 | Attachments | Files/images on a task, stored outside the DB; 25 MiB cap, base64-in-JSON upload to stay inside the CSRF gate | `docs/attachments.md` |
 | Git tab | Read-only working-tree + history per project; external `git` shell-outs only | `docs/git-tab.md` |
 | Project version | The app version in a project's `local_path`, read from its manifest and shown beside the name; derived on every read, never stored, quiet-empty on any miss | `docs/project-version.md` |
-| Files tab | Project file browser + editor; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
+| Files tab | Project file browser + editor + project-wide search; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
 | Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |
 | Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE`. A **play** button reads an item aloud through `kokoro-rs` — audio streams back to the browser, the body reaches the binary on stdin | `docs/inbox.md` |
 | Agents | Live Claude Code sessions per project. Terminal access is code execution → all four routes share one mode-dependent gate stronger than task CRUD; `local_path` writes loopback-only in both modes | `docs/agents.md` |
 | Terminal | Shell panes (`portable-pty`, not `claude attach`), same `require_agent_access` stack. Global page + per-project tab (cwd resolved **server-side** from `?project=<id>`, never client-supplied) | `docs/terminal.md` |
-| Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `shouldIgnoreShortcut()` is the sole suppression chokepoint — every new global single-key shortcut must call it | `docs/keyboard.md` |
+| Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `keyboardScope.ts` is the sole suppression chokepoint, in two exports: `shouldIgnoreShortcut()` — every new global single-key shortcut must call it — and its chord sibling `shouldIgnoreFilesShortcut()`, which the Files tab's Cmd/Ctrl+F, Cmd/Ctrl+Shift+F and Alt+W / Alt+`[` / Alt+`]` bindings call because the first rule of the former is "a modifier chord belongs to its existing owner" | `docs/keyboard.md` |
 | Mobile | Two width tiers (860px narrow, 600px phone) at the end of `App.css`; the app has exactly **one** `MediaQueryList` (`phoneTier.ts`) and tier-dependent state is edge-triggered, never derived | `docs/mobile.md` |
 | Todo watcher | `serve --watch-todo` auto-dispatch, off by default. "Busy" = a **count** — `max(in_progress **leaves**, sessions under the project holding a live shell/subagent)`, max not a sum, an unavailable `claude` counting as zero — against a per-project limit (config `watchers.todo-concurrency`, default 1, read every tick); an umbrella counts toward nothing and narrows the tick to its descendants | `docs/todo-watcher.md` |
 | Inbox watcher | `serve --watch-inbox` auto-triage, off by default and independent of `--watch-todo`; re-dispatch guard is an **in-memory** set, not a db write | `docs/inbox-watcher.md` |
 | Hooks | User-configured shell commands on events (`task-execute`); a nonzero exit is **data**, not a failure | `docs/hooks.md` |
 | Config | `~/.mesa/config.json`: the 3 agent-spawn command templates (todo-watcher, inbox-watcher, add-agent). **A value is never spliced into a string a shell parses** — one line is argv (substitution happens after tokenizing, so an untrusted name is one argument); a value with a **newline** is a `bash -c` script whose values arrive as `MESA_*` env vars, never substituted into the body (so `{}` in a script is a save-time error). Edited from the **Settings** page (`#/settings`, sticky at the bottom of the left nav) over `GET`/`PUT /api/config`; blank = the built-in default, and the write is loopback-only in **both** serve modes. A second, independent `pricing` section prices model families for the CC Dashboard (prefix match, longest wins; absent/`null` = the built-in rate; an unknown prefix is allowed, which is how a new family gets priced without a rebuild) over `GET`/`PUT /api/config/pricing`, same gates. A third, independent `watchers` section tunes the todo-watcher's per-project concurrency limit (`todo-concurrency`, integer 1..=20, absent/`null` = built-in default 1) over `GET`/`PUT /api/config/watchers`, same gates, read fresh every tick — and each section's save preserves the other two | `docs/config.md` |
 | Scripts | User-authored shell in the db (`scripts` table, `project_id` **`ON DELETE SET NULL`**), each declaring a typed arg list the web form is generated from — arguments are **declared, never parsed out of the body**. `bash -c` gets the body verbatim and the values positionally + as `MESA_ARG_*`, so **no value is ever interpolated into a string a shell parses**; the `env_remove`-then-`env` sweep makes "not supplied" genuinely unset. A nonzero exit is **data** (CLI exits 0, API 200), runs are never persisted, cwd is server-side from the project binding. Reads and `run` are `require_agent_access`; all three **mutations are loopback-only in both serve modes** — a LAN peer may trigger a run but must never choose the program | `docs/scripts.md` |
-| CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files, with exactly **two** carve-outs — `cc live` and `cc text` (one node's full, uncapped body, deliberately not stored). A session drills into an aggregate detail page, that into the call tree, and a timeline row into its own text | `docs/cc-dashboard.md` |
+| CC Dashboard | Analytics over Claude Code transcripts in `cc_*` tables; the dashboard reads only the db, never the files, with exactly **three** carve-outs — `cc live`, `cc text` (one node's full, uncapped body, deliberately not stored) and `cc chat` (one session's whole conversation, live, for the Agent sidebar's chat view). A session drills into an aggregate detail page, that into the call tree, and a timeline row into its own text | `docs/cc-dashboard.md` |
 
 ## Untrusted input
 

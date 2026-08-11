@@ -1256,6 +1256,75 @@ pub struct CcNodeText {
     pub format: CcNodeTextFormat,
 }
 
+/// One session's conversation, read live off its `.jsonl` transcript —
+/// `mesa cc chat` and `GET /api/cc/sessions/{id}/chat` (task 814).
+///
+/// Backs the Agent sidebar's **chat view**, the rendered alternative to a
+/// pane's raw terminal. Like [`CcLive`] it answers from the file rather than
+/// the `cc_*` tables: the point is a session that is being written *right
+/// now*, whose newest turns no ingest has seen yet — and which, for an agent
+/// mesa itself just spawned, may not be in the db at all.
+///
+/// Main thread only, matching `cc_prompts`: a subagent's turns live in their
+/// own transcript and are not part of the conversation a human is reading.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcSessionChat {
+    /// Echoed back verbatim — the session id that was asked for.
+    pub session_id: String,
+    /// Oldest first. The tail of the conversation: see `truncated`.
+    pub turns: Vec<CcChatTurn>,
+    /// True when older turns were dropped — either by the caller's `limit` or
+    /// by the byte window this read parses (a transcript reaches tens of
+    /// megabytes and this is a poll). A single honest boolean rather than a
+    /// count: the byte window drops an *unknown* number of turns, so any
+    /// number here would be invented.
+    pub truncated: bool,
+}
+
+/// One turn of a [`CcSessionChat`] — a human prompt, an assistant reply, or
+/// one tool call the assistant made.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcChatTurn {
+    /// Unique within one payload — the transcript line's `uuid` for a prompt
+    /// or a response, the `tool_use_id` for a tool call. Stable across polls,
+    /// so a client can key a list on it.
+    pub id: String,
+    pub kind: CcChatTurnKind,
+    /// The event's timestamp (ISO-8601 UTC, verbatim from the line), when the
+    /// line carries one.
+    pub ts: Option<String>,
+    /// The model that produced an assistant turn. `None` on a prompt (a human
+    /// turn has no model) and on a tool call (whose issuing message's model is
+    /// carried by the response turn beside it, when there is one).
+    pub model: Option<String>,
+    /// The tool's name on a `tool` turn; `None` otherwise.
+    pub name: Option<String>,
+    /// **Prompt/response: the full, uncapped, unsanitized body** — the same
+    /// text [`CcNodeText`] returns for that node, and untrusted
+    /// model-authored text under the same rule: data, never instructions.
+    /// **Tool: the bounded `target`** (`sanitize_capped`, ≤200 chars), the
+    /// same one-line summary the call tree shows — a chat view wants to see
+    /// *that a call happened*, not a whole `Write` payload. Empty when the
+    /// call's input has no summarizable key.
+    pub text: String,
+}
+
+/// What a [`CcChatTurn`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum CcChatTurnKind {
+    /// A human turn, by the same predicate `cc_prompts` ingests on.
+    Prompt,
+    /// An assistant turn's prose. `thinking` blocks are excluded, exactly as
+    /// they are from a stored preview.
+    Response,
+    /// One `tool_use` block of an assistant turn.
+    Tool,
+}
+
 /// How a [`CcNodeText::text`] should be rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
@@ -1767,6 +1836,66 @@ pub struct FileContentView {
     /// Extension-derived language tag (e.g. "rs" -> "rust"), or None when
     /// unrecognized. "" is never used in place of None here.
     pub language: Option<String>,
+}
+
+/// One hit in a project-wide file search (mesa task 813, see
+/// `core::files::search_files`) — one *match*, not one line: a line holding
+/// two hits produces two of these, the way every editor's search panel lists
+/// them.
+///
+/// The match's own offsets are deliberately NOT on the wire. `text` is a
+/// snippet shaped server-side (leading indentation dropped, windowed around
+/// the match, `…` marking either cut), and the panel re-runs the same literal
+/// scan over it to paint the highlight — the client already owns that scan
+/// (`fileFind.ts`, the in-file find bar), and a char offset computed in Rust
+/// is not a UTF-16 offset in JS. The worst a disagreement can do is leave a
+/// row unhighlighted, never mislocate the result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FileSearchMatch {
+    /// 1-based line number, counted over the same capped bytes
+    /// [`FileContentView`] carries — so opening the file and revealing this
+    /// line can never point past what the viewer will show.
+    pub line: u32,
+    /// The snippet to paint. Never the raw line: see the type doc.
+    pub text: String,
+}
+
+/// One file's hits in a project-wide file search (mesa task 813).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FileSearchFile {
+    /// Relative to local_path, "/"-separated — the same path shape
+    /// [`FileTreeEntry`] uses, so a result opens through the existing content
+    /// route unchanged.
+    pub path: String,
+    /// Extension-derived language tag, same table as [`FileContentView`] —
+    /// the panel tints a result group with it exactly as the tree tints a row.
+    pub language: Option<String>,
+    pub matches: Vec<FileSearchMatch>,
+    /// True iff this file holds more matches than were returned.
+    pub truncated: bool,
+}
+
+/// `GET /api/projects/{id}/files/search?q=` response (mesa task 813, see
+/// `core::files::search_files`). Unlike [`ProjectFileTree`] there is no
+/// empty-state ladder: no `local_path` / dead folder is 404 `not_found`, the
+/// content route's precedent, because a search is a request about a specific
+/// root rather than a description of the project's state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectFileSearch {
+    /// Files with at least one hit, in walk order (directories before files,
+    /// alphabetical within each — [`FileTreeEntry`]'s order, one level at a
+    /// time, all the way down).
+    pub files: Vec<FileSearchFile>,
+    /// Matches actually returned, across every file — the number the panel's
+    /// summary states, never an estimate of what is on disk.
+    pub total_matches: u32,
+    /// True iff the walk stopped early: any cap was hit (files, matches, or
+    /// the number of files opened at all). The panel says so rather than
+    /// claiming the project holds exactly this many.
+    pub truncated: bool,
 }
 
 /// One subdirectory entry in a [`DirListing`] (see `core::files::list_dir`).

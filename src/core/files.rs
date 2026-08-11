@@ -13,7 +13,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::core::types::{DirEntry, DirListing, FileContentView, FileTreeEntry};
+use crate::core::types::{
+    DirEntry, DirListing, FileContentView, FileSearchFile, FileSearchMatch, FileTreeEntry,
+    ProjectFileSearch,
+};
 
 /// Mirrors `git.rs`'s `DIFF_CAP` precedent: one huge file can't balloon the
 /// JSON response.
@@ -544,6 +547,331 @@ pub fn create_file(root: &str, rel: &str) -> Result<(), CreateFileError> {
         std::io::ErrorKind::AlreadyExists => CreateFileError::Conflict,
         _ => CreateFileError::NotFound,
     })
+}
+
+/// The two toggles a search carries, mirroring the in-file find bar's
+/// (`frontend/src/fileFind.ts`) — the same two questions, asked of the whole
+/// tree instead of one open file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+}
+
+/// The most matches [`search_files`] returns from one file. A file that
+/// mentions the query on every line is one row per line in a panel that has
+/// to stay scannable; the file's own `truncated` flag is how it says there
+/// are more, and the in-file find bar (`Cmd/Ctrl+F`, which has its own,
+/// larger cap) is where an exhaustive answer for one file lives.
+const MAX_SEARCH_MATCHES_PER_FILE: usize = 50;
+
+/// The most files one search reports hits for.
+const MAX_SEARCH_FILES: usize = 200;
+
+/// The most matches one search returns in total, across every file — the
+/// ceiling on the response, and on the DOM the panel builds from it.
+const MAX_SEARCH_TOTAL_MATCHES: usize = 1_000;
+
+/// The most files one search will *open*, hit or not. The other three caps
+/// bound the answer; this one bounds the work, so a query that matches
+/// nothing in a huge tree still terminates promptly instead of reading every
+/// byte under `local_path`.
+const MAX_SEARCH_SCANNED_FILES: usize = 20_000;
+
+/// The longest query [`search_files`] accepts. A literal scan is linear in
+/// it, and nothing a person types at a search box comes near this — the API
+/// layer turns a longer one into a 422 rather than scanning a megabyte of
+/// pasted text against every file.
+pub const MAX_SEARCH_QUERY: usize = 200;
+
+/// Characters of context kept *before* a match in a result snippet.
+const SNIPPET_LEAD: usize = 40;
+
+/// The longest snippet a result row carries. A minified bundle is one line
+/// of half a megabyte; windowing around the match is what keeps the row a
+/// row.
+const SNIPPET_MAX: usize = 240;
+
+/// True when `ch` is a word character for the whole-word toggle — ASCII
+/// letters, digits and `_`, the *same* set `fileFind.ts::isWordChar` uses.
+/// Deliberately not a unicode-aware class: the two implementations answer the
+/// same question about the same query, and widening one of them silently
+/// would make the panel and the find bar disagree about what a word is.
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// True when `a` and `b` are the same character under the chosen case rule.
+/// Folded per character, `fileFind.ts::sameChar`'s rule and for its reason:
+/// a lowercased *copy* of a line is not character-for-character the line the
+/// snippet is cut out of.
+fn same_char(a: char, b: char, case_sensitive: bool) -> bool {
+    if a == b {
+        return true;
+    }
+    if case_sensitive {
+        return false;
+    }
+    a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// Every match of `query` in `line`, as start indices into `line`, in order
+/// and never overlapping — the char-slice twin of `fileFind.ts::findMatches`,
+/// with the same whole-word rule (a boundary is demanded only on the sides
+/// where the *query itself* ends in a word character, so `(x` still finds
+/// `f(x)`).
+///
+/// Both sides are `&[char]` rather than `&str` because a snippet is cut by
+/// character position: indexing a `&str` by byte offset is the one way this
+/// could panic, and there is no reason to go near it.
+fn line_matches(line: &[char], query: &[char], opts: SearchOptions) -> Vec<usize> {
+    let mut out = Vec::new();
+    if query.is_empty() || line.len() < query.len() {
+        return out;
+    }
+    let head_is_word = is_word_char(query[0]);
+    let tail_is_word = is_word_char(query[query.len() - 1]);
+    let mut i = 0;
+    while i + query.len() <= line.len() {
+        let hit = (0..query.len()).all(|k| same_char(line[i + k], query[k], opts.case_sensitive));
+        if !hit {
+            i += 1;
+            continue;
+        }
+        let end = i + query.len();
+        if opts.whole_word
+            && ((head_is_word && i > 0 && is_word_char(line[i - 1]))
+                || (tail_is_word && line.get(end).copied().is_some_and(is_word_char)))
+        {
+            i += 1;
+            continue;
+        }
+        out.push(i);
+        // The scan index only ever moves forward — by one on a miss, by the
+        // whole (non-empty) query on a hit — so no input can loop.
+        i = end;
+    }
+    out
+}
+
+/// The snippet a result row paints: the line with its leading indentation
+/// dropped, windowed around the match, `…` marking either cut.
+///
+/// Shaped here rather than in the client for the reason the offsets are not
+/// on the wire at all ([`crate::core::types::FileSearchMatch`]): one
+/// implementation, tested with `cargo test`, and a payload whose size is
+/// bounded before it is serialized rather than after it is rendered.
+fn snippet(line: &[char], at: usize) -> String {
+    let indent = line.iter().take_while(|c| c.is_whitespace()).count();
+    // A match *inside* the indentation (searching for a tab, say) must not
+    // put the window before the text it is in.
+    let body_start = indent.min(at);
+    let start = at.saturating_sub(SNIPPET_LEAD).max(body_start);
+    let end = (start + SNIPPET_MAX).min(line.len());
+    let mut out = String::new();
+    if start > body_start {
+        out.push('…');
+    }
+    out.extend(&line[start..end]);
+    if end < line.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Every match of `query` under `root`, grouped by file — the project-wide
+/// search behind `GET /api/projects/{id}/files/search` (mesa task 813) and
+/// the Files tab's `Cmd/Ctrl+Shift+F` panel.
+///
+/// A **literal** scan, never a regular expression, for `fileFind.ts`'s reason:
+/// a query is a user's typing, not a pattern language. `query` must be
+/// non-empty and no longer than [`MAX_SEARCH_QUERY`]; the API layer rejects
+/// both before calling, and an empty one here answers "no results" rather
+/// than "every position".
+///
+/// What it reads is exactly what the Files tab can show, which is the whole
+/// point of not reusing a `grep`:
+///   - The walk is [`tree_level`]'s, applied recursively — [`EXCLUDED_DIRS`]
+///     skipped by name, directories before files alphabetically, and symlinks
+///     never followed (one rule covering escape and cycle at once), so no
+///     result can name a path the tree would not list.
+///   - A file is read through the same [`FILE_CONTENT_CAP`]-bounded read and
+///     the same extension/NUL binary rules [`read_file`] applies, so a hit's
+///     line number always exists in the viewer that opens next, and binary
+///     bytes are never scanned or quoted.
+///   - `root` itself is resolved once through [`safe_path`] and every
+///     descendant is reached by walking real directory entries from there, so
+///     nothing outside the project's `local_path` is ever opened.
+///
+/// Four caps bound the answer and the work
+/// ([`MAX_SEARCH_MATCHES_PER_FILE`], [`MAX_SEARCH_FILES`],
+/// [`MAX_SEARCH_TOTAL_MATCHES`], [`MAX_SEARCH_SCANNED_FILES`]); hitting any
+/// of them sets `truncated` on the result, and the per-file one sets it on
+/// that file as well. `None` only for a `root` that does not resolve to a
+/// directory — the caller's 404, exactly as for [`tree_level`].
+pub fn search_files(root: &str, query: &str, opts: SearchOptions) -> Option<ProjectFileSearch> {
+    let root_canon = safe_path(root, ".")?;
+    if !root_canon.is_dir() {
+        return None;
+    }
+    let needle: Vec<char> = query.chars().collect();
+    let mut out = ProjectFileSearch {
+        files: Vec::new(),
+        total_matches: 0,
+        truncated: false,
+    };
+    if needle.is_empty() || needle.len() > MAX_SEARCH_QUERY {
+        return Some(out);
+    }
+    let mut scanned = 0usize;
+    search_dir(&root_canon, "", &needle, opts, &mut out, &mut scanned);
+    Some(out)
+}
+
+/// One directory level of [`search_files`]'s walk: scan this level's files,
+/// then recurse into its subdirectories, in the order [`tree_level`] lists
+/// them. Stops the moment any cap is hit, which is what `out.truncated`
+/// carries back up.
+fn search_dir(
+    dir: &Path,
+    rel: &str,
+    needle: &[char],
+    opts: SearchOptions,
+    out: &mut ProjectFileSearch,
+    scanned: &mut usize,
+) {
+    if out.truncated {
+        return;
+    }
+    // An unreadable directory is "no entries", not a failed search — the same
+    // precedent `tree_level` takes for a permission change under it.
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if EXCLUDED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        // symlink_metadata, so a symlink is a file leaf whatever it points at
+        // — never recursed into, never opened as a directory.
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if meta.is_symlink() {
+            continue;
+        }
+        entries.push((name, meta.is_dir()));
+    }
+    entries.sort_by(|a, b| match (a.1, b.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.cmp(&b.0),
+    });
+
+    for (name, is_dir) in &entries {
+        if *is_dir {
+            continue;
+        }
+        if out.truncated {
+            return;
+        }
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        search_one_file(&dir.join(name), &child_rel, needle, opts, out, scanned);
+    }
+    for (name, is_dir) in &entries {
+        if !*is_dir {
+            continue;
+        }
+        if out.truncated {
+            return;
+        }
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        search_dir(&dir.join(name), &child_rel, needle, opts, out, scanned);
+    }
+}
+
+/// Scan one file and append its group, if it has one.
+fn search_one_file(
+    path: &Path,
+    rel: &str,
+    needle: &[char],
+    opts: SearchOptions,
+    out: &mut ProjectFileSearch,
+    scanned: &mut usize,
+) {
+    if *scanned >= MAX_SEARCH_SCANNED_FILES {
+        out.truncated = true;
+        return;
+    }
+    *scanned += 1;
+    let ext = extension_of(path);
+    if ext
+        .as_deref()
+        .is_some_and(|e| BINARY_EXTENSIONS.contains(&e))
+    {
+        return;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    if (&mut file)
+        .take(FILE_CONTENT_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return;
+    }
+    if sniff_binary(&bytes) {
+        return;
+    }
+    let (content, _) = capped(&bytes);
+
+    let mut matches: Vec<FileSearchMatch> = Vec::new();
+    let mut file_truncated = false;
+    'lines: for (i, line) in content.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        for at in line_matches(&chars, needle, opts) {
+            if matches.len() >= MAX_SEARCH_MATCHES_PER_FILE {
+                file_truncated = true;
+                break 'lines;
+            }
+            matches.push(FileSearchMatch {
+                line: (i + 1) as u32,
+                text: snippet(&chars, at),
+            });
+            if out.total_matches as usize + matches.len() >= MAX_SEARCH_TOTAL_MATCHES {
+                out.truncated = true;
+                break 'lines;
+            }
+        }
+    }
+    if matches.is_empty() {
+        return;
+    }
+    out.total_matches += matches.len() as u32;
+    out.files.push(FileSearchFile {
+        path: rel.to_string(),
+        language: extension_of(path)
+            .as_deref()
+            .and_then(language_of)
+            .map(str::to_string),
+        matches,
+        truncated: file_truncated,
+    });
+    if out.files.len() >= MAX_SEARCH_FILES {
+        out.truncated = true;
+    }
 }
 
 /// NUL-byte sniff over the first 8 KiB — the standard cheap binary-file
@@ -1383,5 +1711,165 @@ mod tests {
             fs::read_to_string(dir.path().join("taken.txt")).unwrap(),
             "keep me"
         );
+    }
+
+    // --- search_files (mesa task 813) ----------------------------------
+
+    fn seed_search_tree(dir: &std::path::Path) {
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("node_modules")).unwrap();
+        fs::write(
+            dir.join("README.md"),
+            "the needle is here\nand nowhere else\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/main.rs"),
+            "fn main() {\n    let needle = 1; // needle again\n    let Needle = 2;\n}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("node_modules/dep.js"), "needle needle needle\n").unwrap();
+        fs::write(dir.join("logo.png"), "needle").unwrap();
+        fs::write(dir.join("blob.dat"), b"nee\0dle needle").unwrap();
+    }
+
+    #[test]
+    fn search_files_groups_hits_by_file_and_skips_excluded_and_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_search_tree(dir.path());
+        let root = dir.path().to_str().unwrap();
+
+        let res = search_files(root, "needle", SearchOptions::default()).unwrap();
+
+        // Files before directories is `tree_level`'s order: README.md then
+        // src/main.rs. `node_modules` (excluded), the `.png` (binary
+        // extension) and the NUL-carrying `.dat` are all absent.
+        let paths: Vec<&str> = res.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["README.md", "src/main.rs"]);
+        assert!(!res.truncated);
+        // Case-insensitive by default, so `Needle` on line 3 counts, and the
+        // two on line 2 are two rows.
+        assert_eq!(res.total_matches, 4);
+        assert_eq!(res.files[0].matches[0].line, 1);
+        assert_eq!(res.files[0].language.as_deref(), Some("markdown"));
+        let rs = &res.files[1];
+        assert_eq!(rs.language.as_deref(), Some("rust"));
+        assert_eq!(
+            rs.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
+            vec![2, 2, 3]
+        );
+        // Leading indentation is dropped from the snippet, and the whole
+        // (short) line survives otherwise.
+        assert_eq!(rs.matches[0].text, "let needle = 1; // needle again");
+    }
+
+    #[test]
+    fn search_files_honours_case_and_whole_word() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_search_tree(dir.path());
+        let root = dir.path().to_str().unwrap();
+
+        let sensitive = search_files(
+            root,
+            "Needle",
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(sensitive.total_matches, 1);
+        assert_eq!(sensitive.files[0].path, "src/main.rs");
+        assert_eq!(sensitive.files[0].matches[0].line, 3);
+
+        fs::write(dir.path().join("words.txt"), "needle needles needle_x\n").unwrap();
+        let whole = search_files(
+            root,
+            "needle",
+            SearchOptions {
+                case_sensitive: false,
+                whole_word: true,
+            },
+        )
+        .unwrap();
+        let words = whole
+            .files
+            .iter()
+            .find(|f| f.path == "words.txt")
+            .expect("words.txt has a whole-word hit");
+        assert_eq!(words.matches.len(), 1);
+    }
+
+    #[test]
+    fn search_files_caps_matches_per_file_and_flags_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let body = "needle\n".repeat(MAX_SEARCH_MATCHES_PER_FILE + 10);
+        fs::write(dir.path().join("many.txt"), body).unwrap();
+
+        let res = search_files(root, "needle", SearchOptions::default()).unwrap();
+        assert_eq!(res.files.len(), 1);
+        assert_eq!(res.files[0].matches.len(), MAX_SEARCH_MATCHES_PER_FILE);
+        assert!(res.files[0].truncated);
+        assert_eq!(res.total_matches as usize, MAX_SEARCH_MATCHES_PER_FILE);
+    }
+
+    #[test]
+    fn search_files_windows_a_long_line_around_the_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let line = format!("{}needle{}", "x".repeat(500), "y".repeat(500));
+        fs::write(dir.path().join("min.js"), line).unwrap();
+
+        let res = search_files(root, "needle", SearchOptions::default()).unwrap();
+        let text = &res.files[0].matches[0].text;
+        // Cut on both sides, marked on both sides, and bounded — never the
+        // whole 1,006-character line.
+        assert!(text.starts_with('…'), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        assert!(text.contains("needle"), "{text}");
+        assert_eq!(text.chars().count(), SNIPPET_MAX + 2);
+    }
+
+    #[test]
+    fn search_files_rejects_nothing_and_finds_nothing_for_an_empty_query() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_search_tree(dir.path());
+        let root = dir.path().to_str().unwrap();
+
+        let res = search_files(root, "", SearchOptions::default()).unwrap();
+        assert!(res.files.is_empty());
+        assert_eq!(res.total_matches, 0);
+        assert!(!res.truncated);
+
+        let long = "n".repeat(MAX_SEARCH_QUERY + 1);
+        assert!(
+            search_files(root, &long, SearchOptions::default())
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_files_is_none_for_a_dead_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(search_files(missing.to_str().unwrap(), "x", SearchOptions::default()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_files_never_follows_a_symlink_out_of_the_root() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "needle outside\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("inside.txt"), "needle inside\n").unwrap();
+        symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let res = search_files(root, "needle", SearchOptions::default()).unwrap();
+        let paths: Vec<&str> = res.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["inside.txt"]);
     }
 }

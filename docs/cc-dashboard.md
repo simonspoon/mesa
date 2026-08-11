@@ -11,10 +11,12 @@ files, so history survives Claude Code's own transcript cleanup and nothing is
 ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
 CLI and API share it and never diverge.
 
-**Two reads carve out of "db only", and only two**: `cc live` (a direct parse of
-the last few minutes, where the files are by definition still present) and
-`cc text` (one node's full body, which is deliberately not in the db — see
-*Node text* below). Everything else answers from `cc_*` alone.
+**Three reads carve out of "db only", and only three**: `cc live` (a direct
+parse of the last few minutes, where the files are by definition still
+present), `cc text` (one node's full body, which is deliberately not in the db
+— see *Node text* below) and `cc chat` (one session's whole conversation, for
+both of those reasons at once — see *Session chat* below). Everything else
+answers from `cc_*` alone.
 
 Migration numbers in this file are the **resulting `user_version`**, i.e.
 1-based: `MIGRATIONS` in `src/core/store.rs` is a 0-indexed array, so
@@ -191,9 +193,25 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
      free-typed turns are ~1% of user lines and whole sessions have **zero**,
      so without it the feature would show almost nothing.
   7. Otherwise, if the line has an `origin` block (Claude Code ≥ v2.1.187) it
-     is **authoritative**: accept iff `origin.type == "human"`. Note it is
-     `origin`, **not** `promptSource` — `claude-desktop` human turns carry
+     is **authoritative**: accept iff it says `human`. Note it is `origin`,
+     **not** `promptSource` — `claude-desktop` human turns carry
      `promptSource: "sdk"`, so keying off that would drop them.
+     **Upstream has spelled the key both ways** and mesa reads both, as **two
+     fields, not one field with `#[serde(alias)]`**: `type` when the block was
+     introduced, `kind` on current releases (observed on v2.1.227, task 814).
+     An alias maps both keys onto one field, so a line carrying *both* — the
+     ordinary way to ship a rename — becomes a serde duplicate-field error,
+     and every parse site skips an unparseable line, dropping it from the
+     ingest entirely along with its usage, tool calls and session span. The
+     fix must never fail worse than the bug. Reading only one spelling fails
+     *closed and silently*
+     — an `origin` object whose one key is unknown parses as "origin present,
+     not human", which is the accept-nothing branch rather than the prefix
+     fallback, so every human turn of every session written by that release is
+     dropped and `cc_prompts` quietly stops growing. It went unnoticed until
+     the chat view (`docs/agents.md`) rendered a conversation with no human
+     side. If a future release renames it again, this is the failure shape to
+     look for: prompts present in old sessions, absent in new ones.
   8. Otherwise — a legacy line with no `origin`, where the text is all there is
      to go on — reject anything opening with one of `cc::NON_HUMAN_PREFIXES`
      (`<command-message>`, `<local-command-stdout>`, `<local-command-caveat>`,
@@ -531,10 +549,89 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     point — and it is untrusted model-authored text. It is the sharpest such
     string mesa serves: every caller must render it as **data, never
     instructions**, never as markup and never as a URL.
-- CLI: `mesa cc {summary,sessions,skills,session,graph,text,sync}` (JSON only; `summary` prints the
+- **Session chat** — `cc::session_chat(session_id, limit) -> CcSessionChat`
+  (task 814), the answer to "what is this agent actually saying", and the read
+  behind the Agent sidebar's **chat view** (`docs/agents.md`). One session's
+  main thread as an ordered list of turns: a human prompt, an assistant reply,
+  or one tool call the assistant made.
+  - **The third carve-out from "the dashboard reads only the db", and the only
+    one that is both of the other two at once.** It is `live`'s case — the
+    turns a reader wants are the ones being appended *right now*, younger than
+    any ingest, and for a session mesa spawned moments ago there is no row at
+    all — *and* `node_text`'s: what a chat window renders is the bodies, and
+    every stored body is a 200-character sanitized preview. So, uniquely among
+    the per-session reads, it takes **no `Store` and runs no `sync`**. That is
+    not an optimization: this is a 3-second poll behind an open pane, and a
+    `sync` is a walk of every transcript on disk under the API's one store
+    mutex. `mesa cc chat` and `GET /api/cc/sessions/{id}/chat` are therefore
+    store-less like `cc live` and `cc usage`.
+  - **Finding the file without the db.** `cc_node_files` is an ingest artifact
+    and this read predates ingest, so the transcript is located by probing each
+    slug directory for `<projects_dir>/*/<session_id>.jsonl` — one `stat` per
+    slug dir (98 on the real corpus), the same shape `agents`'s subagent-liveness
+    probe uses for the same reason. Because the id *builds* that path it is
+    validated to the id charset (ASCII alphanumeric, `-`, `_`) **before any
+    filesystem access** — a non-id is `validation`, never a path — and the
+    result still goes through `transcript_path`, so the containment check that
+    protects `cc text` protects this too.
+  - **Two bounds, one honest flag.** `limit` caps turns, **newest kept** (a
+    chat window is read at its end), and `CHAT_TAIL_BYTES` (2 MiB) caps how
+    much of the file is parsed at all. The byte window is what actually bounds
+    the cost, since dropping turns after parsing them saves nothing — and on a
+    long session it is also the **operative** bound by a wide margin, because
+    transcript bytes are dominated by tool *results*, which produce no turn:
+    measured over the six largest real transcripts (21.2 down to 8.2 MB), 2 MiB
+    yielded 18-84 turns, never close to 200. So the view shows the last few
+    dozen exchanges of a long session whatever `limit` says. Reading back by
+    turn count instead would mean re-reading most of a 21 MB file every 3
+    seconds, which is the cost the window exists to avoid.
+    `truncated` is a single boolean covering both bounds: the byte window drops
+    an *unknown* number of turns, so a count would be invented.
+    Two properties the window has to have, both regression-tested:
+    **it never lands inside a single line and answers nothing** — a transcript
+    line can itself be megabytes (the real corpus holds a 2.59 MB tool result),
+    and a window holding no complete line would blank the pane for a session
+    that is talking fine, so it widens (to `CHAT_TAIL_MAX_BYTES`, 32 MiB —
+    above every transcript observed, i.e. "read it all rather than say
+    nothing") until it captures one; and **a boundary that lands exactly on a
+    line start keeps that line**, which is why the read seeks one byte *early*
+    — that byte is the whole difference between a cut that was mid-line and one
+    that was not.
+  - **What a line becomes.** A human turn is `human_prompt_raw` — the same
+    predicate `cc_prompts` ingests on, uncapped — so main-thread only, no
+    injections, no tool-result carriers. An assistant turn is
+    `assistant_text_raw`, uncapped, `thinking` excluded exactly as it is from a
+    stored preview. **An assistant turn is recognized by `type == "assistant"`,
+    never by the shape of `message`**: Claude Code writes its own injections (a
+    skill body, hook output) as `user` lines whose content is an array of
+    `text` blocks — the very shape `assistant_text_raw` reads — so a shape test
+    alone renders an injected skill body as something the agent said (found in
+    live QA of this task). A tool call keeps the **bounded** `tool_target`, the
+    same one-line summary the call tree shows: a chat row says *that* a call
+    happened and what it acted on; the whole input is `cc text`'s job. Turns
+    come out in file order (a transcript is append-only), with one line's prose
+    before that line's own calls — the same response-before-tool rule
+    `session_graph` applies at an equal timestamp.
+  - Errors, both already-scoped codes: `validation` for an id that is not a
+    session id, `unavailable` for a session with no transcript on disk. There
+    is deliberately **no `not_found`** — with no db consulted, "never ingested"
+    and "no such session" are not distinguishable here, and both are the same
+    answer to a caller: the file isn't there.
+  - CLI `mesa cc chat <SESSION_ID> [--limit N]`; API
+    `GET /api/cc/sessions/{session_id}/chat?limit=` (clamped at 2,000), same
+    router-wide gate as the graph/text routes — the bodies are that route's
+    population, served in bulk rather than one at a time — and not cached.
+  - The prose it returns is **uncapped and unsanitized**, exactly like
+    `cc text`'s: untrusted model-authored text, data never instructions. The
+    chat view renders it as markdown (structure only — `Markdown` passes no raw
+    HTML through) with every image refused; see `docs/agents.md`.
+- CLI: `mesa cc {summary,sessions,skills,session,graph,text,chat,sync}` (JSON only; `summary` prints the
   full dashboard object, `sessions`/`skills` print bare arrays; `--window`, plus
   `--limit` on `sessions` and `--rebuild` on `sync`). Like every other handler
-  these open the database; only `cc live` and `cc usage` stay store-less.
+  these open the database; only `cc live`, `cc usage` and `cc chat` stay
+  store-less — and `cc chat`'s being so is load-bearing, not incidental (see
+  *Session chat* above; `scripts/cc-check.sh` pins it with a fixture that is
+  never ingested).
 - API: `GET /api/cc?window=<w>` syncs, then serves the dashboard from an
   in-memory cache in `AppState.cc_cache` keyed per-window by `Store::cc_stamp()`
   — a monotone count over the cc tables (rows are never deleted), so it sees
@@ -718,6 +815,18 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   deleted `-demo` transcript (whose rows are still queryable) → `unavailable`.
   The HTTP half asserts a payload equal to the CLI's plus the 404/422/503
   split, since the status mapping is the only thing that surface adds.
+  `cc chat` gets a **fifth appended fixture project**, and the thing that makes
+  it a fixture rather than a copy of `-text-project` is *when* it is written:
+  after the last `cc sync`, and never ingested. The check asserts `cc sessions`
+  does not list it and that `cc chat` answers completely anyway — the only
+  assertion in the suite that would fail if this read ever grew a sync. Also
+  asserted: the turn classification (an `isMeta` injection whose content is an
+  array of `text` blocks produces nothing, as do a tool-result carrier and a
+  subagent transcript; one assistant line emits prose before its own calls),
+  full prose against a `thinking` block that must not appear, a tool turn
+  bounded to its target, `--limit` keeping the *newest* turns and setting
+  `truncated`, and both error codes. The HTTP half adds `?limit=` and the
+  422/503 split.
 
 ## Subscription usage (the one network read)
 

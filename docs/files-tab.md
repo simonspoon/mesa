@@ -1263,13 +1263,24 @@ Three details are load-bearing:
 - **The landing goes to whichever pane holds that path**, not to a chosen side.
   The same file can be open in both panes of a split, and both should show the
   line that was clicked.
+- **The reveal is marked done when the match arrives, not when it is
+  attempted** — and this one was found live. A *step* is armed by a call and
+  lands on a pane that is already laid out; a landing is armed by a render of a
+  pane that is usually still mounting, and on a large file (`src/api.rs`, 6,800
+  lines) that first pass measured a layout the browser had not settled: the
+  scroll was issued and nothing moved, leaving the counter reading `3 of 30`
+  over the top of the file — the "counter stepped, view sat still" failure this
+  whole reveal exists to prevent. So the effect re-measures after scrolling and
+  only consumes the landing once the mark is inside the readable band,
+  retrying on the next render otherwise, bounded by `MAX_LANDING_REVEALS` so a
+  match the band can never contain cannot re-scroll indefinitely.
 
 **A markdown file in view mode is the one result that opens without landing** —
 it has no offsets once rendered as prose, which is exactly why `findable` is
-false there. The landing is marked consumed anyway (leaving it armed would fire
-it at whatever that tab shows next), so the click is "open this file" and the
-browser's own find still works on what is painted. Editing that same file makes
-it source again, and findable like anything else.
+false there, and there the click is simply "open this file" (the browser's own
+find still works on what is painted). Being a *condition* on the derivation
+rather than a discard, it resolves itself the moment there is something to point
+at: pressing Edit on that file makes it source again, and the landing lands.
 
 ### Gates
 

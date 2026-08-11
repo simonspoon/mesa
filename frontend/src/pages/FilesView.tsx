@@ -287,6 +287,13 @@ interface FindState {
   autoFocus: boolean
 }
 
+/** How many renders a search-result landing may spend trying to scroll its
+ * match into view before giving up (task 813). More than one because the first
+ * try happens as the pane is mounting and can measure a layout that has not
+ * settled; bounded, because a match the readable band can never contain must
+ * not re-scroll on every render for as long as the landing is active. */
+const MAX_LANDING_REVEALS = 3
+
 const BLANK_FIND: FindState = {
   open: false,
   query: '',
@@ -381,8 +388,11 @@ function ContentPane({
   // mark — a flag rather than a dependency list, for the reason stated at both.
   const pendingReveal = useRef(false)
   // The last search result this pane actually scrolled to (task 813), so one
-  // click reveals once however many times the pane re-renders after it.
+  // click reveals once however many times the pane re-renders after it — and
+  // how many times the current one has been attempted without arriving, which
+  // is what bounds the retry.
   const revealedLanding = useRef<number | null>(null)
+  const landingTries = useRef(0)
 
   // Everything below is computed before the early returns, because hooks are:
   // `data` is still loading on the first renders, and a search over "" is a
@@ -410,9 +420,14 @@ function ContentPane({
    * find state goes through `setFind` below, which records the landing as
    * consumed — so this is "the search panel's answer, until you take over",
    * not a mode. It also needs the fetch to have landed, since the line is an
-   * offset into content that may not be here yet, and needs the file to be
-   * findable at all: a binary, an image or markdown rendered as prose has no
-   * offsets to point at, and there the click is just "open this file".
+   * offset into content that may not be here yet.
+   *
+   * And it needs the file to be **findable**: a binary, an image or markdown
+   * rendered as prose has no offsets to point at, so there the click is just
+   * "open this file". That is a condition rather than a discard, which has one
+   * consequence worth naming: pressing Edit on a markdown file opened from a
+   * result makes it source again, and the landing takes effect then — the
+   * first moment there is something to point at.
    */
   const landingActive =
     landing !== null && landing.seq !== consumedLanding && data != null && findable
@@ -694,10 +709,10 @@ function ContentPane({
   useEffect(() => {
     const landed =
       landingActive && current >= 0 && revealedLanding.current !== landing.seq
-    if (landed) revealedLanding.current = landing.seq
     if (!pendingReveal.current && !landed) return
     pendingReveal.current = false
     if (landed && ui.editing) {
+      revealedLanding.current = landing.seq
       const match = matches[current]
       if (match !== undefined) editorRef.current?.reveal(match.start, match.end)
       return
@@ -711,19 +726,44 @@ function ContentPane({
     // its parent is the scrollport the sticky bars are pinned inside.
     const port = content.parentElement
     const band = port?.getBoundingClientRect()
-    if (band !== undefined) {
+    /** The readable band, in the mark's own coordinates. */
+    const readable = (): [number, number] | null => {
+      if (band === undefined) return null
       const head = content.querySelector<HTMLElement>('.files-content-top')
       const status = content.querySelector<HTMLElement>('.files-status-bar')
+      return [
+        band.top + (head?.offsetHeight ?? 0),
+        band.bottom - (status?.offsetHeight ?? 0),
+      ]
+    }
+    const bounds = readable()
+    if (bounds !== null) {
       const box = mark.getBoundingClientRect()
-      if (
-        boxNeedsReveal(
-          box.top,
-          box.height,
-          band.top + (head?.offsetHeight ?? 0),
-          band.bottom - (status?.offsetHeight ?? 0),
-        )
-      ) {
+      if (boxNeedsReveal(box.top, box.height, bounds[0], bounds[1])) {
         mark.scrollIntoView({ block: 'center', inline: 'nearest' })
+      }
+    }
+    // A landing is marked done only once the match has actually **arrived** in
+    // the readable band — not when the attempt was made.
+    //
+    // The step case is armed by a call and lands on a pane that is already
+    // laid out; a landing is armed by a *render* of a pane that is usually
+    // mounting, and on a large file that first pass can measure a layout the
+    // browser has not settled — the scroll is issued and nothing moves.
+    // Consuming on the attempt turns that into a permanent silent miss ("the
+    // counter stepped and the view sat still", the failure this whole reveal
+    // exists to prevent), so instead the next render tries again. Bounded by
+    // `MAX_LANDING_REVEALS` rather than by the check alone, so a file the band
+    // can never contain (a match taller than the pane) cannot re-scroll on
+    // every unrelated render for as long as the landing is active.
+    if (landed) {
+      const after = mark.getBoundingClientRect()
+      const settled =
+        bounds === null || !boxNeedsReveal(after.top, after.height, bounds[0], bounds[1])
+      landingTries.current = settled ? 0 : landingTries.current + 1
+      if (settled || landingTries.current >= MAX_LANDING_REVEALS) {
+        revealedLanding.current = landing.seq
+        landingTries.current = 0
       }
     }
     const scroller = mark.closest<HTMLElement>('.files-code-scroll')
@@ -1776,6 +1816,13 @@ function SearchPanel({
       onKeyDown={(e) => {
         if (e.key !== 'Escape') return
         e.preventDefault()
+        // Stopped rather than allowed to bubble, the close-confirm bar's rule:
+        // the focused pane binds Escape on `document` too (close the find
+        // bar), and a keystroke aimed at this panel must not also answer a
+        // question asked over there. `shouldIgnoreFilesShortcut` already
+        // stands that listener down while the caret is in this input; this
+        // covers the panel's buttons, which are not text controls.
+        e.stopPropagation()
         onClose()
       }}
     >

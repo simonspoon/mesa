@@ -3939,14 +3939,21 @@ body.files-tree-resizing {
   flex: none;
   display: flex;
   align-items: center;
+  /* Wraps, unlike the find bar's row: this one lives in a column the user can
+     drag down to 160px, where a query box beside three buttons leaves about
+     two characters of query visible. Wrapping keeps the box usable at every
+     width and costs a row only where it has to. */
+  flex-wrap: wrap;
   gap: 0.4rem;
   padding: 0.35rem 0.5rem;
   border-bottom: 1px solid var(--border);
 }
 
+/* `8rem` is the basis it wraps at, not a floor it clips to — `min-width` below
+   the basis is what lets it still shrink on the row it ends up on. */
 .files-search-input {
-  flex: 1 1 auto;
-  min-width: 0;
+  flex: 1 1 8rem;
+  min-width: 6rem;
   font-family: var(--font-mono);
   font-size: 0.8rem;
 }

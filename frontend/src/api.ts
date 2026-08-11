@@ -27,6 +27,7 @@ import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { MesaVersion } from './types/MesaVersion'
 import type { ModelRates } from './types/ModelRates'
+import type { ProjectFileSearch } from './types/ProjectFileSearch'
 import type { ProjectFileTree } from './types/ProjectFileTree'
 import type { ProjectGitLog } from './types/ProjectGitLog'
 import type { ProjectGitStatus } from './types/ProjectGitStatus'
@@ -513,6 +514,27 @@ export function createProjectFile(
     `/api/projects/${id}/files/content`,
     jsonInit('POST', { path }),
   )
+}
+
+/**
+ * Every match of a literal `query` across the project's tree (mesa task 813) —
+ * the Files tab's Cmd/Ctrl+Shift+F panel. Grouped by file, capped server-side
+ * on every axis (matches per file, files, total, files opened), and searching
+ * exactly the tree the browser lists: excluded and binary files are skipped
+ * there, not filtered here.
+ *
+ * An empty query never reaches this (the panel refuses it) and would 422; a
+ * query that simply matches nothing is a 200 with no files.
+ */
+export function searchProjectFiles(
+  id: number,
+  query: string,
+  options: { caseSensitive: boolean; wholeWord: boolean },
+): Promise<ProjectFileSearch> {
+  const params = new URLSearchParams({ q: query })
+  if (options.caseSensitive) params.set('case', 'true')
+  if (options.wholeWord) params.set('word', 'true')
+  return request(`/api/projects/${id}/files/search?${params.toString()}`)
 }
 
 // ---- agents (live Claude Code sessions; local/LAN-page-gated endpoints) ----

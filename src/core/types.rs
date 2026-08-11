@@ -1769,6 +1769,66 @@ pub struct FileContentView {
     pub language: Option<String>,
 }
 
+/// One hit in a project-wide file search (mesa task 813, see
+/// `core::files::search_files`) — one *match*, not one line: a line holding
+/// two hits produces two of these, the way every editor's search panel lists
+/// them.
+///
+/// The match's own offsets are deliberately NOT on the wire. `text` is a
+/// snippet shaped server-side (leading indentation dropped, windowed around
+/// the match, `…` marking either cut), and the panel re-runs the same literal
+/// scan over it to paint the highlight — the client already owns that scan
+/// (`fileFind.ts`, the in-file find bar), and a char offset computed in Rust
+/// is not a UTF-16 offset in JS. The worst a disagreement can do is leave a
+/// row unhighlighted, never mislocate the result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FileSearchMatch {
+    /// 1-based line number, counted over the same capped bytes
+    /// [`FileContentView`] carries — so opening the file and revealing this
+    /// line can never point past what the viewer will show.
+    pub line: u32,
+    /// The snippet to paint. Never the raw line: see the type doc.
+    pub text: String,
+}
+
+/// One file's hits in a project-wide file search (mesa task 813).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct FileSearchFile {
+    /// Relative to local_path, "/"-separated — the same path shape
+    /// [`FileTreeEntry`] uses, so a result opens through the existing content
+    /// route unchanged.
+    pub path: String,
+    /// Extension-derived language tag, same table as [`FileContentView`] —
+    /// the panel tints a result group with it exactly as the tree tints a row.
+    pub language: Option<String>,
+    pub matches: Vec<FileSearchMatch>,
+    /// True iff this file holds more matches than were returned.
+    pub truncated: bool,
+}
+
+/// `GET /api/projects/{id}/files/search?q=` response (mesa task 813, see
+/// `core::files::search_files`). Unlike [`ProjectFileTree`] there is no
+/// empty-state ladder: no `local_path` / dead folder is 404 `not_found`, the
+/// content route's precedent, because a search is a request about a specific
+/// root rather than a description of the project's state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ProjectFileSearch {
+    /// Files with at least one hit, in walk order (directories before files,
+    /// alphabetical within each — [`FileTreeEntry`]'s order, one level at a
+    /// time, all the way down).
+    pub files: Vec<FileSearchFile>,
+    /// Matches actually returned, across every file — the number the panel's
+    /// summary states, never an estimate of what is on disk.
+    pub total_matches: u32,
+    /// True iff the walk stopped early: any cap was hit (files, matches, or
+    /// the number of files opened at all). The panel says so rather than
+    /// claiming the project holds exactly this many.
+    pub truncated: bool,
+}
+
 /// One subdirectory entry in a [`DirListing`] (see `core::files::list_dir`).
 /// Directories only — this endpoint never lists files (see arch.md #4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

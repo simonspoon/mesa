@@ -846,6 +846,12 @@ fn router(state: AppState) -> Router {
         // `attachment` is a boundary that must not be relaxed. Still a plain
         // read — standard guard only, like both siblings' GETs.
         .route("/api/projects/{id}/files/raw", get(raw_project_file))
+        // Project-wide search across the same tree (task 813). A FOURTH read
+        // route rather than a mode of the tree listing: that one answers "what
+        // is in this directory" from a 5s cache keyed on the directory, and a
+        // search is keyed on a query and cached by nothing. Standard guard
+        // only, like every other read on this tab.
+        .route("/api/projects/{id}/files/search", get(search_project_files))
         // New-project folder picker: unscoped (not one project's local_path)
         // server-side directory listing, plus creating one folder to pick.
         // Loopback-only in BOTH serve modes, reusing `require_local_path_write`
@@ -2917,6 +2923,70 @@ async fn get_project_files_content(
         .await
         .unwrap_or(None);
     view.map(|v| Json(v).into_response()).ok_or_else(not_found)
+}
+
+#[derive(Deserialize)]
+struct FilesSearchQuery {
+    #[serde(default)]
+    q: Option<String>,
+    /// `?case=true` — match case. Absent is the plain, case-insensitive
+    /// search, the same default the in-file find bar opens with.
+    #[serde(default)]
+    case: bool,
+    /// `?word=true` — whole word only.
+    #[serde(default)]
+    word: bool,
+}
+
+/// Files tab project-wide search (task 813) — every match of a literal `?q=`
+/// under `local_path`, grouped by file, via `core::files::search_files`.
+///
+/// The `?q=` contract mirrors the content route's `?path=`: missing, empty or
+/// longer than `files::MAX_SEARCH_QUERY` is 422 `validation`, and no
+/// `local_path` / a dead folder / a root that no longer resolves is 404
+/// `not_found`. A query that simply matches nothing is a 200 with an empty
+/// `files` — a state, not a failure, the same way an empty commit list is on
+/// the Git tab.
+///
+/// Gate: the standard `guard` only, like the tree, content, download and raw
+/// reads beside it — it reads bytes the same way they do, executes nothing,
+/// and the Content-Type gate does not fire on a GET. Not cached: the tree
+/// cache is keyed on a directory, and a search is keyed on a query nobody
+/// repeats. `spawn_blocking` because it is a filesystem walk, the same reason
+/// its neighbours use one.
+async fn search_project_files(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FilesSearchQuery>,
+) -> ApiResult<Response> {
+    let query = q.q.unwrap_or_default();
+    if query.is_empty() || query.chars().count() > files::MAX_SEARCH_QUERY {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!(
+                "q query parameter is required and must be at most {} characters",
+                files::MAX_SEARCH_QUERY
+            ),
+        });
+    }
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: "project has no readable local path".into(),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let opts = files::SearchOptions {
+        case_sensitive: q.case,
+        whole_word: q.word,
+    };
+    let found = tokio::task::spawn_blocking(move || files::search_files(&root, &query, opts))
+        .await
+        .unwrap_or(None);
+    found.map(|r| Json(r).into_response()).ok_or_else(not_found)
 }
 
 /// Files tab raw-bytes download (task 683) — the same `?path=` contract as

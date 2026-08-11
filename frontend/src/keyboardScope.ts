@@ -47,15 +47,35 @@ export function shouldIgnoreShortcut(e: KeyboardEvent): boolean {
   return false
 }
 
-/** Which of the Files tab's chords is asking: `'find'` is Cmd/Ctrl+F, `'tabs'`
- * is Alt+W and Alt+[ / Alt+]. The two differ on exactly one control — see
+/** Which of the Files tab's chords is asking: `'find'` is Cmd/Ctrl+F,
+ * `'search'` is Cmd/Ctrl+Shift+F (the project-wide search panel, mesa task
+ * 813), `'tabs'` is Alt+W and Alt+[ / Alt+]. They differ on exactly one thing
+ * — which text controls they may still be claimed from — see
  * `shouldIgnoreFilesShortcut`. */
-export type FilesChord = 'find' | 'tabs'
+export type FilesChord = 'find' | 'search' | 'tabs'
 
 /**
- * True when a Files-tab chord (Cmd/Ctrl+F, Alt+W, Alt+[ / Alt+]) must let the
- * keystroke go — to the browser's own binding, or to whatever else is on
- * screen.
+ * The text controls each chord is still claimed *from*, beyond the code editor
+ * every one of them claims.
+ *
+ * `find` keeps its own query box, where a second Cmd/Ctrl+F is the reflex for
+ * "select what I typed and let me retype it"; `search` keeps both search-ish
+ * boxes, since Cmd/Ctrl+Shift+F is that same reflex for the panel and is also
+ * the natural escalation from the in-file bar to the whole project — and
+ * unlike the tab chords it has somewhere deliberate to put the caret
+ * afterwards, its own input. `tabs` keeps neither, for the reason spelled out
+ * below.
+ */
+const CHORD_FIELDS: Record<FilesChord, readonly string[]> = {
+  find: ['files-find-input'],
+  search: ['files-find-input', 'files-search-input'],
+  tabs: [],
+}
+
+/**
+ * True when a Files-tab chord (Cmd/Ctrl+F, Cmd/Ctrl+Shift+F, Alt+W,
+ * Alt+[ / Alt+]) must let the keystroke go — to the browser's own binding, or
+ * to whatever else is on screen.
  *
  * One predicate for all of them rather than one per chord: they ask nearly the
  * same question — "may the Files tab claim a chord right now?" — and two copies
@@ -81,11 +101,10 @@ export type FilesChord = 'find' | 'tabs'
  *    palette). The Files tab is still mounted underneath it, and typing in a
  *    task field must never be interrupted by a find bar behind the modal.
  * 2. The caret is in a text control that is *not* the tab's own: the tree's
- *    new-file naming row, or any other field inside the tab. Two controls do
- *    claim these chords — the editor (`.files-content-editor`), since finding
- *    text in the file you are editing is the whole point, and the find bar's
- *    own box (`.files-find-input`), where a second Cmd/Ctrl+F is the reflex for
- *    "select what I typed and let me retype it".
+ *    new-file naming row, or any other field inside the tab. The editor
+ *    (`.files-content-editor`) claims every one of these chords, since finding
+ *    text in — or closing — the file you are editing is the whole point; which
+ *    *other* boxes a chord survives is `CHORD_FIELDS` above.
  *
  * The find bar's box is where `'find'` and `'tabs'` part company, because the
  * two chords do not do the same thing to it: Cmd/Ctrl+F acts *in* that input,
@@ -118,7 +137,7 @@ export function shouldIgnoreFilesShortcut(
   if (
     field &&
     !field.classList.contains('files-content-editor') &&
-    !(chord === 'find' && field.classList.contains('files-find-input'))
+    !CHORD_FIELDS[chord].some((cls) => field.classList.contains(cls))
   )
     return true
 

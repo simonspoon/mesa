@@ -3311,7 +3311,15 @@ body.files-tree-resizing {
   }
 
   .files-tree-pane.collapsed .files-tree,
+  .files-tree-pane.collapsed .files-search-panel,
   .files-tree-pane.collapsed .files-tree-resize-handle {
+    display: none;
+  }
+
+  /* Collapsed, the rail is the expander and nothing else — the search toggle
+     goes with `+` below, since Cmd/Ctrl+Shift+F expands the pane on its way
+     in and the toggle would otherwise open a panel into a hidden column. */
+  .files-tree-pane.collapsed .files-tree-search-toggle {
     display: none;
   }
 
@@ -3460,6 +3468,32 @@ body.files-tree-resizing {
 
 .files-tree-pane.collapsed .files-tree-add {
   display: none;
+}
+
+/* The panel's own toggle (mesa task 813), beside `+` on the pane's header
+   rail: the mouse route to Cmd/Ctrl+Shift+F, and the control the panel hands
+   the caret back to when it closes. Always visible, unlike `+` — an
+   affordance nobody can find is a shortcut nobody knows about — and chromeless
+   like the collapse toggle it sits next to. */
+.files-tree-search-toggle {
+  margin-left: auto;
+  padding: 0 0.3rem;
+  border: none;
+  border-radius: 0;
+  clip-path: none;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.files-tree-search-toggle:hover,
+.files-tree-search-toggle[aria-pressed='true'] {
+  background: none;
+  box-shadow: none;
+  color: var(--cyan);
 }
 
 /* The inline naming row: an input shaped like the tree row it replaces, so
@@ -3869,6 +3903,162 @@ body.files-tree-resizing {
   color: var(--cyan);
   border-color: var(--cyan);
   box-shadow: inset 0 0 8px var(--cyan-dim);
+}
+
+/* Project search (mesa task 813): the panel takes the tree's place inside
+   `.files-tree-pane`, so it inherits that pane's width, collapse, drag handle
+   and phone-tier stack — every rule about where this column sits is already
+   written, and none of it is repeated here. Same box as `.files-tree`. */
+.files-search-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+/* The query row, `.files-find-bar`'s shape one column over. It does not
+   scroll with the results: a search you cannot retype without scrolling back
+   up is the same mistake the pinned pane header fixed. */
+.files-search-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.files-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.files-search-summary {
+  flex: none;
+  margin: 0;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+}
+
+.files-search-panel .error {
+  flex: none;
+  margin: 0;
+  padding: 0 0.6rem 0.35rem;
+  font-size: 0.75rem;
+}
+
+/* The one scroller in the panel — the bar and the summary above it stay put
+   however long the result list is. */
+.files-search-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.files-search-results ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Both rows are real <button>s (one file heading, one per hit), so they are
+   Tab-reachable and Enter-activatable for free — the tab's standing rule that
+   focus candidates are just native ones. The app's button chrome hangs off the
+   element selector, so both strip it back to a row. */
+.files-search-file,
+.files-search-hit {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  clip-path: none;
+  box-shadow: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.files-search-file {
+  padding: 0.3rem 0.5rem;
+  border-left: 3px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--text-h);
+}
+
+.files-search-file:hover,
+.files-search-hit:hover {
+  background: var(--panel-raised);
+  box-shadow: none;
+}
+
+.files-search-file-name {
+  flex: none;
+  font-family: var(--font-mono);
+}
+
+/* The directory takes the slack and gives it up first: basenames collide, so
+   the path is what disambiguates, and the middle of it is the least useful
+   part to keep. */
+.files-search-file-dir {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.files-search-file-count {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+}
+
+.files-search-hit {
+  padding: 0.15rem 0.5rem 0.15rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.files-search-hit-line {
+  flex: none;
+  min-width: 2.5em;
+  text-align: right;
+  color: var(--muted);
+  opacity: 0.7;
+}
+
+/* One line per hit, clipped rather than wrapped: a wrapping row changes height
+   as the query changes, and the server already windowed the snippet around the
+   match. */
+.files-search-hit-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  color: var(--text);
+}
+
+/* NOT `.files-find-hit`: that mark is one layer of an overlay stack and paints
+   `color: transparent` so the text behind it shows through. Here the mark IS
+   the text. */
+.files-search-mark {
+  background: rgba(255, 180, 68, 0.28);
+  color: inherit;
 }
 
 /* File history (task 542): a commit list pinned beside the file, inside the

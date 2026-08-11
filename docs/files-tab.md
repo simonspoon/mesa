@@ -1125,3 +1125,162 @@ Nothing here is reachable by `scripts/files-check.sh` — it gates the API, and
 this task added none. The gate is `npm --prefix frontend run test` over the
 modules above, plus khora for anything needing a rendered tree, real focus
 routing or a trusted keystroke (CLAUDE.md's standing split).
+
+## Project-wide search (task 813)
+
+`Cmd/Ctrl+Shift+F` — every match of a literal query across the project's tree,
+grouped by file, in a panel that takes the **tree pane's** place. Clicking a
+result opens the file and shows the line.
+
+This is the one slice since task 327 that is not frontend-only: the browser has
+no tree to walk, so the search is a route and a `core::files` function, with
+one pure module and the panel on top of them.
+
+### The route
+
+`GET /api/projects/{id}/files/search?q=<literal>[&case=true][&word=true]` →
+`ProjectFileSearch` via `files::search_files`. A **fourth** read route rather
+than a mode of the tree listing: that one answers "what is in this directory"
+out of a 5s cache keyed on the directory, and a search is keyed on a query
+nobody repeats — so nothing is cached here, like the content and diff reads.
+
+- The `?q=` contract mirrors the content route's `?path=`: missing, empty, or
+  longer than `files::MAX_SEARCH_QUERY` (200 characters) is 422 `validation`.
+  No `local_path`, a dead folder, or a root that no longer resolves is 404
+  `not_found` — the content route's collapse, *not* `ProjectFileTree`'s
+  three-rung ladder, because a search is a request about a specific root rather
+  than a description of the project's state. A query that simply matches
+  nothing is a **200 with an empty `files`**: a state, not a failure, the same
+  way an empty commit list is on the Git tab.
+- Gate: the standard `guard` only, like the tree, content, download and raw
+  reads beside it. It executes nothing, and the Content-Type gate does not fire
+  on a GET. `spawn_blocking`, because it is a filesystem walk.
+- **A literal scan, never a `RegExp`** — `fileFind.ts`'s rule, for its reason: a
+  query is a user's typing, not a pattern language. The two options are the same
+  two the find bar offers, with the same rules implemented the same way: case
+  folded **per character** (a lowercased copy of a line is not
+  character-for-character the line the snippet is cut out of), and whole-word
+  demanding a boundary only on the sides the query itself ends in a word
+  character (so `(x` still finds `f(x)`), against the same ASCII word set.
+
+### What it reads is exactly what the tab can show
+
+That correspondence is the reason this is not a `grep` shell-out, and every
+piece of it is a reuse rather than a parallel rule:
+
+- The walk is `tree_level`'s, applied recursively — `EXCLUDED_DIRS` skipped by
+  name, directories before files alphabetically, and **symlinks never followed**
+  (one rule covering escape and cycle at once). No result can name a path the
+  tree would not list.
+- A file is opened through the same `FILE_CONTENT_CAP`-bounded read and the same
+  extension/NUL binary rules `read_file` applies. So a hit's **line number
+  always exists in the viewer that opens next**, and binary bytes are never
+  scanned or quoted.
+- `root` is resolved once through `safe_path` and every descendant is reached by
+  walking real directory entries from there — there is no request path to
+  traverse with, and nothing outside `local_path` is ever opened.
+
+Four caps bound the answer and the work, and hitting any of them sets
+`truncated` on the result (the per-file one sets it on that file too, which is
+what its `12+` count means): 50 matches per file, 200 files, 1,000 matches
+total, and 20,000 files *opened* — the first three bound the response and the
+DOM built from it, the fourth bounds a query that matches nothing in a huge
+tree. The panel says `+` rather than claiming the project holds exactly this
+many; an exhaustive answer for one file is the in-file bar, which has its own,
+larger cap.
+
+### Snippets carry no offsets
+
+`FileSearchMatch` is `{line, text}` and nothing else. `text` is shaped
+server-side — leading indentation dropped, windowed around the match
+(40 characters of lead-in, 240 long), `…` marking either cut — and the panel
+re-runs the **same literal scan** over it to paint the highlight
+(`fileSearch.ts::snippetSegments`, delegating to `fileFind.ts`).
+
+That is deliberate: a char offset computed in Rust is not a UTF-16 offset in JS,
+and this side already owns the identical scan. When the two do disagree — a
+snippet windowed through the middle of a match, a case-folding difference at the
+edges — the cost is a row painted **without** a highlight, never a row pointing
+somewhere wrong. Same posture as the find layer: the worst an overlay bug can do
+is misplace a background.
+
+### The panel
+
+`SearchPanel` in `FilesView.tsx`, rendered **in place of** `.files-tree` inside
+`.files-tree-pane`. That is the whole layout decision: it inherits the pane's
+drag-width, collapse, resize handle and phone-tier stack (tasks 671/559) with no
+new rule, and it leaves the file it points into fully visible beside it —
+reading a result *is* reading the file. The tree is unmounted while it is up, so
+the two can never scroll past each other in one column; reopening costs nothing,
+since `childrenCache` outlives the swap.
+
+- **The search runs on submit, not per keystroke.** Every other query box in
+  this tab searches a string already in memory; this one is a filesystem walk of
+  the whole project, and one request per character would have the server reading
+  every file under `local_path` five times for `needle`. Enter sends it, a
+  toggle re-sends it (a deliberate re-ask of the same question, and only once
+  there is a result to re-ask), and the summary line says `Press Enter to
+  search` before the first one.
+- **The result carries the query it was found with** (`SearchRun`), so rows stay
+  highlighted against *that* query while a new one is being typed over it.
+- A stale response is dropped by a sequence number: a walk is slow enough that
+  the answer to an older question can land after a newer one, and overwriting
+  the new with the old is the classic version of this bug. The same counter is
+  bumped on a project change, so an in-flight walk of project A can never land
+  in project B.
+- Nothing is persisted or deep-linked — no `localStorage`, no URL hash, no
+  server state. Component lifetime, like the find bar one file down, and reset
+  wholesale on a project change.
+
+### Clicking a result: a landing, not a scroll
+
+A click opens the file exactly as a tree click does (`fileTabs.ts::openFile`
+through the existing `commit()`), and hands the pane that gets it a
+`SearchLanding` — `{seq, path, line, query, caseSensitive, wholeWord}`.
+
+The pane turns that into an **ordinary find**: the line becomes an anchor
+(`offsetForLine`, the same function the status bar counts with) and the query
+becomes the query, so `matchIndexFrom` picks the match and task 809's whole
+reveal machinery shows it — correct in view *and* edit mode, wrap on *and* off,
+with no second scroll rule. The reader also arrives with the in-file bar open on
+that query, able to keep stepping through the file, which is the next thing they
+want and would otherwise be a second `Cmd/Ctrl+F`.
+
+Three details are load-bearing:
+
+- **The find state is derived, not assigned.** `ContentPane` computes
+  `find` as "the landing's, while one is active; otherwise the stored state",
+  and every write to the bar (`setFind`) records the landing as consumed. So
+  "take over from the panel" is one condition rather than an effect racing the
+  first paint — and clicking the *same* result twice lands twice, because a
+  fresh `seq` is simply not the consumed one. An effect would have painted the
+  top of the file first and jumped a frame later, and would have needed its own
+  answer to the second-click question.
+- **The bar does not take the caret on a landing** (`FindState.autoFocus`,
+  `FindBar`'s `takeFocus`). Focus belongs to the panel the reader is still
+  clicking through; every way a *user* opens the bar still focuses and selects
+  it.
+- **The landing goes to whichever pane holds that path**, not to a chosen side.
+  The same file can be open in both panes of a split, and both should show the
+  line that was clicked.
+
+**A markdown file in view mode is the one result that opens without landing** —
+it has no offsets once rendered as prose, which is exactly why `findable` is
+false there. The landing is marked consumed anyway (leaving it armed would fire
+it at whatever that tab shows next), so the click is "open this file" and the
+browser's own find still works on what is painted. Editing that same file makes
+it source again, and findable like anything else.
+
+### Gates
+
+`scripts/files-check.sh` section 5 covers the route: hits grouped by file over a
+seeded tree where an excluded directory and a NUL-carrying file hold the query
+too (both absent from the result, skipped server-side rather than filtered by a
+client), the snippet's dropped indentation, both option toggles, a miss as a
+200, and the whole `?q=` contract — plus, in **both** serve modes, that search
+is reachable while the PATCH write keeps its gate. `core::files::search_files`
+has unit tests for the walk, the caps, the snippet window and the symlink
+refusal; `fileSearch.test.ts` covers the summary, the query gate and the
+snippet highlighting; `keyboardScope.test.ts` covers the `'search'` chord.
+Everything else — the panel's focus routing, the landing's reveal — is khora's,
+per CLAUDE.md's standing split.

@@ -14,6 +14,7 @@ Frontend-only — no CLI, API, or Rust surface.
 | `Enter` | global | Activates the focused element (native browser behavior) |
 | `Cmd/Ctrl+Shift+P` | global | Command palette — **pre-existing**, untouched |
 | `Cmd/Ctrl+F` | Files tab, focused pane, findable file | Opens find-in-file, selecting the remembered query (task 809) |
+| `Cmd/Ctrl+Shift+F` | Files tab | Opens the project-wide search panel in place of the tree, selecting the remembered query (task 813) |
 | `Cmd/Ctrl+S` | Files tab editor | Saves the file, staying in the editor (and swallows Save Page) |
 | `Alt+W` | Files tab | Closes the focused pane's active tab |
 | `Alt+[` `Alt+]` | Files tab | Previous / next tab in the focused pane |
@@ -74,25 +75,35 @@ Files tab's chords therefore call a *sibling* export in the same file,
 **`shouldIgnoreFilesShortcut(e, chord)`**, so there is still exactly one module
 deciding which surface may claim a keystroke.
 
-One predicate for all four chords, not one each: they ask nearly the same
+One predicate for all five chords, not one each: they ask nearly the same
 question. It returns `true` (stand down) when a modal that owns its own keys is
 open (`.create-task-backdrop`, `.command-palette-backdrop` — rule 5 above, same
-classes) or when the caret is in a text control that is not the tab's own; the
-two that *do* claim these chords are `.files-content-editor` and
-`.files-find-input`. The `chord` argument (`'find'` | `'tabs'`, required, never
-defaulted) is the one place the four part company, and only on that second
-control: Cmd/Ctrl+F acts *in* the find bar's query box, while Alt+W and
-Alt+[ / ] act by tearing it down — the pane's active path changes,
-`ContentPane` remounts, and the input is unmounted while it holds focus, which
-drops focus on `<body>` (Tab restarts at the top of the page, Escape answers
-nothing). `closeFind` hands the caret on for exactly that reason and the tab
-chords have nothing to hand it to, the pane that would take it not existing yet,
-so they stand down there instead. Everything else about scoping is the caller's:
-the
+classes) or when the caret is in a text control that is not the tab's own. The
+editor (`.files-content-editor`) claims every one of them — finding text in, or
+closing, the file you are editing is what they exist for. Which *other* boxes a
+chord survives is one table in the module (`CHORD_FIELDS`), and it is the only
+place the chords part company: `'find'` keeps `.files-find-input`, `'search'`
+keeps that one *and* `.files-search-input`, `'tabs'` keeps neither. The `chord`
+argument (`'find'` | `'search'` | `'tabs'`, required, never defaulted) is how a
+caller says which it is, rather than inheriting whichever answer happened to be
+the default.
+
+The reason they differ is what each does to the box in question. Cmd/Ctrl+F acts
+*in* the find bar's query box, and Cmd/Ctrl+Shift+F acts in its own (and
+escalating from the in-file bar to the project is the natural move, so it is
+claimed from both). Alt+W and Alt+[ / ] act by tearing the bar down — the pane's
+active path changes, `ContentPane` remounts, and the input is unmounted while it
+holds focus, which drops focus on `<body>` (Tab restarts at the top of the page,
+Escape answers nothing). `closeFind` hands the caret on for exactly that reason
+and the tab chords have nothing to hand it to, the pane that would take it not
+existing yet, so they stand down there instead. Everything else about scoping is
+the caller's: the
 listeners live in `FilesView`/`ContentPane`, so they exist only while the tab
 is mounted, and Cmd/Ctrl+F additionally requires that pane to be the focused
 one — in a split, both are mounted and two find bars racing for one keystroke
-is the bug scoping avoids.
+is the bug scoping avoids. Cmd/Ctrl+Shift+F is `FilesView`'s for the opposite
+reason: the panel is the tab's, not a file's, so there is no pane to be focused
+and nothing to race.
 
 **`preventDefault` fires only after a binding has decided to act**, which is
 what keeps the browser's own Cmd+F everywhere else and leaves an Alt chord this
@@ -140,10 +151,29 @@ and worst on the Scripts page, where the same component is one field of a form
 and nothing binds Escape at all. Any other typed key disarms it, so a user who
 presses Escape and keeps typing never sees it.
 
-**Cmd/Ctrl+Shift+F is not this tab's.** The find binding excludes Shift: that
-chord is "find in files" everywhere it is bound and a browser/extension chord on
-some setups, and swallowing it to open the in-file bar would be claiming a key
-this tab was never offered.
+**Cmd/Ctrl+Shift+F is the project search** (task 813), and the find binding
+still excludes Shift. That was the point of the exclusion: the chord means "find
+in files" everywhere it is bound, so swallowing it to open the *in-file* bar
+would have been claiming a key this tab was never offered — while the tab now
+has the surface the chord actually names, and takes it for that.
+
+Its listener is `FilesView`'s, not a pane's, because the panel belongs to the
+tab rather than to a file: there is no focused-pane condition and nothing for a
+split to race. It stands down through the same `shouldIgnoreFilesShortcut`, as
+`'search'`, which is claimed from the editor and from *either* query box — the
+find bar's and its own — since a second Cmd/Ctrl+Shift+F is "select what I
+typed" and escalating from one bar to the other is the natural move. Unlike the
+tab chords it has somewhere deliberate to put the caret afterwards (its own
+input), which is why the hand-off argument that stands those down does not apply
+here.
+
+**Escape in the panel is bound on the panel**, not on `document` — the one place
+this feature deviates from the find bar's shape, and deliberately. The panel
+sits *beside* the file rather than over it, so the editor's Escape (discard the
+edit) and the find bar's (close the bar) have to keep working while it is open;
+a React `onKeyDown` on the panel's own wrapper answers the key exactly when
+focus is inside it. Closing hands the caret to the tree pane's search toggle —
+a real control that outlives the panel, the same rule `closeFind` follows.
 
 ## Focus candidates
 

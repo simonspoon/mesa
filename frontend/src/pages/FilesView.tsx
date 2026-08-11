@@ -57,6 +57,12 @@ import {
   stepMatch,
   type FindMatch,
 } from '../fileFind'
+import {
+  MAX_SEARCH_QUERY,
+  searchRequestQuery,
+  searchSummary,
+  snippetSegments,
+} from '../fileSearch'
 import { shouldIgnoreFilesShortcut } from '../keyboardScope'
 import { loadWordWrap, saveWordWrap } from '../wordWrap'
 import { onNarrowTierChange, useNarrowTier } from '../phoneTier'
@@ -78,9 +84,11 @@ import {
   getProjectGitFileLog,
   projectFileDownloadUrl,
   projectFileRawUrl,
+  searchProjectFiles,
   updateProjectFilesContent,
 } from '../api'
 import type { FileTreeEntry } from '../types/FileTreeEntry'
+import type { ProjectFileSearch } from '../types/ProjectFileSearch'
 import type { GitCommit } from '../types/GitCommit'
 import { useFetch } from '../useFetch'
 
@@ -271,6 +279,12 @@ interface FindState {
   /** Index into the current match list, or -1 for none. */
   index: number
   anchor: number
+  /** Whether the bar should take the caret as it comes up. True for every way
+   * a *user* opens it (Cmd/Ctrl+F is "let me type a query"), false for the one
+   * way it opens without being asked for — a project-search result landing in
+   * this pane (task 813), where the caret belongs to the panel the user is
+   * still clicking through. */
+  autoFocus: boolean
 }
 
 const BLANK_FIND: FindState = {
@@ -280,6 +294,32 @@ const BLANK_FIND: FindState = {
   wholeWord: false,
   index: -1,
   anchor: 0,
+  autoFocus: true,
+}
+
+/**
+ * A result clicked in the project-search panel (mesa task 813), handed to the
+ * pane that opens the file so it can show the reader *which* line matched.
+ *
+ * It is deliberately expressed as a search rather than as a scroll offset: the
+ * pane already knows how to run a query, land on the first match at or after an
+ * anchor, and reveal it in either mode and either wrap setting (`runFind`, and
+ * the machinery task 809 built under it). Handing it a line and the query that
+ * found the line reuses all of that — and leaves the reader with the in-file
+ * bar open on the same query, which is where they wanted to be next anyway.
+ *
+ * `seq` is what makes a second click on the *same* result land again: every
+ * other field can be identical, and only a fresh number says "this is a new
+ * click" to the pane that already consumed the last one.
+ */
+interface SearchLanding {
+  seq: number
+  path: string
+  /** 1-based, over the same capped bytes the content route serves. */
+  line: number
+  query: string
+  caseSensitive: boolean
+  wholeWord: boolean
 }
 
 /** The selected file's content: monospace, with a language-tinted header,
@@ -295,6 +335,7 @@ function ContentPane({
   wrap,
   onWrapChange,
   focused,
+  landing,
 }: {
   projectId: number
   path: string
@@ -308,6 +349,10 @@ function ContentPane({
    * Cmd/Ctrl+F — in a split, both panes are mounted, and two find bars racing
    * for one keystroke is the bug that scoping avoids. */
   focused: boolean
+  /** The project-search result this pane was opened for, if any (task 813) —
+   * consumed once, by `seq`. Null in every other case, which is every case
+   * before this feature existed. */
+  landing: SearchLanding | null
 }) {
   const { data, error, refetch } = useFetch(
     () => getProjectFilesContent(projectId, path),
@@ -324,14 +369,20 @@ function ContentPane({
   // autofocuses at offset 0, which is where this starts.
   const [caret, setCaret] = useState<CaretPosition>({ line: 1, col: 1 })
   // Find-in-file (task 809). Same lifetime as `caret` above, for the reason
-  // `FindState` sets out.
-  const [find, setFind] = useState<FindState>(BLANK_FIND)
+  // `FindState` sets out. `find` itself is *derived* just below — a search
+  // result landing in this pane overrides it until the user touches the bar,
+  // which is what `setFind` records (task 813).
+  const [findState, setFindState] = useState<FindState>(BLANK_FIND)
+  const [consumedLanding, setConsumedLanding] = useState<number | null>(null)
   const editorRef = useRef<CodeEditorHandle>(null)
   const findInputRef = useRef<HTMLInputElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   // Armed by `reveal` in view mode and consumed by the effect that measures the
   // mark — a flag rather than a dependency list, for the reason stated at both.
   const pendingReveal = useRef(false)
+  // The last search result this pane actually scrolled to (task 813), so one
+  // click reveals once however many times the pane re-renders after it.
+  const revealedLanding = useRef<number | null>(null)
 
   // Everything below is computed before the early returns, because hooks are:
   // `data` is still loading on the first renders, and a search over "" is a
@@ -350,6 +401,59 @@ function ContentPane({
     !isImagePath(data.path) &&
     ui.selectedCommit === null &&
     (ui.editing || data.language !== 'markdown')
+  /**
+   * A project-search result the user clicked, still waiting to be shown
+   * (task 813): the pane is displaying the file, the reader is looking for the
+   * line, and nothing they have done since says otherwise.
+   *
+   * It stops being active the moment the bar is touched — every write to the
+   * find state goes through `setFind` below, which records the landing as
+   * consumed — so this is "the search panel's answer, until you take over",
+   * not a mode. It also needs the fetch to have landed, since the line is an
+   * offset into content that may not be here yet, and needs the file to be
+   * findable at all: a binary, an image or markdown rendered as prose has no
+   * offsets to point at, and there the click is just "open this file".
+   */
+  const landingActive =
+    landing !== null && landing.seq !== consumedLanding && data != null && findable
+  /**
+   * The bar's state: normally the state above, and a landing's own while one
+   * is active.
+   *
+   * Derived rather than written into state from an effect, which is the same
+   * choice `blocked` is in the store and `findOpen` is two lines down: an
+   * effect would paint the top of the file first and jump a frame later, and
+   * it would have to decide what "the same result clicked twice" means. Here
+   * that falls out — a fresh `seq` is not the consumed one, so the derivation
+   * simply answers differently.
+   */
+  const find: FindState = landingActive
+    ? {
+        open: true,
+        // The caret stays with the panel the reader is clicking through; the
+        // bar is here to be stepped, not typed in, until they say otherwise.
+        autoFocus: false,
+        query: landing.query,
+        caseSensitive: landing.caseSensitive,
+        wholeWord: landing.wholeWord,
+        index: -1,
+        // The line becomes an anchor through the same function the status bar
+        // counts lines with — so "which match" is `matchIndexFrom`'s ordinary
+        // answer rather than a second rule about landings.
+        anchor: offsetForLine(ui.editing ? ui.draft : (data?.content ?? ''), landing.line),
+      }
+    : findState
+  /** Every write to the bar — typing, a toggle, a step, a close — and the one
+   * place a landing is marked as taken over. They are the same event: the user
+   * has said where they are now, so the panel's answer stops overriding it. */
+  function setFind(next: FindState | ((prev: FindState) => FindState)) {
+    // An updater resolves against the *derived* state, not the stored one:
+    // crossing into or out of edit mode while a landing is showing means
+    // taking that landing over, and `{...f}` there has to be what is on
+    // screen.
+    setFindState(typeof next === 'function' ? next(find) : next)
+    setConsumedLanding(landing?.seq ?? null)
+  }
   // Whether the bar is actually *up*, which is what every reader below wants —
   // `find.open` alone is not it. The two part company on their own: cancelling
   // an edit turns a markdown file back into rendered prose, which is not
@@ -368,9 +472,14 @@ function ContentPane({
     [searchText, findOpen, find.query, find.caseSensitive, find.wholeWord],
   )
   // Clamped rather than trusted: the list shrinks under the index every time
-  // the query grows a character.
-  const current =
-    matches.length === 0 ? -1 : Math.min(Math.max(find.index, 0), matches.length - 1)
+  // the query grows a character. A landing has no index to clamp — it has a
+  // line — so it asks the same question `runFind` asks: the first match at or
+  // after the anchor, wrapping if there is none past it.
+  const current = landingActive
+    ? matchIndexFrom(matches, find.anchor, true)
+    : matches.length === 0
+      ? -1
+      : Math.min(Math.max(find.index, 0), matches.length - 1)
 
   /** Search for `next`'s query/options from `anchor` and land on a match.
    *
@@ -422,7 +531,7 @@ function ContentPane({
       findInputRef.current?.select()
       return
     }
-    runFind({ ...find, open: true, anchor: findAnchor() }, true)
+    runFind({ ...find, open: true, autoFocus: true, anchor: findAnchor() }, true)
   }
 
   // ...and the same selection when the bar comes *up*, which is the reopen the
@@ -434,8 +543,8 @@ function ContentPane({
   // in `openFind`, because on a fresh open the input does not exist until React
   // has rendered it.
   useEffect(() => {
-    if (findOpen) findInputRef.current?.select()
-  }, [findOpen])
+    if (findOpen && find.autoFocus) findInputRef.current?.select()
+  }, [findOpen, find.autoFocus])
 
   /** Where a fresh search starts from: what the user is looking at.
    *
@@ -572,9 +681,27 @@ function ContentPane({
   // numbers in one of them. Measured off rects rather than `offsetLeft` because
   // the mark's offset parent is `.files-code-main`, one box in from the
   // scroller.
+  //
+  // A **landing** arms it too (task 813), and by the same kind of flag rather
+  // than by watching `landing`: the pane is being *rendered* with the panel's
+  // answer in place (`landingActive`), and the mark to measure exists only
+  // after that render — which is exactly the state this effect already exists
+  // to handle. `revealedLanding` is the once-per-`seq` guard; a second click on
+  // the same result is a new `seq` and reveals again, while an unrelated
+  // re-render (a keystroke elsewhere, a resize) is the same one and does not.
+  // Editing, there is no mark to measure and the editor does it, which is the
+  // one branch that leaves this effect early.
   useEffect(() => {
-    if (!pendingReveal.current) return
+    const landed =
+      landingActive && current >= 0 && revealedLanding.current !== landing.seq
+    if (landed) revealedLanding.current = landing.seq
+    if (!pendingReveal.current && !landed) return
     pendingReveal.current = false
+    if (landed && ui.editing) {
+      const match = matches[current]
+      if (match !== undefined) editorRef.current?.reveal(match.start, match.end)
+      return
+    }
     const content = contentRef.current
     const mark = content?.querySelector<HTMLElement>('.files-find-hit.current')
     if (content == null || mark == null || !findOpen || ui.editing || current < 0) {
@@ -832,6 +959,7 @@ function ContentPane({
             caseSensitive={find.caseSensitive}
             wholeWord={find.wholeWord}
             label={matchLabel(current, matches.length, capped)}
+            takeFocus={find.autoFocus}
             inputRef={findInputRef}
             onSearch={(patch) => runFind({ ...find, ...patch }, true)}
             onStep={stepFind}
@@ -953,6 +1081,7 @@ function FindBar({
   caseSensitive,
   wholeWord,
   label,
+  takeFocus,
   inputRef,
   onSearch,
   onStep,
@@ -964,6 +1093,10 @@ function FindBar({
   /** Already-formatted "n of N" / "No results" — the arithmetic is
    * `matchLabel`'s, not this component's. */
   label: string
+  /** Whether the query box takes the caret as the bar mounts. False for the
+   * one open nobody asked for — a project-search result landing in this pane
+   * (task 813), where the caret stays with the panel being clicked through. */
+  takeFocus: boolean
   /** Held by the parent so a second Cmd/Ctrl+F can re-select the query. */
   inputRef: RefObject<HTMLInputElement | null>
   /** Any change that re-runs the search from the anchor. */
@@ -981,7 +1114,7 @@ function FindBar({
   return (
     <div className="files-find-bar">
       <input
-        autoFocus
+        autoFocus={takeFocus}
         ref={inputRef}
         className="files-find-input"
         value={query}
@@ -1551,6 +1684,206 @@ function basename(path: string): string {
   return i < 0 ? path : path.slice(i + 1)
 }
 
+/** A path's directory part, `''` at the project root — the dimmed half of a
+ *  search result's heading, for the same reason a tab shows its basename: the
+ *  names collide, the paths do not. */
+function dirname(path: string): string {
+  const i = path.lastIndexOf('/')
+  return i < 0 ? '' : path.slice(0, i)
+}
+
+/** What the panel is searching for and how, plus whether it is showing at
+ *  all. The result of the last search it *ran* is separate state: the two part
+ *  company the moment a character is typed, and the rows on screen must keep
+ *  being highlighted against the query they were found with, not against the
+ *  one being typed over it. */
+interface SearchState {
+  open: boolean
+  query: string
+  caseSensitive: boolean
+  wholeWord: boolean
+}
+
+/** One completed search: the answer, and the query and options it answers —
+ *  carried together so a row can never be highlighted against a query that
+ *  found something else. */
+interface SearchRun {
+  query: string
+  caseSensitive: boolean
+  wholeWord: boolean
+  data: ProjectFileSearch
+}
+
+/**
+ * The project-wide search panel (mesa task 813) — Cmd/Ctrl+Shift+F.
+ *
+ * It takes the tree pane's place rather than opening over the file, so it
+ * inherits that pane's width, collapse and phone-tier stacking (task 671/559)
+ * and leaves the editor beside it fully visible: reading a result *is*
+ * reading the file it points into.
+ *
+ * **The search runs on submit, not on every keystroke.** Every other query box
+ * in this tab searches a string already in memory; this one is a filesystem
+ * walk of the whole project, and firing one per character would have the
+ * server re-reading every file under `local_path` five times for `needle`. So
+ * Enter (or a toggle, which is a deliberate re-ask of the same question) is
+ * what sends it, and the box says so.
+ */
+function SearchPanel({
+  state,
+  run,
+  busy,
+  error,
+  inputRef,
+  onChange,
+  onSubmit,
+  onOpen,
+  onClose,
+}: {
+  state: SearchState
+  /** The last completed search, or null before the first one — which is what
+   * makes an empty panel silent rather than claiming "No results". */
+  run: SearchRun | null
+  busy: boolean
+  error: string | null
+  inputRef: RefObject<HTMLInputElement | null>
+  onChange: (patch: Partial<SearchState>) => void
+  onSubmit: () => void
+  onOpen: (path: string, line: number) => void
+  onClose: () => void
+}) {
+  /** Do the thing, then put the caret back in the query box — the find bar's
+   * rule and its reason: otherwise the next Enter re-activates the button that
+   * was clicked instead of re-running the search. */
+  function refocus(act: () => void): () => void {
+    return () => {
+      act()
+      inputRef.current?.focus()
+    }
+  }
+  const options = {
+    caseSensitive: run?.caseSensitive ?? false,
+    wholeWord: run?.wholeWord ?? false,
+  }
+  return (
+    <div
+      className="files-search-panel"
+      // Escape is bound here rather than on `document`, and that is the whole
+      // scoping: the panel sits beside the file instead of over it, so the
+      // editor's own Escape (discard the edit) and the find bar's (close the
+      // bar) must keep working while it is open. A React handler on this
+      // wrapper answers the key exactly when focus is inside the panel.
+      onKeyDown={(e) => {
+        if (e.key !== 'Escape') return
+        e.preventDefault()
+        onClose()
+      }}
+    >
+      <div className="files-search-bar">
+        <input
+          autoFocus
+          ref={inputRef}
+          className="files-search-input"
+          value={state.query}
+          maxLength={MAX_SEARCH_QUERY}
+          placeholder="Search project"
+          spellCheck={false}
+          aria-label="Search in project files"
+          onChange={(e) => onChange({ query: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key !== 'Enter') return
+            e.preventDefault()
+            onSubmit()
+          }}
+        />
+        <button
+          type="button"
+          className="files-find-toggle"
+          aria-pressed={state.caseSensitive}
+          title="Match case"
+          onClick={refocus(() => onChange({ caseSensitive: !state.caseSensitive }))}
+        >
+          Aa
+        </button>
+        <button
+          type="button"
+          className="files-find-toggle"
+          aria-pressed={state.wholeWord}
+          title="Whole word"
+          onClick={refocus(() => onChange({ wholeWord: !state.wholeWord }))}
+        >
+          |ab|
+        </button>
+        <button
+          type="button"
+          className="files-find-toggle"
+          aria-label="Close search"
+          title="Close (Escape)"
+          onClick={onClose}
+        >
+          ×
+        </button>
+      </div>
+      <p className="files-search-summary muted">
+        {busy ? 'Searching…' : (searchSummary(run?.data ?? null) || 'Press Enter to search')}
+      </p>
+      {error !== null && <p className="error">{error}</p>}
+      {run !== null && (
+        <ul className="files-search-results">
+          {run.data.files.map((file) => (
+            <li key={file.path} className="files-search-group">
+              {/* The heading opens the file at its first hit — the same thing
+                  a tree row does, with a line to land on. */}
+              <button
+                type="button"
+                className={`files-search-file ${accentClass(file.language)}`}
+                title={file.path}
+                onClick={() => onOpen(file.path, file.matches[0]?.line ?? 1)}
+              >
+                <span className="files-search-file-name">{basename(file.path)}</span>
+                <span className="files-search-file-dir">{dirname(file.path)}</span>
+                <span className="files-search-file-count">
+                  {file.matches.length}
+                  {file.truncated ? '+' : ''}
+                </span>
+              </button>
+              <ul>
+                {file.matches.map((match, i) => (
+                  // Index in the key because a file legitimately holds two
+                  // hits on one line — that is two rows, not one.
+                  <li key={`${match.line}-${i}`}>
+                    <button
+                      type="button"
+                      className="files-search-hit"
+                      onClick={() => onOpen(file.path, match.line)}
+                    >
+                      <span className="files-search-hit-line">{match.line}</span>
+                      <span className="files-search-hit-text">
+                        {/* Highlighted by re-running the same literal scan the
+                            find bar uses, never by offsets off the wire —
+                            `fileSearch.ts` says why. */}
+                        {snippetSegments(match.text, run.query, options).map((seg, s) =>
+                          seg.match < 0 ? (
+                            <span key={s}>{seg.text}</span>
+                          ) : (
+                            <mark key={s} className="files-search-mark">
+                              {seg.text}
+                            </mark>
+                          ),
+                        )}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 /** The tab being dragged, for the length of one HTML5 drag.
  *
  * Module scope rather than component state on purpose: `dragover` fires many
@@ -1805,6 +2138,7 @@ function FilePane({
   onUi,
   wrap,
   onWrapChange,
+  landing,
   onFocus,
   onActivate,
   onClose,
@@ -1832,6 +2166,11 @@ function FilePane({
   onUi: (path: string, patch: Partial<FileUiState>) => void
   wrap: boolean
   onWrapChange: (wrap: boolean) => void
+  /** The project-search result to land on, if it names a file this pane has
+   * open (task 813). Handed to whichever pane is showing that path rather than
+   * to a chosen side: the same file can be open in both, and both should show
+   * the reader the line they clicked. */
+  landing: SearchLanding | null
   onFocus: () => void
   onActivate: (path: string) => void
   onClose: (path: string) => void
@@ -1894,6 +2233,7 @@ function FilePane({
             wrap={wrap}
             onWrapChange={onWrapChange}
             focused={focused}
+            landing={landing?.path === active ? landing : null}
           />
         ) : (
           <p className="muted">Select a file to see its content.</p>
@@ -1986,6 +2326,34 @@ export function FilesView({ projectId }: { projectId: number }) {
   // in it, reads code the same way — the toggle in one pane's status bar is a
   // statement about the tab, not about that file.
   const [wrap, setWrap] = useState(loadWordWrap)
+  // Project-wide search (mesa task 813): what the panel is asking, the last
+  // answer it got, and whether one is in flight. Component state with the
+  // tab's lifetime — nothing about a search is persisted or deep-linked, the
+  // same posture the find bar takes one file down.
+  const [search, setSearch] = useState<SearchState>({
+    open: false,
+    query: '',
+    caseSensitive: false,
+    wholeWord: false,
+  })
+  const [searchRun, setSearchRun] = useState<SearchRun | null>(null)
+  const [searchBusy, setSearchBusy] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+  // Which request the panel is still interested in. A search is a filesystem
+  // walk, so a slow one can land after a later, narrower one — and the answer
+  // to the older question overwriting the newer one is the classic version of
+  // this bug.
+  const searchSeq = useRef(0)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  // Where the caret goes when the panel closes: a real control that outlives
+  // it. Closing without a hand-off drops focus on <body>, which is the same
+  // trap `closeFind` documents.
+  const searchToggleRef = useRef<HTMLButtonElement>(null)
+  // The result being opened, if any — handed to whichever pane holds that file
+  // so it can reveal the line (`SearchLanding`). Its `seq` is what makes a
+  // second click on the same result land again.
+  const [landing, setLanding] = useState<SearchLanding | null>(null)
+  const landingSeq = useRef(0)
   // The tab whose close is waiting on a discard/keep answer (task 809, slice
   // 4), or null. One at a time and identified by pane *and* path, since the
   // same file can be open in both panes of a split and only one of the two
@@ -2155,6 +2523,41 @@ export function FilesView({ projectId }: { projectId: number }) {
     return () => document.removeEventListener('keydown', onKey)
   })
 
+  // Cmd/Ctrl+Shift+F — the project-search chord (mesa task 813).
+  //
+  // This is the chord the in-file find bar deliberately let go: Cmd/Ctrl+F
+  // excludes Shift because "find in files" is what Cmd/Ctrl+Shift+F means
+  // everywhere it is bound, and the tab had no such surface to open. It has
+  // one now, so the tab claims the key it was already declining to misuse —
+  // and `docs/keyboard.md` moved with it.
+  //
+  // Bound on `FilesView` rather than on a pane, unlike Cmd/Ctrl+F: the panel
+  // belongs to the tab, not to a file, so there is no focused-pane condition
+  // and nothing to race in a split. Escape is NOT bound here — it belongs to
+  // whatever has focus (the editor's discard, the find bar's close), and the
+  // panel answers it from its own subtree instead.
+  //
+  // No dependency array, for the reason the tab chords' listener above states.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || !e.shiftKey) return
+      if (e.key !== 'f' && e.key !== 'F') return
+      if (shouldIgnoreFilesShortcut(e, 'search')) return
+      e.preventDefault()
+      openSearch()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  })
+
+  // Select the query on a fresh open, the same reflex — and for the same
+  // reason — as the find bar's twin of this effect: the input does not exist
+  // until React has rendered the panel, and a re-open keeps the last query,
+  // which `autoFocus` would focus without selecting.
+  useEffect(() => {
+    if (search.open) searchInputRef.current?.select()
+  }, [search.open])
+
   // Persist the open set (never `fileUi`). Every tabs write funnels through
   // `commit()`, so this one effect covers open/close/activate/focus/split/
   // move/ratio — no save calls sprinkled through the handlers.
@@ -2188,6 +2591,18 @@ export function FilesView({ projectId }: { projectId: number }) {
     setNewFileParent(null)
     setNewFileError(null)
     setPendingClose(null)
+    // A search is about one project's tree, and so is the result open on
+    // screen; both are meaningless against the next one. The query itself goes
+    // with them rather than being carried over, since the panel would
+    // otherwise show project A's hits under project B's name until the next
+    // Enter. Bumping `searchSeq` is what stops an in-flight walk of A from
+    // landing in B.
+    searchSeq.current++
+    setSearch({ open: false, query: '', caseSensitive: false, wholeWord: false })
+    setSearchRun(null)
+    setSearchBusy(false)
+    setSearchError(null)
+    setLanding(null)
   }
 
   // Drop a pending close whose reason has gone — the file was saved from the
@@ -2256,6 +2671,91 @@ export function FilesView({ projectId }: { projectId: number }) {
     if (pending === null) return
     setPendingClose(null)
     commit((prev) => closeTab(prev, pending.side, pending.path))
+  }
+
+  /** Cmd/Ctrl+Shift+F, and the tree pane's Search toggle.
+   *
+   * On an already-open panel it is "let me retype that" — a `focus()` *and* a
+   * `select()`, the pair `openFind` documents: `select()` alone sets a range
+   * without moving focus, and this chord is deliberately claimed from the
+   * editor, where the characters typed next would otherwise land in the file.
+   *
+   * Opening also undoes whatever is hiding the pane the panel appears in: the
+   * wide tier's collapse and the phone tier's `treeOpen`. A shortcut that
+   * opened a surface the user cannot see would read as doing nothing. */
+  function openSearch() {
+    setTreeCollapsed(false)
+    saveFilesTreeCollapsed(false)
+    setTreeOpen(true)
+    if (search.open) {
+      searchInputRef.current?.focus()
+      searchInputRef.current?.select()
+      return
+    }
+    setSearch((prev) => ({ ...prev, open: true }))
+  }
+
+  /** Closing keeps the query and the results — the panel reopens where it was,
+   *  the same promise `closeFind` makes one file down — and hands the caret to
+   *  the toggle that reopens it, rather than dropping it on `<body>`. */
+  function closeSearch() {
+    setSearch((prev) => ({ ...prev, open: false }))
+    searchToggleRef.current?.focus()
+  }
+
+  /** Run the search: Enter in the box, or a toggle click (a deliberate re-ask
+   *  of the same question). Never a keystroke — see `SearchPanel`.
+   *
+   *  `next` is passed in rather than read from state because a toggle click
+   *  runs the search for the value it is *setting*, not the one on screen —
+   *  the same reason `runFind` recomputes instead of reading its render's
+   *  matches. */
+  function runSearch(next: SearchState) {
+    const query = searchRequestQuery(next.query)
+    if (query === null) {
+      setSearchRun(null)
+      setSearchError(null)
+      return
+    }
+    const seq = ++searchSeq.current
+    setSearchBusy(true)
+    setSearchError(null)
+    const options = {
+      caseSensitive: next.caseSensitive,
+      wholeWord: next.wholeWord,
+    }
+    searchProjectFiles(projectId, query, options).then(
+      (data) => {
+        // A walk that lands after a later one asked a different question is
+        // an answer nobody is waiting for.
+        if (seq !== searchSeq.current) return
+        setSearchBusy(false)
+        setSearchRun({ query, ...options, data })
+      },
+      (e) => {
+        if (seq !== searchSeq.current) return
+        setSearchBusy(false)
+        setSearchError(e instanceof ApiError ? e.message : 'Search failed.')
+      },
+    )
+  }
+
+  /** A result clicked: open the file the way the tree opens one, and hand the
+   *  pane that gets it the line to land on (`SearchLanding`). */
+  function openResult(path: string, line: number) {
+    commit((prev) => openFile(prev, path))
+    setLanding({
+      seq: ++landingSeq.current,
+      path,
+      line,
+      query: searchRun?.query ?? '',
+      caseSensitive: searchRun?.caseSensitive ?? false,
+      wholeWord: searchRun?.wholeWord ?? false,
+    })
+    // Same reason a tree click does it: on the phone tier the pane and the
+    // file are stacked, so leaving the panel up pushes the file below the
+    // fold. Inert above 600px, where both are on screen at once.
+    setTreeOpen(false)
   }
 
   function patchUi(path: string, patch: Partial<FileUiState>) {
@@ -2428,6 +2928,7 @@ export function FilesView({ projectId }: { projectId: number }) {
       onUi: patchUi,
       wrap,
       onWrapChange: toggleWrap,
+      landing,
       onFocus: () => commit((prev) => focusPane(prev, side)),
       onActivate: (path: string) => commit((prev) => activateTab(prev, side, path)),
       onClose: (path: string) => requestClose(side, path),
@@ -2502,6 +3003,21 @@ export function FilesView({ projectId }: { projectId: number }) {
               label="New file in the project root"
               create={create}
             />
+            {/* The mouse route to the same panel Cmd/Ctrl+Shift+F opens, and
+                the control the panel hands the caret back to when it closes.
+                Rendered whether or not the panel is open, so that hand-off
+                always has somewhere to go. */}
+            <button
+              type="button"
+              ref={searchToggleRef}
+              className="files-tree-search-toggle"
+              aria-pressed={search.open}
+              aria-label="Search in project files"
+              title="Search in project files (Cmd/Ctrl+Shift+F)"
+              onClick={() => (search.open ? closeSearch() : openSearch())}
+            >
+              ⌕
+            </button>
             <button
               type="button"
               className="files-tree-collapse-toggle"
@@ -2521,6 +3037,32 @@ export function FilesView({ projectId }: { projectId: number }) {
               {treeCollapsed ? '»' : '«'}
             </button>
           </div>
+          {/* The panel takes the tree's place rather than opening over the
+              file (mesa task 813): it inherits this pane's width, collapse
+              and phone-tier stack, and leaves the file it points into fully
+              visible beside it. The tree is unmounted while it is up, so the
+              two can never scroll past each other in one column — reopening
+              the tree costs nothing, since `childrenCache` outlives this. */}
+          {search.open ? (
+            <SearchPanel
+              state={search}
+              run={searchRun}
+              busy={searchBusy}
+              error={searchError}
+              inputRef={searchInputRef}
+              onChange={(patch) => {
+                const next = { ...search, ...patch }
+                setSearch(next)
+                // A toggle is a deliberate re-ask of the same question, so it
+                // re-runs immediately — but only once there is a query to
+                // re-ask, and never for typing, which is what `onSubmit` is.
+                if (patch.query === undefined && searchRun !== null) runSearch(next)
+              }}
+              onSubmit={() => runSearch(search)}
+              onOpen={openResult}
+              onClose={closeSearch}
+            />
+          ) : (
           <ul className="files-tree">
             {create.parent === '' && <NewFileRow depth={0} create={create} />}
             {data.tree.map((entry) => (
@@ -2551,6 +3093,7 @@ export function FilesView({ projectId }: { projectId: number }) {
               <li className="files-tree-note muted">This folder is empty.</li>
             )}
           </ul>
+          )}
           {/* Drag handle on the pane's own right edge — absolutely
               positioned so the tree's `overflow-y: auto` can't scroll it
               away, straddling the border so it's grabbable from either

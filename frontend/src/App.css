@@ -961,6 +961,19 @@ main {
   border-color: var(--border);
 }
 
+/* The create action rides at the far end of the tab strip (mesa task 811) —
+   in it for the vertical space, not of it: it switches no view, so it takes
+   the ordinary button colours back off `.tabs button`'s muted pair (it is not
+   an unselected tab) without the active tab's glow (it is not a selected one
+   either), and the auto margin holds the gap that says so. Wrapping tabs push
+   it onto the last row, where the same margin still parks it at the right
+   edge. */
+.tabs .tabs-action {
+  margin-left: auto;
+  color: var(--cyan);
+  border-color: var(--border-bright);
+}
+
 .tabs button.active {
   color: var(--cyan);
   border-color: var(--cyan);
@@ -4962,6 +4975,15 @@ body.files-tree-resizing {
   justify-content: center;
 }
 
+/* The create-task modal's own, lighter dim (mesa task 811). It is the one
+   modal you fill in *while reading the view behind it* — a task written about
+   what is on screen — so the page underneath has to stay legible. Additive:
+   the base class above is still on the element, since that is the one
+   `shouldIgnoreShortcut()` matches. */
+.create-task-backdrop-soft {
+  background: rgba(6, 10, 16, 0.45);
+}
+
 .create-task-modal {
   width: min(26rem, 90vw);
   max-height: 85vh;
@@ -4971,6 +4993,34 @@ body.files-tree-resizing {
   clip-path: var(--cut);
   box-shadow: 0 0 32px rgba(0, 229, 255, 0.2);
   padding: 0.75rem 1rem 1.5rem;
+}
+
+/* Drag handle for the movable create-task modal (mesa task 811): the head bar
+   `CreateTaskPanel` already renders, turned into a title bar. The ✕ keeps its
+   right edge and the grip takes the left, so the bar reads as grabbable before
+   the cursor confirms it. `CreateTaskModal` excludes buttons from the drag, so
+   the ✕ still closes on a click. */
+.create-task-modal-movable .panel-head {
+  align-items: center;
+  cursor: move;
+  /* The box scrolls its own overflow, so on a touch screen a drag starting
+     here would be claimed as a scroll of it before `pointermove` ever ran —
+     this bar opts out of that so the gesture is the modal's. */
+  touch-action: none;
+}
+
+.create-task-modal-movable .panel-head::before {
+  content: '⠿';
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1;
+  /* The grip claims the left end by pushing everything after it right, rather
+     than by the bar switching to `space-between`. That is what lets the phone
+     tier drop the grip alone: `.panel-head`'s own `flex-end` is still in
+     force, so the ✕ returns to the right edge with no second override —
+     `space-between` left it stranded at the left, the only child of a bar
+     with nothing to space it against. */
+  margin-right: auto;
 }
 
 /* Task detail (mesa task 472): same shell as .create-task-modal, sized for
@@ -5320,6 +5370,20 @@ body.files-tree-resizing {
     padding: 0.4rem 0.75rem;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
+  }
+
+  /* The drag is already inert here — `modalDrag.ts` clamps a box against the
+     viewport, and this sheet *is* the viewport, so every drag resolves to no
+     movement. Drop the grip and the cursor rather than advertise a gesture
+     that cannot do anything, and hand the head bar's touches back to the
+     sheet's own scrolling (mesa task 811). */
+  .create-task-modal-movable .panel-head {
+    cursor: default;
+    touch-action: auto;
+  }
+
+  .create-task-modal-movable .panel-head::before {
+    content: none;
   }
 
   .create-task-modal .panel-close,

@@ -297,6 +297,22 @@ phone tier the backdrop stops centring its child and the box fills the
 viewport instead — full width and height, no `--cut` corner notch, no border
 or glow, body scrolling inside itself.
 
+The create-task modal adds two desktop behaviours on top of those shared
+classes (task 811) — a lighter dim and a drag by its head bar — and **neither
+needs the phone tier to switch it off**. The dim is a second class on the same
+element, so the phone block's `.create-task-backdrop` rules still apply, and a
+full-bleed sheet covers the backdrop anyway. The drag clamps the box inside the
+viewport (`modalDrag.ts`), and a sheet is exactly viewport-sized, so every drag
+on a phone already resolves to an offset of (0, 0) — verified by dragging one
+across a 390x844 screen and reading back `translate(0px, 0px)`.
+
+What the phone block *does* carry is the other half of that: `cursor`,
+`touch-action` and the `⠿` grip on `.create-task-modal-movable .panel-head` are
+reset, because a handle that cannot move anything must not look like one, and
+`touch-action: none` on a bar the user can only ever scroll from would eat the
+sheet's scroll. Presentation only — do not add a rule that changes *where the
+box goes*, or the phone tier becomes a second place that decision is made.
+
 Three things about that are load-bearing rather than cosmetic:
 
 - **A full-bleed sheet is what makes the touch story work**, and it needs no

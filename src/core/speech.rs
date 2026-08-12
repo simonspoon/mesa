@@ -123,6 +123,14 @@ pub fn is_voice_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The sentence the Settings page's voice **test** button speaks (mesa task
+/// 824), so a voice can be heard before it is saved. Mesa's own words, not
+/// anything a user or agent wrote: this is the one text on this path that is
+/// not a mesa record, and keeping it a constant is what makes the preview route
+/// carry no caller-supplied body at all. Short on purpose — it is a sample, and
+/// every sentence is seconds of synthesis.
+pub const SAMPLE: &str = "This is how mesa will read your inbox items aloud.";
+
 /// A synthesis in flight: WAV bytes in the order they must be written, the
 /// first chunk being the (size-patched) header. An `Err` item is a read that
 /// failed mid-render, which ends the response body abnormally rather than

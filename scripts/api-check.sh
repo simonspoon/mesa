@@ -24,6 +24,11 @@
 #      rendered (task 816), the hostile body arriving as stdin data, the
 #      `unavailable` failure and the `require_agent_access` gate, driven
 #      against a stub `kokoro-rs` (`MESA_KOKORO_BIN`);
+#   5c. GET /api/config/speech/preview (task 824) — the Settings page's voice
+#      test button: the same audio contract and gate, mesa's own sentence as
+#      the spoken text, the *query's* voice as one argv after `-v`, no `-v` at
+#      all when it is blank, and a name shaped like an option refused before
+#      anything is spawned;
 #   6. LAN mode — the Host allowlist is skipped while the Content-Type gate
 #      still applies, the two halves of one posture (CLAUDE.md), and the speak
 #      route keeps its stronger gate through the flip.
@@ -802,6 +807,79 @@ speak "/api/inbox/$SPEAK_ID/speak" -H 'Sec-Fetch-Site: none'
 [ "$STATUS" = "200" ] || fail "speak: a typed-in URL must be served, got $STATUS"
 ok "speak: Sec-Fetch-Site closes the no-Origin subresource hole (cross-site 403, same-origin/none 200)"
 
+# =====================================================================
+# 5c. GET /api/config/speech/preview — hearing a voice before saving it (824)
+# =====================================================================
+#
+# The Settings page's test button. Same synthesis and same gates as 5b, but two
+# things are its own: the spoken text is a mesa constant (nothing the caller
+# sent), and the voice comes off the *query string* rather than the config file
+# — which is what makes it a preview of an unsaved choice. So the assertions
+# are about where each of those two values comes from.
+
+speak "/api/config/speech/preview?voice=af_heart"
+[ "$STATUS" = "200" ] || fail "preview: expected 200, got $STATUS ($(cat "$TMP/audio"))"
+grep -qi '^content-type: audio/wav' "$TMP/headers" || fail "preview: Content-Type must be audio/wav"
+grep -qi '^x-content-type-options: nosniff' "$TMP/headers" || fail "preview: nosniff missing"
+grep -qi '^content-length:' "$TMP/headers" &&
+  fail "preview: a streamed body must not declare a Content-Length"
+[ "$(wc -c <"$TMP/audio" | tr -d ' ')" = "52" ] || fail "preview: audio bytes not passed through"
+HEXED=$(od -An -tx1 -v "$TMP/audio" | tr -d ' \n')
+[ "${HEXED:8:8}" = "2400ff7f" ] || fail "preview: RIFF size not patched (got ${HEXED:8:8})"
+[ "${HEXED:80:8}" = "0000ff7f" ] || fail "preview: data size not patched (got ${HEXED:80:8})"
+ok "GET /api/config/speech/preview: the same streamed audio/wav contract as speak"
+
+# The voice is the query's, one argv after -v…
+[ "$(cat "$STUB_DIR/last-argv")" = "-q -o - -v af_heart" ] ||
+  fail "preview: the query voice must be argv after -v, got $(cat "$STUB_DIR/last-argv")"
+# …and the text is mesa's own sample, not anything the caller supplied — the
+# route reads no request body at all, and the inbox item's text must not leak
+# into it.
+grep -q 'inbox items aloud' "$STUB_DIR/last-stdin" ||
+  fail "preview: the spoken text must be mesa's sample, got $(cat "$STUB_DIR/last-stdin")"
+ok "preview: mesa's own sentence on stdin, the query's voice as one argv after -v"
+
+# No voice (and a blank one) is the synthesiser's own default: no -v at all,
+# the exact argv an unconfigured install has always run.
+for QS in "" "?voice=" "?voice=%20"; do
+  speak "/api/config/speech/preview$QS"
+  [ "$STATUS" = "200" ] || fail "preview: '$QS' must be 200, got $STATUS"
+  [ "$(cat "$STUB_DIR/last-argv")" = "-q -o -" ] ||
+    fail "preview: '$QS' must add no -v, got $(cat "$STUB_DIR/last-argv")"
+done
+ok "preview: an absent or blank voice adds no -v (the synthesiser's own default)"
+
+# A name that isn't a voice name is refused *before* anything is spawned, so a
+# value shaped like an option can never reach the argv.
+rm -f "$STUB_DIR/last-argv"
+speak "/api/config/speech/preview?voice=-o%20%2Ftmp%2Fpwned.wav"
+[ "$STATUS" = "422" ] || fail "preview: a non-voice name must be 422, got $STATUS"
+[ "$(jq -r .error.code <"$TMP/audio")" = "validation" ] ||
+  fail "preview: the refusal must be code validation"
+[ ! -e "$STUB_DIR/last-argv" ] ||
+  fail "preview: a refused voice must never reach the synthesiser"
+ok "preview: a name shaped like an option is 422 validation, and nothing is spawned"
+
+touch "$STUB_DIR/fail"
+speak "/api/config/speech/preview?voice=af_heart"
+rm -f "$STUB_DIR/fail"
+[ "$STATUS" = "503" ] || fail "preview: a failing synthesiser must be 503, got $STATUS"
+[ "$(jq -r .error.code <"$TMP/audio")" = "unavailable" ] ||
+  fail "preview: a failing synthesiser must be code unavailable"
+ok "preview: a failing synthesiser is 503 unavailable"
+
+# The gate is the speak route's, both halves: a foreign Origin and a cross-site
+# subresource are refused, our own page's <audio> is not.
+speak "/api/config/speech/preview?voice=af_heart" -H 'Origin: http://evil.example'
+[ "$STATUS" = "403" ] || fail "preview: a foreign Origin must be 403, got $STATUS"
+speak "/api/config/speech/preview?voice=af_heart" \
+  -H 'Sec-Fetch-Site: cross-site' -H 'Sec-Fetch-Dest: audio'
+[ "$STATUS" = "403" ] || fail "preview: a cross-site subresource must be 403, got $STATUS"
+speak "/api/config/speech/preview?voice=af_heart" \
+  -H 'Sec-Fetch-Site: same-origin' -H 'Sec-Fetch-Dest: audio'
+[ "$STATUS" = "200" ] || fail "preview: our own page's <audio> must be served, got $STATUS"
+ok "preview: require_agent_access + the no-Origin subresource half, exactly as speak"
+
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
@@ -852,6 +930,14 @@ speak "/api/inbox/$SPEAK_ID/speak" -H "Host: 127.0.0.1:$LAN_PORT"
 [ "$STATUS" = "200" ] || fail "--lan speak: an IP-literal Host must be served, got $STATUS"
 grep -qi '^content-type: audio/wav' "$TMP/headers" || fail "--lan speak: Content-Type"
 ok "--lan: speak keeps the agent gate (DNS Host 403, IP-literal Host 200)"
+
+# The voice preview carries the same gate for the same reason — it is the same
+# synthesis, reached from the Settings page.
+speak "/api/config/speech/preview?voice=af_heart" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "--lan preview: a DNS-name Host must still be 403, got $STATUS"
+speak "/api/config/speech/preview?voice=af_heart" -H "Host: 127.0.0.1:$LAN_PORT"
+[ "$STATUS" = "200" ] || fail "--lan preview: an IP-literal Host must be served, got $STATUS"
+ok "--lan: the voice preview keeps the agent gate too"
 
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true

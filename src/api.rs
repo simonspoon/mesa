@@ -934,6 +934,11 @@ fn router(state: AppState) -> Router {
             "/api/config/speech",
             get(get_config_speech).put(update_config_speech),
         )
+        // Hearing a voice before saving it (mesa task 824): the same synthesis
+        // the inbox's play button does, on a fixed mesa-authored sentence, in
+        // the voice named on the query string rather than the one on disk.
+        // A read that changes nothing, gated like the speak route it copies.
+        .route("/api/config/speech/preview", get(preview_speech))
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -4126,6 +4131,80 @@ async fn update_config_speech(
             },
         })?;
     get_config_speech(State(state), ConnectInfo(addr), headers).await
+}
+
+#[derive(Deserialize)]
+struct PreviewQuery {
+    /// The voice to sample. Absent or blank is "the synthesiser's own default"
+    /// — the same `None` an unconfigured install speaks with, so the default
+    /// entry in the dropdown is auditionable too.
+    #[serde(default)]
+    voice: Option<String>,
+}
+
+/// `GET /api/config/speech/preview?voice=<name>` — speaks [`speech::SAMPLE`] in
+/// the voice named, so the Settings page's **test** button can play a voice
+/// *before* it is saved (mesa task 824). Nothing is read from the config file
+/// and nothing is written to it: the drafted name comes off the query string,
+/// which is exactly what makes this a preview rather than a second way to
+/// listen to the stored setting.
+///
+/// Shaped like `speak_inbox` deliberately — same streaming `audio/wav` body, no
+/// `Content-Length`, same `unavailable` for a missing or failing synthesiser,
+/// and the same two gates: `require_agent_access` plus the `Origin`-independent
+/// half a no-cors `<audio src>` needs. The text is a mesa constant, so the only
+/// caller-supplied value on this path is the voice — which reaches the child as
+/// one `Command::arg` after `-v`, and only after passing the shape rule that
+/// keeps a name from ever being read as an option.
+///
+/// The shape rule is the *whole* check: unlike a save, a preview does not
+/// require the name to be one this binary lists. A voice the binary rejects is
+/// the synthesiser's answer to give, and hearing that failure is a legitimate
+/// outcome of pressing test.
+async fn preview_speech(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<PreviewQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    require_same_site_fetch(&headers)?;
+    let voice = match query.voice.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(name) => {
+            // The save path's own check with an empty offer list — its
+            // "shape only, membership skipped" mode. One rule, one message: a
+            // name refused here must read the same as one refused on save.
+            config::validate_voice(name, &[]).map_err(|message| ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message,
+            })?;
+            Some(name.to_string())
+        }
+    };
+    let speech =
+        tokio::task::spawn_blocking(move || speech::start(speech::SAMPLE, voice.as_deref()))
+            .await
+            .map_err(|e| ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "unavailable",
+                message: format!("speech synthesis failed: {e}"),
+            })?
+            .map_err(|e| ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "unavailable",
+                message: e,
+            })?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "audio/wav".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        Body::from_stream(ReceiverStream::new(speech.chunks)),
+    )
+        .into_response())
 }
 
 async fn restart_server(

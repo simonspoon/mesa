@@ -613,6 +613,29 @@ speak "$ITEM_1"
   fail "the saved voice must reach the synthesiser's argv, got $(cat "$KOKORO_ARGV")"
 ok "the saved voice reaches the synthesiser as \`-v <voice>\`, read on the press (no restart)"
 
+# …and the Settings page's test button (mesa task 824) is the other way round:
+# the voice it speaks is the *query's*, because it exists to audition a choice
+# that has not been saved. `bm_george` is what the file says here, so a preview
+# asking for `af_bella` proves the route reads the query and not the file —
+# which is only assertable with a voice actually configured, so it lives here
+# rather than beside the route's other checks in api-check.sh.
+preview() { # preview <query> -> CODE, argv in $KOKORO_ARGV
+  rm -f "$KOKORO_ARGV"
+  CODE=$(curl -s -o "$TMP/audio" -w '%{http_code}' \
+    "http://127.0.0.1:$PORT/api/config/speech/preview$1")
+}
+preview "?voice=af_bella"
+[ "$CODE" = "200" ] || fail "preview with a configured voice: expected 200, got $CODE: $(cat "$TMP/audio")"
+[ "$(cat "$KOKORO_ARGV")" = "-q -o - -v af_bella" ] ||
+  fail "preview must speak the query's voice, not the saved one: $(cat "$KOKORO_ARGV")"
+# The blank one is the same story: it means "the synthesiser's own default",
+# never "fall back to whatever is saved".
+preview "?voice="
+[ "$CODE" = "200" ] || fail "preview with a blank voice: expected 200, got $CODE: $(cat "$TMP/audio")"
+[ "$(cat "$KOKORO_ARGV")" = "-q -o -" ] ||
+  fail "a blank preview voice must add no -v, saved or not: $(cat "$KOKORO_ARGV")"
+ok "the voice preview speaks the query's voice, never the saved one — and blank stays the synthesiser's own default"
+
 # The other three savers have to leave the voice alone, exactly as it leaves
 # them alone.
 api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
@@ -705,6 +728,15 @@ api PUT /api/config/speech '{"voice": "af_bella"}'
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
 ok "a malformed config is 502 unavailable on all eight config verbs, and a PUT never overwrites a file it could not read"
+
+# The preview is the one speech surface a malformed file cannot break, because
+# it reads no config at all — which is what makes it usable on the page whose
+# job is to fix that file.
+preview "?voice=af_bella"
+[ "$CODE" = "200" ] || fail "preview under a malformed config: expected 200, got $CODE: $(cat "$TMP/audio")"
+[ "$(cat "$KOKORO_ARGV")" = "-q -o - -v af_bella" ] ||
+  fail "preview under a malformed config must still speak the query's voice: $(cat "$KOKORO_ARGV")"
+ok "the voice preview still works under a malformed config — it reads no config at all"
 
 # ---- an unconfigured command falls back to the built-in claude argv ----
 

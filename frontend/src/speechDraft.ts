@@ -62,6 +62,28 @@ export function valueError(text: string): string | null {
   return null
 }
 
+/**
+ * What the **test** button reads while a sample is (or isn't) playing — the
+ * three states the Inbox's play button also distinguishes (mesa task 824).
+ * Synthesis takes seconds, so "asked for it" and "hearing it" must not look
+ * alike; the label and its tooltip come from here together, so the two can
+ * never disagree about which control the button currently is.
+ *
+ * `playing` is only meaningful while a sample exists — a stale `true` with no
+ * sample is still "test", because there is nothing to stop.
+ */
+export function sampleButton(
+  sampling: boolean,
+  playing: boolean,
+): { label: string; title: string } {
+  if (!sampling) {
+    return { label: 'test', title: 'hear a sentence in this voice' }
+  }
+  return playing
+    ? { label: 'stop', title: 'stop the sample' }
+    : { label: 'synthesising…', title: 'stop synthesising this sample' }
+}
+
 /** What the box means: a voice, or `null` for "the binary's default". */
 function valueOf(draft: SpeechDraft): string | null {
   const trimmed = (draft.voice ?? '').trim()

@@ -6,6 +6,7 @@ import {
   isDirty,
   isSavable,
   options,
+  sampleButton,
   valueError,
 } from './speechDraft'
 import type { ConfigSpeech } from './types/ConfigSpeech'
@@ -86,5 +87,24 @@ describe('changedSpeech', () => {
 
   it('sends nothing the server would reject', () => {
     expect(changedSpeech(SET, { voice: '-o' })).toEqual({})
+  })
+})
+
+describe('sampleButton', () => {
+  it('offers to play when nothing is sampling', () => {
+    expect(sampleButton(false, false).label).toBe('test')
+  })
+
+  it('separates "asked for it" from "hearing it"', () => {
+    expect(sampleButton(true, false).label).toBe('synthesising…')
+    expect(sampleButton(true, true).label).toBe('stop')
+  })
+
+  it('never lets the tooltip and the label be two different controls', () => {
+    // While a sample exists the button stops it, whichever state it is in.
+    for (const playing of [false, true]) {
+      expect(sampleButton(true, playing).title).toContain('stop')
+    }
+    expect(sampleButton(false, true)).toEqual(sampleButton(false, false))
   })
 })

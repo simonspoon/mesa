@@ -948,6 +948,18 @@ export function updateSpeech(
   return request('/api/config/speech', jsonInit('PUT', speech))
 }
 
+/**
+ * Spoken-sample URL for one voice (mesa task 824) — an `<audio src>` like
+ * `inboxSpeakUrl`, never fetched as JSON. It speaks a fixed mesa sentence in
+ * the voice named, reading nothing from the config file, which is what lets the
+ * Settings page audition a **drafted** voice before saving it. A blank name is
+ * the synthesiser's own default. Synthesis runs on every request, so this is a
+ * play action, not a cheap read.
+ */
+export function speechPreviewUrl(voice: string): string {
+  return `/api/config/speech/preview?voice=${encodeURIComponent(voice)}`
+}
+
 // ---- scripts (user-authored shell) ----
 
 /** The create/patch body. A `PATCH` sends only the keys it changes; `null` on

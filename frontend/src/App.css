@@ -6697,6 +6697,15 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* …with the test button beside it, so hearing a voice reads as part of picking
+   one. Wraps rather than squeezing the picker on a narrow screen. */
+.settings-voice-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 /* Model pricing: a prefix, four rates and one action per row. The grid is
    declared once on the container so the header labels and every row share
    their columns — the header is the only thing naming what the boxes are. */

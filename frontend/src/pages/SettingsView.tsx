@@ -7,6 +7,7 @@ import {
   listProjects,
   resetCcIndex,
   restartServer,
+  speechPreviewUrl,
   updateConfig,
   updatePricing,
   updateSpeech,
@@ -48,6 +49,7 @@ import {
   isDirty as isSpeechDirty,
   isSavable as isSpeechSavable,
   options as voiceOptions,
+  sampleButton,
   valueError as voiceError,
   type SpeechDraft,
 } from '../speechDraft'
@@ -401,6 +403,18 @@ function SpeechSection() {
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const [saving, setSaving] = useState(false)
+  // The sample being played, if any: the voice it was started for and a nonce
+  // that makes pressing test twice on the same voice a second play rather than
+  // a no-op (the <audio> is keyed by it). Null is "nothing playing" — the
+  // element is unmounted then, which is what stops the sound.
+  const [sample, setSample] = useState<{ voice: string; nonce: number } | null>(
+    null,
+  )
+  // Whether the sample's audio has actually started: synthesis takes seconds,
+  // so "asked for it" and "hearing it" are different states, exactly as on the
+  // Inbox page's play button.
+  const [playing, setPlaying] = useState(false)
+  const [sampleError, setSampleError] = useState(false)
 
   const seeded: SpeechDraft =
     draft ?? (speech ? speechDraftFrom(speech) : { voice: '' })
@@ -408,6 +422,21 @@ function SpeechSection() {
   function edit(value: string) {
     setDraft({ voice: value })
     setSaved(false)
+    // A different voice is a different sample; stop the old one rather than
+    // leave the previous voice playing under a changed selection.
+    setSample(null)
+    setPlaying(false)
+    setSampleError(false)
+  }
+
+  // Stops the sample if one is playing, starts one for the drafted voice
+  // otherwise — the drafted one, not the saved one, which is the whole point.
+  function toggleSample() {
+    setSampleError(false)
+    setPlaying(false)
+    setSample((current) =>
+      current ? null : { voice: seeded.voice, nonce: Date.now() },
+    )
   }
 
   function save() {
@@ -465,25 +494,25 @@ function SpeechSection() {
           play. Blank = the voice the synthesiser picks itself; a change applies
           on the next press, with no restart.
         </p>
-        {canPick(speech) ? (
-          <select
-            id="speech-voice"
-            className="settings-voice-input"
-            value={seeded.voice}
-            onChange={(e) => edit(e.target.value)}
-          >
-            {/* Not a count: `options()` may carry a configured voice the
-                binary no longer lists, so any number here would be wrong in
-                exactly the case that matters. */}
-            <option value="">default (the synthesiser's own)</option>
-            {voiceOptions(speech).map((v) => (
-              <option key={v} value={v}>
-                {v}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <>
+        <div className="settings-voice-row">
+          {canPick(speech) ? (
+            <select
+              id="speech-voice"
+              className="settings-voice-input"
+              value={seeded.voice}
+              onChange={(e) => edit(e.target.value)}
+            >
+              {/* Not a count: `options()` may carry a configured voice the
+                  binary no longer lists, so any number here would be wrong in
+                  exactly the case that matters. */}
+              <option value="">default (the synthesiser's own)</option>
+              {voiceOptions(speech).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          ) : (
             <input
               id="speech-voice"
               type="text"
@@ -493,15 +522,69 @@ function SpeechSection() {
               placeholder="af_heart"
               onChange={(e) => edit(e.target.value)}
             />
-            <p className="muted settings-command-blurb">
-              mesa could not ask <code>kokoro-rs</code> which voices it has —
-              type a name, or run <code>kokoro-rs --list-voices</code> to see
-              them.
-            </p>
-          </>
+          )}
+          {/* Hears the *drafted* voice, not the saved one — so the choice can
+              be made before it is committed. Refused while the name is one the
+              save would reject: there is nothing to audition then. */}
+          <button
+            type="button"
+            disabled={!!fieldError}
+            title={sampleButton(!!sample, playing).title}
+            onClick={toggleSample}
+          >
+            {sampleButton(!!sample, playing).label}
+          </button>
+        </div>
+        {!canPick(speech) && (
+          <p className="muted settings-command-blurb">
+            mesa could not ask <code>kokoro-rs</code> which voices it has — type
+            a name, or run <code>kokoro-rs --list-voices</code> to see them.
+          </p>
         )}
         {fieldError && <p className="error">{fieldError}</p>}
+        {sampleError && (
+          <p className="error">could not play a sample in this voice</p>
+        )}
       </section>
+
+      {/* One player, unmounted to stop — the same shape (and the same
+          `AbortError` caveat) as the Inbox page's, so a browser that refuses
+          autoplay reports a failure instead of leaving the button reading
+          "synthesising…" forever. The in-flight synthesis on the server
+          finishes and its bytes are discarded. */}
+      {sample && (
+        <audio
+          key={`${sample.voice}:${sample.nonce}`}
+          src={speechPreviewUrl(sample.voice)}
+          ref={(el) => {
+            // A refusal that lands after this element is gone belongs to a
+            // sample the user has already replaced or stopped, so it must not
+            // report a failure against whatever is playing by then — the
+            // Inbox player guards the same race with its item id. The cleanup
+            // runs on unmount, which is exactly when this closure goes stale.
+            let live = true
+            el?.play().catch((err: DOMException) => {
+              if (err.name === 'AbortError' || !live) return
+              setSampleError(true)
+              setSample(null)
+              setPlaying(false)
+            })
+            return () => {
+              live = false
+            }
+          }}
+          onPlaying={() => setPlaying(true)}
+          onEnded={() => {
+            setSample(null)
+            setPlaying(false)
+          }}
+          onError={() => {
+            setSampleError(true)
+            setSample(null)
+            setPlaying(false)
+          }}
+        />
+      )}
 
       <div className="settings-actions">
         <button

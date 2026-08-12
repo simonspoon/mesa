@@ -462,6 +462,21 @@ reads an item in (mesa task 822, `docs/inbox.md`).
   is **422 `validation`**, writing nothing. Gated with
   `require_local_path_write`: **loopback-only in both serve modes**, the same
   posture as every other config write.
+- `GET /api/config/speech/preview?voice=<name>` → `audio/wav`, streamed, no
+  `Content-Length`: the **test** button beside the picker (mesa task 824),
+  which is how a voice is heard *before* it is saved. Two things make it a
+  preview rather than a second way to play the stored setting: the voice comes
+  off the **query string**, and the config file is neither read nor written.
+  The spoken text is a mesa constant (`core::speech::SAMPLE`), so the voice is
+  the only caller-supplied value on the path — and it must pass the same shape
+  rule (`422 validation` otherwise, before anything is spawned). A blank or
+  absent voice adds no `-v`, so the dropdown's *default* entry is auditionable
+  too. Unlike a save, membership in the offered list is **not** required: a
+  voice this binary rejects is the synthesiser's answer to give, and hearing
+  that failure (**503 `unavailable`**) is a legitimate result of pressing test.
+  Gated exactly like `/api/inbox/{id}/speak` — `require_agent_access` plus the
+  `Origin`-independent half a no-cors `<audio src>` needs — since it is the
+  same synthesis.
 
 ## Gate
 
@@ -492,7 +507,14 @@ reaching the synthesiser's argv as `-v <voice>` on the very next press, `null`
 `-v` at all, a voice that isn't a bounded identifier and a well-shaped one the
 binary never offered both 422 writing nothing, 502 on a malformed file, each
 of the other three savers preserving `speech` and vice versa, and both verbs
-refused to a request that isn't from this machine's own page.
+refused to a request that isn't from this machine's own page. The **preview**
+route is `scripts/api-check.sh`'s, beside the speak route whose contract and
+gate it shares (5c): mesa's own sentence on stdin, the query's voice as one
+argv after `-v`, no `-v` for a blank one, and an option-shaped name refused
+before anything is spawned. Its "reads no config" half is here instead, where a
+voice is actually configured: with `bm_george` saved, a preview of `af_bella`
+still speaks `af_bella` and a blank one still adds no `-v` — and a preview
+works even under the malformed file every other config verb answers 502 to.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

@@ -20,12 +20,11 @@ export const REWIND_STEP_SECONDS = 10
 export function rewindTarget(
   currentTime: number,
   seekableStart: number | null,
-  step: number = REWIND_STEP_SECONDS,
 ): number | null {
   if (seekableStart === null) return null
   if (!Number.isFinite(currentTime) || !Number.isFinite(seekableStart)) {
     return null
   }
-  const target = Math.max(seekableStart, currentTime - step)
+  const target = Math.max(seekableStart, currentTime - REWIND_STEP_SECONDS)
   return target < currentTime ? target : null
 }

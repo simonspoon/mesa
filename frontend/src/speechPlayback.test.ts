@@ -27,7 +27,9 @@ describe('rewindTarget', () => {
     expect(rewindTarget(Number.POSITIVE_INFINITY, 0)).toBeNull()
   })
 
-  it('takes an explicit step', () => {
-    expect(rewindTarget(42, 0, 5)).toBe(37)
+  it('never seeks forward when the playhead is behind the window', () => {
+    // A live stream can transiently report a playhead earlier than the range
+    // it still holds; a rewind must not become a skip ahead.
+    expect(rewindTarget(3, 30)).toBeNull()
   })
 })

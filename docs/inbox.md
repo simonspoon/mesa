@@ -56,13 +56,30 @@ instructions**; `author` is free-text attribution.
     speakers, so it still works under `serve --lan`, where the browser is a
     different machine.
   - The body reaches `kokoro-rs` on **stdin**, verbatim, markdown and all
-    (`core::speech::synthesize`). Not a shell string and not even an argument:
+    (`core::speech::start`). Not a shell string and not even an argument:
     a body opening with `-o` cannot become an option, and a long one has no
     `ARG_MAX` ceiling. Stripping markdown before speaking is a deliberate
     non-goal — the body is the record.
+  - The audio **streams** (task 816). `kokoro-rs` renders sentence by sentence
+    and writes each one as it lands, so mesa forwards the bytes as they arrive
+    instead of collecting the render: playback starts a couple of seconds in
+    rather than after the whole item. The response is therefore chunked with
+    **no `Content-Length`**, and the blocking wait before the 200 is only "the
+    WAV header is readable" — which is also the last moment a dead synthesiser
+    can still be a status code. A failure *after* that point ends the body
+    early; the listener hears a truncated item, because the 200 is long gone.
+    Before that point every failure is still a 503, including the two a
+    streaming reader can get wrong: mesa drains **stderr on its own thread** for
+    the child's whole life (a binary that fills that pipe would otherwise block
+    there and hang the request), and output that never becomes a WAV header —
+    what a binary printing its error on stdout looks like — falls back to
+    collect-then-check-the-exit-status rather than being served as `audio/wav`.
   - `kokoro-rs -o -` writes a *streaming* RIFF header with both lengths as
-    `0xFFFFFFFF`; since the whole buffer is held anyway, mesa patches them to
-    the real sizes (Chrome tolerates the placeholders, Safari often won't).
+    `0xFFFFFFFF`; mesa patches them (Chrome tolerates the placeholders, Safari
+    often won't). The real length is unknowable while streaming, so what
+    replaces them is the open-ended `0x7FFF0000` (RIFF gets it plus the header
+    ahead of the audio) — both still positive 31-bit sizes, the property a
+    strict player wants — and playback ends where the bytes do.
     Anything that isn't that exact shape is passed through untouched.
   - Gate: **`require_agent_access` plus `require_same_site_fetch`**, not the
     plain `guard` the other external-command reads (`git status`) use. The
@@ -76,11 +93,16 @@ instructions**; `author` is free-text attribution.
     `Sec-Fetch-Site` is the header that separates them (browsers always send
     it, scripts cannot forge it); absent means a non-browser client and is
     allowed. There is no timeout (matching hooks/agents/
-    scripts) and no kill path: **stop** stops playback, while the in-flight
-    synthesis finishes and its bytes are discarded. A missing or failing
-    binary is `unavailable` (503), the code reserved for a dependency outside
-    mesa. `MESA_KOKORO_BIN` overrides the binary — the seam `api-check.sh`
-    drives this route through.
+    scripts) and no kill path — bar the one case where mesa can no longer read
+    the child's output at all, which would otherwise leave a zombie: **stop**
+    stops playback, while the in-flight synthesis finishes and its bytes are
+    discarded. Discarding means mesa keeps
+    *reading* them: a listener that hangs up mid-stream would otherwise leave
+    the synthesiser blocked on a full stdout pipe forever, so the reader drains
+    to EOF and throws the audio away (`api-check.sh` asserts no wedged child
+    survives a hang-up). A missing or failing binary is `unavailable` (503),
+    the code reserved for a dependency outside mesa. `MESA_KOKORO_BIN`
+    overrides the binary — the seam `api-check.sh` drives this route through.
 - Triage can also run itself: `mesa serve --watch-inbox` periodically spawns a
   background `claude` agent per pending item (`/inbox-triage <id>`). Off by
   default. It never mutates an item — everything it does is start the agent

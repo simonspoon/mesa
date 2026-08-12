@@ -39,7 +39,7 @@ isolation.
 | Script | Gates | Extra env |
 | --- | --- | --- |
 | `cli-check` | CLI JSON contract: create→list→block→cycle→delete→backup. Never speaks HTTP | |
-| `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan`, plus `/api/inbox/{id}/speak` (audio contract, patched WAV sizes, injection-proof body, `require_agent_access` in both modes) | `MESA_KOKORO_BIN` (stub) |
+| `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan`, plus `/api/inbox/{id}/speak` (audio contract, patched WAV sizes, the header arriving mid-render, injection-proof body, `require_agent_access` in both modes) | `MESA_KOKORO_BIN` (stub) |
 | `storyboard-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
 | `attachments-check` | CLI + API contract incl. cascade-delete | |
@@ -272,7 +272,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Files tab | Project file browser + editor + project-wide search; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
 | Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |
-| Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE`. A **play** button reads an item aloud through `kokoro-rs` — audio streams back to the browser, the body reaches the binary on stdin | `docs/inbox.md` |
+| Inbox | Global free-text update requests; assigning converts to a task and deletes the item. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE`. A **play** button reads an item aloud through `kokoro-rs` — audio streams back to the browser *as it is rendered* (chunked, no `Content-Length`), the body reaches the binary on stdin | `docs/inbox.md` |
 | Agents | Live Claude Code sessions per project. Terminal access is code execution → all four routes share one mode-dependent gate stronger than task CRUD; `local_path` writes loopback-only in both modes | `docs/agents.md` |
 | Terminal | Shell panes (`portable-pty`, not `claude attach`), same `require_agent_access` stack. Global page + per-project tab (cwd resolved **server-side** from `?project=<id>`, never client-supplied) | `docs/terminal.md` |
 | Keyboard | `a` opens create-task on a Board; `hjkl`/arrows move native focus, `Enter` activates. `keyboardScope.ts` is the sole suppression chokepoint, in two exports: `shouldIgnoreShortcut()` — every new global single-key shortcut must call it — and its chord sibling `shouldIgnoreFilesShortcut()`, which the Files tab's Cmd/Ctrl+F, Cmd/Ctrl+Shift+F and Alt+W / Alt+`[` / Alt+`]` bindings call because the first rule of the former is "a modifier chord belongs to its existing owner" | `docs/keyboard.md` |

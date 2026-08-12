@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
@@ -34,6 +35,7 @@ use base64::Engine;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
@@ -1957,6 +1959,12 @@ async fn assign_inbox(
 /// nothing is cached — the button is a read, repeated as often as it is
 /// pressed.
 ///
+/// The audio **streams** (task 816): the response goes out as soon as the WAV
+/// header exists and the rest of the render follows it down the same body, so
+/// a long item starts playing in a couple of seconds rather than after the
+/// whole synthesis. That is also why there is no `Content-Length` — the length
+/// is not known when the headers go out.
+///
 /// A GET on purpose: that is what lets the Inbox page be a plain `<audio src>`
 /// with no fetch/blob plumbing, and a same-origin media request sends no
 /// `Origin`, which both origin checks inside [`require_agent_access`] treat as
@@ -1981,9 +1989,12 @@ async fn speak_inbox(
         let store = state.store.lock().unwrap();
         store.get_inbox_item(id)?.body
     };
-    // Synthesis is seconds of CPU; keep it off the async workers, like every
-    // other blocking read in this file.
-    let audio = tokio::task::spawn_blocking(move || speech::synthesize(&body))
+    // Starting synthesis blocks until the header arrives (seconds of CPU); keep
+    // it off the async workers, like every other blocking read in this file.
+    // Everything after that point is already on the wire, so a synthesiser that
+    // dies later can no longer be a status code — this is the last moment
+    // `unavailable` is available.
+    let speech = tokio::task::spawn_blocking(move || speech::start(&body))
         .await
         .map_err(|e| ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -2001,7 +2012,7 @@ async fn speak_inbox(
             (header::CONTENT_TYPE, "audio/wav".to_string()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         ],
-        audio,
+        Body::from_stream(ReceiverStream::new(speech.chunks)),
     )
         .into_response())
 }

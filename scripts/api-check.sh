@@ -20,7 +20,8 @@
 #      `parent_id` surface added by task 668 (nesting, detach, cycle/unknown
 #      rejection, the archive cascade and the subtree delete echo);
 #   5b. GET /api/inbox/{id}/speak (task 815) — the audio contract, the patched
-#      streaming WAV sizes, the hostile body arriving as stdin data, the
+#      streaming WAV sizes, the audio arriving *while* it is still being
+#      rendered (task 816), the hostile body arriving as stdin data, the
 #      `unavailable` failure and the `require_agent_access` gate, driven
 #      against a stub `kokoro-rs` (`MESA_KOKORO_BIN`);
 #   6. LAN mode — the Host allowlist is skipped while the Content-Type gate
@@ -65,6 +66,12 @@ OTHER=$("$MESA" project create "API gate archived project" --no-git | jq -r .id)
 # assertion can read it back) and emits the exact *streaming* WAV header
 # `kokoro-rs -o -` writes — both sizes 0xFFFFFFFF — so the response proves
 # mesa patched them.
+#
+# It also models the property task 816 turned on: a real synthesiser writes the
+# header first and the audio sentence by sentence over the following seconds.
+# Dropping a `slow` file in the stub dir inserts that pause between the two, so
+# the gate can prove the header reaches the client while the render is still
+# running.
 
 STUB_DIR="$TMP/stub"
 mkdir -p "$STUB_DIR"
@@ -73,8 +80,24 @@ cat > "$STUB_DIR/kokoro-rs" <<EOF
 printf '%s\n' "\$*" > "$STUB_DIR/last-argv"
 cat > "$STUB_DIR/last-stdin"
 [ -e "$STUB_DIR/fail" ] && { echo "stub kokoro is down" >&2; exit 1; }
-# RIFF ffffffff WAVE fmt (PCM/mono/24k) data ffffffff + 8 bytes of "audio".
-printf 'RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff\x01\x02\x03\x04\x05\x06\x07\x08'
+# A failure that says a LOT (more than a pipe buffer) before dying: mesa must
+# be draining stderr all along, or the child blocks there and never writes the
+# stdout byte the request is waiting for.
+[ -e "$STUB_DIR/noisy" ] && { head -c 200000 /dev/zero | tr '\0' 'x' >&2; exit 1; }
+# A failure that complains on *stdout*: not a WAV, so it must never be served
+# as audio.
+[ -e "$STUB_DIR/garbage" ] && { echo "kokoro: model load failed, aborting"; exit 1; }
+# RIFF ffffffff WAVE fmt (PCM/mono/24k) data ffffffff, then 8 bytes of "audio".
+printf 'RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff'
+if [ -e "$STUB_DIR/slow" ]; then
+  sleep 3
+  # More than a pipe buffer: a server that stopped reading wedges here forever
+  # instead of reaching the marker below.
+  head -c 262144 /dev/zero
+else
+  printf '\x01\x02\x03\x04\x05\x06\x07\x08'
+fi
+touch "$STUB_DIR/done"
 EOF
 chmod +x "$STUB_DIR/kokoro-rs"
 export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
@@ -649,14 +672,54 @@ grep -qi '^x-content-type-options: nosniff' "$TMP/headers" || fail "speak: nosni
 ok "GET /api/inbox/{id}/speak: 200 audio/wav + nosniff"
 
 # The stub emits a 44-byte streaming header + 8 bytes of audio with BOTH sizes
-# 0xFFFFFFFF; mesa must hand back 52 bytes with RIFF=44 and data=8, so a
-# player that refuses the placeholder header (Safari) can play it.
+# 0xFFFFFFFF. Since the audio streams (task 816) the real length is unknown when
+# the header goes out, so mesa replaces the placeholders with the open-ended
+# 0x7FFF0000 (+ the 36 header bytes for RIFF) — both still positive 31-bit
+# sizes, which is what a player that refuses the placeholder (Safari) wants. The
+# samples must still arrive untouched.
 [ "$(wc -c <"$TMP/audio" | tr -d ' ')" = "52" ] || fail "speak: audio bytes not passed through"
 HEXED=$(od -An -tx1 -v "$TMP/audio" | tr -d ' \n')
-[ "${HEXED:8:8}" = "2c000000" ] || fail "speak: RIFF size not patched (got ${HEXED:8:8})"
-[ "${HEXED:80:8}" = "08000000" ] || fail "speak: data size not patched (got ${HEXED:80:8})"
+[ "${HEXED:8:8}" = "2400ff7f" ] || fail "speak: RIFF size not patched (got ${HEXED:8:8})"
+[ "${HEXED:80:8}" = "0000ff7f" ] || fail "speak: data size not patched (got ${HEXED:80:8})"
 [ "${HEXED:88}" = "0102030405060708" ] || fail "speak: audio payload altered"
 ok "speak: the streaming 0xFFFFFFFF WAV sizes are patched, the samples are untouched"
+
+# The response must also carry no Content-Length: the body is chunked because
+# its length is not knowable when the header goes out.
+grep -qi '^content-length:' "$TMP/headers" &&
+  fail "speak: a streamed body must not declare a Content-Length"
+ok "speak: the body is chunked, not length-declared"
+
+# …and streaming means exactly this: the header reaches the client while the
+# synthesiser is still rendering. The slow stub pauses 3s between the header and
+# the samples, so a 1s cap must return the header alone (curl exit 28), not the
+# empty body a collect-then-send route would have produced.
+touch "$STUB_DIR/slow"
+set +e
+curl -s --max-time 1 -o "$TMP/partial" "$BASE/api/inbox/$SPEAK_ID/speak"
+CURL_RC=$?
+set -e
+rm -f "$STUB_DIR/slow"
+[ "$CURL_RC" = "28" ] || fail "speak: the slow stub should have outlived the 1s cap (curl rc $CURL_RC)"
+[ "$(wc -c <"$TMP/partial" | tr -d ' ')" = "44" ] ||
+  fail "speak: the header must arrive while synthesis runs, got $(wc -c <"$TMP/partial") bytes"
+ok "speak: audio streams — the header plays before the render finishes"
+
+# A listener that hangs up mid-render (stop, or a closed tab) discards the rest
+# of the audio — but the synthesis still runs to completion, the no-kill-path
+# posture of docs/inbox.md. A server that merely stopped reading would leave the
+# child blocked on a full stdout pipe forever, so the marker is the proof.
+rm -f "$STUB_DIR/done"
+touch "$STUB_DIR/slow"
+curl -s --max-time 1 -o /dev/null "$BASE/api/inbox/$SPEAK_ID/speak" || true
+for _ in $(seq 1 60); do
+  [ -e "$STUB_DIR/done" ] && break
+  sleep 0.5
+done
+rm -f "$STUB_DIR/slow"
+[ -e "$STUB_DIR/done" ] ||
+  fail "speak: a client that hung up left the synthesiser wedged on a full pipe"
+ok "speak: a listener that hangs up mid-render leaves no wedged synthesiser"
 
 # Injection-proof: the body reaches the binary as stdin bytes, verbatim, and
 # no shell ever parses it.
@@ -680,6 +743,29 @@ speak "/api/inbox/$SPEAK_ID/speak"
   fail "speak: a failing synthesiser must be code unavailable"
 rm -f "$STUB_DIR/fail"
 ok "speak: a failing synthesiser is 503 unavailable (an outside-mesa dependency)"
+
+# …and the two shapes of failure that a *streaming* reader can get wrong, both
+# of which used to be reportable and must stay so. First: a binary that fills
+# its stderr pipe before dying. Every pipe must be drained for the child's whole
+# life, or it blocks on stderr and the request hangs with no status at all.
+touch "$STUB_DIR/noisy"
+speak "/api/inbox/$SPEAK_ID/speak" --max-time 20
+rm -f "$STUB_DIR/noisy"
+[ "$STATUS" = "503" ] || fail "speak: a synthesiser that fills stderr must still be 503, got $STATUS"
+[ "$(jq -r .error.code <"$TMP/audio")" = "unavailable" ] ||
+  fail "speak: the noisy failure must be code unavailable"
+ok "speak: a synthesiser that fills its stderr pipe is still 503, not a hung request"
+
+# Second: a binary that complains on stdout and exits nonzero. Those bytes are
+# not a WAV, so serving them as audio/wav would render an error message to the
+# listener as if it were speech.
+touch "$STUB_DIR/garbage"
+speak "/api/inbox/$SPEAK_ID/speak" --max-time 20
+rm -f "$STUB_DIR/garbage"
+[ "$STATUS" = "503" ] || fail "speak: non-WAV output from a failed run must be 503, got $STATUS"
+[ "$(jq -r .error.code <"$TMP/audio")" = "unavailable" ] ||
+  fail "speak: the garbage-stdout failure must be code unavailable"
+ok "speak: a failed run's stdout is never passed off as audio"
 
 # Gate, half one: require_agent_access refuses a cross-site Origin, while the
 # same item's JSON — on the plain guard — is served with that same Origin. The

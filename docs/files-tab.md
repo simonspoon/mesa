@@ -45,7 +45,10 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   reads up to `FILE_CONTENT_CAP` (256 KiB, mirrors the Git tab's `DIFF_CAP`)
   bytes with the same lossy-UTF8/char-boundary truncation as `git.rs::capped`.
   `language` is an extension→tag lookup (e.g. `rs`→`rust`) set in both
-  branches — it describes the file, not the content.
+  branches — it describes the file, not the content. `.xml` and .NET's
+  `.csproj`/`.xaml` — XML documents wearing a bespoke extension — all tag as
+  `xml` (task 823), which `prismGrammar` resolves onto the already-registered
+  `markup` grammar, so this costs no new grammar in the bundle.
 - `pub fn read_file_download(root: &str, rel: &str) -> Result<(String,
   Vec<u8>), DownloadFileError>` (task 683) returns `(basename, full bytes)` —
   the file, not a view of it. It resolves `rel` through the same `safe_path`

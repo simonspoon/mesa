@@ -147,6 +147,9 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   hpp: 'cpp',
   cc: 'cpp',
   cs: 'csharp',
+  xml: 'xml',
+  csproj: 'xml',
+  xaml: 'xml',
 }
 
 // Language tag -> one of the theme's five neon accent hues. The Tron palette
@@ -168,6 +171,7 @@ const LANGUAGE_ACCENT: Record<string, string> = {
   javascript: 'magenta',
   typescript: 'magenta',
   html: 'magenta',
+  xml: 'magenta',
   css: 'magenta',
   json: 'amber',
   yaml: 'amber',

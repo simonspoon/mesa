@@ -74,6 +74,10 @@ fn language_of(ext: &str) -> Option<&'static str> {
         "c" | "h" => "c",
         "cpp" | "hpp" | "cc" => "cpp",
         "cs" => "csharp",
+        // .NET project and UI files are XML documents under a bespoke
+        // extension — tagging them "xml" is what gets them markup colouring
+        // (task 823).
+        "xml" | "csproj" | "xaml" => "xml",
         _ => return None,
     })
 }
@@ -1386,6 +1390,28 @@ mod tests {
     #[test]
     fn language_of_tags_svg() {
         assert_eq!(language_of("svg"), Some("svg"));
+    }
+
+    #[test]
+    fn language_of_tags_dotnet_markup_as_xml() {
+        assert_eq!(language_of("csproj"), Some("xml"));
+        assert_eq!(language_of("xaml"), Some("xml"));
+        assert_eq!(language_of("xml"), Some("xml"));
+    }
+
+    #[test]
+    fn read_file_tags_csproj_as_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(
+            dir.path().join("App.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />\n",
+        )
+        .unwrap();
+
+        let v = read_file(root, "App.csproj").unwrap();
+        assert!(!v.is_binary);
+        assert_eq!(v.language.as_deref(), Some("xml"));
     }
 
     // --- read_file_download -------------------------------------------------

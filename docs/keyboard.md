@@ -35,6 +35,15 @@ a diff or a storyboard would have thrown away the thing it was about. The
 in-place modal leaves the view untouched, and is draggable and lightly dimmed
 for the same reason (`modalDrag.ts`, `CreateTaskModal.tsx`).
 
+It is the one shortcut bound on **`keyup`** rather than `keydown` (task 817).
+The modal it opens autoFocuses its description textarea, and React flushes a
+discrete event synchronously — so opening on `keydown` mounted that textarea
+while the keystroke was still in flight, and the rest of the keystroke typed an
+`a` into the empty description. Waiting for `keyup` lets the whole keystroke
+land on the (non-editable) view first. Anything that opens a focused text
+control from a printable key needs the same treatment; `preventDefault()` is
+not a substitute.
+
 The listener is bound app-wide with no view check, because
 `shouldIgnoreShortcut` already answers the question every non-Board view would
 have asked: the Files editor and the new-file row are text controls (rule 2),

@@ -46,10 +46,16 @@ function useCreateTaskShortcut(onOpen: () => void) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (shouldIgnoreShortcut(e)) return
-      if (e.key === 'a') latest.current()
+      if (e.key !== 'a') return
+      latest.current()
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    // Bound on keyup, not keydown (mesa task 817). The create form autoFocuses
+    // its description field and React flushes a discrete event synchronously,
+    // so opening on keydown mounts that textarea while the keystroke is still
+    // in flight — and the rest of the keystroke types an 'a' into it. Waiting
+    // for keyup lets the whole keystroke land on the (non-editable) view first.
+    window.addEventListener('keyup', onKey)
+    return () => window.removeEventListener('keyup', onKey)
   }, [])
 }
 

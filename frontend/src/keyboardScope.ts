@@ -1,7 +1,7 @@
 // Shared suppression predicates for mesa's global keyboard shortcuts (mesa
 // spec 449, .scratch/arch-449-keyboard.md §1). Every global single-key
 // shortcut listener (the 'a' create-task shortcut, and the h/j/k/l spatial
-// nav) must check `shouldIgnoreShortcut` before acting on a keydown; a
+// nav) must check `shouldIgnoreShortcut` before acting on a keystroke; a
 // *chord* shortcut that steals a browser binding checks its own sibling
 // below, for the reason set out there.
 

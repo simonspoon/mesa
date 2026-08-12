@@ -96,9 +96,9 @@ function agentLabel(a: AgentSession): string {
 
 /**
  * Which of a pane's two views is showing (task 814). `term` is the attached
- * terminal — the original, and still the default, since it is the only one you
- * can type into. `chat` is the same session's transcript rendered as a
- * conversation (`AgentChat`).
+ * terminal — the original, and the only one you can type into. `chat` is the
+ * same session's transcript rendered as a conversation (`AgentChat`), and is
+ * what a pane opens in (task 820).
  */
 export type PaneView = 'term' | 'chat'
 
@@ -628,7 +628,7 @@ function SplitNodeView({
                   return session ? agentLabel(session) : child.node.id
                 })()}
                 ratio={child.ratio}
-                view={views[child.node.id] ?? 'term'}
+                view={views[child.node.id] ?? 'chat'}
                 onViewChange={(v) => onViewChange(child.node.id, v)}
                 paused={paused}
                 onClose={() => onClose(child.node.id)}
@@ -760,7 +760,10 @@ export function AgentSidebar({
     DONE: true,
   })
   // Which view each open pane is showing (task 814), keyed by leaf id; an
-  // absent key is the default `term`. Owned here rather than inside a pane
+  // absent key is the default `chat` (task 820 — the conversation is what a
+  // pane is opened to read; `term` is a click away and is still where you
+  // type), falling back to `term` for a pane whose session isn't listed and
+  // so has no transcript to render. Owned here rather than inside a pane
   // because a pane component is remounted by any reparent (a drag-to-edge
   // split, a cross-split move, an auto-tile rebuild) — pane-local state would
   // silently snap back to the terminal on a layout change. Keys of closed
@@ -1424,7 +1427,7 @@ export function AgentSidebar({
                     agentId={soloId}
                     sessionId={sessionIdFor(agents, soloId)}
                     label={soloSession ? agentLabel(soloSession) : soloId}
-                    view={paneViews[soloId] ?? 'term'}
+                    view={paneViews[soloId] ?? 'chat'}
                     onViewChange={(v) => setPaneView(soloId, v)}
                     paused={collapsed}
                     onClose={() => closePane(soloId)}

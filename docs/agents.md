@@ -334,8 +334,8 @@ already use.
     is always another leaf's id, in whichever split it lives in, no
     separate `useDroppable` surface for the edge case.
 - **Every pane has two views: `term` and `chat`** (mesa task 814). `term` is
-  the attached terminal — the original, still the default, and the only one you
-  can type into. `chat` is the *same* session rendered as a conversation:
+  the attached terminal — the original, and the only one you can type into.
+  `chat` is the *same* session rendered as a conversation:
   human prompts and assistant replies as markdown bubbles, with each run of
   tool calls between them collapsed into one muted, expandable block. A
   terminal is a screen buffer — it cannot be scrolled back past its scrollback,
@@ -376,6 +376,14 @@ already use.
     opposite: it owns no connection, so it *is* unmounted when not showing, and
     while the whole sidebar is collapsed it stops polling — nobody polls a view
     nobody can see, the same rule the session-list poll follows.
+  - **`chat` is the default view a pane opens in** (mesa task 820). Opening a
+    pane is a *read* — you look at an agent to see what it is saying and doing,
+    and only sometimes to type at it — so the pane starts in the view that
+    answers that, and the terminal is one click away in the same header. The
+    default is only the absent-key case: a pane whose session isn't in the
+    session list has no transcript to render and still falls back to `term`
+    (the same guard that disables the `chat` button), and a pane the reader has
+    switched keeps their choice, closed panes included.
   - The view mode lives in `AgentSidebar` state keyed by pane id, not in the
     pane component and not on the tree leaf: a pane is remounted by any
     reparent (a drag-to-edge split, a cross-split move, an auto-tile rebuild),

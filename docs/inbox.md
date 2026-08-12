@@ -52,6 +52,26 @@ instructions**; `author` is free-text attribution.
   nothing but an `<audio src>` on that URL — which is why the route is a GET
   (a same-origin media request sends no `Origin`, and no fetch/blob plumbing
   is needed). Nothing is stored or cached: synthesis runs on every press.
+  - Once the item is actually sounding, that button is joined by **rewind**
+    and **pause/resume** (mesa task 827) — transport for the one item being
+    read, mounted only while it is (before playback there is no playhead to
+    move and nothing to hold, and the buttons would describe a state the
+    element isn't in). Both drive the same single `<audio>` element directly;
+    neither re-requests the route, so **no press re-synthesises** — pausing
+    holds a stream the server keeps filling, and resuming is refused the same
+    way a first play can be. Rewind goes back `REWIND_STEP_SECONDS` (10), but
+    clamped to the **earliest seekable second**, not to zero: the response is
+    chunked with no `Content-Length` and no range support, so what a player
+    can go back to is only what it already holds. When nothing is seekable
+    yet, or the playhead is already at that floor, a press does nothing rather
+    than seeking anyway (`frontend/src/speechPlayback.ts::rewindTarget`, the
+    one place that arithmetic lives). Paused-ness is mirrored from the
+    element's own `play`/`pause` events, never decided by the page, so the
+    browser's media keys can't desync the label. The player's `ref` callback is
+    **stable** (`attachPlayer`, keyed to the speaking id) for the same reason:
+    React re-runs a fresh inline ref on every commit, and this list re-renders
+    every 3s from its own poll, which would call `play()` again and silently
+    undo a pause.
   - The audio comes **back to the browser** rather than playing on the host's
     speakers, so it still works under `serve --lan`, where the browser is a
     different machine.

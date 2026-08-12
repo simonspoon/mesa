@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import {
   assignInboxItem,
   createInboxItem,
@@ -10,6 +10,7 @@ import {
 import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
+import { REWIND_STEP_SECONDS, rewindTarget } from '../speechPlayback'
 import { useFetch } from '../useFetch'
 
 /**
@@ -40,12 +41,67 @@ export function InboxView() {
   // The failure belongs to the item whose button was pressed, so it carries the
   // id — the <audio> is gone by the time the message renders.
   const [speakError, setSpeakError] = useState<number | null>(null)
+  // Whether playback is held. The element's own events are the source of truth
+  // (pausing is what the browser's own media keys do too), so this only mirrors
+  // them — it never decides.
+  const [paused, setPaused] = useState(false)
+  // The live player, so pause/resume and rewind can reach it. Held rather than
+  // re-found by query, since the element is mounted by this component.
+  const player = useRef<HTMLAudioElement | null>(null)
 
   // Stops if this item is already the one playing, starts it otherwise.
   function toggleSpeak(id: number) {
     setSpeakError(null)
     setSpeaking(false)
+    setPaused(false)
     setSpeakingId((current) => (current === id ? null : id))
+  }
+
+  function togglePause() {
+    const el = player.current
+    if (!el) return
+    // Resuming can be refused the same way the first play can; treat it the
+    // same way, so the buttons never describe a state the element isn't in.
+    if (el.paused) {
+      el.play().catch(() => setPaused(true))
+    } else {
+      el.pause()
+    }
+  }
+
+  // Attaching the player is what starts it — done here rather than with
+  // `autoPlay` so a refused play is visible: a browser that blocks autoplay
+  // rejects the promise and fires no `error` event, which would otherwise leave
+  // the button reading "synthesising…" forever. `AbortError` is not a refusal —
+  // it is this element being unmounted by stop, or by a switch to another item,
+  // so it must not report a failure or cancel whatever is playing by then.
+  //
+  // The callback must stay stable across re-renders: React re-runs a *new*
+  // function ref on every commit, and this list re-renders every 3s from its
+  // own poll — an inline one would call `play()` again each time and silently
+  // undo a pause. Keyed to `speakingId`, it runs once per player instead, which
+  // is also exactly when the element itself is replaced (same key).
+  const attachPlayer = useCallback(
+    (el: HTMLAudioElement | null) => {
+      player.current = el
+      const id = speakingId
+      el?.play().catch((err: DOMException) => {
+        if (err.name === 'AbortError') return
+        setSpeakError(id)
+        setSpeakingId((current) => (current === id ? null : current))
+      })
+    },
+    [speakingId],
+  )
+
+  // Back one step, but only inside what the stream still holds: the response is
+  // chunked with no `Content-Length`, so `seekable` — not `0` — is the floor.
+  function rewind() {
+    const el = player.current
+    if (!el) return
+    const start = el.seekable.length > 0 ? el.seekable.start(0) : null
+    const target = rewindTarget(el.currentTime, start)
+    if (target !== null) el.currentTime = target
   }
 
   function submit(e: React.FormEvent) {
@@ -131,6 +187,27 @@ export function InboxView() {
                       ? 'stop'
                       : 'synthesising…'}
                 </button>
+                {/* Transport for the item being read, and only once it is
+                    actually sounding: before that there is no playhead to
+                    move and nothing to hold. */}
+                {speakingId === item.id && speaking && (
+                  <>
+                    <button
+                      type="button"
+                      title={`go back ${REWIND_STEP_SECONDS} seconds`}
+                      onClick={rewind}
+                    >
+                      rewind
+                    </button>
+                    <button
+                      type="button"
+                      title={paused ? 'resume reading' : 'pause reading'}
+                      onClick={togglePause}
+                    >
+                      {paused ? 'resume' : 'pause'}
+                    </button>
+                  </>
+                )}
                 <label>
                   Assign to{' '}
                   <select
@@ -170,22 +247,12 @@ export function InboxView() {
         <audio
           key={speakingId}
           src={inboxSpeakUrl(speakingId)}
-          // Started here rather than with `autoPlay` so a refused play is
-          // visible: a browser that blocks autoplay rejects the promise and
-          // fires no `error` event, which would otherwise leave the button
-          // reading "synthesising…" forever. `AbortError` is not a refusal —
-          // it is this element being unmounted by stop, or by a switch to
-          // another item, so it must not report a failure or cancel whatever
-          // is playing by then.
-          ref={(el) => {
-            const id = speakingId
-            el?.play().catch((err: DOMException) => {
-              if (err.name === 'AbortError') return
-              setSpeakError(id)
-              setSpeakingId((current) => (current === id ? null : current))
-            })
-          }}
+          // Attaching is what starts it, and holds the element for the
+          // transport buttons — see `attachPlayer`.
+          ref={attachPlayer}
           onPlaying={() => setSpeaking(true)}
+          onPlay={() => setPaused(false)}
+          onPause={() => setPaused(true)}
           onEnded={() => setSpeakingId(null)}
           onError={() => {
             setSpeakError(speakingId)

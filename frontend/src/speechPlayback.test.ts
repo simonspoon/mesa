@@ -1,5 +1,40 @@
 import { describe, expect, it } from 'vitest'
-import { REWIND_STEP_SECONDS, rewindTarget } from './speechPlayback'
+import { playFailure, REWIND_STEP_SECONDS, rewindTarget } from './speechPlayback'
+
+describe('playFailure', () => {
+  const STREAM = '/api/inbox/7/speak'
+  const ABSOLUTE = `http://192.168.1.4:7770${STREAM}`
+
+  it('falls back to the buffered audio the first time the stream fails', () => {
+    expect(playFailure(ABSOLUTE, STREAM, false)).toBe('buffer')
+  })
+
+  it('reports a stream that failed again after the fallback', () => {
+    expect(playFailure(ABSOLUTE, STREAM, true)).toBe('report')
+  })
+
+  it('reports a blob that would not play — there is nothing left to try', () => {
+    expect(playFailure('blob:http://localhost:7770/9f2c', STREAM, false)).toBe(
+      'report',
+    )
+  })
+
+  it('ignores a failure reported against no source at all', () => {
+    // Stop clears the element's source. Whatever a browser then reports, it is
+    // not the stream failing — treating it as one would restart what was just
+    // stopped.
+    expect(playFailure('', STREAM, false)).toBe('ignore')
+    expect(playFailure('http://192.168.1.4:7770/#/inbox', STREAM, false)).toBe(
+      'ignore',
+    )
+  })
+
+  it('ignores a failure belonging to another item', () => {
+    expect(playFailure(`${ABSOLUTE}`, '/api/inbox/8/speak', false)).toBe(
+      'ignore',
+    )
+  })
+})
 
 describe('rewindTarget', () => {
   it('goes back one step when that much is still seekable', () => {

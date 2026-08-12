@@ -65,10 +65,12 @@ instructions**; `author` is free-text attribution.
   or not it has started to sound.
 - An item can be **read aloud**: `GET /api/inbox/{id}/speak` synthesises the
   item's body with the external `kokoro-rs` binary and answers `audio/wav`
-  (+ `nosniff`). The web Inbox gives each item a **play/stop** button that is
-  nothing but an `<audio src>` on that URL — which is why the route is a GET
-  (a same-origin media request sends no `Origin`, and no fetch/blob plumbing
-  is needed). Nothing is stored or cached: synthesis runs on every press.
+  (+ `nosniff`). The web Inbox gives each item a **play/stop** button, and the
+  URL is an `<audio src>` — which is why the route is a GET, and why a
+  same-origin media request sending no `Origin` is a case its gate has to
+  answer for. (Since task 829 a browser that will not play the stream fetches
+  the same URL whole as a fallback; the route is unchanged either way.)
+  Nothing is stored or cached: synthesis runs on every press.
   - Once the item is actually sounding, that button is joined by **rewind**
     and **pause/resume** (mesa task 827) — transport for the one item being
     read, mounted only while it is (before playback there is no playhead to
@@ -84,11 +86,57 @@ instructions**; `author` is free-text attribution.
     than seeking anyway (`frontend/src/speechPlayback.ts::rewindTarget`, the
     one place that arithmetic lives). Paused-ness is mirrored from the
     element's own `play`/`pause` events, never decided by the page, so the
-    browser's media keys can't desync the label. The player's `ref` callback is
-    **stable** (`attachPlayer`, keyed to the speaking id) for the same reason:
-    React re-runs a fresh inline ref on every commit, and this list re-renders
-    every 3s from its own poll, which would call `play()` again and silently
-    undo a pause.
+    browser's media keys can't desync the label.
+  - There is **one `<audio>` element for the page**, mounted for its whole life
+    and never re-keyed; a press sets its `src` and calls `play()` **itself**
+    (mesa task 829). Both halves matter. Starting playback from inside the
+    press is what a browser's autoplay policy weighs — an element mounted by
+    the render the press schedules is played too late for a phone to count it,
+    and the refusal comes back as `NotAllowedError`, the one `play()` rejection
+    the page reports (a source that will not load arrives as the element's own
+    `error` event instead). And an element nothing re-renders is an element
+    this list's 3s poll cannot touch: the pre-829 code needed a stable `ref`
+    callback to stop a fresh inline one calling `play()` on every commit and
+    silently undoing a pause. Stopping is **clearing that source**
+    (`removeAttribute('src')` + `load()`, which fires no `error` of its own —
+    `src = ''` would), so playback still ends with the connection, and the
+    element outliving the row is why an item that is assigned or deleted
+    underneath the page stops the audio explicitly rather than by unmounting.
+  - **A browser that will not play the stream gets it whole instead** (mesa
+    task 829 — the mobile bug). Apple's media stack (iOS Safari, and Safari on
+    a Mac) requires **byte-range support** of an HTTP media source: it refuses
+    a 200 that carries no `Content-Length` and answers no `Range` with
+    `-12939`, "the server is not correctly configured", which is precisely the
+    shape task 816 gave this route — so `<audio src>` there fired `error` and
+    the row said "could not play this item" while every other part of the page
+    worked. Verified against AVFoundation directly: the same bytes play from a
+    range-serving host and refuse to from mesa, and the patched
+    `0x7FFF0000` sizes are **not** what it objects to (they play fine when the
+    body is ranged).
+    The fix is client-side, so the route's contract is untouched: on that
+    `error` the page re-requests the audio with `fetch`
+    (`api.ts::fetchInboxSpeech`), plays the resulting **blob** — which has a
+    length and is seekable, the two things a stream cannot be. Once that blob
+    **plays**, and only then, the page remembers for the rest of its life that
+    this browser needs it (`buffered`), so only the first press pays for the
+    attempt that cannot work. Latching on the *failure* instead would be wrong:
+    a media `error` carries no reason, so a missing synthesiser (503) and a
+    refused address (403) arrive as the same event, and a browser that streams
+    perfectly well would be pinned to whole-fetch playback for a fault that has
+    nothing to do with its media stack. It costs that browser the streaming start: sound begins when the
+    **whole** render is in hand (~10s where the stream took ~3s, measured on a
+    six-sentence item), and the failed first attempt means one wasted render
+    per page load, whose synthesis finishes and is discarded server-side like
+    any hang-up. Rewind on that path can reach the start, because a blob is
+    seekable to 0 — the clamp arithmetic already answers that from `seekable`
+    and needs no case of its own. The mode is **page state on purpose**: a
+    remembered guess would cost a browser that can stream its fast start, and
+    the element is only ever unlocked for a later programmatic `play()` because
+    the failed first press called `play()` from a real gesture.
+  - A failed press now shows **the reason**, not a fixed sentence: the fallback
+    fetch reads the route's `{"error": {...}}` body, so a synthesiser that is
+    missing says so, and the `--lan` Host refusal (below) tells the reader to
+    browse mesa by IP instead of failing silently.
   - The audio comes **back to the browser** rather than playing on the host's
     speakers, so it still works under `serve --lan`, where the browser is a
     different machine.
@@ -147,6 +195,13 @@ instructions**; `author` is free-text attribution.
     survives a hang-up). A missing or failing binary is `unavailable` (503),
     the code reserved for a dependency outside mesa. `MESA_KOKORO_BIN`
     overrides the binary — the seam `api-check.sh` drives this route through.
+    One consequence worth knowing, because it looks like a bug from a phone:
+    under `--lan` this gate pins the **Host** to `localhost` or an IP literal
+    on the serve port, while the pages and the task routes around it do not —
+    so a device that reached mesa by a DNS or Bonjour name (`something.local`,
+    a tunnel domain) can browse the whole UI and gets a 403 on **play alone**.
+    That is the DNS-rebinding defense working as designed; the answer is to
+    browse by IP, which is what the refusal now says in the row.
 - Triage can also run itself: `mesa serve --watch-inbox` periodically spawns a
   background `claude` agent per pending item (`/inbox-triage <id>`). Off by
   default. It never mutates an item — everything it does is start the agent

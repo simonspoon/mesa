@@ -1,8 +1,9 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   assignInboxItem,
   createInboxItem,
   deleteInboxItem,
+  fetchInboxSpeech,
   inboxSpeakUrl,
   listInbox,
   listProjects,
@@ -10,7 +11,11 @@ import {
 import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
-import { REWIND_STEP_SECONDS, rewindTarget } from '../speechPlayback'
+import {
+  playFailure,
+  REWIND_STEP_SECONDS,
+  rewindTarget,
+} from '../speechPlayback'
 import { useFetch } from '../useFetch'
 
 /**
@@ -34,20 +39,41 @@ export function InboxView() {
   const [createError, setCreateError] = useState<string | null>(null)
   // Which item is being read aloud, and whether its audio has started yet:
   // synthesis takes seconds, so "asked for it" and "hearing it" are different
-  // states the button has to distinguish. One item at a time — a single
-  // <audio> element, keyed by the id, so picking another stops the first.
+  // states the button has to distinguish. One item at a time — there is one
+  // <audio> element for the page, so picking another item stops the first.
   const [speakingId, setSpeakingId] = useState<number | null>(null)
   const [speaking, setSpeaking] = useState(false)
   // The failure belongs to the item whose button was pressed, so it carries the
-  // id — the <audio> is gone by the time the message renders.
-  const [speakError, setSpeakError] = useState<number | null>(null)
+  // id — and its message, because the reason is often specific enough to act on
+  // (a synthesiser that isn't installed, an address the route refuses).
+  const [speakError, setSpeakError] = useState<{
+    id: number
+    message: string
+  } | null>(null)
+  // Whether this page must fetch the audio whole rather than stream it (mesa
+  // task 829): Apple's media stack refuses an HTTP source with no byte-range
+  // support, which is exactly what the speak route is, so later presses skip
+  // the attempt that cannot work. Set only once a fetched blob has actually
+  // **played** — a media `error` carries no reason, so a stream that failed
+  // because the synthesiser is missing or the route refused the address looks
+  // identical to one this browser cannot play, and latching on the failure
+  // would cost a browser that streams fine every later press. Page state,
+  // deliberately not remembered: a wrong guess costs a streaming start.
+  const [buffered, setBuffered] = useState(false)
   // Whether playback is held. The element's own events are the source of truth
   // (pausing is what the browser's own media keys do too), so this only mirrors
   // them — it never decides.
   const [paused, setPaused] = useState(false)
-  // The live player, so pause/resume and rewind can reach it. Held rather than
-  // re-found by query, since the element is mounted by this component.
+  // The live player, so pause/resume and rewind can reach it. One element for
+  // the life of the page, never re-keyed: a press must be able to call `play()`
+  // on an element that already exists, because that call is what a browser's
+  // autoplay policy weighs against the gesture that is still on the stack (an
+  // element mounted by a later render is played too late for iOS to count it).
   const player = useRef<HTMLAudioElement | null>(null)
+  // The blob a buffered play is playing from, so it can be handed back.
+  const objectUrl = useRef<string | null>(null)
+  // The in-flight buffered fetch, so stop can drop it.
+  const fetching = useRef<AbortController | null>(null)
   // Which items are opened out to their full body. Collapsed is the default:
   // the list is a triage queue, so every item shows a few lines and the one
   // being read is opened on purpose. Playback is deliberately *not* gated on
@@ -62,12 +88,105 @@ export function InboxView() {
     })
   }
 
+  // Everything one press holds: the element itself, a fetch that may still be
+  // collecting audio, and the blob a buffered play was reading from. Clearing
+  // the source is what closes the connection — the synthesis already running on
+  // the server finishes and its bytes are discarded, as ever. `removeAttribute`
+  // rather than `src = ''`: the empty string is a URL the element would go on
+  // to load and fail, which is an `error` this page would have to tell from a
+  // real one.
+  const releasePlayer = useCallback(() => {
+    fetching.current?.abort()
+    fetching.current = null
+    const el = player.current
+    if (el) {
+      el.pause()
+      el.removeAttribute('src')
+      el.load()
+    }
+    if (objectUrl.current) {
+      URL.revokeObjectURL(objectUrl.current)
+      objectUrl.current = null
+    }
+  }, [])
+
+  // The fallback path: ask for the whole audio, then play that. A blob has a
+  // length and is seekable, which is what the streamed response cannot be and
+  // what Apple's media stack requires — at the cost of the first sound waiting
+  // for the last sentence. `play()` here is outside the press that asked for
+  // it, which is allowed because the element was already started from one (the
+  // streamed attempt that failed is what put this page in buffered mode).
+  const playBuffered = useCallback(
+    async (id: number, el: HTMLAudioElement) => {
+      const attempt = new AbortController()
+      fetching.current = attempt
+      try {
+        const audio = await fetchInboxSpeech(id, attempt.signal)
+        if (attempt.signal.aborted) return
+        const url = URL.createObjectURL(audio)
+        objectUrl.current = url
+        el.src = url
+        await el.play()
+        // Playing is the only evidence that this browser needed the blob; a
+        // fallback that failed too says nothing about the media stack.
+        setBuffered(true)
+      } catch (err) {
+        if (attempt.signal.aborted) return
+        setSpeakError({
+          id,
+          message: err instanceof Error ? err.message : String(err),
+        })
+        setSpeakingId((current) => (current === id ? null : current))
+      } finally {
+        if (fetching.current === attempt) fetching.current = null
+      }
+    },
+    [],
+  )
+
   // Stops if this item is already the one playing, starts it otherwise.
+  // Starting happens here, inside the press, rather than as a side effect of
+  // the render it schedules — see `player`.
   function toggleSpeak(id: number) {
+    const stopping = speakingId === id
+    releasePlayer()
     setSpeakError(null)
     setSpeaking(false)
     setPaused(false)
-    setSpeakingId((current) => (current === id ? null : id))
+    setSpeakingId(stopping ? null : id)
+    const el = player.current
+    if (stopping || !el) return
+    if (buffered) {
+      void playBuffered(id, el)
+      return
+    }
+    el.src = inboxSpeakUrl(id)
+    // A source that will not load arrives as the element's own `error` event,
+    // which is where the fallback lives; the only rejection to report from here
+    // is the browser refusing to start at all.
+    el.play().catch((err: DOMException) => {
+      if (err.name !== 'NotAllowedError') return
+      setSpeakError({ id, message: 'this browser would not start playback' })
+      setSpeakingId((current) => (current === id ? null : current))
+    })
+  }
+
+  // A player that failed either has a second thing to try or has run out of
+  // them — and an element whose source was just cleared has failed at nothing.
+  function playerFailed() {
+    const el = player.current
+    if (el === null || speakingId === null) return
+    switch (playFailure(el.src, inboxSpeakUrl(speakingId), buffered)) {
+      case 'ignore':
+        return
+      case 'buffer':
+        void playBuffered(speakingId, el)
+        return
+      case 'report':
+        releasePlayer()
+        setSpeakError({ id: speakingId, message: 'could not play this item' })
+        setSpeakingId(null)
+    }
   }
 
   function togglePause() {
@@ -82,30 +201,22 @@ export function InboxView() {
     }
   }
 
-  // Attaching the player is what starts it — done here rather than with
-  // `autoPlay` so a refused play is visible: a browser that blocks autoplay
-  // rejects the promise and fires no `error` event, which would otherwise leave
-  // the button reading "synthesising…" forever. `AbortError` is not a refusal —
-  // it is this element being unmounted by stop, or by a switch to another item,
-  // so it must not report a failure or cancel whatever is playing by then.
-  //
-  // The callback must stay stable across re-renders: React re-runs a *new*
-  // function ref on every commit, and this list re-renders every 3s from its
-  // own poll — an inline one would call `play()` again each time and silently
-  // undo a pause. Keyed to `speakingId`, it runs once per player instead, which
-  // is also exactly when the element itself is replaced (same key).
-  const attachPlayer = useCallback(
-    (el: HTMLAudioElement | null) => {
-      player.current = el
-      const id = speakingId
-      el?.play().catch((err: DOMException) => {
-        if (err.name === 'AbortError') return
-        setSpeakError(id)
-        setSpeakingId((current) => (current === id ? null : current))
-      })
-    },
-    [speakingId],
-  )
+  // The item being read can be assigned or deleted underneath us — by this
+  // person on another device, or by an agent. Playback follows the list: an
+  // item that is no longer there has no button left to stop it with, so the
+  // audio must not outlive its row. Only the element is touched here; the
+  // state describing it is read by that row alone, which is already gone.
+  const listed =
+    speakingId === null || !items || items.some((it) => it.id === speakingId)
+  useEffect(() => {
+    if (!listed) releasePlayer()
+  }, [listed, releasePlayer])
+
+  // Leaving the page drops any fetch still collecting audio and hands back the
+  // blob. Removing the element from the document is what stops the sound —
+  // React has already detached the ref by the time this runs, so it is not
+  // this cleanup that pauses it.
+  useEffect(() => releasePlayer, [releasePlayer])
 
   // Back one step, but only inside what the stream still holds: the response is
   // chunked with no `Content-Length`, so `seekable` — not `0` — is the floor.
@@ -221,8 +332,8 @@ export function InboxView() {
                     {item.author && <span>from {item.author} · </span>}
                     <span>sent {item.created_at}</span>
                   </div>
-                  {speakError === item.id && (
-                    <span className="error">could not play this item</span>
+                  {speakError?.id === item.id && (
+                    <span className="error">{speakError.message}</span>
                   )}
                 </div>
                 {/* Playback rides on the row itself, open or not: hearing an
@@ -302,30 +413,24 @@ export function InboxView() {
         </ul>
       )}
 
-      {/* One player for the whole page. `key` restarts it when the selection
-          changes, and unmounting it (stop, ended, error) is what stops the
-          sound — the already-running synthesis on the server finishes and its
-          bytes are discarded, the same no-timeout posture as hooks and
-          scripts. It renders only while its item is still listed, so deleting
-          or assigning the item being read stops it too: otherwise the audio
-          would outlive the only button that can stop it. */}
-      {items?.some((item) => item.id === speakingId) && speakingId !== null && (
-        <audio
-          key={speakingId}
-          src={inboxSpeakUrl(speakingId)}
-          // Attaching is what starts it, and holds the element for the
-          // transport buttons — see `attachPlayer`.
-          ref={attachPlayer}
-          onPlaying={() => setSpeaking(true)}
-          onPlay={() => setPaused(false)}
-          onPause={() => setPaused(true)}
-          onEnded={() => setSpeakingId(null)}
-          onError={() => {
-            setSpeakError(speakingId)
-            setSpeakingId(null)
-          }}
-        />
-      )}
+      {/* One player for the whole page, mounted for its whole life: a press
+          reaches it directly rather than mounting a new element, and its source
+          is set imperatively. Nothing here re-renders it, so the list's 3s poll
+          can no longer touch playback at all. Stopping is clearing that source
+          — the already-running synthesis on the server finishes and its bytes
+          are discarded, the same no-timeout posture as hooks and scripts. */}
+      <audio
+        ref={player}
+        onPlaying={() => setSpeaking(true)}
+        onPlay={() => setPaused(false)}
+        onPause={() => setPaused(true)}
+        onEnded={() => {
+          releasePlayer()
+          setSpeakingId(null)
+          setSpeaking(false)
+        }}
+        onError={playerFailed}
+      />
     </div>
   )
 }

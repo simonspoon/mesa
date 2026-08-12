@@ -68,25 +68,28 @@ function jsonInit(method: string, body: unknown): RequestInit {
   }
 }
 
+/** The `ApiError` a failed response describes, whatever it answered with. */
+async function apiErrorFrom(res: Response): Promise<ApiError> {
+  let code = 'http_error'
+  let message = `${res.status} ${res.statusText}`
+  try {
+    const body = (await res.json()) as {
+      error?: { code?: string; message?: string }
+    }
+    if (body.error?.code) code = body.error.code
+    if (body.error?.message) message = body.error.message
+  } catch {
+    // non-JSON error body: keep the HTTP status line as the message
+  }
+  return new ApiError(code, message, res.status)
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
     headers: { Accept: 'application/json', ...init?.headers },
   })
-  if (!res.ok) {
-    let code = 'http_error'
-    let message = `${res.status} ${res.statusText}`
-    try {
-      const body = (await res.json()) as {
-        error?: { code?: string; message?: string }
-      }
-      if (body.error?.code) code = body.error.code
-      if (body.error?.message) message = body.error.message
-    } catch {
-      // non-JSON error body: keep the HTTP status line as the message
-    }
-    throw new ApiError(code, message, res.status)
-  }
+  if (!res.ok) throw await apiErrorFrom(res)
   return (await res.json()) as T
 }
 
@@ -734,6 +737,29 @@ export function assignInboxItem(id: number, projectId: number): Promise<Task> {
  */
 export function inboxSpeakUrl(id: number): string {
   return `/api/inbox/${id}/speak`
+}
+
+/**
+ * The same audio, fetched **whole** instead of played as it streams (mesa task
+ * 829) — the fallback for a browser whose media stack refuses the streamed
+ * body. Apple's (iOS Safari, and Safari on a Mac) requires byte-range support
+ * of an HTTP media source, and the speak route is chunked with no
+ * `Content-Length` on purpose, so `<audio src>` never gets past "the server is
+ * not correctly configured" there. A blob has both, so the audio plays once it
+ * is all in hand.
+ *
+ * A second full synthesis, so it is a fallback and never the first attempt:
+ * the route caches nothing. `signal` is what stop cancels it with — the render
+ * already running on the server finishes regardless, as it does for a listener
+ * that hangs up mid-stream.
+ */
+export async function fetchInboxSpeech(
+  id: number,
+  signal: AbortSignal,
+): Promise<Blob> {
+  const res = await fetch(inboxSpeakUrl(id), { signal })
+  if (!res.ok) throw await apiErrorFrom(res)
+  return await res.blob()
 }
 
 /** Returns the destroyed item. */

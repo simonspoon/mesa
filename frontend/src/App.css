@@ -264,6 +264,59 @@ header {
   margin-bottom: 0;
 }
 
+/* An item's collapsed shape: disclosure, preview + meta, playback (task 828).
+   The middle column is the only one that grows, and it must be allowed to
+   shrink below its content — a bare URL in the preview would otherwise widen
+   the row, the same `min-width: auto` trap as `.inbox-actions label`. */
+.inbox-item-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.inbox-item-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.inbox-disclosure {
+  flex: none;
+  padding: 0 0.35rem;
+  line-height: 1.4;
+}
+
+/* A few lines of the raw body. Clamped in CSS rather than cut in JS so the
+   preview follows the column width, and `pre-wrap` keeps the item's own line
+   breaks — the first lines are what an agent puts the summary in. */
+.inbox-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+/* Playback sits at the right edge of the row, never shrinking: the preview is
+   what gives way when the row is narrow. */
+.inbox-playback {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.inbox-playback button {
+  min-width: 2rem;
+  padding: 0.25rem 0.4rem;
+  line-height: 1.4;
+}
+
 .inbox-actions {
   display: flex;
   align-items: center;

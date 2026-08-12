@@ -227,7 +227,7 @@ rather than a second `isPhone()` call.
 | Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified; the content half is one pane, never split — see *Files tab and the unified diff* |
 | Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
 | Terminal / Agent panes | one pane, no split UI; shell height follows the on-screen keyboard — see *Terminal and agent panes* |
-| Inbox | body text wraps unbreakable URLs; the assign `<select>` is capped to its row — see *Crossing the breakpoint* for the audit's other half |
+| Inbox | body text wraps unbreakable URLs; the assign `<select>` is capped to its row — see *Crossing the breakpoint* for the audit's other half. Since task 828 an item is collapsed to a 3-line preview with the playback glyphs pinned right: the preview is the flex item that gives way (`min-width: 0`), so the row holds at 390px with no rule of its own, and the triage controls only exist inside an opened item |
 | Project page header / tab strip | `.tabs` already wraps to two rows at 390px; all six tabs in-view and hit-testable, no change needed |
 | Command palette | 351px wide inside a 390px viewport, input autofocused; no change needed |
 | Archived projects group | drawer rows hold at 223px with a 56-char name; `restore` stays visible and hittable |

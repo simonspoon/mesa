@@ -46,6 +46,23 @@ instructions**; `author` is free-text attribution.
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unassigned-count badge); `#/inbox` lists items, each with an "Assign to"
   project dropdown that converts the item to a backlog task on selection.
+- The list is a **triage queue**, so an item is **collapsed** by default (mesa
+  task 828): a three-line CSS clamp over the raw body — plain text, not
+  markdown, which is what makes it an inert click target — plus its meta line.
+  A disclosure caret (or a click on the preview) opens it to the rendered
+  markdown body, and the triage controls (assign, delete) live **only** in the
+  opened item: the collapsed row carries nothing that writes to the db.
+  Playback is the deliberate exception — the play button and, once sounding,
+  the transport ride on the collapsed row, because hearing an item is how you
+  triage it without reading it. Expansion is per-item page state, not stored,
+  and nothing about playback depends on it (an item being read can be closed).
+  The transport is **symbols, not words** (▶ / ■ / ⏪ / ⏸, with `…` while
+  synthesising). A glyph is the button's whole content and content outranks
+  `title` in the accessible name, so every symbol button here carries the same
+  wording as **both** `aria-label` and `title` — and that wording is what the
+  press *does*, in every state: the play button reads "stop reading this item"
+  from the moment it is pressed, since pressing it again stops the item whether
+  or not it has started to sound.
 - An item can be **read aloud**: `GET /api/inbox/{id}/speak` synthesises the
   item's body with the external `kokoro-rs` binary and answers `audio/wav`
   (+ `nosniff`). The web Inbox gives each item a **play/stop** button that is

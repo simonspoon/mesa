@@ -48,6 +48,19 @@ export function InboxView() {
   // The live player, so pause/resume and rewind can reach it. Held rather than
   // re-found by query, since the element is mounted by this component.
   const player = useRef<HTMLAudioElement | null>(null)
+  // Which items are opened out to their full body. Collapsed is the default:
+  // the list is a triage queue, so every item shows a few lines and the one
+  // being read is opened on purpose. Playback is deliberately *not* gated on
+  // this — an item can be played from its collapsed row (mesa task 828).
+  const [expanded, setExpanded] = useState<ReadonlySet<number>>(new Set())
+
+  function toggleExpanded(id: number) {
+    setExpanded((current) => {
+      const next = new Set(current)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
+  }
 
   // Stops if this item is already the one playing, starts it otherwise.
   function toggleSpeak(id: number) {
@@ -164,73 +177,126 @@ export function InboxView() {
         <ul className="card-list inbox-list">
           {items.map((item) => (
             <li key={item.id} className="inbox-item">
-              <div className="inbox-body">
-                <Markdown text={item.body} />
-              </div>
-              <div className="muted storyboard-meta">
-                {item.author && <span>from {item.author} · </span>}
-                <span>sent {item.created_at}</span>
-              </div>
-              <div className="inbox-actions">
+              <div className="inbox-item-row">
                 <button
                   type="button"
-                  title={
-                    speakingId === item.id
-                      ? 'stop reading this item'
-                      : 'read this item aloud'
+                  className="inbox-disclosure"
+                  aria-expanded={expanded.has(item.id)}
+                  // A glyph is a button's whole content, and content outranks
+                  // `title` in the accessible name — so every symbol button
+                  // here carries the same wording twice, once for the pointer
+                  // and once for assistive tech.
+                  aria-label={
+                    expanded.has(item.id)
+                      ? 'collapse this item'
+                      : 'open this item'
                   }
-                  onClick={() => toggleSpeak(item.id)}
+                  title={
+                    expanded.has(item.id)
+                      ? 'collapse this item'
+                      : 'open this item'
+                  }
+                  onClick={() => toggleExpanded(item.id)}
                 >
-                  {speakingId !== item.id
-                    ? 'play'
-                    : speaking
-                      ? 'stop'
-                      : 'synthesising…'}
+                  {expanded.has(item.id) ? '▾' : '▸'}
                 </button>
-                {/* Transport for the item being read, and only once it is
-                    actually sounding: before that there is no playhead to
-                    move and nothing to hold. */}
-                {speakingId === item.id && speaking && (
-                  <>
-                    <button
-                      type="button"
-                      title={`go back ${REWIND_STEP_SECONDS} seconds`}
-                      onClick={rewind}
+                <div className="inbox-item-main">
+                  {expanded.has(item.id) ? (
+                    <div className="inbox-body">
+                      <Markdown text={item.body} />
+                    </div>
+                  ) : (
+                    // Collapsed: the raw first lines, clamped by CSS rather
+                    // than cut here, so the preview follows the column width.
+                    // Plain text, not markdown — an inert block is safe to
+                    // make the click target that opens the item.
+                    <div
+                      className="inbox-preview"
+                      onClick={() => toggleExpanded(item.id)}
                     >
-                      rewind
-                    </button>
-                    <button
-                      type="button"
-                      title={paused ? 'resume reading' : 'pause reading'}
-                      onClick={togglePause}
-                    >
-                      {paused ? 'resume' : 'pause'}
-                    </button>
-                  </>
-                )}
-                <label>
-                  Assign to{' '}
-                  <select
-                    value=""
-                    onChange={(e) => assign(item.id, e.target.value)}
+                      {item.body}
+                    </div>
+                  )}
+                  <div className="muted storyboard-meta">
+                    {item.author && <span>from {item.author} · </span>}
+                    <span>sent {item.created_at}</span>
+                  </div>
+                  {speakError === item.id && (
+                    <span className="error">could not play this item</span>
+                  )}
+                </div>
+                {/* Playback rides on the row itself, open or not: hearing an
+                    item is how you triage it without reading it. */}
+                <div className="inbox-playback">
+                  {/* The label says what the press does, in all three states —
+                      pressing while it is still synthesising stops it too. The
+                      glyph is what carries "not sounding yet". */}
+                  <button
+                    type="button"
+                    aria-label={
+                      speakingId === item.id
+                        ? 'stop reading this item'
+                        : 'read this item aloud'
+                    }
+                    title={
+                      speakingId === item.id
+                        ? 'stop reading this item'
+                        : 'read this item aloud'
+                    }
+                    onClick={() => toggleSpeak(item.id)}
                   >
-                    <option value="">— pick a project —</option>
-                    {projects?.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <ConfirmDelete
-                  label="delete"
-                  message="Delete this item?"
-                  onDelete={() => deleteInboxItem(item.id).then(refetch)}
-                />
-                {speakError === item.id && (
-                  <span className="error">could not play this item</span>
-                )}
+                    {speakingId !== item.id ? '▶' : speaking ? '■' : '…'}
+                  </button>
+                  {/* Transport for the item being read, and only once it is
+                      actually sounding: before that there is no playhead to
+                      move and nothing to hold. */}
+                  {speakingId === item.id && speaking && (
+                    <>
+                      <button
+                        type="button"
+                        aria-label={`go back ${REWIND_STEP_SECONDS} seconds`}
+                        title={`go back ${REWIND_STEP_SECONDS} seconds`}
+                        onClick={rewind}
+                      >
+                        ⏪
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={paused ? 'resume reading' : 'pause reading'}
+                        title={paused ? 'resume reading' : 'pause reading'}
+                        onClick={togglePause}
+                      >
+                        {paused ? '▶' : '⏸'}
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
+              {/* Triage controls belong to the opened item — the collapsed row
+                  is a preview plus playback, nothing that changes the db. */}
+              {expanded.has(item.id) && (
+                <div className="inbox-actions">
+                  <label>
+                    Assign to{' '}
+                    <select
+                      value=""
+                      onChange={(e) => assign(item.id, e.target.value)}
+                    >
+                      <option value="">— pick a project —</option>
+                      {projects?.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <ConfirmDelete
+                    label="delete"
+                    message="Delete this item?"
+                    onDelete={() => deleteInboxItem(item.id).then(refetch)}
+                  />
+                </div>
+              )}
             </li>
           ))}
         </ul>

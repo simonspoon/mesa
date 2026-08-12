@@ -222,7 +222,10 @@ The same file is editable from the web UI: **Settings**, pinned to the bottom
 of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). It is a form
 over `commands` — a text box per action, the built-in default shown as the
 box's placeholder, the action's placeholder vocabulary listed under it, and the
-argv that will actually run spelled out beneath.
+argv that will actually run spelled out beneath — followed by one section per
+other part of the file (Watchers, Speech, Model pricing). **Each section has
+its own endpoint, draft and save button**: they are separate writes, so one
+form's rejection must never strand another's edits.
 
 The page's title row also carries **Restart server** (`POST /api/restart`),
 right-aligned opposite the heading — moved here off the left nav's footer in
@@ -394,9 +397,71 @@ the todo-watcher's per-project concurrency limit (mesa task 777,
   modes**, the same posture as the other two config writes: it is the same
   file, and which file a LAN peer may rewrite is not a per-section question.
 
-The three sections are siblings over one document: saving `watchers`
-preserves `commands`, `pricing` and any section mesa doesn't know about, and
+The sections are siblings over one document: saving `watchers` preserves
+`commands`, `pricing`, `speech` and any section mesa doesn't know about, and
 vice versa.
+
+## Speech
+
+A fourth, independent section picks the **voice** the Inbox's play button
+reads an item in (mesa task 822, `docs/inbox.md`).
+
+```json
+{
+  "speech": {
+    "voice": "bm_george"
+  }
+}
+```
+
+- **Absent or blank ⇒ no `-v` at all.** mesa names no default
+  voice of its own: with nothing configured the argv is byte-for-byte the one
+  it ran before this key existed, and which voice that means is
+  `kokoro-rs`'s business. That is why `ConfigSpeech` has no `voice_default`
+  twin to `todo_concurrency_default` — there is no mesa-side default to
+  report.
+- **The list of voices comes from the binary**, not from mesa:
+  `kokoro-rs --list-voices`, filtered to bounded identifiers and cached for
+  the life of the process (`core::speech::voices`). An **empty list means mesa
+  could not ask** — no binary, or an answer that wasn't a list of names —
+  never "there are no voices", so the editor falls back to a plain text box
+  and the save-time membership check is skipped. mesa never ships a voice list
+  a model update could silently make wrong. The cache is per process, so
+  installing the synthesiser (or a model that adds a voice) while `mesa serve`
+  is already running needs a **Restart server** before the picker sees it —
+  the button is in the Settings page's own title row. `--list-voices` runs with
+  `--no-download`: listing names must never turn into a model fetch, because
+  the call sits behind a `OnceLock` where one hang would wedge every later
+  reader.
+- **A voice is a bounded identifier** (`core::speech::is_voice_name`: up to 64
+  ASCII letters/digits/`_`/`-`, starting with a letter or digit) — one
+  `Command::arg` after `-v`, so a value can never be read as an option or
+  reach a shell. The save path refuses anything else (`422`), and the *read*
+  path drops it: a hand-edited `"--output /tmp/x"` speaks in the default voice
+  rather than reaching the argv. A config file that cannot be *read* is not a
+  fallback at all — the speak route answers **503 `unavailable`**, the same
+  answer the editor gets, rather than guessing at a setting it couldn't read.
+  The Settings page still shows the raw stored value, the same split the
+  watcher clamp draws — the editor must be able to see and fix what the file
+  says.
+- **Read on every press**, like `commands` on every spawn: change the voice
+  and the next play uses it, no restart. A malformed config file is
+  `unavailable` on the speak route too (503) rather than a guessed default.
+
+### Routes
+
+- `GET /api/config/speech` → `ConfigSpeech`: `{voice, voices}`, `voice` being
+  the override (`null` when unset) and `voices` what the installed binary
+  offers (`[]` when mesa couldn't ask — **not** an error, since the setting
+  must stay visible on a machine where the synthesiser isn't installed yet).
+  Gated like the other config getters (`require_agent_access`); a malformed
+  config is **502 `unavailable`**.
+- `PUT /api/config/speech`, body `{"voice": "<name>" | null}` → echoes the
+  getter. `null` **and** blank both remove the key, restoring the binary's own
+  voice. A name that isn't a voice — or, when mesa has a list, isn't on it —
+  is **422 `validation`**, writing nothing. Gated with
+  `require_local_path_write`: **loopback-only in both serve modes**, the same
+  posture as every other config write.
 
 ## Gate
 
@@ -418,6 +483,16 @@ watchers it also covers the round trip (`GET` reporting the default with a
 non-integer rejected as 422 writing nothing, 502 on a malformed file, and
 `commands`/`pricing`/an unknown section surviving a watchers write and vice
 versa.
+
+For speech it covers the round trip against a stub synthesiser (`GET`
+reporting `voice: null` and offering exactly the names the stub's
+`--list-voices` printed, non-name lines filtered out), the saved voice
+reaching the synthesiser's argv as `-v <voice>` on the very next press, `null`
+**and** `""` both removing the key, the unconfigured argv proven to carry no
+`-v` at all, a voice that isn't a bounded identifier and a well-shaped one the
+binary never offered both 422 writing nothing, 502 on a malformed file, each
+of the other three savers preserving `speech` and vice versa, and both verbs
+refused to a request that isn't from this machine's own page.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

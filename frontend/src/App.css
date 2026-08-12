@@ -6690,6 +6690,13 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* Speech: the voice picker is a list when the synthesiser could be asked and a
+   plain box when it could not, so both wear the same width. */
+.settings-voice-input {
+  width: 14rem;
+  font-size: 0.8rem;
+}
+
 /* Model pricing: a prefix, four rates and one action per row. The grid is
    declared once on the container so the header labels and every row share
    their columns — the header is the only thing naming what the boxes are. */

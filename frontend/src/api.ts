@@ -15,6 +15,7 @@ import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
 import type { ConfigPrice } from './types/ConfigPrice'
+import type { ConfigSpeech } from './types/ConfigSpeech'
 import type { ConfigWatchers } from './types/ConfigWatchers'
 import type { DiagramType } from './types/DiagramType'
 import type { DirEntry } from './types/DirEntry'
@@ -921,6 +922,30 @@ export function updateWatchers(
   watchers: Record<string, number | null>,
 ): Promise<ConfigWatchers> {
   return request('/api/config/watchers', jsonInit('PUT', watchers))
+}
+
+/**
+ * The speech settings in `~/.mesa/config.json`: the voice the inbox's play
+ * button speaks in (mesa task 822), plus every voice the installed `kokoro-rs`
+ * reports. `voice: null` means the config says nothing, so the synthesiser's
+ * own default applies; an empty `voices` means mesa could not ask the binary,
+ * not that there are none. 502 `unavailable` means the config file itself is
+ * unreadable, exactly as for `getConfig`.
+ */
+export function getSpeech(): Promise<ConfigSpeech> {
+  return request('/api/config/speech')
+}
+
+/**
+ * Writes speech settings and echoes them as re-read from disk. Only the keys
+ * passed are touched; `null` removes one, restoring the synthesiser's default.
+ * 422 `validation` is a name that isn't a voice (or isn't one this binary
+ * offers), and nothing is written in that case.
+ */
+export function updateSpeech(
+  speech: Record<string, string | null>,
+): Promise<ConfigSpeech> {
+  return request('/api/config/speech', jsonInit('PUT', speech))
 }
 
 // ---- scripts (user-authored shell) ----

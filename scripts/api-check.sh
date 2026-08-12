@@ -101,6 +101,13 @@ touch "$STUB_DIR/done"
 EOF
 chmod +x "$STUB_DIR/kokoro-rs"
 export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
+# …against a config file that doesn't exist, so this gate reads the developer's
+# own `~/.mesa/config.json` as little as it reads their db. Since task 822 the
+# speak route takes its voice from that file, and the argv assertions below are
+# about the *unconfigured* argv — they must not turn red because whoever runs
+# the script picked a voice in the UI. `config-check.sh` owns the configured
+# half (it already runs under a throwaway HOME).
+export MESA_CONFIG_FILE="$TMP/no-such-config.json"
 
 # ---- server ----
 
@@ -728,9 +735,14 @@ ok "speak: a listener that hangs up mid-render leaves no wedged synthesiser"
 [ ! -e "$TMP/pwned" ] || fail "speak: a hostile body was evaluated by a shell"
 # …and the body is on stdin *only*: argv must stay the fixed three flags, so a
 # regression that also passed the text as an argument fails here.
+# Since task 822 the voice is configurable, but mesa names no default of its
+# own, so with nothing configured this exact-match is also the assertion that
+# no `-v` is added: the argv is the one this gate asserted before the setting
+# existed. (The configured half lives in scripts/config-check.sh, which owns a
+# throwaway HOME.)
 [ "$(cat "$STUB_DIR/last-argv")" = "-q -o -" ] ||
   fail "speak: argv must be the fixed flags, got $(cat "$STUB_DIR/last-argv")"
-ok "speak: a hostile body is stdin data, never syntax and never argv"
+ok "speak: a hostile body is stdin data, never syntax and never argv — and an unconfigured voice adds no -v"
 
 api 404 GET "/api/inbox/999999/speak"
 [ "$(jqb .error.code)" = "not_found" ] || fail "speak: unknown id must be not_found"

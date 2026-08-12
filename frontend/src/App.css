@@ -2984,6 +2984,22 @@ body.files-tree-resizing {
   opacity: 0.5;
 }
 
+/* The agent pane's title bar carries the theme's violet (task 819), which is
+   what separates it from the cyan chrome around it — with several panes
+   tiled, the header is the only band of a pane that is always visible, so
+   it is where the tint belongs. Deliberately a child selector of
+   `.agent-sidebar-pane`: the same `.agent-terminal-header` class also heads
+   the Terminal page's panes and the sidebar's own agent-list rail, and both
+   keep the neutral chrome. */
+.agent-sidebar-pane > .agent-terminal-header {
+  background: var(--violet-dim);
+  border-bottom-color: var(--violet-edge);
+}
+
+.agent-sidebar-pane > .agent-terminal-header .agent-sidebar-pane-label {
+  color: var(--violet);
+}
+
 /* Drag-to-split preview (story 387): shown on whichever pane a drag is
    currently hovering an edge zone of (AgentSidebar.tsx's `computeDropEdge`
    / `dropZone` state), sized to the half the dropped pane will occupy.

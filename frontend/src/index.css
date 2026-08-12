@@ -15,6 +15,12 @@
   --cyan: #00e5ff;
   --cyan-dim: rgba(0, 229, 255, 0.35);
   --magenta: #ff2bd6;
+  /* A third neon, sitting between cyan and magenta on the wheel (task 819):
+     the agent sidebar's pane headers use it so an agent pane reads as its
+     own surface without leaving the palette. */
+  --violet: #b06bff;
+  --violet-dim: rgba(176, 107, 255, 0.12);
+  --violet-edge: rgba(176, 107, 255, 0.4);
   --amber: #ffb444;
   --green: #2bff9c;
   --red: #ff3b5c;

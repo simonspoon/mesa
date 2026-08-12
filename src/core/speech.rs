@@ -68,7 +68,9 @@ pub fn kokoro_bin() -> String {
 
 /// The most voices [`voices`] will report. `kokoro-rs` ships ~54; the bound is
 /// there so a binary that answers `--list-voices` with something else entirely
-/// cannot fill a dropdown (or this process's memory) with its output.
+/// cannot fill a dropdown — and the JSON every Settings load carries — with its
+/// output. It bounds what mesa *keeps*, not what the child may write: the
+/// answer is collected before it is filtered.
 const MAX_VOICES: usize = 500;
 
 /// The voice names the installed synthesiser offers, asked of the binary
@@ -86,7 +88,11 @@ pub fn voices() -> &'static [String] {
     static VOICES: OnceLock<Vec<String>> = OnceLock::new();
     VOICES.get_or_init(|| {
         let out = Command::new(kokoro_bin())
-            .arg("--list-voices")
+            // `--no-download`: listing names must never become a model fetch.
+            // This runs inside a `OnceLock`, so a call that blocks blocks every
+            // later caller for the life of the process — there is no cheap
+            // timeout here, so the fix is not to start anything that can hang.
+            .args(["--no-download", "--list-voices"])
             .stdin(Stdio::null())
             .output();
         let Ok(out) = out else { return Vec::new() };

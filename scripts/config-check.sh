@@ -79,14 +79,17 @@ EOF
 # The synthesiser behind the `speech` section (mesa task 822). `--list-voices`
 # is the one source of the voices mesa offers — read by the Settings route and
 # by the save-time check — so the stub answers it with a bounded list plus a
-# line that is not a name, which must be filtered out. Every other invocation
-# logs its argv (the whole point: does the saved voice reach `-v`?) and emits
+# line that is not a name, which must be filtered out. mesa asks for the list
+# with `--no-download` beside it (listing names must never become a model
+# fetch), so the stub matches the flag anywhere in its argv rather than at $1.
+# Every other invocation logs its argv (the whole point: does the saved voice reach `-v`?) and emits
 # the streaming WAV header `kokoro-rs -o -` writes, exactly like the stub in
 # scripts/api-check.sh.
 KOKORO_ARGV="$TMP/kokoro.argv"
 cat > "$STUB_DIR/kokoro-rs" <<EOF
 #!/usr/bin/env bash
-if [ "\$1" = "--list-voices" ]; then
+case " \$* " in *" --list-voices "*) LISTING=1;; *) LISTING=0;; esac
+if [ "\$LISTING" = "1" ]; then
   printf 'Available voices:\naf_heart\naf_bella\nbm_george\n'
   exit 0
 fi

@@ -472,7 +472,10 @@ function SpeechSection() {
             value={seeded.voice}
             onChange={(e) => edit(e.target.value)}
           >
-            <option value="">default ({speech.voices.length} available)</option>
+            {/* Not a count: `options()` may carry a configured voice the
+                binary no longer lists, so any number here would be wrong in
+                exactly the case that matters. */}
+            <option value="">default (the synthesiser's own)</option>
             {voiceOptions(speech).map((v) => (
               <option key={v} value={v}>
                 {v}

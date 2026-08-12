@@ -414,7 +414,7 @@ reads an item in (mesa task 822, `docs/inbox.md`).
 }
 ```
 
-- **Absent, blank or unreadable ⇒ no `-v` at all.** mesa names no default
+- **Absent or blank ⇒ no `-v` at all.** mesa names no default
   voice of its own: with nothing configured the argv is byte-for-byte the one
   it ran before this key existed, and which voice that means is
   `kokoro-rs`'s business. That is why `ConfigSpeech` has no `voice_default`
@@ -426,15 +426,24 @@ reads an item in (mesa task 822, `docs/inbox.md`).
   could not ask** — no binary, or an answer that wasn't a list of names —
   never "there are no voices", so the editor falls back to a plain text box
   and the save-time membership check is skipped. mesa never ships a voice list
-  a model update could silently make wrong.
+  a model update could silently make wrong. The cache is per process, so
+  installing the synthesiser (or a model that adds a voice) while `mesa serve`
+  is already running needs a **Restart server** before the picker sees it —
+  the button is in the Settings page's own title row. `--list-voices` runs with
+  `--no-download`: listing names must never turn into a model fetch, because
+  the call sits behind a `OnceLock` where one hang would wedge every later
+  reader.
 - **A voice is a bounded identifier** (`core::speech::is_voice_name`: up to 64
   ASCII letters/digits/`_`/`-`, starting with a letter or digit) — one
   `Command::arg` after `-v`, so a value can never be read as an option or
   reach a shell. The save path refuses anything else (`422`), and the *read*
   path drops it: a hand-edited `"--output /tmp/x"` speaks in the default voice
-  rather than reaching the argv. The Settings page still shows the raw stored
-  value, the same split the watcher clamp draws — the editor must be able to
-  see and fix what the file says.
+  rather than reaching the argv. A config file that cannot be *read* is not a
+  fallback at all — the speak route answers **503 `unavailable`**, the same
+  answer the editor gets, rather than guessing at a setting it couldn't read.
+  The Settings page still shows the raw stored value, the same split the
+  watcher clamp draws — the editor must be able to see and fix what the file
+  says.
 - **Read on every press**, like `commands` on every spawn: change the voice
   and the next play uses it, no restart. A malformed config file is
   `unavailable` on the speak route too (503) rather than a guessed default.

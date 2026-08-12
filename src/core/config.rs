@@ -1214,10 +1214,17 @@ fn speech_in(path: &Path) -> Result<ConfigSpeech, String> {
 ///   read-modify-write over the whole document, so all four sections (and any
 ///   mesa doesn't know) survive each other's edits.
 pub fn save_speech(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
-    save_speech_in(&config_file(), updates)
+    save_speech_in(&config_file(), updates, speech::voices())
 }
 
-fn save_speech_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+/// `offered` is the list membership is checked against — a parameter rather
+/// than a [`speech::voices`] call, so a test names the list it is asserting
+/// about instead of inheriting whatever synthesiser the machine has installed.
+fn save_speech_in(
+    path: &Path,
+    updates: &HashMap<String, Option<String>>,
+    offered: &[String],
+) -> Result<(), SaveError> {
     if updates.is_empty() {
         // Nothing named, nothing to do — and no empty `"speech": {}` written
         // into a file the user never configured.
@@ -1236,7 +1243,7 @@ fn save_speech_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Res
         if let Some(value) = updates[*key].as_deref().map(str::trim)
             && !value.is_empty()
         {
-            validate_voice(value).map_err(SaveError::Validation)?;
+            validate_voice(value, offered).map_err(SaveError::Validation)?;
         }
     }
 
@@ -1277,20 +1284,19 @@ fn save_speech_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Res
 
 /// A voice has to be a name the synthesiser could accept: a bounded identifier
 /// ([`speech::is_voice_name`] — so it can never be read as an option), and,
-/// when mesa managed to ask the binary what it offers, one of those.
+/// when mesa managed to ask the binary what it `offers`, one of those.
 ///
-/// The membership half is skipped when the list is empty, which is what a
+/// The membership half is skipped when `offered` is empty, which is what a
 /// missing or uncooperative binary looks like: mesa cannot prove the name is
 /// wrong there, and refusing a value it merely can't check would be the worse
 /// answer (the same call [`bash_syntax_check`] makes).
-pub fn validate_voice(voice: &str) -> Result<(), String> {
+pub fn validate_voice(voice: &str, offered: &[String]) -> Result<(), String> {
     if !speech::is_voice_name(voice) {
         return Err(format!(
             "the voice {voice:?} is not a voice name: up to 64 letters, digits, \
              underscores and dashes, starting with a letter or digit"
         ));
     }
-    let offered = speech::voices();
     if !offered.is_empty() && !offered.iter().any(|v| v == voice) {
         return Err(format!(
             "unknown voice {voice:?}; {} offers {}",
@@ -2164,7 +2170,7 @@ mod tests {
         assert_eq!(todo_concurrency_in(&path).unwrap(), 7);
         // The speech saver is the fourth of the same shape: it rewrites its own
         // key and nothing else (`survives` re-asserts the voice it just wrote).
-        save_speech_in(&path, &voice(&[(VOICE, Some("bm_george"))])).unwrap();
+        save_speech_in(&path, &voice(&[(VOICE, Some("bm_george"))]), &offered()).unwrap();
         assert_eq!(survives("speech")["watchers"][TODO_CONCURRENCY], 7);
         assert_eq!(
             survives("speech")["commands"]["todo-watcher"],
@@ -2239,6 +2245,16 @@ mod tests {
             .collect()
     }
 
+    /// The voices a save is checked against. A fixture, never
+    /// `speech::voices()`: what a real synthesiser on this machine happens to
+    /// offer is not something a config unit test may depend on.
+    fn offered() -> Vec<String> {
+        ["af_heart", "af_bella", "bm_george"]
+            .iter()
+            .map(|v| (*v).to_string())
+            .collect()
+    }
+
     #[test]
     fn speech_round_trips_a_voice_and_resets_to_the_binary_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -2246,7 +2262,7 @@ mod tests {
         // No file at all: no voice, so no `-v` — the pre-822 argv.
         assert_eq!(speech_voice_in(&path).unwrap(), None);
 
-        save_speech_in(&path, &voice(&[(VOICE, Some("  bm_george  "))])).unwrap();
+        save_speech_in(&path, &voice(&[(VOICE, Some("  bm_george  "))]), &offered()).unwrap();
         // Stored trimmed, and visible to the read path immediately.
         assert_eq!(
             speech_voice_in(&path).unwrap().as_deref(),
@@ -2258,8 +2274,8 @@ mod tests {
         // `null` and blank both remove the key — the reset, expressed by
         // absence rather than by a stored empty string.
         for reset in [None, Some("")] {
-            save_speech_in(&path, &voice(&[(VOICE, Some("af_bella"))])).unwrap();
-            save_speech_in(&path, &voice(&[(VOICE, reset)])).unwrap();
+            save_speech_in(&path, &voice(&[(VOICE, Some("af_bella"))]), &offered()).unwrap();
+            save_speech_in(&path, &voice(&[(VOICE, reset)]), &offered()).unwrap();
             let written: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert!(written["speech"].get(VOICE).is_none(), "{reset:?}");
@@ -2275,7 +2291,7 @@ mod tests {
         // A name that could be read as an option, or carry a shell metacharacter
         // into an argv — refused in the editor, not at the next press.
         for bad in ["-o", "af heart", "af_heart; rm -rf /", &"a".repeat(65)] {
-            let err = save_speech_in(&path, &voice(&[(VOICE, Some(bad))])).unwrap_err();
+            let err = save_speech_in(&path, &voice(&[(VOICE, Some(bad))]), &offered()).unwrap_err();
             assert!(
                 matches!(&err, SaveError::Validation(m) if m.contains("voice")),
                 "{bad:?}: {err:?}"
@@ -2283,7 +2299,7 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{bad:?}");
         }
         // An unknown key in the section is a validation error too.
-        let err = save_speech_in(&path, &voice(&[("speed", Some("1.2"))])).unwrap_err();
+        let err = save_speech_in(&path, &voice(&[("speed", Some("1.2"))]), &offered()).unwrap_err();
         assert!(
             matches!(&err, SaveError::Validation(m) if m.contains("unknown speech setting")),
             "{err:?}"
@@ -2291,8 +2307,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         // Nothing named writes nothing — no empty `"speech": {}` appears.
         let path = dir.path().join("untouched.json");
-        save_speech_in(&path, &HashMap::new()).unwrap();
+        save_speech_in(&path, &HashMap::new(), &offered()).unwrap();
         assert!(!path.exists());
+    }
+
+    /// The membership half of the check: a well-shaped name the binary never
+    /// offered is refused — but only when mesa actually has a list. An empty
+    /// list is "mesa could not ask", where refusing a name it merely can't
+    /// check would be the worse answer.
+    #[test]
+    fn save_speech_refuses_an_unoffered_voice_only_when_it_has_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let err =
+            save_speech_in(&path, &voice(&[(VOICE, Some("zz_nobody"))]), &offered()).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("zz_nobody")),
+            "{err:?}"
+        );
+        assert!(!path.exists(), "a rejected save writes nothing");
+        // No list: the same name is stored, because nothing here can disprove it.
+        save_speech_in(&path, &voice(&[(VOICE, Some("zz_nobody"))]), &[]).unwrap();
+        assert_eq!(
+            speech_voice_in(&path).unwrap().as_deref(),
+            Some("zz_nobody")
+        );
     }
 
     /// A voice hand-edited into something the argv must never carry falls back
@@ -2316,7 +2355,8 @@ mod tests {
         let err = speech_voice_in(&path).unwrap_err();
         assert!(err.contains("malformed mesa config"), "{err}");
         assert!(speech_in(&path).is_err());
-        let err = save_speech_in(&path, &voice(&[(VOICE, Some("af_heart"))])).unwrap_err();
+        let err =
+            save_speech_in(&path, &voice(&[(VOICE, Some("af_heart"))]), &offered()).unwrap_err();
         assert!(
             matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
             "{err:?}"

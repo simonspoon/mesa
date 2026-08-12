@@ -4050,7 +4050,10 @@ async fn get_config_speech(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
-    match config::speech() {
+    // On the first call of the process this asks the synthesiser for its voice
+    // list — a subprocess, so it goes off the async workers like every other
+    // shell-out in this file. Later calls are the cached list plus a file read.
+    match blocking(config::speech).await? {
         Ok(speech) => Ok(Json(speech).into_response()),
         Err(message) => Err(ApiError {
             status: StatusCode::BAD_GATEWAY,
@@ -4058,6 +4061,23 @@ async fn get_config_speech(
             message,
         }),
     }
+}
+
+/// Runs a blocking config call on the blocking pool, turning a panicked or
+/// cancelled worker into the same 502 an unreadable config gives — the caller
+/// asked about this machine's config and mesa could not answer.
+async fn blocking<T, E>(
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> ApiResult<Result<T, E>>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        code: "unavailable",
+        message: format!("reading the mesa config failed: {e}"),
+    })
 }
 
 #[derive(Deserialize)]
@@ -4089,18 +4109,22 @@ async fn update_config_speech(
     if let Some(value) = body.voice {
         updates.insert(config::VOICE.to_string(), value);
     }
-    config::save_speech(&updates).map_err(|e| match e {
-        config::SaveError::Validation(message) => ApiError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "validation",
-            message,
-        },
-        config::SaveError::Unavailable(message) => ApiError {
-            status: StatusCode::BAD_GATEWAY,
-            code: "unavailable",
-            message,
-        },
-    })?;
+    // Validating a voice consults the same (possibly uncached) voice list the
+    // getter does, so the save is a blocking call too.
+    blocking(move || config::save_speech(&updates))
+        .await?
+        .map_err(|e| match e {
+            config::SaveError::Validation(message) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message,
+            },
+            config::SaveError::Unavailable(message) => ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "unavailable",
+                message,
+            },
+        })?;
     get_config_speech(State(state), ConnectInfo(addr), headers).await
 }
 

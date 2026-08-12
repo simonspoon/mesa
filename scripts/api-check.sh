@@ -101,6 +101,13 @@ touch "$STUB_DIR/done"
 EOF
 chmod +x "$STUB_DIR/kokoro-rs"
 export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
+# …against a config file that doesn't exist, so this gate reads the developer's
+# own `~/.mesa/config.json` as little as it reads their db. Since task 822 the
+# speak route takes its voice from that file, and the argv assertions below are
+# about the *unconfigured* argv — they must not turn red because whoever runs
+# the script picked a voice in the UI. `config-check.sh` owns the configured
+# half (it already runs under a throwaway HOME).
+export MESA_CONFIG_FILE="$TMP/no-such-config.json"
 
 # ---- server ----
 
@@ -731,6 +738,14 @@ ok "speak: a listener that hangs up mid-render leaves no wedged synthesiser"
 [ "$(cat "$STUB_DIR/last-argv")" = "-q -o -" ] ||
   fail "speak: argv must be the fixed flags, got $(cat "$STUB_DIR/last-argv")"
 ok "speak: a hostile body is stdin data, never syntax and never argv"
+
+# The voice is configurable since task 822, but mesa names no default of its
+# own: with nothing configured the argv must carry no `-v` at all, i.e. be the
+# one this gate asserted before the setting existed. (The configured half lives
+# in scripts/config-check.sh, which owns a throwaway HOME.)
+grep -q -- ' -v' "$STUB_DIR/last-argv" &&
+  fail "speak: an unconfigured voice must add no -v, got $(cat "$STUB_DIR/last-argv")"
+ok "speak: with no voice configured the argv carries no -v (unchanged from before task 822)"
 
 api 404 GET "/api/inbox/999999/speak"
 [ "$(jqb .error.code)" = "not_found" ] || fail "speak: unknown id must be not_found"

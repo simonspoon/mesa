@@ -928,6 +928,12 @@ fn router(state: AppState) -> Router {
             "/api/config/watchers",
             get(get_config_watchers).put(update_config_watchers),
         )
+        // The same file's `speech` section — the voice the inbox's play button
+        // speaks in. A fourth route for the same reason as the other two.
+        .route(
+            "/api/config/speech",
+            get(get_config_speech).put(update_config_speech),
+        )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -1989,12 +1995,21 @@ async fn speak_inbox(
         let store = state.store.lock().unwrap();
         store.get_inbox_item(id)?.body
     };
+    // The configured voice, read fresh on every press (mesa task 822) — `None`
+    // is "the synthesiser's own default", the pre-822 argv. An unreadable
+    // config file is `unavailable` here too: the speak path must not guess at
+    // settings it couldn't read, and the Settings page says the same thing.
+    let voice = config::speech_voice().map_err(|message| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "unavailable",
+        message,
+    })?;
     // Starting synthesis blocks until the header arrives (seconds of CPU); keep
     // it off the async workers, like every other blocking read in this file.
     // Everything after that point is already on the wire, so a synthesiser that
     // dies later can no longer be a status code — this is the last moment
     // `unavailable` is available.
-    let speech = tokio::task::spawn_blocking(move || speech::start(&body))
+    let speech = tokio::task::spawn_blocking(move || speech::start(&body, voice.as_deref()))
         .await
         .map_err(|e| ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -4018,6 +4033,75 @@ async fn update_config_watchers(
         },
     })?;
     get_config_watchers(State(state), ConnectInfo(addr), headers).await
+}
+
+/// `GET /api/config/speech` — the voice the inbox's play button speaks in, plus
+/// the voices the installed synthesiser offers so the editor can be a list
+/// (`docs/config.md`, mesa task 822).
+///
+/// Gated like `get_config_watchers` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`. A **missing synthesiser is
+/// not** an error here: it makes `voices` empty, because this route is about
+/// the config file, and refusing to show the setting when the binary is absent
+/// would hide the one control that survives installing it.
+async fn get_config_speech(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::speech() {
+        Ok(speech) => Ok(Json(speech).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct SpeechUpdate {
+    /// Absent leaves the voice alone; `null` (or blank) removes it, restoring
+    /// the synthesiser's own default.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    voice: Option<Option<String>>,
+}
+
+/// `PUT /api/config/speech` — writes the voice and echoes the settings.
+///
+/// **Loopback-only in both modes**, like every other config write: it is the
+/// same file mesa's own argv comes out of, and the section a write lands in is
+/// not the distinction that matters.
+async fn update_config_speech(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<SpeechUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    let mut updates = HashMap::new();
+    if let Some(value) = body.voice {
+        updates.insert(config::VOICE.to_string(), value);
+    }
+    config::save_speech(&updates).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_speech(State(state), ConnectInfo(addr), headers).await
 }
 
 async fn restart_server(

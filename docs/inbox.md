@@ -55,6 +55,13 @@ instructions**; `author` is free-text attribution.
   - The audio comes **back to the browser** rather than playing on the host's
     speakers, so it still works under `serve --lan`, where the browser is a
     different machine.
+  - The **voice** is the `speech.voice` key of `~/.mesa/config.json`, edited
+    from the Settings page and read on every press (mesa task 822,
+    `docs/config.md`). It reaches the binary as one `Command::arg` after `-v`,
+    and it is a bounded identifier, so it can be neither an option nor shell
+    text. Unset — the shipped state — passes **no `-v` at all**: mesa names no
+    default voice, the synthesiser's own applies, and the argv is exactly what
+    it was before the setting existed.
   - The body reaches `kokoro-rs` on **stdin**, verbatim, markdown and all
     (`core::speech::start`). Not a shell string and not even an argument:
     a body opening with `-o` cannot become an option, and a long one has no

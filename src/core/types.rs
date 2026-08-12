@@ -243,6 +243,23 @@ pub struct ConfigWatchers {
     pub todo_concurrency_default: u32,
 }
 
+/// The speech settings as the Settings page sees them (`core::config`,
+/// `docs/config.md`, mesa task 822) — a fourth view of `~/.mesa/config.json`,
+/// with the same null-means-fallback rule as [`ConfigWatchers`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigSpeech {
+    /// The configured voice for the inbox's play button, or `null` when the
+    /// config says nothing — then the synthesiser's own default applies and
+    /// mesa passes no `-v` at all.
+    pub voice: Option<String>,
+    /// Every voice the installed `kokoro-rs` reports (`--list-voices`), so the
+    /// editor can offer a list. **Empty means mesa could not ask** — a missing
+    /// or uncooperative binary — never "there are no voices", so an empty list
+    /// is a reason to accept a typed name, not to refuse one.
+    pub voices: Vec<String>,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

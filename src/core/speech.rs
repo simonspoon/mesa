@@ -31,6 +31,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc;
@@ -65,6 +66,57 @@ pub fn kokoro_bin() -> String {
     std::env::var("MESA_KOKORO_BIN").unwrap_or_else(|_| "kokoro-rs".to_string())
 }
 
+/// The most voices [`voices`] will report. `kokoro-rs` ships ~54; the bound is
+/// there so a binary that answers `--list-voices` with something else entirely
+/// cannot fill a dropdown (or this process's memory) with its output.
+const MAX_VOICES: usize = 500;
+
+/// The voice names the installed synthesiser offers, asked of the binary
+/// itself (`kokoro-rs --list-voices`, one name per line) — mesa ships no list
+/// of its own, because a voice set belongs to the model on this machine.
+///
+/// Empty when the binary is missing, fails, or answers with something that
+/// isn't a list of names: an empty list means "mesa cannot offer a choice
+/// here", never "there are no voices". Callers must treat it as advisory —
+/// [`start`] passes whatever voice it is given.
+///
+/// Cached for the life of the process: the call costs ~1s, the answer changes
+/// only when the binary does, and it is read on every Settings page load.
+pub fn voices() -> &'static [String] {
+    static VOICES: OnceLock<Vec<String>> = OnceLock::new();
+    VOICES.get_or_init(|| {
+        let out = Command::new(kokoro_bin())
+            .arg("--list-voices")
+            .stdin(Stdio::null())
+            .output();
+        let Ok(out) = out else { return Vec::new() };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| is_voice_name(line))
+            .take(MAX_VOICES)
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+/// Whether `name` is shaped like a voice: a bounded identifier that cannot be
+/// mistaken for an option. The one spelling of the rule, shared by the
+/// `--list-voices` filter above and the config editor's save-time check
+/// (`core::config::validate_voice`), so mesa can never store a name it would
+/// then refuse to recognise.
+pub fn is_voice_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// A synthesis in flight: WAV bytes in the order they must be written, the
 /// first chunk being the (size-patched) header. An `Err` item is a read that
 /// failed mid-render, which ends the response body abnormally rather than
@@ -82,17 +134,25 @@ impl Speech {
     }
 }
 
-/// Starts synthesising `text`, blocking only until the WAV header is readable,
-/// and streams the audio from there. `Err` is a synthesiser that produced no
-/// usable audio — the one failure the caller can still turn into a status code.
+/// Starts synthesising `text` in `voice`, blocking only until the WAV header is
+/// readable, and streams the audio from there. `Err` is a synthesiser that
+/// produced no usable audio — the one failure the caller can still turn into a
+/// status code.
+///
+/// `voice` is the user's configured voice (`core::config::speech_voice`, mesa
+/// task 822) or `None` for "whatever the binary's own default is" — mesa does
+/// not name a default of its own, so an unconfigured install runs the exact
+/// argv it ran before the setting existed. The name is one `Command::arg`
+/// after `-v`, never text spliced into anything.
 ///
 /// Blocking: call it from `spawn_blocking`, not an async worker.
-pub fn start(text: &str) -> Result<Speech, String> {
+pub fn start(text: &str, voice: Option<&str>) -> Result<Speech, String> {
     let bin = kokoro_bin();
     let mut child = Command::new(&bin)
         // `-q`: progress output on stderr is noise we'd only ever quote back in
         // an error. `-o -`: WAV on stdout instead of the host's speakers.
         .args(["-q", "-o", "-"])
+        .args(voice.map_or_else(Vec::new, |v| vec!["-v", v]))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -421,8 +481,28 @@ mod tests {
     fn start_reports_a_failing_binary() {
         // A binary that cannot exist: the spawn error path, no stub needed.
         unsafe { std::env::set_var("MESA_KOKORO_BIN", "mesa-no-such-tts-binary") };
-        let err = start("hello").err().expect("no binary, no speech");
+        let err = start("hello", None).err().expect("no binary, no speech");
         unsafe { std::env::remove_var("MESA_KOKORO_BIN") };
         assert!(err.contains("mesa-no-such-tts-binary"), "{err}");
+    }
+
+    /// The shape rule is what keeps a stored voice from ever being read as an
+    /// option, and what filters a `--list-voices` answer that isn't a list.
+    #[test]
+    fn voice_names_are_bounded_identifiers() {
+        for good in ["af_heart", "bm_george", "zf_xiaoni", "v2", "a"] {
+            assert!(is_voice_name(good), "{good} is a voice name");
+        }
+        for bad in [
+            "",
+            "-o",
+            "_leading",
+            "af heart",
+            "af/heart",
+            "af_heart;rm -rf /",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_voice_name(bad), "{bad:?} is not a voice name");
+        }
     }
 }

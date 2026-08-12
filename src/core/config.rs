@@ -71,6 +71,20 @@
 //! running **per project** ([`todo_concurrency`]), default
 //! [`DEFAULT_TODO_CONCURRENCY`]. Read per tick rather than at startup, so an
 //! edit lands on the next tick with no restart. See `docs/todo-watcher.md`.
+//!
+//! ## Speech
+//!
+//! A fourth section picks the voice the inbox's play button speaks in (mesa
+//! task 822):
+//!
+//! ```json
+//! { "speech": { "voice": "bm_george" } }
+//! ```
+//!
+//! One key, [`VOICE`], read on every press. Absent or blank is **not** a
+//! default mesa names: it means no `-v` is passed at all, so the synthesiser's
+//! own default applies and an unconfigured install runs the argv it ran before
+//! this setting existed. See [`speech_voice`] and `docs/inbox.md`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -78,7 +92,8 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::core::types::{ConfigCommand, ConfigPrice, ConfigWatchers, ModelRates};
+use crate::core::speech;
+use crate::core::types::{ConfigCommand, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates};
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
 pub const TODO_WATCHER: &str = "todo-watcher";
@@ -1110,6 +1125,182 @@ fn validate_limit(key: &str, value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Speech (mesa task 822)
+// ---------------------------------------------------------------------------
+
+/// The config key holding the voice the inbox's play button speaks in.
+pub const VOICE: &str = "voice";
+
+/// Every key the `speech` section understands, for the unknown-key error.
+const SPEECH_KEYS: &[&str] = &[VOICE];
+
+/// The `speech` map, deserialized on its own for the reason every other
+/// section is: four independent features share one file, and a broken value in
+/// any of them must not take the other three down ([`PricingConfig`] is the
+/// model).
+#[derive(Debug, Default, Deserialize)]
+struct SpeechConfig {
+    #[serde(default)]
+    speech: SpeechSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SpeechSection {
+    #[serde(default)]
+    voice: Option<String>,
+}
+
+fn read_speech(path: &Path) -> Result<SpeechSection, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SpeechSection::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: SpeechConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.speech)
+}
+
+/// The configured voice, or `None` for "the synthesiser's own default".
+///
+/// Read **on every press**, like [`command_for`] is read on every spawn, so a
+/// change is audible on the next play with no restart. Absent, blank and a
+/// value the shape rule rejects all mean `None`: a hand-edited nonsense voice
+/// falls back to the default rather than reaching the binary's argv, which is
+/// the same conservatism [`todo_concurrency`] clamps with. A file that exists
+/// but can't be read or parsed is `Err`, never a silent fall back.
+pub fn speech_voice() -> Result<Option<String>, String> {
+    speech_voice_in(&config_file())
+}
+
+fn speech_voice_in(path: &Path) -> Result<Option<String>, String> {
+    Ok(read_speech(path)?
+        .voice
+        .map(|v| v.trim().to_string())
+        .filter(|v| speech::is_voice_name(v)))
+}
+
+/// The speech settings for the Settings page (`GET /api/config/speech`): the
+/// configured voice (`null` when the file says nothing) plus the voices the
+/// installed synthesiser offers, so the editor can be a list rather than a
+/// magic string. An empty `voices` is "mesa could not ask the binary" — the
+/// editor still has to accept a typed name then.
+pub fn speech() -> Result<ConfigSpeech, String> {
+    speech_in(&config_file())
+}
+
+fn speech_in(path: &Path) -> Result<ConfigSpeech, String> {
+    Ok(ConfigSpeech {
+        // The **raw** stored value, not the filtered one [`speech_voice_in`]
+        // hands the synthesiser: a hand-edited nonsense voice must reach the
+        // editor that can fix it, exactly as an out-of-range watcher limit
+        // does. Blank is still absence — the file's own spelling of "default".
+        voice: read_speech(path)?
+            .voice
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        voices: speech::voices().to_vec(),
+    })
+}
+
+/// Writes the `speech` entries named in `updates` into the config file.
+///
+/// - `None` **removes** the key, restoring the synthesiser's own default — the
+///   same meaning blank has for a command and `null` for a watcher limit.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_commands`], [`save_pricing`] and [`save_watchers`]: one
+///   read-modify-write over the whole document, so all four sections (and any
+///   mesa doesn't know) survive each other's edits.
+pub fn save_speech(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    save_speech_in(&config_file(), updates)
+}
+
+fn save_speech_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        // Nothing named, nothing to do — and no empty `"speech": {}` written
+        // into a file the user never configured.
+        return Ok(());
+    }
+    let mut keys: Vec<&String> = updates.keys().collect();
+    keys.sort();
+    for key in &keys {
+        if !SPEECH_KEYS.contains(&key.as_str()) {
+            return Err(SaveError::Validation(format!(
+                "unknown speech setting {key:?}; mesa configures {}",
+                SPEECH_KEYS.join(", ")
+            )));
+        }
+        // Blank is the reset, not a value to check — same rule as a command box.
+        if let Some(value) = updates[*key].as_deref().map(str::trim)
+            && !value.is_empty()
+        {
+            validate_voice(value).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("speech")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"speech\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for key in keys {
+        match updates[key].as_deref().map(str::trim) {
+            // Blank is the same reset as `null`, exactly as it is for a command
+            // template — the editor clears a box, it does not send a sentinel.
+            None | Some("") => {
+                section.remove(key);
+            }
+            Some(value) => {
+                section.insert(key.clone(), serde_json::Value::String(value.to_string()));
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// A voice has to be a name the synthesiser could accept: a bounded identifier
+/// ([`speech::is_voice_name`] — so it can never be read as an option), and,
+/// when mesa managed to ask the binary what it offers, one of those.
+///
+/// The membership half is skipped when the list is empty, which is what a
+/// missing or uncooperative binary looks like: mesa cannot prove the name is
+/// wrong there, and refusing a value it merely can't check would be the worse
+/// answer (the same call [`bash_syntax_check`] makes).
+pub fn validate_voice(voice: &str) -> Result<(), String> {
+    if !speech::is_voice_name(voice) {
+        return Err(format!(
+            "the voice {voice:?} is not a voice name: up to 64 letters, digits, \
+             underscores and dashes, starting with a letter or digit"
+        ));
+    }
+    let offered = speech::voices();
+    if !offered.is_empty() && !offered.iter().any(|v| v == voice) {
+        return Err(format!(
+            "unknown voice {voice:?}; {} offers {}",
+            speech::kokoro_bin(),
+            offered.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1933,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn each_saver_preserves_the_other_two_sections_and_unknown_ones() {
+    fn each_saver_preserves_the_other_sections_and_unknown_ones() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
@@ -1941,6 +2132,7 @@ mod tests {
                  "commands": {"inbox-watcher": "mytool triage {id}"},
                  "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}},
                  "watchers": {"todo-concurrency": 4},
+                 "speech": {"voice": "bm_george"},
                  "future": {"x": 1}
                }"#,
         );
@@ -1952,14 +2144,15 @@ mod tests {
                 "{label}"
             );
             assert_eq!(root["pricing"]["claude-opus"]["output"], 2.0, "{label}");
+            assert_eq!(root["speech"][VOICE], "bm_george", "{label}");
             assert_eq!(root["future"]["x"], 1, "{label}");
             root
         };
 
-        // Saving watchers leaves commands, pricing and the unknown section alone.
+        // Saving watchers leaves every other section alone.
         save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(7))])).unwrap();
         assert_eq!(survives("watchers")["watchers"][TODO_CONCURRENCY], 7);
-        // …and each of the other two savers leaves `watchers` alone.
+        // …and each of the other savers leaves `watchers` alone.
         save_commands_in(&path, &update(&[("todo-watcher", "mytool run {id}")])).unwrap();
         assert_eq!(survives("commands")["watchers"][TODO_CONCURRENCY], 7);
         save_pricing_in(
@@ -1969,6 +2162,14 @@ mod tests {
         .unwrap();
         assert_eq!(survives("pricing")["watchers"][TODO_CONCURRENCY], 7);
         assert_eq!(todo_concurrency_in(&path).unwrap(), 7);
+        // The speech saver is the fourth of the same shape: it rewrites its own
+        // key and nothing else (`survives` re-asserts the voice it just wrote).
+        save_speech_in(&path, &voice(&[(VOICE, Some("bm_george"))])).unwrap();
+        assert_eq!(survives("speech")["watchers"][TODO_CONCURRENCY], 7);
+        assert_eq!(
+            survives("speech")["commands"]["todo-watcher"],
+            "mytool run {id}"
+        );
     }
 
     #[test]
@@ -2029,6 +2230,98 @@ mod tests {
         assert_eq!(watchers_in(&path).unwrap().todo_concurrency, Some(0));
         let path = write_config(dir.path(), r#"{"watchers": {"todo-concurrency": 500}}"#);
         assert_eq!(todo_concurrency_in(&path).unwrap(), MAX_TODO_CONCURRENCY);
+    }
+
+    fn voice(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn speech_round_trips_a_voice_and_resets_to_the_binary_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // No file at all: no voice, so no `-v` — the pre-822 argv.
+        assert_eq!(speech_voice_in(&path).unwrap(), None);
+
+        save_speech_in(&path, &voice(&[(VOICE, Some("  bm_george  "))])).unwrap();
+        // Stored trimmed, and visible to the read path immediately.
+        assert_eq!(
+            speech_voice_in(&path).unwrap().as_deref(),
+            Some("bm_george")
+        );
+        let view = speech_in(&path).unwrap();
+        assert_eq!(view.voice.as_deref(), Some("bm_george"));
+
+        // `null` and blank both remove the key — the reset, expressed by
+        // absence rather than by a stored empty string.
+        for reset in [None, Some("")] {
+            save_speech_in(&path, &voice(&[(VOICE, Some("af_bella"))])).unwrap();
+            save_speech_in(&path, &voice(&[(VOICE, reset)])).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(written["speech"].get(VOICE).is_none(), "{reset:?}");
+            assert_eq!(speech_voice_in(&path).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn save_speech_rejects_a_name_that_is_not_a_voice_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"speech": {"voice": "af_heart"}}"#;
+        let path = write_config(dir.path(), before);
+        // A name that could be read as an option, or carry a shell metacharacter
+        // into an argv — refused in the editor, not at the next press.
+        for bad in ["-o", "af heart", "af_heart; rm -rf /", &"a".repeat(65)] {
+            let err = save_speech_in(&path, &voice(&[(VOICE, Some(bad))])).unwrap_err();
+            assert!(
+                matches!(&err, SaveError::Validation(m) if m.contains("voice")),
+                "{bad:?}: {err:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{bad:?}");
+        }
+        // An unknown key in the section is a validation error too.
+        let err = save_speech_in(&path, &voice(&[("speed", Some("1.2"))])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unknown speech setting")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // Nothing named writes nothing — no empty `"speech": {}` appears.
+        let path = dir.path().join("untouched.json");
+        save_speech_in(&path, &HashMap::new()).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// A voice hand-edited into something the argv must never carry falls back
+    /// to the binary's default on the speak path, while the editor still sees
+    /// the raw value — the same split the watcher clamp draws.
+    #[test]
+    fn a_hand_edited_voice_that_is_not_a_name_is_ignored_but_still_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"speech": {"voice": "--output /tmp/x"}}"#);
+        assert_eq!(speech_voice_in(&path).unwrap(), None);
+        assert_eq!(
+            speech_in(&path).unwrap().voice.as_deref(),
+            Some("--output /tmp/x")
+        );
+    }
+
+    #[test]
+    fn speech_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = speech_voice_in(&path).unwrap_err();
+        assert!(err.contains("malformed mesa config"), "{err}");
+        assert!(speech_in(&path).is_err());
+        let err = save_speech_in(&path, &voice(&[(VOICE, Some("af_heart"))])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]

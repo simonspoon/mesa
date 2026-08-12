@@ -2,12 +2,14 @@ import { useState } from 'react'
 import {
   getConfig,
   getPricing,
+  getSpeech,
   getWatchers,
   listProjects,
   resetCcIndex,
   restartServer,
   updateConfig,
   updatePricing,
+  updateSpeech,
   updateWatchers,
   type CcResetReport,
 } from '../api'
@@ -39,6 +41,16 @@ import {
   scriptPlaceholderError,
   type Draft,
 } from '../settingsDraft'
+import {
+  canPick,
+  changedSpeech,
+  draftFrom as speechDraftFrom,
+  isDirty as isSpeechDirty,
+  isSavable as isSpeechSavable,
+  options as voiceOptions,
+  valueError as voiceError,
+  type SpeechDraft,
+} from '../speechDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
 import { useFetch } from '../useFetch'
 import {
@@ -252,6 +264,7 @@ export function SettingsView() {
       {saveError && <p className="error">{saveError}</p>}
 
       <WatchersSection />
+      <SpeechSection />
       <PricingSection />
     </div>
   )
@@ -357,6 +370,143 @@ function WatchersSection() {
           onClick={save}
         >
           {saving ? 'saving…' : 'save watchers'}
+        </button>
+        {dirty && savable && !saving && (
+          <span className="muted">unsaved changes</span>
+        )}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {saveError && <p className="error">{saveError}</p>}
+    </>
+  )
+}
+
+/**
+ * Speech: the voice the Inbox's play button reads an item in (mesa task 822).
+ * Its own section, draft and save button, for the same reason watchers and
+ * pricing have theirs — a separate endpoint, so one form's rejection must not
+ * strand the other's edits.
+ *
+ * Two things it must not soften:
+ * - **Blank is the synthesiser's own default**, not silence: mesa passes no
+ *   `-v` at all then, which is exactly what it did before this setting existed.
+ * - **The list is what the installed binary reports**, not a list mesa ships.
+ *   When mesa could not ask it (no `kokoro-rs` on PATH) there is no list to
+ *   pick from, so the box becomes a plain one rather than an empty dropdown
+ *   that would look like "no voices exist".
+ */
+function SpeechSection() {
+  const { data: speech, error, refetch } = useFetch(() => getSpeech(), 'speech')
+  const [draft, setDraft] = useState<SpeechDraft | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const seeded: SpeechDraft =
+    draft ?? (speech ? speechDraftFrom(speech) : { voice: '' })
+
+  function edit(value: string) {
+    setDraft({ voice: value })
+    setSaved(false)
+  }
+
+  function save() {
+    if (!speech) return
+    setSaving(true)
+    setSaveError(null)
+    updateSpeech(changedSpeech(speech, seeded)).then(
+      (fresh) => {
+        // Re-seed from what the server read back, so the box shows what landed.
+        setDraft(speechDraftFrom(fresh))
+        setSaving(false)
+        setSaved(true)
+        refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Speech</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!speech) {
+    return (
+      <>
+        <h2>Speech</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isSpeechDirty(speech, seeded)
+  const savable = isSpeechSavable(seeded)
+  const fieldError = voiceError(seeded.voice)
+
+  return (
+    <>
+      <h2>Speech</h2>
+      <section className="settings-command">
+        <label htmlFor="speech-voice">
+          <span className="settings-command-title">
+            Inbox playback voice
+          </span>
+          <code className="settings-command-key">voice</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          The voice <code>kokoro-rs</code> reads an inbox item in when you press
+          play. Blank = the voice the synthesiser picks itself; a change applies
+          on the next press, with no restart.
+        </p>
+        {canPick(speech) ? (
+          <select
+            id="speech-voice"
+            className="settings-voice-input"
+            value={seeded.voice}
+            onChange={(e) => edit(e.target.value)}
+          >
+            <option value="">default ({speech.voices.length} available)</option>
+            {voiceOptions(speech).map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <>
+            <input
+              id="speech-voice"
+              type="text"
+              className="settings-voice-input"
+              spellCheck={false}
+              value={seeded.voice}
+              placeholder="af_heart"
+              onChange={(e) => edit(e.target.value)}
+            />
+            <p className="muted settings-command-blurb">
+              mesa could not ask <code>kokoro-rs</code> which voices it has —
+              type a name, or run <code>kokoro-rs --list-voices</code> to see
+              them.
+            </p>
+          </>
+        )}
+        {fieldError && <p className="error">{fieldError}</p>}
+      </section>
+
+      <div className="settings-actions">
+        <button
+          type="button"
+          disabled={!dirty || !savable || saving}
+          onClick={save}
+        >
+          {saving ? 'saving…' : 'save speech'}
         </button>
         {dirty && savable && !saving && (
           <span className="muted">unsaved changes</span>

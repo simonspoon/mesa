@@ -76,7 +76,27 @@ if [ "\$1" = "--bg" ]; then
 fi
 exit 2
 EOF
-chmod +x "$STUB_DIR/mytool" "$STUB_DIR/mytool-receipt" "$STUB_DIR/claude"
+# The synthesiser behind the `speech` section (mesa task 822). `--list-voices`
+# is the one source of the voices mesa offers — read by the Settings route and
+# by the save-time check — so the stub answers it with a bounded list plus a
+# line that is not a name, which must be filtered out. Every other invocation
+# logs its argv (the whole point: does the saved voice reach `-v`?) and emits
+# the streaming WAV header `kokoro-rs -o -` writes, exactly like the stub in
+# scripts/api-check.sh.
+KOKORO_ARGV="$TMP/kokoro.argv"
+cat > "$STUB_DIR/kokoro-rs" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "--list-voices" ]; then
+  printf 'Available voices:\naf_heart\naf_bella\nbm_george\n'
+  exit 0
+fi
+printf '%s\n' "\$*" > "$KOKORO_ARGV"
+cat > /dev/null
+printf 'RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff'
+printf '\x01\x02\x03\x04\x05\x06\x07\x08'
+EOF
+chmod +x "$STUB_DIR/mytool" "$STUB_DIR/mytool-receipt" "$STUB_DIR/claude" "$STUB_DIR/kokoro-rs"
+export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
 
 # ---- fixtures ----
 
@@ -538,6 +558,128 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused watchers PUT must not touch the file"
 ok "both watchers verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
+# ---- the speech section: GET/PUT /api/config/speech (mesa task 822) ----
+#
+# The fourth section of the same file, and the only one whose value has to
+# survive all the way into another program's argv: the voice is what the inbox's
+# play button passes to `kokoro-rs`. So this covers the sibling-section rules
+# like pricing and watchers, and then the thing those two have no analogue of —
+# the saved value showing up in the synthesiser's command line, and NOT showing
+# up at all when nothing is saved.
+
+speak() { # speak <inbox-id> -> CODE, argv in $KOKORO_ARGV
+  rm -f "$KOKORO_ARGV"
+  CODE=$(curl -s -o "$TMP/audio" -w '%{http_code}' \
+    "http://127.0.0.1:$PORT/api/inbox/$1/speak")
+}
+
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}, "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}}, "watchers": {"todo-concurrency": 3}}
+EOF
+api GET /api/config/speech
+[ "$CODE" = "200" ] || fail "GET speech: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.voice' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured voice must report null, got $STDOUT"
+# mesa ships no voice list of its own: the choices are whatever the installed
+# binary answers `--list-voices` with, minus the lines that aren't names.
+[ "$(jq -r '.voices | join(",")' <<<"$STDOUT")" = "af_heart,af_bella,bm_george" ] ||
+  fail "GET speech: voices must be the binary's --list-voices output, names only: $STDOUT"
+ok "GET /api/config/speech reports voice: null on a fresh config and offers exactly the voices the installed synthesiser lists"
+
+api PUT /api/config/speech '{"voice": "bm_george"}'
+[ "$CODE" = "200" ] || fail "PUT speech: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.voice' <<<"$STDOUT")" = "bm_george" ] ||
+  fail "PUT must echo the stored voice: $STDOUT"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "bm_george" ] ||
+  fail "PUT speech did not write the voice: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "a speech write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
+  fail "a speech write clobbered the pricing section: $(cat "$CONFIG")"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "a speech write clobbered the watchers section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "a speech write dropped a section it doesn't own: $(cat "$CONFIG")"
+ok "PUT /api/config/speech sets the voice, leaving commands, pricing, watchers and an unknown section untouched"
+
+# The whole point of the setting: the saved name reaches the synthesiser, as one
+# argument after `-v`, read fresh on the press with no restart.
+speak "$ITEM_1"
+[ "$CODE" = "200" ] || fail "speak with a configured voice: expected 200, got $CODE: $(cat "$TMP/audio")"
+[ "$(cat "$KOKORO_ARGV")" = "-q -o - -v bm_george" ] ||
+  fail "the saved voice must reach the synthesiser's argv, got $(cat "$KOKORO_ARGV")"
+ok "the saved voice reaches the synthesiser as \`-v <voice>\`, read on the press (no restart)"
+
+# The other three savers have to leave the voice alone, exactly as it leaves
+# them alone.
+api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
+[ "$CODE" = "200" ] || fail "PUT commands after speech: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "bm_george" ] ||
+  fail "a commands write clobbered the speech section: $(cat "$CONFIG")"
+api PUT /api/config/pricing '{"pricing": {"claude-opus": null}}'
+[ "$CODE" = "200" ] || fail "PUT pricing after speech: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "bm_george" ] ||
+  fail "a pricing write clobbered the speech section: $(cat "$CONFIG")"
+api PUT /api/config/watchers '{"todo_concurrency": 2}'
+[ "$CODE" = "200" ] || fail "PUT watchers after speech: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "bm_george" ] ||
+  fail "a watchers write clobbered the speech section: $(cat "$CONFIG")"
+ok "saving commands, pricing or watchers preserves the speech section, exactly as speech preserves them"
+
+# Both spellings of "no voice" remove the key: an install with nothing saved and
+# an install that saved and cleared must be the same file, and the same argv.
+for RESET in 'null' '""'; do
+  api PUT /api/config/speech "{\"voice\": \"bm_george\"}"
+  [ "$CODE" = "200" ] || fail "PUT speech before reset $RESET: got $CODE: $STDOUT"
+  api PUT /api/config/speech "{\"voice\": $RESET}"
+  [ "$CODE" = "200" ] || fail "PUT speech $RESET: expected 200, got $CODE: $STDOUT"
+  [ "$(jq -r '.voice' <<<"$STDOUT")" = "null" ] ||
+    fail "PUT speech $RESET must report no voice, got $STDOUT"
+  [ "$(jq -r '.speech | has("voice")' < "$CONFIG")" = "false" ] ||
+    fail "PUT speech $RESET must remove the key, never store it: $(cat "$CONFIG")"
+done
+ok "PUT voice null and voice \"\" both remove the key (absence, never an empty string in the file)"
+
+# …and with the key gone the argv is byte-for-byte the one mesa ran before the
+# setting existed — mesa names no default voice of its own.
+speak "$ITEM_1"
+[ "$CODE" = "200" ] || fail "speak with no voice: expected 200, got $CODE: $(cat "$TMP/audio")"
+[ "$(cat "$KOKORO_ARGV")" = "-q -o -" ] ||
+  fail "an unconfigured voice must add no -v at all, got $(cat "$KOKORO_ARGV")"
+ok "with no voice configured the synthesiser runs the pre-822 argv — no \`-v\`, no mesa-chosen default"
+
+BEFORE=$(cat "$CONFIG")
+# A voice is a bounded identifier, so a value that could be read as an option,
+# split into two arguments, or carry shell syntax is refused at save time —
+# the store-what-you-would-refuse-to-run rule.
+for BAD in '-o' 'a b' 'af_heart; rm -rf /'; do
+  api PUT /api/config/speech "$(jq -n --arg v "$BAD" '{voice: $v}')"
+  [ "$CODE" = "422" ] || fail "voice $BAD: expected 422, got $CODE: $STDOUT"
+  [ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+    fail "voice $BAD: expected code validation, got $STDOUT"
+done
+# A well-shaped name the installed binary never offered is refused too, by the
+# same list the editor is built from.
+api PUT /api/config/speech '{"voice": "zz_nobody"}'
+[ "$CODE" = "422" ] || fail "unknown voice: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "unknown voice: expected code validation, got $STDOUT"
+grep -q "zz_nobody" <<<"$STDOUT" || fail "the message must name the voice: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected speech PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT /api/config/speech rejects a voice that isn't a bounded identifier and one the binary doesn't offer as 422 validation, writing nothing"
+
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/speech")
+[ "$CODE" = "403" ] || fail "GET speech with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
+  -H 'Content-Type: application/json' \
+  --data '{"voice": "af_bella"}' \
+  "http://127.0.0.1:$PORT/api/config/speech")
+[ "$CODE" = "403" ] || fail "PUT speech with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused speech PUT must not touch the file"
+ok "both speech verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"
@@ -553,9 +695,13 @@ api GET /api/config/watchers
 [ "$CODE" = "502" ] || fail "malformed config watchers GET: expected 502, got $CODE: $STDOUT"
 api PUT /api/config/watchers '{"todo_concurrency": 5}'
 [ "$CODE" = "502" ] || fail "malformed config watchers PUT: expected 502, got $CODE: $STDOUT"
+api GET /api/config/speech
+[ "$CODE" = "502" ] || fail "malformed config speech GET: expected 502, got $CODE: $STDOUT"
+api PUT /api/config/speech '{"voice": "af_bella"}'
+[ "$CODE" = "502" ] || fail "malformed config speech PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
-ok "a malformed config is 502 unavailable on all six config verbs, and a PUT never overwrites a file it could not read"
+ok "a malformed config is 502 unavailable on all eight config verbs, and a PUT never overwrites a file it could not read"
 
 # ---- an unconfigured command falls back to the built-in claude argv ----
 

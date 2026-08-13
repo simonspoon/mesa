@@ -3158,6 +3158,18 @@ body.files-tree-resizing {
   border: 2px solid var(--cyan);
 }
 
+/* A view tab dropped in the CENTER of a pane lands beside it without a new
+   split (mesa task 843), so there is no half to preview — outline the whole
+   target instead. The Terminal page never renders this: over there a center
+   drop reorders identical shells, and moving one shell one slot along needs
+   no preview at all. */
+.agent-sidebar-pane-drop-indicator-center {
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
+
 .agent-sidebar-pane-drop-indicator-left {
   top: 0;
   left: 0;
@@ -7176,4 +7188,44 @@ button:focus-visible,
     font-size: 0.7rem;
     padding: 0.4rem;
   }
+}
+
+/* The project page's Custom tab (mesa task 843): the user's own tree of view
+   panes, filling the same viewport box every other view-filling project tab
+   uses so the strip above it never moves. */
+.project-panes {
+  display: flex;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
+  margin-bottom: 1rem;
+}
+
+/* A view inside a pane is bounded by the PANE, not by the window: the tabs
+   that size themselves off `--tab-viewport-height` (Files, Git, Terminal,
+   Storyboards) each ask for a full screen, which in a half-height pane is an
+   overflow. Redefining the two vars here rebinds that same request to this
+   pane's own box — one declaration, no per-view CSS. */
+.project-pane-body {
+  --tab-viewport-height: 100%;
+  --tab-viewport-min: 0px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  padding: 0 0.5rem 0.5rem;
+}
+
+/* The pane header doubles as its grip (dragging it moves the pane), so it
+   takes the grab cursor the sidebar's own grips have. */
+.project-pane > .agent-terminal-header {
+  cursor: grab;
+}
+
+/* The single-view case is a drop target too — dropping a tab on it is what
+   creates the Custom layout — so it has to be able to anchor the drop
+   indicator. Layout-neutral otherwise: it is a plain block wrapper around
+   exactly the markup that used to sit here directly. */
+.project-view-drop {
+  position: relative;
 }

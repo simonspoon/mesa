@@ -256,6 +256,11 @@ function App() {
   // The project's OWN settings tab (folder / parent / archive) — distinct
   // from `settingsMatch` above, which is the global config.json editor.
   const projectSettingsMatch = /^\/projects\/(\d+)\/settings$/.exec(path)
+  // The project's own pane layout (mesa task 843) — the tab a tab-into-the-
+  // main-area drag creates. URL-driven like every other project tab; the tree
+  // it shows is machine-local (`projectPanes.ts`), and a project with no
+  // remembered tree renders the Board here instead.
+  const projectCustomMatch = /^\/projects\/(\d+)\/custom(?:\/tasks\/(\d+))?$/.exec(path)
   // Route the command palette's "Create task in <project>" entry navigates
   // to; ProjectTasksPage opens the create-task form on arrival and returns
   // to the plain project route once the form is closed or saved (spec
@@ -277,11 +282,13 @@ function App() {
               ? Number(dashboardMatch[1])
               : projectSettingsMatch
                 ? Number(projectSettingsMatch[1])
-                : createTaskMatch
-                  ? Number(createTaskMatch[1])
-                  : projectMatch
-                    ? Number(projectMatch[1])
-                    : null
+                : projectCustomMatch
+                  ? Number(projectCustomMatch[1])
+                  : createTaskMatch
+                    ? Number(createTaskMatch[1])
+                    : projectMatch
+                      ? Number(projectMatch[1])
+                      : null
 
   let page
   if (settingsMatch) {
@@ -318,6 +325,7 @@ function App() {
         terminal={false}
         dashboard={false}
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -335,6 +343,7 @@ function App() {
         terminal={false}
         dashboard={false}
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -352,6 +361,7 @@ function App() {
         terminal={false}
         dashboard={false}
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -369,6 +379,7 @@ function App() {
         terminal={false}
         dashboard={false}
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -391,6 +402,7 @@ function App() {
         terminal
         dashboard={false}
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -408,6 +420,7 @@ function App() {
         terminal={false}
         dashboard
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -426,6 +439,26 @@ function App() {
         terminal={false}
         dashboard={false}
         settings
+        custom={false}
+        createTask={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (projectCustomMatch) {
+    // The project's own pane layout, in place inside the project page frame
+    // like every other tab (mesa task 843).
+    page = (
+      <ProjectTasksPage
+        projectId={Number(projectCustomMatch[1])}
+        taskId={projectCustomMatch[2] ? Number(projectCustomMatch[2]) : null}
+        storyboards={false}
+        storyboardId={null}
+        git={false}
+        files={false}
+        terminal={false}
+        dashboard={false}
+        settings={false}
+        custom
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -444,6 +477,7 @@ function App() {
         terminal={false}
         dashboard={false}
         settings={false}
+        custom={false}
         createTask
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
@@ -460,6 +494,7 @@ function App() {
         terminal={false}
         dashboard={false}
         settings={false}
+        custom={false}
         createTask={false}
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />

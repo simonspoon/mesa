@@ -17,6 +17,11 @@ import type { CcTab } from './pages/CCDashboardView'
 export type { CcTab }
 export type ProjectTab =
   | 'board'
+  // The user's own pane layout (mesa task 843). Remembered like any other
+  // tab, so leaving a project and coming back reopens the layout — but only
+  // ever as a *link*: a project whose layout has since been emptied renders
+  // the Board at that route rather than an empty frame.
+  | 'custom'
   | 'dashboard'
   | 'storyboards'
   | 'git'
@@ -27,6 +32,7 @@ export type ProjectTab =
 // The tabs that appear as a path segment. `board` is the bare
 // `#/projects/{id}` route — there is no `/board` segment to emit or match.
 const TAB_SEGMENTS = [
+  'custom',
   'dashboard',
   'storyboards',
   'git',

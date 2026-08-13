@@ -28,16 +28,16 @@ import { KanbanBoard } from '../KanbanBoard'
 import { shouldIgnoreShortcut } from '../keyboardScope'
 import { useFetch } from '../useFetch'
 import { CCDashboardView } from './CCDashboardView'
+import { DiagramBoardView } from './DiagramBoardView'
+import { DiagramListView } from './DiagramListView'
 import { FilesView } from './FilesView'
 import { GitView } from './GitView'
-import { StoryboardBoardView } from './StoryboardBoardView'
 import { ProjectSettingsView } from './ProjectSettingsView'
-import { StoryboardListView } from './StoryboardListView'
 import { TerminalPage } from './TerminalPage'
 
 // 'a' opens the create-task form, on every view of a project page and not
 // just the Board (mesa task 811): a task is most often written *about* what is
-// currently on screen — a file, a diff, a storyboard frame — so the view you
+// currently on screen — a file, a diff, a diagram frame — so the view you
 // are on is the reason to create one, never a reason to have to leave first.
 //
 // It opens the panel in place rather than navigating to
@@ -47,7 +47,7 @@ import { TerminalPage } from './TerminalPage'
 //
 // `shouldIgnoreShortcut` (keyboardScope.ts) is what makes app-wide scope safe:
 // it already covers modifiers, text-editing contexts, xterm panes, the
-// storyboard canvas and open modals — i.e. every place on these views where
+// diagram canvas and open modals — i.e. every place on these views where
 // 'a' means the letter a. The remaining views have no key handling of their
 // own to collide with.
 //
@@ -77,8 +77,8 @@ function useCreateTaskShortcut(onOpen: () => void) {
 export function ProjectTasksPage({
   projectId,
   taskId,
-  storyboards,
-  storyboardId,
+  diagrams,
+  diagramId,
   git,
   files,
   terminal,
@@ -90,10 +90,10 @@ export function ProjectTasksPage({
 }: {
   projectId: number
   taskId: number | null
-  // Storyboards is a URL-driven view (refresh-/back-stable): `storyboards` is
-  // true on the boards routes, `storyboardId` selects a single board's canvas.
-  storyboards: boolean
-  storyboardId: number | null
+  // Diagrams is a URL-driven view (refresh-/back-stable): `diagrams` is
+  // true on the boards routes, `diagramId` selects a single board's canvas.
+  diagrams: boolean
+  diagramId: number | null
   // Git is another URL-driven view: working-tree status of the project's
   // linked folder, with a per-file diff pane.
   git: boolean
@@ -189,7 +189,7 @@ export function ProjectTasksPage({
   // once because both the 'a' shortcut and the agents poll below are scoped
   // to it.
   const onBoard =
-    !storyboards && !git && !files && !terminal && !dashboard && !settings && !onCustom
+    !diagrams && !git && !files && !terminal && !dashboard && !settings && !onCustom
 
   // Which single view fills the main area when Custom is not the open tab —
   // and therefore which pane a tab dropped on it splits against.
@@ -203,8 +203,8 @@ export function ProjectTasksPage({
           ? 'files'
           : terminal
             ? 'terminal'
-            : storyboards
-              ? 'storyboards'
+            : diagrams
+              ? 'diagrams'
               : 'board'
 
   const {
@@ -242,7 +242,7 @@ export function ProjectTasksPage({
   const { data: sessions } = useFetch(() => listAllAgents(), 'board-agents', {
     pollMs: boardVisible ? 3000 : undefined,
   })
-  // Storyboards, Git, Files, Terminal, Dashboard and Settings are their own
+  // Diagrams, Git, Files, Terminal, Dashboard and Settings are their own
   // views with their own fetches/error handling, so a failed task fetch must
   // not block them; only surface it where the board is actually on screen —
   // otherwise a Custom layout holding a board pane would show that pane
@@ -348,11 +348,11 @@ export function ProjectTasksPage({
           // rather than carrying the previous one's panes across.
           <TerminalPage key={`project-${projectId}`} projectId={projectId} />
         )
-      case 'storyboards':
-        return storyboardId !== null ? (
-          <StoryboardBoardView projectId={projectId} storyboardId={storyboardId} />
+      case 'diagrams':
+        return diagramId !== null ? (
+          <DiagramBoardView projectId={projectId} diagramId={diagramId} />
         ) : (
-          <StoryboardListView projectId={projectId} />
+          <DiagramListView projectId={projectId} />
         )
       case 'board':
         return !tasks ? (
@@ -454,7 +454,7 @@ export function ProjectTasksPage({
           {project?.archived && (
             <span
               className="badge project-archived-badge"
-              title="Hidden from the sidebar's main list and from unscoped task/storyboard views. Restore from the Settings tab."
+              title="Hidden from the sidebar's main list and from unscoped task/diagram views. Restore from the Settings tab."
             >
               archived
             </span>

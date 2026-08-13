@@ -68,7 +68,7 @@ describe('layoutFrames', () => {
   })
 
   it('terminates on a cycle by dropping the back edge', () => {
-    // Storyboard edges may legitimately form cycles — this is a diagram, not
+    // Diagram edges may legitimately form cycles — this is a drawing, not
     // a dependency graph, so the layout must rank rather than throw or hang.
     const pos = layoutFrames(
       [frame(1), frame(2), frame(3)],

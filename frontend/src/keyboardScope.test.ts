@@ -68,10 +68,10 @@ describe('shouldIgnoreShortcut', () => {
     ).toBe(false)
   })
 
-  it('ignores every key while a storyboard canvas is mounted anywhere', () => {
-    // Document-wide, not target-scoped: the storyboard owns its own spatial
+  it('ignores every key while a diagram canvas is mounted anywhere', () => {
+    // Document-wide, not target-scoped: the diagram owns its own spatial
     // key handling even when focus sits elsewhere on the page.
-    mount('<div class="storyboard"></div><button id="t"></button>')
+    mount('<div class="diagram"></div><button id="t"></button>')
     expect(ignores(document.getElementById('t')!)).toBe(true)
   })
 
@@ -183,8 +183,8 @@ describe('shouldIgnoreFilesShortcut', () => {
     },
   )
 
-  it('does not care about a storyboard canvas — the Files tab is its own page', () => {
-    mount('<div class="storyboard"></div><button id="t"></button>')
+  it('does not care about a diagram canvas — the Files tab is its own page', () => {
+    mount('<div class="diagram"></div><button id="t"></button>')
     expect(ignoresFind(document.getElementById('t')!)).toBe(false)
   })
 

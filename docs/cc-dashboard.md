@@ -758,7 +758,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   `PROMPT_COLOR`, `shortTarget`, all still used by the dashboard and detail
   pages); the tidy-tree
   layout, the `NODE_W`/`NODE_H` box and `minimapStrokeWidth` went with the
-  canvas. `@xyflow/react` stays a dependency — the storyboard canvas uses it.
+  canvas. `@xyflow/react` stays a dependency — the diagram canvas uses it.
   The truncation banner gates each of its three sentences on its own counter
   (`omitted_prompts` / `omitted_tool_calls` / `omitted_responses`), since
   `truncated` means any population was cut and a response-only truncation would
@@ -781,7 +781,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   account-wide Live Sessions/Subscription Limits cards are omitted (they read
   separate unscoped endpoints with no project filter). A project with no
   matching transcript activity renders a quiet zero-state, never an error.
-  Registered like the Git/Agents/Storyboards tabs: a route match in `App.tsx`
+  Registered like the Git/Agents/Diagrams tabs: a route match in `App.tsx`
   feeding a boolean prop into `ProjectTasksPage.tsx`'s tab bar and content switch.
 - Gate: `scripts/cc-check.sh` drives `mesa cc` against a synthetic transcript
   tree (`MESA_CC_PROJECTS_DIR`) + throwaway db (`MESA_DB`) and asserts the JSON

@@ -3,12 +3,12 @@ import type { AnchorSide } from "./AnchorSide";
 import type { Waypoint } from "./Waypoint";
 
 /**
- * A directed connection from one frame to another on the same storyboard.
- * Unlike task dependencies, storyboard edges may form cycles freely — a
- * storyboard is a freeform diagram, not a dependency graph. Self-edges
+ * A directed connection from one frame to another on the same diagram.
+ * Unlike task dependencies, diagram edges may form cycles freely — a
+ * diagram is a freeform diagram, not a dependency graph. Self-edges
  * (`from_frame == to_frame`) are the only rejected shape.
  */
-export type FrameEdge = { id: number, storyboard_id: number, from_frame: number, to_frame: number, label: string | null, 
+export type FrameEdge = { id: number, diagram_id: number, from_frame: number, to_frame: number, label: string | null, 
 /**
  * Free-text actor id that created the edge (an agent name or "user").
  */

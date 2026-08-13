@@ -63,7 +63,7 @@ so the board could not be scrolled by touch anywhere it mattered.
 constraint.
 
 **Scope, and the one place it does not apply.** The rule is about draggables
-inside a *scrolling* view. `.frame-header` on the storyboard canvas keeps
+inside a *scrolling* view. `.frame-header` on the diagram canvas keeps
 `touch-action: none` and is correct to — a pan/zoom canvas is the other case
 entirely, and copying the kanban's `pan-y` there would break it. See *The
 canvas gesture model* below.
@@ -90,7 +90,7 @@ the page behind was never the drawer's scroll chain, it was simply the element
 under the finger. The scrim also gives the drawer a tap-to-dismiss target,
 which it previously lacked entirely.
 
-`z-index` ladder, lowest first: storyboard takeover `1000` → scrim `1150` →
+`z-index` ladder, lowest first: diagram takeover `1000` → scrim `1150` →
 drawers `1200` → **tab bar `1220`** → modal backdrop `1250` → command palette
 `1300`. A modal therefore still opens above an open drawer, and the tab bar
 stays tappable while a drawer is open (see *Bottom tab bar* below).
@@ -110,16 +110,16 @@ that already lived there.
 
 ## The canvas gesture model
 
-The storyboard is the one phone surface that is **not** a scrolling list, so
+The diagram canvas is the one phone surface that is **not** a scrolling list, so
 invariant 1 inverts on it. It is a pan/zoom canvas (React Flow / `@xyflow`
-v12, `StoryboardCanvas.tsx`), and a canvas has to own every touch that lands
+v12, `DiagramCanvas.tsx`), and a canvas has to own every touch that lands
 inside it — a browser that "helpfully" panned the page mid-pinch would make
 it unusable. React Flow says so itself: its own stylesheet puts
 `touch-action: none` on `.react-flow__pane` **and** `.react-flow__node`.
 `.frame-header` matching that is the canvas agreeing with its library, not
 the kanban bug surviving in a second place.
 
-Inside `.storyboard-viewport`, measured at 390×844:
+Inside `.diagram-viewport`, measured at 390×844:
 
 | Gesture | Owner | Measured |
 |---|---|---|
@@ -142,7 +142,7 @@ accidents:
   background, move from the header.
 - **The page can only be scrolled by the strips around the canvas box**, since
   the box itself absorbs everything. So the box may never grow tall enough to
-  leave no strip — `.storyboard:not(.expanded) .storyboard-viewport` carries a
+  leave no strip — `.diagram:not(.expanded) .diagram-viewport` carries a
   `max-height` guard for that. At 390×844 the box is 556px against a 652px
   ceiling, i.e. the guard is currently slack; it exists so a future
   `--tab-viewport-height` change cannot strand the reader. Scrolled to the
@@ -156,7 +156,7 @@ desktop uses to keep those in sync. With no hover, anything
 `pointer-events: all` and invisible becomes a trap that swallows the pan with
 nothing on screen to explain the refusal. Two were found and fixed:
 
-- **Connection handles.** `.storyboard .react-flow__handle` is `opacity: 0`
+- **Connection handles.** `.diagram .react-flow__handle` is `opacity: 0`
   until its node is hovered, but stays hit-testable — 22×22, four per frame,
   28 on the test board with six of them on screen at rest. They are now shown
   (`opacity: 0.55`) on coarse pointers, which also makes touch edge-creation
@@ -225,7 +225,7 @@ rather than a second `isPhone()` call.
 | History rows | wrap instead of holding fixed timestamp/actor columns |
 | Modals (task detail, new task, new project) | full-screen sheets with a sticky close header |
 | Files tab | tree collapses when a file opens, behind a breadcrumb toggle; per-file diffs go unified; the content half is one pane, never split — see *Files tab and the unified diff* |
-| Storyboard canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
+| Diagram canvas | pan/zoom/move all work by touch; controls at 44px, MiniMap hidden — see *The canvas gesture model* |
 | Terminal / Agent panes | one pane, no split UI; shell height follows the on-screen keyboard — see *Terminal and agent panes* |
 | Inbox | body text wraps unbreakable URLs; the assign `<select>` is capped to its row — see *Crossing the breakpoint* for the audit's other half. Since task 828 an item is collapsed to a 3-line preview with the playback glyphs pinned right: the preview is the flex item that gives way (`min-width: 0`), so the row holds at 390px with no rule of its own, and the triage controls only exist inside an opened item |
 | Project page header / tab strip | `.tabs` already wraps to two rows at 390px; all six tabs in-view and hit-testable, no change needed |
@@ -676,7 +676,7 @@ Checks worth re-running after any change to this surface:
    attached and still scrolled where it was. This is the one check a tab-bar
    change can silently break, and it fails loudly only in a *live* browser —
    nothing about the JSX makes a conditional render look wrong.
-5. Open a storyboard: one finger on the canvas background pans it, two
+5. Open a diagram: one finger on the canvas background pans it, two
    fingers zoom, a drag on a frame header moves that frame, and
    `main.scrollTop` stays put through all three. Quote the transform values —
    "the canvas panned" is not a number.

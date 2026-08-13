@@ -40,7 +40,7 @@ sort_order: number,
 /**
  * Parent project (task 668), or `null` at top level. A pure **grouping**
  * relation: the left nav renders the result as a tree, and nothing rolls
- * up — a child keeps its own tasks, storyboards, `root_commit` and
+ * up — a child keeps its own tasks, diagrams, `root_commit` and
  * `local_path`. Arbitrary depth; `Store` rejects self-parenting and any
  * cycle. The one place it changes behaviour beyond display is visibility:
  * an unscoped read hides a project iff it is archived **or any ancestor

@@ -490,7 +490,7 @@ already use.
   the thing being floored against, not an arbitrary product limit like the
   sidebar's own old 720px cap. A separate **maximize** toggle
   (`agent-sidebar-maximize`) grows the panel to fill the whole main content
-  area instead (`main` display:none via `:has()`), matching the storyboard
+  area instead (`main` display:none via `:has()`), matching the diagram
   canvas's own takeover-view expand toggle; `Escape` restores.
 - **Starting a new agent**: a `+ agent` button (`agent-sidebar-add`) sits in
   the header actions next to maximize, visible only while expanded. It opens

@@ -1,5 +1,5 @@
 // Auto-layout: a small hand-rolled layered (Sugiyama-style) graph layout for
-// the storyboard canvas. Storyboard edges may form cycles (a diagram, not a
+// the diagram canvas. Diagram edges may form cycles (a drawing, not a
 // dependency graph — see FrameEdge.ts), so layering first breaks cycles by
 // discarding DFS back-edges, then longest-path-ranks the remaining DAG into
 // layers, then positions each layer along the chosen flow direction.

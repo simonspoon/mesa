@@ -40,7 +40,7 @@ isolation.
 | --- | --- | --- |
 | `cli-check` | CLI JSON contract: create→list→block→cycle→delete→backup. Never speaks HTTP | |
 | `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan`, plus `/api/inbox/{id}/speak` (audio contract, patched WAV sizes, the header arriving mid-render, injection-proof body, `require_agent_access` in both modes) | `MESA_KOKORO_BIN` (stub) |
-| `storyboard-check` | Board/frame/edge CRUD, cascade, history | |
+| `diagram-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
 | `attachments-check` | CLI + API contract incl. cascade-delete | |
 | `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, `/files/search` (hits grouped by file, excluded/binary files skipped, both toggles, the `?q=` contract), and the read/write gate pairing in default *and* `--lan` | |
@@ -117,7 +117,7 @@ The code is the source of truth. These are the invariants you must not break:
   for every `show`. Errors are `{"error": {"code", "message"}}` on stderr.
 - **`--quiet` prints the compact projection instead of the full object.** Opt-in,
   long form only (no `-q`, no env var, no config key, never default-on), accepted
-  on every mutation and `show`/`get` across `task`, `project`, `storyboard`
+  on every mutation and `show`/`get` across `task`, `project`, `diagram`
   (+ `frame`, `edge`) and `inbox` — and on nothing else (`list`, `deps`,
   `events`, `next`, `resolve`, `execute`, `attachment`, `cc`, `backup`, `serve`
   reject it as an unknown argument, exit 2). The quiet shape is the record minus
@@ -135,7 +135,7 @@ The code is the source of truth. These are the invariants you must not break:
   hand-written keep-list, so a new bounded field is omitted by default — the
   key-parity `#[test]` against `TaskSummary` is what forces the decision.
   Composites (`project delete`, `task delete`/`import`,
-  `storyboard show`/`delete`, `frame delete`, `inbox assign`) keep their key
+  `diagram show`/`delete`, `frame delete`, `inbox assign`) keep their key
   structure and compact only their members. Any quiet payload that actually
   drops a key is rebuilt as a `serde_json::Value`, so its keys come out
   **alphabetical** rather than in struct-declaration order — single records as
@@ -156,21 +156,21 @@ The code is the source of truth. These are the invariants you must not break:
   live `cc usage` endpoint, the agents endpoints, `cc text` (the transcript
   file a node's body lives in may have been deleted) and the inbox speak route
   (the `kokoro-rs` binary may be missing or fail).
-- **Every CLI project argument takes an id or a name** (task/storyboard
+- **Every CLI project argument takes an id or a name** (task/diagram
   create+list, task next, inbox list/assign, `project update` and its
   `--parent`): a non-numeric value resolves via
   `Store::find_project_by_name` — case-insensitive exact match; unknown name is
   `not_found` with a hint, duplicated name is `conflict` listing candidate ids.
 - **Create subcommands take required args positionally or as flags** —
-  `task create <PROJECT> <DESCRIPTION>`, `storyboard create <PROJECT> <TITLE>`,
-  `storyboard frame create <STORYBOARD> <TITLE>`, `storyboard edge create
-  <STORYBOARD> <FROM> <TO>`, `project create <NAME>`. Each positional has an
+  `task create <PROJECT> <DESCRIPTION>`, `diagram create <PROJECT> <TITLE>`,
+  `diagram frame create <DIAGRAM> <TITLE>`, `diagram edge create
+  <DIAGRAM> <FROM> <TO>`, `project create <NAME>`. Each positional has an
   equivalent `--flag`; clap enforces exactly one of the pair (both or neither is
   `usage`, exit 2). A task's description is the one three-way case — positional,
   `--description` or `--description-file`, exactly one — so a multi-line body
-  can still arrive from a heredoc. Frame/edge are nested under `storyboard` — there is no
+  can still arrive from a heredoc. Frame/edge are nested under `diagram` — there is no
   top-level `mesa frame`/`mesa edge`. The optional project filter on `task list`,
-  `task next` and `storyboard list` takes the same shape: positional `[PROJECT]`
+  `task next` and `diagram list` takes the same shape: positional `[PROJECT]`
   or `--project`; neither means unscoped.
 - **API security boundary is mode-dependent** (`serve` default vs `--lan`),
   enforced by middleware in `src/api.rs`, **not** by the bind address. Two
@@ -229,7 +229,7 @@ The code is the source of truth. These are the invariants you must not break:
   repo).
 - A project may name another project as its **`parent_id`** (task 668) — a
   pure *grouping* relation, arbitrary depth, `NULL` = top level. Nothing rolls
-  up: a child keeps its own tasks, storyboards, `root_commit` and `local_path`,
+  up: a child keeps its own tasks, diagrams, `root_commit` and `local_path`,
   and nothing of its appears on the parent's board. `Store` rejects
   self-parenting and any cycle (`cycle`) and an unknown parent (`validation`),
   mirroring a task's parent. `list_projects` still returns **one flat array**
@@ -272,7 +272,7 @@ The code is the source of truth. These are the invariants you must not break:
 | Project version | The app version in a project's `local_path`, read from its manifest and shown beside the name; derived on every read, never stored, quiet-empty on any miss | `docs/project-version.md` |
 | Files tab | Project file browser + editor + project-wide search; `safe_path()` is the sole traversal chokepoint, and both write routes (edit, create-file) share one code-execution-grade gate | `docs/files-tab.md` |
 | Filesystem browse | Server-side dir listing + create-folder for the new-project picker; unscoped, both verbs loopback-gated | `docs/fs-browse.md` |
-| Storyboards | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here | `docs/storyboards.md` |
+| Diagrams | Freeform visual canvas (frames + edges), distinct from the kanban board; cycles are **allowed** here. The container is a *diagram*; `storyboard` survives as one value of its `diagram_type` (alongside `flowchart`, `erd`, `brainstorm`) | `docs/diagrams.md` |
 | Inbox | Global free-text update requests; assigning converts to a task and deletes the item. Each item declares a **`kind`** — `task-summary` (an agent reporting, for a person to read) or `change-request` (asks for work) — fixed at creation, defaulting to `task-summary` on both surfaces and for every pre-846 row, because an item nobody labelled must wait for a person rather than get an agent: the inbox-watcher triages **change requests only**, and the web list tints each row by kind (`inboxKind.ts`) with the word in the meta line too. The nav's Inbox row owns three sub-views — **New** (`#/inbox`, unread), **Read** and **Archived** — a filter over the one polled list (`inboxFilter.ts`), never three fetches; an item the reader has open or is hearing stays on its view until closed, since both are what mark it read. **Archiving** (`archived_at`, `POST /api/inbox/{id}/archive`, `mesa inbox archive [--undo]`) sets an item aside without triaging or destroying it: it toggles (unlike `read_at`), outranks read state in every view and drops out of the unread badge. `project_id` FK is `ON DELETE SET NULL`, deliberately **not** `CASCADE`. A **play** button reads an item aloud through `kokoro-rs` — audio streams back to the browser *as it is rendered* (chunked, no `Content-Length`), the body reaches the binary on stdin, in the voice `~/.mesa/config.json`'s `speech.voice` names; once it sounds, **rewind** and **pause/resume** drive that one `<audio>` without re-requesting the route, and rewind clamps to what is seekable because a chunked body has nothing earlier to go back to. There is **one player element for the page** and the press itself starts it (an autoplay policy weighs the gesture, not the render it schedules); a browser whose media stack refuses a range-less stream — Apple's does — re-fetches the same URL and **decodes the WAV itself**, scheduling each piece on a Web Audio clock the press unlocked, so it streams too; that mode is remembered for the page only, once decoded audio has actually sounded. Items list **collapsed** — a clamped plain-text preview a click expands — with the transport (symbols, not words) on the collapsed row and the triage controls only inside the opened item. An item is **unread** until `read_at` is stamped, which the *page* does — after the item has been held open a few seconds, or once it actually sounds — through an idempotent `POST /api/inbox/{id}/read`; the stamp is when it was **first** read, never moved and never cleared, and the nav badge counts unread items rather than all of them | `docs/inbox.md` |
 | Agents | Live Claude Code sessions per project. Terminal access is code execution → all four routes share one mode-dependent gate stronger than task CRUD; `local_path` writes loopback-only in both modes | `docs/agents.md` |
 | Terminal | Shell panes (`portable-pty`, not `claude attach`), same `require_agent_access` stack. Global page + per-project tab (cwd resolved **server-side** from `?project=<id>`, never client-supplied) | `docs/terminal.md` |

@@ -16,7 +16,7 @@
  *    native <select> — typing and native select option-cycling/type-ahead.
  * 3. The event target is inside an xterm terminal pane (`.xterm` or
  *    `.agent-terminal`).
- * 4. A storyboard canvas is mounted anywhere on the page (`.storyboard`) —
+ * 4. A diagram canvas is mounted anywhere on the page (`.diagram`) —
  *    it owns its own key handling and is its own spatial surface.
  * 5. A modal that owns its own key handling is open (create-task/
  *    create-project/command-palette backdrops).
@@ -35,7 +35,7 @@ export function shouldIgnoreShortcut(e: KeyboardEvent): boolean {
 
   if (target?.closest('.xterm, .agent-terminal')) return true
 
-  if (document.querySelector('.storyboard') !== null) return true
+  if (document.querySelector('.diagram') !== null) return true
 
   if (
     document.querySelector(

@@ -90,8 +90,8 @@ demo_click 'a[href="#/projects/1/tasks/5"]' 1.4       # blocked task + deps
 demo_click '.panel-close' 0.6
 demo_click 'a[href="#/projects/1/tasks/2"]' 1.4       # in-progress task + subtask
 demo_click '.panel-close' 0.6
-demo_click '.tabs button:nth-of-type(3)' 1.0          # Storyboards tab
-demo_click 'a[href="#/projects/1/storyboards/1"]' 1.8 # Checkout Flow canvas
+demo_click '.tabs button:nth-of-type(3)' 1.0          # Diagrams tab
+demo_click 'a[href="#/projects/1/diagrams/1"]' 1.8 # Checkout Flow canvas
 demo_click 'a[href="#/projects/2"]' 1.6                # switch project
 demo_click 'a[href="#/inbox"]' 1.4                    # global inbox
 # --------------------------------------------------------------------------

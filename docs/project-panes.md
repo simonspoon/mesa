@@ -1,6 +1,6 @@
 # Project view panes — the Custom tab
 
-Drag a project view tab (Dashboard, Board, Storyboards, Git, Files, Terminal,
+Drag a project view tab (Dashboard, Board, Diagrams, Git, Files, Terminal,
 Settings) into the main area and it is added *beside* what is already there as
 a new pane. The first such drop mints a **Custom** tab, first in the strip,
 which is where that layout lives from then on. Clicking any other tab still
@@ -75,7 +75,7 @@ nothing.
 ## Sizing
 
 A view inside a pane is bounded by the pane, not the window. The view-filling
-tabs (Files, Git, Terminal, Storyboards) size their bodies off
+tabs (Files, Git, Terminal, Diagrams) size their bodies off
 `--tab-viewport-height`, which asks for a full screen; `.project-pane-body`
 redefines that variable (and `--tab-viewport-min`) to the pane's own box, so
 one CSS declaration rebinds every one of them with no per-view change.
@@ -97,6 +97,6 @@ the panes and closing it returns to them.
   in the always-mounted `PtyPool` and its tree is kept per scope — but nothing
   else has that mitigation. Rebuilding it for every view would mean a pane pool
   like `PtySlot`'s, which this task deliberately did not take on.
-- **A Storyboards pane shows the list only.** Opening a single board is its own
-  route (`/storyboards/:sid`), which is not a Custom route, so it navigates away
+- **A Diagrams pane shows the list only.** Opening a single board is its own
+  route (`/diagrams/:sid`), which is not a Custom route, so it navigates away
   from the layout.

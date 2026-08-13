@@ -44,9 +44,9 @@ import { Markdown } from './components/Markdown'
 import { layoutFrames, type LayoutDirection } from './layout'
 import type { AnchorSide } from './types/AnchorSide'
 import type { DiagramType } from './types/DiagramType'
+import type { DiagramView } from './types/DiagramView'
 import type { Frame } from './types/Frame'
 import type { FrameShape } from './types/FrameShape'
-import type { StoryboardView } from './types/StoryboardView'
 import type { Waypoint } from './types/Waypoint'
 
 const MIN_ZOOM = 0.25
@@ -57,7 +57,7 @@ const MAX_ZOOM = 3
  *  null`) plus every `FrameShape` value. */
 type FrameNodeKind = FrameShape | 'frame'
 
-/** The valid `Frame.shape` set for each `Storyboard.diagram_type`, per
+/** The valid `Frame.shape` set for each `Diagram.diagram_type`, per
  *  `Store::validate_frame_shape` (src/core/store.rs) — a `storyboard` board
  *  takes no shape (the generic card, `shape: null`), a `flowchart` board
  *  takes exactly one of process/decision/start_end, an `erd` board takes
@@ -136,7 +136,7 @@ const HANDLES = [
 ]
 
 /**
- * One storyboard frame as a React Flow node. The header is the drag handle
+ * One diagram frame as a React Flow node. The header is the drag handle
  * (`dragHandle` on the node targets it), so the body stays free for text
  * selection and link clicks. Connections start from the four side dots; while
  * a connection is being dragged from another node, an invisible full-size
@@ -455,7 +455,7 @@ function EntityNode(props: NodeProps<FrameNodeType>) {
 /** Brainstorm "central topic": the mind-map hub the ideas branch off. Same
  *  card behavior as every other shape; the bold pill styling is CSS only, and
  *  nothing enforces one-central-per-board — a brainstorm board is as freeform
- *  as every other storyboard. */
+ *  as every other diagram. */
 function CentralNode(props: NodeProps<FrameNodeType>) {
   return <FrameCardNode {...props} shapeClass="frame-central" />
 }
@@ -1028,7 +1028,7 @@ const nodeTypes = {
 const edgeTypes = { frame: FrameEdgeView }
 
 /**
- * The freeform storyboard canvas, rendered by React Flow: frames are custom
+ * The freeform diagram canvas, rendered by React Flow: frames are custom
  * nodes dragged by their header (a PATCH on drop), edges are floating
  * anchor-to-anchor connectors created by dragging between the side handles,
  * and double-clicking a frame edits it in place on the card (title/body/
@@ -1039,18 +1039,18 @@ const edgeTypes = { frame: FrameEdgeView }
  * keys this component by board id, so a board switch remounts onto that
  * board's saved viewport.
  */
-export function StoryboardCanvas({
+export function DiagramCanvas({
   view,
   projectId,
   author,
   onChanged,
 }: {
-  view: StoryboardView
+  view: DiagramView
   projectId: number
   author: string
   onChanged: () => void
 }) {
-  const storyboardId = view.storyboard.id
+  const diagramId = view.diagram.id
   const [selectedId, setSelectedId] = useState<number | null>(null)
   // The frame currently in on-card inline edit mode (entered by double-click),
   // distinct from `selectedId` (highlight + Cmd+D target) — a card can be
@@ -1114,7 +1114,7 @@ export function StoryboardCanvas({
     (frames: Frame[], selected: number | null, editing: number | null): FrameNodeType[] =>
       frames.map((f) => ({
         id: String(f.id),
-        // Storyboard-type boards (and any pre-357 frame): `shape` is always
+        // `storyboard`-type boards (and any pre-357 frame): `shape` is always
         // null, so this always resolves to `'frame'` — byte-identical to the
         // pre-flowchart behavior (Must #6 regression guard). A flowchart
         // board's frames key off their own persisted shape instead.
@@ -1242,7 +1242,7 @@ export function StoryboardCanvas({
   // validation error a `shape: null` create now hits there. `[0]` is
   // `undefined` for a `storyboard`-type board (empty array), matching
   // pre-360 behavior exactly.
-  const boardShapes = SHAPES_FOR_TYPE[view.storyboard.diagram_type]
+  const boardShapes = SHAPES_FOR_TYPE[view.diagram.diagram_type]
   const defaultShape = boardShapes[0]
 
   /** Creates the frame untitled and opens it for editing, so the user lands in
@@ -1251,7 +1251,7 @@ export function StoryboardCanvas({
    *  untitled frame renders as a muted "untitled" until named. */
   function addFrame(shape?: FrameShape, pos?: { x: number; y: number }) {
     const n = view.frames.length
-    createFrame(storyboardId, {
+    createFrame(diagramId, {
       title: '',
       x: pos ? Math.round(pos.x) : 48 + (n % 6) * 28,
       y: pos ? Math.round(pos.y) : 48 + (n % 6) * 28,
@@ -1274,7 +1274,7 @@ export function StoryboardCanvas({
    *  first shape. */
   const duplicateFrame = useCallback(
     (frame: Frame) => {
-      createFrame(storyboardId, {
+      createFrame(diagramId, {
         title: frame.title,
         body: frame.body ?? undefined,
         x: frame.x + 32,
@@ -1290,7 +1290,7 @@ export function StoryboardCanvas({
         setSelectedId(f.id)
       }, showError)
     },
-    [storyboardId, author, onChanged, showError],
+    [diagramId, author, onChanged, showError],
   )
 
   // React Flow has no onPaneDoubleClick — capture the instance via onInit and
@@ -1335,7 +1335,7 @@ export function StoryboardCanvas({
 
   function onConnect(c: Connection) {
     if (c.source === c.target) return // self-edges are rejected server-side
-    createEdge(storyboardId, {
+    createEdge(diagramId, {
       from_frame: Number(c.source),
       to_frame: Number(c.target),
       author,
@@ -1361,7 +1361,7 @@ export function StoryboardCanvas({
     const point = 'changedTouches' in event ? event.changedTouches[0] : event
     const pos = inst.screenToFlowPosition({ x: point.clientX, y: point.clientY })
     const fromId = connectionState.fromNode.id
-    createFrame(storyboardId, {
+    createFrame(diagramId, {
       title: '',
       x: Math.round(pos.x),
       y: Math.round(pos.y),
@@ -1372,7 +1372,7 @@ export function StoryboardCanvas({
       onChanged()
       setSelectedId(f.id)
       setEditingId(f.id)
-      createEdge(storyboardId, {
+      createEdge(diagramId, {
         from_frame: Number(fromId),
         to_frame: f.id,
         author,
@@ -1384,13 +1384,13 @@ export function StoryboardCanvas({
   // saved {tx, ty, scale} maps 1:1 onto React Flow's {x, y, zoom}. Loaded once
   // per mount (the parent remounts per board); saved on every move end.
   const [defaultViewport] = useState<Viewport>(() => {
-    const saved = loadBoardView(storyboardId)
+    const saved = loadBoardView(diagramId)
     return saved
       ? { x: saved.tx, y: saved.ty, zoom: saved.scale }
       : { x: 0, y: 0, zoom: 1 }
   })
   function onMoveEnd(_e: unknown, vp: Viewport) {
-    saveBoardView(storyboardId, { tx: vp.x, ty: vp.y, scale: vp.zoom })
+    saveBoardView(diagramId, { tx: vp.x, ty: vp.y, scale: vp.zoom })
   }
 
   // Escape leaves expanded (whole-window) mode — the usual way out of a takeover
@@ -1434,8 +1434,8 @@ export function StoryboardCanvas({
   }, [selectedId, view.frames, duplicateFrame])
 
   return (
-    <div className={`storyboard${expanded ? ' expanded' : ''}`}>
-      <div className="storyboard-viewport">
+    <div className={`diagram${expanded ? ' expanded' : ''}`}>
+      <div className="diagram-viewport">
         <ReactFlow
           colorMode="dark"
           nodes={nodes}
@@ -1490,7 +1490,7 @@ export function StoryboardCanvas({
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="canvas-controls">
             {boardShapes.length === 0 ? (
-              // storyboard-type board: exactly today's single button, shape
+              // `storyboard`-type board: exactly today's single button, shape
               // implicitly null — zero UI regression (Must #6).
               <button onClick={() => addFrame()}>add frame</button>
             ) : (

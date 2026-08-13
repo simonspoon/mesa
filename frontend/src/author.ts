@@ -1,4 +1,4 @@
-// The local actor id ("who am I") stamped on storyboards, frames, and edges
+// The local actor id ("who am I") stamped on diagrams, frames, and edges
 // for attribution. Collaboration is asynchronous and attribution-based, so the
 // web just needs a name to send; it persists in localStorage between visits
 // and defaults to "user".

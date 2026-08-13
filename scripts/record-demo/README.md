@@ -19,7 +19,7 @@ filesystem) that has no business in a promo video.
 export MESA_DB=/tmp/mesa-demo/demo.db
 mesa serve --port 7799 &
 
-# 2. Seed fictional demo data (creates projects 1-2, tasks 1-5, storyboard 1)
+# 2. Seed fictional demo data (creates projects 1-2, tasks 1-5, diagram 1)
 scripts/record-demo/seed-demo-data.sh
 
 # 3. Record (headless khora session; ~15-20s tour)
@@ -40,7 +40,7 @@ python3 scripts/record-demo/assemble.py /tmp/mesa-demo/frames /tmp/mesa-demo/dem
 - `walkthrough.sh` — launches headless khora, injects a synthetic cursor dot
   (moved via `khora eval` before each click so the recording reads as a
   person driving the app), and clicks through: board → a blocked task's
-  dependencies → a task with a subtask → the storyboard canvas → a second
+  dependencies → a task with a subtask → the diagram canvas → a second
   project → the inbox.
 - `assemble.py` — turns `manifest.json` + frames into an mp4 via ffmpeg's
   concat demuxer, holding each frame for its real on-screen duration.

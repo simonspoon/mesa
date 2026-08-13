@@ -1,6 +1,6 @@
 // Persisted width of the left nav sidebar (mesa task 665), the mirror of the
 // agent sidebar's own drag-resize. Machine-local (localStorage), like
-// `lastFolder.ts` and the storyboard view state: it is a per-browser
+// `lastFolder.ts` and the diagram view state: it is a per-browser
 // preference about this one screen, never project or server data, so it has
 // no column, no route and no place in a backup.
 //

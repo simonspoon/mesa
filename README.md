@@ -120,14 +120,14 @@ mesa backup /tmp/mesa-snap.db
   the derived `blocked` boolean. `get` is an alias for every `show`.
 - **`--quiet` prints the compact projection instead.** Opt-in, long form only
   (no `-q`, no env var, no config key, never on by default), and accepted on
-  every mutation and `show`/`get` in `project`, `task`, `storyboard` (plus
+  every mutation and `show`/`get` in `project`, `task`, `diagram` (plus
   `frame` and `edge`) and `inbox`. The quiet shape is the record minus its
   unbounded free-text fields — for a task that is exactly the `task list`
   shape (it drops `description`, `result` and `created_at`, and keeps
   `artifact`, so a `--quiet` close-out echoes the SHA you just stored); for a
-  project or storyboard it drops `description`, for a frame or
+  project or diagram it drops `description`, for a frame or
   inbox item `body`; an edge has no such field, so its output is unchanged.
-  Composite payloads (`project delete`, `task delete`/`import`, `storyboard
+  Composite payloads (`project delete`, `task delete`/`import`, `diagram
   show`/`delete`, `frame delete`, `inbox assign`) keep their key structure and
   compact their members. Any quiet payload that actually drops a key is rebuilt
   as a JSON object, so its keys come out alphabetical rather than in declaration
@@ -198,7 +198,7 @@ mesa serve --watch-inbox   # opt-in: auto-triage the global inbox
 ```
 
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
-`block`/`unblock`/`dependencies`/`dependents` actions, `/api/storyboards` with its
+`block`/`unblock`/`dependencies`/`dependents` actions, `/api/diagrams` with its
 `frames`/`edges`/`events`, `/api/inbox`, `/api/scripts`, `/api/cc`,
 `/api/config`, and per-project `git`/`files`/`agents` endpoints), with the React
 web UI served at `/`. Beside a project's board sit its **Files**, **Git** and
@@ -249,10 +249,10 @@ UI does not live-sync; it refetches on window focus.
   rejected. `blocked` is true while any blocker is not `done`/`cancelled`, and is
   derived on every read.
 - **Task event** — an append-only log of status changes (`mesa task events`).
-- **Storyboard** — a freeform visual canvas belonging to a project: **frames**
+- **Diagram** — a freeform visual canvas belonging to a project: **frames**
   (cards at an `x/y` position, optionally linking a task in the same project)
   joined by directed **edges** (arrows, with optional labels). Cycles between
-  frames are allowed (it is a diagram, not a dependency graph). Every change is
+  frames are allowed (it is a picture, not a dependency graph). Every change is
   recorded in a **change history** that attributes who did what, when — so
   agents and people building the same board over time can see each other's
   edits. The web renders the graph as a draggable canvas; agents read and write
@@ -281,26 +281,26 @@ UI does not live-sync; it refetches on window focus.
   `mesa script {create,list,show,update,delete,run}`, plus a global **Scripts**
   page. See `docs/scripts.md`.
 
-## Storyboards
+## Diagrams
 
 ```bash
 # Create a board, add two frames, connect them — all stamped with an author
-SB=$(mesa storyboard create 1 "Onboarding flow" --author agent-7 | jq .id)
-A=$(mesa storyboard frame create "$SB" "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
-B=$(mesa storyboard frame create "$SB" "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
-mesa storyboard edge create "$SB" "$A" "$B" --label "then" --author agent-7
+SB=$(mesa diagram create 1 "Onboarding flow" --author agent-7 | jq .id)
+A=$(mesa diagram frame create "$SB" "Land on home" --x 40 --y 40 --author agent-7 | jq .id)
+B=$(mesa diagram frame create "$SB" "Sign up" --x 360 --y 40 --task 3 --author agent-7 | jq .id)
+mesa diagram edge create "$SB" "$A" "$B" --label "then" --author agent-7
 
-# Read the whole board in one call: {storyboard, frames, edges}
-mesa storyboard show "$SB"
+# Read the whole board in one call: {diagram, frames, edges}
+mesa diagram show "$SB"
 
 # See who changed what, when (the collaboration log)
-mesa storyboard events "$SB"
+mesa diagram events "$SB"
 ```
 
 Frames carry free-text bodies (markdown by convention) and a colour; edges may
-form cycles. `mesa storyboard delete` cascades the board's frames, edges, and
+form cycles. `mesa diagram delete` cascades the board's frames, edges, and
 history, echoing the full destroyed contents. The web UI (under a project's
-**storyboards →** link) lets a person add and drag frames, draw and delete
+**diagrams →** link) lets a person add and drag frames, draw and delete
 connections, edit a frame, and view the history — building the same board an
 agent drives from the CLI.
 
@@ -314,7 +314,7 @@ mesa project create "API v2" --parent "Platform"   # id or name
 mesa project update "API v2" --parent ""           # back to top level
 ```
 
-Nesting is grouping only — a child keeps its own tasks, storyboards, repo
+Nesting is grouping only — a child keeps its own tasks, diagrams, repo
 binding and board; nothing rolls up onto the parent. What it *does* change is
 two whole-tree behaviours: archiving a project hides its descendants from
 unscoped reads too (their own `archived` flag is untouched), and deleting one
@@ -394,7 +394,7 @@ cargo fmt --check                           # CI-gated
 
 scripts/cli-check.sh        # CLI JSON-contract end-to-end gate
 scripts/api-check.sh        # HTTP task-route contract + the security boundary, over a live server
-scripts/storyboard-check.sh # storyboard/frame/edge CLI contract gate
+scripts/diagram-check.sh    # diagram/frame/edge CLI contract gate
 scripts/concurrent-check.sh # 20 interleaved CLI + API writes against one db
 scripts/attachments-check.sh    # attachment contract over CLI + API, including cascade-delete
 scripts/files-check.sh      # Files-tab reads, the image allowlist, search, both write gates

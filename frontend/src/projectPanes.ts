@@ -1,5 +1,5 @@
 // The project page's "Custom" tab (mesa task 843): the pane tree a user builds
-// by dragging view tabs (Dashboard, Board, Storyboards, …) into the main area,
+// by dragging view tabs (Dashboard, Board, Diagrams, …) into the main area,
 // plus the machine-local memory that keeps it across navigations.
 //
 // Two deliberate shapes:
@@ -35,7 +35,7 @@ import {
 export const PANE_TABS: readonly PaneTab[] = [
   'dashboard',
   'board',
-  'storyboards',
+  'diagrams',
   'git',
   'files',
   'terminal',
@@ -66,7 +66,7 @@ export function isPaneTab(value: unknown): value is PaneTab {
 const LABELS: Record<PaneTab, string> = {
   dashboard: 'Dashboard',
   board: 'Board',
-  storyboards: 'Storyboards',
+  diagrams: 'Diagrams',
   git: 'Git',
   files: 'Files',
   terminal: 'Terminal',

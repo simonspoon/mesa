@@ -1,7 +1,7 @@
 // The view the user was last on, so the left nav's project links and its "CC
 // Dashboard" link reopen that tab instead of always dumping you back on the
 // Board / the CC overview (mesa tasks 694, 695). Machine-local (localStorage),
-// like lastFolder.ts and the storyboard view state — never project or server
+// like lastFolder.ts and the diagram view state — never project or server
 // data.
 //
 // Two deliberate shapes:
@@ -23,7 +23,7 @@ export type ProjectTab =
   // the Board at that route rather than an empty frame.
   | 'custom'
   | 'dashboard'
-  | 'storyboards'
+  | 'diagrams'
   | 'git'
   | 'files'
   | 'terminal'
@@ -34,7 +34,7 @@ export type ProjectTab =
 const TAB_SEGMENTS = [
   'custom',
   'dashboard',
-  'storyboards',
+  'diagrams',
   'git',
   'files',
   'terminal',
@@ -53,8 +53,8 @@ const CC_KEY = 'mesa-last-cc-tab'
  *
  *  The tab only — never the deep id: `/projects/7/tasks/12`,
  *  `/projects/7/create-task` and `/projects/7` are all `board`, and
- *  `/projects/7/storyboards/3` is `storyboards`, so the remembered link lands
- *  on the *new* project's storyboards list rather than another project's row. */
+ *  `/projects/7/diagrams/3` is `diagrams`, so the remembered link lands
+ *  on the *new* project's diagrams list rather than another project's row. */
 export function projectViewFromPath(
   path: string,
 ): { id: number; tab: ProjectTab } | null {

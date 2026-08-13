@@ -2,14 +2,14 @@
 import type { DiagramType } from "./DiagramType";
 
 /**
- * A visual storyboard: a freeform spatial canvas of frames (cards) and the
+ * A visual diagram: a freeform spatial canvas of frames (cards) and the
  * directed edges between them. Belongs to a project, fixed at creation (like a
  * task). `author` is a free-text actor id — an agent name or "user" — naming
  * who created the board. Collaboration is asynchronous and attribution-based:
  * many agents and users edit one board over time; there is no live-sync, no
  * auth, and no locking (consistent with the rest of mesa).
  */
-export type Storyboard = { id: number, project_id: number, title: string, description: string | null, 
+export type Diagram = { id: number, project_id: number, title: string, description: string | null, 
 /**
  * Free-text actor id that created the board (an agent name or "user").
  */

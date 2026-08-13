@@ -25,7 +25,7 @@ import { useVisualViewportHeightVar } from './visualViewport'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
 // #/projects/:id/tasks/:tid (task open in the side panel),
-// #/projects/:id/storyboards, #/projects/:id/storyboards/:sid,
+// #/projects/:id/diagrams, #/projects/:id/diagrams/:sid,
 // #/projects/:id/git (working-tree status + per-file diffs),
 // #/projects/:id/files (file tree + content viewer),
 // #/projects/:id/terminal (the Terminal page's shell panes, rooted at the
@@ -250,8 +250,8 @@ function App() {
     : ccDetailMatch || ccTimelineMatch
       ? ('sessions' as CcTab)
       : null
-  const storyboardMatch = /^\/projects\/(\d+)\/storyboards\/(\d+)$/.exec(path)
-  const storyboardListMatch = /^\/projects\/(\d+)\/storyboards$/.exec(path)
+  const diagramMatch = /^\/projects\/(\d+)\/diagrams\/(\d+)$/.exec(path)
+  const diagramListMatch = /^\/projects\/(\d+)\/diagrams$/.exec(path)
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
   const filesMatch = /^\/projects\/(\d+)\/files$/.exec(path)
   // Distinct from `terminalMatch` above: this one is a project tab rendered
@@ -274,10 +274,10 @@ function App() {
   const createTaskMatch = /^\/projects\/(\d+)\/create-task$/.exec(path)
   const projectMatch = /^\/projects\/(\d+)(?:\/tasks\/(\d+))?$/.exec(path)
   const legacyTaskMatch = /^\/tasks\/(\d+)$/.exec(path)
-  const activeProjectId = storyboardMatch
-    ? Number(storyboardMatch[1])
-    : storyboardListMatch
-      ? Number(storyboardListMatch[1])
+  const activeProjectId = diagramMatch
+    ? Number(diagramMatch[1])
+    : diagramListMatch
+      ? Number(diagramListMatch[1])
       : gitMatch
         ? Number(gitMatch[1])
         : filesMatch
@@ -318,14 +318,14 @@ function App() {
     // CC Dashboard: global telemetry view, also above projects. `ccTab` is
     // non-null whenever ccMatch is.
     page = <CCDashboardView tab={ccTab!} />
-  } else if (storyboardMatch) {
-    // Single board: in-place storyboard view inside the project page frame.
+  } else if (diagramMatch) {
+    // Single board: in-place diagram view inside the project page frame.
     page = (
       <ProjectTasksPage
-        projectId={Number(storyboardMatch[1])}
+        projectId={Number(diagramMatch[1])}
         taskId={null}
-        storyboards
-        storyboardId={Number(storyboardMatch[2])}
+        diagrams
+        diagramId={Number(diagramMatch[2])}
         git={false}
         files={false}
         terminal={false}
@@ -336,14 +336,14 @@ function App() {
         onProjectsChanged={() => setNavVersion((v) => v + 1)}
       />
     )
-  } else if (storyboardListMatch) {
-    // Boards index: in-place storyboards view inside the project page frame.
+  } else if (diagramListMatch) {
+    // Boards index: in-place diagrams view inside the project page frame.
     page = (
       <ProjectTasksPage
-        projectId={Number(storyboardListMatch[1])}
+        projectId={Number(diagramListMatch[1])}
         taskId={null}
-        storyboards
-        storyboardId={null}
+        diagrams
+        diagramId={null}
         git={false}
         files={false}
         terminal={false}
@@ -360,8 +360,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(gitMatch[1])}
         taskId={null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git
         files={false}
         terminal={false}
@@ -378,8 +378,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(filesMatch[1])}
         taskId={null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files
         terminal={false}
@@ -401,8 +401,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(projectTerminalMatch[1])}
         taskId={null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files={false}
         terminal
@@ -419,8 +419,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(dashboardMatch[1])}
         taskId={null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files={false}
         terminal={false}
@@ -438,8 +438,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(projectSettingsMatch[1])}
         taskId={null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files={false}
         terminal={false}
@@ -457,8 +457,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(projectCustomMatch[1])}
         taskId={projectCustomMatch[2] ? Number(projectCustomMatch[2]) : null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files={false}
         terminal={false}
@@ -476,8 +476,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(createTaskMatch[1])}
         taskId={null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files={false}
         terminal={false}
@@ -493,8 +493,8 @@ function App() {
       <ProjectTasksPage
         projectId={Number(projectMatch[1])}
         taskId={projectMatch[2] ? Number(projectMatch[2]) : null}
-        storyboards={false}
-        storyboardId={null}
+        diagrams={false}
+        diagramId={null}
         git={false}
         files={false}
         terminal={false}

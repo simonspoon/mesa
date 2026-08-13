@@ -1,25 +1,25 @@
 import { useState } from 'react'
-import { createStoryboard, listStoryboards } from '../api'
+import { createDiagram, listDiagrams } from '../api'
 import { getAuthor, setAuthor } from '../author'
 import type { DiagramType } from '../types/DiagramType'
 import { useFetch } from '../useFetch'
 
-/** The three board styles a new storyboard can be created as (Must #1/#9) —
+/** The three board styles a new diagram can be created as (Must #1/#9) —
  *  offered as a plain `<select>` alongside title/author, defaulting to the
  *  original generic board so existing creation behavior is unchanged unless
  *  the user picks otherwise. */
 const DIAGRAM_TYPES: DiagramType[] = ['storyboard', 'flowchart', 'erd', 'brainstorm']
 
 /**
- * Lists a project's storyboards and creates new ones. A board is a freeform
- * canvas; this is just the index — the canvas lives in StoryboardView. Rendered
+ * Lists a project's diagrams and creates new ones. A board is a freeform
+ * canvas; this is just the index — the canvas lives in DiagramBoardView. Rendered
  * in place inside ProjectTasksPage's frame (project header + tab row supply the
  * surrounding chrome), so it carries no header or back link of its own.
  */
-export function StoryboardListView({ projectId }: { projectId: number }) {
+export function DiagramListView({ projectId }: { projectId: number }) {
   const { data: boards, error, refetch } = useFetch(
-    () => listStoryboards(projectId),
-    `storyboards-${projectId}`,
+    () => listDiagrams(projectId),
+    `diagrams-${projectId}`,
   )
   const [title, setTitle] = useState('')
   const [author, setAuthorState] = useState(getAuthor())
@@ -29,17 +29,17 @@ export function StoryboardListView({ projectId }: { projectId: number }) {
   function submit(e: React.FormEvent) {
     e.preventDefault()
     setAuthor(author)
-    createStoryboard({
+    createDiagram({
       project_id: projectId,
       title,
       author,
       diagram_type: diagramType,
     }).then(
-      (sb) => {
+      (d) => {
         setTitle('')
         setCreateError(null)
         refetch()
-        window.location.hash = `#/projects/${projectId}/storyboards/${sb.id}`
+        window.location.hash = `#/projects/${projectId}/diagrams/${d.id}`
       },
       (err: unknown) =>
         setCreateError(err instanceof Error ? err.message : String(err)),
@@ -52,7 +52,7 @@ export function StoryboardListView({ projectId }: { projectId: number }) {
         <input
           type="text"
           value={title}
-          placeholder="new storyboard title"
+          placeholder="new diagram title"
           required
           onChange={(e) => setTitle(e.target.value)}
         />
@@ -83,18 +83,18 @@ export function StoryboardListView({ projectId }: { projectId: number }) {
       ) : !boards ? (
         <p className="muted">Loading…</p>
       ) : boards.length === 0 ? (
-        <p className="muted">No storyboards yet.</p>
+        <p className="muted">No diagrams yet.</p>
       ) : (
         <ul className="card-list">
           {boards.map((b) => (
             <li key={b.id}>
-              <a href={`#/projects/${projectId}/storyboards/${b.id}`}>
+              <a href={`#/projects/${projectId}/diagrams/${b.id}`}>
                 {b.title}
               </a>
               {b.description && (
                 <span className="muted"> — {b.description}</span>
               )}
-              <div className="muted storyboard-meta">
+              <div className="muted diagram-meta">
                 {b.author && <span>by {b.author} · </span>}
                 <span>updated {b.updated_at}</span>
               </div>

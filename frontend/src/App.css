@@ -1333,16 +1333,16 @@ main {
   flex-wrap: wrap;
 }
 
-/* ---- storyboards ---- */
+/* ---- diagrams ---- */
 
-.storyboard-meta {
+.diagram-meta {
   font-size: 0.75rem;
   margin-top: 0.2rem;
 }
 
 /* The canvas and the (optional) editor panel share a row; all canvas controls
    now live as overlays inside the viewport itself (no separate toolbar row). */
-.storyboard {
+.diagram {
   display: flex;
   flex-wrap: wrap;
   gap: 1rem;
@@ -1399,9 +1399,9 @@ main {
   box-shadow: 0 0 8px rgba(255, 43, 214, 0.4);
 }
 
-/* Expanded mode: the storyboard takes over the whole window, the root
+/* Expanded mode: the diagram takes over the whole window, the root
    pinning to the viewport and the canvas viewport filling it. */
-.storyboard.expanded {
+.diagram.expanded {
   position: fixed;
   inset: 0;
   z-index: 1000;
@@ -1412,14 +1412,14 @@ main {
   flex-wrap: nowrap;
 }
 
-.storyboard.expanded .storyboard-viewport {
+.diagram.expanded .diagram-viewport {
   flex: 1 1 auto;
   height: 100%;
 }
 
 /* Viewport: fixed-size window React Flow fills (it needs an explicitly-sized
    container); pan/zoom/drag are React Flow's own. */
-.storyboard-viewport {
+.diagram-viewport {
   flex: 1 1 24rem;
   min-width: 0;
   overflow: hidden;
@@ -1432,16 +1432,16 @@ main {
 
 /* React Flow theming: match the app's panel/cyan look. The transparent pane
    lets the viewport's own background show through. */
-.storyboard .react-flow {
+.diagram .react-flow {
   background: transparent;
 }
 
-.storyboard .react-flow__edge-path {
+.diagram .react-flow__edge-path {
   stroke: var(--cyan-dim);
   stroke-width: 2;
 }
 
-.storyboard .react-flow__connection-path {
+.diagram .react-flow__connection-path {
   stroke: var(--cyan);
   stroke-width: 2;
 }
@@ -1451,7 +1451,7 @@ main {
    The element itself is sized to a generous hit target (React Flow starts a
    drag on pointerdown over this exact box) — the visible 9px dot is drawn as
    a centered ::after so it doesn't look larger than before. */
-.storyboard .react-flow__handle {
+.diagram .react-flow__handle {
   width: 22px;
   height: 22px;
   background: transparent;
@@ -1461,7 +1461,7 @@ main {
   transition: opacity 0.15s;
 }
 
-.storyboard .react-flow__handle::after {
+.diagram .react-flow__handle::after {
   content: '';
   position: absolute;
   inset: 6.5px;
@@ -1470,18 +1470,18 @@ main {
   border: 1px solid var(--border-bright);
 }
 
-.storyboard .react-flow__node:hover .react-flow__handle {
+.diagram .react-flow__node:hover .react-flow__handle {
   opacity: 1;
 }
 
-.storyboard .react-flow__handle:hover::after {
+.diagram .react-flow__handle:hover::after {
   background: var(--cyan);
 }
 
 /* Full-card drop target while a connection is in flight: invisible, but the
    drop can land anywhere on the frame. No dot to draw, so the ::after above
    is switched off. */
-.storyboard .react-flow__handle.frame-drop-handle {
+.diagram .react-flow__handle.frame-drop-handle {
   inset: 0;
   transform: none;
   width: 100%;
@@ -1492,35 +1492,35 @@ main {
   opacity: 1;
 }
 
-.storyboard .react-flow__handle.frame-drop-handle::after {
+.diagram .react-flow__handle.frame-drop-handle::after {
   content: none;
 }
 
-.storyboard .react-flow__controls {
+.diagram .react-flow__controls {
   box-shadow: none;
   border: 1px solid var(--border);
 }
 
-.storyboard .react-flow__controls button {
+.diagram .react-flow__controls button {
   background: rgba(6, 10, 16, 0.85);
   border-bottom: 1px solid var(--border);
   color: var(--cyan);
   fill: var(--cyan);
 }
 
-.storyboard .react-flow__controls button:hover {
+.diagram .react-flow__controls button:hover {
   background: var(--panel-raised);
 }
 
-.storyboard .react-flow__minimap {
+.diagram .react-flow__minimap {
   background: var(--panel);
 }
 
-.storyboard .react-flow__minimap-mask {
+.diagram .react-flow__minimap-mask {
   fill: rgba(6, 10, 16, 0.7);
 }
 
-.storyboard .react-flow__minimap-node {
+.diagram .react-flow__minimap-node {
   fill: var(--border-bright);
 }
 
@@ -1960,7 +1960,7 @@ main {
   width: 8rem;
 }
 
-.storyboard-history {
+.diagram-history {
   flex: 1 1 100%;
   border: 1px solid var(--border);
   background: var(--panel);
@@ -1969,7 +1969,7 @@ main {
   overflow: auto;
 }
 
-.storyboard-history h2 {
+.diagram-history h2 {
   margin: 0.25rem 0 0.5rem;
 }
 
@@ -5293,7 +5293,7 @@ body.files-tree-resizing {
    block reads as a stack of boxed lines. Class-scoped (set in Markdown.tsx, on
    both the plain and the syntax-highlighted path) rather than a descendant
    selector, so it covers every markdown surface — Files pane, task modal,
-   storyboard cards — with one rule, and leaves inline code chips alone. */
+   diagram cards — with one rule, and leaves inline code chips alone. */
 .markdown-code-block {
   background: none;
   border: none;
@@ -5304,7 +5304,7 @@ body.files-tree-resizing {
   color: var(--cyan);
 }
 /* An inline markdown image never widens its surface — the Files pane and the
-   task modal are fixed-width columns. Storyboard cards render into .frame-body,
+   task modal are fixed-width columns. Diagram cards render into .frame-body,
    not here, and are deliberately left alone: nothing resolves their images, so
    the only ones they can show are remote. */
 .markdown-body :where(img) {
@@ -5484,7 +5484,7 @@ body.files-tree-resizing {
 }
 
 /* Command palette (Cmd/Ctrl+Shift+P): a centered modal above every other
-   overlay in the app — higher than the expanded-storyboard takeover (1000)
+   overlay in the app — higher than the expanded-diagram takeover (1000)
    and the phone sidebar drawer (1200). */
 .command-palette-backdrop {
   position: fixed;
@@ -5543,7 +5543,7 @@ body.files-tree-resizing {
 }
 
 /* Shared backdrop for the centered modals (new task, new project, and task
-   detail — see TaskModal.tsx). Sits above the expanded-storyboard takeover
+   detail — see TaskModal.tsx). Sits above the expanded-diagram takeover
    (1000) and phone sidebar drawer (1200), below the command palette (1300)
    so Cmd/Ctrl+Shift+P still surfaces on top of it. Also one of the selectors
    `shouldIgnoreShortcut()` watches, so any modal using it suppresses the
@@ -5639,7 +5639,7 @@ body.files-tree-resizing {
 @media (max-width: 600px) {
   :root {
     /* Header + tabs + chrome are tighter on a phone; let viewport-bound panes
-       (storyboard canvas, agents terminal) fit without forcing page scroll. */
+       (diagram canvas, agents terminal) fit without forcing page scroll. */
     --tab-viewport-min: 16rem;
     /* Tap-target row of the bottom tab bar, excluding the home-indicator
        inset. `--phone-tabbar-reserve` is the whole thing — what everything
@@ -5711,7 +5711,7 @@ body.files-tree-resizing {
      Sits at 1220: ABOVE both drawers (1200) so switching tabs while a drawer
      is open is one tap rather than dismiss-then-tap, and below the modal
      backdrop (1250) so a modal is still exclusive. Full ladder, lowest first:
-     storyboard takeover 1000 → scrim 1150 → drawers 1200 → tab bar 1220 →
+     diagram takeover 1000 → scrim 1150 → drawers 1200 → tab bar 1220 →
      modal backdrop 1250 → command palette 1300. */
   .phone-tabbar {
     display: flex;
@@ -6049,7 +6049,7 @@ body.files-tree-resizing {
     width: auto;
   }
 
-  /* ── Storyboard canvas (mesa task 558) ──────────────────────────────────
+  /* ── Diagram canvas (mesa task 558) ──────────────────────────────────
      The canvas is the phone tier's one *pan/zoom* surface rather than a
      scrolling list, so it plays by the opposite rule to the kanban board:
      React Flow's own `.react-flow__pane` and `.react-flow__node` set
@@ -6066,31 +6066,31 @@ body.files-tree-resizing {
      stops a future `--tab-viewport-height` bump from stranding the reader on
      a canvas with nothing left to scroll by. `:not(.expanded)` because the
      takeover mode below is `position: fixed; inset: 0` and wants the lot. */
-  .storyboard:not(.expanded) .storyboard-viewport {
+  .diagram:not(.expanded) .diagram-viewport {
     max-height: calc(100dvh - var(--phone-tabbar-reserve) - 9rem);
   }
 
   /* Takeover mode covers the viewport at z-index 1000; the tab bar (1220)
      stays on top of it, so without this the bar sits over the bottom of the
      canvas — including React Flow's own zoom controls, which pin there. */
-  .storyboard.expanded {
+  .diagram.expanded {
     padding-bottom: calc(0.6rem + var(--phone-tabbar-reserve));
   }
 
   /* 200x150 of a 364x556 canvas is a sixth of the drawing surface, parked on
      the bottom-right corner where it also blocks panning. A phone has no
      room for a second, smaller copy of the thing it is already looking at. */
-  .storyboard .react-flow__minimap {
+  .diagram .react-flow__minimap {
     display: none;
   }
 
   /* React Flow ships 26x26 zoom buttons. */
-  .storyboard .react-flow__controls button {
+  .diagram .react-flow__controls button {
     width: 44px;
     height: 44px;
   }
 
-  .storyboard .react-flow__controls button svg {
+  .diagram .react-flow__controls button svg {
     max-width: 16px;
     max-height: 16px;
   }
@@ -6313,7 +6313,7 @@ body.files-tree-resizing {
    it and a 500px desktop window does not, so neither width tier above can
    express it.
 
-   `.storyboard .react-flow__handle` is `opacity: 0` until its node is
+   `.diagram .react-flow__handle` is `opacity: 0` until its node is
    hovered, but it keeps `pointer-events: all` — 22x22 each, four per frame.
    With no hover to reveal them they are invisible traps: measured at
    390x844, six of the board's 28 handles sat on screen at rest, and a
@@ -6322,7 +6322,7 @@ body.files-tree-resizing {
    target and the visible affordance agree, and it is also the only way to
    start an edge by touch at all. */
 @media (hover: none) and (pointer: coarse) {
-  .storyboard .react-flow__handle {
+  .diagram .react-flow__handle {
     opacity: 0.55;
   }
 }
@@ -7235,7 +7235,7 @@ button:focus-visible,
 
 /* A view inside a pane is bounded by the PANE, not by the window: the tabs
    that size themselves off `--tab-viewport-height` (Files, Git, Terminal,
-   Storyboards) each ask for a full screen, which in a half-height pane is an
+   Diagrams) each ask for a full screen, which in a half-height pane is an
    overflow. Redefining the two vars here rebinds that same request to this
    pane's own box — one declaration, no per-view CSS. */
 .project-pane-body {

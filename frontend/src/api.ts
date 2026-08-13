@@ -17,7 +17,10 @@ import type { ConfigCommand } from './types/ConfigCommand'
 import type { ConfigPrice } from './types/ConfigPrice'
 import type { ConfigSpeech } from './types/ConfigSpeech'
 import type { ConfigWatchers } from './types/ConfigWatchers'
+import type { Diagram } from './types/Diagram'
+import type { DiagramEvent } from './types/DiagramEvent'
 import type { DiagramType } from './types/DiagramType'
+import type { DiagramView } from './types/DiagramView'
 import type { DirEntry } from './types/DirEntry'
 import type { DirListing } from './types/DirListing'
 import type { FileContentView } from './types/FileContentView'
@@ -42,9 +45,6 @@ import type { Script } from './types/Script'
 import type { ScriptArg } from './types/ScriptArg'
 import type { ScriptRun } from './types/ScriptRun'
 import type { Status } from './types/Status'
-import type { Storyboard } from './types/Storyboard'
-import type { StoryboardEvent } from './types/StoryboardEvent'
-import type { StoryboardView } from './types/StoryboardView'
 import type { Task } from './types/Task'
 import type { TaskSummary } from './types/TaskSummary'
 import type { Waypoint } from './types/Waypoint'
@@ -562,7 +562,7 @@ export function spawnProjectAgent(
   return request(`/api/projects/${id}/agents`, jsonInit('POST', body))
 }
 
-// ---- storyboards ----
+// ---- diagrams ----
 // The guard middleware requires a JSON Content-Type on every mutating method,
 // so even body-less DELETEs send the header (src/api.rs Requirement 7).
 
@@ -575,22 +575,22 @@ function actorQuery(author?: string): string {
   return author ? `?author=${encodeURIComponent(author)}` : ''
 }
 
-export function listStoryboards(project?: number): Promise<Storyboard[]> {
+export function listDiagrams(project?: number): Promise<Diagram[]> {
   const qs = project !== undefined ? `?project=${project}` : ''
-  return request(`/api/storyboards${qs}`)
+  return request(`/api/diagrams${qs}`)
 }
 
 /** A board's full contents in one object: the board plus its frames and edges. */
-export function getStoryboard(id: number): Promise<StoryboardView> {
-  return request(`/api/storyboards/${id}`)
+export function getDiagram(id: number): Promise<DiagramView> {
+  return request(`/api/diagrams/${id}`)
 }
 
 /** The board's change history (who/what/when), oldest first. */
-export function listStoryboardEvents(id: number): Promise<StoryboardEvent[]> {
-  return request(`/api/storyboards/${id}/events`)
+export function listDiagramEvents(id: number): Promise<DiagramEvent[]> {
+  return request(`/api/diagrams/${id}/events`)
 }
 
-export interface StoryboardCreate {
+export interface DiagramCreate {
   project_id: number
   title: string
   description?: string
@@ -598,26 +598,26 @@ export interface StoryboardCreate {
   diagram_type?: DiagramType
 }
 
-export function createStoryboard(body: StoryboardCreate): Promise<Storyboard> {
-  return request('/api/storyboards', jsonInit('POST', body))
+export function createDiagram(body: DiagramCreate): Promise<Diagram> {
+  return request('/api/diagrams', jsonInit('POST', body))
 }
 
-export interface StoryboardPatch {
+export interface DiagramPatch {
   title?: string
   description?: string | null
 }
 
-export function updateStoryboard(
+export function updateDiagram(
   id: number,
-  patch: StoryboardPatch,
+  patch: DiagramPatch,
   author?: string,
-): Promise<Storyboard> {
-  return request(`/api/storyboards/${id}`, jsonInit('PATCH', { ...patch, author }))
+): Promise<Diagram> {
+  return request(`/api/diagrams/${id}`, jsonInit('PATCH', { ...patch, author }))
 }
 
 /** Returns the destroyed contents: the board plus all cascaded frames/edges. */
-export function deleteStoryboard(id: number): Promise<StoryboardView> {
-  return request(`/api/storyboards/${id}`, jsonDelete())
+export function deleteDiagram(id: number): Promise<DiagramView> {
+  return request(`/api/diagrams/${id}`, jsonDelete())
 }
 
 export interface FrameCreate {
@@ -634,10 +634,10 @@ export interface FrameCreate {
 }
 
 export function createFrame(
-  storyboardId: number,
+  diagramId: number,
   body: FrameCreate,
 ): Promise<Frame> {
-  return request(`/api/storyboards/${storyboardId}/frames`, jsonInit('POST', body))
+  return request(`/api/diagrams/${diagramId}/frames`, jsonInit('POST', body))
 }
 
 export interface FramePatch {
@@ -675,10 +675,10 @@ export interface EdgeCreate {
 }
 
 export function createEdge(
-  storyboardId: number,
+  diagramId: number,
   body: EdgeCreate,
 ): Promise<FrameEdge> {
-  return request(`/api/storyboards/${storyboardId}/edges`, jsonInit('POST', body))
+  return request(`/api/diagrams/${diagramId}/edges`, jsonInit('POST', body))
 }
 
 export interface EdgePatch {

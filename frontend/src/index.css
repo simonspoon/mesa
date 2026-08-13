@@ -32,7 +32,7 @@
      option, but the media query stays in one place. */
   --pty-font-size: 13px;
   /* A project-tab body pane that fills the viewport below the header/tabs/
-     chrome and scrolls internally (storyboard canvas, agents terminal). */
+     chrome and scrolls internally (diagram canvas, agents terminal). */
   --tab-viewport-height: calc(100vh - 18rem);
   --tab-viewport-min: 24rem;
   /* Angular corner cut shared by panels, cards, and buttons. */

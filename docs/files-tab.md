@@ -220,7 +220,7 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   tabs — a left-hand expandable file tree (`.files-tree`, directories
   toggled open/closed in local component state, no deep-linking) and a
   right-hand **content half holding many open files as tabs** (task 670, see
-  its own section below), registered like the Git/Agents/Storyboards tabs (a
+  its own section below), registered like the Git/Agents/Diagrams tabs (a
   boolean `files` route prop threaded `App.tsx` → `ProjectTasksPage.tsx`'s tab
   bar + content switch). The root level loads eagerly with the tab (one
   `getProjectFiles(id)` call); each directory's contents load lazily on
@@ -352,7 +352,7 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   both this tab and markdown fenced code blocks without registering twice or
   growing the bundle. `.md` files render as formatted markdown via the
   existing `Markdown` component (`frontend/src/components/Markdown.tsx`,
-  already used for storyboard frame cards) instead of raw/highlighted text —
+  already used for diagram frame cards) instead of raw/highlighted text —
   safe against untrusted content the same way (no raw HTML passthrough). That
   component carries `remark-gfm` (task 432), so GitHub-flavoured tables,
   strikethrough, task lists and autolinks render as real elements rather than

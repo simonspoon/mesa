@@ -1,29 +1,30 @@
-# Storyboards (freeform visual canvas)
+# Diagrams (freeform visual canvas)
 
-A **storyboard** is a freeform spatial canvas of **frames** (cards at `x/y`) and
+A **diagram** is a freeform spatial canvas of **frames** (cards at `x/y`) and
 directed **frame_edges** between them — a Miro/Excalidraw-lite graph, distinct
-from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
-`storyboard_events` (migration index 4 = the boards, 5 = the change history).
+from the kanban view of tasks. Tables `diagrams`, `frames`, `frame_edges`,
+`diagram_events` (migration index 4 = the boards, 5 = the change history; the
+tables were named `storyboards`/`storyboard_events` until the rename migration).
 
-- A storyboard belongs to a project, immutable after creation (like a task).
+- A diagram belongs to a project, immutable after creation (like a task).
 - A frame may optionally link a task **in the same project** (validated in
   `Store`); the link is `ON DELETE SET NULL`, so deleting the task clears it.
 - Edges connect two frames **of the same board**; self-edges are rejected
-  (`validation`). **Cycles are allowed** — a storyboard is a diagram, not a
+  (`validation`). **Cycles are allowed** — a diagram is a picture, not a
   dependency graph, so there is deliberately no `would_cycle` check here.
-- **Every storyboard/frame/edge mutation appends a `storyboard_events` row**
+- **Every diagram/frame/edge mutation appends a `diagram_events` row**
   (the change history) inside the same transaction: `actor` (free-text "who"),
   a stable `action` token, and a human `summary`. This is the collaboration
-  record. `delete_storyboard` cascades frames/edges/events and writes no event
+  record. `delete_diagram` cascades frames/edges/events and writes no event
   (the history dies with the board; the delete echo is the recoverable record).
-- CLI: `mesa storyboard {create,list,show,update,delete,events}` plus nested
-  `mesa storyboard frame {create,update,delete}` and `mesa storyboard edge
-  {create,update,delete}` — frame/edge subcommands live under `storyboard`,
+- CLI: `mesa diagram {create,list,show,update,delete,events}` plus nested
+  `mesa diagram frame {create,update,delete}` and `mesa diagram edge
+  {create,update,delete}` — frame/edge subcommands live under `diagram`,
   not as top-level `mesa frame`/`mesa edge` commands. `show`/`delete` print
-  the full `{storyboard, frames, edges}` view; `frame delete` echoes `{frame,
+  the full `{diagram, frames, edges}` view; `frame delete` echoes `{frame,
   edges}`; `events` prints the change log. Mutating commands take `--author`
   for attribution.
-- API: `/api/storyboards` CRUD, `/api/storyboards/{id}/{frames,edges,events}`,
+- API: `/api/diagrams` CRUD, `/api/diagrams/{id}/{frames,edges,events}`,
   `/api/frames/{id}` (PATCH/DELETE), `/api/edges/{id}` (GET/PATCH/DELETE).
   Mutations attribute via an `author` body field (POST/PATCH) or `?author=`
   query (DELETE); it sets the change actor and never mutates an entity's own
@@ -36,13 +37,13 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   (never `null`), ordered from the `from_frame` end to the `to_frame` end.
   `EdgePatch`/`EdgeUpdate` gain a matching `waypoints: Option<Vec<Waypoint>>`
   field (`Store::update_edge`/API `update_edge` handler); a PATCH that changes
-  it logs a `"edge_rerouted"` storyboard event (mirrors `edge_relabeled`) in
+  it logs a `"edge_rerouted"` diagram event (mirrors `edge_relabeled`) in
   the same transaction. No CLI flag for authoring waypoints — `show`/`delete`
   round-trip the field automatically as a struct member. An edge with an empty
   waypoint list renders byte-identical to before this feature (plain
   `nearestAnchor`/`getBezierPath` bezier between the two frames); one or more
   waypoints routes the path through them in order via
-  `buildRoutedPath(from, to, waypoints)` in `frontend/src/StoryboardCanvas.tsx`
+  `buildRoutedPath(from, to, waypoints)` in `frontend/src/DiagramCanvas.tsx`
   (returns `{ path, anchors, mid }`, `anchors` = `[start, ...waypoints, end]`
   in absolute canvas coordinates — the seam the interactive layer builds on),
   with the start/end anchors snapping toward the first/last waypoint instead
@@ -90,7 +91,7 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   serde boundary, mapped to a 422 `validation` error the same way an invalid
   `status`/`priority` literal is today; there is no separate `Store`-level
   check. A PATCH that actually changes either anchor logs a single
-  `"edge_anchor_changed"` storyboard event (checked first in
+  `"edge_anchor_changed"` diagram event (checked first in
   `Store::update_edge`'s one-event-per-call priority, ahead of
   `edge_rerouted`/`edge_relabeled`) naming which end(s) changed and to/from
   which side; a patch that re-asserts the already-locked side (or otherwise
@@ -117,7 +118,7 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   only the topmost was ever clickable — the other could never be selected,
   relabeled, or deleted. `buildRoutedPath` now takes a `dupOffset` (px,
   signed): edges sharing an unordered frame pair (`parallelOffsets` in
-  `StoryboardCanvas.tsx`, keyed by edge id) fan out evenly around the straight
+  `DiagramCanvas.tsx`, keyed by edge id) fan out evenly around the straight
   line via a perpendicular bow (rendered through the existing `smoothPath`
   spline machinery, `anchors` unchanged at `[start, end]` so waypoint
   insertion/handle rendering aren't affected). A lone edge between its two
@@ -125,21 +126,24 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   an edge with real waypoints already diverges naturally, so `dupOffset` is
   only applied in the plain-bezier (no-waypoints) branch.
 - **Diagram types + per-frame shapes** (spec 355; `brainstorm` added by mesa
-  task 444): a storyboard carries a
-  `diagram_type` (`Storyboard.diagram_type: DiagramType`) — `storyboard`
+  task 444): a diagram carries a
+  `diagram_type` (`Diagram.diagram_type: DiagramType`) — `storyboard`
   (default), `flowchart`, `erd`, or `brainstorm` — stored as a **bare
   lowercase string**
   (`as_str()`/`parse()`, same convention as `AnchorSide`/`Status`/`Priority`),
   added via migration index 17 alongside `frames.shape` (`ALTER TABLE
   storyboards ADD COLUMN diagram_type TEXT NOT NULL DEFAULT 'storyboard'` /
   `ALTER TABLE frames ADD COLUMN shape TEXT`, one migration entry, no new
-  table). Every pre-feature storyboard backfills to `diagram_type:
-  "storyboard"` for free via the column default; every pre-feature frame's
-  `shape` reads back `null`.
+  table — that shipped migration keeps the table's old name verbatim; the
+  rename migration comes later). Note the surviving vocabulary: the
+  *container* is a diagram, but `storyboard` remains one of its **types** —
+  the plain freeform style, and the column default — so every pre-feature
+  board backfills to `diagram_type: "storyboard"` for free; every pre-feature
+  frame's `shape` reads back `null`.
   - **`diagram_type` is immutable after creation** — the same structural
     posture as `project_id`/`author`: there is no field for it on
-    `StoryboardPatch`/the API's `StoryboardUpdate`, so there is no runtime
-    guard to bypass. `storyboard update --type ...` doesn't exist as a flag;
+    `DiagramPatch`/the API's `DiagramUpdate`, so there is no runtime
+    guard to bypass. `diagram update --type ...` doesn't exist as a flag;
     passing one is a clap **usage error (exit 2)**, not a domain `validation`
     error, because the patch type has no path to carry the value.
   - Each frame carries its own **`shape: Option<FrameShape>`** —
@@ -150,8 +154,8 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     `FrameNew.shape`. `Store::create_frame` validates the given shape against
     the parent board's `diagram_type` via `validate_frame_shape`
     (`src/core/store.rs`), reading `diagram_type` off the same
-    `get_storyboard` call `create_frame` already makes (no extra query):
-    a `storyboard` board's frames must have `shape: None`; a `flowchart`
+    `get_diagram` call `create_frame` already makes (no extra query):
+    a `storyboard`-type board's frames must have `shape: None`; a `flowchart`
     board's frames must be one of `process`/`decision`/`start_end` (not
     `entity`); an `erd` board's frames must be `entity` (not any flowchart
     shape); a `brainstorm` board's frames must be `central` or `idea`. A
@@ -164,36 +168,36 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
   - **`shape` is likewise immutable after creation** — no field on
     `FramePatch`/the API's `FrameUpdate`, mirroring `diagram_type`'s
     reasoning: a frame should never carry a shape from the "wrong" type
-    system, and no story needs to re-shape a frame in place. `storyboard
+    system, and no story needs to re-shape a frame in place. `diagram
     frame update --shape ...` doesn't exist as a flag; same clap usage-error
-    posture as `storyboard update --type`.
-  - CLI: `storyboard create <PROJECT> <TITLE> [--type
+    posture as `diagram update --type`.
+  - CLI: `diagram create <PROJECT> <TITLE> [--type
     storyboard|flowchart|erd|brainstorm]` (absent → `storyboard`, the column default;
     an unrecognized value is a clap usage error, exit 2, same posture as
-    `--priority`). `storyboard frame create <STORYBOARD> <TITLE> [--shape
+    `--priority`). `diagram frame create <DIAGRAM> <TITLE> [--shape
     process|decision|start_end|entity|central|idea]` (absent → `None`; an unrecognized
     value is a clap usage error, exit 2; a syntactically valid value that's
     wrong for the board's `diagram_type` is the `Store` `validation` error
     above, exit 1 — the CLI does not auto-correct or default a shape for a
     non-`storyboard` board, it just passes what it's given through to
-    `Store`). Neither `storyboard update` nor `storyboard frame update` gets
-    a corresponding flag (immutability, above). `storyboard show`/`list`/
+    `Store`). Neither `diagram update` nor `diagram frame update` gets
+    a corresponding flag (immutability, above). `diagram show`/`list`/
     `delete` and `frame` reads need no CLI change — they already print the
-    full `Storyboard`/`Frame`/`StoryboardView` object, so `diagram_type`/
+    full `Diagram`/`Frame`/`DiagramView` object, so `diagram_type`/
     `shape` ride for free once the struct fields exist.
-  - API: `POST /api/storyboards` accepts `#[serde(default)] diagram_type:
+  - API: `POST /api/diagrams` accepts `#[serde(default)] diagram_type:
     Option<DiagramType>` in the request body (missing/`null` → `storyboard`);
-    `POST /api/storyboards/{id}/frames` accepts `#[serde(default)] shape:
-    Option<FrameShape>` (missing/`null` → `None`). Neither `StoryboardUpdate`
+    `POST /api/diagrams/{id}/frames` accepts `#[serde(default)] shape:
+    Option<FrameShape>` (missing/`null` → `None`). Neither `DiagramUpdate`
     nor `FrameUpdate` gains a field. A syntactically-invalid string for
     either (e.g. `"diagram_type": "bogus"`) fails to deserialize at the serde
     boundary → the existing `JsonRejection` 422 `validation` path, same as an
     invalid `AnchorSide` literal on `EdgeUpdate` today. A syntactically-valid but
     wrong-for-board-type shape is the same `Store` `validation` error as the
-    CLI path. Every `Storyboard`/`Frame`/`StoryboardView` response (create,
+    CLI path. Every `Diagram`/`Frame`/`DiagramView` response (create,
     show, list, embedded in the board view) carries `diagram_type`/`shape`
     automatically — it's the same struct, not a projection.
-  - Frontend node types (`frontend/src/StoryboardCanvas.tsx`): React Flow's
+  - Frontend node types (`frontend/src/DiagramCanvas.tsx`): React Flow's
     per-node `type` is keyed off `Frame.shape`, not `diagram_type` —
     `diagram_type` only selects which shape *set* the creation UX offers.
     `toNodes` sets `type: (f.shape ?? 'frame') as FrameNodeKind`; `nodeTypes`
@@ -264,18 +268,18 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
       task 445 fixed it by adopting these same 32px/1.1rem values, so the
       two shapes now share one treatment. Nothing enforces one `central`
       per board — a brainstorm
-      board is as freeform as every other storyboard, and the styling is the
+      board is as freeform as every other diagram, and the styling is the
       only thing that says "hub", exactly as the flowchart shapes only *look*
       like their roles. `SHAPES_FOR_TYPE.brainstorm` lists `idea` *before*
       `central` on purpose: the first entry doubles as the `defaultShape` for
       the quick-create gestures (pane double-click, drag-to-empty-canvas,
       Cmd+D duplicate), and those should mint a branch idea rather than a
       second hub.
-  - Frontend creation UX: `StoryboardListView.tsx`'s new-storyboard form adds
+  - Frontend creation UX: `DiagramListView.tsx`'s new-diagram form adds
     a `diagram_type` `<select>` (options
     `storyboard`/`flowchart`/`erd`/`brainstorm`, default `storyboard`) next to title/author, passed straight through to
-    `createStoryboard(...)`. `StoryboardCanvas.tsx`'s add-frame toolbar reads
-    `SHAPES_FOR_TYPE[view.storyboard.diagram_type]` (`storyboard: []`,
+    `createDiagram(...)`. `DiagramCanvas.tsx`'s add-frame toolbar reads
+    `SHAPES_FOR_TYPE[view.diagram.diagram_type]` (`storyboard: []`,
     `flowchart: ['process','decision','start_end']`, `erd: ['entity']`,
     `brainstorm: ['idea','central']` — kept
     in lockstep with `Store::validate_frame_shape`) to decide what to render:
@@ -305,7 +309,7 @@ from the kanban view of tasks. Tables `storyboards`, `frames`, `frame_edges`,
     out of the body textarea.
     `Store::create_frame` writes `added untitled frame (#N)` rather than
     `added frame '' (#N)` for the now-common empty title, keeping the
-    storyboard history readable. It otherwise has no
+    diagram history readable. It otherwise has no
     non-empty-title check, so an empty title is a legal stored value;
     `saveTitle` still refuses to *overwrite* a title with an empty one, and
     read mode renders a muted `untitled` for `f.title.trim() === ''` so an

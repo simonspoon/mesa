@@ -31,7 +31,7 @@ instead of navigating to `#/projects/:id/create-task`. That route renders the
 **Board** underneath the form, which is the right landing place for the command
 palette's "Create task in &lt;project&gt;" entry (its only remaining caller) and
 exactly the wrong one for this shortcut — a task written while reading a file,
-a diff or a storyboard would have thrown away the thing it was about. The
+a diff or a diagram would have thrown away the thing it was about. The
 in-place modal leaves the view untouched, and is draggable and lightly dimmed
 for the same reason (`modalDrag.ts`, `CreateTaskModal.tsx`).
 
@@ -47,7 +47,7 @@ not a substitute.
 The listener is bound app-wide with no view check, because
 `shouldIgnoreShortcut` already answers the question every non-Board view would
 have asked: the Files editor and the new-file row are text controls (rule 2),
-the Terminal tab's panes are xterm (rule 3), a storyboard canvas suppresses
+the Terminal tab's panes are xterm (rule 3), a diagram canvas suppresses
 everything (rule 4). Do not re-add a per-view gate on top of it — that is the
 divergent second suppression check the chokepoint exists to prevent.
 
@@ -70,7 +70,7 @@ Returns `true` (suppress) for, in order:
    option-cycling/type-ahead win.
 3. `e.target.closest('.xterm, .agent-terminal')` — xterm panes read real
    `keydown` events.
-4. A storyboard canvas is mounted anywhere on the page (`.storyboard`) — it
+4. A diagram canvas is mounted anywhere on the page (`.diagram`) — it
    owns its own key handling and is its own spatial surface.
 5. A modal that owns its own key handling is open
    (`.create-task-backdrop`, `.command-palette-backdrop`).
@@ -250,7 +250,7 @@ Two independent `window` `keydown` listeners with disjoint key sets, mounted
 side by side in `App.tsx`: the pre-existing `useCommandPaletteShortcut`
 (Cmd/Ctrl+Shift+P) and `useSpatialNav()`. The `a` shortcut is a third,
 mounted inside `ProjectTasksPage` and gated on the Board view, so it is inert
-by construction on Storyboards/Git/Files/Dashboard — no route-string
+by construction on Diagrams/Git/Files/Dashboard — no route-string
 comparison involved.
 
 ## Verifying changes here

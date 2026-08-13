@@ -16,7 +16,7 @@ describe('projectTabFromPath', () => {
   it('maps each project tab route to its tab', () => {
     expect(projectTabFromPath('/projects/7')).toBe('board')
     expect(projectTabFromPath('/projects/7/dashboard')).toBe('dashboard')
-    expect(projectTabFromPath('/projects/7/storyboards')).toBe('storyboards')
+    expect(projectTabFromPath('/projects/7/diagrams')).toBe('diagrams')
     expect(projectTabFromPath('/projects/7/git')).toBe('git')
     expect(projectTabFromPath('/projects/7/files')).toBe('files')
     expect(projectTabFromPath('/projects/7/terminal')).toBe('terminal')
@@ -24,7 +24,7 @@ describe('projectTabFromPath', () => {
   })
 
   it('remembers the tab, never the deep id', () => {
-    expect(projectTabFromPath('/projects/7/storyboards/3')).toBe('storyboards')
+    expect(projectTabFromPath('/projects/7/diagrams/3')).toBe('diagrams')
     expect(projectTabFromPath('/projects/7/tasks/12')).toBe('board')
     expect(projectTabFromPath('/projects/7/create-task')).toBe('board')
   })
@@ -40,9 +40,9 @@ describe('projectViewFromPath', () => {
   it('keeps the project id alongside the tab', () => {
     expect(projectViewFromPath('/projects/7')).toEqual({ id: 7, tab: 'board' })
     expect(projectViewFromPath('/projects/9/files')).toEqual({ id: 9, tab: 'files' })
-    expect(projectViewFromPath('/projects/12/storyboards/3')).toEqual({
+    expect(projectViewFromPath('/projects/12/diagrams/3')).toEqual({
       id: 12,
-      tab: 'storyboards',
+      tab: 'diagrams',
     })
     expect(projectViewFromPath('/projects/7/tasks/12')).toEqual({ id: 7, tab: 'board' })
   })
@@ -139,8 +139,8 @@ describe('hrefs', () => {
     expect(projectHref(7)).toBe('#/projects/7')
     rememberView('/projects/7/files')
     expect(projectHref(7)).toBe('#/projects/7/files')
-    rememberView('/projects/7/storyboards/3')
-    expect(projectHref(7)).toBe('#/projects/7/storyboards')
+    rememberView('/projects/7/diagrams/3')
+    expect(projectHref(7)).toBe('#/projects/7/diagrams')
   })
 
   it('emits #/cc for overview, the sub-tab otherwise', () => {

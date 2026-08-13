@@ -1,7 +1,7 @@
 // The folder the new-project picker last confirmed with "use this folder".
 // Reopening the picker starts there instead of the server's $HOME — most new
 // projects live beside the previous one, so $HOME is rarely the useful floor
-// after the first time. Machine-local (localStorage), like the storyboard
+// after the first time. Machine-local (localStorage), like the diagram
 // view state and author name: it's a per-browser convenience, never project
 // or server data.
 

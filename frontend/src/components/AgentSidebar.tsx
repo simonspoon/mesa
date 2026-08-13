@@ -779,7 +779,7 @@ export function AgentSidebar({
   const [width, setWidth] = useState(DEFAULT_AGENT_SIDEBAR_WIDTH)
   const [resizing, setResizing] = useState(false)
   // Maximized: the panel grows to fill the whole main content area (in place
-  // of the fixed drag-resized width), matching the storyboard canvas's own
+  // of the fixed drag-resized width), matching the diagram canvas's own
   // takeover-view expand toggle. Distinct from `collapsed` — maximized only
   // has an effect while the panel isn't collapsed.
   const [maximized, setMaximized] = useState(false)
@@ -851,7 +851,7 @@ export function AgentSidebar({
   )
 
   // Escape leaves maximized mode — the usual way out of a takeover view,
-  // same convention as the storyboard canvas. Only bound while maximized so
+  // same convention as the diagram canvas. Only bound while maximized so
   // it never swallows Escape elsewhere.
   useEffect(() => {
     if (!maximized) return

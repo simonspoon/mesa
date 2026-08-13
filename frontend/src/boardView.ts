@@ -66,14 +66,14 @@ export function capColumn<T>(
 }
 
 // Per-board canvas view state (pan + zoom), persisted browser-local so each
-// storyboard reopens at the pan/zoom the user left it. This lives only on the
+// diagram reopens at the pan/zoom the user left it. This lives only on the
 // user's machine (localStorage), keyed by board id — never on the board/server
 // and never shared across devices, matching the author-id pattern in author.ts.
 
-const KEY = (storyboardId: number) => `mesa-board-view-${storyboardId}`
+const KEY = (diagramId: number) => `mesa-board-view-${diagramId}`
 
 /** The pan/zoom transform applied to the canvas content layer. Mirrors the
- *  `ViewTransform` shape in StoryboardCanvas; kept structural so a saved view
+ *  `ViewTransform` shape in DiagramCanvas; kept structural so a saved view
  *  round-trips unchanged. */
 export type BoardView = {
   tx: number
@@ -84,8 +84,8 @@ export type BoardView = {
 /** Load the saved view for a board, or null if none is stored / it is
  *  unreadable. Validates the shape so a corrupt entry falls back to the
  *  default rather than throwing. */
-export function loadBoardView(storyboardId: number): BoardView | null {
-  const raw = localStorage.getItem(KEY(storyboardId))
+export function loadBoardView(diagramId: number): BoardView | null {
+  const raw = localStorage.getItem(KEY(diagramId))
   if (raw === null) return null
   try {
     const v = JSON.parse(raw) as unknown
@@ -104,6 +104,6 @@ export function loadBoardView(storyboardId: number): BoardView | null {
   return null
 }
 
-export function saveBoardView(storyboardId: number, view: BoardView): void {
-  localStorage.setItem(KEY(storyboardId), JSON.stringify(view))
+export function saveBoardView(diagramId: number, view: BoardView): void {
+  localStorage.setItem(KEY(diagramId), JSON.stringify(view))
 }

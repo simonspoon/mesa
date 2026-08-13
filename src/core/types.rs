@@ -102,7 +102,7 @@ pub struct Project {
     pub sort_order: f64,
     /// Parent project (task 668), or `null` at top level. A pure **grouping**
     /// relation: the left nav renders the result as a tree, and nothing rolls
-    /// up — a child keeps its own tasks, storyboards, `root_commit` and
+    /// up — a child keeps its own tasks, diagrams, `root_commit` and
     /// `local_path`. Arbitrary depth; `Store` rejects self-parenting and any
     /// cycle. The one place it changes behaviour beyond display is visibility:
     /// an unscoped read hides a project iff it is archived **or any ancestor
@@ -679,8 +679,8 @@ mod task_name_tests {
     }
 }
 
-/// A storyboard's diagram style, chosen at creation and immutable thereafter
-/// (no field on `StoryboardPatch` — the same structural-immutability posture
+/// A diagram's style, chosen at creation and immutable thereafter
+/// (no field on `DiagramPatch` — the same structural-immutability posture
 /// as `project_id`/`author`). Picks the shape set offered for its frames: a
 /// `storyboard` board takes the generic frame card, a `flowchart` board takes
 /// `process`/`decision`/`start_end` node shapes, an `erd` board takes only the
@@ -760,7 +760,7 @@ impl FrameShape {
     }
 }
 
-/// A visual storyboard: a freeform spatial canvas of frames (cards) and the
+/// A visual diagram: a freeform spatial canvas of frames (cards) and the
 /// directed edges between them. Belongs to a project, fixed at creation (like a
 /// task). `author` is a free-text actor id — an agent name or "user" — naming
 /// who created the board. Collaboration is asynchronous and attribution-based:
@@ -768,7 +768,7 @@ impl FrameShape {
 /// auth, and no locking (consistent with the rest of mesa).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
-pub struct Storyboard {
+pub struct Diagram {
     #[ts(type = "number")]
     pub id: i64,
     #[ts(type = "number")]
@@ -785,7 +785,7 @@ pub struct Storyboard {
     pub updated_at: String,
 }
 
-/// One card on a storyboard, positioned freely on the canvas. `x`/`y` are the
+/// One card on a diagram, positioned freely on the canvas. `x`/`y` are the
 /// top-left corner and `w`/`h` the size, in abstract canvas units the web
 /// renders as pixels. `body` is free text (markdown by convention). `task_id`
 /// optionally links the frame to an existing task in the *same project* — a
@@ -796,7 +796,7 @@ pub struct Frame {
     #[ts(type = "number")]
     pub id: i64,
     #[ts(type = "number")]
-    pub storyboard_id: i64,
+    pub diagram_id: i64,
     pub title: String,
     pub body: Option<String>,
     pub x: f64,
@@ -860,9 +860,9 @@ impl AnchorSide {
     }
 }
 
-/// A directed connection from one frame to another on the same storyboard.
-/// Unlike task dependencies, storyboard edges may form cycles freely — a
-/// storyboard is a freeform diagram, not a dependency graph. Self-edges
+/// A directed connection from one frame to another on the same diagram.
+/// Unlike task dependencies, diagram edges may form cycles freely — a
+/// diagram is a freeform diagram, not a dependency graph. Self-edges
 /// (`from_frame == to_frame`) are the only rejected shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -870,7 +870,7 @@ pub struct FrameEdge {
     #[ts(type = "number")]
     pub id: i64,
     #[ts(type = "number")]
-    pub storyboard_id: i64,
+    pub diagram_id: i64,
     #[ts(type = "number")]
     pub from_frame: i64,
     #[ts(type = "number")]
@@ -891,13 +891,13 @@ pub struct FrameEdge {
     pub to_anchor: Option<AnchorSide>,
 }
 
-/// The full contents of one storyboard: the board plus all of its frames and
+/// The full contents of one diagram: the board plus all of its frames and
 /// edges. Returned by `show` and echoed by `delete`, so a client renders (or
 /// recovers) an entire canvas from a single object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
-pub struct StoryboardView {
-    pub storyboard: Storyboard,
+pub struct DiagramView {
+    pub diagram: Diagram,
     pub frames: Vec<Frame>,
     pub edges: Vec<FrameEdge>,
 }
@@ -1815,18 +1815,18 @@ pub struct CcUsageExtra {
     pub currency: String,
 }
 
-/// One entry in a storyboard's append-only change history. `actor` is the
+/// One entry in a diagram's append-only change history. `actor` is the
 /// free-text id of whoever made the change (an agent name or "user"); it is the
 /// collaboration record — who did what, when. `action` is a stable machine
 /// token (e.g. `frame_added`, `frame_moved`, `edge_added`); `summary` is a
 /// human-readable one-liner for the web history view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
-pub struct StoryboardEvent {
+pub struct DiagramEvent {
     #[ts(type = "number")]
     pub id: i64,
     #[ts(type = "number")]
-    pub storyboard_id: i64,
+    pub diagram_id: i64,
     pub actor: Option<String>,
     pub action: String,
     pub summary: String,

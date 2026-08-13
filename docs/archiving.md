@@ -17,7 +17,7 @@ its own account stays archived, because its own flag still says so.
 
 One shared recursive-CTE predicate (`HIDDEN_PROJECTS_CTE` /
 `NOT_HIDDEN_PROJECT` in `src/core/store.rs`) implements it at every unscoped
-site — `list_projects`, `list_tasks`, `next_task`, `list_storyboards`, and so
+site — `list_projects`, `list_tasks`, `next_task`, `list_diagrams`, and so
 the todo watcher and `GET /api/git-status` that read through them. It is
 defined once on purpose: four hand-copied CTEs would be four chances for
 "archived" to mean something slightly different.
@@ -45,17 +45,17 @@ parent**.
   simply stops seeing archived projects — which is how the watcher and
   git-status decoration both skip them with no edit of their own.
 
-## Tasks and storyboards follow the same rule
+## Tasks and diagrams follow the same rule
 
 `Store::list_tasks` gained the `project: Option<i64>` argument its siblings
-(`next_task`, `list_storyboards`) already had. All three share one rule:
+(`next_task`, `list_diagrams`) already had. All three share one rule:
 `Some(id)` returns that project's rows regardless of `archived` (a scoped read of
 an archived project is byte-identical to before archiving), `None` excludes rows
 whose project is hidden — archived or under an archived ancestor — via an inner
 join on `projects` plus the shared hidden-projects CTE.
 
-`mesa task list`, `mesa task next`, `GET /api/tasks`, `mesa storyboard list` and
-`GET /api/storyboards` all resolve their project id/name once and pass it
+`mesa task list`, `mesa task next`, `GET /api/tasks`, `mesa diagram list` and
+`GET /api/diagrams` all resolve their project id/name once and pass it
 straight into the same `Store` call — the CLI and API no longer re-implement the
 project filter as a handler-side `.filter(...)`, closing the divergence risk
 structurally rather than by discipline.

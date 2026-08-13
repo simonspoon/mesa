@@ -8,7 +8,7 @@
 //! - `--quiet` (opt-in, long form only) swaps that full object for the compact
 //!   projection — the record minus its unbounded free-text fields, the same
 //!   bounded shape `task list` already emits. Accepted on every mutation and
-//!   `show`/`get` in `project`, `task`, `storyboard` (+ `frame`, `edge`),
+//!   `show`/`get` in `project`, `task`, `diagram` (+ `frame`, `edge`),
 //!   `inbox` and `script`; composites keep their key structure and compact
 //!   their members.
 //!   Default output is unchanged. On a `delete` it waives the full echo, which
@@ -24,9 +24,9 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    DiagramType, EdgePatch, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    InboxItem, InboxKind, NextResult, Priority, Project, ProjectPatch, Result, Script, ScriptArg,
-    ScriptArgKind, ScriptPatch, Status, Store, Storyboard, StoryboardPatch, StoryboardView, Task,
+    Diagram, DiagramPatch, DiagramType, DiagramView, EdgePatch, Error, Frame, FrameEdge, FrameNew,
+    FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind, NextResult, Priority, Project,
+    ProjectPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
     TaskPatch,
 };
 
@@ -41,7 +41,7 @@ OUTPUT
   --quiet (opt-in, long form only; no -q) prints the COMPACT projection
   instead — the record minus its unbounded free-text fields; for a task that
   is exactly the bounded shape `task list` already emits. Accepted on every
-  mutation and `show`/`get` in `project`, `task`, `storyboard` (+ `frame`,
+  mutation and `show`/`get` in `project`, `task`, `diagram` (+ `frame`,
   `edge`), `inbox` and `script`; composite payloads keep their key structure and
   compact their members. It changes stdout only — never exit codes, stderr or
   stored data — and default output is byte-identical to before the flag
@@ -89,9 +89,9 @@ enum Command {
     /// Create, list, inspect, update, delete, and (un)block tasks
     #[command(subcommand)]
     Task(TaskCmd),
-    /// Create and edit visual storyboards (frames + connecting edges)
+    /// Create and edit visual diagrams (frames + connecting edges)
     #[command(subcommand)]
-    Storyboard(StoryboardCmd),
+    Diagram(DiagramCmd),
     /// Send and triage global inbox items (project-update requests)
     #[command(subcommand)]
     Inbox(InboxCmd),
@@ -286,7 +286,7 @@ EXAMPLES
     /// Delete a project, its subprojects AND all their tasks (no confirmation)
     ///
     /// Cascades immediately over the whole subtree — every descendant project,
-    /// its tasks and its storyboards go too. The output echoes the deleted
+    /// its tasks and its diagrams go too. The output echoes the deleted
     /// project, the destroyed `subprojects` and every cascaded task in full, so
     /// the transcript is a recoverable record. Take `mesa backup <path>` first
     /// if you want a safety net.
@@ -1248,28 +1248,28 @@ EXAMPLES
 }
 
 #[derive(Subcommand)]
-enum StoryboardCmd {
-    /// Create a storyboard in a project; prints the full created storyboard
+enum DiagramCmd {
+    /// Create a diagram in a project; prints the full created diagram
     /// (`--quiet`: without its `description`)
     ///
-    /// A storyboard belongs to exactly one project, fixed at creation. It is a
+    /// A diagram belongs to exactly one project, fixed at creation. It is a
     /// freeform canvas of frames (cards) and the edges between them; add those
-    /// with `storyboard frame create` and `storyboard edge create`.
+    /// with `diagram frame create` and `diagram edge create`.
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard create 1 \"Onboarding flow\"
-  mesa storyboard create mesa \"Checkout\" --author agent-7")]
+  mesa diagram create 1 \"Onboarding flow\"
+  mesa diagram create mesa \"Checkout\" --author agent-7")]
     Create {
-        /// Project the storyboard belongs to, by id or name (immutable after creation)
+        /// Project the diagram belongs to, by id or name (immutable after creation)
         #[arg(value_name = "PROJECT", required_unless_present = "project")]
         project_pos: Option<String>,
-        /// Storyboard title
+        /// Diagram title
         #[arg(value_name = "TITLE", required_unless_present = "title")]
         title_pos: Option<String>,
         /// Project, by id or name (flag form of PROJECT)
         #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
-        /// Storyboard title (flag form of TITLE)
+        /// Diagram title (flag form of TITLE)
         #[arg(long, allow_hyphen_values = true, conflicts_with = "title_pos")]
         title: Option<String>,
         /// Optional free-text description
@@ -1277,43 +1277,43 @@ EXAMPLES
         description: Option<String>,
         /// Diagram type: storyboard|flowchart|erd|brainstorm (default
         /// storyboard); immutable after creation — no --type on
-        /// `storyboard update`
+        /// `diagram update`
         #[arg(long = "type", value_parser = parse_diagram_type)]
         diagram_type: Option<DiagramType>,
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
-        /// Print the storyboard without its `description` instead of the full object
+        /// Print the diagram without its `description` instead of the full object
         #[arg(long)]
         quiet: bool,
     },
-    /// List storyboards as a bare JSON array (no frames/edges; use `show`)
+    /// List diagrams as a bare JSON array (no frames/edges; use `show`)
     List {
-        /// Only storyboards in this project (id or name)
+        /// Only diagrams in this project (id or name)
         #[arg(value_name = "PROJECT")]
         project_pos: Option<String>,
-        /// Only storyboards in this project (id or name); flag form of [PROJECT]
+        /// Only diagrams in this project (id or name); flag form of [PROJECT]
         #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
     },
-    /// Print a storyboard's full contents: {storyboard, frames, edges}
+    /// Print a diagram's full contents: {diagram, frames, edges}
     #[command(visible_alias = "get")]
     Show {
-        /// Storyboard id
+        /// Diagram id
         id: i64,
-        /// Keep the {storyboard, frames, edges} keys but drop each member's
-        /// free text (the storyboard's `description`, every frame's `body`)
+        /// Keep the {diagram, frames, edges} keys but drop each member's
+        /// free text (the diagram's `description`, every frame's `body`)
         #[arg(long)]
         quiet: bool,
     },
-    /// Update a storyboard's title/description; prints the full storyboard
+    /// Update a diagram's title/description; prints the full diagram
     /// (`--quiet`: without its `description`)
     ///
     /// Only the flags you pass change; at least one is required. The project
     /// and author are immutable. `--description ""` clears the description.
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
-        /// Storyboard id
+        /// Diagram id
         id: i64,
         /// New title
         #[arg(long, group = "fields")]
@@ -1324,7 +1324,7 @@ EXAMPLES
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
-        /// Print the storyboard without its `description` instead of the full
+        /// Print the diagram without its `description` instead of the full
         /// object
         ///
         /// Deliberately outside the `fields` group: it is a modifier, so
@@ -1333,13 +1333,13 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Delete a storyboard AND all its frames and edges (no confirmation)
+    /// Delete a diagram AND all its frames and edges (no confirmation)
     ///
     /// Cascades immediately, including the change history. The output echoes the
-    /// full destroyed contents ({storyboard, frames, edges}) so the transcript
+    /// full destroyed contents ({diagram, frames, edges}) so the transcript
     /// is a recoverable record.
     Delete {
-        /// Storyboard id
+        /// Diagram id
         id: i64,
         /// Echo the destroyed view with each member's free text dropped
         ///
@@ -1348,18 +1348,18 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Print a storyboard's change history as a JSON array, oldest first
+    /// Print a diagram's change history as a JSON array, oldest first
     ///
-    /// Each row records one change — who, what, when: {id, storyboard_id, actor,
-    /// action, summary, at}. `action` is a stable token (storyboard_created,
-    /// storyboard_edited, frame_added, frame_moved, frame_edited, frame_removed,
+    /// Each row records one change — who, what, when: {id, diagram_id, actor,
+    /// action, summary, at}. `action` is a stable token (diagram_created,
+    /// diagram_edited, frame_added, frame_moved, frame_edited, frame_removed,
     /// edge_added, edge_relabeled, edge_rerouted, edge_anchor_changed,
     /// edge_removed). This is the collaboration record across agents and users.
     Events {
-        /// Storyboard id
+        /// Diagram id
         id: i64,
     },
-    /// Create, update, and delete frames (cards) on a storyboard
+    /// Create, update, and delete frames (cards) on a diagram
     #[command(subcommand)]
     Frame(FrameCmd),
     /// Create, update, and delete edges (connections) between frames
@@ -1369,7 +1369,7 @@ EXAMPLES
 
 #[derive(Subcommand)]
 enum FrameCmd {
-    /// Add a frame to a storyboard; prints the full created frame (`--quiet`:
+    /// Add a frame to a diagram; prints the full created frame (`--quiet`:
     /// without its `body`)
     ///
     /// Position (--x/--y) and size (--w/--h) are abstract canvas units the web
@@ -1377,18 +1377,18 @@ enum FrameCmd {
     /// project (a soft reference, cleared if that task is later deleted).
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard frame create 1 \"Land on home\" --x 40 --y 40
-  mesa storyboard frame create 1 \"Sign up\" --task 7 --color '#ff2bd6'")]
+  mesa diagram frame create 1 \"Land on home\" --x 40 --y 40
+  mesa diagram frame create 1 \"Sign up\" --task 7 --color '#ff2bd6'")]
     Create {
-        /// Storyboard the frame belongs to (immutable after creation)
-        #[arg(value_name = "STORYBOARD", required_unless_present = "storyboard")]
-        storyboard_pos: Option<i64>,
+        /// Diagram the frame belongs to (immutable after creation)
+        #[arg(value_name = "DIAGRAM", required_unless_present = "diagram")]
+        diagram_pos: Option<i64>,
         /// Frame title
         #[arg(value_name = "TITLE", required_unless_present = "title")]
         title_pos: Option<String>,
-        /// Storyboard id (flag form of STORYBOARD)
-        #[arg(long, conflicts_with = "storyboard_pos")]
-        storyboard: Option<i64>,
+        /// Diagram id (flag form of DIAGRAM)
+        #[arg(long, conflicts_with = "diagram_pos")]
+        diagram: Option<i64>,
         /// Frame title (flag form of TITLE)
         #[arg(long, allow_hyphen_values = true, conflicts_with = "title_pos")]
         title: Option<String>,
@@ -1410,14 +1410,14 @@ EXAMPLES
         /// Optional colour hint (a CSS colour, e.g. '#00e5ff')
         #[arg(long)]
         color: Option<String>,
-        /// Optional task id to link (must be in the storyboard's project)
+        /// Optional task id to link (must be in the diagram's project)
         #[arg(long)]
         task: Option<i64>,
         /// Node shape, required to match the board's diagram type: omit it on
         /// a storyboard board, process|decision|start_end on a flowchart,
         /// entity on an erd, central|idea on a brainstorm. Any mismatch —
         /// including omitting it on a typed board — is a "validation" error.
-        /// Immutable after creation — no --shape on `storyboard frame update`
+        /// Immutable after creation — no --shape on `diagram frame update`
         #[arg(long, value_parser = parse_frame_shape)]
         shape: Option<FrameShape>,
         /// Free-text actor id of the creator (an agent name or "user")
@@ -1430,13 +1430,13 @@ EXAMPLES
     /// Update a frame; prints the full updated frame (`--quiet`: without its
     /// `body`)
     ///
-    /// Only the flags you pass change; at least one is required. The storyboard
+    /// Only the flags you pass change; at least one is required. The diagram
     /// and author are immutable. `--body ""`/`--color ""` clear those fields;
     /// `--no-task` unlinks the task.
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard frame update 3 --x 120 --y 80     # move it
-  mesa storyboard frame update 3 --title \"Revised\" --no-task")]
+  mesa diagram frame update 3 --x 120 --y 80     # move it
+  mesa diagram frame update 3 --title \"Revised\" --no-task")]
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
         /// Frame id
@@ -1462,7 +1462,7 @@ EXAMPLES
         /// New colour hint; pass "" to clear it
         #[arg(long, group = "fields")]
         color: Option<String>,
-        /// New linked task id (must be in the storyboard's project)
+        /// New linked task id (must be in the diagram's project)
         #[arg(long, group = "fields", conflicts_with = "no_task")]
         task: Option<i64>,
         /// Unlink the frame from its task
@@ -1500,27 +1500,27 @@ EXAMPLES
 
 #[derive(Subcommand)]
 enum EdgeCmd {
-    /// Connect two frames of a storyboard with a directed edge
+    /// Connect two frames of a diagram with a directed edge
     ///
-    /// Both frames must belong to the storyboard. Self-edges are rejected
-    /// (code "validation"); cycles are allowed (a storyboard is a freeform
+    /// Both frames must belong to the diagram. Self-edges are rejected
+    /// (code "validation"); cycles are allowed (a diagram is a freeform
     /// diagram, not a dependency graph).
     #[command(after_help = "\
 EXAMPLES
-  mesa storyboard edge create 1 3 4 --label \"then\"")]
+  mesa diagram edge create 1 3 4 --label \"then\"")]
     Create {
-        /// Storyboard both frames belong to
-        #[arg(value_name = "STORYBOARD", required_unless_present = "storyboard")]
-        storyboard_pos: Option<i64>,
+        /// Diagram both frames belong to
+        #[arg(value_name = "DIAGRAM", required_unless_present = "diagram")]
+        diagram_pos: Option<i64>,
         /// Source frame id
         #[arg(value_name = "FROM", required_unless_present = "from")]
         from_pos: Option<i64>,
         /// Destination frame id
         #[arg(value_name = "TO", required_unless_present = "to")]
         to_pos: Option<i64>,
-        /// Storyboard id (flag form of STORYBOARD)
-        #[arg(long, conflicts_with = "storyboard_pos")]
-        storyboard: Option<i64>,
+        /// Diagram id (flag form of DIAGRAM)
+        #[arg(long, conflicts_with = "diagram_pos")]
+        diagram: Option<i64>,
         /// Source frame id (flag form of FROM)
         #[arg(long, conflicts_with = "from_pos")]
         from: Option<i64>,
@@ -1841,8 +1841,8 @@ fn print_tasks(tasks: &[Task], quiet: bool) {
 
 /// Keys dropped from a `Project` under `--quiet`.
 const QUIET_DROP_PROJECT: &[&str] = &["description"];
-/// Keys dropped from a `Storyboard` under `--quiet`.
-const QUIET_DROP_STORYBOARD: &[&str] = &["description"];
+/// Keys dropped from a `Diagram` under `--quiet`.
+const QUIET_DROP_DIAGRAM: &[&str] = &["description"];
 /// Keys dropped from a `Frame` under `--quiet`.
 const QUIET_DROP_FRAME: &[&str] = &["body"];
 /// Keys dropped from an `InboxItem` under `--quiet`.
@@ -1921,9 +1921,9 @@ fn print_project_delete(
     }
 }
 
-/// Print one storyboard: the full record, or the record minus `description`.
-fn print_storyboard(storyboard: &Storyboard, is_quiet: bool) {
-    print_record(storyboard, is_quiet, QUIET_DROP_STORYBOARD);
+/// Print one diagram: the full record, or the record minus `description`.
+fn print_diagram(diagram: &Diagram, is_quiet: bool) {
+    print_record(diagram, is_quiet, QUIET_DROP_DIAGRAM);
 }
 
 /// Print one frame: the full record, or the record minus `body`.
@@ -1950,17 +1950,17 @@ fn print_script(script: &Script, is_quiet: bool) {
     print_record(script, is_quiet, QUIET_DROP_SCRIPT);
 }
 
-/// Print a `{storyboard, frames, edges}` view (`storyboard show`/`delete`).
+/// Print a `{diagram, frames, edges}` view (`diagram show`/`delete`).
 ///
 /// Under `--quiet` the container KEY SET is unchanged — only the members are
 /// projected, so a client's `jq 'keys'` is identical either way. (Member and
 /// container key ORDER is alphabetical under `--quiet`, as for any
 /// `serde_json::Value`; JSON object order is not semantically meaningful and
 /// the default, non-quiet output is untouched.)
-fn print_storyboard_view(view: &StoryboardView, is_quiet: bool) {
+fn print_diagram_view(view: &DiagramView, is_quiet: bool) {
     if is_quiet {
         print_json(&json!({
-            "storyboard": quiet(&view.storyboard, QUIET_DROP_STORYBOARD),
+            "diagram": quiet(&view.diagram, QUIET_DROP_DIAGRAM),
             "frames": quiet_all(&view.frames, QUIET_DROP_FRAME),
             "edges": quiet_all(&view.edges, QUIET_DROP_FRAME_EDGE),
         }));
@@ -2024,7 +2024,7 @@ fn execute(command: Command) -> Result<()> {
     match command {
         Command::Project(cmd) => run_project(cmd),
         Command::Task(cmd) => run_task(cmd),
-        Command::Storyboard(cmd) => run_storyboard(cmd),
+        Command::Diagram(cmd) => run_diagram(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
         Command::Script(cmd) => run_script_cmd(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
@@ -2395,10 +2395,10 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
     Ok(())
 }
 
-fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
+fn run_diagram(cmd: DiagramCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
-        StoryboardCmd::Create {
+        DiagramCmd::Create {
             project_pos,
             title_pos,
             project,
@@ -2407,8 +2407,8 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             diagram_type,
             author,
             quiet,
-        } => print_storyboard(
-            &store.create_storyboard(
+        } => print_diagram(
+            &store.create_diagram(
                 // clap guarantees exactly one of each positional/flag pair.
                 resolve_project(&store, &project.or(project_pos).unwrap())?,
                 &title.or(title_pos).unwrap(),
@@ -2418,38 +2418,31 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
             )?,
             quiet,
         ),
-        StoryboardCmd::List {
+        DiagramCmd::List {
             project_pos,
             project,
         } => {
             let project = project.or(project_pos);
-            print_json(&store.list_storyboards(resolve_project_opt(&store, project.as_deref())?)?)
+            print_json(&store.list_diagrams(resolve_project_opt(&store, project.as_deref())?)?)
         }
-        StoryboardCmd::Show { id, quiet } => {
-            print_storyboard_view(&store.get_storyboard_view(id)?, quiet)
-        }
-        StoryboardCmd::Update {
+        DiagramCmd::Show { id, quiet } => print_diagram_view(&store.get_diagram_view(id)?, quiet),
+        DiagramCmd::Update {
             id,
             title,
             description,
             author,
             quiet,
         } => {
-            let patch = StoryboardPatch {
+            let patch = DiagramPatch {
                 title,
                 description: description.map(clear_if_empty),
             };
-            print_storyboard(
-                &store.update_storyboard(id, &patch, author.as_deref())?,
-                quiet,
-            );
+            print_diagram(&store.update_diagram(id, &patch, author.as_deref())?, quiet);
         }
-        StoryboardCmd::Delete { id, quiet } => {
-            print_storyboard_view(&store.delete_storyboard(id)?, quiet)
-        }
-        StoryboardCmd::Events { id } => print_json(&store.list_storyboard_events(id)?),
-        StoryboardCmd::Frame(cmd) => run_frame(&mut store, cmd)?,
-        StoryboardCmd::Edge(cmd) => run_edge(&mut store, cmd)?,
+        DiagramCmd::Delete { id, quiet } => print_diagram_view(&store.delete_diagram(id)?, quiet),
+        DiagramCmd::Events { id } => print_json(&store.list_diagram_events(id)?),
+        DiagramCmd::Frame(cmd) => run_frame(&mut store, cmd)?,
+        DiagramCmd::Edge(cmd) => run_edge(&mut store, cmd)?,
     }
     Ok(())
 }
@@ -2457,9 +2450,9 @@ fn run_storyboard(cmd: StoryboardCmd) -> Result<()> {
 fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
     match cmd {
         FrameCmd::Create {
-            storyboard_pos,
+            diagram_pos,
             title_pos,
-            storyboard,
+            diagram,
             title,
             body,
             x,
@@ -2473,7 +2466,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
             quiet,
         } => {
             // clap guarantees exactly one of each positional/flag pair.
-            let storyboard = storyboard.or(storyboard_pos).unwrap();
+            let diagram = diagram.or(diagram_pos).unwrap();
             let new = FrameNew {
                 title: title.or(title_pos).unwrap(),
                 body,
@@ -2486,7 +2479,7 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
                 author,
                 shape,
             };
-            print_frame(&store.create_frame(storyboard, &new)?, quiet);
+            print_frame(&store.create_frame(diagram, &new)?, quiet);
         }
         FrameCmd::Update {
             id,
@@ -2537,10 +2530,10 @@ fn run_frame(store: &mut Store, cmd: FrameCmd) -> Result<()> {
 fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
     match cmd {
         EdgeCmd::Create {
-            storyboard_pos,
+            diagram_pos,
             from_pos,
             to_pos,
-            storyboard,
+            diagram,
             from,
             to,
             label,
@@ -2549,7 +2542,7 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
         } => print_edge(
             &store.create_edge(
                 // clap guarantees exactly one of each positional/flag pair.
-                storyboard.or(storyboard_pos).unwrap(),
+                diagram.or(diagram_pos).unwrap(),
                 from.or(from_pos).unwrap(),
                 to.or(to_pos).unwrap(),
                 label.as_deref(),
@@ -2884,14 +2877,14 @@ mod tests {
     //!
     //! Each projection is pinned against an explicit expected key list for its
     //! record type. That list is the tripwire: add a field to `Project`,
-    //! `Storyboard`, `Frame`, `FrameEdge`, `InboxItem`, `Script` or `Task` and the
+    //! `Diagram`, `Frame`, `FrameEdge`, `InboxItem`, `Script` or `Task` and the
     //! corresponding test goes red, forcing a decision about whether the new
     //! field belongs in the quiet shape — instead of it silently appearing
     //! (derived projections) or silently vanishing (`compact`'s literal).
 
     use super::*;
     use crate::core::{
-        AnchorSide, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Project, Storyboard,
+        AnchorSide, Diagram, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Project,
         TaskSummary, Waypoint,
     };
 
@@ -2981,8 +2974,8 @@ mod tests {
         }
     }
 
-    fn sample_storyboard() -> Storyboard {
-        Storyboard {
+    fn sample_diagram() -> Diagram {
+        Diagram {
             id: 1,
             project_id: 2,
             title: "s".into(),
@@ -2997,7 +2990,7 @@ mod tests {
     fn sample_frame() -> Frame {
         Frame {
             id: 1,
-            storyboard_id: 2,
+            diagram_id: 2,
             title: "f".into(),
             body: Some("b".into()),
             x: 40.0,
@@ -3016,7 +3009,7 @@ mod tests {
     fn sample_edge() -> FrameEdge {
         FrameEdge {
             id: 1,
-            storyboard_id: 2,
+            diagram_id: 2,
             from_frame: 3,
             to_frame: 4,
             label: Some("l".into()),
@@ -3139,8 +3132,8 @@ mod tests {
     }
 
     #[test]
-    fn storyboard_quiet_drops_description() {
-        let full = keys(&sample_storyboard());
+    fn diagram_quiet_drops_description() {
+        let full = keys(&sample_diagram());
         assert_eq!(
             sorted_owned(full.clone()),
             sorted(&[
@@ -3153,15 +3146,12 @@ mod tests {
                 "created_at",
                 "updated_at",
             ]),
-            "Storyboard gained/lost a field: decide whether it belongs in the \
+            "Diagram gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",
         );
         assert_eq!(
-            sorted_owned(value_keys(&quiet(
-                &sample_storyboard(),
-                QUIET_DROP_STORYBOARD
-            ))),
-            minus(&full, QUIET_DROP_STORYBOARD),
+            sorted_owned(value_keys(&quiet(&sample_diagram(), QUIET_DROP_DIAGRAM))),
+            minus(&full, QUIET_DROP_DIAGRAM),
         );
     }
 
@@ -3172,7 +3162,7 @@ mod tests {
             sorted_owned(full.clone()),
             sorted(&[
                 "id",
-                "storyboard_id",
+                "diagram_id",
                 "title",
                 "body",
                 "x",
@@ -3202,7 +3192,7 @@ mod tests {
             sorted_owned(full.clone()),
             sorted(&[
                 "id",
-                "storyboard_id",
+                "diagram_id",
                 "from_frame",
                 "to_frame",
                 "label",

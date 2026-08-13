@@ -6,9 +6,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
-    AnchorSide, Attachment, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, InboxKind,
-    Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Storyboard, StoryboardEvent,
-    StoryboardView, Task, TaskEvent, Waypoint, task_name,
+    AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, Frame, FrameEdge,
+    FrameShape, InboxItem, InboxKind, Priority, Project, Script, ScriptArg, ScriptArgKind, Status,
+    Task, TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -493,6 +493,19 @@ const MIGRATIONS: &[&str] = &[
     // item nobody labelled must not start being auto-triaged by an upgrade.
     // Additive; nothing else changes.
     "ALTER TABLE inbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'task-summary';",
+    // Task 848: the container concept is renamed Storyboard -> Diagram. Pure
+    // rename, no shape change: the tables and the foreign-key column get the
+    // new name, and the two board-level history tokens are rewritten so an
+    // upgraded db's change history reads in one vocabulary rather than two.
+    // `storyboard` survives untouched as one value of `diagram_type` — it is
+    // now one diagram *style*, not the container.
+    "ALTER TABLE storyboards RENAME TO diagrams;
+     ALTER TABLE storyboard_events RENAME TO diagram_events;
+     ALTER TABLE frames RENAME COLUMN storyboard_id TO diagram_id;
+     ALTER TABLE frame_edges RENAME COLUMN storyboard_id TO diagram_id;
+     ALTER TABLE diagram_events RENAME COLUMN storyboard_id TO diagram_id;
+     UPDATE diagram_events SET action = 'diagram_created' WHERE action = 'storyboard_created';
+     UPDATE diagram_events SET action = 'diagram_edited'  WHERE action = 'storyboard_edited';",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -580,7 +593,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 ///
 /// Prefix for a query that then filters on [`NOT_HIDDEN_PROJECT`]; defined
 /// once and shared by every unscoped site (`list_projects`, `list_tasks`,
-/// `next_task`, `list_storyboards`) so they cannot drift
+/// `next_task`, `list_diagrams`) so they cannot drift
 /// apart on what "archived" means. `UNION` (not `UNION ALL`) so a malformed
 /// parent cycle terminates instead of recursing forever — the same guard
 /// `next_subtask` uses on the task tree.
@@ -594,12 +607,12 @@ const HIDDEN_PROJECTS_CTE: &str = "WITH RECURSIVE hidden_projects(id) AS ( \
 /// aliased as `p`, which every unscoped query here already does.
 const NOT_HIDDEN_PROJECT: &str = "p.id NOT IN (SELECT id FROM hidden_projects)";
 
-const STORYBOARD_COLUMNS: &str =
+const DIAGRAM_COLUMNS: &str =
     "id, project_id, title, description, author, diagram_type, created_at, updated_at";
-const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, task_id, author, \
+const FRAME_COLUMNS: &str = "id, diagram_id, title, body, x, y, w, h, color, task_id, author, \
      shape, created_at, updated_at";
-const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
-const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
+const EDGE_COLUMNS: &str = "id, diagram_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
+const DIAGRAM_EVENT_COLUMNS: &str = "id, diagram_id, actor, action, summary, at";
 const INBOX_COLUMNS: &str =
     "id, project_id, author, body, created_at, updated_at, read_at, archived_at, kind";
 
@@ -731,9 +744,9 @@ fn row_to_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
     })
 }
 
-fn row_to_storyboard(row: &rusqlite::Row<'_>) -> rusqlite::Result<Storyboard> {
+fn row_to_diagram(row: &rusqlite::Row<'_>) -> rusqlite::Result<Diagram> {
     let diagram_type: String = row.get(5)?;
-    Ok(Storyboard {
+    Ok(Diagram {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
@@ -749,7 +762,7 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
     let shape: Option<String> = row.get(11)?;
     Ok(Frame {
         id: row.get(0)?,
-        storyboard_id: row.get(1)?,
+        diagram_id: row.get(1)?,
         title: row.get(2)?,
         body: row.get(3)?,
         x: row.get(4)?,
@@ -807,7 +820,7 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
     let to_anchor: Option<String> = row.get(9)?;
     Ok(FrameEdge {
         id: row.get(0)?,
-        storyboard_id: row.get(1)?,
+        diagram_id: row.get(1)?,
         from_frame: row.get(2)?,
         to_frame: row.get(3)?,
         label: row.get(4)?,
@@ -823,10 +836,10 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
     })
 }
 
-fn row_to_storyboard_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoryboardEvent> {
-    Ok(StoryboardEvent {
+fn row_to_diagram_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<DiagramEvent> {
+    Ok(DiagramEvent {
         id: row.get(0)?,
-        storyboard_id: row.get(1)?,
+        diagram_id: row.get(1)?,
         actor: row.get(2)?,
         action: row.get(3)?,
         summary: row.get(4)?,
@@ -834,26 +847,26 @@ fn row_to_storyboard_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Storyboa
     })
 }
 
-/// Appends one change-history row for a storyboard. Operates on any
+/// Appends one change-history row for a diagram. Operates on any
 /// `Connection` (including an open transaction) so a mutation and its event
 /// commit atomically.
-fn insert_storyboard_event(
+fn insert_diagram_event(
     conn: &Connection,
-    storyboard_id: i64,
+    diagram_id: i64,
     actor: Option<&str>,
     action: &str,
     summary: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO storyboard_events (storyboard_id, actor, action, summary, at) \
+        "INSERT INTO diagram_events (diagram_id, actor, action, summary, at) \
          VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-        (storyboard_id, actor, action, summary),
+        (diagram_id, actor, action, summary),
     )?;
     Ok(())
 }
 
 /// Describes an anchor-lock change to `edge` relative to `current` for the
-/// `edge_anchor_changed` storyboard event. Only called once at least one of
+/// `edge_anchor_changed` diagram event. Only called once at least one of
 /// `from_anchor`/`to_anchor` differs between the two.
 fn anchor_summary(edge: &FrameEdge, current: &FrameEdge) -> String {
     let from_changed = edge.from_anchor != current.from_anchor;
@@ -890,23 +903,23 @@ fn anchor_state_str(side: Option<AnchorSide>) -> &'static str {
     }
 }
 
-/// Reads a storyboard's frames, ordered by id. Operates on any `Connection`
+/// Reads a diagram's frames, ordered by id. Operates on any `Connection`
 /// (including an open transaction) so a delete can echo an atomic snapshot.
-fn read_frames(conn: &Connection, storyboard_id: i64) -> Result<Vec<Frame>> {
+fn read_frames(conn: &Connection, diagram_id: i64) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {FRAME_COLUMNS} FROM frames WHERE storyboard_id = ?1 ORDER BY id"
+        "SELECT {FRAME_COLUMNS} FROM frames WHERE diagram_id = ?1 ORDER BY id"
     ))?;
-    let rows = stmt.query_map([storyboard_id], row_to_frame)?;
+    let rows = stmt.query_map([diagram_id], row_to_frame)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Reads a storyboard's edges, ordered by id. Operates on any `Connection`
+/// Reads a diagram's edges, ordered by id. Operates on any `Connection`
 /// (including an open transaction).
-fn read_edges(conn: &Connection, storyboard_id: i64) -> Result<Vec<FrameEdge>> {
+fn read_edges(conn: &Connection, diagram_id: i64) -> Result<Vec<FrameEdge>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {EDGE_COLUMNS} FROM frame_edges WHERE storyboard_id = ?1 ORDER BY id"
+        "SELECT {EDGE_COLUMNS} FROM frame_edges WHERE diagram_id = ?1 ORDER BY id"
     ))?;
-    let rows = stmt.query_map([storyboard_id], row_to_edge)?;
+    let rows = stmt.query_map([diagram_id], row_to_edge)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -978,11 +991,11 @@ fn append_text(existing: Option<&str>, added: &str) -> String {
     }
 }
 
-/// Fields to change on a storyboard; `None` means leave unchanged. A
-/// storyboard's project and `author` (its creator) are immutable, so there is
+/// Fields to change on a diagram; `None` means leave unchanged. A
+/// diagram's project and `author` (its creator) are immutable, so there is
 /// deliberately no field for either.
 #[derive(Debug, Default, Clone)]
-pub struct StoryboardPatch {
+pub struct DiagramPatch {
     pub title: Option<String>,
     /// `Some(None)` clears the description.
     pub description: Option<Option<String>>,
@@ -1005,10 +1018,10 @@ pub struct ScriptPatch {
     pub args: Option<Vec<ScriptArg>>,
 }
 
-/// A new frame to add to a storyboard. Coordinates and size are caller-supplied
+/// A new frame to add to a diagram. Coordinates and size are caller-supplied
 /// (the CLI/API apply sensible defaults); `task_id`, if given, must reference a
-/// task in the storyboard's project. `shape`, if given, must be a member of
-/// the storyboard's `diagram_type` shape set (validated by
+/// task in the diagram's project. `shape`, if given, must be a member of
+/// the diagram's `diagram_type` shape set (validated by
 /// `Store::create_frame`) — settable only at creation, no field on
 /// `FramePatch`.
 #[derive(Debug, Clone)]
@@ -1026,7 +1039,7 @@ pub struct FrameNew {
 }
 
 /// Fields to change on a frame; `None` means leave unchanged. A frame's
-/// storyboard and `author` are immutable.
+/// diagram and `author` are immutable.
 #[derive(Debug, Default, Clone)]
 pub struct FramePatch {
     pub title: Option<String>,
@@ -2403,21 +2416,21 @@ impl Store {
         Ok(attachment)
     }
 
-    // ---- storyboards ----
+    // ---- diagrams ----
 
-    /// Creates a storyboard in an existing project. The project is fixed at
+    /// Creates a diagram in an existing project. The project is fixed at
     /// creation (immutable thereafter), mirroring tasks. `diagram_type`
     /// defaults to `DiagramType::Storyboard` when omitted, matching the
     /// column default — immutable after creation (no field on
-    /// `StoryboardPatch`).
-    pub fn create_storyboard(
+    /// `DiagramPatch`).
+    pub fn create_diagram(
         &mut self,
         project_id: i64,
         title: &str,
         description: Option<&str>,
         author: Option<&str>,
         diagram_type: Option<DiagramType>,
-    ) -> Result<Storyboard> {
+    ) -> Result<Diagram> {
         let project_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
             [project_id],
@@ -2430,81 +2443,81 @@ impl Store {
         let id = {
             let tx = self.conn.transaction()?;
             tx.execute(
-                "INSERT INTO storyboards (project_id, title, description, author, diagram_type, created_at, updated_at) \
+                "INSERT INTO diagrams (project_id, title, description, author, diagram_type, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))",
                 (project_id, title, description, author, diagram_type.as_str()),
             )?;
             let id = tx.last_insert_rowid();
-            insert_storyboard_event(
+            insert_diagram_event(
                 &tx,
                 id,
                 author,
-                "storyboard_created",
-                &format!("created storyboard '{title}'"),
+                "diagram_created",
+                &format!("created diagram '{title}'"),
             )?;
             tx.commit()?;
             id
         };
-        self.get_storyboard(id)
+        self.get_diagram(id)
     }
 
-    pub fn get_storyboard(&self, id: i64) -> Result<Storyboard> {
+    pub fn get_diagram(&self, id: i64) -> Result<Diagram> {
         self.conn
             .query_row(
-                &format!("SELECT {STORYBOARD_COLUMNS} FROM storyboards WHERE id = ?1"),
+                &format!("SELECT {DIAGRAM_COLUMNS} FROM diagrams WHERE id = ?1"),
                 [id],
-                row_to_storyboard,
+                row_to_diagram,
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
-                    Error::NotFound(format!("storyboard {id} not found"))
+                    Error::NotFound(format!("diagram {id} not found"))
                 }
                 e => Error::Db(e),
             })
     }
 
-    /// Lists storyboards, newest activity is not implied — ordered by id.
+    /// Lists diagrams, newest activity is not implied — ordered by id.
     /// Scoped to `project` if given (archived-agnostic); when `None`, excludes
-    /// storyboards whose project is archived. Frames and edges are omitted
-    /// (the compact list shape); use `get_storyboard_view` for a board's full
+    /// diagrams whose project is archived. Frames and edges are omitted
+    /// (the compact list shape); use `get_diagram_view` for a board's full
     /// contents.
-    pub fn list_storyboards(&self, project: Option<i64>) -> Result<Vec<Storyboard>> {
-        // STORYBOARD_COLUMNS is unqualified; under the join both `id` and
+    pub fn list_diagrams(&self, project: Option<i64>) -> Result<Vec<Diagram>> {
+        // DIAGRAM_COLUMNS is unqualified; under the join both `id` and
         // `description` collide with `projects` columns, so this query
         // aliases the table and qualifies every column explicitly instead of
         // reusing the shared constant.
         let mut stmt = self.conn.prepare(&format!(
             "{HIDDEN_PROJECTS_CTE}SELECT s.id, s.project_id, s.title, s.description, s.author, \
              s.diagram_type, s.created_at, s.updated_at \
-             FROM storyboards s JOIN projects p ON p.id = s.project_id \
+             FROM diagrams s JOIN projects p ON p.id = s.project_id \
              WHERE (?1 IS NULL OR s.project_id = ?1) \
              AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
              ORDER BY s.id"
         ))?;
-        let rows = stmt.query_map([project], row_to_storyboard)?;
+        let rows = stmt.query_map([project], row_to_diagram)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Returns a board's full contents: the storyboard plus its frames and
+    /// Returns a board's full contents: the diagram plus its frames and
     /// edges (each ordered by id). `NotFound` if the board is absent.
-    pub fn get_storyboard_view(&self, id: i64) -> Result<StoryboardView> {
-        let storyboard = self.get_storyboard(id)?;
+    pub fn get_diagram_view(&self, id: i64) -> Result<DiagramView> {
+        let diagram = self.get_diagram(id)?;
         let frames = read_frames(&self.conn, id)?;
         let edges = read_edges(&self.conn, id)?;
-        Ok(StoryboardView {
-            storyboard,
+        Ok(DiagramView {
+            diagram,
             frames,
             edges,
         })
     }
 
-    pub fn update_storyboard(
+    pub fn update_diagram(
         &mut self,
         id: i64,
-        patch: &StoryboardPatch,
+        patch: &DiagramPatch,
         actor: Option<&str>,
-    ) -> Result<Storyboard> {
-        let current = self.get_storyboard(id)?;
+    ) -> Result<Diagram> {
+        let current = self.get_diagram(id)?;
         let mut sb = current.clone();
         if let Some(title) = &patch.title {
             sb.title = title.clone();
@@ -2519,61 +2532,61 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE storyboards SET title = ?1, description = ?2, updated_at = datetime('now') \
+            "UPDATE diagrams SET title = ?1, description = ?2, updated_at = datetime('now') \
              WHERE id = ?3",
             (&sb.title, &sb.description, id),
         )?;
-        insert_storyboard_event(&tx, id, actor, "storyboard_edited", "edited board details")?;
+        insert_diagram_event(&tx, id, actor, "diagram_edited", "edited board details")?;
         tx.commit()?;
-        self.get_storyboard(id)
+        self.get_diagram(id)
     }
 
-    /// Deletes a storyboard and all its frames, edges, and history (cascade).
+    /// Deletes a diagram and all its frames, edges, and history (cascade).
     /// Returns the full destroyed contents so the transcript stays a recoverable
     /// record. The echo read and the delete run in one transaction, so the
     /// echoed contents exactly match what was destroyed even under a concurrent
     /// writer. No change-history row is written: the board's history dies with
     /// it, and the delete echo is the recoverable record.
-    pub fn delete_storyboard(&mut self, id: i64) -> Result<StoryboardView> {
+    pub fn delete_diagram(&mut self, id: i64) -> Result<DiagramView> {
         let tx = self.conn.transaction()?;
-        let storyboard = tx
+        let diagram = tx
             .query_row(
-                &format!("SELECT {STORYBOARD_COLUMNS} FROM storyboards WHERE id = ?1"),
+                &format!("SELECT {DIAGRAM_COLUMNS} FROM diagrams WHERE id = ?1"),
                 [id],
-                row_to_storyboard,
+                row_to_diagram,
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
-                    Error::NotFound(format!("storyboard {id} not found"))
+                    Error::NotFound(format!("diagram {id} not found"))
                 }
                 e => Error::Db(e),
             })?;
         let frames = read_frames(&tx, id)?;
         let edges = read_edges(&tx, id)?;
-        tx.execute("DELETE FROM storyboards WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM diagrams WHERE id = ?1", [id])?;
         tx.commit()?;
-        Ok(StoryboardView {
-            storyboard,
+        Ok(DiagramView {
+            diagram,
             frames,
             edges,
         })
     }
 
-    /// Lists a storyboard's change history, oldest first. `NotFound` if the
+    /// Lists a diagram's change history, oldest first. `NotFound` if the
     /// board is absent.
-    pub fn list_storyboard_events(&self, storyboard_id: i64) -> Result<Vec<StoryboardEvent>> {
-        self.get_storyboard(storyboard_id)?;
+    pub fn list_diagram_events(&self, diagram_id: i64) -> Result<Vec<DiagramEvent>> {
+        self.get_diagram(diagram_id)?;
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {STORYBOARD_EVENT_COLUMNS} FROM storyboard_events \
-             WHERE storyboard_id = ?1 ORDER BY id"
+            "SELECT {DIAGRAM_EVENT_COLUMNS} FROM diagram_events \
+             WHERE diagram_id = ?1 ORDER BY id"
         ))?;
-        let rows = stmt.query_map([storyboard_id], row_to_storyboard_event)?;
+        let rows = stmt.query_map([diagram_id], row_to_diagram_event)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // ---- frames ----
 
-    /// Adds a frame to an existing storyboard. An unknown storyboard is a
+    /// Adds a frame to an existing diagram. An unknown diagram is a
     /// validation error (the id is a request parameter, like a task's project).
     /// A `task_id`, if given, must reference a task in the board's project.
     /// `new.shape`, if given, must be a member of the board's `diagram_type`
@@ -2581,13 +2594,11 @@ impl Store {
     /// takes `process`/`decision`/`start_end`, an `erd` board takes only
     /// `entity`, a `brainstorm` board takes `central`/`idea`; a mismatch is a
     /// validation error.
-    pub fn create_frame(&mut self, storyboard_id: i64, new: &FrameNew) -> Result<Frame> {
-        let sb = match self.get_storyboard(storyboard_id) {
+    pub fn create_frame(&mut self, diagram_id: i64, new: &FrameNew) -> Result<Frame> {
+        let sb = match self.get_diagram(diagram_id) {
             Ok(sb) => sb,
             Err(Error::NotFound(_)) => {
-                return Err(Error::Validation(format!(
-                    "storyboard {storyboard_id} not found"
-                )));
+                return Err(Error::Validation(format!("diagram {diagram_id} not found")));
             }
             Err(e) => return Err(e),
         };
@@ -2600,10 +2611,10 @@ impl Store {
             let tx = self.conn.transaction()?;
             tx.execute(
                 "INSERT INTO frames \
-                 (storyboard_id, title, body, x, y, w, h, color, task_id, author, shape, created_at, updated_at) \
+                 (diagram_id, title, body, x, y, w, h, color, task_id, author, shape, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))",
                 rusqlite::params![
-                    storyboard_id,
+                    diagram_id,
                     new.title,
                     new.body,
                     new.x,
@@ -2617,9 +2628,9 @@ impl Store {
                 ],
             )?;
             let id = tx.last_insert_rowid();
-            insert_storyboard_event(
+            insert_diagram_event(
                 &tx,
-                storyboard_id,
+                diagram_id,
                 new.author.as_deref(),
                 "frame_added",
                 // The canvas creates frames untitled so the user types straight
@@ -2684,7 +2695,7 @@ impl Store {
         }
         if let Some(task_id) = patch.task_id {
             if let Some(tid) = task_id {
-                let sb = self.get_storyboard(f.storyboard_id)?;
+                let sb = self.get_diagram(f.diagram_id)?;
                 self.check_frame_task(tid, sb.project_id)?;
             }
             f.task_id = task_id;
@@ -2714,7 +2725,7 @@ impl Store {
              color = ?7, task_id = ?8, updated_at = datetime('now') WHERE id = ?9",
             rusqlite::params![f.title, f.body, f.x, f.y, f.w, f.h, f.color, f.task_id, id,],
         )?;
-        insert_storyboard_event(&tx, f.storyboard_id, actor, action, &summary)?;
+        insert_diagram_event(&tx, f.diagram_id, actor, action, &summary)?;
         tx.commit()?;
         self.get_frame(id)
     }
@@ -2739,9 +2750,9 @@ impl Store {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         tx.execute("DELETE FROM frames WHERE id = ?1", [id])?;
-        insert_storyboard_event(
+        insert_diagram_event(
             &tx,
-            frame.storyboard_id,
+            frame.diagram_id,
             actor,
             "frame_removed",
             &format!("removed frame '{}' (#{id})", frame.title),
@@ -2770,7 +2781,7 @@ impl Store {
         };
         if task_project != project_id {
             return Err(Error::Validation(format!(
-                "task {task_id} belongs to project {task_project}, not the storyboard's \
+                "task {task_id} belongs to project {task_project}, not the diagram's \
                  project {project_id}: a frame may only link a task in its own project"
             )));
         }
@@ -2779,34 +2790,32 @@ impl Store {
 
     // ---- edges ----
 
-    /// Connects two frames of the same storyboard with a directed edge. Rejects
+    /// Connects two frames of the same diagram with a directed edge. Rejects
     /// an unknown board, a self-edge, or an endpoint that is not a frame of this
     /// board — all validation errors. Cycles are allowed.
     pub fn create_edge(
         &mut self,
-        storyboard_id: i64,
+        diagram_id: i64,
         from_frame: i64,
         to_frame: i64,
         label: Option<&str>,
         author: Option<&str>,
     ) -> Result<FrameEdge> {
-        let storyboard_exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM storyboards WHERE id = ?1)",
-            [storyboard_id],
+        let diagram_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM diagrams WHERE id = ?1)",
+            [diagram_id],
             |r| r.get(0),
         )?;
-        if !storyboard_exists {
-            return Err(Error::Validation(format!(
-                "storyboard {storyboard_id} not found"
-            )));
+        if !diagram_exists {
+            return Err(Error::Validation(format!("diagram {diagram_id} not found")));
         }
         if from_frame == to_frame {
             return Err(Error::Validation(format!(
                 "frame {from_frame} cannot connect to itself"
             )));
         }
-        self.check_frame_in_storyboard(from_frame, storyboard_id, "from")?;
-        self.check_frame_in_storyboard(to_frame, storyboard_id, "to")?;
+        self.check_frame_in_diagram(from_frame, diagram_id, "from")?;
+        self.check_frame_in_diagram(to_frame, diagram_id, "to")?;
         let summary = match label {
             Some(l) if !l.is_empty() => {
                 format!("connected #{from_frame} \u{2192} #{to_frame} ({l})")
@@ -2816,12 +2825,12 @@ impl Store {
         let id = {
             let tx = self.conn.transaction()?;
             tx.execute(
-                "INSERT INTO frame_edges (storyboard_id, from_frame, to_frame, label, author, created_at) \
+                "INSERT INTO frame_edges (diagram_id, from_frame, to_frame, label, author, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-                (storyboard_id, from_frame, to_frame, label, author),
+                (diagram_id, from_frame, to_frame, label, author),
             )?;
             let id = tx.last_insert_rowid();
-            insert_storyboard_event(&tx, storyboard_id, author, "edge_added", &summary)?;
+            insert_diagram_event(&tx, diagram_id, author, "edge_added", &summary)?;
             tx.commit()?;
             id
         };
@@ -2902,7 +2911,7 @@ impl Store {
                 ),
             )
         };
-        insert_storyboard_event(&tx, edge.storyboard_id, actor, action, &summary)?;
+        insert_diagram_event(&tx, edge.diagram_id, actor, action, &summary)?;
         tx.commit()?;
         self.get_edge(id)
     }
@@ -2911,9 +2920,9 @@ impl Store {
         let edge = self.get_edge(id)?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM frame_edges WHERE id = ?1", [id])?;
-        insert_storyboard_event(
+        insert_diagram_event(
             &tx,
-            edge.storyboard_id,
+            edge.diagram_id,
             actor,
             "edge_removed",
             &format!(
@@ -2925,18 +2934,13 @@ impl Store {
         Ok(edge)
     }
 
-    /// Validates that `frame_id` exists and belongs to `storyboard_id`. `which`
+    /// Validates that `frame_id` exists and belongs to `diagram_id`. `which`
     /// ("from"/"to") names the offending endpoint in the error message.
-    fn check_frame_in_storyboard(
-        &self,
-        frame_id: i64,
-        storyboard_id: i64,
-        which: &str,
-    ) -> Result<()> {
+    fn check_frame_in_diagram(&self, frame_id: i64, diagram_id: i64, which: &str) -> Result<()> {
         let frame_board: Option<i64> = self
             .conn
             .query_row(
-                "SELECT storyboard_id FROM frames WHERE id = ?1",
+                "SELECT diagram_id FROM frames WHERE id = ?1",
                 [frame_id],
                 |r| r.get(0),
             )
@@ -2950,10 +2954,10 @@ impl Store {
                 "{which} frame {frame_id} not found"
             )));
         };
-        if frame_board != storyboard_id {
+        if frame_board != diagram_id {
             return Err(Error::Validation(format!(
-                "{which} frame {frame_id} belongs to storyboard {frame_board}, not \
-                 storyboard {storyboard_id}: an edge must connect two frames of the same board"
+                "{which} frame {frame_id} belongs to diagram {frame_board}, not \
+                 diagram {diagram_id}: an edge must connect two frames of the same board"
             )));
         }
         Ok(())
@@ -4345,7 +4349,7 @@ mod tests {
         let t_child = add_task(&mut store, child.id, "child task");
         let t_other = add_task(&mut store, other.id, "other task");
         store
-            .create_storyboard(child.id, "child board", None, None, None)
+            .create_diagram(child.id, "child board", None, None, None)
             .unwrap();
 
         store.archive_project(root.id).unwrap();
@@ -4373,7 +4377,7 @@ mod tests {
             store.next_task(None).unwrap(),
             NextResult::Task(t) if t.id == t_other.id
         ));
-        assert!(store.list_storyboards(None).unwrap().is_empty());
+        assert!(store.list_diagrams(None).unwrap().is_empty());
 
         // The descendants' own flag is untouched — nothing was written.
         assert_eq!(store.get_project(child.id).unwrap(), child);
@@ -4396,7 +4400,7 @@ mod tests {
             store.next_task(Some(child.id)).unwrap(),
             NextResult::Task(t) if t.id == t_child.id
         ));
-        assert_eq!(store.list_storyboards(Some(child.id)).unwrap().len(), 1);
+        assert_eq!(store.list_diagrams(Some(child.id)).unwrap().len(), 1);
 
         // Unarchiving the root restores the subtree with no per-child write.
         store.unarchive_project(root.id).unwrap();
@@ -4429,7 +4433,7 @@ mod tests {
         let t_grand = add_task(&mut store, grandchild.id, "grandchild task");
         let t_keep = add_task(&mut store, keep.id, "kept task");
         let board = store
-            .create_storyboard(grandchild.id, "board", None, None, None)
+            .create_diagram(grandchild.id, "board", None, None, None)
             .unwrap();
 
         let (deleted, subprojects, tasks) = store.delete_project(root.id).unwrap();
@@ -4455,7 +4459,7 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            store.get_storyboard(board.id),
+            store.get_diagram(board.id),
             Err(Error::NotFound(_))
         ));
         assert_eq!(store.get_project(keep.id).unwrap(), keep);
@@ -6033,21 +6037,21 @@ mod tests {
     }
 
     #[test]
-    fn list_storyboards_unscoped_excludes_archived_project_scoped_unaffected() {
+    fn list_diagrams_unscoped_excludes_archived_project_scoped_unaffected() {
         let (mut store, _dir) = temp_store();
         let p1 = store.create_project("p1", None, None, None, None).unwrap();
         let p2 = store.create_project("p2", None, None, None, None).unwrap();
         let sb1 = store
-            .create_storyboard(p1.id, "p1 board", None, None, None)
+            .create_diagram(p1.id, "p1 board", None, None, None)
             .unwrap();
         let sb2 = store
-            .create_storyboard(p2.id, "p2 board", None, None, None)
+            .create_diagram(p2.id, "p2 board", None, None, None)
             .unwrap();
 
         store.archive_project(p2.id).unwrap();
 
         let ids: Vec<i64> = store
-            .list_storyboards(None)
+            .list_diagrams(None)
             .unwrap()
             .iter()
             .map(|s| s.id)
@@ -6055,7 +6059,7 @@ mod tests {
         assert_eq!(ids, vec![sb1.id]);
 
         // Scoped read of the archived project is completely unaffected.
-        assert_eq!(store.list_storyboards(Some(p2.id)).unwrap(), vec![sb2]);
+        assert_eq!(store.list_diagrams(Some(p2.id)).unwrap(), vec![sb2]);
     }
 
     fn import_task(ref_: &str, description: &str) -> ImportTask {
@@ -6304,7 +6308,7 @@ mod tests {
         assert!(store.list_projects().unwrap().is_empty());
     }
 
-    // ---- storyboards ----
+    // ---- diagrams ----
 
     fn frame_new(title: &str) -> FrameNew {
         FrameNew {
@@ -6322,35 +6326,32 @@ mod tests {
     }
 
     #[test]
-    fn storyboard_crud_round_trip_with_view() {
+    fn diagram_crud_round_trip_with_view() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
-            .create_storyboard(p.id, "flow", Some("the happy path"), Some("agent-1"), None)
+            .create_diagram(p.id, "flow", Some("the happy path"), Some("agent-1"), None)
             .unwrap();
         assert_eq!(sb.title, "flow");
         assert_eq!(sb.description.as_deref(), Some("the happy path"));
         assert_eq!(sb.author.as_deref(), Some("agent-1"));
         assert_eq!(sb.created_at, sb.updated_at);
 
-        assert_eq!(store.get_storyboard(sb.id).unwrap(), sb);
-        assert_eq!(store.list_storyboards(None).unwrap(), vec![sb.clone()]);
-        assert_eq!(
-            store.list_storyboards(Some(p.id)).unwrap(),
-            vec![sb.clone()]
-        );
-        assert!(store.list_storyboards(Some(p.id + 1)).unwrap().is_empty());
+        assert_eq!(store.get_diagram(sb.id).unwrap(), sb);
+        assert_eq!(store.list_diagrams(None).unwrap(), vec![sb.clone()]);
+        assert_eq!(store.list_diagrams(Some(p.id)).unwrap(), vec![sb.clone()]);
+        assert!(store.list_diagrams(Some(p.id + 1)).unwrap().is_empty());
 
         // empty board view
-        let view = store.get_storyboard_view(sb.id).unwrap();
-        assert_eq!(view.storyboard, sb);
+        let view = store.get_diagram_view(sb.id).unwrap();
+        assert_eq!(view.diagram, sb);
         assert!(view.frames.is_empty());
         assert!(view.edges.is_empty());
 
         let updated = store
-            .update_storyboard(
+            .update_diagram(
                 sb.id,
-                &StoryboardPatch {
+                &DiagramPatch {
                     title: Some("renamed".into()),
                     description: Some(None),
                 },
@@ -6363,19 +6364,16 @@ mod tests {
         assert_eq!(updated.author.as_deref(), Some("agent-1"));
         assert_eq!(updated.project_id, p.id);
 
-        let destroyed = store.delete_storyboard(sb.id).unwrap();
-        assert_eq!(destroyed.storyboard.id, sb.id);
-        assert!(matches!(
-            store.get_storyboard(sb.id),
-            Err(Error::NotFound(_))
-        ));
+        let destroyed = store.delete_diagram(sb.id).unwrap();
+        assert_eq!(destroyed.diagram.id, sb.id);
+        assert!(matches!(store.get_diagram(sb.id), Err(Error::NotFound(_))));
     }
 
     #[test]
-    fn create_storyboard_unknown_project_is_validation_error() {
+    fn create_diagram_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let err = store
-            .create_storyboard(999, "orphan", None, None, None)
+            .create_diagram(999, "orphan", None, None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));
@@ -6415,7 +6413,7 @@ mod tests {
         ];
         for (diagram_type, valid, invalid) in sets {
             let sb = store
-                .create_storyboard(p.id, diagram_type.as_str(), None, None, Some(diagram_type))
+                .create_diagram(p.id, diagram_type.as_str(), None, None, Some(diagram_type))
                 .unwrap();
             for shape in valid {
                 let f = store
@@ -6461,7 +6459,7 @@ mod tests {
              a shipped migration was edited or reordered, which is never allowed"
         );
         // Build a db at the version just before the diagram_type/shape
-        // migration, with a pre-feature storyboard and frame (spec 355 Must
+        // migration, with a pre-feature diagram and frame (spec 355 Must
         // #1/#6: existing rows must read back as diagram_type=storyboard,
         // shape=null, with no explicit backfill statement).
         {
@@ -6488,10 +6486,10 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        let boards = store.list_storyboards(None).unwrap();
+        let boards = store.list_diagrams(None).unwrap();
         assert_eq!(boards.len(), 1);
         assert_eq!(boards[0].diagram_type, DiagramType::Storyboard);
-        let view = store.get_storyboard_view(boards[0].id).unwrap();
+        let view = store.get_diagram_view(boards[0].id).unwrap();
         assert_eq!(view.frames.len(), 1);
         assert_eq!(view.frames[0].shape, None);
     }
@@ -6500,9 +6498,7 @@ mod tests {
     fn frame_crud_and_view_ordering() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
 
         let f1 = store
             .create_frame(
@@ -6525,7 +6521,7 @@ mod tests {
         let f2 = store.create_frame(sb.id, &frame_new("second")).unwrap();
 
         // The view lists frames by id.
-        let view = store.get_storyboard_view(sb.id).unwrap();
+        let view = store.get_diagram_view(sb.id).unwrap();
         let ids: Vec<i64> = view.frames.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![f1.id, f2.id]);
 
@@ -6557,7 +6553,7 @@ mod tests {
     }
 
     #[test]
-    fn create_frame_unknown_storyboard_is_validation_error() {
+    fn create_frame_unknown_diagram_is_validation_error() {
         let (mut store, _dir) = temp_store();
         let err = store.create_frame(999, &frame_new("x")).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
@@ -6569,9 +6565,7 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let p1 = store.create_project("p1", None, None, None, None).unwrap();
         let p2 = store.create_project("p2", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p1.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p1.id, "b", None, None, None).unwrap();
         let t1 = add_task(&mut store, p1.id, "in p1");
         let t2 = add_task(&mut store, p2.id, "in p2");
 
@@ -6633,11 +6627,9 @@ mod tests {
     fn edge_crud_rejects_self_and_foreign_frames_and_allows_cycles() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let other = store
-            .create_storyboard(p.id, "other", None, None, None)
+            .create_diagram(p.id, "other", None, None, None)
             .unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
@@ -6655,7 +6647,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
-        // unknown storyboard rejected
+        // unknown diagram rejected
         let err = store.create_edge(999, a.id, b.id, None, None).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
@@ -6668,7 +6660,7 @@ mod tests {
         assert_eq!(e1.label.as_deref(), Some("then"));
         let e2 = store.create_edge(sb.id, b.id, a.id, None, None).unwrap();
 
-        let view = store.get_storyboard_view(sb.id).unwrap();
+        let view = store.get_diagram_view(sb.id).unwrap();
         assert_eq!(view.edges.len(), 2);
 
         // relabel + clear
@@ -6698,16 +6690,14 @@ mod tests {
         let deleted = store.delete_edge(e2.id, None).unwrap();
         assert_eq!(deleted.id, e2.id);
         assert!(matches!(store.get_edge(e2.id), Err(Error::NotFound(_))));
-        assert_eq!(store.get_storyboard_view(sb.id).unwrap().edges.len(), 1);
+        assert_eq!(store.get_diagram_view(sb.id).unwrap().edges.len(), 1);
     }
 
     #[test]
     fn delete_frame_cascades_edges_and_echoes_them() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let c = store.create_frame(sb.id, &frame_new("c")).unwrap();
@@ -6724,59 +6714,49 @@ mod tests {
         // a and c survive; no edges remain
         assert_eq!(store.get_frame(a.id).unwrap().id, a.id);
         assert_eq!(store.get_frame(c.id).unwrap().id, c.id);
-        assert!(store.get_storyboard_view(sb.id).unwrap().edges.is_empty());
+        assert!(store.get_diagram_view(sb.id).unwrap().edges.is_empty());
     }
 
     #[test]
-    fn delete_storyboard_cascades_and_echoes_full_view() {
+    fn delete_diagram_cascades_and_echoes_full_view() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
 
-        let view = store.delete_storyboard(sb.id).unwrap();
+        let view = store.delete_diagram(sb.id).unwrap();
         assert_eq!(view.frames.len(), 2);
         assert_eq!(view.edges.len(), 1);
         // gone, with frames and edges cascaded
-        assert!(matches!(
-            store.get_storyboard(sb.id),
-            Err(Error::NotFound(_))
-        ));
+        assert!(matches!(store.get_diagram(sb.id), Err(Error::NotFound(_))));
         assert!(matches!(store.get_frame(a.id), Err(Error::NotFound(_))));
     }
 
     #[test]
-    fn delete_project_cascades_storyboards() {
+    fn delete_project_cascades_diagrams() {
         let (mut store, _dir) = temp_store();
         let p = store
             .create_project("doomed", None, None, None, None)
             .unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
 
         store.delete_project(p.id).unwrap();
-        assert!(matches!(
-            store.get_storyboard(sb.id),
-            Err(Error::NotFound(_))
-        ));
+        assert!(matches!(store.get_diagram(sb.id), Err(Error::NotFound(_))));
         assert!(matches!(store.get_frame(a.id), Err(Error::NotFound(_))));
         assert!(matches!(store.get_edge(1), Err(Error::NotFound(_))));
     }
 
     #[test]
-    fn storyboard_change_history_records_actor_and_actions() {
+    fn diagram_change_history_records_actor_and_actions() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
-            .create_storyboard(p.id, "flow", None, Some("agent-1"), None)
+            .create_diagram(p.id, "flow", None, Some("agent-1"), None)
             .unwrap();
         let a = store
             .create_frame(
@@ -6835,12 +6815,12 @@ mod tests {
             .unwrap();
         store.delete_edge(e.id, Some("agent-2")).unwrap();
 
-        let events = store.list_storyboard_events(sb.id).unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
         let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
         assert_eq!(
             actions,
             vec![
-                "storyboard_created",
+                "diagram_created",
                 "frame_added",
                 "frame_added",
                 "edge_added",
@@ -6863,34 +6843,30 @@ mod tests {
 
         // deleting a frame logs a removal on the surviving board
         store.delete_frame(a.id, Some("user")).unwrap();
-        let events = store.list_storyboard_events(sb.id).unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
         assert_eq!(events.last().unwrap().action, "frame_removed");
         assert_eq!(events.last().unwrap().actor.as_deref(), Some("user"));
 
         // history dies with the board; unknown board is NotFound
         assert!(matches!(
-            store.list_storyboard_events(9999),
+            store.list_diagram_events(9999),
             Err(Error::NotFound(_))
         ));
     }
 
     #[test]
-    fn delete_storyboard_cascades_its_change_history() {
+    fn delete_diagram_cascades_its_change_history() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         store.create_frame(sb.id, &frame_new("a")).unwrap();
-        assert!(!store.list_storyboard_events(sb.id).unwrap().is_empty());
-        store.delete_storyboard(sb.id).unwrap();
+        assert!(!store.list_diagram_events(sb.id).unwrap().is_empty());
+        store.delete_diagram(sb.id).unwrap();
         // a fresh board reuses no rows; the orphaned events are gone
-        let sb2 = store
-            .create_storyboard(p.id, "b2", None, None, None)
-            .unwrap();
-        let events = store.list_storyboard_events(sb2.id).unwrap();
+        let sb2 = store.create_diagram(p.id, "b2", None, None, None).unwrap();
+        let events = store.list_diagram_events(sb2.id).unwrap();
         assert_eq!(events.len(), 1); // only its own creation
-        assert_eq!(events[0].action, "storyboard_created");
+        assert_eq!(events[0].action, "diagram_created");
     }
 
     #[test]
@@ -6898,22 +6874,22 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
         let sb = store
-            .create_storyboard(p.id, "b", Some("d"), None, None)
+            .create_diagram(p.id, "b", Some("d"), None, None)
             .unwrap();
         let f = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let g = store.create_frame(sb.id, &frame_new("g")).unwrap();
         let e = store
             .create_edge(sb.id, f.id, g.id, Some("lbl"), None)
             .unwrap();
-        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let before = store.list_diagram_events(sb.id).unwrap().len();
         let frame_updated_at = store.get_frame(f.id).unwrap().updated_at;
 
         // Re-set every field to its current value: no change, no event, and
         // updated_at is not bumped.
         store
-            .update_storyboard(
+            .update_diagram(
                 sb.id,
-                &StoryboardPatch {
+                &DiagramPatch {
                     title: Some("b".into()),
                     description: Some(Some("d".into())),
                 },
@@ -6941,7 +6917,7 @@ mod tests {
                 Some("noop"),
             )
             .unwrap();
-        assert_eq!(store.list_storyboard_events(sb.id).unwrap().len(), before);
+        assert_eq!(store.list_diagram_events(sb.id).unwrap().len(), before);
         assert_eq!(store.get_frame(f.id).unwrap().updated_at, frame_updated_at);
 
         // A real change still logs one event.
@@ -6955,19 +6931,14 @@ mod tests {
                 Some("mover"),
             )
             .unwrap();
-        assert_eq!(
-            store.list_storyboard_events(sb.id).unwrap().len(),
-            before + 1
-        );
+        assert_eq!(store.list_diagram_events(sb.id).unwrap().len(), before + 1);
     }
 
     #[test]
     fn edge_anchor_patch_is_three_state_preserved_and_logged() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        let sb = store
-            .create_storyboard(p.id, "b", None, None, None)
-            .unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let e = store
@@ -6991,7 +6962,7 @@ mod tests {
         assert_eq!(locked.to_anchor, None);
 
         // (1) A label-only PATCH leaves the existing anchor lock untouched.
-        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let before = store.list_diagram_events(sb.id).unwrap().len();
         let relabeled = store
             .update_edge(
                 e.id,
@@ -7004,12 +6975,12 @@ mod tests {
             .unwrap();
         assert_eq!(relabeled.from_anchor, Some(AnchorSide::Right));
         assert_eq!(relabeled.to_anchor, None);
-        let events = store.list_storyboard_events(sb.id).unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
         assert_eq!(events.len(), before + 1);
         assert_eq!(events.last().unwrap().action, "edge_relabeled");
 
         // (2) Locking the other end logs exactly one edge_anchor_changed event.
-        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let before = store.list_diagram_events(sb.id).unwrap().len();
         let changed = store
             .update_edge(
                 e.id,
@@ -7022,14 +6993,14 @@ mod tests {
             .unwrap();
         assert_eq!(changed.to_anchor, Some(AnchorSide::Bottom));
         assert_eq!(changed.from_anchor, Some(AnchorSide::Right)); // independent endpoints
-        let events = store.list_storyboard_events(sb.id).unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
         assert_eq!(events.len(), before + 1);
         assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
         assert!(events.last().unwrap().summary.contains("locked to-anchor"));
 
         // (3) Re-PATCHing an endpoint to the side it's already locked to is a
         // no-op: no change, no event.
-        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let before = store.list_diagram_events(sb.id).unwrap().len();
         let noop = store
             .update_edge(
                 e.id,
@@ -7041,10 +7012,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(noop.to_anchor, Some(AnchorSide::Bottom));
-        assert_eq!(store.list_storyboard_events(sb.id).unwrap().len(), before);
+        assert_eq!(store.list_diagram_events(sb.id).unwrap().len(), before);
 
         // Unlocking logs its own event with the "unlocked" summary shape.
-        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let before = store.list_diagram_events(sb.id).unwrap().len();
         let unlocked = store
             .update_edge(
                 e.id,
@@ -7057,7 +7028,7 @@ mod tests {
             .unwrap();
         assert_eq!(unlocked.from_anchor, None);
         assert_eq!(unlocked.to_anchor, Some(AnchorSide::Bottom)); // untouched
-        let events = store.list_storyboard_events(sb.id).unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
         assert_eq!(events.len(), before + 1);
         assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
         assert!(
@@ -7070,7 +7041,7 @@ mod tests {
 
         // Priority: when a single PATCH changes both an anchor and the label,
         // the anchor change wins the one-event-per-call slot.
-        let before = store.list_storyboard_events(sb.id).unwrap().len();
+        let before = store.list_diagram_events(sb.id).unwrap().len();
         store
             .update_edge(
                 e.id,
@@ -7082,7 +7053,7 @@ mod tests {
                 Some("user"),
             )
             .unwrap();
-        let events = store.list_storyboard_events(sb.id).unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
         assert_eq!(events.len(), before + 1);
         assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
     }

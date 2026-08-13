@@ -38,13 +38,13 @@ use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{
-    AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
-    FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, MesaVersion, ModelRates, NextResult,
-    Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
-    ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, StoryboardPatch,
-    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks,
-    scripts, speech, version,
+    AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
+    EdgePatch, Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile,
+    GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, MesaVersion,
+    ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch,
+    Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git,
+    hooks, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -737,19 +737,16 @@ fn router(state: AppState) -> Router {
         // GET, not mutating — the Content-Type gate doesn't apply (matches
         // the git-diff/agents-list GET precedent below).
         .route("/api/attachments/{id}/download", get(download_attachment))
+        .route("/api/diagrams", get(list_diagrams).post(create_diagram))
         .route(
-            "/api/storyboards",
-            get(list_storyboards).post(create_storyboard),
+            "/api/diagrams/{id}",
+            get(show_diagram)
+                .patch(update_diagram)
+                .delete(delete_diagram),
         )
-        .route(
-            "/api/storyboards/{id}",
-            get(show_storyboard)
-                .patch(update_storyboard)
-                .delete(delete_storyboard),
-        )
-        .route("/api/storyboards/{id}/frames", post(create_frame))
-        .route("/api/storyboards/{id}/edges", post(create_edge))
-        .route("/api/storyboards/{id}/events", get(list_storyboard_events))
+        .route("/api/diagrams/{id}/frames", post(create_frame))
+        .route("/api/diagrams/{id}/edges", post(create_edge))
+        .route("/api/diagrams/{id}/events", get(list_diagram_events))
         .route("/api/frames/{id}", patch(update_frame).delete(delete_frame))
         .route(
             "/api/edges/{id}",
@@ -1645,16 +1642,16 @@ async fn delete_attachment(
     Ok(Json(store.delete_attachment(id)?).into_response())
 }
 
-// ---- storyboards ----
+// ---- diagrams ----
 
 #[derive(Deserialize)]
-struct StoryboardQuery {
+struct DiagramQuery {
     #[serde(default)]
     project: Option<i64>,
 }
 
 #[derive(Deserialize)]
-struct StoryboardCreate {
+struct DiagramCreate {
     project_id: i64,
     title: String,
     #[serde(default)]
@@ -1662,7 +1659,7 @@ struct StoryboardCreate {
     #[serde(default)]
     author: Option<String>,
     /// Missing/null defaults to `DiagramType::Storyboard`. Immutable after
-    /// creation — no field on `StoryboardUpdate`.
+    /// creation — no field on `DiagramUpdate`.
     #[serde(default)]
     diagram_type: Option<DiagramType>,
 }
@@ -1675,7 +1672,7 @@ struct ActorQuery {
 }
 
 #[derive(Deserialize)]
-struct StoryboardUpdate {
+struct DiagramUpdate {
     #[serde(default)]
     title: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
@@ -1759,73 +1756,67 @@ struct EdgeUpdate {
     author: Option<String>,
 }
 
-async fn list_storyboards(
+async fn list_diagrams(
     State(state): State<AppState>,
-    Query(q): Query<StoryboardQuery>,
+    Query(q): Query<DiagramQuery>,
 ) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
-    Ok(Json(store.list_storyboards(q.project)?).into_response())
+    Ok(Json(store.list_diagrams(q.project)?).into_response())
 }
 
-async fn create_storyboard(
+async fn create_diagram(
     State(state): State<AppState>,
-    body: Result<Json<StoryboardCreate>, JsonRejection>,
+    body: Result<Json<DiagramCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let storyboard = store.create_storyboard(
+    let diagram = store.create_diagram(
         body.project_id,
         &body.title,
         body.description.as_deref(),
         body.author.as_deref(),
         body.diagram_type,
     )?;
-    Ok((StatusCode::CREATED, Json(storyboard)).into_response())
+    Ok((StatusCode::CREATED, Json(diagram)).into_response())
 }
 
-/// Returns the board's full contents: {storyboard, frames, edges}.
-async fn show_storyboard(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> ApiResult<Response> {
+/// Returns the board's full contents: {diagram, frames, edges}.
+async fn show_diagram(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
-    Ok(Json(store.get_storyboard_view(id)?).into_response())
+    Ok(Json(store.get_diagram_view(id)?).into_response())
 }
 
-async fn update_storyboard(
+async fn update_diagram(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    body: Result<Json<StoryboardUpdate>, JsonRejection>,
+    body: Result<Json<DiagramUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
-    let patch = StoryboardPatch {
+    let patch = DiagramPatch {
         title: body.title,
         description: body.description,
     };
     let mut store = state.store.lock().unwrap();
-    Ok(Json(store.update_storyboard(id, &patch, body.author.as_deref())?).into_response())
+    Ok(Json(store.update_diagram(id, &patch, body.author.as_deref())?).into_response())
 }
 
-async fn delete_storyboard(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> ApiResult<Response> {
+async fn delete_diagram(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
-    Ok(Json(store.delete_storyboard(id)?).into_response())
+    Ok(Json(store.delete_diagram(id)?).into_response())
 }
 
-/// Storyboard change history (who/what/when), oldest first.
-async fn list_storyboard_events(
+/// Diagram change history (who/what/when), oldest first.
+async fn list_diagram_events(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
-    Ok(Json(store.list_storyboard_events(id)?).into_response())
+    Ok(Json(store.list_diagram_events(id)?).into_response())
 }
 
 async fn create_frame(
     State(state): State<AppState>,
-    Path(storyboard_id): Path<i64>,
+    Path(diagram_id): Path<i64>,
     payload: Result<Json<FrameCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(payload) = payload?;
@@ -1842,7 +1833,7 @@ async fn create_frame(
         shape: payload.shape,
     };
     let mut store = state.store.lock().unwrap();
-    let frame = store.create_frame(storyboard_id, &new)?;
+    let frame = store.create_frame(diagram_id, &new)?;
     Ok((StatusCode::CREATED, Json(frame)).into_response())
 }
 
@@ -1878,13 +1869,13 @@ async fn delete_frame(
 
 async fn create_edge(
     State(state): State<AppState>,
-    Path(storyboard_id): Path<i64>,
+    Path(diagram_id): Path<i64>,
     body: Result<Json<EdgeCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
     let edge = store.create_edge(
-        storyboard_id,
+        diagram_id,
         body.from_frame,
         body.to_frame,
         body.label.as_deref(),

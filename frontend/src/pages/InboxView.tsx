@@ -583,7 +583,7 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
                       {item.body}
                     </div>
                   )}
-                  <div className="muted storyboard-meta">
+                  <div className="muted diagram-meta">
                     <span className="inbox-kind">{inboxKindLabel(item.kind)}</span>
                     <span> · </span>
                     {item.author && <span>from {item.author} · </span>}

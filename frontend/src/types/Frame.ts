@@ -2,13 +2,13 @@
 import type { FrameShape } from "./FrameShape";
 
 /**
- * One card on a storyboard, positioned freely on the canvas. `x`/`y` are the
+ * One card on a diagram, positioned freely on the canvas. `x`/`y` are the
  * top-left corner and `w`/`h` the size, in abstract canvas units the web
  * renders as pixels. `body` is free text (markdown by convention). `task_id`
  * optionally links the frame to an existing task in the *same project* — a
  * soft reference that is set to null if the task is later deleted.
  */
-export type Frame = { id: number, storyboard_id: number, title: string, body: string | null, x: number, y: number, w: number, h: number, 
+export type Frame = { id: number, diagram_id: number, title: string, body: string | null, x: number, y: number, w: number, h: number, 
 /**
  * Free-text colour hint for the web canvas (a CSS colour, e.g. `#00e5ff`).
  */

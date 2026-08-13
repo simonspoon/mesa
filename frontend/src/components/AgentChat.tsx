@@ -2,9 +2,11 @@ import { useLayoutEffect, useRef, useState } from 'react'
 import { getCcSessionChat } from '../api'
 import { useFetch } from '../useFetch'
 import { Markdown } from './Markdown'
+import * as ptyPool from '../lib/ptyPool'
 import {
   chatClock,
   chatGroups,
+  chatSendKeys,
   chatToolLabel,
   chatToolSummary,
   chatToolTarget,
@@ -36,7 +38,18 @@ import type { CcChatTurn } from '../types/CcChatTurn'
  * refuse every image, so a transcript can never make the browser fetch a
  * remote URL. Tool names and targets render as plain text children only.
  */
-export function AgentChat({ sessionId, paused }: { sessionId: string; paused: boolean }) {
+export function AgentChat({
+  agentId,
+  sessionId,
+  paused,
+}: {
+  /** The pane's own id — the background job id its terminal is attached under,
+   *  which is what the composer types into (`ptyPool.send`). Not the session
+   *  id: the transcript is keyed by one and the PTY by the other. */
+  agentId: string
+  sessionId: string
+  paused: boolean
+}) {
   const { data, error } = useFetch(
     () => getCcSessionChat(sessionId),
     `agent-chat-${sessionId}`,
@@ -68,89 +81,220 @@ export function AgentChat({ sessionId, paused }: { sessionId: string; paused: bo
     if (el && followRef.current) el.scrollTop = el.scrollHeight
   }, [data, collapsed])
 
+  // Shared by the jump-to-latest button and by sending: both are "show me the
+  // tail again".
+  const jumpToTail = () => {
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+    followRef.current = true
+    setAdrift(false)
+  }
+  // Every state below is the same two-part pane — conversation, then composer
+  // at the same tree position — so half-typed text survives the first payload
+  // arriving, and a session with no transcript yet (exactly the one you may
+  // want to say something to) can still be spoken to.
   if (error !== null && data === null)
     return (
-      <div className="agent-chat agent-chat-empty">
-        <p>No transcript for this session yet.</p>
-        <p className="agent-chat-hint">{error}</p>
+      <div className="agent-chat-pane">
+        <div className="agent-chat agent-chat-empty">
+          <p>No transcript for this session yet.</p>
+          <p className="agent-chat-hint">{error}</p>
+        </div>
+        <Composer agentId={agentId} onSent={jumpToTail} />
       </div>
     )
-  if (data === null) return <div className="agent-chat agent-chat-empty">loading…</div>
+  if (data === null)
+    return (
+      <div className="agent-chat-pane">
+        <div className="agent-chat agent-chat-empty">loading…</div>
+        <Composer agentId={agentId} onSent={jumpToTail} />
+      </div>
+    )
 
   const groups = chatGroups(data.turns)
   return (
-    <div
-      className="agent-chat"
-      ref={scrollRef}
-      onScroll={(e) => {
-        const el = e.currentTarget
-        const near = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
-        followRef.current = near
-        setAdrift(!near)
+    <div className="agent-chat-pane">
+      <div
+        className="agent-chat"
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget
+          const near = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight)
+          followRef.current = near
+          setAdrift(!near)
+        }}
+      >
+        {data.truncated && (
+          <p className="agent-chat-truncated">Older turns are not shown.</p>
+        )}
+        {/* A failure AFTER the first load leaves the last good conversation on
+            screen — the right call for the transient 503 a transcript rotation
+            gives — but silently, it reads as a live chat that has simply gone
+            quiet. Say so instead. */}
+        {error !== null && (
+          <p className="agent-chat-hint">Not updating — {error}</p>
+        )}
+        {groups.length === 0 && (
+          <p className="agent-chat-hint">This session has not said anything yet.</p>
+        )}
+        {groups.map((g, i) => {
+          if (g.kind !== 'tools') return <Bubble key={g.id} kind={g.kind} turn={g.turns[0]} />
+          // Closed by default — a session puts tens of calls between two
+          // replies, and expanded they are a wall of shell that buries the
+          // conversation this view exists to show; the summary line says what
+          // ran. The exception is the run at the very end, which on a live
+          // session is what the agent is doing *right now* and is the one thing
+          // a watcher is here for.
+          const isOpen = collapsed[g.id] === undefined ? i === groups.length - 1 : !collapsed[g.id]
+          return (
+            <div key={g.id} className="agent-chat-tools">
+              <button
+                type="button"
+                className="agent-chat-tools-head"
+                aria-expanded={isOpen}
+                onClick={() => setCollapsed((c) => ({ ...c, [g.id]: isOpen }))}
+              >
+                <span className="agent-chat-caret">{isOpen ? '▾' : '▸'}</span>
+                <span className="agent-chat-tools-count">
+                  {g.turns.length} step{g.turns.length === 1 ? '' : 's'}
+                </span>
+                <span className="agent-chat-tools-summary">{chatToolSummary(g.turns)}</span>
+              </button>
+              {isOpen &&
+                g.turns.map((t) => (
+                  <div key={t.id} className="agent-chat-tool" title={chatToolLabel(t)}>
+                    <span className="agent-chat-tool-name">{t.name ?? 'tool'}</span>
+                    <span className="agent-chat-tool-target">{chatToolTarget(t.text)}</span>
+                  </div>
+                ))}
+            </div>
+          )
+        })}
+        {adrift && (
+          <button type="button" className="agent-chat-jump" onClick={jumpToTail}>
+            ↓ latest
+          </button>
+        )}
+      </div>
+      <Composer agentId={agentId} onSent={jumpToTail} />
+    </div>
+  )
+}
+
+/**
+ * The chat's send icon: a flat sharp-cornered dart in `currentColor`, drawn
+ * rather than typed — the same vocabulary as the inbox transport glyphs (task
+ * 832) and the brand mark, so it takes the button's cyan and its hover and
+ * disabled states for free instead of rendering in whatever symbol font the
+ * platform picks for `➤`.
+ */
+function SendIcon() {
+  return (
+    <svg
+      className="agent-chat-send-icon"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <polygon points="1,1 15,8 1,15 4,8" />
+    </svg>
+  )
+}
+
+/**
+ * The message box, pinned to the bottom of the pane (task 844).
+ *
+ * There is no "send a message" API: a chat view is a *render* of a transcript
+ * file, and the only channel into a running session is the terminal this pane
+ * is already attached to. So a composed message is typed into that PTY —
+ * `ptyPool.send` on the pane's own leaf id — exactly as a person at the
+ * terminal would type it, and the reply comes back through the ordinary
+ * transcript poll like any other turn. That also means it fails the way the
+ * terminal fails: no live socket, no send, said out loud rather than dropped.
+ *
+ * Enter sends and Shift+Enter opens a line, the convention of every chat box;
+ * the multi-line case is what `chatSendKeys`'s bracketed paste exists for.
+ */
+function Composer({ agentId, onSent }: { agentId: string; onSent: () => void }) {
+  const [text, setText] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // One line until it needs more, then up to a few — a pane in a 2x2 tile is
+  // only a couple of hundred pixels tall, so a fixed multi-line box would eat
+  // the conversation it sits under. Measured, not `field-sizing: content`,
+  // which Safari does not have.
+  const grow = (el: HTMLTextAreaElement) => {
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`
+  }
+
+  const submit = () => {
+    const keys = chatSendKeys(text)
+    if (keys === null) return
+    if (!ptyPool.send(agentId, keys)) {
+      setError('not connected — reopen the terminal view to reconnect')
+      return
+    }
+    setError(null)
+    setText('')
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto'
+      inputRef.current.focus()
+    }
+    // Sending is following: a reader who has scrolled up to something older
+    // and then says something wants to see the answer.
+    onSent()
+  }
+
+  return (
+    <form
+      className="agent-chat-composer"
+      onSubmit={(e) => {
+        e.preventDefault()
+        submit()
       }}
     >
-      {data.truncated && (
-        <p className="agent-chat-truncated">Older turns are not shown.</p>
-      )}
-      {/* A failure AFTER the first load leaves the last good conversation on
-          screen — the right call for the transient 503 a transcript rotation
-          gives — but silently, it reads as a live chat that has simply gone
-          quiet. Say so instead. */}
-      {error !== null && (
-        <p className="agent-chat-hint">Not updating — {error}</p>
-      )}
-      {groups.length === 0 && (
-        <p className="agent-chat-hint">This session has not said anything yet.</p>
-      )}
-      {groups.map((g, i) => {
-        if (g.kind !== 'tools') return <Bubble key={g.id} kind={g.kind} turn={g.turns[0]} />
-        // Closed by default — a session puts tens of calls between two
-        // replies, and expanded they are a wall of shell that buries the
-        // conversation this view exists to show; the summary line says what
-        // ran. The exception is the run at the very end, which on a live
-        // session is what the agent is doing *right now* and is the one thing
-        // a watcher is here for.
-        const isOpen = collapsed[g.id] === undefined ? i === groups.length - 1 : !collapsed[g.id]
-        return (
-          <div key={g.id} className="agent-chat-tools">
-            <button
-              type="button"
-              className="agent-chat-tools-head"
-              aria-expanded={isOpen}
-              onClick={() => setCollapsed((c) => ({ ...c, [g.id]: isOpen }))}
-            >
-              <span className="agent-chat-caret">{isOpen ? '▾' : '▸'}</span>
-              <span className="agent-chat-tools-count">
-                {g.turns.length} step{g.turns.length === 1 ? '' : 's'}
-              </span>
-              <span className="agent-chat-tools-summary">{chatToolSummary(g.turns)}</span>
-            </button>
-            {isOpen &&
-              g.turns.map((t) => (
-                <div key={t.id} className="agent-chat-tool" title={chatToolLabel(t)}>
-                  <span className="agent-chat-tool-name">{t.name ?? 'tool'}</span>
-                  <span className="agent-chat-tool-target">{chatToolTarget(t.text)}</span>
-                </div>
-              ))}
-          </div>
-        )
-      })}
-      {adrift && (
-        <button
-          type="button"
-          className="agent-chat-jump"
-          onClick={() => {
-            const el = scrollRef.current
-            if (!el) return
-            el.scrollTop = el.scrollHeight
-            followRef.current = true
-            setAdrift(false)
+      {error && <p className="agent-chat-send-error">{error}</p>}
+      <div className="agent-chat-composer-row">
+        <textarea
+          ref={inputRef}
+          className="agent-chat-input"
+          rows={1}
+          value={text}
+          placeholder="message this agent…"
+          aria-label="message this agent"
+          onChange={(e) => {
+            setText(e.target.value)
+            // The failure it reports is about the socket, not about the text —
+            // leaving it up over a composer that has since reconnected is the
+            // one way this line can lie.
+            if (error !== null) setError(null)
+            grow(e.target)
           }}
+          onKeyDown={(e) => {
+            if (e.key !== 'Enter' || e.shiftKey) return
+            // The Enter that commits an IME candidate is not a send: it
+            // arrives as a plain `Enter` keydown with `isComposing` set, and
+            // acting on it would ship half-converted text. Same guard, for the
+            // same reason, as `CodeEditor`'s.
+            if (e.nativeEvent.isComposing) return
+            e.preventDefault()
+            submit()
+          }}
+        />
+        <button
+          type="submit"
+          className="agent-chat-send"
+          title="send to this agent (Enter)"
+          aria-label="send"
+          disabled={chatSendKeys(text) === null}
         >
-          ↓ latest
+          <SendIcon />
         </button>
-      )}
-    </div>
+      </div>
+    </form>
   )
 }
 

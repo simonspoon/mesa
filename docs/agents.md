@@ -390,6 +390,42 @@ already use.
     so pane-local state would snap back to the terminal on a layout change.
     Closed panes keep their key, so reopening a session restores the view it
     was last read in.
+  - **The chat view can be typed into** (mesa task 844): a composer pinned to
+    the bottom of the pane — a one-line textarea that grows with its content to
+    a cap, and a drawn send icon (a flat `currentColor` polygon, the same
+    vocabulary as the inbox transport glyphs, not a typed `➤`). Enter sends,
+    Shift+Enter opens a line, and an all-whitespace message sends **nothing**
+    (a bare `\r` would submit whatever the agent's own input box already
+    holds). It is a flex sibling of the scroll box, not a `sticky` child, so
+    the conversation never scrolls underneath it — in a 200px auto-tile that
+    overlap is most of the last turn.
+    - **There is no send API, and deliberately so.** The chat is a *render* of
+      a transcript file; the only channel into a live session is the terminal
+      the pane is already attached to. A composed message is therefore **typed
+      into that PTY** — `ptyPool.send(<pane id>, chatSendKeys(text))` — exactly
+      as a person at the terminal would type it, and the reply comes back
+      through the ordinary 3s transcript poll like any other turn. No new
+      route, no second write path into a session, and the whole
+      `require_agent_access` gate on the attach socket already covers it.
+    - The socket belongs to the pooled `PtyTerminal`, so it registers a writer
+      with `ptyPool.setSender` **on open** and withdraws it on close/unmount;
+      the **writer itself** answers whether the bytes went out, so
+      `ptyPool.send` returns `false` both for a leaf with no writer and for one
+      whose socket has left `OPEN` — a graceful close leaves the writer
+      registered until the `close` event dispatches, and only the terminal
+      holds the `readyState` that tells those apart. Either way the composer
+      says so rather than dropping the message: a writer handed out during
+      `CONNECTING` would swallow what was typed, and an outside writer has no
+      keyboard in front of it to notice.
+    - A **multi-line** message is wrapped in bracketed paste
+      (`ESC[200~` … `ESC[201~`) rather than sent as raw newlines: a raw `\n` is
+      the submit key in the agent's TUI, so three lines would arrive as three
+      prompts. CRLF is normalised first, for the same reason. `chatSendKeys`
+      (`frontend/src/agentChat.ts`, vitest-covered) is the one place that
+      encoding lives.
+    - This is the one thing the chat view can do that the terminal cannot do
+      better, and it is why the pane defaults to `chat`: read what it is doing,
+      say the next thing, without switching views.
   - **Untrusted text, rendered as markup — deliberately, and narrowly.** Every
     body here is model-authored transcript text, which the CC surfaces
     otherwise render only as a text child or a `title`. The chat view is the

@@ -140,3 +140,28 @@ export function isNearBottom(scrollTop: number, scrollHeight: number, clientHeig
   const slack = Math.max(16, Math.min(80, clientHeight * 0.25))
   return scrollHeight - clientHeight - scrollTop <= slack
 }
+
+/**
+ * The keystrokes that send one composed message to the pane's session (task
+ * 844). The chat view has no channel of its own: it is a render of a
+ * transcript, and the only way into the session is the terminal the pane is
+ * already attached to — so a composed message is typed into that PTY, exactly
+ * as a person at the terminal would.
+ *
+ * Returns `null` for a message that is only whitespace: `\r` alone is a real
+ * keystroke (it submits whatever the agent's own input box already holds), so
+ * an empty compose must send *nothing* rather than a bare newline.
+ *
+ * A multi-line message is wrapped in **bracketed paste** (`ESC[200~` …
+ * `ESC[201~`) instead of being sent as raw newlines, because a raw `\n` is the
+ * submit key in the agent's TUI — an unwrapped three-line message would arrive
+ * as three separate prompts. Wrapped, it arrives as one paste, which is what
+ * the same text dropped into the terminal by hand does. CRLF is normalised
+ * first for the same reason: a stray `\r` from a paste would submit early.
+ */
+export function chatSendKeys(text: string): string | null {
+  const body = text.replace(/\r\n?/g, '\n').trim()
+  if (body === '') return null
+  if (!body.includes('\n')) return `${body}\r`
+  return `\x1b[200~${body}\x1b[201~\r`
+}

@@ -32,6 +32,18 @@ type PoolEntry = {
 
 const pool = new Map<string, PoolEntry>()
 
+// How anything outside the terminal types INTO a leaf's PTY (mesa task 844:
+// the chat view's composer). The socket belongs to the `PtyTerminal` the pool
+// portals into that leaf's container, so the terminal registers a writer here
+// while it has a live socket and clears it on close/unmount — an id with no
+// entry is a leaf whose connection is gone, which is the one thing a caller
+// has to be told apart from a successful write.
+// The writer answers whether the bytes actually went out: a socket that has
+// entered CLOSING is still registered until its `close` event dispatches (a
+// server round-trip on a graceful close), and only the terminal holds the
+// `readyState` that tells them apart.
+const senders = new Map<string, (data: string) => boolean>()
+
 // A referentially-stable snapshot array, rebuilt only when the pool's own
 // membership actually changes (`ensure`/`remove` below) — never on every
 // `getIds()` call. `useSyncExternalStore` (in `PtyPool.tsx`) treats any new
@@ -89,7 +101,32 @@ export function ensure(
 export function remove(id: string): void {
   if (!pool.has(id)) return
   pool.delete(id)
+  senders.delete(id)
   notify()
+}
+
+/**
+ * Registers (or, with `null`, clears) the writer for one leaf's PTY. Called by
+ * the pooled `PtyTerminal` itself — nobody else has the socket. Not part of
+ * `PoolEntry`: an entry is created before its terminal has connected and
+ * outlives any one socket (a reconnect keeps the entry and swaps the writer),
+ * so the two have different lifetimes.
+ */
+export function setSender(id: string, send: ((data: string) => boolean) | null): void {
+  if (send === null) senders.delete(id)
+  else senders.set(id, send)
+}
+
+/**
+ * Types `data` into a leaf's PTY as if it had been keyed at the terminal.
+ * Returns false when the bytes did not go out — no registered writer at all,
+ * or a socket that is no longer open — so the caller can say so rather than
+ * silently dropping the message.
+ */
+export function send(id: string, data: string): boolean {
+  const sender = senders.get(id)
+  if (!sender) return false
+  return sender(data)
 }
 
 export function get(id: string): PoolEntry | undefined {

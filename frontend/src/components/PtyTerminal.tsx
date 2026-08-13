@@ -38,6 +38,7 @@ function ptyFontSize(): number {
 export function PtyTerminal({
   endpoint,
   closedMessage,
+  registerSend,
 }: {
   // Path (no origin) to the websocket endpoint to attach to, e.g.
   // `/api/agents/${agentId}/attach` or `/api/terminal/attach`.
@@ -45,6 +46,12 @@ export function PtyTerminal({
   // Shown in the "connection closed" banner — callers know what "closed"
   // means for their own backing process (session detach vs. shell exit).
   closedMessage: ReactNode
+  // Hands the caller a writer into this socket for as long as it is open, and
+  // `null` when it goes (mesa task 844: the chat view's composer types into
+  // the terminal its pane is already attached to, since a transcript render
+  // has no channel of its own). Optional — a surface with nothing but the
+  // terminal itself typing into the PTY simply omits it.
+  registerSend?: (send: ((data: string) => boolean) | null) => void
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   // Held only so the tier effect below can retune an already-open terminal;
@@ -56,6 +63,13 @@ export function PtyTerminal({
   // fresh socket without unmounting (the parent's key is its own pane
   // identity, which does not change on reconnect).
   const [epoch, setEpoch] = useState(0)
+  // Read inside the connect effect without being one of its dependencies: the
+  // prop is a fresh closure on every parent render, and re-running the effect
+  // would tear down and reopen the socket each time.
+  const registerRef = useRef(registerSend)
+  useEffect(() => {
+    registerRef.current = registerSend
+  })
 
   useEffect(() => {
     const el = containerRef.current
@@ -98,18 +112,35 @@ export function PtyTerminal({
       `${proto}://${window.location.host}${endpoint}${sep}cols=${term.cols}&rows=${term.rows}`,
     )
     ws.binaryType = 'arraybuffer'
+    const encoder = new TextEncoder()
     ws.onmessage = (ev) => term.write(new Uint8Array(ev.data as ArrayBuffer))
     ws.onopen = () => {
       // Resizes fit()'d during the CONNECTING window were dropped (the guard
       // below only sends when OPEN); push the current size once so the PTY
       // matches the actual viewport rather than the initial query-param size.
       ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }))
+      // Handed out only once the socket is open, and withdrawn again below the
+      // moment it closes: an outside writer (the chat composer) has no
+      // keyboard in front of it to notice a dropped message, so "there is no
+      // writer" has to be the honest answer whenever a write wouldn't land.
+      registerRef.current?.((d) => {
+        if (ws.readyState !== WebSocket.OPEN) return false
+        ws.send(encoder.encode(d))
+        return true
+      })
     }
     ws.onclose = () => {
-      if (!disposed) setClosed(true)
+      // Both inside the `disposed` guard, and the writer for the same reason
+      // the banner is: a socket torn down by this effect's own cleanup closes
+      // *asynchronously*, by which time the reconnect (or StrictMode's second
+      // mount) has already opened a new one and registered its writer —
+      // clearing here would strand the composer against a live terminal. The
+      // cleanup path has already withdrawn the writer itself.
+      if (disposed) return
+      registerRef.current?.(null)
+      setClosed(true)
     }
 
-    const encoder = new TextEncoder()
     const dataSub = term.onData((d) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(encoder.encode(d))
     })
@@ -125,6 +156,7 @@ export function PtyTerminal({
 
     return () => {
       disposed = true
+      registerRef.current?.(null)
       observer.disconnect()
       dataSub.dispose()
       resizeSub.dispose()

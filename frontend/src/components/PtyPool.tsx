@@ -24,7 +24,15 @@ export function PtyPool() {
         const e = ptyPool.get(id)
         if (!e) return null
         return createPortal(
-          <PtyTerminal key={id} endpoint={e.endpoint} closedMessage={e.closedMessage} />,
+          <PtyTerminal
+            key={id}
+            endpoint={e.endpoint}
+            closedMessage={e.closedMessage}
+            // The pool is the only place a leaf id and its socket meet, so it
+            // is where the id-keyed writer `ptyPool.send` looks up is bound
+            // (mesa task 844).
+            registerSend={(send) => ptyPool.setSender(id, send)}
+          />,
           e.container,
         )
       })}

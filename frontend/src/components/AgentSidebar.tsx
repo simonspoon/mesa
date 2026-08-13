@@ -201,7 +201,10 @@ function PaneBody({
       </div>
       {showChat && sessionId !== null && (
         <div className="agent-pane-view">
-          <AgentChat key={sessionId} sessionId={sessionId} paused={paused} />
+          {/* Both ids: the transcript it renders is keyed by the session id,
+              while its composer types into the PTY, which is keyed by the
+              pane's own background job id (task 844). */}
+          <AgentChat key={sessionId} agentId={agentId} sessionId={sessionId} paused={paused} />
         </div>
       )}
     </div>

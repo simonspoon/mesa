@@ -3292,6 +3292,20 @@ body.files-tree-resizing {
   pointer-events: none;
 }
 
+/* The chat view is two stacked pieces, not one scroll box: the conversation,
+   which scrolls, and the composer (task 844), which does not. The composer is
+   a flex sibling rather than a `position: sticky` child so the transcript
+   never scrolls under it — in a 200px-tall tile that overlap is most of the
+   last turn. */
+.agent-chat-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
 .agent-chat {
   flex: 1;
   min-width: 0;
@@ -3478,6 +3492,62 @@ body.files-tree-resizing {
 
 .agent-chat-jump:hover {
   border-color: var(--cyan);
+}
+
+/* Pinned to the bottom of the pane, above the tile's own edge: the one place
+   in this view you can type, so it stays put while the conversation moves. */
+.agent-chat-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.4rem 0.6rem 0.5rem;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.agent-chat-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.4rem;
+}
+
+/* One line to start; `Composer` grows it against its own content up to a cap,
+   after which it scrolls — a pane in a 2x2 tile has only a couple of hundred
+   pixels to spend, and they belong to the conversation. */
+.agent-chat-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  resize: none;
+  overflow-y: auto;
+  max-height: 120px;
+}
+
+.agent-chat-send {
+  flex: none;
+  padding: 0.3rem 0.55rem;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Sized off the button's own text and coloured by `currentColor`, so it takes
+   the cyan, the hover glow and the disabled grey for free — same rule as the
+   inbox transport glyphs. */
+.agent-chat-send-icon {
+  width: 0.9em;
+  height: 0.9em;
+  display: block;
+}
+
+.agent-chat-send-error {
+  margin: 0;
+  color: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
 }
 
 .agent-chat-tool {

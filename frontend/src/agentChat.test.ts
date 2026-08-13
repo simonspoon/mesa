@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   chatClock,
   chatGroups,
+  chatSendKeys,
   chatToolLabel,
   chatToolSummary,
   chatToolTarget,
@@ -151,5 +152,31 @@ describe('isNearBottom', () => {
     // flat 80px would have snapped them back to the tail.
     expect(isNearBottom(2760, 3000, 200)).toBe(true)
     expect(isNearBottom(2740, 3000, 200)).toBe(false)
+  })
+})
+
+describe('chatSendKeys', () => {
+  it('sends a single-line message as typed text plus the submit key', () => {
+    expect(chatSendKeys('run the tests')).toBe('run the tests\r')
+  })
+
+  it('trims the surrounding whitespace a textarea collects', () => {
+    expect(chatSendKeys('  ship it \n')).toBe('ship it\r')
+  })
+
+  it('sends nothing at all for an empty or whitespace-only message', () => {
+    // A bare `\r` is a real keystroke: it would submit whatever the agent's
+    // own input box already holds.
+    expect(chatSendKeys('')).toBeNull()
+    expect(chatSendKeys('   \n\t ')).toBeNull()
+  })
+
+  it('wraps a multi-line message in bracketed paste, so it arrives as one prompt', () => {
+    expect(chatSendKeys('one\ntwo')).toBe('\x1b[200~one\ntwo\x1b[201~\r')
+  })
+
+  it('normalises CRLF, which would otherwise submit early', () => {
+    expect(chatSendKeys('one\r\ntwo')).toBe('\x1b[200~one\ntwo\x1b[201~\r')
+    expect(chatSendKeys('one\rtwo')).toBe('\x1b[200~one\ntwo\x1b[201~\r')
   })
 })

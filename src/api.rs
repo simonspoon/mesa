@@ -758,6 +758,11 @@ fn router(state: AppState) -> Router {
         // on the PATCH above: that PATCH *assigns*, answering with the created
         // task and leaving no item behind, so the two could never share a body.
         .route("/api/inbox/{id}/read", post(read_inbox))
+        // Archiving an item, or putting it back (mesa task 845). Its own route
+        // for the same reason `read` is one: the PATCH above assigns, and this
+        // answers with the item rather than a task. Unlike `read` it toggles,
+        // so the direction rides in the body.
+        .route("/api/inbox/{id}/archive", post(archive_inbox))
         // Reading an item aloud: a GET that runs an external synthesiser and
         // answers WAV bytes. It shares `require_agent_access` with the
         // code-execution routes rather than the plain `guard` the other
@@ -1933,6 +1938,14 @@ struct InboxAssign {
     project_id: i64,
 }
 
+/// Body of `POST /api/inbox/{id}/archive` (mesa task 845).
+#[derive(Deserialize)]
+struct InboxArchive {
+    /// Where the item should end up: archived, or back in the live inbox.
+    /// Required — the direction is the whole content of the request.
+    archived: bool,
+}
+
 async fn list_inbox(
     State(state): State<AppState>,
     Query(q): Query<InboxQuery>,
@@ -1976,6 +1989,19 @@ async fn assign_inbox(
 async fn read_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.mark_inbox_item_read(id)?).into_response())
+}
+
+/// Archives one item, or puts it back (mesa task 845), answering with the item
+/// either way. The body carries the direction because this one toggles —
+/// unlike `read`, which only ever stamps.
+async fn archive_inbox(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<InboxArchive>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.set_inbox_item_archived(id, body.archived)?).into_response())
 }
 
 /// Speaks one inbox item: the item's body, verbatim, through `kokoro-rs`, back
@@ -7220,6 +7246,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             created_at: String::new(),
             updated_at: String::new(),
             read_at: None,
+            archived_at: None,
         };
         assert_eq!(
             inbox_session_name(&item(

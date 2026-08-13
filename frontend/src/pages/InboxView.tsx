@@ -7,10 +7,12 @@ import {
   listInbox,
   listProjects,
   markInboxItemRead,
+  setInboxItemArchived,
 } from '../api'
 import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
+import { filterInbox, INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
 import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
 import {
   playFailure,
@@ -84,10 +86,16 @@ const PendingIcon = () => (
  * for now; nothing is inferred from the text. Live-syncs, since agents write the
  * DB underneath us (the CLI's `inbox add`).
  */
-export function InboxView() {
-  const { data: items, error, refetch } = useFetch(() => listInbox(), 'inbox', {
+export function InboxView({ filter }: { filter: InboxFilter }) {
+  const { data: all, error, refetch } = useFetch(() => listInbox(), 'inbox', {
     pollMs: 3000,
   })
+  // One fetch, three views (mesa task 845): the sub-links slice the list the
+  // page already polls rather than asking the server for a different one, so
+  // the read marks, the dedup set and playback below are untouched by which
+  // view is open — `items` is simply the slice this one shows. The slice is
+  // computed after the state below, since what the reader has open is part of
+  // it (see `filterInbox`).
   // Projects for the assignment dropdown; refreshed less often than the inbox.
   const { data: projects } = useFetch(() => listProjects(), 'inbox-projects', {
     pollMs: 10000,
@@ -153,6 +161,14 @@ export function InboxView() {
   // this — an item can be played from its collapsed row (mesa task 828).
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(new Set())
 
+  // The slice on screen: this view's items, plus whatever the reader is
+  // engaged with — an open item, or the one being read aloud. Both of those
+  // are what *marks* an item read, so without the exemption the New view
+  // would drop an item out from under the person reading it.
+  const held = new Set(expanded)
+  if (speakingId !== null) held.add(speakingId)
+  const items = all && filterInbox(all, filter, held)
+
   function toggleExpanded(id: number) {
     setExpanded((current) => {
       const next = new Set(current)
@@ -164,10 +180,10 @@ export function InboxView() {
   // The latest list, for the read marks below (mesa task 831): a dwell timer
   // fires long after the render that started it, and the poll has replaced the
   // array by then.
-  const latest = useRef(items)
+  const latest = useRef(all)
   useEffect(() => {
-    latest.current = items
-  }, [items])
+    latest.current = all
+  }, [all])
   // Items this page has already sent the mark for. `read_at` only changes when
   // the next fetch lands, so without this the second trigger — or any render
   // in between — would send the same no-op write again.
@@ -440,12 +456,21 @@ export function InboxView() {
     assignInboxItem(id, Number(value)).then(refetch)
   }
 
+  // Archiving sets an item aside without triaging it — and putting it back is
+  // the same call the other way, which is the button the Archived view shows.
+  function archive(id: number, archived: boolean) {
+    setInboxItemArchived(id, archived).then(refetch)
+  }
+
   return (
     <div className="inbox-page">
-      <h1>Inbox</h1>
+      <h1>Inbox · {INBOX_SUBNAV.find((s) => s.filter === filter)?.label}</h1>
       <p className="muted">
-        Update requests agents send to the shared inbox. Assign each to a project
-        to turn it into a backlog task there.
+        {filter === 'new'
+          ? 'Update requests agents send to the shared inbox, still unread. Assign each to a project to turn it into a backlog task there — or archive it to set it aside.'
+          : filter === 'read'
+            ? 'Items you have already read, still waiting to be triaged.'
+            : 'Items set aside without being triaged. Put one back to return it to the queue it came from.'}
       </p>
 
       <form className="create-form" onSubmit={submit}>
@@ -474,7 +499,13 @@ export function InboxView() {
       ) : !items ? (
         <p className="muted">Loading…</p>
       ) : items.length === 0 ? (
-        <p className="muted">Inbox is empty.</p>
+        <p className="muted">
+          {filter === 'new'
+            ? 'Nothing new — the inbox is clear.'
+            : filter === 'read'
+              ? 'Nothing read and waiting.'
+              : 'Nothing archived.'}
+        </p>
       ) : (
         <ul className="card-list inbox-list">
           {items.map((item) => (
@@ -606,6 +637,14 @@ export function InboxView() {
                       ))}
                     </select>
                   </label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      archive(item.id, item.archived_at === null)
+                    }
+                  >
+                    {item.archived_at === null ? 'archive' : 'put back'}
+                  </button>
                   <ConfirmDelete
                     label="delete"
                     message="Delete this item?"

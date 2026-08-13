@@ -6,6 +6,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
+import { inboxFilterFor } from './inboxFilter'
 import { unreadCount } from './inboxRead'
 import { rememberView } from './lastView'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
@@ -202,7 +203,12 @@ function App() {
   // nothing renders until it lands (a placeholder would be noise).
   const { data: mesaVersion } = useFetch(() => getMesaVersion(), 'mesa-version')
 
-  const inboxMatch = /^\/inbox$/.exec(path)
+  // The inbox and its three sub-views (mesa task 845). One page, one fetch:
+  // capture group 1 names the slice to show, and its absence is the "New"
+  // triage queue, so the plain `#/inbox` URL every existing link uses still
+  // lands where it always did.
+  const inboxMatch = /^\/inbox(?:\/(read|archived))?$/.exec(path)
+  const inboxFilter = inboxMatch ? inboxFilterFor(inboxMatch[1]) : null
   // Settings: global, above projects like the Inbox — the config file it edits
   // is per-machine, not per-project.
   const settingsMatch = /^\/settings$/.exec(path)
@@ -301,7 +307,7 @@ function App() {
   } else if (inboxMatch) {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
-    page = <InboxView />
+    page = <InboxView filter={inboxFilter!} />
   } else if (ccTimelineMatch) {
     // Checked before `ccMatch` for readability only — every one of these
     // patterns is disjoint (`ccMatch` anchors the end right after `sessions`).
@@ -526,7 +532,7 @@ function App() {
       <div className="shell-body">
         <Sidebar
           activeProjectId={activeProjectId}
-          inboxActive={inboxMatch !== null}
+          inboxFilter={inboxFilter}
           settingsActive={settingsMatch !== null}
           scriptsActive={scriptsMatch !== null}
           terminalActive={terminalActive}

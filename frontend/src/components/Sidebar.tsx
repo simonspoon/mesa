@@ -22,6 +22,7 @@ import {
   unarchiveProject,
   updateProject,
 } from '../api'
+import { INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
 import { dropIntentFor, zoneForOffset, type DropIntent, type DropZone } from '../navOrder'
 import {
   expandAncestors,
@@ -82,12 +83,13 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
 /**
  * Persistent left nav: four top-level entries sharing one `.nav-item` style —
  * the CC Dashboard, the global Inbox, Terminal, and Projects. The CC Dashboard
- * owns a fixed subnav of its sub-pages; Projects owns a subnav (the project
+ * owns a fixed subnav of its sub-pages, as does the Inbox (its three views —
+ * New / Read / Archived, mesa task 845); Projects owns a subnav (the project
  * list + create form). Both collapse: Projects' row *is* the disclosure header,
  * while the CC Dashboard keeps its link and pairs it with a caret button
  * (mesa task 776). `ccTab` is the active CC sub-page (or null when off the dashboard)
  * and drives which CC link is highlighted. `terminalActive` highlights the
- * Terminal link the same way `inboxActive` does — the page itself is a
+ * Terminal link the same way `inboxFilter` does the Inbox — the page itself is a
  * permanent sibling mount in `App.tsx` (mesa task 396), not rendered here.
  * `version` is bumped by pages after project rename/delete so the list
  * refetches (it is part of the useFetch key). The inbox count live-polls so
@@ -215,7 +217,7 @@ function SortableProject({
 
 export function Sidebar({
   activeProjectId,
-  inboxActive,
+  inboxFilter,
   settingsActive,
   scriptsActive,
   terminalActive,
@@ -226,7 +228,10 @@ export function Sidebar({
   onCollapsedChange,
 }: {
   activeProjectId: number | null
-  inboxActive: boolean
+  // Which Inbox sub-view is open, or null when the inbox is not (mesa task
+  // 845) — the twin of `ccTab` above: it both highlights the Inbox row and
+  // says which of its three sub-links is the active one.
+  inboxFilter: InboxFilter | null
   settingsActive: boolean
   scriptsActive: boolean
   terminalActive: boolean
@@ -313,6 +318,8 @@ export function Sidebar({
   // as the two section headers below; `navCollapse.ts` localStorage is
   // reserved for the project subtrees the user curated themselves.
   const [ccCollapsed, setCcCollapsed] = useState(false)
+  // Ephemeral collapse of the Inbox subnav (mesa task 845), same pattern.
+  const [inboxCollapsed, setInboxCollapsed] = useState(false)
   // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
   // Ephemeral collapse of the archived group, same non-persisted pattern as
@@ -600,10 +607,42 @@ export function Sidebar({
             ))}
           </ul>
         )}
-        <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
-          <span className="nav-item-label">Inbox</span>
-          {unread > 0 && <span className="inbox-badge">{unread}</span>}
-        </a>
+        {/* Shaped exactly like the CC Dashboard row above: the row stays a
+            link (to the triage queue) and the caret is a sibling button, so
+            the three sub-views are a disclosure rather than a fourth click to
+            reach the inbox at all. */}
+        <div className="nav-item-row">
+          <a
+            className={`nav-item${inboxFilter !== null ? ' active' : ''}`}
+            href="#/inbox"
+          >
+            <span className="nav-item-label">Inbox</span>
+            {unread > 0 && <span className="inbox-badge">{unread}</span>}
+          </a>
+          <button
+            type="button"
+            className="nav-subtree-caret"
+            aria-expanded={!inboxCollapsed}
+            aria-label={inboxCollapsed ? 'Expand Inbox views' : 'Collapse Inbox views'}
+            onClick={() => setInboxCollapsed((c) => !c)}
+          >
+            {inboxCollapsed ? '▸' : '▾'}
+          </button>
+        </div>
+        {!inboxCollapsed && (
+          <ul className="nav-projects nav-subnav">
+            {INBOX_SUBNAV.map((s) => (
+              <li key={s.filter}>
+                <a
+                  className={inboxFilter === s.filter ? 'active' : ''}
+                  href={s.hash}
+                >
+                  {s.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
         <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
           <span className="nav-item-label">Terminal</span>
         </a>

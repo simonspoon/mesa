@@ -789,6 +789,22 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
+    /// Archive an item (or `--undo`); prints the item with its `archived_at`
+    ///
+    /// Archiving sets an item aside without triaging or destroying it — the
+    /// third thing that can happen to an item, beside `assign` and `delete`.
+    /// Unlike `read` this toggles: `--undo` puts the item back in the live
+    /// inbox. Both directions are idempotent.
+    Archive {
+        /// Inbox item id
+        id: i64,
+        /// Put the item back in the live inbox instead of archiving it
+        #[arg(long)]
+        undo: bool,
+        /// Print the item without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Delete an inbox item (no confirmation); echoes the destroyed item
     Delete {
         /// Inbox item id
@@ -2702,6 +2718,9 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
             print_task(&store.assign_inbox_item(id, project)?, quiet);
         }
         InboxCmd::Read { id, quiet } => print_inbox_item(&store.mark_inbox_item_read(id)?, quiet),
+        InboxCmd::Archive { id, undo, quiet } => {
+            print_inbox_item(&store.set_inbox_item_archived(id, !undo)?, quiet)
+        }
         InboxCmd::Delete { id, quiet } => print_inbox_item(&store.delete_inbox_item(id)?, quiet),
     }
     Ok(())
@@ -3004,6 +3023,7 @@ mod tests {
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
             read_at: Some("2026-01-02 00:00:00".into()),
+            archived_at: None,
         }
     }
 
@@ -3208,6 +3228,9 @@ mod tests {
                 // it would read as "the mark didn't take", the same reasoning
                 // that keeps `artifact` in a task's quiet shape.
                 "read_at",
+                // Task 845: bounded the same way, and the field `inbox
+                // archive` exists to write — same reasoning as `read_at`.
+                "archived_at",
             ]),
             "InboxItem gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

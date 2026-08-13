@@ -823,9 +823,10 @@ run 0 "$MESA" inbox add --author agent-q "$BODY"
 IQ=$(jqs .id)
 run 0 "$MESA" inbox show "$IQ"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
-# non-quiet output is unchanged: the full 7-key inbox item (task 831 added
-# `read_at`, which is bounded and therefore stays in the quiet shape too)
-[ "$(jqs 'keys | join(",")')" = "author,body,created_at,id,project_id,read_at,updated_at" ] ||
+# non-quiet output is unchanged: the full 8-key inbox item (task 831 added
+# `read_at` and task 845 `archived_at`, both bounded and therefore staying in
+# the quiet shape too)
+[ "$(jqs 'keys | join(",")')" = "archived_at,author,body,created_at,id,project_id,read_at,updated_at" ] ||
   fail "inbox show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
 run 0 "$MESA" inbox show "$IQ" --quiet

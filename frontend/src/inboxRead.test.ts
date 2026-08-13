@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { needsMarkRead, READ_DWELL_MS, unreadCount } from './inboxRead'
 import type { InboxItem } from './types/InboxItem'
 
-function item(id: number, read_at: string | null): InboxItem {
+function item(
+  id: number,
+  read_at: string | null,
+  archived_at: string | null = null,
+): InboxItem {
   return {
     id,
     project_id: null,
@@ -11,6 +15,7 @@ function item(id: number, read_at: string | null): InboxItem {
     created_at: '2026-01-01 00:00:00',
     updated_at: '2026-01-01 00:00:00',
     read_at,
+    archived_at,
   }
 }
 
@@ -19,6 +24,12 @@ describe('unreadCount', () => {
     expect(
       unreadCount([item(1, null), item(2, '2026-01-02 00:00:00'), item(3, null)]),
     ).toBe(2)
+  })
+
+  it('ignores archived items, unread or not (mesa task 845)', () => {
+    expect(
+      unreadCount([item(1, null), item(2, null, '2026-01-03 00:00:00')]),
+    ).toBe(1)
   })
 
   it('is zero before anything is fetched, and for an all-read inbox', () => {

@@ -19,6 +19,9 @@
 #      sidebar's drag-reorder writes, and the list order it drives, plus the
 #      `parent_id` surface added by task 668 (nesting, detach, cycle/unknown
 #      rejection, the archive cascade and the subtree delete echo);
+#   5a3. POST /api/inbox/{id}/archive (task 845) — the archive toggle: stamped
+#      once, cleared by the other direction, independent of the read mark, and
+#      inside the Content-Type gate;
 #   5b. GET /api/inbox/{id}/speak (task 815) — the audio contract, the patched
 #      streaming WAV sizes, the audio arriving *while* it is still being
 #      rendered (task 816), the hostile body arriving as stdin data, the
@@ -690,6 +693,44 @@ raw POST "/api/inbox/$READ_ID/read"
 [ "$STATUS" = "415" ] ||
   fail "inbox read: a form-shaped POST must be refused, got $STATUS ($BODY)"
 ok "POST /api/inbox/{id}/read: 404 on an unknown id, and inside the Content-Type gate"
+
+# =====================================================================
+# 5a3. POST /api/inbox/{id}/archive — the third triage answer (mesa task 845)
+# =====================================================================
+#
+# Archiving sets an item aside without triaging or destroying it. Unlike the
+# read mark it TOGGLES, so the direction rides in the body — and both
+# directions are idempotent, so a second press cannot move the first's stamp.
+
+api 201 POST "/api/inbox" '{"body":"nothing to do here","author":"api-check"}'
+ARCH_ID=$(jqb .id)
+[ "$(jqb .archived_at)" = "null" ] || fail "inbox create: a new item must be live"
+
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true}'
+FIRST_ARCH=$(jqb .archived_at)
+[ "$FIRST_ARCH" != "null" ] || fail "inbox archive: archived_at must be stamped"
+[ "$(jqb .read_at)" = "null" ] ||
+  fail "inbox archive: archiving must not mark the item read"
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true}'
+[ "$(jqb .archived_at)" = "$FIRST_ARCH" ] ||
+  fail "inbox archive: re-archiving must not move the stamp"
+ok "POST /api/inbox/{id}/archive: stamps archived_at once, independent of read"
+
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":false}'
+[ "$(jqb .archived_at)" = "null" ] ||
+  fail "inbox archive: --undo must clear the stamp"
+api 200 GET "/api/inbox/$ARCH_ID"
+[ "$(jqb .archived_at)" = "null" ] || fail "inbox archive: the clear must persist"
+ok "POST /api/inbox/{id}/archive: toggles back, unlike the read mark"
+
+api 404 POST "/api/inbox/999999/archive" '{"archived":true}'
+[ "$(jqb .error.code)" = "not_found" ] ||
+  fail "inbox archive: unknown id must be not_found"
+# It mutates, so it sits behind the Content-Type gate like every other write.
+raw POST "/api/inbox/$ARCH_ID/archive" -d 'archived=true'
+[ "$STATUS" = "415" ] ||
+  fail "inbox archive: a form-shaped POST must be refused, got $STATUS ($BODY)"
+ok "POST /api/inbox/{id}/archive: 404 on an unknown id, and inside the Content-Type gate"
 
 # =====================================================================
 # 5b. GET /api/inbox/{id}/speak — reading an item aloud (mesa task 815)

@@ -482,6 +482,11 @@ const MIGRATIONS: &[&str] = &[
     // every item that predates this migration is unread — which is what an
     // untriaged item is. Additive; nothing else changes.
     "ALTER TABLE inbox ADD COLUMN read_at TEXT;",
+    // Task 845: an inbox item can be **archived** — set aside without being
+    // triaged or destroyed, which is what the Inbox nav's third sub-view
+    // lists. Nullable, so every item that predates this migration is live.
+    // Additive; nothing else changes.
+    "ALTER TABLE inbox ADD COLUMN archived_at TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -589,7 +594,8 @@ const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, 
      shape, created_at, updated_at";
 const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
-const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at, read_at";
+const INBOX_COLUMNS: &str =
+    "id, project_id, author, body, created_at, updated_at, read_at, archived_at";
 
 fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
     Ok(InboxItem {
@@ -600,6 +606,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
         read_at: row.get(6)?,
+        archived_at: row.get(7)?,
     })
 }
 
@@ -3060,6 +3067,35 @@ impl Store {
              WHERE id = ?1 AND read_at IS NULL",
             [id],
         )?;
+        self.get_inbox_item(id)
+    }
+
+    /// Archives an inbox item, or puts it back (mesa task 845): sets aside an
+    /// item that needs no triage without destroying it, which is the third
+    /// thing that can happen to an item beside "assign" and "delete".
+    ///
+    /// Unlike `read_at`, this one *toggles* — archiving is a place an item
+    /// sits, not a fact about the past — so `archived_at` is the moment it was
+    /// last archived, and un-archiving clears it. Idempotent in both
+    /// directions: re-archiving an archived item leaves its stamp alone.
+    pub fn set_inbox_item_archived(&mut self, id: i64, archived: bool) -> Result<InboxItem> {
+        // The read first, for the `not_found` the caller expects; the write
+        // then decides on the row itself (see `mark_inbox_item_read`) so a
+        // second archiver cannot move a stamp the first one set.
+        self.get_inbox_item(id)?;
+        if archived {
+            self.conn.execute(
+                "UPDATE inbox SET archived_at = datetime('now'), updated_at = datetime('now') \
+                 WHERE id = ?1 AND archived_at IS NULL",
+                [id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE inbox SET archived_at = NULL, updated_at = datetime('now') \
+                 WHERE id = ?1 AND archived_at IS NOT NULL",
+                [id],
+            )?;
+        }
         self.get_inbox_item(id)
     }
 
@@ -7122,6 +7158,46 @@ mod tests {
         let again = store.mark_inbox_item_read(item.id).unwrap();
         assert_eq!(again.read_at, Some(stamp));
         assert_eq!(again.updated_at, read.updated_at);
+    }
+
+    /// Task 845: archiving is a place an item sits, not a fact about the past,
+    /// so it toggles — and both directions are idempotent, so a second press
+    /// (or a second writer) cannot move the stamp the first one set.
+    #[test]
+    fn set_inbox_item_archived_toggles_and_is_idempotent() {
+        let (mut store, _dir) = temp_store();
+        let item = store.create_inbox_item(None, "nothing to do here").unwrap();
+        assert_eq!(item.archived_at, None);
+
+        let archived = store.set_inbox_item_archived(item.id, true).unwrap();
+        let stamp = archived
+            .archived_at
+            .clone()
+            .expect("archived_at is stamped");
+        assert!(
+            store.list_inbox_items(None).unwrap()[0]
+                .archived_at
+                .is_some()
+        );
+
+        let again = store.set_inbox_item_archived(item.id, true).unwrap();
+        assert_eq!(again.archived_at, Some(stamp));
+        assert_eq!(again.updated_at, archived.updated_at);
+
+        // …and back, which clears the stamp rather than adding a second one.
+        let live = store.set_inbox_item_archived(item.id, false).unwrap();
+        assert_eq!(live.archived_at, None);
+        // Archiving is independent of reading: an item can be set aside unread.
+        assert_eq!(live.read_at, None);
+    }
+
+    #[test]
+    fn set_inbox_item_archived_unknown_id_is_not_found() {
+        let (mut store, _dir) = temp_store();
+        assert!(matches!(
+            store.set_inbox_item_archived(999, true),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

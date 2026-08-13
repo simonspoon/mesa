@@ -739,6 +739,18 @@ export function markInboxItemRead(id: number): Promise<InboxItem> {
 }
 
 /**
+ * Archive an item, or put it back (mesa task 845). Unlike the read mark this
+ * toggles, so the direction is the body; the resolved item carries the new
+ * `archived_at`.
+ */
+export function setInboxItemArchived(
+  id: number,
+  archived: boolean,
+): Promise<InboxItem> {
+  return request(`/api/inbox/${id}/archive`, jsonInit('POST', { archived }))
+}
+
+/**
  * Spoken-audio URL for one inbox item (mesa task 815) — used directly as an
  * `<audio src>`, never fetched as JSON. The route synthesises the item's body
  * with `kokoro-rs` on the server and answers `audio/wav`; synthesis runs on

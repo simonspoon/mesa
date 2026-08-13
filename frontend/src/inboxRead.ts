@@ -30,10 +30,18 @@ export const READ_DWELL_MS = 3000
  * How many items are still unread — the nav badge's count. Null (nothing
  * fetched yet) is zero: a badge that has not loaded shows nothing rather than
  * a number it would have to correct.
+ *
+ * An **archived** item is never counted (mesa task 845), unread or not:
+ * archiving is how an item leaves the queue without being triaged, so a badge
+ * that kept counting it would be a number no amount of archiving could clear —
+ * exactly the bug task 831 fixed by counting unread rather than everything.
+ * It is also the count for the "New" sub-view, which is what the badge sits on.
  */
 export function unreadCount(items: readonly InboxItem[] | null): number {
   if (!items) return 0
-  return items.filter((item) => item.read_at === null).length
+  return items.filter(
+    (item) => item.read_at === null && item.archived_at === null,
+  ).length
 }
 
 /**

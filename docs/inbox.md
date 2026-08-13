@@ -51,28 +51,62 @@ instructions**; `author` is free-text attribution.
   `frontend/src/inboxRead.ts`, not inline in the view: the list's 3s poll is
   exactly what makes "already read" and "already sent the mark" two different
   facts.
+- An item can be **archived** — set aside without being triaged or destroyed
+  (mesa task 845). `archived_at` is a second nullable timestamp on the row, and
+  unlike `read_at` it **toggles**: archiving is a place an item sits rather
+  than a fact about the past, so un-archiving clears the stamp and re-archiving
+  an archived item leaves it alone (`Store::set_inbox_item_archived`, both
+  directions idempotent, both decided on the row itself so a second writer can
+  never move the first one's stamp). Archiving is orthogonal to reading — an
+  item can be set aside unread — but it **outranks** it everywhere a view has
+  to choose: an archived item is in the Archived view and nowhere else, and the
+  nav's unread badge stops counting it (a badge archiving could not clear would
+  be the same bug task 831 fixed by counting unread rather than everything).
+  Nothing archives automatically; it is a person's third triage answer beside
+  "assign" and "delete".
 - No event/history table: an item *is* the record. The safety floor is the
   delete echo + `mesa backup`; once converted, the created task is the record.
 - `list` returns items newest first; the `--project N`/`?project=` filter still
   exists but, since items are never assigned, only the unfiltered whole-inbox
   listing is meaningful.
-- CLI: `mesa inbox {add,list,show,assign,read,delete}`. `add <text…>` takes the
+- CLI: `mesa inbox {add,list,show,assign,read,archive,delete}`. `add <text…>` takes the
   free-text message as a trailing positional (quoting optional; words joined),
   always unassigned; `--author` attributes (place it before the text). `assign
   <id> <project>` (project required) converts the item into a backlog task in that
   project and **prints the created task**; assigning to a project id that does
   not exist is `validation` (an unknown project *name* is `not_found`, from the
   shared resolver). `read <id>` marks the item read (idempotent — a second
-  call echoes the item unchanged). `delete` echoes the destroyed item.
+  call echoes the item unchanged). `archive <id>` sets the item aside and
+  `archive <id> --undo` puts it back (idempotent both ways). `delete` echoes
+  the destroyed item.
 - API: `/api/inbox` (GET list, POST create — body `{body, author}`),
   `/api/inbox/{id}` (GET show, PATCH assign, DELETE),
   `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
   the PATCH, which *assigns*: that one answers with the created task and leaves
-  no item behind, so the two could never share a body). PATCH body is
+  no item behind, so the two could never share a body),
+  `/api/inbox/{id}/archive` (POST, body `{archived: <bool>}` — its own route
+  for the same reason, and the direction rides in the body because this one
+  toggles). PATCH body is
   `{project_id: <number>}` (required) and **returns the created task** (not the
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unread-count badge); `#/inbox` lists items, each with an "Assign to"
-  project dropdown that converts the item to a backlog task on selection.
+  project dropdown that converts the item to a backlog task on selection, an
+  archive/put-back button beside it.
+- The nav's Inbox row owns a **subnav of three views** (mesa task 845), shaped
+  exactly like the CC Dashboard's: the row stays a link and the caret is a
+  sibling button, so the sub-views are a disclosure rather than a click in the
+  way of the inbox. **New** is `#/inbox` — the plain URL every existing link
+  already uses, so the triage queue is still where Inbox lands — **Read** is
+  `#/inbox/read` and **Archived** is `#/inbox/archived`. They are a *filter
+  over one list*, not three lists: the page makes the same unfiltered fetch and
+  the same 3s poll, and `frontend/src/inboxFilter.ts` slices it, so read marks,
+  the mark-sent dedup set and playback are untouched by which view is open.
+  The one exemption is what the reader is **engaged with** — an item they have
+  open, or the one being read aloud — which stays on the view it was opened
+  from until they close it: both of those are exactly what *marks* an item
+  read, so without it the New view would drop an item out from under the person
+  reading it three seconds in, taking the stop button for the audio still
+  playing with it.
 - The list is a **triage queue**, so an item is **collapsed** by default (mesa
   task 828): a three-line CSS clamp over the raw body — plain text, not
   markdown, which is what makes it an inert click target — plus its meta line.

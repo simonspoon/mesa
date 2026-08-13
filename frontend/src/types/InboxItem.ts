@@ -37,4 +37,10 @@ updated_at: string,
  * has been opened long enough to take in, or heard through the play
  * button, and re-reading it says nothing new.
  */
-read_at: string | null, };
+read_at: string | null, 
+/**
+ * When the item was archived — set aside without being triaged — or null
+ * while it is live (mesa task 845). Unlike `read_at` this toggles:
+ * archiving is a place an item sits, so un-archiving clears the stamp.
+ */
+archived_at: string | null, };

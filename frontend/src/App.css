@@ -335,6 +335,20 @@ header {
   min-width: 2rem;
   padding: 0.25rem 0.4rem;
   line-height: 1.4;
+  /* The glyph is an svg now: centre it in the button rather than letting it sit
+     on the text baseline. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Drawn transport glyphs: sized off the button's own text so they stay in
+   proportion with the rest of the row, and coloured by `currentColor` so the
+   button's cyan, hover and disabled states carry straight through. */
+.transport-icon {
+  width: 0.85em;
+  height: 0.85em;
+  display: block;
 }
 
 .inbox-actions {

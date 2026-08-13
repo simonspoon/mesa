@@ -21,6 +21,63 @@ import { playSpeechStream, type SpeechStream } from '../speechStream'
 import { useFetch } from '../useFetch'
 
 /**
+ * Transport glyphs, drawn rather than typed: the unicode media characters
+ * render in whatever emoji/symbol font the platform picks, so they sat at a
+ * different size, weight and colour than everything else on the row. These are
+ * flat sharp-cornered polygons in `currentColor` — the same vocabulary as the
+ * brand mark and the cut-corner buttons they sit inside, so they take the
+ * button's cyan and its disabled/hover states for free.
+ */
+function TransportIcon({ children }: { children: React.ReactNode }) {
+  return (
+    <svg
+      className="transport-icon"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {children}
+    </svg>
+  )
+}
+
+const PlayIcon = () => (
+  <TransportIcon>
+    <polygon points="4,2 14,8 4,14" />
+  </TransportIcon>
+)
+
+const StopIcon = () => (
+  <TransportIcon>
+    <rect x="3" y="3" width="10" height="10" />
+  </TransportIcon>
+)
+
+const PauseIcon = () => (
+  <TransportIcon>
+    <rect x="3" y="2" width="4" height="12" />
+    <rect x="9" y="2" width="4" height="12" />
+  </TransportIcon>
+)
+
+const RewindIcon = () => (
+  <TransportIcon>
+    <polygon points="8,2 8,14 1,8" />
+    <polygon points="15,2 15,14 8,8" />
+  </TransportIcon>
+)
+
+/** Synthesising: nothing is sounding yet, so there is no transport to draw. */
+const PendingIcon = () => (
+  <TransportIcon>
+    <rect x="1" y="7" width="3" height="3" />
+    <rect x="6.5" y="7" width="3" height="3" />
+    <rect x="12" y="7" width="3" height="3" />
+  </TransportIcon>
+)
+
+/**
  * The global inbox: free-text update requests agents send without a project. It
  * lives above projects in the nav — a person triages each item by assigning it
  * to the project it belongs to (or deleting it). Assignment is the only routing
@@ -498,7 +555,13 @@ export function InboxView() {
                     }
                     onClick={() => toggleSpeak(item.id)}
                   >
-                    {speakingId !== item.id ? '▶' : speaking ? '■' : '…'}
+                    {speakingId !== item.id ? (
+                      <PlayIcon />
+                    ) : speaking ? (
+                      <StopIcon />
+                    ) : (
+                      <PendingIcon />
+                    )}
                   </button>
                   {/* Transport for the item being read, and only once it is
                       actually sounding: before that there is no playhead to
@@ -511,7 +574,7 @@ export function InboxView() {
                         title={`go back ${REWIND_STEP_SECONDS} seconds`}
                         onClick={rewind}
                       >
-                        ⏪
+                        <RewindIcon />
                       </button>
                       <button
                         type="button"
@@ -519,7 +582,7 @@ export function InboxView() {
                         title={paused ? 'resume reading' : 'pause reading'}
                         onClick={togglePause}
                       >
-                        {paused ? '▶' : '⏸'}
+                        {paused ? <PlayIcon /> : <PauseIcon />}
                       </button>
                     </>
                   )}

@@ -1,38 +1,94 @@
 import { describe, expect, it } from 'vitest'
-import { playFailure, REWIND_STEP_SECONDS, rewindTarget } from './speechPlayback'
+import {
+  playFailure,
+  replaySlices,
+  REWIND_STEP_SECONDS,
+  rewindTarget,
+  scheduleAt,
+  SCHEDULE_LEAD_SECONDS,
+} from './speechPlayback'
 
 describe('playFailure', () => {
   const STREAM = '/api/inbox/7/speak'
   const ABSOLUTE = `http://192.168.1.4:7770${STREAM}`
 
-  it('falls back to the buffered audio the first time the stream fails', () => {
-    expect(playFailure(ABSOLUTE, STREAM, false)).toBe('buffer')
-  })
-
-  it('reports a stream that failed again after the fallback', () => {
-    expect(playFailure(ABSOLUTE, STREAM, true)).toBe('report')
-  })
-
-  it('reports a blob that would not play — there is nothing left to try', () => {
-    expect(playFailure('blob:http://localhost:7770/9f2c', STREAM, false)).toBe(
-      'report',
-    )
+  it('decodes the audio itself when the element will not play it', () => {
+    expect(playFailure(ABSOLUTE, STREAM)).toBe('decode')
   })
 
   it('ignores a failure reported against no source at all', () => {
     // Stop clears the element's source. Whatever a browser then reports, it is
     // not the stream failing — treating it as one would restart what was just
     // stopped.
-    expect(playFailure('', STREAM, false)).toBe('ignore')
-    expect(playFailure('http://192.168.1.4:7770/#/inbox', STREAM, false)).toBe(
-      'ignore',
-    )
+    expect(playFailure('', STREAM)).toBe('ignore')
+    expect(playFailure('http://192.168.1.4:7770/#/inbox', STREAM)).toBe('ignore')
   })
 
   it('ignores a failure belonging to another item', () => {
-    expect(playFailure(`${ABSOLUTE}`, '/api/inbox/8/speak', false)).toBe(
-      'ignore',
-    )
+    expect(playFailure(ABSOLUTE, '/api/inbox/8/speak')).toBe('ignore')
+  })
+})
+
+describe('scheduleAt', () => {
+  it('keeps a slot that is still ahead of the clock', () => {
+    // Back-to-back is what makes decoded audio continuous: a buffer whose turn
+    // has not come yet starts exactly when the one before it ends.
+    expect(scheduleAt(4.2, 5)).toBe(5)
+  })
+
+  it('puts a buffer the network delivered late a lead ahead instead', () => {
+    expect(scheduleAt(5.5, 5)).toBe(5.5 + SCHEDULE_LEAD_SECONDS)
+  })
+
+  it('leads the very first buffer, which has no slot yet', () => {
+    expect(scheduleAt(9, 9)).toBe(9 + SCHEDULE_LEAD_SECONDS)
+  })
+})
+
+describe('replaySlices', () => {
+  // Four seconds of decoded audio in one-second pieces, as a sentence-by-
+  // sentence render arrives.
+  const held = [
+    { at: 0, duration: 1 },
+    { at: 1, duration: 1 },
+    { at: 2, duration: 1 },
+    { at: 3, duration: 1 },
+  ]
+
+  it('resumes inside the piece the target lands in', () => {
+    // 1.5s back into the second piece: it sounds at once, half-way through,
+    // and the ones after it keep their spacing from that moment.
+    expect(replaySlices(held, 1.5)).toEqual([
+      { index: 1, from: 0.5, delay: 0 },
+      { index: 2, from: 0, delay: 0.5 },
+      { index: 3, from: 0, delay: 1.5 },
+    ])
+  })
+
+  it('drops the pieces entirely behind the target', () => {
+    expect(replaySlices(held, 3).map((s) => s.index)).toEqual([3])
+  })
+
+  it('replays everything when the target is the start of the item', () => {
+    expect(replaySlices(held, 0)).toEqual([
+      { index: 0, from: 0, delay: 0 },
+      { index: 1, from: 0, delay: 1 },
+      { index: 2, from: 0, delay: 2 },
+      { index: 3, from: 0, delay: 3 },
+    ])
+  })
+
+  it('replays a piece the target lands exactly on from its start', () => {
+    // The boundary is the case a `<=` in the wrong place turns into a skipped
+    // piece or a repeated one.
+    expect(replaySlices(held, 2)).toEqual([
+      { index: 2, from: 0, delay: 0 },
+      { index: 3, from: 0, delay: 1 },
+    ])
+  })
+
+  it('has nothing to replay before the first piece arrives', () => {
+    expect(replaySlices([], 0)).toEqual([])
   })
 })
 

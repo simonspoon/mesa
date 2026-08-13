@@ -740,13 +740,14 @@ export function inboxSpeakUrl(id: number): string {
 }
 
 /**
- * The same audio, fetched **whole** instead of played as it streams (mesa task
- * 829) — the fallback for a browser whose media stack refuses the streamed
- * body. Apple's (iOS Safari, and Safari on a Mac) requires byte-range support
- * of an HTTP media source, and the speak route is chunked with no
- * `Content-Length` on purpose, so `<audio src>` never gets past "the server is
- * not correctly configured" there. A blob has both, so the audio plays once it
- * is all in hand.
+ * The same audio as a body the page reads itself (mesa task 830) — the
+ * fallback for a browser whose media stack refuses the streamed response.
+ * Apple's (iOS Safari, and Safari on a Mac) requires byte-range support of an
+ * HTTP media source, and this route is chunked with no `Content-Length` on
+ * purpose, so `<audio src>` never gets past "the server is not correctly
+ * configured" there. A `fetch` asks for none of that, and its body arrives in
+ * pieces, so the audio can still start on the first sentence — the decoding
+ * and the playing are `speechStream.ts`.
  *
  * A second full synthesis, so it is a fallback and never the first attempt:
  * the route caches nothing. `signal` is what stop cancels it with — the render
@@ -756,10 +757,11 @@ export function inboxSpeakUrl(id: number): string {
 export async function fetchInboxSpeech(
   id: number,
   signal: AbortSignal,
-): Promise<Blob> {
+): Promise<ReadableStream<Uint8Array>> {
   const res = await fetch(inboxSpeakUrl(id), { signal })
   if (!res.ok) throw await apiErrorFrom(res)
-  return await res.blob()
+  if (res.body === null) throw new ApiError('http_error', 'no audio', 200)
+  return res.body
 }
 
 /** Returns the destroyed item. */

@@ -68,25 +68,27 @@ instructions**; `author` is free-text attribution.
   (+ `nosniff`). The web Inbox gives each item a **play/stop** button, and the
   URL is an `<audio src>` — which is why the route is a GET, and why a
   same-origin media request sending no `Origin` is a case its gate has to
-  answer for. (Since task 829 a browser that will not play the stream fetches
-  the same URL whole as a fallback; the route is unchanged either way.)
+  answer for. (Since task 830 a browser that will not play the stream fetches
+  the same URL and decodes it itself; the route is unchanged either way.)
   Nothing is stored or cached: synthesis runs on every press.
   - Once the item is actually sounding, that button is joined by **rewind**
     and **pause/resume** (mesa task 827) — transport for the one item being
     read, mounted only while it is (before playback there is no playhead to
     move and nothing to hold, and the buttons would describe a state the
-    element isn't in). Both drive the same single `<audio>` element directly;
-    neither re-requests the route, so **no press re-synthesises** — pausing
-    holds a stream the server keeps filling, and resuming is refused the same
-    way a first play can be. Rewind goes back `REWIND_STEP_SECONDS` (10), but
-    clamped to the **earliest seekable second**, not to zero: the response is
-    chunked with no `Content-Length` and no range support, so what a player
-    can go back to is only what it already holds. When nothing is seekable
-    yet, or the playhead is already at that floor, a press does nothing rather
-    than seeking anyway (`frontend/src/speechPlayback.ts::rewindTarget`, the
-    one place that arithmetic lives). Paused-ness is mirrored from the
-    element's own `play`/`pause` events, never decided by the page, so the
-    browser's media keys can't desync the label.
+    player isn't in). On the element's path both drive that one `<audio>`
+    directly; neither re-requests the route, so **no press re-synthesises** —
+    pausing holds a stream the server keeps filling, and resuming is refused
+    the same way a first play can be. Rewind goes back `REWIND_STEP_SECONDS`
+    (10), but clamped to the **earliest seekable second**, not to zero: the
+    response is chunked with no `Content-Length` and no range support, so what
+    the element can go back to is only what it already holds. When nothing is
+    seekable yet, or the playhead is already at that floor, a press does
+    nothing rather than seeking anyway
+    (`frontend/src/speechPlayback.ts::rewindTarget`, the one place that
+    arithmetic lives — the decoded path passes it a floor of `0` and needs no
+    case of its own). Paused-ness is mirrored from the element's own
+    `play`/`pause` events, never decided by the page, so the browser's media
+    keys can't desync the label.
   - There is **one `<audio>` element for the page**, mounted for its whole life
     and never re-keyed; a press sets its `src` and calls `play()` **itself**
     (mesa task 829). Both halves matter. Starting playback from inside the
@@ -102,8 +104,8 @@ instructions**; `author` is free-text attribution.
     `src = ''` would), so playback still ends with the connection, and the
     element outliving the row is why an item that is assigned or deleted
     underneath the page stops the audio explicitly rather than by unmounting.
-  - **A browser that will not play the stream gets it whole instead** (mesa
-    task 829 — the mobile bug). Apple's media stack (iOS Safari, and Safari on
+  - **A browser that will not play the stream decodes it itself** (mesa tasks
+    829 and 830 — the mobile bug). Apple's media stack (iOS Safari, and Safari on
     a Mac) requires **byte-range support** of an HTTP media source: it refuses
     a 200 that carries no `Content-Length` and answers no `Range` with
     `-12939`, "the server is not correctly configured", which is precisely the
@@ -114,29 +116,60 @@ instructions**; `author` is free-text attribution.
     `0x7FFF0000` sizes are **not** what it objects to (they play fine when the
     body is ranged).
     The fix is client-side, so the route's contract is untouched: on that
-    `error` the page re-requests the audio with `fetch`
-    (`api.ts::fetchInboxSpeech`), plays the resulting **blob** — which has a
-    length and is seekable, the two things a stream cannot be. Once that blob
-    **plays**, and only then, the page remembers for the rest of its life that
-    this browser needs it (`buffered`), so only the first press pays for the
-    attempt that cannot work. Latching on the *failure* instead would be wrong:
-    a media `error` carries no reason, so a missing synthesiser (503) and a
-    refused address (403) arrive as the same event, and a browser that streams
-    perfectly well would be pinned to whole-fetch playback for a fault that has
-    nothing to do with its media stack. It costs that browser the streaming start: sound begins when the
-    **whole** render is in hand (~10s where the stream took ~3s, measured on a
-    six-sentence item), and the failed first attempt means one wasted render
-    per page load, whose synthesis finishes and is discarded server-side like
-    any hang-up. Rewind on that path can reach the start, because a blob is
-    seekable to 0 — the clamp arithmetic already answers that from `seekable`
-    and needs no case of its own. The mode is **page state on purpose**: a
-    remembered guess would cost a browser that can stream its fast start, and
-    the element is only ever unlocked for a later programmatic `play()` because
-    the failed first press called `play()` from a real gesture.
-  - A failed press now shows **the reason**, not a fixed sentence: the fallback
+    `error` the page asks for the same URL with `fetch`
+    (`api.ts::fetchInboxSpeech`) and **decodes the audio itself** — task 829
+    played the response as a whole blob, task 830 reads the body as it arrives
+    instead. `fetch` demands none of what the media stack does, so the bytes
+    that `<audio>` refused are perfectly playable; what is needed is somewhere
+    to put them, and that is the Web Audio clock.
+    `wavStream.ts` turns the arriving chunks into samples — a chunked decoder,
+    so the two boundary cases it has to survive are a header split across
+    chunks and a chunk cut through the middle of a sample — and
+    `speechStream.ts` schedules each piece back-to-back on an `AudioContext`
+    (`speechPlayback.ts::scheduleAt` decides where). **Mobile therefore streams
+    like the desktop does**: sound starts on the first sentence (~2-3s where
+    the whole render takes ~10s, measured in Safari on a seven-sentence item),
+    which is exactly what fetching it whole cost.
+    Once decoded audio has actually **sounded**, and only then, the page
+    remembers for the rest of its life that this browser needs it (`decodes`),
+    so only the first press pays for the attempt that cannot work. Latching on
+    the *failure* instead would be wrong: a media `error` carries no reason, so
+    a missing synthesiser (503) and a refused address (403) arrive as the same
+    event, and a browser the element serves perfectly well would be pinned to
+    decoding for a fault that has nothing to do with its media stack. The first
+    press still pays for the discovery — the element's failed attempt and the
+    decoded one are two synthesis requests, so the first sound on a page load
+    waits for both, and the abandoned render finishes and is discarded
+    server-side like any hang-up.
+    The transport is the same three buttons over a different engine. There are
+    no media events here, so the press that holds the audio is what says it is
+    held (`ctx.suspend()`, which stops the context clock, so the playhead keeps
+    its meaning across a hold of any length). Rewind on this path reaches the
+    **start** of the item: the page is holding every sample it has been sent,
+    so the floor the clamp arithmetic takes is `0` rather than the earliest
+    seekable second, and rewinding is re-scheduling those buffers from the
+    target — the one function still answers both paths. A gap the network
+    forces slips the item's clock rather than dropping a sample.
+    The `AudioContext` is created **and resumed inside the press**, whether or
+    not that press turns out to need it: a gesture is what unlocks audio on a
+    phone, and the element failure that says decoding is needed arrives long
+    after the gesture is gone. One context for the life of the page — a context
+    is a device, not a play.
+    The mode is **page state on purpose**: a remembered guess would cost a
+    browser that can play the element its start, and it costs nothing to
+    rediscover.
+  - A failed press shows **the reason**, not a fixed sentence: the fallback
     fetch reads the route's `{"error": {...}}` body, so a synthesiser that is
     missing says so, and the `--lan` Host refusal (below) tells the reader to
-    browse mesa by IP instead of failing silently.
+    browse mesa by IP instead of failing silently. There is no second sentence
+    to fall back to after that — a decoded play that fails has a real reason to
+    give, unlike the element's reasonless `error`. That holds for the failures
+    the *body* carries too, which land long after the request was answered: a
+    200 followed by bytes that are not a playable WAV, or a connection that
+    dropped before a single sample, is reported to the row (`onError`) rather
+    than leaving it on `…` forever. A failure once the item is **sounding** is
+    not reported at all — the audio simply ends where the bytes do, which is
+    what a truncated stream already does to the element.
   - The audio comes **back to the browser** rather than playing on the host's
     speakers, so it still works under `serve --lan`, where the browser is a
     different machine.

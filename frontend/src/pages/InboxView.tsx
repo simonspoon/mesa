@@ -3,7 +3,6 @@ import {
   assignInboxItem,
   createInboxItem,
   deleteInboxItem,
-  fetchInboxSpeech,
   inboxSpeakUrl,
   listInbox,
   listProjects,
@@ -16,6 +15,7 @@ import {
   REWIND_STEP_SECONDS,
   rewindTarget,
 } from '../speechPlayback'
+import { playSpeechStream, type SpeechStream } from '../speechStream'
 import { useFetch } from '../useFetch'
 
 /**
@@ -50,19 +50,22 @@ export function InboxView() {
     id: number
     message: string
   } | null>(null)
-  // Whether this page must fetch the audio whole rather than stream it (mesa
-  // task 829): Apple's media stack refuses an HTTP source with no byte-range
-  // support, which is exactly what the speak route is, so later presses skip
-  // the attempt that cannot work. Set only once a fetched blob has actually
-  // **played** — a media `error` carries no reason, so a stream that failed
-  // because the synthesiser is missing or the route refused the address looks
-  // identical to one this browser cannot play, and latching on the failure
-  // would cost a browser that streams fine every later press. Page state,
-  // deliberately not remembered: a wrong guess costs a streaming start.
-  const [buffered, setBuffered] = useState(false)
-  // Whether playback is held. The element's own events are the source of truth
-  // (pausing is what the browser's own media keys do too), so this only mirrors
-  // them — it never decides.
+  // Whether this page must decode the audio itself rather than hand the URL to
+  // an <audio> element (mesa tasks 829, 830): Apple's media stack refuses an
+  // HTTP source with no byte-range support, which is exactly what the speak
+  // route is, so later presses skip the attempt that cannot work. Set only
+  // once decoded audio has actually **sounded** — a media `error` carries no
+  // reason, so a stream that failed because the synthesiser is missing or the
+  // route refused the address looks identical to one this browser cannot play,
+  // and latching on the failure would cost a browser that plays the element
+  // fine every later press. Page state, deliberately not remembered: a wrong
+  // guess costs nothing but one attempt, and remembering a wrong one costs
+  // every press.
+  const [decodes, setDecodes] = useState(false)
+  // Whether playback is held. On the element's path its own events are the
+  // source of truth (pausing is what the browser's media keys do too) and this
+  // only mirrors them; on the decoded path there are no such events, so the
+  // press that holds the audio sets it.
   const [paused, setPaused] = useState(false)
   // The live player, so pause/resume and rewind can reach it. One element for
   // the life of the page, never re-keyed: a press must be able to call `play()`
@@ -70,10 +73,21 @@ export function InboxView() {
   // autoplay policy weighs against the gesture that is still on the stack (an
   // element mounted by a later render is played too late for iOS to count it).
   const player = useRef<HTMLAudioElement | null>(null)
-  // The blob a buffered play is playing from, so it can be handed back.
-  const objectUrl = useRef<string | null>(null)
-  // The in-flight buffered fetch, so stop can drop it.
+  // The Web Audio clock the decoded path plays on. Created — and resumed — by
+  // a press, because a gesture is what unlocks audio and the element failure
+  // that sends a press down that path arrives long after the gesture is gone.
+  // One for the life of the page: a context is a device, not a play.
+  const clock = useRef<AudioContext | null>(null)
+  // The decoded item being read, so the transport can reach it.
+  const decoded = useRef<SpeechStream | null>(null)
+  // The request that item is arriving on, so a stop can drop it. It is held
+  // here rather than inside the stream because the route answers only once the
+  // synthesiser has audio: until then there is no transport to stop, and the
+  // press may already have been abandoned.
   const fetching = useRef<AbortController | null>(null)
+  // Which press is current. A decoded play is awaited, so the item it belongs
+  // to can be stopped — or swapped for another — before it ever sounds.
+  const press = useRef(0)
   // Which items are opened out to their full body. Collapsed is the default:
   // the list is a triage queue, so every item shows a few lines and the one
   // being read is opened on purpose. Playback is deliberately *not* gated on
@@ -88,60 +102,84 @@ export function InboxView() {
     })
   }
 
-  // Everything one press holds: the element itself, a fetch that may still be
-  // collecting audio, and the blob a buffered play was reading from. Clearing
-  // the source is what closes the connection — the synthesis already running on
-  // the server finishes and its bytes are discarded, as ever. `removeAttribute`
-  // rather than `src = ''`: the empty string is a URL the element would go on
-  // to load and fail, which is an `error` this page would have to tell from a
-  // real one.
+  // Everything one press holds: the element, and the decoded item with the
+  // body still arriving for it. Either way the connection closes — the
+  // synthesis already running on the server finishes and its bytes are
+  // discarded, as ever. `removeAttribute` rather than `src = ''`: the empty
+  // string is a URL the element would go on to load and fail, which is an
+  // `error` this page would have to tell from a real one.
   const releasePlayer = useCallback(() => {
+    press.current += 1
     fetching.current?.abort()
     fetching.current = null
+    decoded.current?.stop()
+    decoded.current = null
     const el = player.current
     if (el) {
       el.pause()
       el.removeAttribute('src')
       el.load()
     }
-    if (objectUrl.current) {
-      URL.revokeObjectURL(objectUrl.current)
-      objectUrl.current = null
-    }
   }, [])
 
-  // The fallback path: ask for the whole audio, then play that. A blob has a
-  // length and is seekable, which is what the streamed response cannot be and
-  // what Apple's media stack requires — at the cost of the first sound waiting
-  // for the last sentence. `play()` here is outside the press that asked for
-  // it, which is allowed because the element was already started from one (the
-  // streamed attempt that failed is what put this page in buffered mode).
-  const playBuffered = useCallback(
-    async (id: number, el: HTMLAudioElement) => {
-      const attempt = new AbortController()
-      fetching.current = attempt
-      try {
-        const audio = await fetchInboxSpeech(id, attempt.signal)
-        if (attempt.signal.aborted) return
-        const url = URL.createObjectURL(audio)
-        objectUrl.current = url
-        el.src = url
-        await el.play()
-        // Playing is the only evidence that this browser needed the blob; a
-        // fallback that failed too says nothing about the media stack.
-        setBuffered(true)
-      } catch (err) {
-        if (attempt.signal.aborted) return
+  // The fallback path (mesa task 830): fetch the same URL and decode the WAV
+  // as it arrives, scheduling each piece on the Web Audio clock. No range
+  // request is involved, which is the whole reason Apple's media stack refused
+  // the element — and the audio still starts on the first sentence rather than
+  // on the last, which is what fetching it whole cost.
+  const playDecoded = useCallback(
+    async (id: number, ctx: AudioContext) => {
+      const attempt = press.current
+      // Whatever went wrong, the row is the only place it can be said: a press
+      // that answers with nothing looks exactly like one still synthesising.
+      const failed = (err: unknown) => {
+        if (press.current !== attempt) return
         setSpeakError({
           id,
           message: err instanceof Error ? err.message : String(err),
         })
         setSpeakingId((current) => (current === id ? null : current))
-      } finally {
-        if (fetching.current === attempt) fetching.current = null
+      }
+      const request = new AbortController()
+      fetching.current = request
+      try {
+        const stream = await playSpeechStream(
+          id,
+          ctx,
+          {
+            onPlaying: () => {
+              if (press.current !== attempt) return
+              setSpeaking(true)
+              // Sounding is the only evidence that this browser needed
+              // decoding; a fallback that failed too says nothing about its
+              // media stack.
+              setDecodes(true)
+            },
+            onEnded: () => {
+              if (press.current !== attempt) return
+              releasePlayer()
+              setSpeakingId(null)
+              setSpeaking(false)
+            },
+            onError: failed,
+          },
+          request.signal,
+        )
+        // Stopped, or another item pressed, while the first bytes were on their
+        // way: the audio this belongs to is already gone.
+        if (press.current !== attempt) {
+          stream.stop()
+          return
+        }
+        decoded.current = stream
+      } catch (err) {
+        // An abandoned press aborts its own request; that rejection is the
+        // page's own doing and has nobody left to tell.
+        if (request.signal.aborted) return
+        failed(err)
       }
     },
-    [],
+    [releasePlayer],
   )
 
   // Stops if this item is already the one playing, starts it otherwise.
@@ -156,8 +194,13 @@ export function InboxView() {
     setSpeakingId(stopping ? null : id)
     const el = player.current
     if (stopping || !el) return
-    if (buffered) {
-      void playBuffered(id, el)
+    // Unlock the Web Audio clock from inside the gesture whether or not this
+    // press turns out to need it: the failure that says it does arrives from
+    // the element afterwards, by which time a resume would be refused.
+    clock.current ??= new AudioContext()
+    void clock.current.resume()
+    if (decodes) {
+      void playDecoded(id, clock.current)
       return
     }
     el.src = inboxSpeakUrl(id)
@@ -171,25 +214,32 @@ export function InboxView() {
     })
   }
 
-  // A player that failed either has a second thing to try or has run out of
-  // them — and an element whose source was just cleared has failed at nothing.
+  // An element that failed has a second thing to try — and one whose source
+  // was just cleared has failed at nothing. There is no third answer: from
+  // here on this page decodes the audio itself, and a decoded play that fails
+  // reports its own reason rather than arriving as a reasonless `error`.
   function playerFailed() {
     const el = player.current
-    if (el === null || speakingId === null) return
-    switch (playFailure(el.src, inboxSpeakUrl(speakingId), buffered)) {
-      case 'ignore':
-        return
-      case 'buffer':
-        void playBuffered(speakingId, el)
-        return
-      case 'report':
-        releasePlayer()
-        setSpeakError({ id: speakingId, message: 'could not play this item' })
-        setSpeakingId(null)
-    }
+    const ctx = clock.current
+    if (el === null || ctx === null || speakingId === null) return
+    if (playFailure(el.src, inboxSpeakUrl(speakingId)) === 'ignore') return
+    // The element is done with for this press; clearing its source keeps its
+    // dead connection from being confused for the decoded one.
+    el.removeAttribute('src')
+    el.load()
+    void playDecoded(speakingId, ctx)
   }
 
   function togglePause() {
+    const stream = decoded.current
+    if (stream) {
+      // Nothing here fires events of its own, so the press that holds the
+      // audio is also what says so. A clock the page has already handed back
+      // refuses both; there is no row left to tell by then.
+      void (paused ? stream.resume() : stream.pause()).catch(() => {})
+      setPaused(!paused)
+      return
+    }
     const el = player.current
     if (!el) return
     // Resuming can be refused the same way the first play can; treat it the
@@ -212,15 +262,31 @@ export function InboxView() {
     if (!listed) releasePlayer()
   }, [listed, releasePlayer])
 
-  // Leaving the page drops any fetch still collecting audio and hands back the
-  // blob. Removing the element from the document is what stops the sound —
-  // React has already detached the ref by the time this runs, so it is not
-  // this cleanup that pauses it.
-  useEffect(() => releasePlayer, [releasePlayer])
+  // Leaving the page drops the body still arriving and silences what is
+  // scheduled. Removing the element from the document is what stops its own
+  // sound — React has already detached the ref by the time this runs, so it is
+  // not this cleanup that pauses it. The Web Audio clock is a device rather
+  // than a play, so it is handed back here and nowhere else: a stop keeps it,
+  // because the next press needs one that a gesture has already unlocked.
+  useEffect(
+    () => () => {
+      releasePlayer()
+      void clock.current?.close()
+      clock.current = null
+    },
+    [releasePlayer],
+  )
 
   // Back one step, but only inside what the stream still holds: the response is
   // chunked with no `Content-Length`, so `seekable` — not `0` — is the floor.
+  // The decoded path keeps every sample it was sent, so there the floor is the
+  // start of the item; the same arithmetic answers both.
   function rewind() {
+    const stream = decoded.current
+    if (stream) {
+      stream.rewind()
+      return
+    }
     const el = player.current
     if (!el) return
     const start = el.seekable.length > 0 ? el.seekable.start(0) : null

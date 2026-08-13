@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   assignInboxItem,
-  createInboxItem,
   deleteInboxItem,
   inboxSpeakUrl,
   listInbox,
@@ -9,16 +8,11 @@ import {
   markInboxItemRead,
   setInboxItemArchived,
 } from '../api'
-import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
 import { filterInbox, INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
-import {
-  DEFAULT_COMPOSE_KIND,
-  INBOX_KINDS,
-  inboxKindClass,
-  inboxKindLabel,
-} from '../inboxKind'
+import { inboxKindClass, inboxKindLabel } from '../inboxKind'
+import { inboxOriginLabel } from '../inboxOrigin'
 import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
 import {
   playFailure,
@@ -26,7 +20,6 @@ import {
   rewindTarget,
 } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
-import type { InboxKind } from '../types/InboxKind'
 import { useFetch } from '../useFetch'
 
 /**
@@ -108,14 +101,6 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
     pollMs: 10000,
   })
 
-  const [body, setBody] = useState('')
-  // What the item being composed is for (mesa task 846). The form always sends
-  // a kind, so this is a person's answer rather than the server's default —
-  // see `DEFAULT_COMPOSE_KIND`. It stays put after a send: someone filing
-  // requests is usually filing several.
-  const [kind, setKind] = useState<InboxKind>(DEFAULT_COMPOSE_KIND)
-  const [author, setAuthorState] = useState(getAuthor())
-  const [createError, setCreateError] = useState<string | null>(null)
   // Which item is being read aloud, and whether its audio has started yet:
   // synthesis takes seconds, so "asked for it" and "hearing it" are different
   // states the button has to distinguish. One item at a time — there is one
@@ -447,24 +432,6 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
     if (target !== null) el.currentTime = target
   }
 
-  function submit(e: React.FormEvent) {
-    e.preventDefault()
-    setAuthor(author)
-    createInboxItem({
-      body,
-      kind,
-      author: author === '' ? undefined : author,
-    }).then(
-      () => {
-        setBody('')
-        setCreateError(null)
-        refetch()
-      },
-      (err: unknown) =>
-        setCreateError(err instanceof Error ? err.message : String(err)),
-    )
-  }
-
   // Assigning converts the item into a backlog task in the chosen project and
   // removes it from the inbox, so we just refetch (the item drops off the list).
   function assign(id: number, value: string) {
@@ -489,38 +456,10 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
             : 'Items set aside without being triaged. Put one back to return it to the queue it came from.'}
       </p>
 
-      <form className="create-form" onSubmit={submit}>
-        <textarea
-          value={body}
-          placeholder="add an update request…"
-          required
-          rows={2}
-          onChange={(e) => setBody(e.target.value)}
-        />
-        <div className="inbox-create-meta">
-          <select
-            value={kind}
-            title="what this is for — a change request is what the inbox watcher triages"
-            aria-label="what this item is for"
-            onChange={(e) => setKind(e.target.value as InboxKind)}
-          >
-            {INBOX_KINDS.map((k) => (
-              <option key={k.kind} value={k.kind}>
-                {k.label}
-              </option>
-            ))}
-          </select>
-          <input
-            type="text"
-            value={author}
-            placeholder="you"
-            title="your name — stamped on what you send"
-            onChange={(e) => setAuthorState(e.target.value)}
-          />
-          <button type="submit">add</button>
-        </div>
-        {createError && <span className="error">{createError}</span>}
-      </form>
+      {/* No compose form (mesa task 847): items are sent by agents, over the
+          CLI and the API, and each one names the task it came from — which is
+          not something a person typing here could supply. This page triages;
+          it does not author. */}
 
       {error ? (
         <p className="error">{error}</p>
@@ -567,6 +506,14 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
                   {expanded.has(item.id) ? '▾' : '▸'}
                 </button>
                 <div className="inbox-item-main">
+                  {/* First line: which project, and which piece of work, this
+                      item is about (mesa task 847). Derived server-side from
+                      the origin task on every read, so it follows a task that
+                      was re-described; absent only for an item with no origin
+                      task at all. */}
+                  {inboxOriginLabel(item) && (
+                    <div className="inbox-origin">{inboxOriginLabel(item)}</div>
+                  )}
                   {expanded.has(item.id) ? (
                     <div className="inbox-body">
                       <Markdown text={item.body} />

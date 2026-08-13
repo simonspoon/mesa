@@ -979,6 +979,23 @@ pub struct InboxItem {
     /// while it is live (mesa task 845). Unlike `read_at` this toggles:
     /// archiving is a place an item sits, so un-archiving clears the stamp.
     pub archived_at: Option<String>,
+    /// The task this item is **about** (mesa task 847) — required at creation,
+    /// because every item arrives from an agent working a task and an item with
+    /// no origin cannot say where it came from. Null only on a row that
+    /// predates 847, or whose task was later deleted (the FK is
+    /// `ON DELETE SET NULL`, like the item's own `project_id`). It is not the
+    /// item's *assignment*: `project_id` stays null until a person triages.
+    #[ts(type = "number | null")]
+    pub task_id: Option<i64>,
+    /// The origin task's `name`, **derived on every read** from that task's
+    /// description by the one `task_name` implementation — never stored, so it
+    /// cannot go stale against a task that was re-described. Null exactly when
+    /// `task_id` is.
+    pub task_name: Option<String>,
+    /// The origin task's project name, derived on every read the same way.
+    /// This is the project the item is *about*; `project_id` above is where it
+    /// was triaged to, which is a different question and stays null.
+    pub project_name: Option<String>,
 }
 
 // ---- scripts (user-authored shell) ----

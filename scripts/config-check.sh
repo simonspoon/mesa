@@ -117,7 +117,7 @@ A=$(jqs .id)
 run 0 "$MESA" project update "$A" --path "$DIR_A"
 run 0 "$MESA" task create "$A" "task a"
 TASK_A=$(jqs .id)
-run 0 "$MESA" inbox add "khora: eval errors on undefined"
+run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "khora: eval errors on undefined"
 ITEM_1=$(jqs .id)
 ok "fixtures: project A at a real path with one todo task, one pending inbox item"
 
@@ -334,7 +334,7 @@ PWNED="$DIR_C/pwned"
 HOSTILE='"; touch pwned #'
 run 0 "$MESA" task create "$C" "$HOSTILE"
 TASK_C=$(jqs .id)
-run 0 "$MESA" inbox add "script-mode triage"
+run 0 "$MESA" inbox add --task "$TASK_C" --kind change-request "script-mode triage"
 ITEM_3=$(jqs .id)
 
 wait_lines "$SCRIPT_LOG" 2
@@ -767,7 +767,7 @@ grep -qx "$DIR_B|--agent|swe|--name|B: task b|--|/execute-mesa-task $TASK_B" "$C
   fail "the built-in todo-watcher argv changed: $(cat "$CLAUDE_LOG")"
 ok "the unconfigured todo-watcher keeps its built-in \`--agent swe --name <project>: <name> -- /execute-mesa-task <id>\` argv"
 
-run 0 "$MESA" inbox add "loki: find exits 0 on no match"
+run 0 "$MESA" inbox add --task "$TASK_B" --kind change-request "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)
 wait_lines "$CLAUDE_LOG" 3
 grep -qx "$FAKE_HOME|--agent|swe|--name|inbox $ITEM_2: loki: find exits 0 on no match|--|/inbox-triage $ITEM_2" "$CLAUDE_LOG" ||

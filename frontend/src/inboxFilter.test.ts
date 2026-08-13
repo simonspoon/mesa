@@ -17,6 +17,9 @@ function item(
     read_at,
     archived_at,
     kind: 'task-summary',
+    task_id: 42,
+    task_name: 'ship the auth fix',
+    project_name: 'mesa',
   }
 }
 

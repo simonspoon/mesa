@@ -17,24 +17,14 @@ import type { InboxKind } from './types/InboxKind'
  */
 
 /**
- * The kinds in the order the compose form offers them. `change-request` comes
- * first because the form is how a *person* sends to the inbox, and a person
- * typing into the inbox is asking for something — summaries arrive from agents
- * over the CLI, which names its own kind.
+ * The two kinds and their wording. There is no compose form any more (mesa task
+ * 847 — items are sent by agents, naming the task they came from), so this list
+ * exists purely to word and tint what arrives.
  */
 export const INBOX_KINDS: readonly { kind: InboxKind; label: string }[] = [
   { kind: 'change-request', label: 'change request' },
   { kind: 'task-summary', label: 'task summary' },
 ]
-
-/**
- * The kind the compose form starts on — see `INBOX_KINDS`. Deliberately *not*
- * the server's default (`task-summary`, what a caller naming no kind gets):
- * the form always sends a kind explicitly, so the two defaults answer two
- * different questions — "what did this person pick" and "what does silence
- * mean".
- */
-export const DEFAULT_COMPOSE_KIND: InboxKind = 'change-request'
 
 /** Human wording for one kind, for the row's meta line. */
 export function inboxKindLabel(kind: InboxKind): string {

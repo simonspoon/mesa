@@ -258,10 +258,12 @@ UI does not live-sync; it refetches on window focus.
   edits. The web renders the graph as a draggable canvas; agents read and write
   it as JSON.
 - **Inbox item** — a free-text update request sent to one shared, global inbox
-  that lives *above* projects. A person triages it: `mesa inbox assign <id>
-  <project>` converts the item into a `backlog` task in that project (one
-  transaction — the item never vanishes without a task to show for it).
-  `mesa inbox {add,list,show,assign,delete}`. `mesa serve --watch-inbox`
+  that lives *above* projects. Every item names the task it came from
+  (`mesa inbox add --task <id> …`, required), and the reader's first line is
+  that task's project and name, derived on every read. A person triages it:
+  `mesa inbox assign <id> <project>` converts the item into a `backlog` task in
+  that project (one transaction — the item never vanishes without a task to show
+  for it). `mesa inbox {add,list,show,assign,read,archive,delete}`. `mesa serve --watch-inbox`
   triages the whole inbox for you, spawning a Claude Code agent per pending
   item; off by default.
 - **Attachment** — an arbitrary file (screenshot, PDF, notes) hung off one

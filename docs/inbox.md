@@ -11,6 +11,29 @@ instructions**; `author` is free-text attribution.
   but still in the inbox" state, because **assignment converts it** (next bullet).
   The FK stays **`ON DELETE SET NULL`** (not cascade) defensively, but with no
   assigned items it never fires. Do not change this to `ON DELETE CASCADE`.
+- **An item names the task it came from** (mesa task 847). `task_id` is
+  **required** at creation on both surfaces (`mesa inbox add --task <id>`,
+  `POST /api/inbox {"task_id": n}`) — an item always reports on a piece of
+  work, and the sender is the only one who knows which. An unknown id is a
+  `validation` error (exit 1 / 422) and nothing is written; omitting the flag
+  is a clap usage error (exit 2), and omitting the key is a 422.
+  The column itself is **nullable**, which is a different question from whether
+  a caller may omit it: a row that predates 847 has no origin to name, and the
+  FK is **`ON DELETE SET NULL`** (as the item's own `project_id` is), so
+  deleting the task loses the pointer rather than the report.
+  This is *not* the item's assignment: `project_id` stays null until a person
+  triages, and the origin task's project is a different project from the one
+  the item may later be assigned to.
+  Two more fields ride back on every read — `task_name` and `project_name`,
+  the origin task's name (through the one `types::task_name`) and its project's
+  name. Both are **derived in SQL on every read**, never stored, exactly like a
+  task's own `name` and its `blocked`: an item whose task was re-described says
+  the new thing, and there is no second copy to go stale. They are null exactly
+  when `task_id` is. Together they are the item's **first line** in the web
+  list (`frontend/src/inboxOrigin.ts`, which answers `null` for the whole line
+  rather than rendering half of one) — which is what makes a queue of reports
+  scannable without opening any of them. All three are bounded, so all three
+  stay in the `--quiet` projection.
 - **Assigning an inbox item to a project converts it into a backlog task** in
   that project and **deletes the item** — it "moves" out of the inbox onto the
   board. **Backlog, not todo** (`Status::Backlog` in `assign_inbox_item`): an
@@ -51,12 +74,10 @@ instructions**; `author` is free-text attribution.
   for every row that predates the column. That default is the **passive** one
   deliberately: an item nobody labelled waits for a person instead of having an
   agent dispatched for it, so neither a caller's silence nor an upgrade starts
-  work on its own. The web compose form is the one place that always sends a
-  kind explicitly, and it starts on `change-request` — a person typing into the
-  inbox is asking for something, while summaries arrive from agents over the
-  CLI, which names its own kind. `kind` is one of two fixed words, hence
-  bounded, so it stays in the `--quiet` projection: it is what decides who
-  reads the item.
+  work on its own. Since task 847 there is no web compose form at all, so every
+  item's kind is named by the agent that sent it, over the CLI or the API.
+  `kind` is one of two fixed words, hence bounded, so it stays in the
+  `--quiet` projection: it is what decides who reads the item.
 - An item is **unread** until it is read, and reading it is something only the
   browser can see (mesa task 831). `read_at` is a nullable timestamp on the row:
   null while unread, stamped **once** the first time the item is read, and never
@@ -100,9 +121,10 @@ instructions**; `author` is free-text attribution.
   listing is meaningful.
 - CLI: `mesa inbox {add,list,show,assign,read,archive,delete}`. `add <text…>` takes the
   free-text message as a trailing positional (quoting optional; words joined),
-  always unassigned; `--author` attributes and `--kind
-  task-summary|change-request` says what the item is for (both go before the
-  text; an unknown kind is a usage error, exit 2). `assign
+  always unassigned; **`--task <id>` is required** and says which task the item
+  came from, `--author` attributes and `--kind task-summary|change-request`
+  says what the item is for (all three go before the text; an unknown kind is a
+  usage error, exit 2, and a missing `--task` likewise). `assign
   <id> <project>` (project required) converts the item into a backlog task in that
   project and **prints the created task**; assigning to a project id that does
   not exist is `validation` (an unknown project *name* is `not_found`, from the
@@ -110,8 +132,8 @@ instructions**; `author` is free-text attribution.
   call echoes the item unchanged). `archive <id>` sets the item aside and
   `archive <id> --undo` puts it back (idempotent both ways). `delete` echoes
   the destroyed item.
-- API: `/api/inbox` (GET list, POST create — body `{body, author, kind}`, all
-  but `body` optional),
+- API: `/api/inbox` (GET list, POST create — body `{body, task_id, author,
+  kind}`; `body` and `task_id` required, the rest optional),
   `/api/inbox/{id}` (GET show, PATCH assign, DELETE),
   `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
   the PATCH, which *assigns*: that one answers with the created task and leaves
@@ -123,7 +145,10 @@ instructions**; `author` is free-text attribution.
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unread-count badge); `#/inbox` lists items, each with an "Assign to"
   project dropdown that converts the item to a backlog task on selection, an
-  archive/put-back button beside it.
+  archive/put-back button beside it. The page **triages; it does not author**
+  (mesa task 847): there is no compose form, because an item names the task it
+  came from and a person typing into the inbox has no such task to name. Items
+  arrive from agents over the CLI and the API.
 - The nav's Inbox row owns a **subnav of three views** (mesa task 845), shaped
   exactly like the CC Dashboard's: the row stays a link and the caret is a
   sibling button, so the sub-views are a disclosure rather than a click in the

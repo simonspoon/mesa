@@ -1,21 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import {
-  DEFAULT_COMPOSE_KIND,
-  INBOX_KINDS,
-  inboxKindClass,
-  inboxKindLabel,
-} from './inboxKind'
+import { INBOX_KINDS, inboxKindClass, inboxKindLabel } from './inboxKind'
 
 describe('INBOX_KINDS', () => {
-  it('offers exactly the two kinds, change request first', () => {
+  it('words exactly the two kinds', () => {
     expect(INBOX_KINDS.map((k) => k.kind)).toEqual([
       'change-request',
       'task-summary',
     ])
-  })
-
-  it('starts the compose form on a kind it actually offers', () => {
-    expect(INBOX_KINDS.some((k) => k.kind === DEFAULT_COMPOSE_KIND)).toBe(true)
   })
 })
 

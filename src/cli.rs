@@ -777,6 +777,18 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
+    /// Mark an item read; prints the item with its `read_at` stamp
+    ///
+    /// Reading is a fact about the past, so the stamp is set once and never
+    /// moved: marking an already-read item is a no-op that echoes it
+    /// unchanged. There is no un-read.
+    Read {
+        /// Inbox item id
+        id: i64,
+        /// Print the item without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Delete an inbox item (no confirmation); echoes the destroyed item
     Delete {
         /// Inbox item id
@@ -2689,6 +2701,7 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
             let project = resolve_project(&store, &project)?;
             print_task(&store.assign_inbox_item(id, project)?, quiet);
         }
+        InboxCmd::Read { id, quiet } => print_inbox_item(&store.mark_inbox_item_read(id)?, quiet),
         InboxCmd::Delete { id, quiet } => print_inbox_item(&store.delete_inbox_item(id)?, quiet),
     }
     Ok(())
@@ -2990,6 +3003,7 @@ mod tests {
             body: "b".into(),
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
+            read_at: Some("2026-01-02 00:00:00".into()),
         }
     }
 
@@ -3189,6 +3203,11 @@ mod tests {
                 "body",
                 "created_at",
                 "updated_at",
+                // Task 831: bounded (a timestamp or null), and it is the one
+                // field `inbox read` exists to write — echoing an item without
+                // it would read as "the mark didn't take", the same reasoning
+                // that keeps `artifact` in a task's quiet shape.
+                "read_at",
             ]),
             "InboxItem gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

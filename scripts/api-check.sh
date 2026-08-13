@@ -659,6 +659,39 @@ api 200 DELETE "/api/projects/$SL"
 ok "DELETE /api/projects/{id} on a leaf: unchanged apart from an empty subprojects"
 
 # =====================================================================
+# 5a2. POST /api/inbox/{id}/read — read/unread (mesa task 831)
+# =====================================================================
+#
+# The web Inbox stamps an item read once it has been held open or heard. The
+# stamp is *when it was first read*, so the route has to be idempotent — the
+# page fires it without knowing whether it already has — and it must never move
+# a stamp that is already there.
+
+api 201 POST "/api/inbox" '{"body":"unread on arrival","author":"api-check"}'
+READ_ID=$(jqb .id)
+[ "$(jqb .read_at)" = "null" ] || fail "inbox create: a new item must be unread"
+
+api 200 POST "/api/inbox/$READ_ID/read"
+FIRST_READ=$(jqb .read_at)
+[ "$FIRST_READ" != "null" ] || fail "inbox read: read_at must be stamped"
+ok "POST /api/inbox/{id}/read: stamps read_at on an unread item"
+
+api 200 POST "/api/inbox/$READ_ID/read"
+[ "$(jqb .read_at)" = "$FIRST_READ" ] ||
+  fail "inbox read: a second mark must not move the stamp"
+api 200 GET "/api/inbox/$READ_ID"
+[ "$(jqb .read_at)" = "$FIRST_READ" ] || fail "inbox read: the stamp must persist"
+ok "POST /api/inbox/{id}/read: idempotent — the stamp is when it was FIRST read"
+
+api 404 POST "/api/inbox/999999/read"
+[ "$(jqb .error.code)" = "not_found" ] || fail "inbox read: unknown id must be not_found"
+# It mutates, so it sits behind the Content-Type gate like every other write.
+raw POST "/api/inbox/$READ_ID/read"
+[ "$STATUS" = "415" ] ||
+  fail "inbox read: a form-shaped POST must be refused, got $STATUS ($BODY)"
+ok "POST /api/inbox/{id}/read: 404 on an unknown id, and inside the Content-Type gate"
+
+# =====================================================================
 # 5b. GET /api/inbox/{id}/speak — reading an item aloud (mesa task 815)
 # =====================================================================
 #

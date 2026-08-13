@@ -6,6 +6,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
+import { unreadCount } from './inboxRead'
 import { rememberView } from './lastView'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionDetailView } from './pages/CCSessionDetailView'
@@ -148,16 +149,16 @@ function App() {
     [],
   )
   // One inbox poll for two badges. The sidebar's nav entry and the phone tab
-  // bar both show the count of items still awaiting triage, and a fetch each
-  // would let them skew by up to a poll interval — `useFetch` caches nothing
+  // bar both show the count of items still UNREAD (mesa task 831 — before it,
+  // the count was every item, which never went down while triage was pending),
+  // and a fetch each would let them skew by up to a poll interval —
+  // `useFetch` caches nothing
   // across components, so an identical `key` in both would still be two
   // independent requests.
   const { data: inbox } = useFetch(() => listInbox(), 'inbox-nav', {
     pollMs: 5000,
   })
-  const unassigned = inbox
-    ? inbox.filter((i) => i.project_id === null).length
-    : 0
+  const unread = unreadCount(inbox)
   // Which build am I looking at? Fetched once — a running server's version
   // cannot change, so no `pollMs`. Pure decoration: no error branch, and
   // nothing renders until it lands (a placeholder would be noise).
@@ -457,7 +458,7 @@ function App() {
           terminalActive={terminalActive}
           ccTab={ccTab}
           version={navVersion}
-          unassigned={unassigned}
+          unread={unread}
           collapsed={navCollapsed}
           onCollapsedChange={setNavCollapsed}
         />
@@ -493,7 +494,7 @@ function App() {
       <PhoneTabBar
         activeProjectId={activeProjectId}
         inboxActive={inboxMatch !== null}
-        unassigned={unassigned}
+        unread={unread}
         navOpen={!navCollapsed}
         agentsOpen={!agentsCollapsed}
         onNavOpenChange={(open) => setNavCollapsed(!open)}

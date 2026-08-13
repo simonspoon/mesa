@@ -478,6 +478,10 @@ const MIGRATIONS: &[&str] = &[
     // prompt rows would only ever appear for turns taken after the upgrade.
     // One-shot and additive — `cc_files` holds cursors, not data.
     "DELETE FROM cc_files;",
+    // Task 831: an inbox item records when it was first read. Nullable, so
+    // every item that predates this migration is unread — which is what an
+    // untriaged item is. Additive; nothing else changes.
+    "ALTER TABLE inbox ADD COLUMN read_at TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -585,7 +589,7 @@ const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, 
      shape, created_at, updated_at";
 const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
-const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at";
+const INBOX_COLUMNS: &str = "id, project_id, author, body, created_at, updated_at, read_at";
 
 fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
     Ok(InboxItem {
@@ -595,6 +599,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         body: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+        read_at: row.get(6)?,
     })
 }
 
@@ -3036,6 +3041,24 @@ impl Store {
         )?;
         tx.commit()?;
         self.get_task(task_id)
+    }
+
+    /// Marks an inbox item **read**, stamping `read_at` with the moment it was
+    /// first read (mesa task 831). Idempotent by design: a second call is a
+    /// no-op that returns the item unchanged, so the stamp is *when you first
+    /// read it* and re-opening an item never moves it. Nothing un-reads an
+    /// item — reading is a fact about the past, not a flag to toggle.
+    pub fn mark_inbox_item_read(&mut self, id: i64) -> Result<InboxItem> {
+        let item = self.get_inbox_item(id)?;
+        if item.read_at.is_some() {
+            return Ok(item);
+        }
+        self.conn.execute(
+            "UPDATE inbox SET read_at = datetime('now'), updated_at = datetime('now') \
+             WHERE id = ?1",
+            [id],
+        )?;
+        self.get_inbox_item(id)
     }
 
     /// Deletes an inbox item; returns the destroyed record (the recoverable
@@ -7079,6 +7102,33 @@ mod tests {
             all.iter().map(|i| i.id).collect::<Vec<_>>(),
             vec![b.id, a.id]
         );
+    }
+
+    /// Task 831: an item arrives unread, is stamped once, and re-marking it is
+    /// a no-op — the stamp is *when it was first read*, so a second pass over
+    /// an item the reader has already seen must not move it.
+    #[test]
+    fn mark_inbox_item_read_stamps_once() {
+        let (mut store, _dir) = temp_store();
+        let item = store.create_inbox_item(None, "unread on arrival").unwrap();
+        assert_eq!(item.read_at, None);
+
+        let read = store.mark_inbox_item_read(item.id).unwrap();
+        let stamp = read.read_at.clone().expect("read_at is stamped");
+        assert!(store.list_inbox_items(None).unwrap()[0].read_at.is_some());
+
+        let again = store.mark_inbox_item_read(item.id).unwrap();
+        assert_eq!(again.read_at, Some(stamp));
+        assert_eq!(again.updated_at, read.updated_at);
+    }
+
+    #[test]
+    fn mark_inbox_item_read_unknown_id_is_not_found() {
+        let (mut store, _dir) = temp_store();
+        assert!(matches!(
+            store.mark_inbox_item_read(999),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

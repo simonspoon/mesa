@@ -221,7 +221,7 @@ export function Sidebar({
   terminalActive,
   ccTab,
   version,
-  unassigned,
+  unread,
   collapsed,
   onCollapsedChange,
 }: {
@@ -232,10 +232,10 @@ export function Sidebar({
   terminalActive: boolean
   ccTab: CcTab | null
   version: number
-  // Count of inbox items still awaiting triage, for the Inbox badge. Fetched
+  // Count of UNREAD inbox items, for the Inbox badge (mesa task 831). Fetched
   // in `App.tsx` and shared with the phone tab bar's own badge so the two can
   // never disagree (task 556).
-  unassigned: number
+  unread: number
   // Full-sidebar collapse: hides the whole nav to give the main content area
   // the extra width, leaving only a thin re-expand handle — and at the phone
   // tier, the difference between a closed drawer and an open one. Owned by
@@ -602,7 +602,7 @@ export function Sidebar({
         )}
         <a className={`nav-item${inboxActive ? ' active' : ''}`} href="#/inbox">
           <span className="nav-item-label">Inbox</span>
-          {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+          {unread > 0 && <span className="inbox-badge">{unread}</span>}
         </a>
         <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
           <span className="nav-item-label">Terminal</span>

@@ -6,10 +6,12 @@ import {
   inboxSpeakUrl,
   listInbox,
   listProjects,
+  markInboxItemRead,
 } from '../api'
 import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
+import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
 import {
   playFailure,
   REWIND_STEP_SECONDS,
@@ -102,6 +104,68 @@ export function InboxView() {
     })
   }
 
+  // The latest list, for the read marks below (mesa task 831): a dwell timer
+  // fires long after the render that started it, and the poll has replaced the
+  // array by then.
+  const latest = useRef(items)
+  useEffect(() => {
+    latest.current = items
+  }, [items])
+  // Items this page has already sent the mark for. `read_at` only changes when
+  // the next fetch lands, so without this the second trigger — or any render
+  // in between — would send the same no-op write again.
+  const marked = useRef<Set<number>>(new Set())
+
+  // Reading an item is something only the browser can see, so the page is what
+  // stamps it: the route is idempotent and the mark is ambient, so a failure
+  // is not reported — it is simply forgotten, and the next trigger retries.
+  const markRead = useCallback(
+    (id: number) => {
+      if (!needsMarkRead(latest.current, id, marked.current)) return
+      marked.current.add(id)
+      markInboxItemRead(id).then(
+        () => refetch(),
+        () => marked.current.delete(id),
+      )
+    },
+    [refetch],
+  )
+
+  // Holding an item open is one of the two ways to read it. The dwell, not the
+  // click: opening the wrong item and closing it again leaves it unread. One
+  // timer per open item, kept across renders — the effect depends on
+  // `expanded` alone, so the list's 3s poll can never restart a dwell that is
+  // nearly due (at these two intervals, that would mean never marking at all).
+  const dwelling = useRef<Map<number, number>>(new Map())
+  useEffect(() => {
+    const timers = dwelling.current
+    for (const id of expanded) {
+      if (timers.has(id)) continue
+      timers.set(
+        id,
+        window.setTimeout(() => {
+          timers.delete(id)
+          markRead(id)
+        }, READ_DWELL_MS),
+      )
+    }
+    // Closing an item before its dwell is up abandons it, unread.
+    for (const [id, timer] of timers) {
+      if (expanded.has(id)) continue
+      clearTimeout(timer)
+      timers.delete(id)
+    }
+  }, [expanded, markRead])
+
+  // Leaving the page drops every dwell still counting.
+  useEffect(() => {
+    const timers = dwelling.current
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer)
+      timers.clear()
+    }
+  }, [])
+
   // Everything one press holds: the element, and the decoded item with the
   // body still arriving for it. Either way the connection closes — the
   // synthesis already running on the server finishes and its bytes are
@@ -150,6 +214,10 @@ export function InboxView() {
             onPlaying: () => {
               if (press.current !== attempt) return
               setSpeaking(true)
+              // Hearing an item is the other way to read it, and the sound is
+              // what says so — a press that never became audio has read
+              // nothing.
+              markRead(id)
               // Sounding is the only evidence that this browser needed
               // decoding; a fallback that failed too says nothing about its
               // media stack.
@@ -179,7 +247,7 @@ export function InboxView() {
         failed(err)
       }
     },
-    [releasePlayer],
+    [markRead, releasePlayer],
   )
 
   // Stops if this item is already the one playing, starts it otherwise.
@@ -353,7 +421,10 @@ export function InboxView() {
       ) : (
         <ul className="card-list inbox-list">
           {items.map((item) => (
-            <li key={item.id} className="inbox-item">
+            <li
+              key={item.id}
+              className={`inbox-item${item.read_at === null ? ' unread' : ''}`}
+            >
               <div className="inbox-item-row">
                 <button
                   type="button"
@@ -397,6 +468,11 @@ export function InboxView() {
                   <div className="muted storyboard-meta">
                     {item.author && <span>from {item.author} · </span>}
                     <span>sent {item.created_at}</span>
+                    {/* The accent bar says it at a glance; the word is what a
+                        reader who cannot see the bar gets (mesa task 831). */}
+                    {item.read_at === null && (
+                      <span className="inbox-unread"> · unread</span>
+                    )}
                   </div>
                   {speakError?.id === item.id && (
                     <span className="error">{speakError.message}</span>
@@ -487,7 +563,11 @@ export function InboxView() {
           are discarded, the same no-timeout posture as hooks and scripts. */}
       <audio
         ref={player}
-        onPlaying={() => setSpeaking(true)}
+        onPlaying={() => {
+          setSpeaking(true)
+          // Same rule as the decoded path: sounding is what reads the item.
+          if (speakingId !== null) markRead(speakingId)
+        }}
         onPlay={() => setPaused(false)}
         onPause={() => setPaused(true)}
         onEnded={() => {

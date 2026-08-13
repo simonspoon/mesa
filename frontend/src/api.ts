@@ -730,6 +730,15 @@ export function assignInboxItem(id: number, projectId: number): Promise<Task> {
 }
 
 /**
+ * Mark an item read (mesa task 831), stamping `read_at` the first time. The
+ * route is idempotent, so the page may send it without knowing whether it
+ * already has; the resolved item carries the stamp.
+ */
+export function markInboxItemRead(id: number): Promise<InboxItem> {
+  return request(`/api/inbox/${id}/read`, jsonInit('POST', {}))
+}
+
+/**
  * Spoken-audio URL for one inbox item (mesa task 815) — used directly as an
  * `<audio src>`, never fetched as JSON. The route synthesises the item's body
  * with `kokoro-rs` on the server and answers `audio/wav`; synthesis runs on

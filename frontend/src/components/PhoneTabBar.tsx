@@ -20,7 +20,7 @@
 export function PhoneTabBar({
   activeProjectId,
   inboxActive,
-  unassigned,
+  unread,
   navOpen,
   agentsOpen,
   onNavOpenChange,
@@ -28,7 +28,7 @@ export function PhoneTabBar({
 }: {
   activeProjectId: number | null
   inboxActive: boolean
-  unassigned: number
+  unread: number
   navOpen: boolean
   agentsOpen: boolean
   onNavOpenChange: (open: boolean) => void
@@ -75,7 +75,7 @@ export function PhoneTabBar({
         onClick={closeDrawers}
       >
         Inbox
-        {unassigned > 0 && <span className="inbox-badge">{unassigned}</span>}
+        {unread > 0 && <span className="inbox-badge">{unread}</span>}
       </a>
       <button
         type="button"

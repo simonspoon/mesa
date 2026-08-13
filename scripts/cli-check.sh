@@ -823,8 +823,9 @@ run 0 "$MESA" inbox add --author agent-q "$BODY"
 IQ=$(jqs .id)
 run 0 "$MESA" inbox show "$IQ"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
-# non-quiet output is unchanged: the full 6-key inbox item
-[ "$(jqs 'keys | join(",")')" = "author,body,created_at,id,project_id,updated_at" ] ||
+# non-quiet output is unchanged: the full 7-key inbox item (task 831 added
+# `read_at`, which is bounded and therefore stays in the quiet shape too)
+[ "$(jqs 'keys | join(",")')" = "author,body,created_at,id,project_id,read_at,updated_at" ] ||
   fail "inbox show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
 run 0 "$MESA" inbox show "$IQ" --quiet
@@ -883,20 +884,39 @@ run 1 "$MESA" inbox show "$IQ3"
 [ "$(jqe .error.code)" = "not_found" ] || fail "inbox delete --quiet: item must still be gone"
 ok "inbox delete --quiet: destroyed item minus body, still deleted"
 
+# read: the stamp is set once and never moved, so a second mark echoes the
+# first — and the flag drops the body here like everywhere else (task 831).
+run 0 "$MESA" inbox add "$BODY"
+IQR=$(jqs .id)
+[ "$(jqs .read_at)" = "null" ] || fail "inbox add: a new item must be unread"
+run 0 "$MESA" inbox read "$IQR"
+printf '%s' "$STDOUT" >"$TMP/ifull.json"
+IQR_AT=$(jqs .read_at)
+[ "$IQR_AT" != "null" ] || fail "inbox read: read_at must be stamped"
+run 0 "$MESA" inbox read "$IQR" --quiet
+printf '%s' "$STDOUT" >"$TMP/iquiet.json"
+[ "$(jqs 'has("body")')" = "false" ] || fail "inbox read --quiet: body must be dropped"
+[ "$(jqs .read_at)" = "$IQR_AT" ] || fail "inbox read: a second mark must not move the stamp"
+inbox_quiet_parity "$TMP/ifull.json" "$TMP/iquiet.json" ||
+  fail "inbox read --quiet: must be the full item minus body"
+run 1 "$MESA" inbox read 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "inbox read: unknown id must be not_found"
+ok "inbox read: stamps read_at once, idempotent, --quiet drops the body"
+
 # long form only: no -q alias
 run 2 "$MESA" inbox show "$IQ" -q
 ok "inbox show -q: exit 2 (no short alias)"
 
-# --quiet does not exist outside the 4 subcommands in scope
+# --quiet does not exist outside the 5 subcommands in scope
 run 2 "$MESA" inbox list --quiet
 ok "inbox list --quiet: exit 2 (unknown argument)"
 
-# every one of the 4 advertises the flag in --help
-for SUB in add show assign delete; do
+# every one of the 5 advertises the flag in --help
+for SUB in add show assign read delete; do
   run 0 "$MESA" inbox "$SUB" --help
   grep -q -- "--quiet" <<<"$STDOUT" || fail "inbox $SUB --help: must list --quiet"
 done
-ok "inbox add/show/assign/delete --help: --quiet listed"
+ok "inbox add/show/assign/read/delete --help: --quiet listed"
 
 # --quiet changes stdout only: exit code and the stderr payload are identical
 run 1 "$MESA" inbox show 999999

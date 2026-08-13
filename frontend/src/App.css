@@ -247,6 +247,24 @@ header {
   gap: 0.5rem;
 }
 
+/* Unread (mesa task 831): an accent down the left edge and a heavier preview,
+   so the queue reads as a queue. An item becomes read by being held open for a
+   few seconds or by being heard — never by the list simply rendering it — so
+   this marker is safe to make loud. */
+.inbox-item.unread {
+  border-left: 3px solid var(--cyan);
+  padding-left: 0.6rem;
+  margin-left: -0.6rem;
+}
+
+.inbox-item.unread .inbox-preview {
+  font-weight: 600;
+}
+
+.inbox-unread {
+  color: var(--cyan);
+}
+
 /* Inbox bodies are free text from agents and frequently carry a bare URL,
    which has no break opportunity at all — measured 726px wide inside a 340px
    column at 390x844, scrolling `main` sideways to 751px (mesa task 562). Same

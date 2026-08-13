@@ -30,4 +30,11 @@ created_at: string,
 /**
  * When the item was last changed — e.g. assigned (SQLite `datetime`, UTC).
  */
-updated_at: string, };
+updated_at: string, 
+/**
+ * When the item was **first** read, or null while it is unread (mesa task
+ * 831). Stamped once and never moved or cleared: an item is read after it
+ * has been opened long enough to take in, or heard through the play
+ * button, and re-reading it says nothing new.
+ */
+read_at: string | null, };

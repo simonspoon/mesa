@@ -754,6 +754,10 @@ fn router(state: AppState) -> Router {
             "/api/inbox/{id}",
             get(show_inbox).patch(assign_inbox).delete(delete_inbox),
         )
+        // Marking an item read (mesa task 831). Its own route rather than a key
+        // on the PATCH above: that PATCH *assigns*, answering with the created
+        // task and leaving no item behind, so the two could never share a body.
+        .route("/api/inbox/{id}/read", post(read_inbox))
         // Reading an item aloud: a GET that runs an external synthesiser and
         // answers WAV bytes. It shares `require_agent_access` with the
         // code-execution routes rather than the plain `guard` the other
@@ -1963,6 +1967,15 @@ async fn assign_inbox(
     let mut store = state.store.lock().unwrap();
     let task = store.assign_inbox_item(id, body.project_id)?;
     Ok(Json(task).into_response())
+}
+
+/// Marks one item read, stamping `read_at` the first time and answering with
+/// the item either way — the web Inbox sends this once an item has been open
+/// long enough to take in, or heard through the play button. Idempotent, which
+/// is what lets the page fire it without tracking whether it already has.
+async fn read_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.mark_inbox_item_read(id)?).into_response())
 }
 
 /// Speaks one inbox item: the item's body, verbatim, through `kokoro-rs`, back
@@ -7206,6 +7219,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             body: body.to_string(),
             created_at: String::new(),
             updated_at: String::new(),
+            read_at: None,
         };
         assert_eq!(
             inbox_session_name(&item(

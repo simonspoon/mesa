@@ -28,23 +28,50 @@ instructions**; `author` is free-text attribution.
   auto-assigns; a person triages. Assigning to an unknown project is `validation`
   and leaves the item untouched. The item's `author` is not carried onto the task
   (tasks have no author field).
+- An item is **unread** until it is read, and reading it is something only the
+  browser can see (mesa task 831). `read_at` is a nullable timestamp on the row:
+  null while unread, stamped **once** the first time the item is read, and never
+  moved or cleared — there is no un-read, because reading is a fact about the
+  past rather than a flag to toggle. The two things that count as reading an
+  item are the two ways a person takes one in: **holding it open** for
+  `READ_DWELL_MS` (3s — the dwell, not the click, so opening the wrong item and
+  closing it again leaves it unread), and **hearing it** through the play button
+  (the first sound, not the last: a press that never became audio has read
+  nothing). Both trigger `POST /api/inbox/{id}/read`, which is idempotent
+  precisely so the page can fire it without tracking whether it already has;
+  `mesa inbox read <id>` is the same write from the CLI. Marking is ambient, so
+  a failed mark says nothing to the reader — it is forgotten and the next
+  trigger retries. In the list an unread item carries an accent bar, a heavier
+  preview and the word "unread" in its meta line, and the **nav badge counts
+  unread items** rather than every item (before 831 it counted the whole inbox,
+  so it never went down until something was triaged). `read_at` is bounded, so
+  it stays in the `--quiet` projection — dropping it would make `inbox read
+  --quiet` echo an item with no evidence the mark took, the same reasoning that
+  keeps a task's `artifact`. The predicates live in
+  `frontend/src/inboxRead.ts`, not inline in the view: the list's 3s poll is
+  exactly what makes "already read" and "already sent the mark" two different
+  facts.
 - No event/history table: an item *is* the record. The safety floor is the
   delete echo + `mesa backup`; once converted, the created task is the record.
 - `list` returns items newest first; the `--project N`/`?project=` filter still
   exists but, since items are never assigned, only the unfiltered whole-inbox
   listing is meaningful.
-- CLI: `mesa inbox {add,list,show,assign,delete}`. `add <text…>` takes the
+- CLI: `mesa inbox {add,list,show,assign,read,delete}`. `add <text…>` takes the
   free-text message as a trailing positional (quoting optional; words joined),
   always unassigned; `--author` attributes (place it before the text). `assign
   <id> <project>` (project required) converts the item into a backlog task in that
   project and **prints the created task**; assigning to a project id that does
   not exist is `validation` (an unknown project *name* is `not_found`, from the
-  shared resolver). `delete` echoes the destroyed item.
+  shared resolver). `read <id>` marks the item read (idempotent — a second
+  call echoes the item unchanged). `delete` echoes the destroyed item.
 - API: `/api/inbox` (GET list, POST create — body `{body, author}`),
-  `/api/inbox/{id}` (GET show, PATCH assign, DELETE). PATCH body is
+  `/api/inbox/{id}` (GET show, PATCH assign, DELETE),
+  `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
+  the PATCH, which *assigns*: that one answers with the created task and leaves
+  no item behind, so the two could never share a body). PATCH body is
   `{project_id: <number>}` (required) and **returns the created task** (not the
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
-  unassigned-count badge); `#/inbox` lists items, each with an "Assign to"
+  unread-count badge); `#/inbox` lists items, each with an "Assign to"
   project dropdown that converts the item to a backlog task on selection.
 - The list is a **triage queue**, so an item is **collapsed** by default (mesa
   task 828): a three-line CSS clamp over the raw body — plain text, not

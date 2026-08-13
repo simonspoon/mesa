@@ -715,6 +715,12 @@ export function getInboxItem(id: number): Promise<InboxItem> {
 
 export interface InboxCreate {
   body: string
+  /**
+   * The task this item comes from (mesa task 847). Required: an item always
+   * reports on a piece of work, and that task is what names the project and
+   * the work on the reader's first line. An unknown id is a 422.
+   */
+  task_id: number
   author?: string
   /**
    * What the item is for (mesa task 846). Omitted, it is a `task-summary`:

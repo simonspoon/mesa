@@ -493,6 +493,14 @@ const MIGRATIONS: &[&str] = &[
     // item nobody labelled must not start being auto-triaged by an upgrade.
     // Additive; nothing else changes.
     "ALTER TABLE inbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'task-summary';",
+    // Task 847: an inbox item names the task it came from, so a reader can see
+    // which project and which piece of work it is about without opening it.
+    // Required at creation from here on, but the column is **nullable**: every
+    // item that predates this migration has no origin to name, and the FK is
+    // `ON DELETE SET NULL` (as the item's own `project_id` is) so deleting a
+    // task loses the pointer rather than the report. Additive; nothing else
+    // changes.
+    "ALTER TABLE inbox ADD COLUMN task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -600,11 +608,23 @@ const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, 
      shape, created_at, updated_at";
 const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
-const INBOX_COLUMNS: &str =
-    "id, project_id, author, body, created_at, updated_at, read_at, archived_at, kind";
+/// The item's own columns plus the two the origin task contributes: its
+/// description (the `task_name` is derived from it on every read, never stored)
+/// and its project's name. Both arrive through `INBOX_FROM`'s left joins, so
+/// they are null exactly when `task_id` is.
+const INBOX_COLUMNS: &str = "i.id, i.project_id, i.author, i.body, i.created_at, i.updated_at, \
+     i.read_at, i.archived_at, i.kind, i.task_id, t.description, p.name";
+
+/// The joins `INBOX_COLUMNS` reads the derived columns from. Left joins: an
+/// item whose origin task was deleted (or that predates task 847) still reads.
+const INBOX_FROM: &str = "FROM inbox i \
+     LEFT JOIN tasks t ON t.id = i.task_id \
+     LEFT JOIN projects p ON p.id = t.project_id";
 
 fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
     let kind: String = row.get(8)?;
+    let task_id: Option<i64> = row.get(9)?;
+    let description: Option<String> = row.get(10)?;
     Ok(InboxItem {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -615,6 +635,12 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         read_at: row.get(6)?,
         archived_at: row.get(7)?,
         kind: InboxKind::parse(&kind).expect("invalid inbox kind in db"),
+        task_id,
+        task_name: match (task_id, description) {
+            (Some(id), Some(d)) => Some(task_name(&d, id)),
+            _ => None,
+        },
+        project_name: row.get(11)?,
     })
 }
 
@@ -2969,16 +2995,30 @@ impl Store {
     /// `kind` says what the item is for (mesa task 846) and is fixed at
     /// creation: a caller that names none sends a task summary, the kind that
     /// waits for a person.
+    ///
+    /// `task_id` is **required** (mesa task 847): an item always comes from an
+    /// agent working a task, and naming it is what lets the reader see the
+    /// project and the piece of work a report is about. An unknown task is a
+    /// `validation` error, mirroring `assign_inbox_item`'s unknown project.
     pub fn create_inbox_item(
         &mut self,
         author: Option<&str>,
         body: &str,
         kind: InboxKind,
+        task_id: i64,
     ) -> Result<InboxItem> {
+        let task_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        if !task_exists {
+            return Err(Error::Validation(format!("task {task_id} not found")));
+        }
         self.conn.execute(
-            "INSERT INTO inbox (project_id, author, body, kind, created_at, updated_at) \
-             VALUES (NULL, ?1, ?2, ?3, datetime('now'), datetime('now'))",
-            (author, body, kind.as_str()),
+            "INSERT INTO inbox (project_id, author, body, kind, task_id, created_at, updated_at) \
+             VALUES (NULL, ?1, ?2, ?3, ?4, datetime('now'), datetime('now'))",
+            (author, body, kind.as_str(), task_id),
         )?;
         self.get_inbox_item(self.conn.last_insert_rowid())
     }
@@ -2986,7 +3026,7 @@ impl Store {
     pub fn get_inbox_item(&self, id: i64) -> Result<InboxItem> {
         self.conn
             .query_row(
-                &format!("SELECT {INBOX_COLUMNS} FROM inbox WHERE id = ?1"),
+                &format!("SELECT {INBOX_COLUMNS} {INBOX_FROM} WHERE i.id = ?1"),
                 [id],
                 row_to_inbox_item,
             )
@@ -3002,8 +3042,8 @@ impl Store {
     /// assigned to that project; otherwise the whole inbox (assigned and not).
     pub fn list_inbox_items(&self, project: Option<i64>) -> Result<Vec<InboxItem>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {INBOX_COLUMNS} FROM inbox \
-             WHERE (?1 IS NULL OR project_id = ?1) ORDER BY id DESC"
+            "SELECT {INBOX_COLUMNS} {INBOX_FROM} \
+             WHERE (?1 IS NULL OR i.project_id = ?1) ORDER BY i.id DESC"
         ))?;
         let rows = stmt.query_map([project], row_to_inbox_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -7089,19 +7129,49 @@ mod tests {
 
     // ---- inbox (global update requests) ----
 
+    /// Every inbox item names the task it came from (task 847), so each test
+    /// needs one to point at. Returns the task's id.
+    fn origin_task(store: &mut Store) -> i64 {
+        let p = store
+            .create_project("origin", None, None, None, None)
+            .unwrap();
+        store
+            .create_task(
+                p.id,
+                "the task this report is about",
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+    }
+
     #[test]
     fn inbox_add_delete_round_trip() {
         let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
 
-        // New items land unassigned in the global inbox.
+        // New items land unassigned in the global inbox, but always name the
+        // task they came from — and read back its project and name, derived.
         let item = store
             .create_inbox_item(
                 Some("agent-7"),
                 "deploy v2 to staging",
                 InboxKind::TaskSummary,
+                origin,
             )
             .unwrap();
         assert_eq!(item.project_id, None);
+        assert_eq!(item.task_id, Some(origin));
+        assert_eq!(
+            item.task_name.as_deref(),
+            Some("the task this report is about")
+        );
+        assert_eq!(item.project_name.as_deref(), Some("origin"));
         assert_eq!(item.author.as_deref(), Some("agent-7"));
         assert_eq!(item.body, "deploy v2 to staging");
 
@@ -7122,6 +7192,7 @@ mod tests {
     fn assigning_an_inbox_item_converts_it_to_a_backlog_task() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
+        let origin = origin_task(&mut store);
 
         // The description is the item's body verbatim; the name is its first
         // line (task 660 — an assigned item keeps every character it arrived
@@ -7131,6 +7202,7 @@ mod tests {
                 Some("agent-7"),
                 "ship the auth fix\nmore detail here",
                 InboxKind::ChangeRequest,
+                origin,
             )
             .unwrap();
 
@@ -7150,7 +7222,7 @@ mod tests {
 
         // A single-line item: body and name coincide, no duplication to avoid.
         let single = store
-            .create_inbox_item(None, "quick note", InboxKind::TaskSummary)
+            .create_inbox_item(None, "quick note", InboxKind::TaskSummary, origin)
             .unwrap();
         let t2 = store.assign_inbox_item(single.id, p.id).unwrap();
         assert_eq!(t2.description, "quick note");
@@ -7160,11 +7232,12 @@ mod tests {
     #[test]
     fn list_inbox_items_newest_first() {
         let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
         let a = store
-            .create_inbox_item(None, "one", InboxKind::TaskSummary)
+            .create_inbox_item(None, "one", InboxKind::TaskSummary, origin)
             .unwrap();
         let b = store
-            .create_inbox_item(None, "two", InboxKind::TaskSummary)
+            .create_inbox_item(None, "two", InboxKind::TaskSummary, origin)
             .unwrap();
         let all = store.list_inbox_items(None).unwrap();
         assert_eq!(
@@ -7179,8 +7252,9 @@ mod tests {
     #[test]
     fn mark_inbox_item_read_stamps_once() {
         let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
         let item = store
-            .create_inbox_item(None, "unread on arrival", InboxKind::TaskSummary)
+            .create_inbox_item(None, "unread on arrival", InboxKind::TaskSummary, origin)
             .unwrap();
         assert_eq!(item.read_at, None);
 
@@ -7199,8 +7273,9 @@ mod tests {
     #[test]
     fn set_inbox_item_archived_toggles_and_is_idempotent() {
         let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
         let item = store
-            .create_inbox_item(None, "nothing to do here", InboxKind::TaskSummary)
+            .create_inbox_item(None, "nothing to do here", InboxKind::TaskSummary, origin)
             .unwrap();
         assert_eq!(item.archived_at, None);
 
@@ -7252,12 +7327,14 @@ mod tests {
     #[test]
     fn inbox_kind_round_trips_and_defaults_to_task_summary() {
         let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
 
         let request = store
             .create_inbox_item(
                 None,
                 "make the board sort by priority",
                 InboxKind::ChangeRequest,
+                origin,
             )
             .unwrap();
         assert_eq!(request.kind, InboxKind::ChangeRequest);
@@ -7281,11 +7358,93 @@ mod tests {
         assert_eq!(legacy.kind, InboxKind::TaskSummary);
     }
 
+    /// Task 847: the origin task is required and must exist — an unknown one is
+    /// a `validation` error, mirroring `assign_inbox_item`'s unknown project.
+    #[test]
+    fn create_inbox_item_unknown_task_is_validation_error() {
+        let (mut store, _dir) = temp_store();
+        let err = store
+            .create_inbox_item(None, "from nowhere", InboxKind::TaskSummary, 999)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("999"));
+        assert!(store.list_inbox_items(None).unwrap().is_empty());
+    }
+
+    /// Task 847: the task's name and project are **derived on every read**, so
+    /// they follow the task rather than freezing at send time — and a row that
+    /// predates the column (or whose task was deleted) reads back with all
+    /// three null instead of failing.
+    #[test]
+    fn inbox_task_name_is_derived_on_read_and_null_without_a_task() {
+        let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(None, "done", InboxKind::TaskSummary, origin)
+            .unwrap();
+
+        // Re-describing the task changes what the item reads back.
+        store
+            .update_task(
+                origin,
+                &TaskPatch {
+                    description: Some("renamed after the report was sent".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after = store.get_inbox_item(item.id).unwrap();
+        assert_eq!(
+            after.task_name.as_deref(),
+            Some("renamed after the report was sent")
+        );
+
+        // A pre-847 row names no task, and reads back with nothing derived.
+        store
+            .conn
+            .execute(
+                "INSERT INTO inbox (project_id, author, body, created_at, updated_at) \
+                 VALUES (NULL, NULL, 'legacy', datetime('now'), datetime('now'))",
+                (),
+            )
+            .unwrap();
+        let legacy = store
+            .get_inbox_item(store.conn.last_insert_rowid())
+            .unwrap();
+        assert_eq!(legacy.task_id, None);
+        assert_eq!(legacy.task_name, None);
+        assert_eq!(legacy.project_name, None);
+    }
+
+    /// Task 847: the FK is `ON DELETE SET NULL` (as the item's own `project_id`
+    /// is) — deleting the origin task loses the pointer, never the report.
+    #[test]
+    fn deleting_the_origin_task_leaves_the_inbox_item() {
+        let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(
+                None,
+                "the report outlives its task",
+                InboxKind::TaskSummary,
+                origin,
+            )
+            .unwrap();
+
+        store.delete_task(origin).unwrap();
+        let after = store.get_inbox_item(item.id).unwrap();
+        assert_eq!(after.body, "the report outlives its task");
+        assert_eq!(after.task_id, None);
+        assert_eq!(after.task_name, None);
+        assert_eq!(after.project_name, None);
+    }
+
     #[test]
     fn assign_inbox_item_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
         let item = store
-            .create_inbox_item(None, "orphan", InboxKind::TaskSummary)
+            .create_inbox_item(None, "orphan", InboxKind::TaskSummary, origin)
             .unwrap();
         let err = store.assign_inbox_item(item.id, 999).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));

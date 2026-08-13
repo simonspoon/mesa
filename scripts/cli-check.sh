@@ -816,17 +816,22 @@ inbox_quiet_parity() {
 
 run 0 "$MESA" project create "Quiet inbox" --no-git
 PIQ=$(jqs .id)
+# Every item names the task it came from (task 847), so the section needs an
+# origin task of its own. It dies with the project at the end of the section.
+run 0 "$MESA" task create "$PIQ" "wire the inbox to its origin task"
+TIQ=$(jqs .id)
 
 # show: the reference parity case — same record read twice, so nothing volatile
 # moves between the two calls.
-run 0 "$MESA" inbox add --author agent-q "$BODY"
+run 0 "$MESA" inbox add --task "$TIQ" --author agent-q "$BODY"
 IQ=$(jqs .id)
 run 0 "$MESA" inbox show "$IQ"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
-# non-quiet output is unchanged: the full 9-key inbox item (task 831 added
-# `read_at`, task 845 `archived_at` and task 846 `kind`, all bounded and
+# non-quiet output is unchanged: the full 12-key inbox item (task 831 added
+# `read_at`, task 845 `archived_at`, task 846 `kind` and task 847 the origin
+# trio `task_id` + the derived `task_name`/`project_name` — all bounded and
 # therefore staying in the quiet shape too)
-[ "$(jqs 'keys | join(",")')" = "archived_at,author,body,created_at,id,kind,project_id,read_at,updated_at" ] ||
+[ "$(jqs 'keys | join(",")')" = "archived_at,author,body,created_at,id,kind,project_id,project_name,read_at,task_id,task_name,updated_at" ] ||
   fail "inbox show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
 run 0 "$MESA" inbox show "$IQ" --quiet
@@ -844,7 +849,7 @@ ok "inbox get --quiet: same shape as show"
 
 # add: --quiet must precede the message (everything after `add` that is not a
 # leading flag is swallowed as the body by trailing_var_arg).
-run 0 "$MESA" inbox add --quiet --author agent-q "$BODY"
+run 0 "$MESA" inbox add --task "$TIQ" --quiet --author agent-q "$BODY"
 printf '%s' "$STDOUT" >"$TMP/iquiet.json"
 IQ2=$(jqs .id)
 [ "$(jqs 'has("body")')" = "false" ] || fail "inbox add --quiet: body must be dropped"
@@ -875,7 +880,7 @@ run 1 "$MESA" inbox show "$IQ2"
 ok "inbox assign --quiet: compact task, item still converted and removed"
 
 # delete: --quiet is an explicit opt-out of the full recovery transcript.
-run 0 "$MESA" inbox add "$BODY"
+run 0 "$MESA" inbox add --task "$TIQ" "$BODY"
 IQ3=$(jqs .id)
 run 0 "$MESA" inbox delete "$IQ3" --quiet
 printf '%s' "$STDOUT" >"$TMP/iquiet.json"
@@ -887,7 +892,7 @@ ok "inbox delete --quiet: destroyed item minus body, still deleted"
 
 # read: the stamp is set once and never moved, so a second mark echoes the
 # first — and the flag drops the body here like everywhere else (task 831).
-run 0 "$MESA" inbox add "$BODY"
+run 0 "$MESA" inbox add --task "$TIQ" "$BODY"
 IQR=$(jqs .id)
 [ "$(jqs .read_at)" = "null" ] || fail "inbox add: a new item must be unread"
 run 0 "$MESA" inbox read "$IQR"
@@ -908,18 +913,49 @@ ok "inbox read: stamps read_at once, idempotent, --quiet drops the body"
 # change request the inbox-watcher triages. Fixed at creation, and an `add`
 # that names none is a summary: silence must never be the kind that gets an
 # agent dispatched for it.
-run 0 "$MESA" inbox add unlabelled item
+run 0 "$MESA" inbox add --task "$TIQ" unlabelled item
 IQK=$(jqs .id)
 [ "$(jqs .kind)" = "task-summary" ] || fail "inbox add: no --kind must default to task-summary"
-run 0 "$MESA" inbox add --kind change-request "please tint the inbox rows"
+run 0 "$MESA" inbox add --task "$TIQ" --kind change-request "please tint the inbox rows"
 IQK2=$(jqs .id)
 [ "$(jqs .kind)" = "change-request" ] || fail "inbox add --kind change-request"
 run 0 "$MESA" inbox show "$IQK2" --quiet
 [ "$(jqs .kind)" = "change-request" ] || fail "inbox show --quiet: kind must survive (bounded)"
-run 2 "$MESA" inbox add --kind bug-report "not a kind"
+run 2 "$MESA" inbox add --task "$TIQ" --kind bug-report "not a kind"
 ok "inbox add --kind: both kinds, task-summary default, unknown kind is exit 2"
 run 0 "$MESA" inbox delete "$IQK"
 run 0 "$MESA" inbox delete "$IQK2"
+
+# --task (task 847): which task the item comes from. Required — every item
+# arrives from an agent working a task, and one with no origin cannot say
+# where it came from — so omitting it is a clap usage error, not a default.
+run 2 "$MESA" inbox add "no origin at all"
+[ -z "$STDOUT" ] || fail "inbox add without --task: stdout must be empty"
+ok "inbox add without --task: exit 2, empty stdout"
+
+run 1 "$MESA" inbox add --task 999999 "from a task that does not exist"
+[ "$(jqe .error.code)" = "validation" ] ||
+  fail "inbox add --task <unknown>: code must be validation"
+ok "inbox add --task with an unknown id: exit 1 validation"
+
+# The origin's name and project come back derived on read — never stored, so
+# they cannot go stale against a task that was later re-described.
+run 0 "$MESA" inbox add --task "$TIQ" "reporting back on the origin task"
+IQT2=$(jqs .id)
+[ "$(jqs .task_id)" = "$TIQ" ] || fail "inbox add --task: task_id must round-trip"
+[ "$(jqs .task_name)" = "wire the inbox to its origin task" ] ||
+  fail "inbox add --task: task_name must be the origin task's derived name"
+[ "$(jqs .project_name)" = "Quiet inbox" ] ||
+  fail "inbox add --task: project_name must be the origin task's project"
+# The origin is not the assignment: triage still has to happen.
+[ "$(jqs .project_id)" = "null" ] ||
+  fail "inbox add --task: naming a task must not assign the item"
+run 0 "$MESA" inbox show "$IQT2" --quiet
+[ "$(jqs .task_id)" = "$TIQ" ] || fail "inbox show --quiet: task_id must survive (bounded)"
+[ "$(jqs .task_name)" = "wire the inbox to its origin task" ] ||
+  fail "inbox show --quiet: task_name must survive (bounded)"
+ok "inbox add --task: origin round-trips with its derived name and project"
+run 0 "$MESA" inbox delete "$IQT2"
 
 # long form only: no -q alias
 run 2 "$MESA" inbox show "$IQ" -q

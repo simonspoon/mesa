@@ -288,15 +288,16 @@ header {
 }
 
 /* Inbox page: each item shows its body, who sent it, and triage controls. */
-.inbox-create-meta {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  align-items: center;
-}
 
-.inbox-create-meta input[type='text'] {
-  flex: 1 1 8rem;
+/* The item's first line: the project and task it came from (mesa task 847).
+   Quiet and small — it says what the item is about, while the body below is
+   what it says. */
+.inbox-origin {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 0.15rem;
+  overflow-wrap: anywhere;
 }
 
 .inbox-item {

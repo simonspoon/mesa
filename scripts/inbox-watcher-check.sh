@@ -83,7 +83,7 @@ run 0 "$MESA" project update "$A" --path "$DIR_A"
 run 0 "$MESA" task create "$A" "task a"
 TASK_A=$(jqs .id)
 
-run 0 "$MESA" inbox add --author "agent-7" --kind change-request "khora: eval errors on undefined
+run 0 "$MESA" inbox add --task "$TASK_A" --author "agent-7" --kind change-request "khora: eval errors on undefined
 second line is ignored by the session name"
 ITEM_1=$(jqs .id)
 [ "$(jqs .project_id)" = "null" ] || fail "a new inbox item must start unassigned"
@@ -163,7 +163,7 @@ ok "item still pending after dispatch is not re-dispatched on later ticks"
 
 # ---- a newly-arrived item dispatches even while older ones are claimed ----
 
-run 0 "$MESA" inbox add --kind change-request "loki: find exits 0 on no match"
+run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)
 wait_bg_lines 2
 LINE=$(sed -n 2p "$BG_LOG")
@@ -175,9 +175,9 @@ ok "a new inbox item is dispatched on the next tick, with its own id"
 
 # The inbox is one global queue with no per-project cap to pace it, unlike
 # the todo-watcher's one-agent-per-project. Three at once must all dispatch.
-run 0 "$MESA" inbox add --kind change-request "mesa: item three"
-run 0 "$MESA" inbox add --kind change-request "mesa: item four"
-run 0 "$MESA" inbox add --kind change-request "mesa: item five"
+run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "mesa: item three"
+run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "mesa: item four"
+run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "mesa: item five"
 wait_bg_lines 5
 sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 5 ] ||
@@ -190,7 +190,7 @@ ok "every pending item dispatches in a single tick, then stops"
 # close-out sends one — so the watcher must leave it alone, tick after tick,
 # rather than answering a report with an agent. The kind never changes, so
 # this is a permanent skip and not a delay.
-run 0 "$MESA" inbox add --kind task-summary "mesa task 846 is done: inbox items now carry a type"
+run 0 "$MESA" inbox add --task "$TASK_A" --kind task-summary "mesa task 846 is done: inbox items now carry a type"
 ITEM_SUMMARY=$(jqs .id)
 sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 5 ] ||

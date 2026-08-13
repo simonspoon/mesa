@@ -670,19 +670,48 @@ ok "DELETE /api/projects/{id} on a leaf: unchanged apart from an empty subprojec
 # page fires it without knowing whether it already has — and it must never move
 # a stamp that is already there.
 
-api 201 POST "/api/inbox" '{"body":"unread on arrival","author":"api-check"}'
+# Every item names the task it came from (mesa task 847), so the inbox section
+# needs a real task of its own to point at. Created through the CLI (same db)
+# so the id is known before the first POST.
+INBOX_TASK=$("$MESA" task create "$PROJ" "wire the inbox to its origin task" | jq -r .id)
+
+api 201 POST "/api/inbox" "{\"body\":\"unread on arrival\",\"author\":\"api-check\",\"task_id\":$INBOX_TASK}"
 READ_ID=$(jqb .id)
 [ "$(jqb .read_at)" = "null" ] || fail "inbox create: a new item must be unread"
 # Task 846: a create body that names no kind is a task summary — the kind that
 # waits for a person — so silence never gets an item auto-triaged.
 [ "$(jqb .kind)" = "task-summary" ] ||
   fail "inbox create: an omitted kind must default to task-summary"
-api 201 POST "/api/inbox" '{"body":"please tint the rows","kind":"change-request"}'
+api 201 POST "/api/inbox" "{\"body\":\"please tint the rows\",\"kind\":\"change-request\",\"task_id\":$INBOX_TASK}"
 KIND_ID=$(jqb .id)
 [ "$(jqb .kind)" = "change-request" ] || fail "inbox create: kind must round-trip"
-api 422 POST "/api/inbox" '{"body":"nope","kind":"bug-report"}'
+api 422 POST "/api/inbox" "{\"body\":\"nope\",\"kind\":\"bug-report\",\"task_id\":$INBOX_TASK}"
 api 200 DELETE "/api/inbox/$KIND_ID"
 ok "POST /api/inbox: kind round-trips, defaults to task-summary, unknown kind is 422"
+
+# task_id (mesa task 847): the origin task is REQUIRED, and the item carries
+# that task's name and project name back — both derived on read, so they can
+# never go stale against a task that was re-described.
+api 422 POST "/api/inbox" '{"body":"where did this come from?"}'
+ok "POST /api/inbox: a body with no task_id is 422"
+
+api 422 POST "/api/inbox" '{"body":"from nowhere","task_id":999999}'
+[ "$(jqb .error.code)" = "validation" ] ||
+  fail "inbox create: an unknown task_id must be validation"
+ok "POST /api/inbox: an unknown task_id is 422 validation"
+
+api 201 POST "/api/inbox" "{\"body\":\"reporting back\",\"task_id\":$INBOX_TASK}"
+ORIGIN_ID=$(jqb .id)
+[ "$(jqb .task_id)" = "$INBOX_TASK" ] || fail "inbox create: task_id must round-trip"
+[ "$(jqb .task_name)" = "wire the inbox to its origin task" ] ||
+  fail "inbox create: task_name must be the origin task's derived name"
+[ "$(jqb .project_name)" = "API gate project" ] ||
+  fail "inbox create: project_name must be the origin task's project"
+# It is the item's ORIGIN, not its assignment: triage is still untouched.
+[ "$(jqb .project_id)" = "null" ] ||
+  fail "inbox create: naming a task must not assign the item"
+api 200 DELETE "/api/inbox/$ORIGIN_ID"
+ok "POST /api/inbox: task_id round-trips with the derived task_name/project_name"
 
 api 200 POST "/api/inbox/$READ_ID/read"
 FIRST_READ=$(jqb .read_at)
@@ -712,7 +741,7 @@ ok "POST /api/inbox/{id}/read: 404 on an unknown id, and inside the Content-Type
 # read mark it TOGGLES, so the direction rides in the body — and both
 # directions are idempotent, so a second press cannot move the first's stamp.
 
-api 201 POST "/api/inbox" '{"body":"nothing to do here","author":"api-check"}'
+api 201 POST "/api/inbox" "{\"body\":\"nothing to do here\",\"author\":\"api-check\",\"task_id\":$INBOX_TASK}"
 ARCH_ID=$(jqb .id)
 [ "$(jqb .archived_at)" = "null" ] || fail "inbox create: a new item must be live"
 
@@ -753,7 +782,7 @@ ok "POST /api/inbox/{id}/archive: 404 on an unknown id, and inside the Content-T
 # `require_agent_access`, stricter than the task routes beside it.
 
 HOSTILE='$(touch '"$TMP"'/pwned); rm -rf / # spoken'
-SPEAK_ID=$("$MESA" inbox add "$HOSTILE" | jq -r .id)
+SPEAK_ID=$("$MESA" inbox add --task "$INBOX_TASK" "$HOSTILE" | jq -r .id)
 
 speak() { # speak <path> [curl args...] -> STATUS, $TMP/audio, $TMP/headers
   local path=$1

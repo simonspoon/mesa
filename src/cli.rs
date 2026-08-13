@@ -721,16 +721,24 @@ enum InboxCmd {
     /// — not tied to any project. Type the message after `add` (quoting is
     /// optional; multiple words are joined). A person routes it to a project
     /// later with `inbox assign`; naming a project in the text does nothing
-    /// automatic. Put `--author` and `--quiet` before the message text.
+    /// automatic. `--task` says which task the item comes from and is
+    /// REQUIRED. Put every flag before the message text.
     #[command(after_help = "\
 EXAMPLES
-  mesa inbox add the auth refactor is ready for review
-  mesa inbox add --author agent-7 \"deploy v2 to staging tonight\"
-  mesa inbox add --kind change-request \"the board should sort by priority\"")]
+  mesa inbox add --task 42 the auth refactor is ready for review
+  mesa inbox add --task 42 --author agent-7 \"deploy v2 to staging tonight\"
+  mesa inbox add --task 42 --kind change-request \"the board should sort by priority\"")]
     Add {
         /// The message (everything after `add`); quoting is optional
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         body: Vec<String>,
+        /// The task this item comes from (required)
+        ///
+        /// Its project and name are what the reader sees on the item's first
+        /// line. An unknown task id is a validation error. Place it before the
+        /// message text.
+        #[arg(long = "task", value_name = "ID", required = true)]
+        task_id: i64,
         /// Free-text actor id of the sender (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
@@ -2712,11 +2720,12 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
     match cmd {
         InboxCmd::Add {
             body,
+            task_id,
             author,
             kind,
             quiet,
         } => print_inbox_item(
-            &store.create_inbox_item(author.as_deref(), &body.join(" "), kind)?,
+            &store.create_inbox_item(author.as_deref(), &body.join(" "), kind, task_id)?,
             quiet,
         ),
         InboxCmd::List { project } => {
@@ -3039,6 +3048,9 @@ mod tests {
             read_at: Some("2026-01-02 00:00:00".into()),
             archived_at: None,
             kind: InboxKind::TaskSummary,
+            task_id: Some(3),
+            task_name: Some("the task this report is about".into()),
+            project_name: Some("mesa".into()),
         }
     }
 
@@ -3250,6 +3262,14 @@ mod tests {
                 // what decides who reads the item, which a quiet echo that
                 // dropped it could not show.
                 "kind",
+                // Task 847: the origin task, and the two fields derived from
+                // it on read. All three are bounded — an id, a 50-char task
+                // name and a project name — and together they are the item's
+                // first line, so a quiet echo that dropped them could not say
+                // what the item is about.
+                "task_id",
+                "task_name",
+                "project_name",
             ]),
             "InboxItem gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

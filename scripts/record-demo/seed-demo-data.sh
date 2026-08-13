@@ -23,7 +23,7 @@ t3=$(mesa task create "$proj1" "QA regression pass" --priority medium | id)
 t4=$(mesa task create "$proj1" "Launch checkout redesign" --priority high | id)
 mesa task block "$t4" --by "$t2" >/dev/null
 mesa task block "$t4" --by "$t3" >/dev/null
-mesa inbox add "Customers report the old checkout still shows on mobile Safari" >/dev/null
+mesa inbox add --task "$t3" "Customers report the old checkout still shows on mobile Safari" >/dev/null
 
 sb=$(mesa storyboard create "$proj1" "Checkout Flow" | id)
 f1=$(mesa storyboard frame create "$sb" "Cart" --x 40 --y 120 | id)

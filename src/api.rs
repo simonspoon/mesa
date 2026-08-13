@@ -1934,6 +1934,11 @@ struct InboxQuery {
 #[derive(Deserialize)]
 struct InboxCreate {
     body: String,
+    /// The task this item comes from (mesa task 847). **Required**: an item
+    /// always reports on a piece of work, and its task is what names the
+    /// project and the work on the reader's first line. An unknown id is a
+    /// `validation` error from `Store`.
+    task_id: i64,
     #[serde(default)]
     author: Option<String>,
     /// What the item is for (mesa task 846). Optional: a body that names no
@@ -1971,7 +1976,8 @@ async fn create_inbox(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let item = store.create_inbox_item(body.author.as_deref(), &body.body, body.kind)?;
+    let item =
+        store.create_inbox_item(body.author.as_deref(), &body.body, body.kind, body.task_id)?;
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
 
@@ -7247,6 +7253,28 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
 
     // --- inbox watcher (mesa task 544) -----------------------------------
 
+    /// Task 847: an inbox item names the task it came from, so these tests need
+    /// a real task to point at. Returns its id.
+    fn inbox_origin(state: &AppState) -> i64 {
+        let mut store = state.store.lock().unwrap();
+        let p = store
+            .create_project("origin", None, None, None, None)
+            .unwrap();
+        store
+            .create_task(
+                p.id,
+                "the task this report is about",
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+    }
+
     #[test]
     fn inbox_session_name_uses_first_nonempty_line_truncated() {
         let item = |body: &str| InboxItem {
@@ -7259,6 +7287,9 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             read_at: None,
             archived_at: None,
             kind: InboxKind::ChangeRequest,
+            task_id: Some(42),
+            task_name: Some("make the watcher name sessions".into()),
+            project_name: Some("mesa".into()),
         };
         assert_eq!(
             inbox_session_name(&item(
@@ -7296,6 +7327,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
         let (_dir, state) = test_state();
+        let origin = inbox_origin(&state);
         let first = state
             .store
             .lock()
@@ -7304,6 +7336,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 Some("agent-7"),
                 "khora: eval errors on undefined",
                 InboxKind::ChangeRequest,
+                origin,
             )
             .unwrap();
         let second = state
@@ -7314,6 +7347,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 None,
                 "loki: find exits 0 on no match",
                 InboxKind::ChangeRequest,
+                origin,
             )
             .unwrap();
 
@@ -7353,7 +7387,12 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(None, "mesa: add an inbox watcher", InboxKind::ChangeRequest)
+            .create_inbox_item(
+                None,
+                "mesa: add an inbox watcher",
+                InboxKind::ChangeRequest,
+                origin,
+            )
             .unwrap();
         inbox_watcher_tick(&state);
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -7400,6 +7439,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
         let (_dir, state) = test_state();
+        let origin = inbox_origin(&state);
         let summary = state
             .store
             .lock()
@@ -7408,13 +7448,19 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 Some("agent-7"),
                 "mesa task 846 is done: added inbox types",
                 InboxKind::TaskSummary,
+                origin,
             )
             .unwrap();
         let request = state
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(None, "mesa: tint the inbox rows", InboxKind::ChangeRequest)
+            .create_inbox_item(
+                None,
+                "mesa: tint the inbox rows",
+                InboxKind::ChangeRequest,
+                origin,
+            )
             .unwrap();
 
         inbox_watcher_tick(&state);
@@ -7458,11 +7504,17 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
         let (_dir, state) = test_state();
+        let origin = inbox_origin(&state);
         let item = state
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(None, "mesa: something to triage", InboxKind::ChangeRequest)
+            .create_inbox_item(
+                None,
+                "mesa: something to triage",
+                InboxKind::ChangeRequest,
+                origin,
+            )
             .unwrap();
 
         inbox_watcher_tick(&state);

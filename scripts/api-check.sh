@@ -673,6 +673,16 @@ ok "DELETE /api/projects/{id} on a leaf: unchanged apart from an empty subprojec
 api 201 POST "/api/inbox" '{"body":"unread on arrival","author":"api-check"}'
 READ_ID=$(jqb .id)
 [ "$(jqb .read_at)" = "null" ] || fail "inbox create: a new item must be unread"
+# Task 846: a create body that names no kind is a task summary — the kind that
+# waits for a person — so silence never gets an item auto-triaged.
+[ "$(jqb .kind)" = "task-summary" ] ||
+  fail "inbox create: an omitted kind must default to task-summary"
+api 201 POST "/api/inbox" '{"body":"please tint the rows","kind":"change-request"}'
+KIND_ID=$(jqb .id)
+[ "$(jqb .kind)" = "change-request" ] || fail "inbox create: kind must round-trip"
+api 422 POST "/api/inbox" '{"body":"nope","kind":"bug-report"}'
+api 200 DELETE "/api/inbox/$KIND_ID"
+ok "POST /api/inbox: kind round-trips, defaults to task-summary, unknown kind is 422"
 
 api 200 POST "/api/inbox/$READ_ID/read"
 FIRST_READ=$(jqb .read_at)

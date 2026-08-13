@@ -1,8 +1,8 @@
 # Inbox watcher
 
 `mesa serve --watch-inbox` starts a periodic background loop that auto-triages
-the global inbox: for every pending item it starts a background `claude`
-session running `/inbox-triage <item-id>`, so items stop accumulating until a
+the global inbox: for every pending **change request** it starts a background
+`claude` session running `/inbox-triage <item-id>`, so items stop accumulating until a
 human gets to them. That command is the default of the **`inbox-watcher`** key
 in `~/.mesa/config.json` and is user-configurable, slash command included
 (`docs/config.md`); `{id}` is the item id and `{name}` the session name derived
@@ -20,8 +20,13 @@ tick constant. `--watch-inbox` alone never claims a task or dispatches
 
 `inbox_watcher_tick` in `src/api.rs`:
 
-- Lists the whole inbox (`Store::list_inbox_items(None)`), then dispatches
-  **every** pending item this process has not already dispatched — all of them
+- Lists the whole inbox (`Store::list_inbox_items(None)`), keeps the items
+  whose `kind` is `change-request` (mesa task 846 — a `task-summary` is an
+  agent reporting to a person, so there is nothing to triage, and answering
+  every close-out report with an agent is exactly what the kind exists to
+  stop; the kind never changes, so the skip is permanent rather than a wait,
+  and a skipped item is not even claimed in the dedup set), then dispatches
+  **every** one of those this process has not already dispatched — all of them
   in the same tick. Unlike the todo watcher, which is naturally capped at one
   agent per project, the inbox is one **global** queue with no per-project
   structure to pace it. A server started against a large backlog therefore

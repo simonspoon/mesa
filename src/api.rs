@@ -40,11 +40,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramType, EdgePatch, Error,
     FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, InboxItem, MesaVersion, ModelRates, NextResult, Priority,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, StoryboardPatch, Task,
-    TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, scripts,
-    speech, version,
+    GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, MesaVersion, ModelRates, NextResult,
+    Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, StoryboardPatch,
+    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks,
+    scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -287,6 +287,12 @@ fn inbox_watcher_tick(state: &AppState) {
         dispatched.retain(|id| present.contains(id));
         items
             .iter()
+            // Only change requests are triaged (mesa task 846). A task summary
+            // is an agent reporting to a person: there is nothing to route,
+            // and dispatching one would turn every close-out report into a
+            // fresh agent. The kind is fixed at creation, so an item skipped
+            // here is skipped for good rather than waiting for a state change.
+            .filter(|item| item.kind == InboxKind::ChangeRequest)
             .filter(|item| dispatched.insert(item.id))
             .map(|item| (item.id, inbox_session_name(item)))
             .collect()
@@ -1930,6 +1936,11 @@ struct InboxCreate {
     body: String,
     #[serde(default)]
     author: Option<String>,
+    /// What the item is for (mesa task 846). Optional: a body that names no
+    /// kind is a task summary, the kind that waits for a person rather than
+    /// one the inbox-watcher acts on.
+    #[serde(default)]
+    kind: InboxKind,
 }
 
 #[derive(Deserialize)]
@@ -1960,7 +1971,7 @@ async fn create_inbox(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let item = store.create_inbox_item(body.author.as_deref(), &body.body)?;
+    let item = store.create_inbox_item(body.author.as_deref(), &body.body, body.kind)?;
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
 
@@ -7247,6 +7258,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             updated_at: String::new(),
             read_at: None,
             archived_at: None,
+            kind: InboxKind::ChangeRequest,
         };
         assert_eq!(
             inbox_session_name(&item(
@@ -7288,13 +7300,21 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(Some("agent-7"), "khora: eval errors on undefined")
+            .create_inbox_item(
+                Some("agent-7"),
+                "khora: eval errors on undefined",
+                InboxKind::ChangeRequest,
+            )
             .unwrap();
         let second = state
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(None, "loki: find exits 0 on no match")
+            .create_inbox_item(
+                None,
+                "loki: find exits 0 on no match",
+                InboxKind::ChangeRequest,
+            )
             .unwrap();
 
         // The whole pending inbox goes out in one tick — the inbox is one
@@ -7333,7 +7353,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(None, "mesa: add an inbox watcher")
+            .create_inbox_item(None, "mesa: add an inbox watcher", InboxKind::ChangeRequest)
             .unwrap();
         inbox_watcher_tick(&state);
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -7364,6 +7384,63 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
     }
 
+    /// Task 846: only a change request is triaged. A task summary is an agent
+    /// reporting to a person — every `/execute-todo` close-out sends one — so
+    /// dispatching it would answer a report with an agent, and the kind never
+    /// changes, so the skip is permanent rather than a wait.
+    #[test]
+    fn inbox_watcher_tick_dispatches_change_requests_only() {
+        // SAFETY: see `inbox_watcher_tick_dispatches_each_item_once_...`.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let summary = state
+            .store
+            .lock()
+            .unwrap()
+            .create_inbox_item(
+                Some("agent-7"),
+                "mesa task 846 is done: added inbox types",
+                InboxKind::TaskSummary,
+            )
+            .unwrap();
+        let request = state
+            .store
+            .lock()
+            .unwrap()
+            .create_inbox_item(None, "mesa: tint the inbox rows", InboxKind::ChangeRequest)
+            .unwrap();
+
+        inbox_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "only the change request may dispatch: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("/inbox-triage {}", request.id)),
+            "{log:?}"
+        );
+        assert!(
+            !state.inbox_dispatched.lock().unwrap().contains(&summary.id),
+            "a summary is not claimed either — it was never a candidate"
+        );
+
+        // A second tick is not a delayed dispatch: the kind is fixed.
+        inbox_watcher_tick(&state);
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(log.lines().count(), 1, "{log:?}");
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
     /// A spawn failure must release the claim, so a transient `claude`
     /// outage retries next tick instead of silently dropping the item —
     /// the inbox equivalent of the todo-watcher's revert-to-`todo`.
@@ -7385,7 +7462,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .store
             .lock()
             .unwrap()
-            .create_inbox_item(None, "mesa: something to triage")
+            .create_inbox_item(None, "mesa: something to triage", InboxKind::ChangeRequest)
             .unwrap();
 
         inbox_watcher_tick(&state);

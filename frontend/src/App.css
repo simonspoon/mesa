@@ -325,6 +325,39 @@ header {
   color: var(--cyan);
 }
 
+/* What an item is FOR, as a tint (mesa task 846). The inbox mixes two things
+   with two different readers — a task summary an agent wrote for a person, and
+   a change request `serve --watch-inbox` triages — and the tint is what tells
+   them apart while scrolling. Deliberately quiet: the loud markers on this row
+   are unread (the cyan edge) and playback, and a wash that competed with them
+   would make the queue harder to read, not easier.
+   The tint is layered OVER `--panel` rather than replacing it, so the card
+   keeps its own surface under the colour, and it is `.inbox-item.inbox-kind-*`
+   so it outranks `.card-list li`'s flat background. The word is in the meta
+   line as well — a colour is not something every reader gets. */
+.inbox-item.inbox-kind-change-request {
+  background: linear-gradient(var(--violet-dim), var(--violet-dim)),
+    var(--panel);
+}
+
+.inbox-item.inbox-kind-task-summary {
+  background: linear-gradient(
+      rgba(43, 255, 156, 0.08),
+      rgba(43, 255, 156, 0.08)
+    ),
+    var(--panel);
+}
+
+/* The same two colours in the meta line, at full strength: the tint says it at
+   a glance, this says it in words. */
+.inbox-kind-change-request .inbox-kind {
+  color: var(--violet);
+}
+
+.inbox-kind-task-summary .inbox-kind {
+  color: var(--green);
+}
+
 /* Inbox bodies are free text from agents and frequently carry a bare URL,
    which has no break opportunity at all — measured 726px wide inside a 340px
    column at 390x844, scrolling `main` sideways to 751px (mesa task 562). Same

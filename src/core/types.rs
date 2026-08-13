@@ -902,6 +902,46 @@ pub struct StoryboardView {
     pub edges: Vec<FrameEdge>,
 }
 
+/// What one inbox item *is for* (mesa task 846) — the two things that arrive in
+/// the inbox, told apart so each reaches its reader. A **task summary** is an
+/// agent reporting what it did, for a person to read; a **change request** asks
+/// for work, which is what the inbox-watcher triages. Exactly two kinds: the
+/// pair is the whole point, so a third would mean deciding again who reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum InboxKind {
+    TaskSummary,
+    ChangeRequest,
+}
+
+impl InboxKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboxKind::TaskSummary => "task-summary",
+            InboxKind::ChangeRequest => "change-request",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<InboxKind> {
+        match s {
+            "task-summary" => Some(InboxKind::TaskSummary),
+            "change-request" => Some(InboxKind::ChangeRequest),
+            _ => None,
+        }
+    }
+}
+
+/// The kind an item that names none is: a report, not a request. The default is
+/// deliberately the passive one — an unlabelled item waits for a person instead
+/// of being auto-triaged by the inbox-watcher, so nothing runs on a caller's
+/// silence (`docs/inbox.md`).
+impl Default for InboxKind {
+    fn default() -> Self {
+        InboxKind::TaskSummary
+    }
+}
+
 /// A global inbox item: a free-text project-update request an agent sends to
 /// one shared inbox, not yet tied to any project. The inbox lives *above*
 /// projects: items arrive unassigned, and a person later routes each one to the
@@ -922,6 +962,10 @@ pub struct InboxItem {
     pub author: Option<String>,
     /// The message body (markdown by convention). Required.
     pub body: String,
+    /// What the item is for (mesa task 846): a summary a person reads, or a
+    /// change request the inbox-watcher triages. Set at creation and never
+    /// changed — it is what the sender meant, not a state the reader moves.
+    pub kind: InboxKind,
     /// When the item was sent (SQLite `datetime` text, UTC).
     pub created_at: String,
     /// When the item was last changed — e.g. assigned (SQLite `datetime`, UTC).

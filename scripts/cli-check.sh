@@ -823,10 +823,10 @@ run 0 "$MESA" inbox add --author agent-q "$BODY"
 IQ=$(jqs .id)
 run 0 "$MESA" inbox show "$IQ"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
-# non-quiet output is unchanged: the full 8-key inbox item (task 831 added
-# `read_at` and task 845 `archived_at`, both bounded and therefore staying in
-# the quiet shape too)
-[ "$(jqs 'keys | join(",")')" = "archived_at,author,body,created_at,id,project_id,read_at,updated_at" ] ||
+# non-quiet output is unchanged: the full 9-key inbox item (task 831 added
+# `read_at`, task 845 `archived_at` and task 846 `kind`, all bounded and
+# therefore staying in the quiet shape too)
+[ "$(jqs 'keys | join(",")')" = "archived_at,author,body,created_at,id,kind,project_id,read_at,updated_at" ] ||
   fail "inbox show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
 run 0 "$MESA" inbox show "$IQ" --quiet
@@ -903,6 +903,23 @@ inbox_quiet_parity "$TMP/ifull.json" "$TMP/iquiet.json" ||
 run 1 "$MESA" inbox read 999999
 [ "$(jqe .error.code)" = "not_found" ] || fail "inbox read: unknown id must be not_found"
 ok "inbox read: stamps read_at once, idempotent, --quiet drops the body"
+
+# kind (task 846): what the item is FOR — a summary a person reads, or a
+# change request the inbox-watcher triages. Fixed at creation, and an `add`
+# that names none is a summary: silence must never be the kind that gets an
+# agent dispatched for it.
+run 0 "$MESA" inbox add unlabelled item
+IQK=$(jqs .id)
+[ "$(jqs .kind)" = "task-summary" ] || fail "inbox add: no --kind must default to task-summary"
+run 0 "$MESA" inbox add --kind change-request "please tint the inbox rows"
+IQK2=$(jqs .id)
+[ "$(jqs .kind)" = "change-request" ] || fail "inbox add --kind change-request"
+run 0 "$MESA" inbox show "$IQK2" --quiet
+[ "$(jqs .kind)" = "change-request" ] || fail "inbox show --quiet: kind must survive (bounded)"
+run 2 "$MESA" inbox add --kind bug-report "not a kind"
+ok "inbox add --kind: both kinds, task-summary default, unknown kind is exit 2"
+run 0 "$MESA" inbox delete "$IQK"
+run 0 "$MESA" inbox delete "$IQK2"
 
 # long form only: no -q alias
 run 2 "$MESA" inbox show "$IQ" -q

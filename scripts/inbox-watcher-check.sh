@@ -83,7 +83,7 @@ run 0 "$MESA" project update "$A" --path "$DIR_A"
 run 0 "$MESA" task create "$A" "task a"
 TASK_A=$(jqs .id)
 
-run 0 "$MESA" inbox add --author "agent-7" "khora: eval errors on undefined
+run 0 "$MESA" inbox add --author "agent-7" --kind change-request "khora: eval errors on undefined
 second line is ignored by the session name"
 ITEM_1=$(jqs .id)
 [ "$(jqs .project_id)" = "null" ] || fail "a new inbox item must start unassigned"
@@ -163,7 +163,7 @@ ok "item still pending after dispatch is not re-dispatched on later ticks"
 
 # ---- a newly-arrived item dispatches even while older ones are claimed ----
 
-run 0 "$MESA" inbox add "loki: find exits 0 on no match"
+run 0 "$MESA" inbox add --kind change-request "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)
 wait_bg_lines 2
 LINE=$(sed -n 2p "$BG_LOG")
@@ -175,14 +175,31 @@ ok "a new inbox item is dispatched on the next tick, with its own id"
 
 # The inbox is one global queue with no per-project cap to pace it, unlike
 # the todo-watcher's one-agent-per-project. Three at once must all dispatch.
-run 0 "$MESA" inbox add "mesa: item three"
-run 0 "$MESA" inbox add "mesa: item four"
-run 0 "$MESA" inbox add "mesa: item five"
+run 0 "$MESA" inbox add --kind change-request "mesa: item three"
+run 0 "$MESA" inbox add --kind change-request "mesa: item four"
+run 0 "$MESA" inbox add --kind change-request "mesa: item five"
 wait_bg_lines 5
 sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 5 ] ||
   fail "expected exactly 5 dispatches, got: $(cat "$BG_LOG")"
 ok "every pending item dispatches in a single tick, then stops"
+
+# ---- only change requests are triaged (task 846) ----
+
+# A task summary is an agent reporting to a person — every /execute-todo
+# close-out sends one — so the watcher must leave it alone, tick after tick,
+# rather than answering a report with an agent. The kind never changes, so
+# this is a permanent skip and not a delay.
+run 0 "$MESA" inbox add --kind task-summary "mesa task 846 is done: inbox items now carry a type"
+ITEM_SUMMARY=$(jqs .id)
+sleep 1
+[ "$(wc -l < "$BG_LOG")" -eq 5 ] ||
+  fail "a task summary must never dispatch: $(cat "$BG_LOG")"
+! grep -q "/inbox-triage $ITEM_SUMMARY" "$BG_LOG" ||
+  fail "a task summary must never be triaged"
+run 0 "$MESA" inbox show "$ITEM_SUMMARY"
+[ "$(jqs .kind)" = "task-summary" ] || fail "the watcher must not touch the item at all"
+ok "a task-summary item is never dispatched, on this tick or any later one"
 
 # ---- --watch-todo is a separate flag: the todo backlog is untouched ----
 

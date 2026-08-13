@@ -6,9 +6,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
-    AnchorSide, Attachment, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Priority,
-    Project, Script, ScriptArg, ScriptArgKind, Status, Storyboard, StoryboardEvent, StoryboardView,
-    Task, TaskEvent, Waypoint, task_name,
+    AnchorSide, Attachment, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, InboxKind,
+    Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Storyboard, StoryboardEvent,
+    StoryboardView, Task, TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -487,6 +487,12 @@ const MIGRATIONS: &[&str] = &[
     // lists. Nullable, so every item that predates this migration is live.
     // Additive; nothing else changes.
     "ALTER TABLE inbox ADD COLUMN archived_at TEXT;",
+    // Task 846: an inbox item declares what it is for — a task summary a
+    // person reads, or a change request the inbox-watcher triages. Every item
+    // that predates this migration becomes a summary, the passive kind: an
+    // item nobody labelled must not start being auto-triaged by an upgrade.
+    // Additive; nothing else changes.
+    "ALTER TABLE inbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'task-summary';",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -595,9 +601,10 @@ const FRAME_COLUMNS: &str = "id, storyboard_id, title, body, x, y, w, h, color, 
 const EDGE_COLUMNS: &str = "id, storyboard_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
 const STORYBOARD_EVENT_COLUMNS: &str = "id, storyboard_id, actor, action, summary, at";
 const INBOX_COLUMNS: &str =
-    "id, project_id, author, body, created_at, updated_at, read_at, archived_at";
+    "id, project_id, author, body, created_at, updated_at, read_at, archived_at, kind";
 
 fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
+    let kind: String = row.get(8)?;
     Ok(InboxItem {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -607,6 +614,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         updated_at: row.get(5)?,
         read_at: row.get(6)?,
         archived_at: row.get(7)?,
+        kind: InboxKind::parse(&kind).expect("invalid inbox kind in db"),
     })
 }
 
@@ -2957,11 +2965,20 @@ impl Store {
     /// to any project. New items are always unassigned (`project_id` null); a
     /// person routes them to a project later via `assign_inbox_item`. The single
     /// write path for inbox items.
-    pub fn create_inbox_item(&mut self, author: Option<&str>, body: &str) -> Result<InboxItem> {
+    ///
+    /// `kind` says what the item is for (mesa task 846) and is fixed at
+    /// creation: a caller that names none sends a task summary, the kind that
+    /// waits for a person.
+    pub fn create_inbox_item(
+        &mut self,
+        author: Option<&str>,
+        body: &str,
+        kind: InboxKind,
+    ) -> Result<InboxItem> {
         self.conn.execute(
-            "INSERT INTO inbox (project_id, author, body, created_at, updated_at) \
-             VALUES (NULL, ?1, ?2, datetime('now'), datetime('now'))",
-            (author, body),
+            "INSERT INTO inbox (project_id, author, body, kind, created_at, updated_at) \
+             VALUES (NULL, ?1, ?2, ?3, datetime('now'), datetime('now'))",
+            (author, body, kind.as_str()),
         )?;
         self.get_inbox_item(self.conn.last_insert_rowid())
     }
@@ -7078,7 +7095,11 @@ mod tests {
 
         // New items land unassigned in the global inbox.
         let item = store
-            .create_inbox_item(Some("agent-7"), "deploy v2 to staging")
+            .create_inbox_item(
+                Some("agent-7"),
+                "deploy v2 to staging",
+                InboxKind::TaskSummary,
+            )
             .unwrap();
         assert_eq!(item.project_id, None);
         assert_eq!(item.author.as_deref(), Some("agent-7"));
@@ -7106,7 +7127,11 @@ mod tests {
         // line (task 660 — an assigned item keeps every character it arrived
         // with, and the board label falls out of the body for free).
         let item = store
-            .create_inbox_item(Some("agent-7"), "ship the auth fix\nmore detail here")
+            .create_inbox_item(
+                Some("agent-7"),
+                "ship the auth fix\nmore detail here",
+                InboxKind::ChangeRequest,
+            )
             .unwrap();
 
         let task = store.assign_inbox_item(item.id, p.id).unwrap();
@@ -7124,7 +7149,9 @@ mod tests {
         assert!(store.list_inbox_items(None).unwrap().is_empty());
 
         // A single-line item: body and name coincide, no duplication to avoid.
-        let single = store.create_inbox_item(None, "quick note").unwrap();
+        let single = store
+            .create_inbox_item(None, "quick note", InboxKind::TaskSummary)
+            .unwrap();
         let t2 = store.assign_inbox_item(single.id, p.id).unwrap();
         assert_eq!(t2.description, "quick note");
         assert_eq!(t2.name, "quick note");
@@ -7133,8 +7160,12 @@ mod tests {
     #[test]
     fn list_inbox_items_newest_first() {
         let (mut store, _dir) = temp_store();
-        let a = store.create_inbox_item(None, "one").unwrap();
-        let b = store.create_inbox_item(None, "two").unwrap();
+        let a = store
+            .create_inbox_item(None, "one", InboxKind::TaskSummary)
+            .unwrap();
+        let b = store
+            .create_inbox_item(None, "two", InboxKind::TaskSummary)
+            .unwrap();
         let all = store.list_inbox_items(None).unwrap();
         assert_eq!(
             all.iter().map(|i| i.id).collect::<Vec<_>>(),
@@ -7148,7 +7179,9 @@ mod tests {
     #[test]
     fn mark_inbox_item_read_stamps_once() {
         let (mut store, _dir) = temp_store();
-        let item = store.create_inbox_item(None, "unread on arrival").unwrap();
+        let item = store
+            .create_inbox_item(None, "unread on arrival", InboxKind::TaskSummary)
+            .unwrap();
         assert_eq!(item.read_at, None);
 
         let read = store.mark_inbox_item_read(item.id).unwrap();
@@ -7166,7 +7199,9 @@ mod tests {
     #[test]
     fn set_inbox_item_archived_toggles_and_is_idempotent() {
         let (mut store, _dir) = temp_store();
-        let item = store.create_inbox_item(None, "nothing to do here").unwrap();
+        let item = store
+            .create_inbox_item(None, "nothing to do here", InboxKind::TaskSummary)
+            .unwrap();
         assert_eq!(item.archived_at, None);
 
         let archived = store.set_inbox_item_archived(item.id, true).unwrap();
@@ -7209,10 +7244,49 @@ mod tests {
         ));
     }
 
+    /// Task 846: the kind is what the sender meant, so it round-trips exactly
+    /// as given — and a row written before the column existed reads back as a
+    /// task summary, the kind that waits for a person. The second half is the
+    /// upgrade path: it must not be an unlabelled item the inbox-watcher
+    /// suddenly starts dispatching agents for.
+    #[test]
+    fn inbox_kind_round_trips_and_defaults_to_task_summary() {
+        let (mut store, _dir) = temp_store();
+
+        let request = store
+            .create_inbox_item(
+                None,
+                "make the board sort by priority",
+                InboxKind::ChangeRequest,
+            )
+            .unwrap();
+        assert_eq!(request.kind, InboxKind::ChangeRequest);
+        assert_eq!(
+            store.get_inbox_item(request.id).unwrap().kind,
+            InboxKind::ChangeRequest
+        );
+
+        // A pre-846 row: the column's own default is what it gets.
+        store
+            .conn
+            .execute(
+                "INSERT INTO inbox (project_id, author, body, created_at, updated_at) \
+                 VALUES (NULL, NULL, 'shipped the auth fix', datetime('now'), datetime('now'))",
+                (),
+            )
+            .unwrap();
+        let legacy = store
+            .get_inbox_item(store.conn.last_insert_rowid())
+            .unwrap();
+        assert_eq!(legacy.kind, InboxKind::TaskSummary);
+    }
+
     #[test]
     fn assign_inbox_item_unknown_project_is_validation_error() {
         let (mut store, _dir) = temp_store();
-        let item = store.create_inbox_item(None, "orphan").unwrap();
+        let item = store
+            .create_inbox_item(None, "orphan", InboxKind::TaskSummary)
+            .unwrap();
         let err = store.assign_inbox_item(item.id, 999).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("999"));

@@ -13,6 +13,12 @@ import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
 import { filterInbox, INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
+import {
+  DEFAULT_COMPOSE_KIND,
+  INBOX_KINDS,
+  inboxKindClass,
+  inboxKindLabel,
+} from '../inboxKind'
 import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
 import {
   playFailure,
@@ -20,6 +26,7 @@ import {
   rewindTarget,
 } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
+import type { InboxKind } from '../types/InboxKind'
 import { useFetch } from '../useFetch'
 
 /**
@@ -102,6 +109,11 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   })
 
   const [body, setBody] = useState('')
+  // What the item being composed is for (mesa task 846). The form always sends
+  // a kind, so this is a person's answer rather than the server's default —
+  // see `DEFAULT_COMPOSE_KIND`. It stays put after a send: someone filing
+  // requests is usually filing several.
+  const [kind, setKind] = useState<InboxKind>(DEFAULT_COMPOSE_KIND)
   const [author, setAuthorState] = useState(getAuthor())
   const [createError, setCreateError] = useState<string | null>(null)
   // Which item is being read aloud, and whether its audio has started yet:
@@ -438,7 +450,11 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   function submit(e: React.FormEvent) {
     e.preventDefault()
     setAuthor(author)
-    createInboxItem({ body, author: author === '' ? undefined : author }).then(
+    createInboxItem({
+      body,
+      kind,
+      author: author === '' ? undefined : author,
+    }).then(
       () => {
         setBody('')
         setCreateError(null)
@@ -482,6 +498,18 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
           onChange={(e) => setBody(e.target.value)}
         />
         <div className="inbox-create-meta">
+          <select
+            value={kind}
+            title="what this is for — a change request is what the inbox watcher triages"
+            aria-label="what this item is for"
+            onChange={(e) => setKind(e.target.value as InboxKind)}
+          >
+            {INBOX_KINDS.map((k) => (
+              <option key={k.kind} value={k.kind}>
+                {k.label}
+              </option>
+            ))}
+          </select>
           <input
             type="text"
             value={author}
@@ -511,7 +539,9 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
           {items.map((item) => (
             <li
               key={item.id}
-              className={`inbox-item${item.read_at === null ? ' unread' : ''}`}
+              // The tint says what the item is for at a glance; the meta line
+              // below says it in words, for the reader the colour is lost on.
+              className={`inbox-item ${inboxKindClass(item.kind)}${item.read_at === null ? ' unread' : ''}`}
             >
               <div className="inbox-item-row">
                 <button
@@ -554,6 +584,8 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
                     </div>
                   )}
                   <div className="muted storyboard-meta">
+                    <span className="inbox-kind">{inboxKindLabel(item.kind)}</span>
+                    <span> · </span>
                     {item.author && <span>from {item.author} · </span>}
                     <span>sent {item.created_at}</span>
                     {/* The accent bar says it at a glance; the word is what a

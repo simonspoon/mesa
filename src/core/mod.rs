@@ -23,8 +23,8 @@ pub use types::{
     CcTokens, CcUsage, CcUsageExtra, CcUsageWindow, ConfigCommand, ConfigPrice, Dependency,
     DiagramType, DirEntry, DirListing, FileContentView, FileTreeEntry, Frame, FrameEdge,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    HookRun, InboxItem, MesaVersion, ModelRates, Priority, Project, ProjectAgents, ProjectFileTree,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Script, ScriptArg,
-    ScriptArgKind, ScriptRun, Status, Storyboard, StoryboardEvent, StoryboardView, Task,
+    HookRun, InboxItem, InboxKind, MesaVersion, ModelRates, Priority, Project, ProjectAgents,
+    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Script,
+    ScriptArg, ScriptArgKind, ScriptRun, Status, Storyboard, StoryboardEvent, StoryboardView, Task,
     TaskSummary, Waypoint, task_name,
 };

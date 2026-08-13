@@ -16,6 +16,7 @@ function item(
     updated_at: '2026-01-01 00:00:00',
     read_at,
     archived_at,
+    kind: 'task-summary',
   }
 }
 

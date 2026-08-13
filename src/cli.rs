@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::core::{
     DiagramType, EdgePatch, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    InboxItem, NextResult, Priority, Project, ProjectPatch, Result, Script, ScriptArg,
+    InboxItem, InboxKind, NextResult, Priority, Project, ProjectPatch, Result, Script, ScriptArg,
     ScriptArgKind, ScriptPatch, Status, Store, Storyboard, StoryboardPatch, StoryboardView, Task,
     TaskPatch,
 };
@@ -725,7 +725,8 @@ enum InboxCmd {
     #[command(after_help = "\
 EXAMPLES
   mesa inbox add the auth refactor is ready for review
-  mesa inbox add --author agent-7 \"deploy v2 to staging tonight\"")]
+  mesa inbox add --author agent-7 \"deploy v2 to staging tonight\"
+  mesa inbox add --kind change-request \"the board should sort by priority\"")]
     Add {
         /// The message (everything after `add`); quoting is optional
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -733,6 +734,14 @@ EXAMPLES
         /// Free-text actor id of the sender (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
+        /// What the item is for: a summary a person reads, or a change
+        /// request the inbox-watcher triages
+        ///
+        /// Defaults to `task-summary` — the kind that waits for a person, so
+        /// an item nobody labelled never starts work on its own. Place it
+        /// before the message text.
+        #[arg(long, value_parser = parse_inbox_kind, default_value = "task-summary")]
+        kind: InboxKind,
         /// Print the item without its `body` instead of in full
         ///
         /// Must come BEFORE the message text: everything after `add` that is
@@ -1575,6 +1584,10 @@ fn parse_status(s: &str) -> std::result::Result<Status, String> {
 
 fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
     Priority::parse(s).ok_or_else(|| format!("'{s}' is not one of low|medium|high"))
+}
+
+fn parse_inbox_kind(s: &str) -> std::result::Result<InboxKind, String> {
+    InboxKind::parse(s).ok_or_else(|| format!("'{s}' is not one of task-summary|change-request"))
 }
 
 fn parse_diagram_type(s: &str) -> std::result::Result<DiagramType, String> {
@@ -2700,9 +2713,10 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
         InboxCmd::Add {
             body,
             author,
+            kind,
             quiet,
         } => print_inbox_item(
-            &store.create_inbox_item(author.as_deref(), &body.join(" "))?,
+            &store.create_inbox_item(author.as_deref(), &body.join(" "), kind)?,
             quiet,
         ),
         InboxCmd::List { project } => {
@@ -3024,6 +3038,7 @@ mod tests {
             updated_at: "2026-01-02 00:00:00".into(),
             read_at: Some("2026-01-02 00:00:00".into()),
             archived_at: None,
+            kind: InboxKind::TaskSummary,
         }
     }
 
@@ -3231,6 +3246,10 @@ mod tests {
                 // Task 845: bounded the same way, and the field `inbox
                 // archive` exists to write — same reasoning as `read_at`.
                 "archived_at",
+                // Task 846: one of two fixed words, so bounded — and it is
+                // what decides who reads the item, which a quiet echo that
+                // dropped it could not show.
+                "kind",
             ]),
             "InboxItem gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

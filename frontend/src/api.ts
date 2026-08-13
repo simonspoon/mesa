@@ -27,6 +27,7 @@ import type { FrameShape } from './types/FrameShape'
 import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
+import type { InboxKind } from './types/InboxKind'
 import type { MesaVersion } from './types/MesaVersion'
 import type { ModelRates } from './types/ModelRates'
 import type { ProjectFileSearch } from './types/ProjectFileSearch'
@@ -715,6 +716,12 @@ export function getInboxItem(id: number): Promise<InboxItem> {
 export interface InboxCreate {
   body: string
   author?: string
+  /**
+   * What the item is for (mesa task 846). Omitted, it is a `task-summary`:
+   * the server decides, so a caller that says nothing never has an item
+   * auto-triaged on its behalf.
+   */
+  kind?: InboxKind
 }
 
 export function createInboxItem(body: InboxCreate): Promise<InboxItem> {

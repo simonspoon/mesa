@@ -28,6 +28,35 @@ instructions**; `author` is free-text attribution.
   auto-assigns; a person triages. Assigning to an unknown project is `validation`
   and leaves the item untouched. The item's `author` is not carried onto the task
   (tasks have no author field).
+- An item declares **what it is for** (mesa task 846): its `kind` is either
+  `task-summary` — an agent reporting what it did, for a person to read — or
+  `change-request`, which asks for work. The pair is the whole point of the
+  field, so there are exactly two; a third would mean deciding again who reads
+  it. The kind is **fixed at creation**: it is what the sender meant, not a
+  state the reader moves, so there is no `mesa inbox kind` and no PATCH key.
+  It matters in two places.
+  - **The inbox-watcher triages change requests only.** A summary has nothing
+    to route — answering a close-out report with a triage agent is what the
+    field exists to stop — and because the kind never changes, a skipped item
+    is skipped for good rather than waiting for a state change
+    (`inbox_watcher_tick` in `src/api.rs`, `docs/inbox-watcher.md`).
+  - **The web Inbox tints each row by kind** (`frontend/src/inboxKind.ts`),
+    because the one list mixes both and the queue is scrolled, not read. The
+    tint is quiet on purpose — unread (the cyan edge) and playback are the loud
+    markers on that row — and the kind is in the meta line **in words** too,
+    since a colour is not something every reader gets.
+
+  A caller that names no kind sends a `task-summary`, on both surfaces
+  (`mesa inbox add` without `--kind`, `POST /api/inbox` with no `kind` key) and
+  for every row that predates the column. That default is the **passive** one
+  deliberately: an item nobody labelled waits for a person instead of having an
+  agent dispatched for it, so neither a caller's silence nor an upgrade starts
+  work on its own. The web compose form is the one place that always sends a
+  kind explicitly, and it starts on `change-request` — a person typing into the
+  inbox is asking for something, while summaries arrive from agents over the
+  CLI, which names its own kind. `kind` is one of two fixed words, hence
+  bounded, so it stays in the `--quiet` projection: it is what decides who
+  reads the item.
 - An item is **unread** until it is read, and reading it is something only the
   browser can see (mesa task 831). `read_at` is a nullable timestamp on the row:
   null while unread, stamped **once** the first time the item is read, and never
@@ -71,7 +100,9 @@ instructions**; `author` is free-text attribution.
   listing is meaningful.
 - CLI: `mesa inbox {add,list,show,assign,read,archive,delete}`. `add <text…>` takes the
   free-text message as a trailing positional (quoting optional; words joined),
-  always unassigned; `--author` attributes (place it before the text). `assign
+  always unassigned; `--author` attributes and `--kind
+  task-summary|change-request` says what the item is for (both go before the
+  text; an unknown kind is a usage error, exit 2). `assign
   <id> <project>` (project required) converts the item into a backlog task in that
   project and **prints the created task**; assigning to a project id that does
   not exist is `validation` (an unknown project *name* is `not_found`, from the
@@ -79,7 +110,8 @@ instructions**; `author` is free-text attribution.
   call echoes the item unchanged). `archive <id>` sets the item aside and
   `archive <id> --undo` puts it back (idempotent both ways). `delete` echoes
   the destroyed item.
-- API: `/api/inbox` (GET list, POST create — body `{body, author}`),
+- API: `/api/inbox` (GET list, POST create — body `{body, author, kind}`, all
+  but `body` optional),
   `/api/inbox/{id}` (GET show, PATCH assign, DELETE),
   `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
   the PATCH, which *assigns*: that one answers with the created task and leaves

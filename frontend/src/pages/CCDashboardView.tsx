@@ -11,6 +11,7 @@ import type { CcDashboard } from '../types/CcDashboard'
 import type { CcLiveSession } from '../types/CcLiveSession'
 import type { CcUsageWindow } from '../types/CcUsageWindow'
 import { useFetch } from '../useFetch'
+import { usagePct, usageSeverity } from '../usageMeter'
 
 // CC Dashboard: telemetry over Claude Code's own session transcripts — sessions,
 // token usage, models, skills, agents, and estimated cost. Read-only; it reads
@@ -192,8 +193,10 @@ function fmtReset(iso: string): string {
 }
 
 function UsageBar({ label, w }: { label: string; w: CcUsageWindow }) {
-  const pct = Math.max(0, Math.min(100, w.utilization))
-  const sev = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : 'ok'
+  // Shared with the header's chips (mesa task 834) so the two surfaces can
+  // never disagree on a percentage or a colour band.
+  const pct = usagePct(w) ?? 0
+  const sev = usageSeverity(pct)
   // Guard on the formatted output, not just presence: a present-but-unparseable
   // resets_at yields '' and should hide the row, not render an empty div.
   const reset = w.resets_at ? fmtReset(w.resets_at) : ''

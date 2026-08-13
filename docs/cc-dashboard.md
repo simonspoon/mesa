@@ -846,4 +846,12 @@ The API caches the result for 60s (`AppState.usage_cache`) so UI polling doesn't
 hammer the endpoint; a missing token / unreachable upstream is a **502
 `{"error":{"code":"unavailable",…}}`** (CLI: same error JSON, exit 1) — a new
 error code scoped to this endpoint, which the web card renders as "unavailable".
-The Web UI shows it as the **Subscription Limits** card beside Live Sessions.
+The Web UI shows it as the **Subscription Limits** card beside Live Sessions,
+and — since mesa task 834 — as two chips on the right of the app header, on
+every page: the 5-hour and 7-day (all-models) utilization, polled on the same
+60s TTL. The chips are decoration like the version beside the wordmark: they
+render **nothing** while loading, on the `unavailable` error, or for a window
+the plan does not meter, because the header has no room to explain a failed
+network read — the card does. Both surfaces clamp and colour-band through the
+one shared module (`frontend/src/usageMeter.ts`, warn ≥70%, crit ≥90%), so a
+percentage can never differ between them.

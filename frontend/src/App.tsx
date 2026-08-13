@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import './App.css'
-import { getMesaVersion, getTask, listInbox } from './api'
+import { getCcUsage, getMesaVersion, getTask, listInbox } from './api'
 import { AgentSidebar } from './components/AgentSidebar'
 import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
@@ -19,6 +19,7 @@ import { TerminalPage } from './pages/TerminalPage'
 import { isPhone, onPhoneTierChange } from './phoneTier'
 import { useSpatialNav } from './spatialNav'
 import { useFetch } from './useFetch'
+import { usagePct, usageSeverity } from './usageMeter'
 import { useVisualViewportHeightVar } from './visualViewport'
 
 // Hash-based routing: #/ (placeholder), #/projects/:id,
@@ -75,6 +76,43 @@ function LegacyTaskRedirect({ taskId }: { taskId: number }) {
   }, [task])
   if (error) return <p className="error">{error}</p>
   return <p className="muted">Loading…</p>
+}
+
+// The header's right-hand plan-limit chips (mesa task 834): how much of the
+// Claude subscription's 5-hour and 7-day windows is spent, on every page. The
+// same `/api/cc/usage` read the CC dashboard's Subscription Limits card makes
+// — one live network call per server cache miss, so poll on its 60s TTL — and
+// the same clamp/severity arithmetic (`usageMeter.ts`), never a second copy.
+//
+// Decoration, like the version beside the wordmark: it renders nothing while
+// loading, on an error (no token, offline — a permanent state on a machine
+// that never authenticated), or for a window the plan does not meter. The
+// dashboard card is where an unavailable read is explained.
+function HeaderUsage() {
+  const { data } = useFetch(getCcUsage, 'cc-usage-header', { pollMs: 60000 })
+  const windows: { label: string; title: string; pct: number }[] = []
+  for (const [label, title, w] of [
+    ['5h', '5-hour session window', data?.five_hour],
+    ['7d', '7-day window (all models)', data?.seven_day],
+  ] as const) {
+    const pct = usagePct(w)
+    if (pct !== null) windows.push({ label, title, pct })
+  }
+  if (windows.length === 0) return null
+  return (
+    <div className="header-usage" aria-label="Claude plan limits">
+      {windows.map(({ label, title, pct }) => (
+        <span
+          key={label}
+          className={`header-usage-chip ${usageSeverity(pct)}`}
+          title={`${title} · ${pct.toFixed(0)}% of plan limit`}
+        >
+          <span className="header-usage-label">{label}</span>
+          <span className="header-usage-pct">{pct.toFixed(0)}%</span>
+        </span>
+      ))}
+    </div>
+  )
 }
 
 // Cmd+Shift+P (Mac) / Ctrl+Shift+P (elsewhere) opens the command palette,
@@ -448,6 +486,7 @@ function App() {
             )}
           </span>
         </a>
+        <HeaderUsage />
       </header>
       <div className="shell-body">
         <Sidebar

@@ -101,7 +101,7 @@ The code is the source of truth. These are the invariants you must not break:
   `navWidth`, `newFile`, `openFiles`, `pricingDraft`, `projectTree`,
   `scriptDraft`, `sessionDetail`, `sessionGraph`, `sessionTimeline`,
   `settingsDraft`, `speechDraft`, `speechPlayback`, `syntaxHighlighter`,
-  `time`, `watchersDraft`, `wavStream`, `wordWrap`) —
+  `time`, `usageMeter`, `watchersDraft`, `wavStream`, `wordWrap`) —
   predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
   in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).

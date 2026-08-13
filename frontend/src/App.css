@@ -250,11 +250,13 @@ header {
 /* Unread (mesa task 831): an accent down the left edge and a heavier preview,
    so the queue reads as a queue. An item becomes read by being held open for a
    few seconds or by being heard — never by the list simply rendering it — so
-   this marker is safe to make loud. */
+   this marker is safe to make loud.
+   The card's own edges do not move: the wider border eats into the padding
+   (1px + 0.75rem of content inset either way), so a read and an unread row
+   line up down the list. */
 .inbox-item.unread {
   border-left: 3px solid var(--cyan);
-  padding-left: 0.6rem;
-  margin-left: -0.6rem;
+  padding-left: calc(0.75rem - 2px);
 }
 
 .inbox-item.unread .inbox-preview {

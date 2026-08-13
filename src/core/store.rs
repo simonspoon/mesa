@@ -3049,13 +3049,15 @@ impl Store {
     /// read it* and re-opening an item never moves it. Nothing un-reads an
     /// item — reading is a fact about the past, not a flag to toggle.
     pub fn mark_inbox_item_read(&mut self, id: i64) -> Result<InboxItem> {
-        let item = self.get_inbox_item(id)?;
-        if item.read_at.is_some() {
-            return Ok(item);
-        }
+        // The read first, for the `not_found` the caller expects. The stamp is
+        // then written by ONE statement whose `read_at IS NULL` decides it:
+        // the CLI opens its own `Store` beside the server's, so a check-then-
+        // act pair here would let two writers both find it unread and the
+        // second move a stamp this method promises never moves.
+        self.get_inbox_item(id)?;
         self.conn.execute(
             "UPDATE inbox SET read_at = datetime('now'), updated_at = datetime('now') \
-             WHERE id = ?1",
+             WHERE id = ?1 AND read_at IS NULL",
             [id],
         )?;
         self.get_inbox_item(id)

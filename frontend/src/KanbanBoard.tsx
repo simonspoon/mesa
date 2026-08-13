@@ -14,6 +14,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-
 import { CSS } from '@dnd-kit/utilities'
 import { updateTaskPosition } from './api'
 import { capColumn, liveAgentCount, DONE_INITIAL, DONE_PAGE } from './boardView'
+import { taskHrefFrom } from './projectPanes'
 import { formatTimestamp, timeAgo } from './time'
 import type { AgentSession } from './types/AgentSession'
 import type { Status } from './types/Status'
@@ -25,7 +26,10 @@ function CardBody({ task, liveAgents }: { task: TaskSummary; liveAgents: number 
   return (
     <>
       <span className="card-id muted">#{task.id}</span>
-      <a href={`#/projects/${task.project_id}/tasks/${task.id}`}>
+      {/* Keeps you on the tab you are on: inside a Board *pane* of the
+          Custom layout this points at that layout's own task route, so
+          opening a task no longer tears the panes down (mesa task 843). */}
+      <a href={taskHrefFrom(window.location.hash, task.project_id, task.id)}>
         {task.name}
       </a>
       <div>

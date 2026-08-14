@@ -126,5 +126,5 @@ export function liveStatusLine(
   if (session.agent_id === null) {
     return 'Live, but no agent is attached — nothing will answer.'
   }
-  return 'Listening. Dictate into the box below and press Enter.'
+  return 'Listening. Dictate into the box below — a settled line sends itself.'
 }

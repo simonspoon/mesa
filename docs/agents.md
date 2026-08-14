@@ -9,8 +9,8 @@ touches the mesa store only to read `local_path`. There is deliberately no
 `mesa agent` CLI: an agent in a terminal would just use `claude` directly.
 
 **The spawn command is user-configurable** — `docs/config.md`.
-`agents::spawn_bg` is the single spawn chokepoint (the two watchers and the
-POST route all go through it) and runs the template
+`agents::spawn_bg` is the single spawn chokepoint (the two watchers, this POST
+route and `mesa live start` all go through it) and runs the template
 `~/.mesa/config.json` gives for that action; this route's key is
 **`agent-spawn`**, defaulting to `{bin} --bg --agent {agent} -- {prompt}`. The
 sections below describe that default. A replacement command owes mesa only its

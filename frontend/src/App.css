@@ -7681,3 +7681,137 @@ button:focus-visible,
     height: 72px;
   }
 }
+
+/* Mesa Live (mesa task 855): the page you talk to — a transport, a transcript,
+   and the box system dictation types into. The transcript is the part that
+   scrolls — capped rather than stretched to the pane, since `main` is itself
+   the app's scroll container and a page sized to it would fight that — so the
+   button that ends the conversation and the box that feeds it both stay on
+   screen while it runs. */
+.live-page {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.live-page h1,
+.live-page > p {
+  margin: 0;
+}
+
+.live-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+/* Live is a state, not just a page: the button carries the colour of the thing
+   it will do next, so a running conversation is readable at a glance. */
+.live-toggle.live-on {
+  color: var(--red);
+  border-color: rgba(255, 59, 92, 0.5);
+}
+
+/* The conversation itself: the one scrolling part, so a long exchange never
+   pushes the composer off the bottom. */
+.live-transcript {
+  flex: 1 1 auto;
+  min-height: 8rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+/* The two sides, told apart by where they sit and what colour they carry — the
+   dictated side to the right in cyan, mesa's replies to the left. The word
+   above each run says it as well, for the reader the placement is lost on. */
+.live-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-width: 44rem;
+}
+
+.live-group.live-user {
+  align-self: flex-end;
+  align-items: flex-end;
+  text-align: right;
+}
+
+.live-who {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.live-user .live-who {
+  color: var(--cyan);
+}
+
+/* Dictation and spoken prose are both free text that may carry a bare URL with
+   no break opportunity at all — the same rule `.inbox-body` needs. */
+.live-turn {
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.live-user .live-turn {
+  border-color: rgba(0, 229, 255, 0.4);
+}
+
+/* What a turn DID, as opposed to what it said: a navigate turn may carry no
+   words at all, and this is the only trace of it in the transcript. */
+.live-navigated {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.live-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.live-input {
+  width: 100%;
+  resize: vertical;
+}
+
+.live-hint {
+  font-size: 0.75rem;
+}
+
+/* Narrow tier: the bubbles give up their fixed ceiling and take the column
+   (docs/mobile.md — CSS only, no new matchMedia). */
+@media (max-width: 860px) {
+  .live-group {
+    max-width: 100%;
+  }
+}
+
+/* Phone: the controls stack, so the status line is never squeezed to a word per
+   line beside the button. */
+@media (max-width: 600px) {
+  .live-controls {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .live-transcript {
+    padding: 0.5rem;
+  }
+}

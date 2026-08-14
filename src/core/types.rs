@@ -2407,6 +2407,22 @@ pub struct LiveTurn {
     pub played_at: Option<String>,
 }
 
+/// The Live page's whole read (`GET /api/live`): the conversation that is
+/// running, and the turns after the cursor the page asked from. A **view**,
+/// never stored — it is assembled per request out of the one live session and
+/// a slice of its turns, the same way [`ProjectAgents`] pairs a folder with
+/// the sessions found under it.
+///
+/// `session` is null when nothing is live, and then `turns` is empty. That is
+/// the ordinary idle state of the page, not an error: the button an idle Live
+/// page renders is exactly what fixes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveState {
+    pub session: Option<LiveSession>,
+    pub turns: Vec<LiveTurn>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -120,13 +120,14 @@ mesa backup /tmp/mesa-snap.db
   the derived `blocked` boolean. `get` is an alias for every `show`.
 - **`--quiet` prints the compact projection instead.** Opt-in, long form only
   (no `-q`, no env var, no config key, never on by default), and accepted on
-  every mutation and `show`/`get` in `project`, `task`, `diagram` (plus
-  `frame` and `edge`) and `inbox`. The quiet shape is the record minus its
+  every mutation and `show`/`get`/`status` in `project`, `task`, `diagram`
+  (plus `frame` and `edge`), `inbox` and `live`. The quiet shape is the record minus its
   unbounded free-text fields — for a task that is exactly the `task list`
   shape (it drops `description`, `result` and `created_at`, and keeps
   `artifact`, so a `--quiet` close-out echoes the SHA you just stored); for a
   project or diagram it drops `description`, for a frame or
-  inbox item `body`; an edge has no such field, so its output is unchanged.
+  inbox item `body`, for a live turn its spoken `text`; an edge and a live
+  session have no such field, so their output is unchanged.
   Composite payloads (`project delete`, `task delete`/`import`, `diagram
   show`/`delete`, `frame delete`, `inbox assign`) keep their key structure and
   compact their members. Any quiet payload that actually drops a key is rebuilt
@@ -200,10 +201,11 @@ mesa serve --watch-inbox   # opt-in: auto-triage the global inbox
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
 `block`/`unblock`/`dependencies`/`dependents` actions, `/api/diagrams` with its
 `frames`/`edges`/`events`, `/api/inbox`, `/api/scripts`, `/api/cc`,
-`/api/config`, and per-project `git`/`files`/`agents` endpoints), with the React
+`/api/config`, `/api/live`, and per-project `git`/`files`/`agents` endpoints),
+with the React
 web UI served at `/`. Beside a project's board sit its **Files**, **Git** and
 **Terminal** tabs; **Scripts**, the **Agents** sidebar, the **CC Dashboard**,
-a global **Terminal** and **Settings** live above projects. The web
+a global **Terminal**, **Live** and **Settings** live above projects. The web
 UI does not live-sync; it refetches on window focus.
 
 **Security boundary** (there is no auth — it is a local tool):
@@ -357,10 +359,23 @@ start locations in the global Agents sidebar.
   a project counts as busy by its `in_progress` *leaves* and its sessions doing
   live work, so an umbrella task parks nothing — it narrows the tick to its own
   descendants. See `docs/todo-watcher.md`.
-- **Configurable spawn commands**: the three places mesa starts an agent — the
-  todo-watcher's dispatch, the inbox-watcher's triage, and the sidebar's *add
-  agent* — each read a command template from `~/.mesa/config.json`
-  (`commands.todo-watcher`, `.inbox-watcher`, `.agent-spawn`), so you can
+- **Mesa live** (`mesa live`, the **Live** page in the web UI): a spoken
+  conversation with an agent. You dictate into a text field with your own
+  system dictation, a dedicated Claude Code session does the work with the
+  ordinary mesa CLI, and every reply is read back to you by `kokoro-rs` — the
+  same synthesis the Inbox's play button uses. The agent runs the loop itself
+  (`mesa live listen` → work → `mesa live say`, plus `mesa live navigate` to
+  move your browser), pulling turns out of the database rather than being
+  pushed at, because the CLI never talks to the server. One conversation at a
+  time. mesa ships **no speech-to-text**, captures no microphone and accepts no
+  audio body: the audio path is one-directional, server to browser. See
+  `docs/live.md`.
+- **Configurable spawn commands**: the four places mesa starts an agent — the
+  todo-watcher's dispatch, the inbox-watcher's triage, the sidebar's *add
+  agent*, and a live conversation — each read a command template from
+  `~/.mesa/config.json`
+  (`commands.todo-watcher`, `.inbox-watcher`, `.agent-spawn`, `.live-agent`),
+  so you can
   change the binary, its flags, the persona or the slash command without
   rebuilding. Placeholders `{id}`, `{name}`, `{prompt}` (plus `{bin}`,
   `{agent}`). Templates are argv, not shell: no config file means the built-in
@@ -404,7 +419,8 @@ scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
 scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`
 scripts/inbox-watcher-check.sh  # `serve --watch-inbox` triage loop against a stub `claude`
-scripts/config-check.sh     # the 3 configurable spawn commands in ~/.mesa/config.json
+scripts/config-check.sh     # the configurable spawn commands in ~/.mesa/config.json
+scripts/live-check.sh       # `mesa live` conversation loop over CLI + API
 scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts
 scripts/scripts-check.sh    # user-authored script contract over CLI + API, incl. the injection + gate proofs
 

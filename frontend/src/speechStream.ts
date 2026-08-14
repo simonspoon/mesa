@@ -1,9 +1,9 @@
 /**
- * Playing the inbox's speak route on a browser whose media stack will not
- * (mesa task 830).
+ * Playing one of mesa's speak routes on a browser whose media stack will not
+ * (mesa task 830) — the inbox's item route, or the live page's turn route.
  *
- * Apple's requires byte-range support of an HTTP media source, and this route
- * is chunked with no `Content-Length` because the render is still happening —
+ * Apple's requires byte-range support of an HTTP media source, and these routes
+ * are chunked with no `Content-Length` because the render is still happening —
  * so `<audio src>` there fails outright (task 829) and the first fix was to
  * fetch the audio whole, which meant waiting for the last sentence. The page
  * can instead decode the bytes itself: `fetch` streams the body, `wavStream`
@@ -20,7 +20,7 @@
  * source nodes. The arithmetic worth pinning is in `speechPlayback.ts`.
  */
 
-import { fetchInboxSpeech } from './api'
+import { fetchSpeech } from './api'
 import { replaySlices, rewindTarget, scheduleAt } from './speechPlayback'
 import { createWavDecoder, type WavFormat } from './wavStream'
 
@@ -54,7 +54,11 @@ export interface SpeechStream {
 }
 
 /**
- * Starts reading inbox item `id` on `ctx` and hands back its transport.
+ * Starts reading the audio at `url` on `ctx` and hands back its transport.
+ *
+ * A URL rather than an inbox id (mesa task 855): the same decoding serves the
+ * inbox's item route and the live page's turn route, and neither of them is
+ * this module's business.
  *
  * The returned promise rejects only for what is known before the body is read
  * — the route's own error, which is the reason the row shows. Everything the
@@ -67,12 +71,12 @@ export interface SpeechStream {
  * is abandoned in that window has nothing else to cancel it.
  */
 export async function playSpeechStream(
-  id: number,
+  url: string,
   ctx: AudioContext,
   events: SpeechStreamEvents,
   signal: AbortSignal,
 ): Promise<SpeechStream> {
-  const body = await fetchInboxSpeech(id, signal)
+  const body = await fetchSpeech(url, signal)
 
   // Every decoded buffer, kept with where it starts in the item: rewinding is
   // re-scheduling from that point, so the audio already heard has to stay.

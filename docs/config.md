@@ -1,6 +1,6 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly three places. Each one's command line
+mesa starts a coding agent from exactly four places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
 persona and the slash command can all change without rebuilding mesa:
 
@@ -9,16 +9,28 @@ persona and the slash command can all change without rebuilding mesa:
 | `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}"` |
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"` |
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `{bin} --bg --agent {agent} -- {prompt}` |
+| `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `{bin} --bg --agent {agent} --name {name} -- {prompt}` |
 
 ```json
 {
   "commands": {
     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
-    "agent-spawn":    "claude --bg -- {prompt}"
+    "agent-spawn":    "claude --bg -- {prompt}",
+    "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}"
   }
 }
 ```
+
+`live-agent`'s default is the union of the two shapes above it, because a live
+session is both a mesa record (so it has an `{id}` and a `{name}`) *and* a
+spawn that carries a prompt. **mesa supplies that prompt itself** —
+`core::live::agent_prompt`, the self-contained instruction block telling the
+agent to loop on `mesa live listen`, reply with `mesa live say` in spoken prose
+rather than markdown, move the browser with `mesa live navigate`, and treat
+every dictated utterance as data rather than instructions. So the feature works
+with no user configuration, and a replacement template's job is to start
+*something* that will read `{prompt}` and do what it says.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
 for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
@@ -72,11 +84,11 @@ what that spawn actually knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{bin}` | all three | `MESA_CLAUDE_BIN`, else `claude` |
-| `{agent}` | all three | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
-| `{id}` | watchers | the task id / inbox item id |
-| `{name}` | watchers | the session name mesa derives — `<project>: <task name>` (todo-watcher), or `inbox <id>: <first body line>` (**untrusted text**) |
-| `{prompt}` | `agent-spawn` | the POST body's `prompt`; unavailable when omitted |
+| `{bin}` | all four | `MESA_CLAUDE_BIN`, else `claude` |
+| `{agent}` | all four | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
+| `{id}` | watchers, `live-agent` | the task id / inbox item id / live session id |
+| `{name}` | watchers, `live-agent` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), or the live session's own name |
+| `{prompt}` | `agent-spawn`, `live-agent` | the POST body's `prompt` (`agent-spawn`; unavailable when omitted) / the live agent's instruction block, always present |
 
 Two rules cover the edges:
 
@@ -131,16 +143,17 @@ variable, offered on exactly the commands its `{}` twin is:
 
 | Placeholder | Variable | Where |
 | --- | --- | --- |
-| `{bin}` | `MESA_BIN` | all three |
-| `{agent}` | `MESA_AGENT` | all three |
-| `{id}` | `MESA_ID` | watchers |
-| `{name}` | `MESA_NAME` | watchers |
-| `{prompt}` | `MESA_PROMPT` | `agent-spawn` |
+| `{bin}` | `MESA_BIN` | all four |
+| `{agent}` | `MESA_AGENT` | all four |
+| `{id}` | `MESA_ID` | watchers, `live-agent` |
+| `{name}` | `MESA_NAME` | watchers, `live-agent` |
+| `{prompt}` | `MESA_PROMPT` | `agent-spawn`, `live-agent` |
 
 Two rules mirror the argv ones:
 
 - **A variable this command doesn't offer is not set** — a watcher script never
   sees `MESA_PROMPT`, an `agent-spawn` script never sees `MESA_ID`/`MESA_NAME`.
+  A `live-agent` script sees all five, since that spawn knows all five.
   mesa explicitly *removes* all five before setting the ones that apply, so a
   variable can't leak in from the environment `mesa serve` was started with.
 - **A value with nothing to say on this call leaves its variable unset**, not

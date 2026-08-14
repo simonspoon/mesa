@@ -1,0 +1,374 @@
+# Mesa live (a spoken conversation with an agent)
+
+**Mesa live** is a conversation mode: a person talks to mesa, mesa talks back,
+and a dedicated Claude Code session does whatever they ask. Tables
+`live_sessions` and `live_turns` (migration index 43), the `mesa live` CLI
+group, `/api/live*`, and the `#/live` page.
+
+The two directions are deliberately asymmetric, and the asymmetry is the whole
+design:
+
+- **Person → mesa is typed text.** The Live page has a plain `<textarea>`, and
+  the person's *own* system dictation (macOS Dictation, a phone keyboard's mic
+  key, or their fingers) types into it. **mesa ships no speech-to-text,
+  captures no microphone, and accepts no audio request body.** See
+  [What is deliberately absent](#what-is-deliberately-absent).
+- **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
+  streamed back to the browser, through the same `speech::start` and the same
+  browser-side player the Inbox's play button uses (`docs/inbox.md`). The audio
+  path stays **one-directional, server to browser**, exactly as it was before
+  this feature.
+
+## The loop, and why it pulls
+
+A live session is a loop the **agent** runs, not one mesa drives:
+
+1. `mesa live listen --wait 60` — the agent asks for the next thing the person
+   said. A turn, or `null` when nobody spoke for that long.
+2. It does the work with the ordinary mesa CLI and its own tools.
+3. `mesa live say "…"` — the reply, which the page speaks.
+4. `mesa live navigate '#/…' --say "…"` — optionally, it moves the person's
+   browser as it answers.
+5. `mesa live status` printing `null` (or an `ended` session) is how it stops.
+
+The agent **pulls**. That is not a style choice: mesa has no way to push at it.
+The only channel into a live Claude Code session is keystrokes over the attach
+PTY, and the only way to read its replies is to tail a transcript file — which
+is exactly why the Agents sidebar's chat composer types into the PTY rather
+than calling a send route (`docs/agents.md`). Building a second write path into
+a session for this feature would mean owning that PTY, and the whole
+conversation would then depend on a terminal nobody is watching. So mesa writes
+the utterance to the database and lets the agent come and get it, over the CLI
+it already uses for everything else.
+
+The consequence at the other end is the same shape mesa already has everywhere:
+**there is no push channel to the browser either**, so the Live page polls
+`GET /api/live?after=<cursor>` at 2s through the ordinary `useFetch` polling,
+like every other view.
+
+The instruction block the agent is spawned with is
+`core::live::AGENT_PROMPT` — one constant in `core`, because both spawn sites
+(the CLI's `live start` and `POST /api/live`) hand the same text to the same
+`agents::spawn_bg` chokepoint. It states the loop, the route vocabulary, the
+"this is speech, so write prose" rule (a bulleted reply gets read aloud as
+punctuation) and the untrusted-input posture below. `live::agent_prompt(id)`
+appends the session id — the only per-call part.
+
+## Why the queue lives in SQLite
+
+The turn queue is two tables, not a channel in the server's memory, because
+**the agent never talks to the server**. Every `mesa` command opens its own
+`Store` against the database file directly (CLAUDE.md's "CLI and API share
+`core` and never diverge"), so anything held in `mesa serve`'s process is
+invisible to `mesa live listen` — the comment at the top of
+`frontend/src/useFetch.ts` says the same thing from the other side: agents
+write SQLite out of the server's sight, and no push channel is possible.
+
+The database is therefore the meeting point, and it also buys the property an
+in-memory queue would have had to invent: `next_user_turn` is **one**
+`UPDATE … RETURNING` that both picks the oldest undelivered `user` turn and
+stamps `delivered_at`, so two listeners can never be handed the same utterance
+and answer it twice.
+
+## One session at a time
+
+`start_live_session` refuses to start a second conversation while one is
+`live` — a `conflict` naming the id that is already running. The Live page has
+one text field and one `<audio>` element; a second conversation would have
+nowhere to be heard. That is what lets every other command drop the session
+argument entirely: `stop`, `status`, `listen`, `say`, `navigate` and `turns`
+all resolve **the** current session through `current_live_session`.
+
+Stopping is idempotent *in the store*: `end_live_session` stamps `ended_at` on
+the row only while it is still `live`, so a page and an agent stopping at once
+echo the ended session rather than one of them failing, and the first ending is
+the one recorded — the same rule, for the same reason, as an inbox item's
+`read_at`. Stopping when **nothing** is live is a different question and is
+`not_found` on both surfaces: the caller asked to end a conversation that isn't
+there.
+
+## What a turn may be
+
+Every shape rule lives in `Store::add_live_turn`, the single write path for
+turns (schema enforces none of it, per CLAUDE.md):
+
+- The session must exist and still be `live`. A turn on a dead conversation is
+  a caller bug, so it is a **`validation`** error rather than a swallowed
+  write — and deliberately not `not_found`, because the session is right there,
+  it is just over.
+- A **`user`** turn carries non-empty text and nothing else: the page dictates,
+  it does not drive itself.
+- A **`mesa`** turn must say something **or** do something. Empty text is legal
+  exactly once — on a pure `navigate`, which moves the browser and speaks
+  nothing.
+- An **`action`** is `navigate` and nothing else, and it must carry a `target`.
+  A `target` with no action is a `validation` error rather than a field nothing
+  reads.
+- A `target`, and the route the page reports through `set_live_route`, pass the
+  **one** route rule (`validate_live_route`): trimmed, non-empty, ≤ 200 chars,
+  and starting with `#/`. Both go through it so the agent can never send the
+  browser somewhere the session could not have recorded.
+- `text` is trimmed and capped at 8192 characters, because it is **spoken**: a
+  runaway body would wedge the synthesiser rather than say anything.
+
+`played_at` is the browser's stamp — set the first time a turn is actually
+heard, never moved and never cleared, and idempotent so the poll can fire it
+without tracking whether it already has. `list_live_turns` takes an exclusive
+`after` cursor and clamps `limit` into `1..=500`.
+
+`live_turns.session_id` is **`ON DELETE CASCADE`** — a turn is part of a
+conversation, not a record of its own. `live_sessions.project_id` is
+**`ON DELETE SET NULL`**, the same call the inbox makes: a conversation
+outlives the project row it happened to be about.
+
+## The navigate vocabulary
+
+`navigate` is the **only** action, and its target is one of the app's own hash
+routes — `#/`, `#/live`, `#/inbox`, `#/cc`, `#/scripts`, `#/settings`,
+`#/terminal`, `#/projects/<id>` and that project's `tasks/<id>`, `diagrams`,
+`git`, `files`, `terminal`, `dashboard` and `settings`. The list is in
+`AGENT_PROMPT` so the agent knows what it may say; the *rule* mesa enforces is
+only the `#/` shape, since the route inventory is the frontend's business and
+pinning a second copy of it in `Store` would be a copy to go stale.
+
+There is no second verb. "Move the browser" is a thing a conversation
+genuinely needs (the person asked to *see* something); anything more — click
+this, fill that — is a remote-control vocabulary, and the agent already has the
+whole mesa CLI for actually changing things.
+
+## CLI
+
+`mesa live` — every command operates on the one current session.
+
+| Command | Args | Prints |
+| --- | --- | --- |
+| `live start [PROJECT]` | `--project P` (id **or** name), `--no-agent` to skip the spawn | the started `LiveSession` |
+| `live stop` | — | the ended `LiveSession` |
+| `live status` (alias `get`, `show`) | — | the live `LiveSession`, or `null` |
+| `live listen` | `--wait <SECONDS>` (default 60, `0` = poll once) | the next undelivered user `LiveTurn`, or `null` |
+| `live say <TEXT>…` | trailing var arg, like `inbox add` — put every flag **before** the message | the `LiveTurn` |
+| `live navigate <ROUTE>` | `--say <TEXT>`; without it the turn is a pure action and says nothing | the `LiveTurn` |
+| `live turns` | `--after <ID>`, `--limit <N>` (clamped to 1..=500) | a bare array of turns, oldest first |
+
+`turns` is the **transcript**, not the queue: both roles, including turns
+already delivered or spoken, and reading it delivers nothing. Only `listen`
+takes an utterance off the queue.
+
+- **`listen` timing out is data, not an error.** It polls the store every
+  500 ms and exits **0** printing `null` when `--wait` elapses, so the agent's
+  loop is `listen` → maybe reply → `listen` again, with no error handling in
+  the middle of it. A quiet minute is not the end of a conversation. It also
+  returns `null` **early** when the session ends while it is waiting, so a
+  conversation stopped from the web UI is noticed in the same second rather
+  than up to a minute later.
+- **`start` spawns the agent** through `agents::spawn_bg` with the
+  `live-agent` command template (`docs/config.md`), in the project's
+  `local_path` when that is a live directory and `$HOME` otherwise — the
+  inbox-watcher's fallback, for the same reason: a conversation is not scoped
+  to a checkout (its `project_id` is optional and it outlives that project), so
+  a missing or stale path is a session with no working folder, not a bad
+  request. A spawn that printed no receipt leaves `agent_id` null
+  (`docs/config.md`, "what a replacement command owes mesa"); that is not a
+  failure.
+- **A failed spawn ends the session it just opened**, on both surfaces, and
+  reports `unavailable`. The alternative — a live session with a null
+  `agent_id` — is a conversation nothing is listening to, and because at most
+  one session may be live it would also turn the obvious retry into a
+  `conflict` until someone stopped it by hand. Ending it costs the caller one
+  error and a retry instead.
+- **`--no-agent`** starts the session without spawning anything, which is how
+  the gate script — and a person driving both halves by hand — use it.
+- **Every command but `start` and `status` is `not_found` with no session
+  live**, and the hint names how to get one. `status` prints `null` and exits
+  **0**: "nobody is talking to mesa" is an answer, not a failure, and it is
+  what the agent's loop reads as "stop looping".
+- **`--quiet`** per CLAUDE.md's contract: accepted on the mutations, on
+  `listen` and on `status`, rejected with exit 2 on `turns`. A turn drops
+  `text` — the one unbounded field, and the one that is *spoken* rather than
+  read by the caller — and keeps its role, action and target. A session has
+  nothing unbounded to drop (ids, one of two status words, a 200-char route and
+  timestamps), so its quiet output equals its full output; the flag is accepted
+  across the group for uniformity.
+
+## API
+
+| Route | Answers | Gate |
+| --- | --- | --- |
+| `GET /api/live?after=<id>` | `{session: LiveSession \| null, turns: [LiveTurn]}` | standard read |
+| `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
+| `DELETE /api/live` | the ended session | `require_agent_access` |
+| `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
+| `POST /api/live/route` `{route}` | the session, route recorded | standard write |
+| `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
+| `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
+
+Start and stop sit on `/api/live` as **verbs** rather than on an
+`/api/live/{id}` pair: there is only ever one live session, so there is no id
+for a caller to name. `GET /api/live` is the page's whole read — session plus
+turns after the cursor, one request per poll — and with nothing running it
+answers `{"session": null, "turns": []}` and **200**: an idle page is this
+route's normal state, and the button it renders is exactly what fixes it. The
+three ordinary writes resolve the current session themselves, so with none live
+each is `not_found` with a hint naming `POST /api/live`, the same shape the
+CLI's not-found hints use.
+
+Why each gate is what it is:
+
+- **Start and stop carry the agent gate** because starting a conversation
+  *spawns a Claude Code session* — code execution, the same capability
+  `POST /api/projects/{id}/agents` exposes, so it gets the same
+  mode-dependent stack (`docs/agents.md`). Stop is gated with it as a pair: the
+  thing that can start the agent is the thing that can stop it.
+- **Utterance, route and played are ordinary writes.** They write rows to the
+  mesa store and nothing else — the same class as creating a task — so they get
+  the standard `guard`, which under `--lan` is what lets the person hold the
+  conversation from their phone.
+- **Speak is exactly `speak_inbox`'s pair**, and both halves are load-bearing.
+  `require_agent_access` because one request spends unbounded CPU in an
+  external binary; `require_same_site_fetch` because every `Origin` check in
+  `api.rs` passes a request carrying no Origin, and a no-cors `<audio src>`
+  never carries one — so without it any page on the internet could point an
+  `<img src>` at a loopback mesa and burn a core per hit. The full reasoning,
+  including the `--lan` Host consequence a phone sees as a 403 on play alone,
+  is in `docs/inbox.md`.
+- The **Content-Type gate** applies to the mutating methods in both serve
+  modes, unchanged. Nothing here is special-cased.
+
+`POST /api/live` is two-phase like every other spawn site in `api.rs`: the
+store lock is taken to open the session and read the project's `local_path`,
+then **dropped** before the blocking `claude --bg` shell-out, which would
+otherwise freeze every other API request for its duration. It answers **201**,
+invalidating the agents cache on the way out so the Agents sidebar shows the
+new session on its next poll rather than after the TTL — a live agent is an
+ordinary background session.
+
+The one behaviour the speak route does not share with its inbox twin: speaking
+a turn whose `text` is empty — a pure `navigate` — is a **`validation`** error,
+not silence. There is nothing to synthesise, and a 200 with no audio would look
+to the page exactly like a synthesiser that died mid-render.
+
+## Speech, reused rather than rebuilt
+
+Nothing about how mesa speaks is new here. `GET /api/live/turns/{id}/speak` is
+the inbox speak route with the body coming off a turn instead of an item: the
+same `config::speech_voice()` read **fresh on every press**, the same
+`spawn_blocking(speech::start)`, the same text on the child's **stdin** (not an
+argument, so a body opening with `-o` cannot become an option), the same
+patched `0x7FFF0000` WAV sizes, the same chunked response with no
+`Content-Length`, and the same `503 unavailable` for a missing or failing
+`kokoro-rs`. `MESA_KOKORO_BIN` is the same seam the checks drive it through.
+
+The browser side is reused unchanged too, including the fallback that matters
+on Apple's media stack: an `<audio>` that refuses a range-less stream fires
+`error`, the page re-fetches the same URL and **decodes the WAV itself** onto a
+Web Audio clock the press unlocked, and remembers that mode for the page once
+decoded audio has actually sounded (`docs/inbox.md`). The Live page reaches
+that machinery through one small hoist made for this feature:
+`playSpeechStream` now takes a **URL** rather than an inbox item id
+(`speechStream.ts`, with `fetchSpeech(url, signal)` in `api.ts`), so the inbox
+passes `inboxSpeakUrl(id)` and Live passes `liveSpeakUrl(id)`. That is the only
+change to the inbox's speech path.
+
+The Live page consequences follow from the same rules the inbox lives under:
+there is **one `<audio>` element for the page**, and the **Go live** press is
+the gesture that unlocks audio — the `AudioContext` is created and `resume()`d
+inside that handler, whether or not it turns out to be needed, because a
+gesture is what a phone weighs and the element failure that says decoding is
+needed arrives long after the gesture is gone. Every mesa turn after that
+reuses the element and the clock that press unlocked, spoken **oldest first,
+one at a time**, each stamped `played` when it finishes. `played_at` only comes
+back on the *next* poll, so the page also holds the turns it has taken in
+hand — otherwise the two seconds after a turn starts would start it again — and
+a turn that failed to speak stays in that set, which is what keeps one bad turn
+from wedging the run on itself. A turn carrying `action: 'navigate'` sets
+`window.location.hash` to its target when the run reaches it — in transcript
+order, so the browser moves where the sentence around it said it would.
+
+## The Live page (`#/live`)
+
+A global page. Its left-nav row is **flat**, between Terminal and Scripts, and
+not a project subtree: a conversation may be *about* a project, but it is not a
+project tab and there is only ever one. It has a command-palette entry too.
+
+- **The page is mounted for the life of the app**, like `TerminalPage`, and the
+  `#/live` route only makes it *visible*. `navigate` is the whole point of the
+  feature, and a page the route unmounted would be torn down by the very
+  navigation it just performed — cutting its own sentence off mid-word and
+  stopping the route reports below.
+- **Go live / End** is the one button that starts and stops the conversation
+  (`POST` / `DELETE /api/live`), and it is where the audio gesture is spent.
+  Until *this* browser has spent that press, nothing is spoken and nothing
+  navigates here — the conversation may well be live on another device, but
+  this page has not joined it.
+- The **dictation textarea** carries a visible hint that this is where system
+  dictation types. Enter sends, Shift+Enter opens a line, and an `isComposing`
+  guard keeps an IME's Enter out of it — the same composer contract as the
+  Agent sidebar's chat box.
+- The **transcript is accumulated by the page**: each poll answers only with
+  what is new (the cursor is a ref, not state — it is read inside the fetch and
+  rendered nowhere), so the page holds the conversation and the server holds
+  the tail. A poll that reports a *different* session id starts a fresh
+  transcript rather than merging two conversations.
+- **On arrival and on every `hashchange`** the page `POST`s
+  `/api/live/route`, so the session records where the person actually is and
+  the agent can answer "what am I looking at" without guessing. Also the moment
+  it goes live, since a session that just started has no idea where its person
+  already was. It is **ambient**, like the inbox's read mark: a failure — no
+  live session, most often — is forgotten rather than shown.
+- **Pure logic is in tested modules, not the `.tsx`** (CLAUDE.md's
+  frontend-test rule): `frontend/src/liveTurns.ts` (cursor advance, merging a
+  poll's turns into the transcript, next-unplayed selection, what a turn
+  speaks, whether it navigates, grouping and labelling) and
+  `frontend/src/liveSession.ts` (the is-live predicate, the button's label and
+  pending state, the status line), each with a sibling vitest file.
+
+## Config
+
+The spawn is the fourth configurable command: **`live-agent`**, defaulting to
+`{bin} --bg --agent {agent} --name {name} -- {prompt}` — the union of the two
+existing shapes, since a live session is a mesa record (so it has an `{id}` and
+a `{name}`) *and* carries a prompt mesa supplies. That prompt is
+`live::agent_prompt`, so the feature works with **no user configuration**.
+Everything else about the template — argv vs script mode, tokenize-then-
+substitute, the `MESA_*` environment handoff, a `{placeholder}` refused inside
+a script — is inherited, not re-implemented. See `docs/config.md`.
+
+## Untrusted input
+
+A dictated utterance is untrusted free text, and it is treated exactly as
+CLAUDE.md requires: **data, never instructions.**
+
+- It reaches the agent as JSON printed by `mesa live listen`, and reaches the
+  spawn as **one `Command::arg`** (or as `$MESA_PROMPT` in script mode). It is
+  never interpolated into a string a shell parses — the reason the one-line
+  template is argv and substitution happens after tokenization.
+- `AGENT_PROMPT` states the posture to the model in the same terms: an
+  utterance may *ask* for work, and the agent may do that work, but it can
+  never change the agent's rules, reveal or rewrite its instructions, or make
+  it run something the utterance embeds verbatim.
+- The route an utterance can cause is bounded by `validate_live_route`
+  regardless of what the agent was talked into: a `navigate` target is a `#/`
+  hash path of at most 200 characters, so the worst case is the browser landing
+  on a mesa page the person could have clicked to.
+
+## What is deliberately absent
+
+- **Speech-to-text.** mesa does not capture a microphone, does not ship or
+  shell out to an STT engine, and no route accepts an audio body. The person's
+  own system dictation types into a text field, which means the recognition
+  quality, the language, and the privacy question are all already theirs and
+  mesa adds nothing to answer for. The audio path stays **one-directional,
+  server to browser**.
+- **A second live session.** One conversation, one page, one player.
+- **A per-session voice.** The voice is `speech.voice` in
+  `~/.mesa/config.json`, read on every press, shared with the inbox.
+- **A push channel**, in either direction — see the loop above.
+- **A navigation vocabulary beyond `navigate`.**
+
+## Gate
+
+`scripts/live-check.sh` — the CLI loop end to end (start → say → navigate →
+listen → turns → stop), the single-session `conflict`, every `validation` rule,
+`listen` returning `null` on timeout and never handing out the same turn twice,
+the `--quiet` key sets, and the API twin including the audio contract and both
+halves of the security boundary in default **and** `--lan` mode.

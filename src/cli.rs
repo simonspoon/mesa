@@ -9,8 +9,8 @@
 //!   projection — the record minus its unbounded free-text fields, the same
 //!   bounded shape `task list` already emits. Accepted on every mutation and
 //!   `show`/`get` in `project`, `task`, `diagram` (+ `frame`, `edge`),
-//!   `inbox` and `script`; composites keep their key structure and compact
-//!   their members.
+//!   `inbox`, `script` and `live`; composites keep their key structure and
+//!   compact their members.
 //!   Default output is unchanged. On a `delete` it waives the full echo, which
 //!   is mesa's recovery transcript.
 //! - Errors are `{"error": {"code", "message"}}` on stderr; clap usage errors
@@ -26,8 +26,9 @@ use serde_json::json;
 use crate::core::{
     Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
     Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
-    NextResult, Priority, Project, ProjectPatch, Result, Script, ScriptArg, ScriptArgKind,
-    ScriptPatch, Status, Store, Task, TaskPatch,
+    LiveAction, LiveRole, LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project,
+    ProjectPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
+    TaskPatch, agents, config, live,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -42,7 +43,7 @@ OUTPUT
   instead — the record minus its unbounded free-text fields; for a task that
   is exactly the bounded shape `task list` already emits. Accepted on every
   mutation and `show`/`get` in `project`, `task`, `diagram` (+ `frame`,
-  `edge`), `inbox` and `script`; composite payloads keep their key structure and
+  `edge`), `inbox`, `script` and `live`; composite payloads keep their key structure and
   compact their members. It changes stdout only — never exit codes, stderr or
   stored data — and default output is byte-identical to before the flag
   existed. On a `delete` it waives the full echo, which is mesa's recovery
@@ -54,9 +55,10 @@ OUTPUT
   Errors are JSON on stderr:
     {\"error\": {\"code\": \"not_found|cycle|validation|conflict|usage|unavailable\", \"message\": \"...\"}}
   Exit codes: 0 success, 1 domain/runtime error, 2 usage error. `unavailable`
-  is scoped to the two commands that depend on something outside mesa:
-  `cc usage` (missing token or unreachable upstream) and `task execute` (the
-  hook shell could not be started).
+  is scoped to the commands that depend on something outside mesa:
+  `cc usage` (missing token or unreachable upstream), `task execute` (the
+  hook shell could not be started) and `live start` (the `claude` binary that
+  drives the conversation could not be started).
 
 DATABASE
   Defaults to ~/Library/Application Support/mesa/mesa.db;
@@ -98,6 +100,9 @@ enum Command {
     /// Author and run user-written shell scripts with declared arguments
     #[command(subcommand)]
     Script(ScriptCmd),
+    /// Run a spoken conversation with mesa (the agent side of the Live page)
+    #[command(subcommand)]
+    Live(LiveCmd),
     /// Attach local files to tasks; list, inspect, fetch, and delete them
     #[command(subcommand)]
     Attachment(AttachmentCmd),
@@ -1010,6 +1015,157 @@ EXAMPLES
         /// Supply one declared argument: NAME=VALUE (repeatable)
         #[arg(long = "set", value_name = "NAME=VALUE", allow_hyphen_values = true)]
         set: Vec<String>,
+    },
+}
+
+/// The agent half of a live (spoken) conversation, mesa task 855.
+///
+/// The person dictates into the web UI's Live page; those utterances become
+/// `user` turns. This group is what the agent driving the conversation runs:
+/// it pulls an utterance with `listen`, does the work with the ordinary mesa
+/// CLI, and pushes spoken replies back with `say` / `navigate`.
+///
+/// At most ONE live session exists at a time, so no command here takes a
+/// session id — they all operate on the current one. With no live session,
+/// every command except `status` is `not_found` naming `mesa live start`;
+/// `status` prints `null` and exits 0, because "nobody is talking to mesa" is
+/// an answer, not a failure.
+#[derive(Subcommand)]
+enum LiveCmd {
+    /// Start the live session and spawn the agent that drives it
+    ///
+    /// Prints the created session (`--quiet`: the same record — a session has
+    /// no unbounded field). Starting while one is already live is a `conflict`
+    /// naming it: stop that one first.
+    ///
+    /// The agent is spawned through the same `agents::spawn_bg` chokepoint the
+    /// watchers use, with the `live-agent` command template from
+    /// ~/.mesa/config.json. Its working directory is the bound project's
+    /// local_path when that folder exists, else $HOME. If the spawn fails the
+    /// session is ENDED again and the command exits 1 with code "unavailable"
+    /// — a live session no agent is listening to would be a conversation that
+    /// never answers and would block the next `live start` with a `conflict`.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live start                 # global conversation, agent runs in $HOME
+  mesa live start mesa            # scoped to a project (id or name)
+  mesa live start --project 1
+  mesa live start --no-agent      # session only; drive `listen` yourself")]
+    Start {
+        /// Project the conversation is about, by id or name (optional)
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Project, by id or name; flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Create the session without spawning an agent for it
+        ///
+        /// For tests and for driving the loop by hand: the session is live and
+        /// its `agent_id` stays null.
+        #[arg(long)]
+        no_agent: bool,
+        /// Print the session in its compact shape instead of in full
+        ///
+        /// A session carries no unbounded free text, so this output is
+        /// identical to the default; the flag is accepted for uniformity.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// End the live session; prints it with its `ended_at` stamp
+    ///
+    /// Idempotent in the store, but there must BE a session: with none live
+    /// this is `not_found`. Ending does not kill the spawned agent — it is
+    /// what makes the agent's own `live status` check say "stop looping".
+    Stop {
+        /// Print the session in its compact shape instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Print the live session, or `null` when nobody is in a conversation
+    #[command(visible_aliases = ["show", "get"])]
+    Status {
+        /// Print the session in its compact shape instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Wait for the next thing the person said; prints the turn, or `null`
+    ///
+    /// Prints the oldest undelivered `user` turn and marks it delivered, so an
+    /// utterance is handed out exactly once no matter how many listeners run.
+    /// With nothing to hear it polls (about twice a second) until --wait
+    /// seconds have passed and then prints `null` and exits 0: a quiet minute
+    /// is DATA, not an error. It also returns `null` early if the session ends
+    /// while waiting, so the loop notices a stopped conversation promptly.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live listen                # wait up to 60s
+  mesa live listen --wait 5
+  mesa live listen --wait 0       # poll once and return")]
+    Listen {
+        /// Seconds to wait for an utterance; 0 polls once and returns
+        #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+        wait: u64,
+        /// Print the turn without its `text` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Say something to the person; prints the created turn
+    ///
+    /// This is SPEECH: the text is read aloud by a synthesiser, so write
+    /// plain spoken prose — no markdown, no bullet lists, no code. Type the
+    /// message after `say` (quoting is optional; multiple words are joined).
+    /// Put every flag BEFORE the message text.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live say I have opened the board for you.
+  mesa live say \"Three tasks are in progress right now.\"
+  mesa live say --quiet \"Working on it.\"")]
+    Say {
+        /// The spoken message (everything after `say`); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the turn without its `text` instead of in full
+        ///
+        /// Must come BEFORE the message text: everything after `say` that is
+        /// not a leading flag is swallowed as the message.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Move the person's browser to a hash route; prints the created turn
+    ///
+    /// ROUTE must start with `#/` (e.g. `#/projects/3`). `--say` is the
+    /// sentence spoken as the page changes; without it the turn is a pure
+    /// action and says nothing.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live navigate '#/inbox' --say \"Opening your inbox.\"
+  mesa live navigate '#/projects/3/tasks/42'")]
+    Navigate {
+        /// Hash route to send the browser to (must start with `#/`)
+        #[arg(value_name = "ROUTE")]
+        route: String,
+        /// What to say while the page changes
+        #[arg(long, value_name = "TEXT")]
+        say: Option<String>,
+        /// Print the turn without its `text` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Print the conversation so far as a bare JSON array, oldest first
+    ///
+    /// Both roles, including turns already delivered or spoken — this is the
+    /// transcript, not the queue. Reading it never delivers anything.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live turns
+  mesa live turns --after 12 --limit 20    # only what came after turn 12")]
+    Turns {
+        /// Only turns with an id greater than this one (exclusive cursor)
+        #[arg(long, value_name = "ID")]
+        after: Option<i64>,
+        /// Maximum number of turns to print (clamped to 1..=500)
+        #[arg(long, value_name = "N", default_value_t = 500)]
+        limit: i64,
     },
 }
 
@@ -1955,6 +2111,14 @@ const QUIET_DROP_SCRIPT: &[&str] = &["body", "description"];
 /// A `FrameEdge` has no unbounded field: quiet output equals full output.
 /// The flag is still accepted on edge subcommands, for uniformity.
 const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
+/// Keys dropped from a `LiveTurn` under `--quiet`: the spoken body, capped at
+/// 8 KiB by `Store` but unbounded as far as a caller reading a JSON line is
+/// concerned. Everything else on a turn is an id, a fixed word or a timestamp.
+const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
+/// A `LiveSession` has no unbounded field either — ids, one of two status
+/// words, a 200-char route and timestamps — so quiet output equals full
+/// output. The flag is accepted across the group for uniformity.
+const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
 
 /// Quiet projection of one record: the serialized record minus `drop`ped keys.
 ///
@@ -2051,6 +2215,17 @@ fn print_script(script: &Script, is_quiet: bool) {
     print_record(script, is_quiet, QUIET_DROP_SCRIPT);
 }
 
+/// Print one live session. Nothing on it is unbounded, so the quiet shape IS
+/// the full record; the flag is accepted for uniformity across the group.
+fn print_live_session(session: &LiveSession, is_quiet: bool) {
+    print_record(session, is_quiet, QUIET_DROP_LIVE_SESSION);
+}
+
+/// Print one live turn: the full record, or the record minus its spoken `text`.
+fn print_live_turn(turn: &LiveTurn, is_quiet: bool) {
+    print_record(turn, is_quiet, QUIET_DROP_LIVE_TURN);
+}
+
 /// Print a `{diagram, frames, edges}` view (`diagram show`/`delete`).
 ///
 /// Under `--quiet` the container KEY SET is unchanged — only the members are
@@ -2128,6 +2303,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Diagram(cmd) => run_diagram(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
         Command::Script(cmd) => run_script_cmd(cmd),
+        Command::Live(cmd) => run_live(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
         Command::Serve {
@@ -2966,6 +3142,181 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
     Ok(())
 }
 
+/// How often `live listen` asks the store whether anything was said. Twice a
+/// second: fast enough that a spoken reply follows an utterance without an
+/// audible pause, slow enough that a waiting agent is not a spinning CPU.
+const LISTEN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The current live session, or the `not_found` every command but `status`
+/// answers with when nobody is in a conversation.
+fn current_live_session(store: &Store) -> Result<LiveSession> {
+    store.current_live_session()?.ok_or_else(|| {
+        Error::NotFound("no live session; start one with `mesa live start`".to_string())
+    })
+}
+
+/// Where the live agent runs, and what its session is called.
+///
+/// The bound project's `local_path` when that folder still exists, else `$HOME`
+/// — the inbox-watcher's fallback, and the same `$HOME` the global Terminal
+/// page uses. Unlike `script run`, a missing or stale `local_path` is NOT an
+/// error here: a live conversation is about talking to mesa, which needs no
+/// checkout, so it degrades to the global shell rather than refusing to start.
+///
+/// The session NAME is what a person reads in the Agents sidebar, so it is the
+/// project name plus the session id when the conversation is scoped to a
+/// project (the todo-watcher's `"{project}: {task}"` idiom), and `mesa live
+/// <id>` when it is not. The id is in both halves because two conversations
+/// about the same project would otherwise be indistinguishable. **The API's
+/// `POST /api/live` builds the same name** — the two spawn sites must not
+/// diverge.
+fn live_agent_dir(
+    store: &Store,
+    project_id: Option<i64>,
+    session_id: i64,
+) -> Result<(String, String)> {
+    let home = || {
+        std::env::var("HOME").map_err(|_| {
+            Error::Validation("no HOME directory to run the live agent in".to_string())
+        })
+    };
+    let Some(id) = project_id else {
+        return Ok((home()?, format!("mesa live {session_id}")));
+    };
+    let project = store.get_project(id)?;
+    let dir = match project.local_path {
+        Some(path) if Path::new(&path).is_dir() => path,
+        _ => home()?,
+    };
+    Ok((dir, format!("{}: live {session_id}", project.name)))
+}
+
+/// Records the spawn receipt on the session — or ends the session when the
+/// spawn failed.
+///
+/// The decision a failed spawn forces: a live session whose agent never
+/// started is a conversation that can never answer, and because at most one
+/// session may be live it would also make the obvious retry (`mesa live start`
+/// again) a `conflict` instead. So the session is ended, and the failure is
+/// reported as `unavailable` — the code this contract reserves for something
+/// outside mesa (here, the `claude` binary) not being startable. The caller
+/// sees a nonzero exit and a message, and the store is back where it was.
+fn bind_live_agent_or_end(
+    store: &mut Store,
+    session: LiveSession,
+    spawned: std::result::Result<Option<String>, String>,
+) -> Result<LiveSession> {
+    match spawned {
+        // `None` is not a failure: the command started a session but printed
+        // no receipt (see `agents::spawn_bg`), so `agent_id` stays null.
+        Ok(job) => store.bind_live_agent(session.id, job.as_deref()),
+        Err(e) => {
+            let id = session.id;
+            store.end_live_session(id)?;
+            Err(Error::Unavailable(format!(
+                "live session {id} could not spawn its agent, so it was ended again: {e}"
+            )))
+        }
+    }
+}
+
+fn run_live(cmd: LiveCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        LiveCmd::Start {
+            project_pos,
+            project,
+            no_agent,
+            quiet,
+        } => {
+            let project_id = resolve_project_opt(&store, project.or(project_pos).as_deref())?;
+            // `start_live_session` is what judges the project id (an unknown
+            // one is `validation`), so it runs before anything reads the
+            // project — and every failure AFTER it goes through
+            // `bind_live_agent_or_end`, which ends the session again.
+            let session = store.start_live_session(project_id)?;
+            let session = if no_agent {
+                session
+            } else {
+                // The command — including which binary drives the conversation
+                // — comes from `~/.mesa/config.json`'s `live-agent` entry. The
+                // prompt is one argument, never spliced into a shell string.
+                let spawned = match live_agent_dir(&store, project_id, session.id) {
+                    Ok((dir, name)) => agents::spawn_bg(
+                        config::LIVE_AGENT,
+                        &dir,
+                        Some(session.id),
+                        Some(&name),
+                        Some(&live::agent_prompt(session.id)),
+                    ),
+                    Err(e) => Err(e.to_string()),
+                };
+                bind_live_agent_or_end(&mut store, session, spawned)?
+            };
+            print_live_session(&session, quiet);
+        }
+        LiveCmd::Stop { quiet } => {
+            let session = current_live_session(&store)?;
+            print_live_session(&store.end_live_session(session.id)?, quiet);
+        }
+        LiveCmd::Status { quiet } => match store.current_live_session()? {
+            Some(session) => print_live_session(&session, quiet),
+            // No conversation is an answer, not a failure — the agent's loop
+            // reads this `null` as "stop looping".
+            None => print_json(&serde_json::Value::Null),
+        },
+        LiveCmd::Listen { wait, quiet } => {
+            let session = current_live_session(&store)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            loop {
+                // `next_user_turn` stamps `delivered_at` inside one statement,
+                // so two listeners can never be handed the same utterance.
+                // There is deliberately no second guard here.
+                if let Some(turn) = store.next_user_turn(session.id)? {
+                    print_live_turn(&turn, quiet);
+                    return Ok(());
+                }
+                // A session stopped from the web UI ends the wait early rather
+                // than leaving the agent listening to a finished conversation.
+                if store.get_live_session(session.id)?.status != LiveStatus::Live {
+                    break;
+                }
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(LISTEN_POLL.min(left));
+            }
+            print_json(&serde_json::Value::Null);
+        }
+        LiveCmd::Say { text, quiet } => {
+            let session = current_live_session(&store)?;
+            let turn =
+                store.add_live_turn(session.id, LiveRole::Mesa, &text.join(" "), None, None)?;
+            print_live_turn(&turn, quiet);
+        }
+        LiveCmd::Navigate { route, say, quiet } => {
+            let session = current_live_session(&store)?;
+            // A navigate with no --say is a pure action turn: empty text, which
+            // `Store` allows for `mesa` precisely so the page can move without
+            // anything being read aloud.
+            let turn = store.add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                say.as_deref().unwrap_or(""),
+                Some(LiveAction::Navigate),
+                Some(&route),
+            )?;
+            print_live_turn(&turn, quiet);
+        }
+        LiveCmd::Turns { after, limit } => {
+            let session = current_live_session(&store)?;
+            print_json(&store.list_live_turns(session.id, after, limit)?);
+        }
+    }
+    Ok(())
+}
+
 /// Resolves a script argument — a numeric id or a script name — to the record.
 /// The same id-or-name rule every project argument follows; a script's name is
 /// unique case-insensitively precisely so this is unambiguous.
@@ -3294,6 +3645,33 @@ mod tests {
         }
     }
 
+    fn sample_live_session() -> LiveSession {
+        LiveSession {
+            id: 1,
+            project_id: Some(2),
+            agent_id: Some("e34b8ed9".into()),
+            status: LiveStatus::Live,
+            route: Some("#/projects/2".into()),
+            started_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+            ended_at: None,
+        }
+    }
+
+    fn sample_live_turn() -> LiveTurn {
+        LiveTurn {
+            id: 1,
+            session_id: 2,
+            role: LiveRole::Mesa,
+            text: "Opening the board.".into(),
+            action: Some(LiveAction::Navigate),
+            target: Some("#/projects/2".into()),
+            created_at: "2026-01-01 00:00:00".into(),
+            delivered_at: Some("2026-01-01 00:00:01".into()),
+            played_at: Some("2026-01-01 00:00:02".into()),
+        }
+    }
+
     // ---- Task: quiet shape is the existing `compact` (spec M6) ----
 
     /// S1: `compact` is a hand-written literal mirroring `TaskSummary`; assert
@@ -3528,6 +3906,107 @@ mod tests {
             sorted_owned(value_keys(&quiet(&sample_script(), QUIET_DROP_SCRIPT))),
             minus(&full, QUIET_DROP_SCRIPT),
         );
+    }
+
+    #[test]
+    fn live_session_quiet_equals_full() {
+        let full = keys(&sample_live_session());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                // Bounded pointers: which project the conversation is about,
+                // and the receipt for the agent driving it.
+                "project_id",
+                "agent_id",
+                // One of two fixed words — and the field that decides whether
+                // the agent's loop keeps going, so it can never be dropped.
+                "status",
+                // A hash route, capped at 200 chars by `Store`: bounded.
+                "route",
+                "started_at",
+                "updated_at",
+                // Bounded (a timestamp or null), and the field `live stop`
+                // exists to write — echoing a session without it would read as
+                // "the stop didn't take", the reasoning that keeps `read_at`
+                // in an inbox item's quiet shape.
+                "ended_at",
+            ]),
+            "LiveSession gained/lost a field: it has no unbounded free text \
+             today, so --quiet == full; revisit if that changes",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_live_session(),
+                QUIET_DROP_LIVE_SESSION
+            ))),
+            minus(&full, QUIET_DROP_LIVE_SESSION),
+        );
+        // Quiet == full, values included, not just keys.
+        assert_eq!(
+            quiet(&sample_live_session(), QUIET_DROP_LIVE_SESSION),
+            serde_json::to_value(sample_live_session()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn live_turn_quiet_drops_text() {
+        let full = keys(&sample_live_turn());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "session_id",
+                // One of two fixed words, and what tells the two sides of the
+                // conversation apart: bounded, and load-bearing.
+                "role",
+                // The one free-text field: what is spoken. Dropped.
+                "text",
+                // A fixed word or null, and the route it acts on (≤ 200
+                // chars) — a quiet echo that dropped these could not say that
+                // a pure navigate turn does anything at all.
+                "action",
+                "target",
+                "created_at",
+                // Both bounded (a timestamp or null), and both are fields a
+                // command exists to write: `live listen` stamps `delivered_at`
+                // and the page stamps `played_at`.
+                "delivered_at",
+                "played_at",
+            ]),
+            "LiveTurn gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_live_turn(),
+                QUIET_DROP_LIVE_TURN
+            ))),
+            minus(&full, QUIET_DROP_LIVE_TURN),
+        );
+    }
+
+    /// A failed spawn must not strand a live session: the session is ended
+    /// again (so the obvious retry is not a `conflict`) and the failure is
+    /// reported as `unavailable`. A successful spawn binds the receipt.
+    #[test]
+    fn failed_agent_spawn_ends_the_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("test.db")).unwrap();
+
+        let session = store.start_live_session(None).unwrap();
+        let err = bind_live_agent_or_end(&mut store, session, Err("claude: not found".into()))
+            .expect_err("a failed spawn is an error");
+        assert_eq!(error_code(&err), "unavailable");
+        assert!(err.to_string().contains("claude: not found"), "{err}");
+        assert!(store.current_live_session().unwrap().is_none());
+
+        // …and the next start therefore succeeds rather than conflicting.
+        let session = store.start_live_session(None).unwrap();
+        let bound =
+            bind_live_agent_or_end(&mut store, session, Ok(Some("e34b8ed9".into()))).unwrap();
+        assert_eq!(bound.agent_id.as_deref(), Some("e34b8ed9"));
+        assert_eq!(bound.status, LiveStatus::Live);
     }
 
     /// `--arg` is shape-only: the NAME passes through untouched so `Store`

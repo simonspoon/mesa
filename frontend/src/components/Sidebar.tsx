@@ -91,6 +91,8 @@ const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
  * and drives which CC link is highlighted. `terminalActive` highlights the
  * Terminal link the same way `inboxFilter` does the Inbox — the page itself is a
  * permanent sibling mount in `App.tsx` (mesa task 396), not rendered here.
+ * `liveActive` does the same for the Live row (mesa task 855), whose page is a
+ * permanent sibling mount for the same reason and one of its own.
  * `version` is bumped by pages after project rename/delete so the list
  * refetches (it is part of the useFetch key). The inbox count live-polls so
  * the badge of items needing triage stays current as agents send.
@@ -221,6 +223,7 @@ export function Sidebar({
   settingsActive,
   scriptsActive,
   terminalActive,
+  liveActive,
   ccTab,
   version,
   unread,
@@ -235,6 +238,10 @@ export function Sidebar({
   settingsActive: boolean
   scriptsActive: boolean
   terminalActive: boolean
+  // Highlights the Live row (mesa task 855) exactly as `terminalActive` does
+  // Terminal's — and for the same reason: the page is a permanent sibling
+  // mount in `App.tsx`, not rendered here.
+  liveActive: boolean
   ccTab: CcTab | null
   version: number
   // Count of UNREAD inbox items, for the Inbox badge (mesa task 831). Fetched
@@ -645,6 +652,11 @@ export function Sidebar({
         )}
         <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
           <span className="nav-item-label">Terminal</span>
+        </a>
+        {/* Flat and global too (mesa task 855): a conversation may be about a
+            project, but it is not a project tab — and there is only ever one. */}
+        <a className={`nav-item${liveActive ? ' active' : ''}`} href="#/live">
+          <span className="nav-item-label">Live</span>
         </a>
         {/* Flat, like Inbox and Terminal: Scripts is a global page, not a
             project subtree, so `navCollapse.ts` (which is project-only) is

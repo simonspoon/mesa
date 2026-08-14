@@ -304,7 +304,7 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
       fetching.current = request
       try {
         const stream = await playSpeechStream(
-          id,
+          inboxSpeakUrl(id),
           ctx,
           {
             onPlaying: () => {

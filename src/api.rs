@@ -41,10 +41,10 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents,
-    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
-    Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, config, files, git, hooks, scripts, speech, version,
+    InboxItem, InboxKind, LiveRole, LiveState, MesaVersion, ModelRates, NextResult, Priority,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
+    ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary,
+    Waypoint, agents, attachments, config, files, git, hooks, live, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -778,6 +778,31 @@ fn router(state: AppState) -> Router {
         // to feed sends no Origin — so the handler adds
         // `require_same_site_fetch` for the cross-site-subresource shape.
         .route("/api/inbox/{id}/speak", get(speak_inbox))
+        // Mesa live: one spoken conversation at a time (mesa task 855). The
+        // GET is the page's whole read — the current session (or `null`) plus
+        // the turns after its cursor, polled like every other view, because
+        // the agent drives mesa through the CLI and there is no push channel
+        // either way (`docs/live.md`). Start and stop sit on the same path as
+        // verbs rather than on `/api/live/{id}` routes: there is only ever one
+        // live session, so there is no id for the caller to name.
+        //
+        // Those two verbs spawn and retire a background `claude` session, so
+        // they share `require_agent_access` with the agent routes — starting a
+        // conversation is code execution. The remaining three writes are
+        // ordinary store writes the page makes on the user's behalf (what they
+        // dictated, where their browser is, what they have heard), gated like
+        // task CRUD.
+        .route(
+            "/api/live",
+            get(get_live).post(start_live).delete(stop_live),
+        )
+        .route("/api/live/utterance", post(live_utterance))
+        .route("/api/live/route", post(live_route))
+        .route("/api/live/turns/{id}/played", post(live_turn_played))
+        // Speaking one turn: the same synthesiser, headers and gate pair as
+        // the inbox's play button — see `speak_inbox` for why that pair, and
+        // why a GET.
+        .route("/api/live/turns/{id}/speak", get(speak_live_turn))
         // Scripts: user-authored shell run from a generated form. A script
         // body is a program mesa executes, so authoring is the strictest gate
         // in the file (`require_local_path_write`, loopback-only in BOTH
@@ -2117,6 +2142,349 @@ async fn speak_inbox(
 async fn delete_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_inbox_item(id)?).into_response())
+}
+
+// ---- live (a spoken conversation) ----
+
+/// How many turns one poll may carry back. `Store::list_live_turns` clamps to
+/// this same ceiling, so it is stated here only to be explicit about what the
+/// page gets: a conversation longer than this is read in cursor-sized pages,
+/// which is what `?after=` is for.
+const LIVE_TURNS_LIMIT: i64 = 500;
+
+#[derive(Deserialize)]
+struct LiveQuery {
+    /// Exclusive id cursor — the last turn this page already has. Absent means
+    /// "from the beginning", which is what a freshly-opened page sends.
+    #[serde(default)]
+    after: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct LiveStart {
+    /// The project the conversation is about, if any. Optional: live is a
+    /// global surface (like the inbox), and a session with no project simply
+    /// runs its agent in `$HOME`. An unknown id is a `validation` error from
+    /// `Store`.
+    #[serde(default)]
+    project_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct LiveUtterance {
+    /// What the person dictated. Required and non-empty (`Store`'s rule for a
+    /// `user` turn) — there is no such thing as an empty thing said.
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct LiveRouteBody {
+    /// Where the user's browser currently is, as a hash route. Required —
+    /// reporting no route is not a thing the page has to say.
+    route: String,
+}
+
+/// Every live write except `start` acts on **the** current session, so there is
+/// no id in any of these paths. Finding none is `not_found` with the hint that
+/// names how to get one, in the shape the CLI's not-found hints use.
+fn no_live_session() -> ApiError {
+    ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: "no live session; start one with POST /api/live".into(),
+    }
+}
+
+/// The folder a live agent is spawned in: the bound project's `local_path` when
+/// it is still a directory on this machine, else `$HOME` — the inbox-watcher's
+/// fallback, and the same folder the global Terminal page opens in.
+///
+/// Deliberately a fallback rather than the 422 `spawn_project_agent` gives: a
+/// live conversation is not scoped to a repo (its `project_id` is optional, and
+/// the whole session survives that project's deletion), so a missing or stale
+/// path is a session with no working folder, not a broken request.
+fn live_spawn_dir(local_path: Option<String>) -> Result<String, ApiError> {
+    if let Some(path) = local_path
+        && std::path::Path::new(&path).is_dir()
+    {
+        return Ok(path);
+    }
+    directories::BaseDirs::new()
+        .map(|d| d.home_dir().to_string_lossy().into_owned())
+        .ok_or_else(|| agents_unavailable("no home directory to run a live agent in".into()))
+}
+
+/// The Live page's whole read: the current session and the turns after its
+/// cursor, in one response so a poll is one request. With nothing running the
+/// answer is `{"session": null, "turns": []}` and 200 — an idle page is the
+/// normal state of this route, not an error, and the button it renders is
+/// exactly what fixes it.
+async fn get_live(
+    State(state): State<AppState>,
+    Query(q): Query<LiveQuery>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    let Some(session) = store.current_live_session()? else {
+        return Ok(Json(LiveState {
+            session: None,
+            turns: vec![],
+        })
+        .into_response());
+    };
+    let turns = store.list_live_turns(session.id, q.after, LIVE_TURNS_LIMIT)?;
+    Ok(Json(LiveState {
+        session: Some(session),
+        turns,
+    })
+    .into_response())
+}
+
+/// Starts the conversation: opens the session, then spawns the `claude` agent
+/// that will drive it. `require_agent_access` because the second half *is* a
+/// background agent — the same capability class as `POST
+/// /api/projects/{id}/agents`, reached by a different door.
+///
+/// A second start while one is live is `conflict` from `Store` (there is one
+/// live session, by construction), so this handler never has to decide that.
+///
+/// A failed spawn **ends the session it just opened** rather than leaving it
+/// live with a null `agent_id`. The alternative strands a session that nothing
+/// is listening to and that would `conflict` every later start until someone
+/// stopped it by hand; ending it means the failure costs the caller one error
+/// and a retry. Nothing is bound in that case — `bind_live_agent` records a
+/// spawn receipt, and there was no spawn.
+async fn start_live(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LiveStart>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    // Two-phase like every other spawn site in this file: the store lock is
+    // dropped before the blocking `claude --bg` shell-out, which would
+    // otherwise freeze every other API request for its duration.
+    // The session opens FIRST, so an unknown `project_id` stays the store's
+    // `validation` rather than becoming a `not_found` from the project read
+    // below. Everything after it goes through the one rollback path.
+    let session_id = state
+        .store
+        .lock()
+        .unwrap()
+        .start_live_session(body.project_id)?
+        .id;
+    let job = match spawn_live_agent(&state, session_id, body.project_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            let _ = state.store.lock().unwrap().end_live_session(session_id);
+            return Err(ApiError {
+                message: format!(
+                    "live session {session_id} could not spawn its agent, so it was \
+                     ended again: {}",
+                    err.message
+                ),
+                ..err
+            });
+        }
+    };
+    let session = state
+        .store
+        .lock()
+        .unwrap()
+        .bind_live_agent(session_id, job.as_deref())?;
+    Ok((StatusCode::CREATED, Json(session)).into_response())
+}
+
+/// The spawn half of [`start_live`], split out so every failure between the
+/// session opening and the agent running has exactly one rollback path at the
+/// call site — a live session nothing is listening to would `conflict` every
+/// later start.
+///
+/// Resolves the same folder and the same session name the CLI's `live start`
+/// does, then hands `spawn_bg` the `live-agent` template from
+/// `~/.mesa/config.json`, the session id, that name, and the instruction block
+/// from `core::live` — one `Command::arg`, never spliced into a shell string.
+/// Answers the spawn receipt, which is `None` when the configured command
+/// printed none (the session is still real — see `AgentSpawned`).
+async fn spawn_live_agent(
+    state: &AppState,
+    session_id: i64,
+    project_id: Option<i64>,
+) -> Result<Option<String>, ApiError> {
+    // The name is what a person reads in the Agents sidebar and the `/resume`
+    // picker, so a scoped conversation leads with its project, the idiom the
+    // todo-watcher's `"{project}: {task}"` set. The id is in both halves, so
+    // two conversations about one project stay distinguishable.
+    let (local_path, name) = match project_id {
+        Some(id) => {
+            let project = state.store.lock().unwrap().get_project(id)?;
+            (
+                project.local_path,
+                format!("{}: live {session_id}", project.name),
+            )
+        }
+        None => (None, format!("mesa live {session_id}")),
+    };
+    let dir = live_spawn_dir(local_path)?;
+    let path = dir.clone();
+    let prompt = live::agent_prompt(session_id);
+    // Two-phase like every other spawn site in this file: the store lock is
+    // dropped before the blocking `claude --bg` shell-out, which would
+    // otherwise freeze every other API request for its duration.
+    let job = tokio::task::spawn_blocking(move || {
+        agents::spawn_bg(
+            config::LIVE_AGENT,
+            &dir,
+            Some(session_id),
+            Some(&name),
+            Some(&prompt),
+        )
+    })
+    .await
+    .map_err(|e| agents_unavailable(format!("live agent spawn panicked: {e}")))
+    .and_then(|result| result.map_err(agents_unavailable))?;
+    // Same cache invalidation as `spawn_project_agent`: a live agent is an
+    // ordinary background session, and the Agents sidebar must show it on the
+    // next poll rather than after the TTL.
+    state.agents_cache.lock().unwrap().remove(&path);
+    state.agents_gen.fetch_add(1, Ordering::SeqCst);
+    Ok(job)
+}
+
+/// Ends the conversation, answering with the ended session. Shares
+/// `require_agent_access` with `start_live`: hanging up on an agent mid-turn is
+/// the other half of the same capability, and the pair must not drift apart.
+///
+/// The agent stops itself — it checks `mesa live status` each time round its
+/// loop — so this writes the status and nothing else. `Store::end_live_session`
+/// is idempotent, but a stop with nothing live is still `not_found`: the caller
+/// asked to end a conversation that isn't there.
+async fn stop_live(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let mut store = state.store.lock().unwrap();
+    let Some(session) = store.current_live_session()? else {
+        return Err(no_live_session());
+    };
+    Ok(Json(store.end_live_session(session.id)?).into_response())
+}
+
+/// The dictated user turn — what the person said, on its way to the agent that
+/// will pull it with `mesa live listen`.
+///
+/// A plain store write, gated like task CRUD rather than like the agent routes:
+/// the text is **data** (see CLAUDE.md's untrusted-input rule and the prompt in
+/// `core::live`), it reaches the agent as JSON out of the store, and it starts
+/// no process of its own. mesa accepts no audio here and captures no
+/// microphone — the body is text the system's own dictation typed.
+async fn live_utterance(
+    State(state): State<AppState>,
+    body: Result<Json<LiveUtterance>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let Some(session) = store.current_live_session()? else {
+        return Err(no_live_session());
+    };
+    let turn = store.add_live_turn(session.id, LiveRole::User, &body.text, None, None)?;
+    Ok((StatusCode::CREATED, Json(turn)).into_response())
+}
+
+/// The page reporting where the user's browser is, so the agent can talk about
+/// what they are looking at. Sent on mount and on every `hashchange`, so it is
+/// a write the page makes constantly and about itself — gated like task CRUD,
+/// and bounded by `Store` (a `#/` route, ≤ 200 chars) rather than by anything
+/// here.
+async fn live_route(
+    State(state): State<AppState>,
+    body: Result<Json<LiveRouteBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let Some(session) = store.current_live_session()? else {
+        return Err(no_live_session());
+    };
+    Ok(Json(store.set_live_route(session.id, &body.route)?).into_response())
+}
+
+/// Stamps one mesa turn as spoken, answering with the turn either way. The
+/// inbox's `read` route in every respect: idempotent, stamped only the first
+/// time and never cleared, which is what lets the page fire it as each turn
+/// finishes without tracking whether it already has.
+///
+/// Addressed by turn id, not "the current session's next one": the page speaks
+/// turns one at a time and knows exactly which one just ended.
+async fn live_turn_played(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.mark_live_turn_played(id)?).into_response())
+}
+
+/// Speaks one turn: its text, verbatim, through `kokoro-rs`, back as streaming
+/// `audio/wav`. A near-copy of [`speak_inbox`] with the body coming from a turn
+/// instead of an item — same fresh-read voice, same `spawn_blocking` start,
+/// same `unavailable` for a missing or failing synthesiser, same headers, same
+/// absent `Content-Length` (the length is not known when they go out), and the
+/// same gate pair for the same two reasons: `require_agent_access` because a
+/// single request pins a core for as long as the body is, and
+/// `require_same_site_fetch` because the `<audio src>` this exists to feed
+/// carries no `Origin` for the first gate's Origin checks to judge.
+///
+/// A turn with empty `text` is a **pure navigate** — a mesa turn is allowed to
+/// carry an action instead of words — and asking to speak one is `validation`,
+/// not a zero-length WAV. Silence coming back down an audio element is
+/// indistinguishable from a broken synthesiser, and the page should never have
+/// asked.
+async fn speak_live_turn(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    require_same_site_fetch(&headers)?;
+    let body = {
+        let store = state.store.lock().unwrap();
+        store.get_live_turn(id)?.text
+    };
+    if body.trim().is_empty() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!("live turn {id} has no text to speak"),
+        });
+    }
+    let voice = config::speech_voice().map_err(|message| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "unavailable",
+        message,
+    })?;
+    let speech = tokio::task::spawn_blocking(move || speech::start(&body, voice.as_deref()))
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: format!("speech synthesis failed: {e}"),
+        })?
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: e,
+        })?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "audio/wav".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        Body::from_stream(ReceiverStream::new(speech.chunks)),
+    )
+        .into_response())
 }
 
 // ---- scripts (user-authored shell) ----
@@ -7850,5 +8218,200 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         }
         let stored = state.store.lock().unwrap().get_script(script.id).unwrap();
         assert_eq!(stored, script);
+    }
+
+    // --- live (mesa task 855) --------------------------------------------
+
+    /// An idle Live page is the normal state of this route, so it answers 200
+    /// with an explicit `null` session and an empty turn list — never a 404
+    /// the page would have to special-case on every 2s poll.
+    #[tokio::test]
+    async fn get_live_answers_a_null_session_when_nothing_is_running() {
+        let (_dir, state) = test_state();
+        let resp = get_live(State(state), Query(LiveQuery { after: None }))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert!(body["session"].is_null());
+        assert_eq!(body["turns"], serde_json::json!([]));
+    }
+
+    /// The whole start path: the session opens, the `live-agent` command runs
+    /// in the project's folder with the session's name and mesa's own prompt,
+    /// and the spawn receipt lands on the session.
+    /// A runtime built inside the test body, so the two spawn tests below can
+    /// hold the process-global `ENV_LOCK` (a plain `Mutex`) across the handler
+    /// call without holding a guard across an `await` in an async fn.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[test]
+    fn start_live_spawns_the_live_agent_and_binds_its_receipt() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN/MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let root = proj_dir.path().canonicalize().unwrap();
+        let id = new_project(&state, Some(root.to_str().unwrap()));
+
+        let resp = block_on(start_live(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Ok(Json(LiveStart {
+                project_id: Some(id),
+            })),
+        ))
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = block_on(json_body(resp));
+        assert_eq!(body["status"], "live");
+        assert_eq!(body["project_id"], id);
+        assert_eq!(body["agent_id"], "deadbeef");
+        let session_id = body["id"].as_i64().unwrap();
+
+        // The stub logs `<cwd>|<name>|<prompt>`; the prompt is multi-line, so
+        // match the head of the line rather than splitting the whole thing.
+        // A name AND a prompt together is what pins the `live-agent` template:
+        // it is the only action whose default offers both.
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        // A scoped conversation is named project-first, the Agents sidebar's
+        // idiom — `new_project` names its project "proj".
+        let head = format!("{}|proj: live {session_id}|", root.display());
+        assert!(logged.starts_with(&head), "{logged}");
+        assert!(
+            logged.contains(&format!("mesa live session {session_id}")),
+            "the session's own prompt must reach the agent: {logged}"
+        );
+
+        // One live session at a time: the second start is the store's
+        // `conflict`, and it must not have spawned anything.
+        let err = block_on(start_live(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Ok(Json(LiveStart { project_id: None })),
+        ))
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "conflict");
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), logged);
+    }
+
+    /// A spawn that fails must not strand a live session: nothing is listening
+    /// to it, and it would `conflict` every retry until someone stopped it by
+    /// hand. The session is ended, so the very next start works.
+    #[test]
+    fn a_failed_live_spawn_ends_the_session_it_opened() {
+        // SAFETY: as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        std::fs::write(stub_dir.path().join("fail"), "").unwrap();
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let err = block_on(start_live(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Ok(Json(LiveStart { project_id: None })),
+        ))
+        .unwrap_err();
+        assert_eq!(err.code, "unavailable");
+        assert!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .current_live_session()
+                .unwrap()
+                .is_none(),
+            "a failed spawn must leave no live session behind"
+        );
+    }
+
+    /// A mesa turn may carry a navigate action instead of words. Asking to
+    /// speak one is the page's bug, and it gets told so — silence down an
+    /// audio element is indistinguishable from a dead synthesiser.
+    #[tokio::test]
+    async fn speak_live_turn_refuses_a_turn_with_nothing_to_say() {
+        let (_dir, state) = test_state();
+        let turn = {
+            let mut store = state.store.lock().unwrap();
+            let session = store.start_live_session(None).unwrap();
+            store
+                .add_live_turn(
+                    session.id,
+                    LiveRole::Mesa,
+                    "",
+                    Some(crate::core::LiveAction::Navigate),
+                    Some("#/inbox"),
+                )
+                .unwrap()
+        };
+        let err = speak_live_turn(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(turn.id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "validation");
+    }
+
+    /// The four session-scoped writes address "the" conversation, so with none
+    /// running they are `not_found` with the hint that names how to get one —
+    /// not a silent no-op, and not a 500 from an unwrap.
+    #[tokio::test]
+    async fn the_live_writes_report_no_session_rather_than_guessing_one() {
+        let (_dir, state) = test_state();
+        let stop = stop_live(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+        )
+        .await
+        .unwrap_err();
+        let utterance = live_utterance(
+            State(state.clone()),
+            Ok(Json(LiveUtterance {
+                text: "hello".into(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        let route = live_route(
+            State(state),
+            Ok(Json(LiveRouteBody {
+                route: "#/live".into(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        for err in [stop, utterance, route] {
+            assert_eq!(err.status, StatusCode::NOT_FOUND);
+            assert_eq!(err.code, "not_found");
+            assert!(err.message.contains("POST /api/live"), "{}", err.message);
+        }
     }
 }

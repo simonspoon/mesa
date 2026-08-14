@@ -33,6 +33,9 @@ import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { InboxKind } from './types/InboxKind'
+import type { LiveSession } from './types/LiveSession'
+import type { LiveState } from './types/LiveState'
+import type { LiveTurn } from './types/LiveTurn'
 import type { MesaVersion } from './types/MesaVersion'
 import type { ModelRates } from './types/ModelRates'
 import type { ProjectFileSearch } from './types/ProjectFileSearch'
@@ -782,25 +785,29 @@ export function inboxSpeakUrl(id: number): string {
 }
 
 /**
- * The same audio as a body the page reads itself (mesa task 830) — the
- * fallback for a browser whose media stack refuses the streamed response.
- * Apple's (iOS Safari, and Safari on a Mac) requires byte-range support of an
- * HTTP media source, and this route is chunked with no `Content-Length` on
- * purpose, so `<audio src>` never gets past "the server is not correctly
- * configured" there. A `fetch` asks for none of that, and its body arrives in
- * pieces, so the audio can still start on the first sentence — the decoding
- * and the playing are `speechStream.ts`.
+ * Any of mesa's spoken-audio routes as a body the page reads itself (mesa task
+ * 830) — the fallback for a browser whose media stack refuses the streamed
+ * response. Apple's (iOS Safari, and Safari on a Mac) requires byte-range
+ * support of an HTTP media source, and these routes are chunked with no
+ * `Content-Length` on purpose, so `<audio src>` never gets past "the server is
+ * not correctly configured" there. A `fetch` asks for none of that, and its
+ * body arrives in pieces, so the audio can still start on the first sentence —
+ * the decoding and the playing are `speechStream.ts`.
+ *
+ * Takes the URL rather than an item id (mesa task 855): the inbox and the live
+ * page speak over two different routes, and which one is being read is the
+ * caller's business, not this function's.
  *
  * A second full synthesis, so it is a fallback and never the first attempt:
- * the route caches nothing. `signal` is what stop cancels it with — the render
+ * the routes cache nothing. `signal` is what stop cancels it with — the render
  * already running on the server finishes regardless, as it does for a listener
  * that hangs up mid-stream.
  */
-export async function fetchInboxSpeech(
-  id: number,
+export async function fetchSpeech(
+  url: string,
   signal: AbortSignal,
 ): Promise<ReadableStream<Uint8Array>> {
-  const res = await fetch(inboxSpeakUrl(id), { signal })
+  const res = await fetch(url, { signal })
   if (!res.ok) throw await apiErrorFrom(res)
   if (res.body === null) throw new ApiError('http_error', 'no audio', 200)
   return res.body
@@ -809,6 +816,69 @@ export async function fetchInboxSpeech(
 /** Returns the destroyed item. */
 export function deleteInboxItem(id: number): Promise<InboxItem> {
   return request(`/api/inbox/${id}`, jsonDelete())
+}
+
+// ---- live (the spoken conversation, mesa task 855) ----
+
+/**
+ * The Live page's one read: the current conversation, if any, and the turns
+ * after `after`. The cursor is exclusive, so a poll that asks for what it has
+ * already seen answers with an empty array — the transcript is accumulated by
+ * the page (`liveTurns.ts`), not re-sent every two seconds.
+ */
+export function getLive(after?: number): Promise<LiveState> {
+  const qs = after !== undefined ? `?after=${after}` : ''
+  return request(`/api/live${qs}`)
+}
+
+/**
+ * Starts a conversation and spawns the agent that drives it. At most one may
+ * be live, so a second start while one is running is a 409 `conflict` naming
+ * the session already there.
+ */
+export function startLive(projectId?: number): Promise<LiveSession> {
+  return request('/api/live', jsonInit('POST', { project_id: projectId ?? null }))
+}
+
+/** Ends the conversation. Idempotent: ending an ended one returns it unchanged. */
+export function stopLive(): Promise<LiveSession> {
+  return request('/api/live', jsonDelete())
+}
+
+/**
+ * One dictated line from the person. Free text from a microphone by way of the
+ * OS — untrusted data, which is why it goes into the store as a turn and
+ * reaches the agent as one argument rather than anything a shell parses.
+ */
+export function sendLiveUtterance(text: string): Promise<LiveTurn> {
+  return request('/api/live/utterance', jsonInit('POST', { text }))
+}
+
+/**
+ * The page reporting where the browser is, so the agent knows what the person
+ * is looking at. Ambient, like the inbox's read mark: sent on arrival and on
+ * every hash change, and a failure is forgotten rather than shown.
+ */
+export function reportLiveRoute(route: string): Promise<LiveSession> {
+  return request('/api/live/route', jsonInit('POST', { route }))
+}
+
+/**
+ * Stamps a mesa turn as spoken, the first time. Idempotent and never moved —
+ * the `read_at` rule — so a re-render can never make the page say a turn twice.
+ */
+export function markLiveTurnPlayed(id: number): Promise<LiveTurn> {
+  return request(`/api/live/turns/${id}/played`, jsonInit('POST', {}))
+}
+
+/**
+ * Spoken-audio URL for one live turn — used directly as an `<audio src>`, or
+ * handed to `fetchSpeech` on the decode-it-yourself path. Synthesis runs on
+ * every request, exactly as `inboxSpeakUrl`'s does, so it is a play action
+ * rather than a cheap read; a turn with no text (a pure navigate) is a 422.
+ */
+export function liveSpeakUrl(id: number): string {
+  return `/api/live/turns/${id}/speak`
 }
 
 // ---- CC Dashboard (Claude Code telemetry) ----

@@ -29,6 +29,12 @@ function buildCommands(projects: Project[]): Command[] {
     { id: 'cc', label: 'CC Dashboard', search: 'cc dashboard', run: () => navigate('#/cc') },
     { id: 'inbox', label: 'Inbox', search: 'inbox', run: () => navigate('#/inbox') },
     {
+      id: 'live',
+      label: 'Live',
+      search: 'live talk speak voice dictate',
+      run: () => navigate('#/live'),
+    },
+    {
       id: 'scripts',
       label: 'Scripts',
       search: 'scripts shell run',

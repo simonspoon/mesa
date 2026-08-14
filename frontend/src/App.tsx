@@ -13,6 +13,7 @@ import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionDetailView } from './pages/CCSessionDetailView'
 import { CCSessionTimelineView } from './pages/CCSessionTimelineView'
 import { InboxView } from './pages/InboxView'
+import { LiveView } from './pages/LiveView'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { ScriptsView } from './pages/ScriptsView'
 import { SettingsView } from './pages/SettingsView'
@@ -39,7 +40,10 @@ import { useVisualViewportHeightVar } from './visualViewport'
 // TerminalPage is a permanent sibling mount, not resolved into `page` — see
 // the render below), #/scripts (the global store of user-authored shell
 // scripts and their generated run forms — global like #/inbox, since a script
-// may bind a project but does not have to).
+// may bind a project but does not have to), #/live (the spoken conversation
+// — like Terminal, a permanent sibling mount rather than a resolved `page`,
+// because a live turn may `navigate` this browser somewhere else and the
+// conversation has to survive the navigation it just performed).
 //
 // Every project-tab and #/cc route is *recorded* browser-local as the last
 // view (`lastView.ts`), so the nav's project and CC Dashboard links reopen it.
@@ -223,6 +227,12 @@ function App() {
   // that visibility toggle and the nav's active-link highlight.
   const terminalMatch = /^\/terminal$/.exec(path)
   const terminalActive = terminalMatch !== null
+  // Live is a permanent sibling mount for the same reason Terminal is, plus
+  // one of its own (mesa task 855): a `navigate` turn moves this browser to
+  // another route, and a page unmounted by that navigation would cut its own
+  // sentence off and stop reporting where the person went. So this match only
+  // drives the visibility toggle and the nav's active-link highlight.
+  const liveActive = /^\/live$/.test(path)
   // CC Dashboard is the default landing view: the root path (#/ or empty) shows
   // the overview, and the brand link points back here. The three sub-pages
   // (#/cc/skills-agents, #/cc/projects, #/cc/sessions) carry the table views;
@@ -536,6 +546,7 @@ function App() {
           settingsActive={settingsMatch !== null}
           scriptsActive={scriptsMatch !== null}
           terminalActive={terminalActive}
+          liveActive={liveActive}
           ccTab={ccTab}
           version={navVersion}
           unread={unread}
@@ -549,11 +560,22 @@ function App() {
               behavior; only the pane wrapper's visibility toggles alongside
               Terminal's, so navigating to/from Terminal never touches
               TerminalPage's own mounted state (arch.md §4.3). */}
-          <div className="main-slot-pane" style={{ visibility: terminalActive ? 'hidden' : 'visible' }}>
+          <div
+            className="main-slot-pane"
+            style={{ visibility: terminalActive || liveActive ? 'hidden' : 'visible' }}
+          >
             <main>{page}</main>
           </div>
           <div className="main-slot-pane" style={{ visibility: terminalActive ? 'visible' : 'hidden' }}>
             <TerminalPage />
+          </div>
+          {/* The third permanent pane (mesa task 855): the conversation keeps
+              speaking, and keeps reporting the route, while the person is
+              looking at whatever a `navigate` turn just opened. */}
+          <div className="main-slot-pane" style={{ visibility: liveActive ? 'visible' : 'hidden' }}>
+            <main>
+              <LiveView />
+            </main>
           </div>
         </div>
         <AgentSidebar

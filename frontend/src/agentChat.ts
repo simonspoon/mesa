@@ -177,6 +177,12 @@ export function isNearBottom(scrollTop: number, scrollHeight: number, clientHeig
  *
  * On a **multi-select** question the same digit *toggles* its row instead of
  * answering, which is why that case needs [`CHAT_COMMIT_KEYS`] after it.
+ *
+ * **One keystroke per press, never a batch.** Measured against the real CLI:
+ * two keys in a single write land as one — the second is dropped — and even
+ * two writes with no gap between them lose the second. So a card that "knew"
+ * the next step could not send it along with this one; every step is its own
+ * click, which is also what makes each one recoverable.
  */
 export function chatAnswerKeys(index: number): string {
   return String(index + 1)

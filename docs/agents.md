@@ -464,6 +464,14 @@ already use.
       call except a single single-select one ends on a **review** step
       (`Ready to submit your answers?`), whose `1` the card's "submit answers"
       sends. `chatNeedsReview` is that last rule.
+    - **Every press sends exactly one keystroke.** Two keys in one write land
+      as one against the real chooser (the second is dropped), and two writes
+      with no gap lose the second — so the card can never "helpfully" send the
+      next step along with this one, and does not try. Its steps are the
+      chooser's steps, one click each. What it deliberately does *not* offer
+      is the chooser's own extra rows: the free-text "Type something" (a
+      question mesa cannot render as a button — type it in the composer or the
+      terminal) and `Esc` to cancel.
     - It fails exactly as the composer does — `ptyPool.send` returning false
       says the socket is gone, and the card says so rather than pretending the
       click landed.

@@ -59,11 +59,10 @@ use super::store::{
 };
 use super::types::{
     CcAgentStat, CcChatAsk, CcChatOption, CcChatQuestion, CcChatTurn, CcChatTurnKind, CcDashboard,
-    CcDayPoint, CcGraphEdge, CcGraphNode,
-    CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText,
-    CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket, CcSessionChat, CcSessionDetail,
-    CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat,
-    CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
+    CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent,
+    CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket,
+    CcSessionChat, CcSessionDetail, CcSessionGraph, CcSessionModelStat, CcSessionRow,
+    CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -2791,8 +2790,7 @@ fn pending_ask(text: &str) -> Option<CcChatAsk> {
         .into_iter()
         .filter(|a| !answered.contains(&a.id))
         // A call with nothing to click is not something a reader can answer.
-        .filter(|a| a.questions.iter().any(|q| !q.options.is_empty()))
-        .next_back()
+        .rfind(|a| a.questions.iter().any(|q| !q.options.is_empty()))
 }
 
 /// The tool a session asks its multiple-choice questions with. Named once:
@@ -5355,7 +5353,10 @@ mod tests {
             Some("q2".to_string()),
             "a session asks one thing at a time: the last one is the open one"
         );
-        let sidechain = ask_line("q3").replace(r#""type":"assistant""#, r#""type":"assistant","isSidechain":true"#);
+        let sidechain = ask_line("q3").replace(
+            r#""type":"assistant""#,
+            r#""type":"assistant","isSidechain":true"#,
+        );
         assert_eq!(
             pending_ask(&sidechain),
             None,

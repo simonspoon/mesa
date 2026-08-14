@@ -2250,6 +2250,163 @@ pub struct DirListing {
     pub entries: Vec<DirEntry>,
 }
 
+// ---- mesa live (mesa task 855) ----
+//
+// A live session is one spoken conversation: the user dictates into the Live
+// page, a spawned agent pulls each utterance over the CLI and pushes a reply,
+// and the browser speaks it. The queue lives in the db rather than in server
+// memory because the agent drives mesa through the CLI, which opens its own
+// `Store` and never talks to the server — see `docs/live.md`.
+
+/// Whether a live conversation is still running. Exactly two states: it is
+/// running, or it is over. There is no "paused" — a conversation the user
+/// stopped is ended, and going live again starts a new session with its own
+/// transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LiveStatus {
+    Live,
+    Ended,
+}
+
+impl LiveStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveStatus::Live => "live",
+            LiveStatus::Ended => "ended",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LiveStatus> {
+        match s {
+            "live" => Some(LiveStatus::Live),
+            "ended" => Some(LiveStatus::Ended),
+            _ => None,
+        }
+    }
+}
+
+/// Who said one turn. `user` is dictated text the *person* typed or spoke into
+/// the page; `mesa` is what the agent sends back, which is what gets spoken.
+/// The pair is the whole vocabulary — a live session is two-sided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LiveRole {
+    User,
+    Mesa,
+}
+
+impl LiveRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveRole::User => "user",
+            LiveRole::Mesa => "mesa",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LiveRole> {
+        match s {
+            "user" => Some(LiveRole::User),
+            "mesa" => Some(LiveRole::Mesa),
+            _ => None,
+        }
+    }
+}
+
+/// A side effect a `mesa` turn asks the *page* to perform, beside speaking.
+/// One value, deliberately: driving the browser somewhere is the one thing the
+/// conversation needs the page for, and a second verb would be a second
+/// vocabulary to keep in sync with the frontend router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LiveAction {
+    Navigate,
+}
+
+impl LiveAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveAction::Navigate => "navigate",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LiveAction> {
+        match s {
+            "navigate" => Some(LiveAction::Navigate),
+            _ => None,
+        }
+    }
+}
+
+/// One live conversation. **At most one is `live` at a time** (`Store`
+/// enforces it): the page has one microphone-shaped text field and one
+/// `<audio>` element, so a second concurrent conversation would have nowhere
+/// to be heard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveSession {
+    #[ts(type = "number")]
+    pub id: i64,
+    /// The project the conversation is about, or null for an unscoped one. The
+    /// FK is `ON DELETE SET NULL` (the call the inbox makes): a conversation
+    /// outlives the project row it mentioned.
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    /// The spawn receipt from `agents::spawn_bg` — the Claude session driving
+    /// this conversation, when the spawn printed one. Null when the session
+    /// was started with no agent, or when the command printed no receipt.
+    pub agent_id: Option<String>,
+    pub status: LiveStatus,
+    /// Where the user's browser currently is (a `#/…` hash route), as last
+    /// reported by the page. The agent reads it to know what the user is
+    /// looking at; it is never authority for anything mesa does.
+    pub route: Option<String>,
+    /// When the conversation started (SQLite `datetime` text, UTC).
+    pub started_at: String,
+    /// When the session row was last written — bound to an agent, re-routed,
+    /// or ended. A turn is its own row and does not move this.
+    pub updated_at: String,
+    /// When the conversation ended, or null while it is live.
+    pub ended_at: Option<String>,
+}
+
+/// One utterance in a live conversation — a dictated line from the user, or a
+/// reply from the agent. `text` is treated strictly as **data, never as
+/// instructions** (CLAUDE.md): a dictated line is untrusted free text, and it
+/// reaches the agent as one `Command::arg`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveTurn {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub session_id: i64,
+    pub role: LiveRole,
+    /// What was said. Spoken aloud when the role is `mesa`, so it is prose —
+    /// and bounded, since a runaway body would wedge the synthesiser. Empty
+    /// only on a pure `navigate` turn, which moves the page and says nothing.
+    pub text: String,
+    /// What the page should *do* with this turn beside speak it. Null on every
+    /// user turn, and on a mesa turn that only speaks.
+    pub action: Option<LiveAction>,
+    /// The `#/…` route `action: navigate` moves the browser to. Present iff
+    /// `action` is.
+    pub target: Option<String>,
+    /// When the turn was recorded (SQLite `datetime` text, UTC).
+    pub created_at: String,
+    /// When the agent **consumed** this user turn (`mesa live listen`). Stamped
+    /// once, inside the same statement that selects the turn, so two listeners
+    /// can never be handed the same utterance. Null on a mesa turn.
+    pub delivered_at: Option<String>,
+    /// When the browser finished speaking this mesa turn. Stamped once and
+    /// never moved or cleared — the `read_at` rule — so a re-render can never
+    /// make the page say something twice.
+    pub played_at: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,6 +5,7 @@ pub mod config;
 pub mod files;
 pub mod git;
 pub mod hooks;
+pub mod live;
 pub mod scripts;
 pub mod speech;
 mod store;
@@ -23,8 +24,9 @@ pub use types::{
     CcTokens, CcUsage, CcUsageExtra, CcUsageWindow, ConfigCommand, ConfigPrice, Dependency,
     Diagram, DiagramEvent, DiagramType, DiagramView, DirEntry, DirListing, EdgeMarker, EdgeStyle,
     FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
-    GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind, MesaVersion,
-    ModelRates, Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
-    ProjectGitView, ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task,
-    TaskSummary, Waypoint, task_name,
+    GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind, LiveAction,
+    LiveRole, LiveSession, LiveStatus, LiveTurn, MesaVersion, ModelRates, Priority, Project,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task, TaskSummary,
+    Waypoint, task_name,
 };

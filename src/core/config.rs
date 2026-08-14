@@ -1,9 +1,9 @@
 //! User config: the command lines mesa uses when it starts a coding agent,
 //! and the per-model price table the CC Dashboard estimates cost from.
 //!
-//! mesa spawns an agent from exactly three places — the todo-watcher's
-//! dispatch, the inbox-watcher's triage, and the Agents surface's "add agent"
-//! button. Each used to be a hardcoded
+//! mesa spawns an agent from exactly four places — the todo-watcher's
+//! dispatch, the inbox-watcher's triage, the Agents surface's "add agent"
+//! button, and the live conversation's agent. Each used to be a hardcoded
 //! `claude --bg …` argv, so swapping the binary, the persona, or the slash
 //! command meant a rebuild. Each is now a **command template** in
 //! `~/.mesa/config.json`:
@@ -13,7 +13,8 @@
 //!   "commands": {
 //!     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
 //!     "inbox-watcher":  "claude --bg --agent swe --name {name} -- \"/inbox-triage {id}\"",
-//!     "agent-spawn":    "claude --bg --agent swe -- {prompt}"
+//!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
+//!     "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}"
 //!   }
 //! }
 //! ```
@@ -101,11 +102,13 @@ pub const TODO_WATCHER: &str = "todo-watcher";
 pub const INBOX_WATCHER: &str = "inbox-watcher";
 /// The Agents surface's "add agent" command (`docs/agents.md`).
 pub const AGENT_SPAWN: &str = "agent-spawn";
+/// The live conversation's agent (`docs/live.md`).
+pub const LIVE_AGENT: &str = "live-agent";
 
 /// Every configurable command, in the order the docs and the Settings page
 /// list them. The single source of truth for "which keys mesa configures" —
 /// [`default_command`] answers the same question one key at a time.
-pub const ACTIONS: [&str; 3] = [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN];
+pub const ACTIONS: [&str; 4] = [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN, LIVE_AGENT];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
 /// config file existed, spelled as a template. `{bin}`/`{agent}` carry the
@@ -125,6 +128,11 @@ pub const DEFAULT_INBOX_WATCHER: &str =
 /// driven by a request body, not a mesa record, and the prompt is optional —
 /// absent, the `-- {prompt}` pair drops out and the session starts idle.
 pub const DEFAULT_AGENT_SPAWN: &str = "{bin} --bg --agent {agent} -- {prompt}";
+/// Built-in default for [`LIVE_AGENT`]. The union of the two shapes above: a
+/// live session is a mesa record (so it has an `{id}` and a `{name}`) *and*
+/// carries a prompt mesa supplies — `core::live::agent_prompt`, the loop the
+/// conversation runs — so the feature works with no user configuration.
+pub const DEFAULT_LIVE_AGENT: &str = "{bin} --bg --agent {agent} --name {name} -- {prompt}";
 
 /// The built-in template for `action`, or `None` if `action` isn't one of
 /// [`ACTIONS`]. Public so the docs check and the API can report the shipped
@@ -134,6 +142,7 @@ pub fn default_command(action: &str) -> Option<&'static str> {
         TODO_WATCHER => Some(DEFAULT_TODO_WATCHER),
         INBOX_WATCHER => Some(DEFAULT_INBOX_WATCHER),
         AGENT_SPAWN => Some(DEFAULT_AGENT_SPAWN),
+        LIVE_AGENT => Some(DEFAULT_LIVE_AGENT),
         _ => None,
     }
 }
@@ -398,10 +407,16 @@ const PLACEHOLDER_ENV: [(&str, &str); 5] = [
 /// [`offered_placeholders`] lists their `{}` twins. Public so the Settings page
 /// can only ever advertise variables the handoff actually sets.
 pub fn offered_env_vars(action: &str) -> &'static [&'static str] {
-    if action == AGENT_SPAWN {
-        &["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"]
-    } else {
-        &["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"]
+    match action {
+        AGENT_SPAWN => &["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"],
+        LIVE_AGENT => &[
+            "MESA_BIN",
+            "MESA_AGENT",
+            "MESA_ID",
+            "MESA_NAME",
+            "MESA_PROMPT",
+        ],
+        _ => &["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"],
     }
 }
 
@@ -538,7 +553,10 @@ impl Vars<'_> {
             "agent" => (true, self.agent.map(str::to_string)),
             "id" => (action != AGENT_SPAWN, self.id.map(|i| i.to_string())),
             "name" => (action != AGENT_SPAWN, self.name.map(str::to_string)),
-            "prompt" => (action == AGENT_SPAWN, self.prompt.map(str::to_string)),
+            "prompt" => (
+                action == AGENT_SPAWN || action == LIVE_AGENT,
+                self.prompt.map(str::to_string),
+            ),
             _ => (false, None),
         };
         if !offered {
@@ -557,10 +575,11 @@ impl Vars<'_> {
 /// so the Settings page can only ever advertise placeholders [`Vars::lookup`]
 /// actually accepts.
 pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
-    if action == AGENT_SPAWN {
-        &["{bin}", "{agent}", "{prompt}"]
-    } else {
-        &["{bin}", "{agent}", "{id}", "{name}"]
+    match action {
+        AGENT_SPAWN => &["{bin}", "{agent}", "{prompt}"],
+        // The union: a live session is a mesa record *and* carries a prompt.
+        LIVE_AGENT => &["{bin}", "{agent}", "{id}", "{name}", "{prompt}"],
+        _ => &["{bin}", "{agent}", "{id}", "{name}"],
     }
 }
 
@@ -1388,6 +1407,14 @@ mod tests {
         );
         assert_eq!(settings[2].action, AGENT_SPAWN);
         assert_eq!(settings[2].placeholders, ["{bin}", "{agent}", "{prompt}"]);
+        // The live agent offers the union of the two shapes: it is a mesa
+        // record with an id and a name, and mesa supplies its prompt.
+        assert_eq!(settings[3].action, LIVE_AGENT);
+        assert_eq!(settings[3].default, DEFAULT_LIVE_AGENT);
+        assert_eq!(
+            settings[3].placeholders,
+            ["{bin}", "{agent}", "{id}", "{name}", "{prompt}"]
+        );
     }
 
     #[test]
@@ -1599,6 +1626,29 @@ mod tests {
                 "swe",
                 "--",
                 "look at the tests"
+            ]
+        );
+        // The live agent takes both halves: a named session id *and* the loop
+        // prompt mesa supplies. The prompt is one argv entry however long or
+        // hostile its text — it is never re-split after substitution.
+        let live = Vars {
+            bin: Some("claude"),
+            agent: Some("swe"),
+            id: Some(12),
+            name: Some("mesa live 12"),
+            prompt: Some("listen; then say \"hi\""),
+        };
+        assert_eq!(
+            expand(LIVE_AGENT, DEFAULT_LIVE_AGENT, &live).unwrap(),
+            [
+                "claude",
+                "--bg",
+                "--agent",
+                "swe",
+                "--name",
+                "mesa live 12",
+                "--",
+                "listen; then say \"hi\"",
             ]
         );
     }
@@ -1858,6 +1908,16 @@ mod tests {
         assert_eq!(
             settings[2].env_vars,
             ["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"]
+        );
+        assert_eq!(
+            settings[3].env_vars,
+            [
+                "MESA_BIN",
+                "MESA_AGENT",
+                "MESA_ID",
+                "MESA_NAME",
+                "MESA_PROMPT"
+            ]
         );
         // The two vocabularies line up one-for-one, in the same order.
         for row in &settings {
@@ -2366,7 +2426,7 @@ mod tests {
 
     #[test]
     fn every_default_names_a_known_action() {
-        for action in [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN] {
+        for action in [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN, LIVE_AGENT] {
             assert!(default_command(action).is_some(), "{action}");
         }
         assert_eq!(default_command("task-execute"), None);

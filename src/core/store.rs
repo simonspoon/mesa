@@ -7,8 +7,9 @@ use rusqlite::{Connection, OptionalExtension};
 use super::attachments;
 use super::types::{
     AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, EdgeMarker, EdgeStyle,
-    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, Priority, Project, Script, ScriptArg,
-    ScriptArgKind, Status, Task, TaskEvent, Waypoint, task_name,
+    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LiveAction, LiveRole, LiveSession,
+    LiveStatus, LiveTurn, Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Task,
+    TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -522,6 +523,39 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE frame_edges ADD COLUMN style TEXT;
      ALTER TABLE frame_edges ADD COLUMN from_marker TEXT;
      ALTER TABLE frame_edges ADD COLUMN to_marker TEXT;",
+    // Task 855: mesa live — one spoken conversation and its turns. The queue
+    // is a table rather than server memory because the agent driving the
+    // conversation reaches mesa through the CLI, which opens its own `Store`
+    // and never talks to the server: anything held in the server's process
+    // would be invisible to the one writer that matters.
+    //
+    // `project_id` is `ON DELETE SET NULL` (the call the inbox makes) — a
+    // conversation outlives the project row it was about. `session_id` is
+    // `ON DELETE CASCADE`: a turn is a part of a session, not a record of its
+    // own. The index is the read pattern — every list and every `listen` is
+    // "this session's turns, in id order".
+    "CREATE TABLE live_sessions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        agent_id    TEXT,
+        status      TEXT NOT NULL,
+        route       TEXT,
+        started_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        ended_at    TEXT
+    );
+    CREATE TABLE live_turns (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id   INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+        role         TEXT NOT NULL,
+        text         TEXT NOT NULL,
+        action       TEXT,
+        target       TEXT,
+        created_at   TEXT NOT NULL,
+        delivered_at TEXT,
+        played_at    TEXT
+    );
+    CREATE INDEX idx_live_turns_session ON live_turns(session_id, id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -664,6 +698,79 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         },
         project_name: row.get(11)?,
     })
+}
+
+// ---- mesa live (task 855) ----
+
+const LIVE_SESSION_COLUMNS: &str =
+    "id, project_id, agent_id, status, route, started_at, updated_at, ended_at";
+
+const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
+     created_at, delivered_at, played_at";
+
+/// Longest route mesa will store or navigate to. A route is a hash path the
+/// page already knows how to render, not free text, so the bound is generous
+/// but real — it lands in `window.location.hash`.
+const LIVE_ROUTE_MAX: usize = 200;
+
+/// Longest turn text. Bounded because a mesa turn is **spoken**: a runaway
+/// body would wedge the synthesiser rather than say anything.
+const LIVE_TEXT_MAX: usize = 8192;
+
+/// Most turns one `list_live_turns` call returns. The page polls with a
+/// cursor, so a bigger page would only ever be a slower first paint.
+const LIVE_TURNS_MAX: i64 = 500;
+
+fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession> {
+    let status: String = row.get(3)?;
+    Ok(LiveSession {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        status: LiveStatus::parse(&status).expect("invalid live session status in db"),
+        route: row.get(4)?,
+        started_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        ended_at: row.get(7)?,
+    })
+}
+
+fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
+    let role: String = row.get(2)?;
+    let action: Option<String> = row.get(4)?;
+    Ok(LiveTurn {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        role: LiveRole::parse(&role).expect("invalid live turn role in db"),
+        text: row.get(3)?,
+        action: action.map(|a| LiveAction::parse(&a).expect("invalid live turn action in db")),
+        target: row.get(5)?,
+        created_at: row.get(6)?,
+        delivered_at: row.get(7)?,
+        played_at: row.get(8)?,
+    })
+}
+
+/// The one route rule, shared by `set_live_route` and a `navigate` turn's
+/// `target` so the page can never be sent somewhere the session couldn't
+/// record: non-empty, bounded, and a `#/` hash path (the app's only routing
+/// vocabulary — see `App.tsx`'s route inventory).
+fn validate_live_route(route: &str) -> Result<String> {
+    let route = route.trim();
+    if route.is_empty() {
+        return Err(Error::Validation("route must not be empty".into()));
+    }
+    if route.chars().count() > LIVE_ROUTE_MAX {
+        return Err(Error::Validation(format!(
+            "route must be at most {LIVE_ROUTE_MAX} characters"
+        )));
+    }
+    if !route.starts_with("#/") {
+        return Err(Error::Validation(format!(
+            "route must start with \"#/\" (got {route:?})"
+        )));
+    }
+    Ok(route.to_string())
 }
 
 const SCRIPT_COLUMNS: &str =
@@ -3319,6 +3426,272 @@ impl Store {
         let item = self.get_inbox_item(id)?;
         self.conn.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
         Ok(item)
+    }
+
+    // ---- mesa live (task 855) ----
+
+    /// Starts a live conversation. **At most one session is `live` at a
+    /// time**: starting while one is running is a `conflict` naming the id
+    /// that is already live, because the Live page has one text field and one
+    /// `<audio>` element and a second conversation would have nowhere to be
+    /// heard. An unknown `project_id` is a `validation` error, mirroring
+    /// `assign_inbox_item`.
+    pub fn start_live_session(&mut self, project_id: Option<i64>) -> Result<LiveSession> {
+        if let Some(id) = project_id {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation(format!("project {id} not found")));
+            }
+        }
+        if let Some(live) = self.current_live_session()? {
+            return Err(Error::Conflict(format!(
+                "live session {} is already running; stop it first",
+                live.id
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO live_sessions (project_id, status, started_at, updated_at) \
+             VALUES (?1, ?2, datetime('now'), datetime('now'))",
+            (project_id, LiveStatus::Live.as_str()),
+        )?;
+        self.get_live_session(self.conn.last_insert_rowid())
+    }
+
+    /// The running conversation, or `None`. Every `mesa live` command but
+    /// `start` resolves its session through this — there is no session
+    /// argument anywhere, because there is only ever one.
+    pub fn current_live_session(&self) -> Result<Option<LiveSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {LIVE_SESSION_COLUMNS} FROM live_sessions \
+                     WHERE status = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                [LiveStatus::Live.as_str()],
+                row_to_live_session,
+            )
+            .optional()?)
+    }
+
+    pub fn get_live_session(&self, id: i64) -> Result<LiveSession> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIVE_SESSION_COLUMNS} FROM live_sessions WHERE id = ?1"),
+                [id],
+                row_to_live_session,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("live session {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Ends a conversation. **Idempotent**: ending an already-ended session
+    /// returns it unchanged rather than erroring, so a stop the user pressed
+    /// twice — or a page and an agent stopping at once — is not a failure.
+    /// Like every other stamp in mesa, `ended_at` records the first ending.
+    pub fn end_live_session(&mut self, id: i64) -> Result<LiveSession> {
+        // The read first, for the `not_found` the caller expects; the write
+        // then decides on the row itself (see `mark_inbox_item_read`) so a
+        // second stopper cannot move the stamp the first one set.
+        self.get_live_session(id)?;
+        self.conn.execute(
+            "UPDATE live_sessions SET status = ?2, ended_at = datetime('now'), \
+             updated_at = datetime('now') WHERE id = ?1 AND status = ?3",
+            (id, LiveStatus::Ended.as_str(), LiveStatus::Live.as_str()),
+        )?;
+        self.get_live_session(id)
+    }
+
+    /// Records the spawn receipt — which Claude session is driving this
+    /// conversation. `None` clears it, which is what a spawn that printed no
+    /// receipt leaves behind (`agents::spawn_bg` returns `Option`).
+    pub fn bind_live_agent(&mut self, id: i64, agent_id: Option<&str>) -> Result<LiveSession> {
+        self.get_live_session(id)?;
+        self.conn.execute(
+            "UPDATE live_sessions SET agent_id = ?2, updated_at = datetime('now') WHERE id = ?1",
+            (id, agent_id),
+        )?;
+        self.get_live_session(id)
+    }
+
+    /// The page reporting where the user's browser is. Bounded by
+    /// [`validate_live_route`] — it is a hash route, not free text.
+    pub fn set_live_route(&mut self, id: i64, route: &str) -> Result<LiveSession> {
+        let route = validate_live_route(route)?;
+        self.get_live_session(id)?;
+        self.conn.execute(
+            "UPDATE live_sessions SET route = ?2, updated_at = datetime('now') WHERE id = ?1",
+            (id, &route),
+        )?;
+        self.get_live_session(id)
+    }
+
+    /// Records one utterance. The single write path for turns, and where every
+    /// shape rule lives:
+    ///
+    /// - the session must exist and still be `live` — a turn on a dead
+    ///   conversation is a caller bug, not a silent no-op, so it is a
+    ///   `validation` error rather than a swallowed write;
+    /// - a `user` turn carries text and nothing else: the page dictates, it
+    ///   does not drive itself;
+    /// - a `mesa` turn must say something **or** do something (a pure
+    ///   `navigate` speaks nothing, which is why empty text is legal there and
+    ///   nowhere else);
+    /// - an `action` must carry a `target` that passes the route rule, and a
+    ///   `target` without an action is a `validation` error rather than a
+    ///   field nothing reads;
+    /// - `text` is bounded ([`LIVE_TEXT_MAX`]) because it is spoken.
+    pub fn add_live_turn(
+        &mut self,
+        session_id: i64,
+        role: LiveRole,
+        text: &str,
+        action: Option<LiveAction>,
+        target: Option<&str>,
+    ) -> Result<LiveTurn> {
+        let session = self
+            .conn
+            .query_row(
+                &format!("SELECT {LIVE_SESSION_COLUMNS} FROM live_sessions WHERE id = ?1"),
+                [session_id],
+                row_to_live_session,
+            )
+            .optional()?
+            .ok_or_else(|| Error::Validation(format!("live session {session_id} not found")))?;
+        if session.status != LiveStatus::Live {
+            return Err(Error::Validation(format!(
+                "live session {session_id} has ended"
+            )));
+        }
+        let text = text.trim();
+        if text.chars().count() > LIVE_TEXT_MAX {
+            return Err(Error::Validation(format!(
+                "turn text must be at most {LIVE_TEXT_MAX} characters"
+            )));
+        }
+        match role {
+            LiveRole::User => {
+                if text.is_empty() {
+                    return Err(Error::Validation("a user turn must have text".into()));
+                }
+                if action.is_some() {
+                    return Err(Error::Validation(
+                        "a user turn cannot carry an action".into(),
+                    ));
+                }
+            }
+            LiveRole::Mesa => {
+                if text.is_empty() && action.is_none() {
+                    return Err(Error::Validation(
+                        "a mesa turn must have text or an action".into(),
+                    ));
+                }
+            }
+        }
+        let target = match (action, target) {
+            (Some(LiveAction::Navigate), Some(t)) => Some(validate_live_route(t)?),
+            (Some(LiveAction::Navigate), None) => {
+                return Err(Error::Validation(
+                    "a navigate turn must name a target route".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::Validation(
+                    "a target route needs an action of \"navigate\"".into(),
+                ));
+            }
+            (None, None) => None,
+        };
+        self.conn.execute(
+            "INSERT INTO live_turns (session_id, role, text, action, target, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            (
+                session_id,
+                role.as_str(),
+                text,
+                action.map(|a| a.as_str()),
+                target.as_deref(),
+            ),
+        )?;
+        self.get_live_turn(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_live_turn(&self, id: i64) -> Result<LiveTurn> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIVE_TURN_COLUMNS} FROM live_turns WHERE id = ?1"),
+                [id],
+                row_to_live_turn,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("live turn {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Hands the agent the oldest undelivered user utterance, stamping it
+    /// delivered on the way out — `None` when there is nothing to say.
+    ///
+    /// The select and the stamp are **one statement**: the CLI opens its own
+    /// `Store` beside the server's, so a read-then-update pair would let two
+    /// listeners be handed the same utterance and answer it twice.
+    pub fn next_user_turn(&mut self, session_id: i64) -> Result<Option<LiveTurn>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "UPDATE live_turns SET delivered_at = datetime('now') \
+                     WHERE id = (SELECT id FROM live_turns \
+                                 WHERE session_id = ?1 AND role = ?2 AND delivered_at IS NULL \
+                                 ORDER BY id LIMIT 1) \
+                     RETURNING {LIVE_TURN_COLUMNS}"
+                ),
+                (session_id, LiveRole::User.as_str()),
+                row_to_live_turn,
+            )
+            .optional()?)
+    }
+
+    /// A session's turns in id order — the transcript, and the page's poll.
+    /// `after` is the cursor (exclusive); `limit` is clamped into
+    /// `1..=`[`LIVE_TURNS_MAX`], so a caller cannot ask for the whole table or
+    /// for nothing.
+    pub fn list_live_turns(
+        &self,
+        session_id: i64,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<LiveTurn>> {
+        let limit = limit.clamp(1, LIVE_TURNS_MAX);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIVE_TURN_COLUMNS} FROM live_turns \
+             WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map((session_id, after, limit), row_to_live_turn)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Marks a turn **spoken**, stamping `played_at` the first time and never
+    /// again — the `read_at` rule, and for the same reason: the page decides a
+    /// turn has been heard, and a re-render must not make it say it twice.
+    pub fn mark_live_turn_played(&mut self, id: i64) -> Result<LiveTurn> {
+        self.get_live_turn(id)?;
+        self.conn.execute(
+            "UPDATE live_turns SET played_at = datetime('now') \
+             WHERE id = ?1 AND played_at IS NULL",
+            [id],
+        )?;
+        self.get_live_turn(id)
     }
 
     // ---- scripts (user-authored shell) ----
@@ -7799,6 +8172,420 @@ mod tests {
         assert!(err.to_string().contains("999"));
         // The failed assignment left the item untouched in the inbox.
         assert!(store.get_inbox_item(item.id).is_ok());
+    }
+
+    // ---- mesa live (task 855) ----
+
+    /// The single-session rule: the Live page has one text field and one
+    /// `<audio>` element, so a second live conversation would have nowhere to
+    /// be heard. Starting again is only possible once the first has ended.
+    #[test]
+    fn only_one_live_session_runs_at_a_time() {
+        let (mut store, _dir) = temp_store();
+        let first = store.start_live_session(None).unwrap();
+        assert_eq!(first.status, LiveStatus::Live);
+        assert_eq!(first.ended_at, None);
+        assert_eq!(store.current_live_session().unwrap().unwrap().id, first.id);
+
+        let err = store.start_live_session(None).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains(&first.id.to_string()));
+
+        store.end_live_session(first.id).unwrap();
+        assert!(store.current_live_session().unwrap().is_none());
+        let second = store.start_live_session(None).unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    #[test]
+    fn start_live_session_binds_a_project_and_refuses_an_unknown_one() {
+        let (mut store, _dir) = temp_store();
+        let project = store
+            .create_project("talking about this", None, None, None, None)
+            .unwrap();
+        let session = store.start_live_session(Some(project.id)).unwrap();
+        assert_eq!(session.project_id, Some(project.id));
+        store.end_live_session(session.id).unwrap();
+
+        let err = store.start_live_session(Some(999)).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err:?}");
+        assert!(err.to_string().contains("999"));
+        // A refused start left no session behind.
+        assert!(store.current_live_session().unwrap().is_none());
+    }
+
+    /// The FK is `ON DELETE SET NULL`, the call the inbox makes: a
+    /// conversation outlives the project row it was about.
+    #[test]
+    fn deleting_the_project_leaves_the_live_session() {
+        let (mut store, _dir) = temp_store();
+        let project = store
+            .create_project("doomed", None, None, None, None)
+            .unwrap();
+        let session = store.start_live_session(Some(project.id)).unwrap();
+        store.delete_project(project.id).unwrap();
+        let after = store.get_live_session(session.id).unwrap();
+        assert_eq!(after.project_id, None);
+        assert_eq!(after.status, LiveStatus::Live);
+    }
+
+    /// Ending is idempotent — a stop pressed twice, or a page and an agent
+    /// stopping at once, is not a failure and never moves the stamp.
+    #[test]
+    fn end_live_session_is_idempotent() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let ended = store.end_live_session(session.id).unwrap();
+        assert_eq!(ended.status, LiveStatus::Ended);
+        let stamp = ended.ended_at.clone().expect("ended_at is stamped");
+
+        let again = store.end_live_session(session.id).unwrap();
+        assert_eq!(again.ended_at, Some(stamp));
+        assert_eq!(again.updated_at, ended.updated_at);
+        assert!(matches!(
+            store.end_live_session(999),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn bind_live_agent_records_and_clears_the_spawn_receipt() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert_eq!(session.agent_id, None);
+        let bound = store.bind_live_agent(session.id, Some("abc123")).unwrap();
+        assert_eq!(bound.agent_id.as_deref(), Some("abc123"));
+        // A spawn that printed no receipt clears it rather than lying.
+        let cleared = store.bind_live_agent(session.id, None).unwrap();
+        assert_eq!(cleared.agent_id, None);
+        assert!(matches!(
+            store.bind_live_agent(999, None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A route is a hash path the page already renders, not free text — the
+    /// one rule `set_live_route` and a `navigate` turn's target share.
+    #[test]
+    fn set_live_route_takes_a_hash_route_and_nothing_else() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let routed = store
+            .set_live_route(session.id, "  #/projects/3/files  ")
+            .unwrap();
+        assert_eq!(routed.route.as_deref(), Some("#/projects/3/files"));
+        assert_ne!(routed.updated_at, "");
+
+        for bad in [
+            "",
+            "   ",
+            "/projects/3",
+            "https://example.com",
+            &format!("#/{}", "x".repeat(LIVE_ROUTE_MAX)),
+        ] {
+            let err = store.set_live_route(session.id, bad).unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{bad:?}: {err:?}");
+        }
+        // …and the route the last good call stored is still there.
+        assert_eq!(
+            store.get_live_session(session.id).unwrap().route.as_deref(),
+            Some("#/projects/3/files")
+        );
+    }
+
+    #[test]
+    fn add_live_turn_records_both_sides_of_the_conversation() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let said = store
+            .add_live_turn(
+                session.id,
+                LiveRole::User,
+                "  what is on the board  ",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(said.role, LiveRole::User);
+        assert_eq!(said.text, "what is on the board");
+        assert_eq!(said.action, None);
+        assert_eq!(said.delivered_at, None);
+        assert_eq!(said.played_at, None);
+
+        let reply = store
+            .add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                "Three tasks are open.",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reply.role, LiveRole::Mesa);
+        // A pure navigate speaks nothing — the one place empty text is legal.
+        let moved = store
+            .add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                "",
+                Some(LiveAction::Navigate),
+                Some("#/projects/1"),
+            )
+            .unwrap();
+        assert_eq!(moved.action, Some(LiveAction::Navigate));
+        assert_eq!(moved.target.as_deref(), Some("#/projects/1"));
+        assert_eq!(moved.text, "");
+
+        let all = store.list_live_turns(session.id, None, 100).unwrap();
+        assert_eq!(
+            all.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![said.id, reply.id, moved.id]
+        );
+    }
+
+    #[test]
+    fn add_live_turn_enforces_every_shape_rule() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let long = "a".repeat(LIVE_TEXT_MAX + 1);
+        let cases = [
+            ("a user turn with no text", LiveRole::User, "  ", None, None),
+            (
+                "a user turn driving the page",
+                LiveRole::User,
+                "go there",
+                Some(LiveAction::Navigate),
+                Some("#/inbox"),
+            ),
+            (
+                "a mesa turn that neither speaks nor acts",
+                LiveRole::Mesa,
+                "",
+                None,
+                None,
+            ),
+            (
+                "a navigate with no target",
+                LiveRole::Mesa,
+                "opening",
+                Some(LiveAction::Navigate),
+                None,
+            ),
+            (
+                "a target with no action",
+                LiveRole::Mesa,
+                "opening",
+                None,
+                Some("#/inbox"),
+            ),
+            (
+                "a target that is not a route",
+                LiveRole::Mesa,
+                "opening",
+                Some(LiveAction::Navigate),
+                Some("/inbox"),
+            ),
+            (
+                "text past the spoken bound",
+                LiveRole::Mesa,
+                long.as_str(),
+                None,
+                None,
+            ),
+        ];
+        for (label, role, text, action, target) in cases {
+            let err = store
+                .add_live_turn(session.id, role, text, action, target)
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{label}: {err:?}");
+        }
+        assert!(
+            store
+                .list_live_turns(session.id, None, 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A turn on a session that never existed, or that has ended, is a
+        // caller bug — a validation error, not a silently swallowed write.
+        assert!(matches!(
+            store.add_live_turn(999, LiveRole::User, "hello", None, None),
+            Err(Error::Validation(_))
+        ));
+        store.end_live_session(session.id).unwrap();
+        let err = store
+            .add_live_turn(session.id, LiveRole::User, "hello", None, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err:?}");
+    }
+
+    /// The delivery stamp is what makes the loop safe: two listeners must
+    /// never be handed the same utterance, and a delivered turn is never
+    /// offered again.
+    #[test]
+    fn next_user_turn_hands_out_each_utterance_exactly_once() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert!(store.next_user_turn(session.id).unwrap().is_none());
+
+        let first = store
+            .add_live_turn(session.id, LiveRole::User, "one", None, None)
+            .unwrap();
+        let second = store
+            .add_live_turn(session.id, LiveRole::User, "two", None, None)
+            .unwrap();
+        // A mesa turn is not something to listen for.
+        store
+            .add_live_turn(session.id, LiveRole::Mesa, "hello there", None, None)
+            .unwrap();
+
+        let got = store.next_user_turn(session.id).unwrap().unwrap();
+        assert_eq!(got.id, first.id);
+        assert!(got.delivered_at.is_some(), "delivered on the way out");
+        let got = store.next_user_turn(session.id).unwrap().unwrap();
+        assert_eq!(got.id, second.id, "oldest first");
+        // Nothing left, and nothing handed out twice.
+        assert!(store.next_user_turn(session.id).unwrap().is_none());
+        assert!(
+            store
+                .list_live_turns(session.id, None, 100)
+                .unwrap()
+                .iter()
+                .filter(|t| t.role == LiveRole::User)
+                .all(|t| t.delivered_at.is_some())
+        );
+        // Another session's turns are not this one's.
+        store.end_live_session(session.id).unwrap();
+        let other = store.start_live_session(None).unwrap();
+        assert!(store.next_user_turn(other.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_live_turns_walks_a_cursor_and_clamps_its_limit() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let ids: Vec<i64> = (0..5)
+            .map(|i| {
+                store
+                    .add_live_turn(session.id, LiveRole::User, &format!("line {i}"), None, None)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+
+        let after = store
+            .list_live_turns(session.id, Some(ids[1]), 100)
+            .unwrap();
+        assert_eq!(
+            after.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ids[2..].to_vec()
+        );
+        assert_eq!(store.list_live_turns(session.id, None, 2).unwrap().len(), 2);
+        // A limit outside the bounds is clamped, never honored literally: 0
+        // would poll forever seeing nothing, and a huge one would page the
+        // whole table into one response.
+        assert_eq!(store.list_live_turns(session.id, None, 0).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_live_turns(session.id, None, i64::MAX)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(
+            store
+                .list_live_turns(session.id, Some(ids[4]), 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The `read_at` rule again: the page decides a turn has been heard, and a
+    /// re-render must never make it say the same thing twice.
+    #[test]
+    fn mark_live_turn_played_stamps_once() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let turn = store
+            .add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                "Three tasks are open.",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(turn.played_at, None);
+
+        let played = store.mark_live_turn_played(turn.id).unwrap();
+        let stamp = played.played_at.clone().expect("played_at is stamped");
+        let again = store.mark_live_turn_played(turn.id).unwrap();
+        assert_eq!(again.played_at, Some(stamp));
+        assert!(matches!(
+            store.mark_live_turn_played(999),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// Turns are parts of a session, not records of their own: the FK is
+    /// `ON DELETE CASCADE`, so nothing outlives the conversation it was said
+    /// in.
+    #[test]
+    fn deleting_a_live_session_takes_its_turns_with_it() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store
+            .add_live_turn(session.id, LiveRole::User, "hello", None, None)
+            .unwrap();
+        store
+            .add_live_turn(session.id, LiveRole::Mesa, "Hello back.", None, None)
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM live_sessions WHERE id = ?1", [session.id])
+            .unwrap();
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM live_turns", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// The live tables arrive by migration, so a db written before this
+    /// feature upgrades into them rather than needing a fresh file.
+    #[test]
+    fn the_live_tables_arrive_by_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        // Index 43 — migration 44 — pinned, NOT `MIGRATIONS.len() - 1`: the
+        // positional form silently re-aims at whatever ships next.
+        const LIVE: usize = 43;
+        assert!(
+            MIGRATIONS[LIVE].contains("CREATE TABLE live_sessions"),
+            "migration {LIVE} is no longer the mesa live migration — a shipped \
+             migration was edited or reordered, which is never allowed"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..LIVE] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", LIVE as i64)
+                .unwrap();
+            conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
+                .unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.list_projects().unwrap().len(), 1);
+        assert!(store.current_live_session().unwrap().is_none());
+        let session = store.start_live_session(None).unwrap();
+        store
+            .add_live_turn(session.id, LiveRole::User, "hello", None, None)
+            .unwrap();
+        assert_eq!(
+            store.list_live_turns(session.id, None, 10).unwrap().len(),
+            1
+        );
     }
 
     // ---- scripts (user-authored shell) ----

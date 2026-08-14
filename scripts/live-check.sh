@@ -133,10 +133,12 @@ export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
 # `--no-git` throughout: a scripted fixture repo would produce a root commit
 # that collides with other gates' fixtures under the DB-unique root_commit
 # binding (see scripts/cli-check.sh).
-WORKDIR="$TMP/work"
-mkdir -p "$WORKDIR"
+mkdir -p "$TMP/work"
 PROJ=$("$MESA" project create "Live gate project" --no-git | jq -r .id)
-"$MESA" project update "$PROJ" --path "$WORKDIR" >/dev/null
+# Read the folder back rather than assuming it: `project update --path` stores
+# the CANONICAL path, and on macOS $TMPDIR lives under a /var -> /private/var
+# symlink, so the stored value is what the spawn's cwd must equal.
+WORKDIR=$("$MESA" project update "$PROJ" --path "$TMP/work" | jq -r .local_path)
 
 # =====================================================================
 # 1. The CLI with nobody talking to mesa

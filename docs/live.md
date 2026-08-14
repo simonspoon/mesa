@@ -154,6 +154,28 @@ whole mesa CLI for actually changing things.
 already delivered or spoken, and reading it delivers nothing. Only `listen`
 takes an utterance off the queue.
 
+### Put every flag before the message
+
+`live say` takes its message as a **trailing var arg** — everything after `say`
+that is not a leading flag is the message, quoting optional, words joined. So:
+
+```bash
+mesa live say --quiet "Working on it."     # right: --quiet is a flag
+mesa live say "Working on it." --quiet     # WRONG: mesa says "Working on it. --quiet"
+```
+
+The second form is not an error and prints no warning; it speaks the flag. This
+is exactly `inbox add`'s behaviour (its `--task`/`--author`/`--kind` go before
+the text for the same reason) and it stays that way — a message must be able to
+contain anything, including something that looks like a flag, and only position
+can settle which is which. But it is a sharper trap here, because the spoken
+result is what the person **hears**, and because `AGENT_PROMPT` tells the
+session to run this command in a loop. `--quiet` is the only flag `say` has, so
+the whole rule is: put it first.
+
+`live navigate` is not affected — its route is a plain positional and `--say`
+takes exactly one value.
+
 - **`listen` timing out is data, not an error.** It polls the store every
   500 ms and exits **0** printing `null` when `--wait` elapses, so the agent's
   loop is `listen` → maybe reply → `listen` again, with no error handling in
@@ -167,15 +189,20 @@ takes an utterance off the queue.
   inbox-watcher's fallback, for the same reason: a conversation is not scoped
   to a checkout (its `project_id` is optional and it outlives that project), so
   a missing or stale path is a session with no working folder, not a bad
-  request. A spawn that printed no receipt leaves `agent_id` null
-  (`docs/config.md`, "what a replacement command owes mesa"); that is not a
-  failure.
-- **A failed spawn ends the session it just opened**, on both surfaces, and
-  reports `unavailable`. The alternative — a live session with a null
-  `agent_id` — is a conversation nothing is listening to, and because at most
-  one session may be live it would also turn the obvious retry into a
-  `conflict` until someone stopped it by hand. Ending it costs the caller one
-  error and a retry instead.
+  request. Both surfaces name the session the same way — `<project>: live <id>`,
+  or `mesa live <id>` when the conversation is bound to no project — so one
+  conversation reads the same in the Agents sidebar however it was started.
+- **A failed spawn ends the session it just opened**, on both surfaces —
+  `live start` exits **1** with code **`unavailable`** (the code reserved for
+  something outside mesa, here the `claude` binary, not being startable), and
+  the store is back where it was. The alternative — leaving a live session with
+  a null `agent_id` — is a conversation nothing is listening to and that will
+  therefore never answer, and because at most one session may be live it would
+  also turn the obvious retry, `mesa live start` again, into a `conflict` until
+  someone stopped it by hand. Ending it costs the caller one error and a retry
+  instead. (A spawn that *succeeded* but printed no receipt is a different
+  case: `agent_id` stays null, the session stays live, and that is not a
+  failure.)
 - **`--no-agent`** starts the session without spawning anything, which is how
   the gate script — and a person driving both halves by hand — use it.
 - **Every command but `start` and `status` is `not_found` with no session
@@ -194,7 +221,7 @@ takes an utterance off the queue.
 
 | Route | Answers | Gate |
 | --- | --- | --- |
-| `GET /api/live?after=<id>` | `{session: LiveSession \| null, turns: [LiveTurn]}` | standard read |
+| `GET /api/live?after=<id>` | one `LiveState` | standard read |
 | `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
 | `DELETE /api/live` | the ended session | `require_agent_access` |
 | `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
@@ -204,13 +231,25 @@ takes an utterance off the queue.
 
 Start and stop sit on `/api/live` as **verbs** rather than on an
 `/api/live/{id}` pair: there is only ever one live session, so there is no id
-for a caller to name. `GET /api/live` is the page's whole read — session plus
-turns after the cursor, one request per poll — and with nothing running it
-answers `{"session": null, "turns": []}` and **200**: an idle page is this
-route's normal state, and the button it renders is exactly what fixes it. The
-three ordinary writes resolve the current session themselves, so with none live
-each is `not_found` with a hint naming `POST /api/live`, the same shape the
-CLI's not-found hints use.
+for a caller to name.
+
+`GET /api/live` is the page's whole read — the running session plus the turns
+after the cursor it asked from, one request per poll. It answers a **real
+type**, `LiveState { session: Option<LiveSession>, turns: Vec<LiveTurn> }` in
+`src/core/types.rs`, not an ad-hoc JSON envelope, so the page's shape is
+generated into `frontend/src/types/LiveState.ts` by ts-rs like everything else
+it reads. `LiveState` is a **view, never stored** — assembled per request out
+of the one live session and a slice of its turns, the same way `ProjectAgents`
+pairs a folder with the sessions found under it. With nothing running it is
+`{"session": null, "turns": []}` and **200**: an idle page is this route's
+normal state, not an error, and the button such a page renders is exactly what
+fixes it. One poll carries at most 500 turns — the ceiling `Store` clamps to
+anyway — so a conversation longer than that is read in cursor-sized pages,
+which is what `?after=` is for.
+
+The three ordinary writes resolve the current session themselves, so with none
+live each is `not_found` with a hint naming `POST /api/live`, the same shape
+the CLI's not-found hints use.
 
 Why each gate is what it is:
 
@@ -270,11 +309,12 @@ passes `inboxSpeakUrl(id)` and Live passes `liveSpeakUrl(id)`. That is the only
 change to the inbox's speech path.
 
 The Live page consequences follow from the same rules the inbox lives under:
-there is **one `<audio>` element for the page**, and the **Go live** press is
-the gesture that unlocks audio — the `AudioContext` is created and `resume()`d
-inside that handler, whether or not it turns out to be needed, because a
-gesture is what a phone weighs and the element failure that says decoding is
-needed arrives long after the gesture is gone. Every mesa turn after that
+there is **one `<audio>` element for the page**, and a press on the primary
+control — **Go live**, or **Listen** when the conversation is already
+running — is the gesture that unlocks audio. The `AudioContext` is created and
+`resume()`d inside that one handler, on every press, whether or not this press
+turns out to need it: a gesture is what a phone weighs, and the element failure
+that says decoding is needed arrives long after the gesture is gone. Every mesa turn after that
 reuses the element and the clock that press unlocked, spoken **oldest first,
 one at a time**, each stamped `played` when it finishes. `played_at` only comes
 back on the *next* poll, so the page also holds the turns it has taken in
@@ -295,11 +335,32 @@ project tab and there is only ever one. It has a command-palette entry too.
   feature, and a page the route unmounted would be torn down by the very
   navigation it just performed — cutting its own sentence off mid-word and
   stopping the route reports below.
-- **Go live / End** is the one button that starts and stops the conversation
-  (`POST` / `DELETE /api/live`), and it is where the audio gesture is spent.
-  Until *this* browser has spent that press, nothing is spoken and nothing
-  navigates here — the conversation may well be live on another device, but
-  this page has not joined it.
+- **The controls are a three-state toggle, not one button.** Nothing live:
+  **Go live** (`POST /api/live`). Live in a browser that has had a press:
+  **End** (`DELETE /api/live`). Live in a browser that has **not** had one:
+  **Listen**, with **End** beside it. A press in flight replaces the label
+  (`Going live…`, `Ending…`) and disables it, so a slow spawn cannot be clicked
+  twice.
+- **`Listen` calls no route at all** — it exists purely to *be a gesture*, the
+  thing a browser weighs its autoplay policy against, and it starts the run on
+  whatever the conversation has already said. Two ordinary situations produce a
+  live session with no gesture behind it: one started from `mesa live start`,
+  and a page reloaded mid-conversation. Before this button the only control on
+  offer there was `End`, so mesa talked and nobody heard a word, and the one
+  press available destroyed the conversation. `End` moves aside to make room
+  for `Listen` rather than being taken away.
+- **Joining does not replay from the top.** Turns already heard carry the
+  server's `played_at`, and `nextUnplayed` skips them, so a browser that joins
+  late picks up where the conversation is rather than reciting it.
+- **Whether *this* browser has audio is a different question from whether the
+  conversation is running**, and the page tracks it separately (`unlocked`).
+  Until a press here, nothing is spoken and nothing navigates on this page —
+  the conversation may well be live on another device.
+- **The status line under the controls says what is actually happening**, and
+  the last failure outranks everything: a page reading "listening" while the
+  last call failed is the one way that line can lie. It also calls out a live
+  session with **no agent bound**, which would otherwise listen for ever and
+  never answer.
 - The **dictation textarea** carries a visible hint that this is where system
   dictation types. Enter sends, Shift+Enter opens a line, and an `isComposing`
   guard keeps an IME's Enter out of it — the same composer contract as the
@@ -319,8 +380,11 @@ project tab and there is only ever one. It has a command-palette entry too.
   frontend-test rule): `frontend/src/liveTurns.ts` (cursor advance, merging a
   poll's turns into the transcript, next-unplayed selection, what a turn
   speaks, whether it navigates, grouping and labelling) and
-  `frontend/src/liveSession.ts` (the is-live predicate, the button's label and
-  pending state, the status line), each with a sibling vitest file.
+  `frontend/src/liveSession.ts` (the is-live predicate, `liveControls` — the
+  four presses above, since "no session", "an ended session", "a session still
+  starting" and "a session running in a browser with no gesture" are four
+  different buttons and the label has to be right in each — and the status
+  line), each with a sibling vitest file.
 
 ## Config
 

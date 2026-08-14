@@ -3,12 +3,12 @@
 **Mesa live** is a conversation mode: a person talks to mesa, mesa talks back,
 and a dedicated Claude Code session does whatever they ask. Tables
 `live_sessions` and `live_turns` (migration index 43), the `mesa live` CLI
-group, `/api/live*`, and the `#/live` page.
+group, `/api/live*`, and the header's conversation hub (`LiveHub`).
 
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
 
-- **Person → mesa is typed text.** The Live page has a plain `<textarea>`, and
+- **Person → mesa is typed text.** The hub's popup has a plain `<textarea>`, and
   the person's *own* system dictation (macOS Dictation, a phone keyboard's mic
   key, or their fingers) types into it. **mesa ships no speech-to-text,
   captures no microphone, and accepts no audio request body.** See
@@ -26,7 +26,7 @@ A live session is a loop the **agent** runs, not one mesa drives:
 1. `mesa live listen --wait 60` — the agent asks for the next thing the person
    said. A turn, or `null` when nobody spoke for that long.
 2. It does the work with the ordinary mesa CLI and its own tools.
-3. `mesa live say "…"` — the reply, which the page speaks.
+3. `mesa live say "…"` — the reply, which the browser speaks.
 4. `mesa live navigate '#/…' --say "…"` — optionally, it moves the person's
    browser as it answers.
 5. `mesa live status` printing `null` (or an `ended` session) is how it stops.
@@ -42,7 +42,7 @@ the utterance to the database and lets the agent come and get it, over the CLI
 it already uses for everything else.
 
 The consequence at the other end is the same shape mesa already has everywhere:
-**there is no push channel to the browser either**, so the Live page polls
+**there is no push channel to the browser either**, so the hub polls
 `GET /api/live?after=<cursor>` at 2s through the ordinary `useFetch` polling,
 like every other view.
 
@@ -73,7 +73,7 @@ and answer it twice.
 ## One session at a time
 
 `start_live_session` refuses to start a second conversation while one is
-`live` — a `conflict` naming the id that is already running. The Live page has
+`live` — a `conflict` naming the id that is already running. The hub has
 one text field and one `<audio>` element; a second conversation would have
 nowhere to be heard. That is what lets every other command drop the session
 argument entirely: `stop`, `status`, `listen`, `say`, `navigate` and `turns`
@@ -301,14 +301,14 @@ The browser side is reused unchanged too, including the fallback that matters
 on Apple's media stack: an `<audio>` that refuses a range-less stream fires
 `error`, the page re-fetches the same URL and **decodes the WAV itself** onto a
 Web Audio clock the press unlocked, and remembers that mode for the page once
-decoded audio has actually sounded (`docs/inbox.md`). The Live page reaches
+decoded audio has actually sounded (`docs/inbox.md`). The hub reaches
 that machinery through one small hoist made for this feature:
 `playSpeechStream` now takes a **URL** rather than an inbox item id
 (`speechStream.ts`, with `fetchSpeech(url, signal)` in `api.ts`), so the inbox
 passes `inboxSpeakUrl(id)` and Live passes `liveSpeakUrl(id)`. That is the only
 change to the inbox's speech path.
 
-The Live page consequences follow from the same rules the inbox lives under:
+The hub's consequences follow from the same rules the inbox lives under:
 there is **one `<audio>` element for the page**, and a press on the primary
 control — **Go live**, or **Listen** when the conversation is already
 running — is the gesture that unlocks audio. The `AudioContext` is created and
@@ -324,17 +324,52 @@ from wedging the run on itself. A turn carrying `action: 'navigate'` sets
 `window.location.hash` to its target when the run reaches it — in transcript
 order, so the browser moves where the sentence around it said it would.
 
-## The Live page (`#/live`)
+## The header hub (`LiveHub`, task 857)
 
-A global page. Its left-nav row is **flat**, between Terminal and Scripts, and
-not a project subtree: a conversation may be *about* a project, but it is not a
-project tab and there is only ever one. It has a command-palette entry too.
+The conversation lives in the **header**, not on a page: a control cluster on
+the right, beside the plan-limit chips, on every route. There is no left-nav
+row and no routed page. `#/live` survives only as a **verb** — the hub
+intercepts it, opens the conversation popup and puts the hash back to wherever
+the person last was — which is what keeps the agent's existing
+`navigate '#/live'` vocabulary and the command-palette entry ("Live
+conversation") working with no backend change.
 
-- **The page is mounted for the life of the app**, like `TerminalPage`, and the
-  `#/live` route only makes it *visible*. `navigate` is the whole point of the
-  feature, and a page the route unmounted would be torn down by the very
-  navigation it just performed — cutting its own sentence off mid-word and
-  stopping the route reports below.
+- **The header is mounted for the life of the app**, which is the whole reason
+  the conversation lives in it. `navigate` is the whole point of the feature,
+  and a routed page would be torn down by the very navigation it just
+  performed — cutting its own sentence off mid-word and stopping the route
+  reports below.
+- **While she speaks, a five-bar indicator animates centered in the header
+  band** — the visible sign of speech while the popup is closed. It freezes to
+  steady half-height bars under `prefers-reduced-motion`, the same rule as
+  `.live-dot`'s pulse.
+- **The popup opens and closes without touching the session.** A speech-bubble
+  toggle sits beside the live button whenever there is a session at all —
+  running, or ended with a transcript still worth reading
+  (`liveControls().overlay`) — and holds the status line, the transcript and
+  the capture box. Closing it calls no route; only `End` ends the
+  conversation. The closed state hides by **clipping**, never `display: none`
+  or `visibility: hidden`, so the capture box inside keeps its focus — and the
+  dictation flowing into it — while the popup is shut.
+- **While joined, the capture box holds the keyboard** (`liveCapture.ts`, the
+  tested module for all of this). The person does not aim their dictation;
+  mesa does: while a session is live *and* this browser has had its press,
+  the box takes focus — so when a `navigate` turn opens a page with a text
+  field, the words that follow still land in the conversation, not in the
+  field, and the person can ask mesa to create something there without their
+  speech typing into it. The referee (`userTookFocus`, `shouldReclaimFocus`):
+  a focus loss on the heels of a pointer/key gesture is the person
+  deliberately clicking into a form — capture **stands down** and the form
+  wins; a gestureless loss (a page's autofocus after a navigate, most often)
+  is taken back. While stood down, only mesa acting again — going live, a
+  `navigate` turn, a press on the hub's own controls — re-arms capture.
+  Nothing grabs the keyboard before the press: an un-joined browser has no
+  business stealing focus.
+- **A settled line is sent on mesa's clock** (`shouldAutoSend`): dictation
+  never presses Enter, so a non-blank draft untouched for `AUTO_SEND_IDLE_MS`
+  (2s) is sent as the utterance — hands-free end to end. Enter still sends at
+  once, Shift+Enter still opens a line, and the IME guard holds it while
+  composing.
 - **The controls are a three-state toggle, not one button.** Nothing live:
   **Go live** (`POST /api/live`). Live in a browser that has had a press:
   **End** (`DELETE /api/live`). Live in a browser that has **not** had one:
@@ -353,24 +388,24 @@ project tab and there is only ever one. It has a command-palette entry too.
   server's `played_at`, and `nextUnplayed` skips them, so a browser that joins
   late picks up where the conversation is rather than reciting it.
 - **Whether *this* browser has audio is a different question from whether the
-  conversation is running**, and the page tracks it separately (`unlocked`).
-  Until a press here, nothing is spoken and nothing navigates on this page —
-  the conversation may well be live on another device.
-- **The status line under the controls says what is actually happening**, and
-  the last failure outranks everything: a page reading "listening" while the
-  last call failed is the one way that line can lie. It also calls out a live
+  conversation is running**, and the hub tracks it separately (`unlocked`).
+  Until a press here, nothing is spoken, nothing navigates and nothing grabs
+  the keyboard — the conversation may well be live on another device.
+- **The status line at the top of the popup says what is actually happening**,
+  and the last failure outranks everything: a line reading "listening" while
+  the last call failed is the one way it can lie. It also calls out a live
   session with **no agent bound**, which would otherwise listen for ever and
   never answer.
-- The **dictation textarea** carries a visible hint that this is where system
-  dictation types. Enter sends, Shift+Enter opens a line, and an `isComposing`
-  guard keeps an IME's Enter out of it — the same composer contract as the
-  Agent sidebar's chat box.
-- The **transcript is accumulated by the page**: each poll answers only with
+- The **capture textarea** carries a visible hint that this is where system
+  dictation types, wherever the app has navigated. Enter sends, Shift+Enter
+  opens a line, and an `isComposing` guard keeps an IME's Enter out of it —
+  the same composer contract as the Agent sidebar's chat box.
+- The **transcript is accumulated by the hub**: each poll answers only with
   what is new (the cursor is a ref, not state — it is read inside the fetch and
-  rendered nowhere), so the page holds the conversation and the server holds
+  rendered nowhere), so the hub holds the conversation and the server holds
   the tail. A poll that reports a *different* session id starts a fresh
   transcript rather than merging two conversations.
-- **On arrival and on every `hashchange`** the page `POST`s
+- **On arrival and on every `hashchange`** the hub `POST`s
   `/api/live/route`, so the session records where the person actually is and
   the agent can answer "what am I looking at" without guessing. Also the moment
   it goes live, since a session that just started has no idea where its person
@@ -383,8 +418,10 @@ project tab and there is only ever one. It has a command-palette entry too.
   `frontend/src/liveSession.ts` (the is-live predicate, `liveControls` — the
   four presses above, since "no session", "an ended session", "a session still
   starting" and "a session running in a browser with no gesture" are four
-  different buttons and the label has to be right in each — and the status
-  line), each with a sibling vitest file.
+  different buttons and the label has to be right in each — plus the popup
+  toggle's `overlay` flag, and the status line) and
+  `frontend/src/liveCapture.ts` (the focus referee and the auto-send rule),
+  each with a sibling vitest file.
 
 ## Config
 

@@ -30,7 +30,9 @@ function buildCommands(projects: Project[]): Command[] {
     { id: 'inbox', label: 'Inbox', search: 'inbox', run: () => navigate('#/inbox') },
     {
       id: 'live',
-      label: 'Live',
+      // `#/live` is a verb now (mesa task 857): the header's LiveHub
+      // intercepts it, opens the conversation popup and puts the hash back.
+      label: 'Live conversation',
       search: 'live talk speak voice dictate',
       run: () => navigate('#/live'),
     },

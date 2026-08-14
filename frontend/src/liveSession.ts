@@ -44,6 +44,12 @@ export interface LiveButton {
 export interface LiveControls {
   primary: LiveButton
   secondary: LiveButton | null
+  /**
+   * Whether the header offers the conversation-popup toggle at all: there is a
+   * session — running, or ended with a transcript still worth reading. With no
+   * session there is nothing to show, and the button would open an empty box.
+   */
+  overlay: boolean
 }
 
 /**
@@ -63,6 +69,9 @@ export function liveControls(
   pending: LivePending,
   unlocked: boolean,
 ): LiveControls {
+  // The popup is about the transcript, not the press: it stays offered for as
+  // long as there is a session to read, in-flight presses included.
+  const overlay = session !== null
   // The press in flight decides the label, not the session: starting takes a
   // spawn, so between the click and the session landing the button would
   // otherwise still read "Go live" and invite a second one.
@@ -70,25 +79,29 @@ export function liveControls(
     return {
       primary: { label: 'Going live…', action: 'stop', disabled: true },
       secondary: null,
+      overlay,
     }
   }
   if (pending === 'stop') {
     return {
       primary: { label: 'Ending…', action: 'start', disabled: true },
       secondary: null,
+      overlay,
     }
   }
   if (!isLive(session)) {
     return {
       primary: { label: 'Go live', action: 'start', disabled: false },
       secondary: null,
+      overlay,
     }
   }
   const end: LiveButton = { label: 'End', action: 'stop', disabled: false }
-  if (unlocked) return { primary: end, secondary: null }
+  if (unlocked) return { primary: end, secondary: null, overlay }
   return {
     primary: { label: 'Listen', action: 'listen', disabled: false },
     secondary: end,
+    overlay,
   }
 }
 

@@ -3,6 +3,9 @@
    stay correct with one child — `space-between` does, `1fr auto` would leave
    a phantom column. */
 header {
+  /* The positioning context for Live's centered talking indicator and its
+     conversation popup (mesa task 857). */
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -7682,43 +7685,136 @@ button:focus-visible,
   }
 }
 
-/* Mesa Live (mesa task 855): the page you talk to — a transport, a transcript,
-   and the box system dictation types into. The transcript is the part that
-   scrolls — capped rather than stretched to the pane, since `main` is itself
-   the app's scroll container and a page sized to it would fight that — so the
-   button that ends the conversation and the box that feeds it both stay on
-   screen while it runs. */
-.live-page {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.live-page h1,
-.live-page > p {
-  margin: 0;
-}
-
-.live-controls {
+/* Mesa Live (mesa tasks 855, 857): the conversation lives in the header — a
+   control cluster on the right beside the plan-limit chips, a talking
+   indicator centered in the band while she speaks, and a popup transcript
+   anchored under the header that opens and closes without touching the
+   session. */
+.header-right {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  flex-wrap: wrap;
+  flex: none;
 }
 
-/* Live is a state, not just a page: the button carries the colour of the thing
-   it will do next, so a running conversation is readable at a glance. */
+.live-hub {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: none;
+}
+
+/* Live is a state, not just a button: it carries the colour of the thing it
+   will do next, so a running conversation is readable at a glance. */
 .live-toggle.live-on {
   color: var(--red);
   border-color: rgba(255, 59, 92, 0.5);
 }
 
+.live-overlay-toggle.live-open {
+  color: var(--cyan);
+  border-color: rgba(0, 229, 255, 0.5);
+}
+
+/* The talking indicator: five bars breathing in the middle of the header
+   band, the visible sign she is speaking while the popup is closed. Absolute
+   against the header, so it takes no room from the flex row. */
+.live-talk {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  pointer-events: none;
+}
+
+.live-talk span {
+  width: 3px;
+  height: 100%;
+  background: var(--cyan);
+  border-radius: 2px;
+  transform-origin: center;
+  animation: live-talk-bar 1s ease-in-out infinite;
+}
+
+.live-talk span:nth-child(1) { animation-delay: 0s; }
+.live-talk span:nth-child(2) { animation-delay: 0.15s; }
+.live-talk span:nth-child(3) { animation-delay: 0.3s; }
+.live-talk span:nth-child(4) { animation-delay: 0.45s; }
+.live-talk span:nth-child(5) { animation-delay: 0.6s; }
+
+@keyframes live-talk-bar {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1); }
+}
+
+/* Motion-sensitive readers keep the signal, not the dance — the same rule as
+   `.live-dot`'s pulse: the bars hold steady at half height. */
+@media (prefers-reduced-motion: reduce) {
+  .live-talk span {
+    animation: none;
+    transform: scaleY(0.5);
+  }
+}
+
+/* The conversation popup, anchored under the header's right edge. Absolute
+   against the header (which never scrolls), above the page but below every
+   modal. */
+.live-overlay {
+  position: absolute;
+  top: calc(100% + 0.5rem);
+  right: 1rem;
+  z-index: 1100;
+  width: min(420px, calc(100vw - 2rem));
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border-bright);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+/* Closed is clipped, never `display: none` or `visibility: hidden`: the
+   capture box inside must keep its focus — and the dictation flowing into it
+   — while the popup is shut (`liveCapture.ts`). */
+.live-overlay.live-closed {
+  clip-path: inset(50%);
+  pointer-events: none;
+}
+
+.live-overlay-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.live-overlay-close {
+  flex: none;
+  background: none;
+  border: none;
+  padding: 0 0.25rem;
+  color: var(--muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.live-overlay-close:hover {
+  color: var(--fg);
+}
+
 /* The conversation itself: the one scrolling part, so a long exchange never
-   pushes the composer off the bottom. */
+   pushes the composer off the bottom of the popup. */
 .live-transcript {
   flex: 1 1 auto;
-  min-height: 8rem;
-  max-height: 60vh;
+  min-height: 6rem;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -7735,7 +7831,6 @@ button:focus-visible,
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  max-width: 44rem;
 }
 
 .live-group.live-user {
@@ -7794,21 +7889,13 @@ button:focus-visible,
   font-size: 0.75rem;
 }
 
-/* Narrow tier: the bubbles give up their fixed ceiling and take the column
-   (docs/mobile.md — CSS only, no new matchMedia). */
-@media (max-width: 860px) {
-  .live-group {
-    max-width: 100%;
-  }
-}
-
-/* Phone: the controls stack, so the status line is never squeezed to a word per
-   line beside the button. */
+/* Phone: the popup takes the width, and the header cluster keeps only its
+   buttons (docs/mobile.md — CSS only, no new matchMedia). */
 @media (max-width: 600px) {
-  .live-controls {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 0.5rem;
+  .live-overlay {
+    left: 0.5rem;
+    right: 0.5rem;
+    width: auto;
   }
 
   .live-transcript {

@@ -34,17 +34,22 @@ describe('liveControls', () => {
       expect(liveControls(null, null, unlocked)).toEqual({
         primary: { label: 'Go live', action: 'start', disabled: false },
         secondary: null,
+        // No session at all: there is no transcript, so no popup to offer.
+        overlay: false,
       })
     }
     expect(liveControls(session({ status: 'ended' }), null, false).primary.action).toBe(
       'start',
     )
+    // An ended session still has a transcript worth opening.
+    expect(liveControls(session({ status: 'ended' }), null, false).overlay).toBe(true)
   })
 
   it('offers to end a conversation this browser can already hear', () => {
     expect(liveControls(session(), null, true)).toEqual({
       primary: { label: 'End', action: 'stop', disabled: false },
       secondary: null,
+      overlay: true,
     })
   })
 
@@ -55,6 +60,7 @@ describe('liveControls', () => {
     expect(liveControls(session(), null, false)).toEqual({
       primary: { label: 'Listen', action: 'listen', disabled: false },
       secondary: { label: 'End', action: 'stop', disabled: false },
+      overlay: true,
     })
   })
 
@@ -64,12 +70,15 @@ describe('liveControls', () => {
     expect(liveControls(null, 'start', false)).toEqual({
       primary: { label: 'Going live…', action: 'stop', disabled: true },
       secondary: null,
+      overlay: false,
     })
     // Not even the join is offered mid-press: whichever way this call goes,
-    // the answer decides which control belongs here.
+    // the answer decides which control belongs here. The popup stays — the
+    // transcript is still worth reading while the session ends.
     expect(liveControls(session(), 'stop', false)).toEqual({
       primary: { label: 'Ending…', action: 'start', disabled: true },
       secondary: null,
+      overlay: true,
     })
   })
 })

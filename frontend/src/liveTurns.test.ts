@@ -4,6 +4,7 @@ import {
   mergeTurns,
   navigateTarget,
   nextUnplayed,
+  sidebarsIntent,
   spokenText,
   turnGroups,
   turnLabel,
@@ -142,6 +143,35 @@ describe('navigateTarget', () => {
       navigateTarget(turn(1, { action: 'navigate', target: 'https://elsewhere' })),
     ).toBeNull()
     expect(navigateTarget(turn(1, { action: 'navigate', target: '  ' }))).toBeNull()
+  })
+
+  it('is null for a sidebar turn', () => {
+    // The two vocabularies must not read each other's turns: a collapse is not
+    // a navigation with a missing route.
+    expect(navigateTarget(turn(1, { action: 'collapse-sidebars' }))).toBeNull()
+  })
+})
+
+describe('sidebarsIntent', () => {
+  it('reads the verb the turn carries', () => {
+    expect(sidebarsIntent(turn(1, { action: 'collapse-sidebars' }))).toBe('collapse')
+    expect(sidebarsIntent(turn(1, { action: 'expand-sidebars' }))).toBe('expand')
+  })
+
+  it('is null for a turn that leaves the sidebars alone', () => {
+    expect(sidebarsIntent(turn(1))).toBeNull()
+    expect(
+      sidebarsIntent(turn(1, { action: 'navigate', target: '#/inbox' })),
+    ).toBeNull()
+  })
+
+  it('speaks whatever text a sidebar turn carries, and nothing when it has none', () => {
+    // The pure-action rule, unchanged: a sidebar verb may narrate itself or
+    // move the panels in silence.
+    expect(
+      spokenText(turn(1, { text: 'Making some room.', action: 'collapse-sidebars' })),
+    ).toBe('Making some room.')
+    expect(spokenText(turn(1, { text: '', action: 'expand-sidebars' }))).toBeNull()
   })
 })
 

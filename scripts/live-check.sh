@@ -9,8 +9,8 @@
 #      other verb is `not_found` naming `mesa live start`, and the usage errors
 #      (exit 2) around them, including `--quiet` refused on `turns`;
 #   2. the CLI happy path on a --no-agent session: start -> say -> navigate ->
-#      turns -> stop -> status, plus the `--quiet` key sets compared with jq
-#      (a turn drops `text`; a session drops nothing);
+#      turns -> sidebars -> stop -> status, plus the `--quiet` key sets compared
+#      with jq (a turn drops `text`; a session drops nothing);
 #   3. every `Validation` rule reachable from a surface — the route shape, the
 #      8192-char text bound, a mesa turn with neither text nor action, an
 #      unknown project — and the `conflict` that enforces one live session;
@@ -162,6 +162,8 @@ run 1 "$MESA" live say "into the void"
 [ "$(jqe .error.code)" = "not_found" ] || fail "live say with no session: error.code"
 run 1 "$MESA" live navigate '#/inbox'
 [ "$(jqe .error.code)" = "not_found" ] || fail "live navigate with no session: error.code"
+run 1 "$MESA" live sidebars collapse
+[ "$(jqe .error.code)" = "not_found" ] || fail "live sidebars with no session: error.code"
 ok "every other live verb with no session: exit 1 not_found, hinting at \`live start\`"
 
 # ---- usage errors (exit 2), and the one --quiet exclusion ----
@@ -179,10 +181,15 @@ run 2 "$MESA" live say
 [ "$(jqe .error.code)" = "usage" ] || fail "live say with no text: error.code"
 run 2 "$MESA" live navigate
 [ "$(jqe .error.code)" = "usage" ] || fail "live navigate with no route: error.code"
+run 2 "$MESA" live sidebars
+[ "$(jqe .error.code)" = "usage" ] || fail "live sidebars with no state: error.code"
+run 2 "$MESA" live sidebars sideways
+[ "$(jqe .error.code)" = "usage" ] ||
+  fail "live sidebars <not collapse|expand>: a closed vocabulary, refused by clap"
 ok "usage errors are exit 2: bad --wait, both project forms, a missing required arg"
 
 # =====================================================================
-# 2. The CLI happy path (start -> say -> navigate -> turns -> stop)
+# 2. The CLI happy path (start -> say -> navigate -> turns -> sidebars -> stop)
 # =====================================================================
 #
 # `--no-agent` throughout this section: the loop is what is under test here,
@@ -236,6 +243,28 @@ run 0 "$MESA" live turns --limit 1
 run 0 "$MESA" live turns --after "$PURE_NAV_ID"
 [ "$(jqs length)" = "0" ] || fail "live turns past the end: an empty array, not an error"
 ok "live turns: bare array oldest first, --after cursor, --limit, empty past the end"
+
+# ---- the sidebar verbs (mesa task 859) ----
+#
+# The second page action: it changes what the person is *looking at*, like
+# navigate, and like navigate it may narrate itself or move in silence. What it
+# must never do is carry a route — that is the other verb.
+
+run 0 "$MESA" live sidebars collapse --say "Making some room."
+[ "$(jqs .action)" = "collapse-sidebars" ] || fail "live sidebars collapse: action"
+[ "$(jqs .target)" = "null" ] || fail "live sidebars collapse: a sidebar turn carries no target"
+[ "$(jqs .text)" = "Making some room." ] || fail "live sidebars --say: spoken text"
+[ "$(jqs .role)" = "mesa" ] || fail "live sidebars: role must be mesa"
+run 0 "$MESA" live sidebars expand
+[ "$(jqs .action)" = "expand-sidebars" ] || fail "live sidebars expand: action"
+[ "$(jqs .text)" = "" ] || fail "live sidebars with no --say: a pure action turn says nothing"
+ok "live sidebars collapse|expand: a targetless action turn, with and without spoken text"
+
+run 0 "$MESA" live sidebars collapse --quiet
+[ "$(jqs 'has("text")')" = "false" ] || fail "live sidebars --quiet: text must be dropped"
+[ "$(jqs .action)" = "collapse-sidebars" ] ||
+  fail "live sidebars --quiet: the action is bounded, so it must survive"
+ok "live sidebars --quiet: the same projection every live turn gets"
 
 # ---- --quiet key sets (jq, never byte-for-byte) ----
 #

@@ -12,7 +12,7 @@ export type LiveTurn = { id: number, session_id: number, role: LiveRole,
 /**
  * What was said. Spoken aloud when the role is `mesa`, so it is prose —
  * and bounded, since a runaway body would wedge the synthesiser. Empty
- * only on a pure `navigate` turn, which moves the page and says nothing.
+ * only on a pure action turn, which changes the page and says nothing.
  */
 text: string, 
 /**
@@ -22,7 +22,7 @@ text: string,
 action: LiveAction | null, 
 /**
  * The `#/…` route `action: navigate` moves the browser to. Present iff
- * `action` is.
+ * the action is `navigate` — the sidebar actions take no target.
  */
 target: string | null, 
 /**

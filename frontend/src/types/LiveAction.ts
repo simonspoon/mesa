@@ -2,8 +2,17 @@
 
 /**
  * A side effect a `mesa` turn asks the *page* to perform, beside speaking.
- * One value, deliberately: driving the browser somewhere is the one thing the
- * conversation needs the page for, and a second verb would be a second
- * vocabulary to keep in sync with the frontend router.
+ *
+ * The vocabulary is deliberately narrow, and it is all one thing: **what the
+ * person is looking at**. `navigate` moves the browser to a page; the sidebar
+ * pair collapses and re-opens the app's two side panels around it (mesa task
+ * 859), which is the other half of the same request — a person who asked to
+ * *see* something wants the screen it needs. Anything beyond that (click this,
+ * fill that) would be a remote-control vocabulary, and the agent already has
+ * the whole mesa CLI for changing things.
+ *
+ * Only `navigate` carries a `target`; the sidebar verbs say everything in
+ * their own name, which is why they are two values rather than one verb with
+ * a state argument in a column typed as a route.
  */
-export type LiveAction = "navigate";
+export type LiveAction = "navigate" | "collapse-sidebars" | "expand-sidebars";

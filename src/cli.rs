@@ -1023,7 +1023,8 @@ EXAMPLES
 /// The person dictates into the web UI's Live page; those utterances become
 /// `user` turns. This group is what the agent driving the conversation runs:
 /// it pulls an utterance with `listen`, does the work with the ordinary mesa
-/// CLI, and pushes spoken replies back with `say` / `navigate`.
+/// CLI, and pushes spoken replies back with `say` — plus the two verbs that
+/// change what the person is looking at, `navigate` and `sidebars`.
 ///
 /// At most ONE live session exists at a time, so no command here takes a
 /// session id — they all operate on the current one. With no live session,
@@ -1145,6 +1146,27 @@ EXAMPLES
         #[arg(value_name = "ROUTE")]
         route: String,
         /// What to say while the page changes
+        #[arg(long, value_name = "TEXT")]
+        say: Option<String>,
+        /// Print the turn without its `text` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Collapse or expand the web UI's two sidebars; prints the created turn
+    ///
+    /// STATE is `collapse` (fold the left navigation and the agents panel
+    /// away, giving the page the whole window) or `expand` (bring them back).
+    /// `--say` is the sentence spoken as the panels move; without it the turn
+    /// is a pure action and says nothing. Takes no route — that is `navigate`.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live sidebars collapse --say \"Making some room.\"
+  mesa live sidebars expand")]
+    Sidebars {
+        /// `collapse` to fold both sidebars away, `expand` to bring them back
+        #[arg(value_name = "STATE", value_parser = parse_sidebars_action)]
+        state: LiveAction,
+        /// What to say while the panels move
         #[arg(long, value_name = "TEXT")]
         say: Option<String>,
         /// Print the turn without its `text` instead of in full
@@ -1797,6 +1819,18 @@ fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
 
 fn parse_inbox_kind(s: &str) -> std::result::Result<InboxKind, String> {
     InboxKind::parse(s).ok_or_else(|| format!("'{s}' is not one of task-summary|change-request"))
+}
+
+/// `mesa live sidebars <STATE>` names the state the person asked for, which
+/// reads as a sentence; the record stores the verb that gets there. The two
+/// sidebar actions are the whole vocabulary here — `navigate` is its own
+/// command, since it is the only one that takes a route.
+fn parse_sidebars_action(s: &str) -> std::result::Result<LiveAction, String> {
+    match s {
+        "collapse" => Ok(LiveAction::CollapseSidebars),
+        "expand" => Ok(LiveAction::ExpandSidebars),
+        _ => Err(format!("'{s}' is not one of collapse|expand")),
+    }
 }
 
 fn parse_diagram_type(s: &str) -> std::result::Result<DiagramType, String> {
@@ -3306,6 +3340,19 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 say.as_deref().unwrap_or(""),
                 Some(LiveAction::Navigate),
                 Some(&route),
+            )?;
+            print_live_turn(&turn, quiet);
+        }
+        LiveCmd::Sidebars { state, say, quiet } => {
+            let session = current_live_session(&store)?;
+            // Like `navigate`, silent without `--say`; unlike it, there is no
+            // route — the verb is the whole instruction.
+            let turn = store.add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                say.as_deref().unwrap_or(""),
+                Some(state),
+                None,
             )?;
             print_live_turn(&turn, quiet);
         }

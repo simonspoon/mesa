@@ -536,7 +536,16 @@ function App() {
         {/* The right cluster (mesa task 857): the live conversation's controls
             sit beside the plan-limit chips, on every page. */}
         <div className="header-right">
-          <LiveHub />
+          {/* A `collapse-sidebars` turn moves both panels at once (task 859):
+              the conversation asked for room, and "the sidebars" is the pair.
+              Both flags live here already — the phone tab bar writes the same
+              two — so the hub relays the request rather than owning it. */}
+          <LiveHub
+            onSidebars={(collapsed) => {
+              setNavCollapsed(collapsed)
+              setAgentsCollapsed(collapsed)
+            }}
+          />
           <HeaderUsage />
         </div>
       </header>

@@ -28,6 +28,7 @@ import {
   mergeTurns,
   navigateTarget,
   nextUnplayed,
+  sidebarsIntent,
   spokenText,
   turnGroups,
   turnLabel,
@@ -74,8 +75,20 @@ import { useFetch } from '../useFetch'
  *   click into another field wins the fight and stands capture down; mesa's
  *   next action re-arms it. Dictation never presses Enter, so a draft that
  *   sits untouched for a beat is sent on mesa's own clock.
+ *
+ * The two page verbs — `navigate` and the sidebar pair (task 859) — are both
+ * performed here, in transcript order, when the run *reaches* the turn: the
+ * browser moves and the panels fold where the sentence around them said they
+ * would. The hub owns neither sidebar's state (App does, for both of them and
+ * for the phone tab bar), so collapsing is one call back up.
  */
-export function LiveHub() {
+export function LiveHub({
+  onSidebars,
+}: {
+  /** Fold both sidebars away (`true`) or bring them back. App owns that state
+   *  — the hub only relays what the conversation asked for. */
+  onSidebars: (collapsed: boolean) => void
+}) {
   // The exclusive id cursor the poll asks from. A ref, not state: it is read
   // inside `load` on every tick and rendered nowhere, so advancing it must not
   // cost a render.
@@ -409,6 +422,10 @@ export function LiveHub() {
         // take — even if the person had deliberately clicked elsewhere before.
         reclaim('navigated', armed.current)
       }
+      const sidebars = sidebarsIntent(turn)
+      // Idempotent by construction: App holds the flags, so asking twice for
+      // the state they are already in changes nothing.
+      if (sidebars !== null) onSidebars(sidebars === 'collapse')
       const text = spokenText(turn)
       if (text === null) {
         // A pure navigate turn: it has already done its work.
@@ -688,6 +705,13 @@ export function LiveHub() {
                     {navigateTarget(turn) !== null && (
                       <div className="live-navigated">
                         went to {navigateTarget(turn)}
+                      </div>
+                    )}
+                    {sidebarsIntent(turn) !== null && (
+                      <div className="live-navigated">
+                        {sidebarsIntent(turn) === 'collapse'
+                          ? 'collapsed the sidebars'
+                          : 'opened the sidebars'}
                       </div>
                     )}
                   </div>

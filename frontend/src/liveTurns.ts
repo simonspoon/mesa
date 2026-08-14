@@ -74,8 +74,8 @@ export function nextUnplayed(
 }
 
 /**
- * What a turn says out loud, or null when it says nothing. A pure `navigate`
- * turn carries no text — it moves the browser and is silent — so the page must
+ * What a turn says out loud, or null when it says nothing. A pure action turn
+ * carries no text — it changes the page and is silent — so the page must
  * be able to tell "nothing to speak" from "speak an empty string", which the
  * synthesiser would refuse.
  */
@@ -95,6 +95,24 @@ export function navigateTarget(turn: LiveTurn): string | null {
   if (turn.action !== 'navigate') return null
   const target = turn.target?.trim() ?? ''
   return target.startsWith('#/') ? target : null
+}
+
+/** What a turn asks the app's two side panels to do. */
+export type SidebarsIntent = 'collapse' | 'expand'
+
+/**
+ * Whether a turn folds the sidebars away or brings them back, or null when it
+ * leaves them alone (mesa task 859).
+ *
+ * The other half of `navigateTarget`: both answer "what does this turn do to
+ * what the person is looking at". A `target` is irrelevant here — `Store`
+ * refuses one on these actions — so the verb alone decides, and an action the
+ * page does not know is the same as none rather than a crash.
+ */
+export function sidebarsIntent(turn: LiveTurn): SidebarsIntent | null {
+  if (turn.action === 'collapse-sidebars') return 'collapse'
+  if (turn.action === 'expand-sidebars') return 'expand'
+  return null
 }
 
 /** One side of the conversation, drawn as a run of consecutive turns. */

@@ -2316,26 +2316,41 @@ impl LiveRole {
 }
 
 /// A side effect a `mesa` turn asks the *page* to perform, beside speaking.
-/// One value, deliberately: driving the browser somewhere is the one thing the
-/// conversation needs the page for, and a second verb would be a second
-/// vocabulary to keep in sync with the frontend router.
+///
+/// The vocabulary is deliberately narrow, and it is all one thing: **what the
+/// person is looking at**. `navigate` moves the browser to a page; the sidebar
+/// pair collapses and re-opens the app's two side panels around it (mesa task
+/// 859), which is the other half of the same request — a person who asked to
+/// *see* something wants the screen it needs. Anything beyond that (click this,
+/// fill that) would be a remote-control vocabulary, and the agent already has
+/// the whole mesa CLI for changing things.
+///
+/// Only `navigate` carries a `target`; the sidebar verbs say everything in
+/// their own name, which is why they are two values rather than one verb with
+/// a state argument in a column typed as a route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "kebab-case")]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum LiveAction {
     Navigate,
+    CollapseSidebars,
+    ExpandSidebars,
 }
 
 impl LiveAction {
     pub fn as_str(self) -> &'static str {
         match self {
             LiveAction::Navigate => "navigate",
+            LiveAction::CollapseSidebars => "collapse-sidebars",
+            LiveAction::ExpandSidebars => "expand-sidebars",
         }
     }
 
     pub fn parse(s: &str) -> Option<LiveAction> {
         match s {
             "navigate" => Some(LiveAction::Navigate),
+            "collapse-sidebars" => Some(LiveAction::CollapseSidebars),
+            "expand-sidebars" => Some(LiveAction::ExpandSidebars),
             _ => None,
         }
     }
@@ -2387,13 +2402,13 @@ pub struct LiveTurn {
     pub role: LiveRole,
     /// What was said. Spoken aloud when the role is `mesa`, so it is prose —
     /// and bounded, since a runaway body would wedge the synthesiser. Empty
-    /// only on a pure `navigate` turn, which moves the page and says nothing.
+    /// only on a pure action turn, which changes the page and says nothing.
     pub text: String,
     /// What the page should *do* with this turn beside speak it. Null on every
     /// user turn, and on a mesa turn that only speaks.
     pub action: Option<LiveAction>,
     /// The `#/…` route `action: navigate` moves the browser to. Present iff
-    /// `action` is.
+    /// the action is `navigate` — the sidebar actions take no target.
     pub target: Option<String>,
     /// When the turn was recorded (SQLite `datetime` text, UTC).
     pub created_at: String,

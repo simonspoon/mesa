@@ -28,7 +28,8 @@ A live session is a loop the **agent** runs, not one mesa drives:
 2. It does the work with the ordinary mesa CLI and its own tools.
 3. `mesa live say "…"` — the reply, which the browser speaks.
 4. `mesa live navigate '#/…' --say "…"` — optionally, it moves the person's
-   browser as it answers.
+   browser as it answers, and `mesa live sidebars collapse|expand` gives that
+   page the whole window, or hands the side panels back.
 5. `mesa live status` printing `null` (or an `ended` session) is how it stops.
 
 The agent **pulls**. That is not a style choice: mesa has no way to push at it.
@@ -76,8 +77,9 @@ and answer it twice.
 `live` — a `conflict` naming the id that is already running. The hub has
 one text field and one `<audio>` element; a second conversation would have
 nowhere to be heard. That is what lets every other command drop the session
-argument entirely: `stop`, `status`, `listen`, `say`, `navigate` and `turns`
-all resolve **the** current session through `current_live_session`.
+argument entirely: `stop`, `status`, `listen`, `say`, `navigate`, `sidebars`
+and `turns` all resolve **the** current session through
+`current_live_session`.
 
 Stopping is idempotent *in the store*: `end_live_session` stamps `ended_at` on
 the row only while it is still `live`, so a page and an agent stopping at once
@@ -99,11 +101,12 @@ turns (schema enforces none of it, per CLAUDE.md):
 - A **`user`** turn carries non-empty text and nothing else: the page dictates,
   it does not drive itself.
 - A **`mesa`** turn must say something **or** do something. Empty text is legal
-  exactly once — on a pure `navigate`, which moves the browser and speaks
-  nothing.
-- An **`action`** is `navigate` and nothing else, and it must carry a `target`.
-  A `target` with no action is a `validation` error rather than a field nothing
-  reads.
+  exactly on a pure action turn, which changes the page and speaks nothing.
+- An **`action`** is one of `navigate`, `collapse-sidebars` and
+  `expand-sidebars`. `navigate` must carry a `target`; the two sidebar verbs
+  must carry none — a route on one is a caller who meant `navigate`, not a
+  field to ignore. A `target` with no action is a `validation` error rather
+  than a field nothing reads.
 - A `target`, and the route the page reports through `set_live_route`, pass the
   **one** route rule (`validate_live_route`): trimmed, non-empty, ≤ 200 chars,
   and starting with `#/`. Both go through it so the agent can never send the
@@ -121,20 +124,32 @@ conversation, not a record of its own. `live_sessions.project_id` is
 **`ON DELETE SET NULL`**, the same call the inbox makes: a conversation
 outlives the project row it happened to be about.
 
-## The navigate vocabulary
+## The action vocabulary
 
-`navigate` is the **only** action, and its target is one of the app's own hash
-routes — `#/`, `#/live`, `#/inbox`, `#/cc`, `#/scripts`, `#/settings`,
-`#/terminal`, `#/projects/<id>` and that project's `tasks/<id>`, `diagrams`,
-`git`, `files`, `terminal`, `dashboard` and `settings`. The list is in
-`AGENT_PROMPT` so the agent knows what it may say; the *rule* mesa enforces is
-only the `#/` shape, since the route inventory is the frontend's business and
-pinning a second copy of it in `Store` would be a copy to go stale.
+Three values, and they are all one idea: **what the person is looking at.**
 
-There is no second verb. "Move the browser" is a thing a conversation
-genuinely needs (the person asked to *see* something); anything more — click
-this, fill that — is a remote-control vocabulary, and the agent already has the
-whole mesa CLI for actually changing things.
+`navigate`'s target is one of the app's own hash routes — `#/`, `#/live`,
+`#/inbox`, `#/cc`, `#/scripts`, `#/settings`, `#/terminal`, `#/projects/<id>`
+and that project's `tasks/<id>`, `diagrams`, `git`, `files`, `terminal`,
+`dashboard` and `settings`. The list is in `AGENT_PROMPT` so the agent knows
+what it may say; the *rule* mesa enforces is only the `#/` shape, since the
+route inventory is the frontend's business and pinning a second copy of it in
+`Store` would be a copy to go stale.
+
+`collapse-sidebars` and `expand-sidebars` (mesa task 859) fold the app's two
+side panels — the left nav and the agents sidebar — away and back. They are the
+other half of "show me that": a person talking hands-free asked for a page, and
+sometimes what they want is the *room* for it. Both panels move together,
+because "the sidebars" is the pair; the two flags already live in `App`
+(the phone tab bar writes the same two), so `LiveHub` relays the request rather
+than owning any collapse state of its own. They carry **no target** — the verb
+is the whole instruction, which is why they are two values rather than one verb
+plus a state argument stuffed into a column that otherwise means a route.
+
+There is nothing beyond that. Moving the browser and giving it room are things
+a conversation genuinely needs; anything more — click this, fill that — is a
+remote-control vocabulary, and the agent already has the whole mesa CLI for
+actually changing things.
 
 ## CLI
 
@@ -148,6 +163,7 @@ whole mesa CLI for actually changing things.
 | `live listen` | `--wait <SECONDS>` (default 60, `0` = poll once) | the next undelivered user `LiveTurn`, or `null` |
 | `live say <TEXT>…` | trailing var arg, like `inbox add` — put every flag **before** the message | the `LiveTurn` |
 | `live navigate <ROUTE>` | `--say <TEXT>`; without it the turn is a pure action and says nothing | the `LiveTurn` |
+| `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route | the `LiveTurn` |
 | `live turns` | `--after <ID>`, `--limit <N>` (clamped to 1..=500) | a bare array of turns, oldest first |
 
 `turns` is the **transcript**, not the queue: both roles, including turns
@@ -322,7 +338,9 @@ hand — otherwise the two seconds after a turn starts would start it again — 
 a turn that failed to speak stays in that set, which is what keeps one bad turn
 from wedging the run on itself. A turn carrying `action: 'navigate'` sets
 `window.location.hash` to its target when the run reaches it — in transcript
-order, so the browser moves where the sentence around it said it would.
+order, so the browser moves where the sentence around it said it would; a
+sidebar turn folds or re-opens both panels at the same point in the run, for
+the same reason.
 
 ## The header hub (`LiveHub`, task 857)
 
@@ -429,7 +447,8 @@ conversation") working with no backend change.
 - **Pure logic is in tested modules, not the `.tsx`** (CLAUDE.md's
   frontend-test rule): `frontend/src/liveTurns.ts` (cursor advance, merging a
   poll's turns into the transcript, next-unplayed selection, what a turn
-  speaks, whether it navigates, grouping and labelling) and
+  speaks, whether it navigates, whether it moves the sidebars, grouping and
+  labelling) and
   `frontend/src/liveSession.ts` (the is-live predicate, `liveControls` — the
   four presses above, since "no session", "an ended session", "a session still
   starting" and "a session running in a browser with no gesture" are four
@@ -479,12 +498,14 @@ CLAUDE.md requires: **data, never instructions.**
 - **A per-session voice.** The voice is `speech.voice` in
   `~/.mesa/config.json`, read on every press, shared with the inbox.
 - **A push channel**, in either direction — see the loop above.
-- **A navigation vocabulary beyond `navigate`.**
+- **A page vocabulary beyond "what am I looking at".** `navigate` and the two
+  sidebar verbs are the whole list; clicking, typing and scrolling on the
+  person's behalf are not on it.
 
 ## Gate
 
 `scripts/live-check.sh` — the CLI loop end to end (start → say → navigate →
-listen → turns → stop), the single-session `conflict`, every `validation` rule,
+listen → turns → sidebars → stop), the single-session `conflict`, every `validation` rule,
 `listen` returning `null` on timeout and never handing out the same turn twice,
 the `--quiet` key sets, and the API twin including the audio contract and both
 halves of the security boundary in default **and** `--lan` mode.

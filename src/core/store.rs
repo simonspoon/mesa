@@ -3545,9 +3545,9 @@ impl Store {
     /// - a `mesa` turn must say something **or** do something (a pure
     ///   `navigate` speaks nothing, which is why empty text is legal there and
     ///   nowhere else);
-    /// - an `action` must carry a `target` that passes the route rule, and a
-    ///   `target` without an action is a `validation` error rather than a
-    ///   field nothing reads;
+    /// - `navigate` must carry a `target` that passes the route rule, the
+    ///   sidebar actions must carry none, and a `target` without an action is a
+    ///   `validation` error rather than a field nothing reads;
     /// - `text` is bounded ([`LIVE_TEXT_MAX`]) because it is spoken.
     pub fn add_live_turn(
         &mut self,
@@ -3603,6 +3603,14 @@ impl Store {
                     "a navigate turn must name a target route".into(),
                 ));
             }
+            // The sidebar verbs say everything in their own name; a route on
+            // one is a caller that meant `navigate`, not a field to ignore.
+            (Some(_), Some(_)) => {
+                return Err(Error::Validation(
+                    "only a navigate turn takes a target route".into(),
+                ));
+            }
+            (Some(_), None) => None,
             (None, Some(_)) => {
                 return Err(Error::Validation(
                     "a target route needs an action of \"navigate\"".into(),
@@ -8392,6 +8400,20 @@ mod tests {
                 None,
                 None,
             ),
+            (
+                "a sidebar action carrying a route",
+                LiveRole::Mesa,
+                "making room",
+                Some(LiveAction::CollapseSidebars),
+                Some("#/inbox"),
+            ),
+            (
+                "a user turn collapsing the sidebars",
+                LiveRole::User,
+                "hide those",
+                Some(LiveAction::CollapseSidebars),
+                None,
+            ),
         ];
         for (label, role, text, action, target) in cases {
             let err = store
@@ -8417,6 +8439,49 @@ mod tests {
             .add_live_turn(session.id, LiveRole::User, "hello", None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)), "{err:?}");
+    }
+
+    /// The sidebar verbs (mesa task 859): the other half of "show me that" —
+    /// they change what the person is looking at, carry no target, and like a
+    /// navigate they may speak or stay silent.
+    #[test]
+    fn add_live_turn_collapses_and_expands_the_sidebars() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let quiet = store
+            .add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                "",
+                Some(LiveAction::CollapseSidebars),
+                None,
+            )
+            .unwrap();
+        assert_eq!(quiet.action, Some(LiveAction::CollapseSidebars));
+        assert_eq!(quiet.target, None);
+        assert_eq!(quiet.text, "");
+
+        let spoken = store
+            .add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                "Bringing those back.",
+                Some(LiveAction::ExpandSidebars),
+                None,
+            )
+            .unwrap();
+        assert_eq!(spoken.action, Some(LiveAction::ExpandSidebars));
+        assert_eq!(spoken.text, "Bringing those back.");
+
+        // Round-trips through the db as its own value, not as a navigate.
+        let all = store.list_live_turns(session.id, None, 100).unwrap();
+        assert_eq!(
+            all.iter().map(|t| t.action).collect::<Vec<_>>(),
+            vec![
+                Some(LiveAction::CollapseSidebars),
+                Some(LiveAction::ExpandSidebars)
+            ]
+        );
     }
 
     /// The delivery stamp is what makes the loop safe: two listeners must

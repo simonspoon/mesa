@@ -108,7 +108,7 @@ The code is the source of truth. These are the invariants you must not break:
   `time`, `usageMeter`, `watchersDraft`, `wavStream`, `wordWrap`) —
   predicates that historically shipped wrong.
   **Logic worth testing therefore belongs in one of those modules, not inline
-  in a `.tsx`** (why `isStaleWorking` was hoisted out of `AgentSidebar`).
+  in a `.tsx`** (why `isRunningAgent` lives outside `AgentSidebar`).
   Anything needing a rendered tree, real focus routing, or a trusted event
   stays with khora.
 

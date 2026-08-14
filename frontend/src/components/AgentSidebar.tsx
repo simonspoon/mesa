@@ -18,7 +18,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
-import { hasLiveWork, isStaleWorking, liveWorkLabel, projectForCwd } from '../agentProject'
+import { liveWorkLabel, projectForCwd } from '../agentProject'
 import {
   clampAgentSidebarWidth,
   DEFAULT_AGENT_SIDEBAR_WIDTH,
@@ -236,49 +236,32 @@ function startedAgo(ms: number): string {
   return `${Math.floor(hours / 24)}d ago`
 }
 
-type Bucket = 'BLOCKED' | 'ACTIVE' | 'DONE'
+type Bucket = 'BLOCKED' | 'ACTIVE'
 
-// `AgentSession` carries no completion timestamp (only `startedAt`, the
-// session's start time) — `claude agents --json` doesn't report one. DONE is
-// sorted by `startedAt` desc as the closest available proxy for "most
-// recently completed".
+// There is no DONE bucket (mesa task 858): `claude agents --json` lists live
+// processes, so every session on this list is active — the sidebar shows the
+// sessions that exist, and a finished one leaves by dropping out of the list,
+// not by moving to a section. This is the same rule as `isRunningAgent`
+// (`agentProject.ts`), which is where the two verdicts mesa used to derive
+// from `state` — a terminal `state`, and the sticky `idle` + `working` pair —
+// are written up.
 //
-// `state` alone is NOT a reliable completion signal, so `isStaleWorking`
-// (see `agentProject.ts` for the measured upstream behavior behind it) also
-// routes a finished-but-idle background session here (mesa task 571).
-// `blocked` is tested first so an idle session that is genuinely *waiting*
-// keeps its own bucket — a permission prompt is blocked no matter what else
-// the session holds. `hasLiveWork` then outranks every `state`-derived DONE:
-// mesa observed a Bash call or subagent still running, which beats upstream's
-// report that the turn ended (mesa task 802).
+// `blocked` is still its own bucket: a session waiting on a permission prompt
+// is live, but it is the one that needs a person.
 function bucketOf(a: AgentSession): Bucket {
-  if (a.state === 'blocked') return 'BLOCKED'
-  if (hasLiveWork(a)) return 'ACTIVE'
-  if (a.state === 'done' || a.state === 'failed' || a.state === 'stopped') return 'DONE'
-  if (isStaleWorking(a)) return 'DONE'
-  return 'ACTIVE' // 'working', or no state at all (interactive sessions)
+  return a.state === 'blocked' ? 'BLOCKED' : 'ACTIVE'
 }
 
-// Upstream's own `working` is still rendered for a reclassified session
-// rather than suppressed — mesa reports external state faithfully, and
-// hiding the disagreement would make the DONE bucket look authoritative
-// when it is an inference. The tooltip is what keeps a `working` badge
-// inside DONE from reading as a mesa bug.
-const STALE_WORKING_HINT =
-  'claude reports this session as "working", but it is idle with its turn ended — ' +
-  'upstream `state` can stick at "working" after a background session finishes. ' +
-  'mesa treats idle+working as done.'
-
-// The counterpart hint for the opposite disagreement: upstream says the turn
-// ended, but mesa can see the session's own work still running. Same job as
-// STALE_WORKING_HINT — keep a badge that contradicts `state` from reading as
-// a mesa bug (mesa task 802).
+// The work-in-flight badge's tooltip. mesa counts running Bash calls and
+// subagents itself, so this can contradict upstream's `state` (which reports
+// a session finished the moment its turn ends) — the hint is what keeps that
+// disagreement from reading as a mesa bug (mesa task 802).
 const LIVE_WORK_HINT =
-  'claude reports this session as finished, but it still holds a running Bash call ' +
-  'or subagent — mesa counts those directly, so it keeps the session active and the ' +
-  'todo watcher will not refill its slot yet.'
+  'mesa sees this session holding a running Bash call or subagent — it counts those ' +
+  'directly, so the todo watcher will not refill its slot yet. `claude` can report the ' +
+  'session as finished at the same time; its `state` ends at the turn, not at the work.'
 
-const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE', 'DONE']
+const BUCKETS: Bucket[] = ['BLOCKED', 'ACTIVE']
 
 /**
  * One agent pane's chrome inside the split view: a header (drag handle +
@@ -528,12 +511,7 @@ function AgentListContent({
                           <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
                           {a.status && <span className={`badge agent-status-${a.status}`}>{a.status}</span>}
                           {a.state && a.state !== a.status && (
-                            <span
-                              className={`badge agent-state-${a.state}${isStaleWorking(a) ? ' agent-state-stale' : ''}`}
-                              title={isStaleWorking(a) ? STALE_WORKING_HINT : undefined}
-                            >
-                              {a.state}
-                            </span>
+                            <span className={`badge agent-state-${a.state}`}>{a.state}</span>
                           )}
                           {liveWorkLabel(a) && (
                             <span className="badge agent-live-work" title={LIVE_WORK_HINT}>
@@ -754,13 +732,11 @@ export function AgentSidebar({
   // reachable from a spawn's `.then` long after the render that started it):
   // a state read there would be whatever the submitting render captured.
   const tileSizeRef = useRef(tileSize)
-  // DONE starts collapsed (stale sessions aren't the thing you want to see
-  // first); BLOCKED/ACTIVE start open. `state` from the API is a live status
+  // Both sections start open. `state` from the API is a live status
   // (working/blocked/done/…), not the `collapsed` UI concept below.
   const [collapsedSections, setCollapsedSections] = useState<Record<Bucket, boolean>>({
     BLOCKED: false,
     ACTIVE: false,
-    DONE: true,
   })
   // Which view each open pane is showing (task 814), keyed by leaf id; an
   // absent key is the default `chat` (task 820 — the conversation is what a
@@ -785,9 +761,10 @@ export function AgentSidebar({
   const [maximized, setMaximized] = useState(false)
   // Auto Tile: while on, the effect below keeps the pane tree in sync with
   // agent state instead of requiring a click per open/close — a pane opens
-  // for every attachable session that's ACTIVE or BLOCKED (mesa task 411:
-  // blocked agents need attention most, so they auto-open too, not just
-  // ACTIVE) and closes the moment its session reaches DONE. Off by default;
+  // for every attachable session on the list (mesa task 411: blocked agents
+  // need attention most, so they auto-open too, not just ACTIVE) and closes
+  // when its session drops off the list, which since task 858 is the one
+  // signal that it is over. Off by default;
   // switching it on syncs immediately against whatever `sessions` already
   // holds, since the effect depends on `autoTile` itself.
   const [autoTile, setAutoTile] = useState(false)
@@ -1052,7 +1029,7 @@ export function AgentSidebar({
     // Oldest first, so a newly started agent appends to the end of the grid
     // instead of shuffling every existing pane one cell along.
     const wanted = [...sessions]
-      .filter((a) => a.id !== null && bucketOf(a) !== 'DONE')
+      .filter((a) => a.id !== null)
       .sort((a, b) => a.startedAt - b.startedAt)
       .map((a) => a.id as string)
     const cols = gridColumns(wanted.length, tileSize.width, tileSize.height)

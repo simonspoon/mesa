@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  hasLiveWork,
-  isRunningAgent,
-  isStaleWorking,
-  liveWorkLabel,
-  projectForCwd,
-} from './agentProject'
+import { isRunningAgent, liveWorkLabel, projectForCwd } from './agentProject'
 import type { AgentSession } from './types/AgentSession'
 import type { Project } from './types/Project'
 
@@ -81,34 +75,6 @@ describe('projectForCwd', () => {
   })
 })
 
-describe('isStaleWorking', () => {
-  it('is true for a background session idle at working', () => {
-    expect(isStaleWorking(session({ status: 'idle', state: 'working' }))).toBe(
-      true,
-    )
-  })
-
-  it('is false for an interactive session, whose state is upstream-owned', () => {
-    expect(
-      isStaleWorking(
-        session({ kind: 'interactive', status: 'idle', state: 'working' }),
-      ),
-    ).toBe(false)
-  })
-
-  it('is false while the session is still busy', () => {
-    expect(isStaleWorking(session({ status: 'busy', state: 'working' }))).toBe(
-      false,
-    )
-  })
-
-  it('is false once the state itself is terminal', () => {
-    expect(isStaleWorking(session({ status: 'idle', state: 'done' }))).toBe(
-      false,
-    )
-  })
-})
-
 describe('isRunningAgent', () => {
   it('counts a busy working session', () => {
     expect(isRunningAgent(session({ status: 'busy', state: 'working' }))).toBe(
@@ -123,9 +89,6 @@ describe('isRunningAgent', () => {
   })
 
   it('counts an idle session that is blocked and genuinely waiting', () => {
-    // The one idle case that must survive: a session waiting on a permission
-    // prompt is not finished, and isStaleWorking's state test is what keeps
-    // it here.
     expect(
       isRunningAgent(
         session({
@@ -137,48 +100,38 @@ describe('isRunningAgent', () => {
     ).toBe(true)
   })
 
-  it.each(['done', 'failed', 'stopped'])('drops a %s session', (state) => {
-    expect(isRunningAgent(session({ status: 'idle', state }))).toBe(false)
+  // mesa task 858: being on the list IS the liveness signal, so no `state`
+  // demotes a session any more — not a terminal one (task 571 measured every
+  // `done` session still running), and not the sticky idle+working pair.
+  it.each(['done', 'failed', 'stopped'])('keeps a listed %s session', (state) => {
+    expect(isRunningAgent(session({ status: 'idle', state }))).toBe(true)
   })
 
-  it('drops a session stuck at a stale working', () => {
+  it('keeps a session sitting at idle + working', () => {
     expect(isRunningAgent(session({ status: 'idle', state: 'working' }))).toBe(
-      false,
+      true,
     )
   })
 
-  it('drops a session whose process has exited', () => {
-    expect(
-      isRunningAgent(session({ pid: null, status: 'busy', state: 'working' })),
-    ).toBe(false)
-  })
-
-  // mesa task 802: observed live work outranks upstream's `state`.
-  it('keeps a done session that still holds a running shell', () => {
-    expect(
-      isRunningAgent(session({ status: 'idle', state: 'done', liveShells: 2 })),
-    ).toBe(true)
-  })
-
-  it('keeps a stale-working session that still holds a subagent', () => {
-    expect(
-      isRunningAgent(
-        session({ status: 'idle', state: 'working', liveSubagents: 1 }),
-      ),
-    ).toBe(true)
-  })
-
-  it('drops a done session once both counts are zero', () => {
+  it('keeps a listed done session with no live work of its own', () => {
     expect(
       isRunningAgent(
         session({ status: 'idle', state: 'done', liveShells: 0, liveSubagents: 0 }),
       ),
-    ).toBe(false)
+    ).toBe(true)
   })
 
-  it('drops a done session when the counts are absent entirely', () => {
+  it('keeps a listed done session whose counts are absent entirely', () => {
     expect(
       isRunningAgent(sessionWithoutCounts({ status: 'idle', state: 'done' })),
+    ).toBe(true)
+  })
+
+  it('drops a session whose process has exited', () => {
+    // The one exclusion left, and it is upstream's own field rather than an
+    // inference of mesa's.
+    expect(
+      isRunningAgent(session({ pid: null, status: 'busy', state: 'working' })),
     ).toBe(false)
   })
 
@@ -188,21 +141,6 @@ describe('isRunningAgent', () => {
         session({ pid: null, state: 'done', liveShells: 3, liveSubagents: 2 }),
       ),
     ).toBe(false)
-  })
-})
-
-describe('hasLiveWork', () => {
-  it('is false with both counts at zero', () => {
-    expect(hasLiveWork(session())).toBe(false)
-  })
-
-  it('is true on either count alone', () => {
-    expect(hasLiveWork(session({ liveShells: 1 }))).toBe(true)
-    expect(hasLiveWork(session({ liveSubagents: 1 }))).toBe(true)
-  })
-
-  it('treats absent counts as zero', () => {
-    expect(hasLiveWork(sessionWithoutCounts())).toBe(false)
   })
 })
 

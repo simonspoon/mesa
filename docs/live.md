@@ -437,7 +437,14 @@ conversation") working with no backend change.
   what is new (the cursor is a ref, not state — it is read inside the fetch and
   rendered nowhere), so the hub holds the conversation and the server holds
   the tail. A poll that reports a *different* session id starts a fresh
-  transcript rather than merging two conversations.
+  transcript rather than merging two conversations — **`None` included**, which
+  is what ending one looks like on the wire. That decision is
+  `liveTurns.ts::transcriptFor`, answered once for the transcript *and* for the
+  set of turns the page has taken in hand: the two coming apart is the whole of
+  task 862's replay — the hub cleared `handled` while keeping every turn it
+  applied to, each still carrying `played_at: null` (the cursor means the
+  server never sends those rows again), and the run said the entire
+  conversation over again the moment the person pressed End.
 - **On arrival and on every `hashchange`** the hub `POST`s
   `/api/live/route`, so the session records where the person actually is and
   the agent can answer "what am I looking at" without guessing. Also the moment

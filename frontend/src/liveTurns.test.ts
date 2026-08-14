@@ -6,6 +6,7 @@ import {
   nextUnplayed,
   sidebarsIntent,
   spokenText,
+  transcriptFor,
   turnGroups,
   turnLabel,
 } from './liveTurns'
@@ -68,6 +69,35 @@ describe('mergeTurns', () => {
     const held = [turn(2), turn(1)]
     mergeTurns(held, [turn(3)])
     expect(held.map((t) => t.id)).toEqual([2, 1])
+  })
+})
+
+describe('transcriptFor', () => {
+  it('accumulates while the poll stays on the same conversation', () => {
+    const { turns, fresh } = transcriptFor([turn(1), turn(2)], 5, 5, [turn(3)])
+    expect(turns.map((t) => t.id)).toEqual([1, 2, 3])
+    expect(fresh).toBe(false)
+  })
+
+  it('drops the old conversation when the session ends (mesa task 862)', () => {
+    // What End looks like on the wire: no session, no turns. Keeping the turns
+    // held here is the replay — every one of them still says `played_at: null`,
+    // because the cursor means the server never sends those rows again.
+    const { turns, fresh } = transcriptFor([turn(1), turn(2)], 5, null, [])
+    expect(turns).toEqual([])
+    expect(fresh).toBe(true)
+  })
+
+  it('starts the next conversation empty', () => {
+    const { turns, fresh } = transcriptFor([turn(1)], 5, 6, [turn(7)])
+    expect(turns.map((t) => t.id)).toEqual([7])
+    expect(fresh).toBe(true)
+  })
+
+  it('is not fresh while there has never been a session', () => {
+    // The idle page polls `{session: null, turns: []}` for as long as nobody
+    // presses Go live; each of those must not read as a new conversation.
+    expect(transcriptFor([], null, null, []).fresh).toBe(false)
   })
 })
 

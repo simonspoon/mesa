@@ -52,6 +52,33 @@ export function mergeTurns(
 }
 
 /**
+ * The transcript after a poll lands, and whether it belongs to a different
+ * conversation than the one on screen (mesa task 862).
+ *
+ * A poll answers for exactly one session — or for none, which is what ending a
+ * conversation looks like on the wire (`{session: null, turns: []}`). Either
+ * change is a *new* transcript: the turns held belong to the conversation that
+ * just went away, and merging them forward leaves the page holding mesa turns
+ * whose `played_at` never came back (the `after=` cursor means those rows are
+ * never re-sent) — which the run would then speak from the top, all of them,
+ * the moment the session ended.
+ *
+ * `fresh` is that decision, answered once and returned rather than re-derived:
+ * the caller uses it for the turns *and* for the set of turns it has taken in
+ * hand, and the two must never disagree — a cleared `handled` beside a kept
+ * transcript is precisely the replay this exists to stop.
+ */
+export function transcriptFor(
+  held: readonly LiveTurn[],
+  shown: number | null,
+  arriving: number | null,
+  incoming: readonly LiveTurn[],
+): { turns: LiveTurn[]; fresh: boolean } {
+  const fresh = arriving !== shown
+  return { turns: mergeTurns(fresh ? [] : held, incoming), fresh }
+}
+
+/**
  * The next turn the page has to act on, oldest first — a mesa turn the browser
  * has not played and this page has not already taken in hand.
  *

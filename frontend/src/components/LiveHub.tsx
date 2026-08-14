@@ -25,11 +25,11 @@ import {
 } from '../liveSession'
 import {
   advanceCursor,
-  mergeTurns,
   navigateTarget,
   nextUnplayed,
   sidebarsIntent,
   spokenText,
+  transcriptFor,
   turnGroups,
   turnLabel,
 } from '../liveTurns'
@@ -142,10 +142,20 @@ export function LiveHub({
   useEffect(() => {
     if (!data) return
     const arriving = data.session?.id ?? null
-    setTurns((current) =>
-      mergeTurns(arriving === shown.current ? current : [], data.turns),
+    // Decided here and not inside a `setTurns` updater: an updater runs at the
+    // next render, by which point `shown.current` below has already been moved
+    // on — so the comparison inside one is always true and the transcript is
+    // never dropped. That was the replay of task 862: ending a conversation
+    // cleared `handled` (checked here, synchronously) while keeping every turn
+    // it applied to, and the run said the whole thing over again.
+    const { turns: next, fresh } = transcriptFor(
+      held.current,
+      shown.current,
+      arriving,
+      data.turns,
     )
-    if (arriving !== shown.current) {
+    setTurns(next)
+    if (fresh) {
       shown.current = arriving
       handled.current = new Set()
     }

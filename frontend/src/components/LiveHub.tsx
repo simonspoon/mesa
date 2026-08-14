@@ -10,6 +10,7 @@ import {
 } from '../api'
 import {
   AUTO_SEND_IDLE_MS,
+  isEditableTarget,
   shouldAutoSend,
   shouldReclaimFocus,
   userTookFocus,
@@ -326,10 +327,16 @@ export function LiveHub() {
       ) {
         return
       }
-      // mesa acting is what re-arms a stood-down capture. The focus itself is
-      // deferred a tick: called mid-blur or mid-navigation, a synchronous
-      // focus() can be overridden by the very move it is answering.
+      // mesa acting is what re-arms a stood-down capture — and it also spends
+      // whatever gesture is on the clock: a navigate's autofocus-then-blur
+      // lands *between* this call and the deferred focus below, and a
+      // keystroke that happened to precede the navigate must not let that
+      // blur read as the person deliberately leaving.
       standingDown.current = false
+      gestureAt.current = null
+      // The focus itself is deferred a tick: called mid-blur or
+      // mid-navigation, a synchronous focus() can be overridden by the very
+      // move it is answering.
       window.setTimeout(() => {
         if (!standingDown.current) capture.current?.focus({ preventScroll: true })
       }, 0)
@@ -351,18 +358,37 @@ export function LiveHub() {
   }, [live, unlocked, reclaim])
 
   // A settled draft is sent on mesa's clock (dictation never presses Enter).
-  // The timer restarts on every keystroke, so firing at all *is* the idle
-  // threshold; `shouldAutoSend` re-checks the draft and the IME at that moment.
+  // Everything the firing timer reads comes through refs, not the closure:
+  // `draftRef` so a deadline racing an Enter send replays nothing (the send
+  // already emptied it), `editedAt` so the idle threshold is measured rather
+  // than assumed, and `refused` so a line the server rejected is not retried
+  // every two seconds for ever — it waits to be edited (or sent by hand).
   const sendRef = useRef<() => void>(() => {})
+  const draftRef = useRef('')
+  const editedAt = useRef(0)
+  const refused = useRef<string | null>(null)
+  // Bumped when an IME composition commits: that commit changes no draft text
+  // (the characters were already displayed), so without it nothing would ever
+  // re-arm a timer the composition suppressed.
+  const [composeTick, setComposeTick] = useState(0)
   useEffect(() => {
     if (!live || draft.trim() === '') return
     const timer = window.setTimeout(() => {
-      if (shouldAutoSend(draft, AUTO_SEND_IDLE_MS, composing.current)) {
+      const text = draftRef.current
+      if (text.trim() === refused.current) return
+      if (shouldAutoSend(text, Date.now() - editedAt.current, composing.current)) {
         sendRef.current()
       }
     }, AUTO_SEND_IDLE_MS)
     return () => window.clearTimeout(timer)
-  }, [draft, live])
+  }, [draft, live, composeTick])
+
+  /** The one write path for the draft: state for the render, refs for the timer. */
+  const updateDraft = useCallback((value: string) => {
+    draftRef.current = value
+    editedAt.current = Date.now()
+    setDraft(value)
+  }, [])
 
   // The run: the oldest mesa turn nobody has played, one at a time. A turn that
   // navigates moves the browser when it is *reached*, whether or not it also
@@ -447,6 +473,10 @@ export function LiveHub() {
   // failure — no live session, most often — is forgotten rather than shown.
   const reportRoute = useCallback(() => {
     const route = window.location.hash || '#/'
+    // `#/live` is a verb, not a place (see the intercept below), and this
+    // listener runs before the intercept's — reporting the transient hash
+    // would record a page that no longer exists.
+    if (route === '#/live') return
     if (!route.startsWith('#/') || route.length > 200) return
     reportLiveRoute(route).catch(() => {})
   }, [])
@@ -472,7 +502,10 @@ export function LiveHub() {
       const hash = window.location.hash
       if (hash === '#/live') {
         setOpen(true)
-        window.location.hash = before.current
+        // `replace`, not an assignment: the put-back must overwrite the
+        // `#/live` history entry, or Back lands on it, the intercept fires
+        // again and the person is trapped bouncing forward for ever.
+        window.location.replace(before.current)
         return
       }
       if (hash !== '') before.current = hash
@@ -505,33 +538,45 @@ export function LiveHub() {
       pump.current()
       return
     }
+    // A failed start leaves no session behind (the server ends the one it
+    // opened), so nothing in the header would say what went wrong — the error
+    // lives in the popup's status line, and the popup opens to show it.
+    const failed = (err: unknown) => {
+      setActionError(err instanceof Error ? err.message : String(err))
+      setOpen(true)
+    }
     if (button.action === 'start') {
       setPending('start')
-      startLive().then(
-        () => refetch(),
-        (err: unknown) => setActionError(err instanceof Error ? err.message : String(err)),
-      ).finally(() => setPending(null))
+      startLive().then(() => refetch(), failed).finally(() => setPending(null))
       return
     }
     setPending('stop')
     silence()
-    stopLive().then(
-      () => refetch(),
-      (err: unknown) => setActionError(err instanceof Error ? err.message : String(err)),
-    ).finally(() => setPending(null))
+    stopLive().then(() => refetch(), failed).finally(() => setPending(null))
   }
 
   function send() {
-    const text = draft.trim()
+    // Read through the ref, not the render's draft: an auto-send deadline
+    // racing an explicit Enter finds the box already emptied and posts
+    // nothing, instead of the same utterance twice.
+    const text = draftRef.current.trim()
     if (text === '' || !live) return
-    setDraft('')
+    updateDraft('')
     sendLiveUtterance(text).then(
-      () => refetch(),
+      () => {
+        refused.current = null
+        refetch()
+      },
       (err: unknown) => {
         setActionError(err instanceof Error ? err.message : String(err))
+        // The failure is only visible inside the popup, so a closed one opens.
+        setOpen(true)
         // The line was never recorded, so it belongs back in the box rather
         // than lost — re-dictating it is the one thing a person cannot redo.
-        setDraft((current) => (current === '' ? text : current))
+        // Marked refused so the auto-send timer does not retry it unedited;
+        // Enter remains the deliberate way to try the same text again.
+        refused.current = text
+        if (draftRef.current === '') updateDraft(text)
       },
     )
   }
@@ -563,7 +608,7 @@ export function LiveHub() {
           onClick={() => {
             setOpen((o) => !o)
             // A press on mesa's own controls hands the keyboard back to mesa.
-            reclaim('went-live', armed.current)
+            reclaim('hub-press', armed.current)
           }}
         >
           💬
@@ -592,8 +637,11 @@ export function LiveHub() {
 
       {/* The popup — always mounted, hidden by clipping when closed, so the
           capture box inside keeps its focus (and the dictation flowing into
-          it) across open/close. Closing is CSS only: no route, no stop. */}
-      <div className={`live-overlay${open ? '' : ' live-closed'}`} aria-hidden={!open}>
+          it) across open/close. Closing is CSS only: no route, no stop. No
+          `aria-hidden` while closed: the capture box inside deliberately
+          keeps real focus, which aria-hidden forbids (browsers block it and
+          screen readers lose the focus point) — the box IS the feature. */}
+      <div className={`live-overlay${open ? '' : ' live-closed'}`}>
         <div className="live-overlay-head">
           <span className={actionError !== null ? 'error' : 'muted'}>
             {liveStatusLine(session, speaking, actionError)}
@@ -602,9 +650,13 @@ export function LiveHub() {
             type="button"
             className="live-overlay-close"
             aria-label="hide the conversation"
+            // Out of the tab order while clipped: an invisible button a Tab
+            // can land on is a trap. The textarea stays tabbable — it is the
+            // one element meant to hold focus while the popup is shut.
+            tabIndex={open ? undefined : -1}
             onClick={() => {
               setOpen(false)
-              reclaim('went-live', armed.current)
+              reclaim('hub-press', armed.current)
             }}
           >
             ×
@@ -662,19 +714,29 @@ export function LiveHub() {
               live ? 'dictate here…' : 'go live to start the conversation'
             }
             aria-label="say something to mesa"
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => updateDraft(e.target.value)}
             onCompositionStart={() => {
               composing.current = true
             }}
             onCompositionEnd={() => {
               composing.current = false
+              // Committing changes no text (it was already displayed), so
+              // this tick is the only thing that re-arms a timer the open
+              // composition suppressed.
+              setComposeTick((t) => t + 1)
             }}
-            onBlur={() => {
-              // The arbiter: focus lost on the heels of a gesture is the
-              // person deliberately going elsewhere — concede. Focus that
-              // drifted with no gesture behind it (a page's autofocus after a
-              // `navigate`, most often) is taken back.
-              if (userTookFocus(gestureAt.current, Date.now())) {
+            onBlur={(e) => {
+              // The arbiter: focus lost to somewhere a person types, on the
+              // heels of a gesture, is them deliberately going elsewhere —
+              // concede. Everything else — a page's autofocus after a
+              // `navigate`, a click on a button or on nothing — is taken
+              // back: none of it means "stop listening".
+              const to = e.relatedTarget as HTMLElement | null
+              if (
+                to !== null &&
+                isEditableTarget(to.tagName, to.isContentEditable) &&
+                userTookFocus(gestureAt.current, Date.now())
+              ) {
                 standingDown.current = true
                 return
               }

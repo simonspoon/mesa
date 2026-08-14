@@ -7889,9 +7889,23 @@ button:focus-visible,
   font-size: 0.75rem;
 }
 
-/* Phone: the popup takes the width, and the header cluster keeps only its
-   buttons (docs/mobile.md — CSS only, no new matchMedia). */
+/* Phone: the popup takes the width, and the header is allowed to wrap
+   (docs/mobile.md — CSS only, no new matchMedia). Brand + three live buttons
+   + two usage chips overrun a 390px viewport, and #root is overflow:hidden —
+   without the wrap the rightmost controls would clip clean off the screen. */
 @media (max-width: 600px) {
+  header {
+    flex-wrap: wrap;
+    row-gap: 0.3rem;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .header-right {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: 0.3rem;
+  }
+
   .live-overlay {
     left: 0.5rem;
     right: 0.5rem;

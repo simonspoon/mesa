@@ -31,8 +31,29 @@ export function userTookFocus(lastGestureAt: number | null, now: number): boolea
   return lastGestureAt !== null && now - lastGestureAt <= GESTURE_WINDOW_MS
 }
 
-/** The moments capture may (re)take focus — all of them mesa's own actions. */
-export type ReclaimCause = 'went-live' | 'navigated' | 'focus-lost-no-gesture'
+/**
+ * Whether the element focus moved to is one a person types into — the only
+ * kind of focus loss that can mean "I am deliberately writing elsewhere".
+ * Any click blurs the box (buttons, links and blank page all take the focus),
+ * but dictation dying because the person pressed a button, or clicked on
+ * nothing, would be a fight nobody picked — those losses are taken back.
+ */
+export function isEditableTarget(tag: string | null, contentEditable: boolean): boolean {
+  if (contentEditable) return true
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+}
+
+/**
+ * The moments capture may (re)take focus — all of them mesa's own actions.
+ * `hub-press` is a click on the hub's own controls (the popup toggle, its
+ * close button): the person pressing mesa's buttons is handing the keyboard
+ * back to mesa, not taking it away.
+ */
+export type ReclaimCause =
+  | 'went-live'
+  | 'navigated'
+  | 'hub-press'
+  | 'focus-lost-no-gesture'
 
 /**
  * Whether the capture box takes focus now. Never before this browser has both

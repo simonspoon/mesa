@@ -330,7 +330,9 @@ The conversation lives in the **header**, not on a page: a control cluster on
 the right, beside the plan-limit chips, on every route. There is no left-nav
 row and no routed page. `#/live` survives only as a **verb** — the hub
 intercepts it, opens the conversation popup and puts the hash back to wherever
-the person last was — which is what keeps the agent's existing
+the person last was (via `location.replace`, so the `#/live` entry never
+lands in history and Back is never trapped on it; the route report also skips
+the transient `#/live` hash) — which is what keeps the agent's existing
 `navigate '#/live'` vocabulary and the command-palette entry ("Live
 conversation") working with no backend change.
 
@@ -358,18 +360,31 @@ conversation") working with no backend change.
   field, the words that follow still land in the conversation, not in the
   field, and the person can ask mesa to create something there without their
   speech typing into it. The referee (`userTookFocus`, `shouldReclaimFocus`):
-  a focus loss on the heels of a pointer/key gesture is the person
-  deliberately clicking into a form — capture **stands down** and the form
-  wins; a gestureless loss (a page's autofocus after a navigate, most often)
-  is taken back. While stood down, only mesa acting again — going live, a
-  `navigate` turn, a press on the hub's own controls — re-arms capture.
+  a focus loss to an element a person types into (`isEditableTarget`), on
+  the heels of a pointer/key gesture, is the person deliberately clicking
+  into a form — capture **stands down** and the form wins; every other loss
+  (a page's autofocus after a navigate, a press on a button, a click on
+  nothing) is taken back, because none of it means "stop listening". While
+  stood down, only mesa acting again — going live, a `navigate` turn, a press
+  on the hub's own controls (`hub-press`) — re-arms capture, and mesa acting
+  also spends the gesture on the clock, so a keystroke that happened to
+  precede a navigate cannot make its autofocus read as deliberate.
   Nothing grabs the keyboard before the press: an un-joined browser has no
   business stealing focus.
 - **A settled line is sent on mesa's clock** (`shouldAutoSend`): dictation
   never presses Enter, so a non-blank draft untouched for `AUTO_SEND_IDLE_MS`
   (2s) is sent as the utterance — hands-free end to end. Enter still sends at
   once, Shift+Enter still opens a line, and the IME guard holds it while
-  composing.
+  composing (an IME commit re-arms the timer, since committing changes no
+  draft text). The firing timer reads the draft, the measured idle time and
+  the IME state through refs, never its own render's closure — which is what
+  makes a deadline racing an explicit Enter post nothing instead of the same
+  utterance twice. A line the server **refused** is put back in the box but
+  marked, and is not auto-retried until edited — Enter is the deliberate way
+  to try the same text again. A failed press (`Go live` on a machine with no
+  `claude`, most likely) **opens the popup**, because the error is the status
+  line's to report and a failed start leaves no session for the header to
+  hint with.
 - **The controls are a three-state toggle, not one button.** Nothing live:
   **Go live** (`POST /api/live`). Live in a browser that has had a press:
   **End** (`DELETE /api/live`). Live in a browser that has **not** had one:

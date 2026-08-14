@@ -58,7 +58,8 @@ use super::store::{
     CcSessionRecord, CcSessionUpsert, CcToolCallRow, Error, Result, Store,
 };
 use super::types::{
-    CcAgentStat, CcChatTurn, CcChatTurnKind, CcDashboard, CcDayPoint, CcGraphEdge, CcGraphNode,
+    CcAgentStat, CcChatAsk, CcChatOption, CcChatQuestion, CcChatTurn, CcChatTurnKind, CcDashboard,
+    CcDayPoint, CcGraphEdge, CcGraphNode,
     CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText,
     CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket, CcSessionChat, CcSessionDetail,
     CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat,
@@ -2716,6 +2717,7 @@ pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
     let (text, windowed) = read_tail(&path)?;
 
     let mut turns = chat_turns(&text);
+    let pending_question = pending_ask(&text);
     let dropped = turns.len().saturating_sub(limit);
     if dropped > 0 {
         turns.drain(..dropped);
@@ -2724,7 +2726,121 @@ pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
         session_id: session_id.to_string(),
         turns,
         truncated: windowed || dropped > 0,
+        pending_question,
     })
+}
+
+/// The `AskUserQuestion` call this window ends on **unanswered**, if any (task
+/// 866) — the one thing in a chat pane a reader can act on rather than watch.
+///
+/// A call is answered when a later line carries a `tool_result` for its
+/// `tool_use_id`; the *last* unanswered one wins, because a session asks one
+/// question at a time and everything before it is history. Read from the same
+/// window the turns are, so a question older than the window is not offered —
+/// which is right: a client that answered it would be typing at a chooser
+/// that closed long ago.
+///
+/// Both the labels and the questions are model-authored text bound for a
+/// button, so each goes through [`sanitize_capped`] exactly as a tool target
+/// does. The tool's `preview` is dropped: it is unbounded, and this payload is
+/// a 3-second poll.
+fn pending_ask(text: &str) -> Option<CcChatAsk> {
+    let mut asked: Vec<CcChatAsk> = Vec::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    for line in text.lines() {
+        let Ok(raw) = serde_json::from_str::<RawLine>(line.trim()) else {
+            continue;
+        };
+        if raw.is_sidechain == Some(true) {
+            continue;
+        }
+        let Some(blocks) = raw
+            .message
+            .as_ref()
+            .and_then(|m| m.content.as_ref())
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for b in blocks {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("tool_result") => {
+                    if let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) {
+                        answered.insert(id.to_string());
+                    }
+                }
+                Some("tool_use") if b.get("name").and_then(|n| n.as_str()) == Some(ASK_TOOL) => {
+                    let (Some(id), Some(questions)) = (
+                        b.get("id").and_then(|i| i.as_str()),
+                        b.get("input")
+                            .and_then(|i| i.get("questions"))
+                            .and_then(|q| q.as_array()),
+                    ) else {
+                        continue;
+                    };
+                    asked.push(CcChatAsk {
+                        id: id.to_string(),
+                        questions: questions.iter().map(chat_question).collect(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    asked
+        .into_iter()
+        .filter(|a| !answered.contains(&a.id))
+        // A call with nothing to click is not something a reader can answer.
+        .filter(|a| a.questions.iter().any(|q| !q.options.is_empty()))
+        .next_back()
+}
+
+/// The tool a session asks its multiple-choice questions with. Named once:
+/// the name is Claude Code's, not mesa's, and this is the only place mesa
+/// reads one tool by name.
+const ASK_TOOL: &str = "AskUserQuestion";
+
+/// One `questions[]` entry of an [`ASK_TOOL`] input, leniently — a field this
+/// build does not find becomes empty rather than dropping the question, the
+/// same rule the rest of this parser follows.
+fn chat_question(raw: &serde_json::Value) -> CcChatQuestion {
+    let field = |key: &str| {
+        raw.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(sanitize_capped)
+            .unwrap_or_default()
+    };
+    CcChatQuestion {
+        question: field("question"),
+        header: field("header"),
+        multi_select: raw
+            .get("multiSelect")
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false),
+        options: raw
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|o| {
+                        let label = o.get("label").and_then(|l| l.as_str())?;
+                        Some(CcChatOption {
+                            // An option with no label is nothing a reader
+                            // could recognise, so it is dropped rather than
+                            // rendered as a blank button.
+                            label: sanitize_capped(label)?,
+                            description: o
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .and_then(sanitize_capped)
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// Fold one transcript's text into ordered chat turns. Split out from
@@ -5173,6 +5289,78 @@ mod tests {
             turns[1].text.chars().count(),
             TARGET_MAX_CHARS + 1,
             "a tool target stays the same bounded summary the call tree shows              — 200 chars plus the ellipsis marking the cut"
+        );
+    }
+
+    /// One `AskUserQuestion` call, as Claude Code writes it: two questions,
+    /// the second `multiSelect`, an unbounded `preview` on one option and an
+    /// option with no label at all.
+    fn ask_line(id: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"a-{id}","sessionId":"s","timestamp":"2026-08-01T10:00:05.000Z","message":{{"model":"m","content":[{{"type":"tool_use","id":"{id}","name":"AskUserQuestion","input":{{"questions":[{{"question":"Redis or in-memory?","header":"Cache","multiSelect":false,"options":[{{"label":"Redis","description":"shared","preview":"a very long preview"}},{{"label":"In memory","description":""}},{{"description":"no label"}}]}},{{"question":"Which suites?","header":"Tests","multiSelect":true,"options":[{{"label":"unit"}},{{"label":"e2e"}}]}}]}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn pending_ask_reads_the_question_a_session_is_waiting_on() {
+        let ask = pending_ask(&ask_line("q1")).expect("an unanswered ask is pending");
+        assert_eq!(ask.id, "q1", "the tool_use_id is what a client answers by");
+        assert_eq!(ask.questions.len(), 2);
+
+        let first = &ask.questions[0];
+        assert_eq!(first.question, "Redis or in-memory?");
+        assert_eq!(first.header, "Cache");
+        assert!(!first.multi_select);
+        assert_eq!(
+            first
+                .options
+                .iter()
+                .map(|o| (o.label.as_str(), o.description.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Redis", "shared"), ("In memory", "")],
+            "options keep their order, an absent description is empty, and an \
+             option with no label is dropped rather than rendered blank"
+        );
+        assert!(
+            ask.questions[1].multi_select,
+            "multiSelect rides along — a chooser that takes several answers is \
+             not answered the way one that takes one is"
+        );
+    }
+
+    #[test]
+    fn pending_ask_is_none_once_the_question_is_answered() {
+        let answered = format!(
+            "{}\n{}",
+            ask_line("q1"),
+            r#"{"type":"user","uuid":"r9","sessionId":"s","timestamp":"2026-08-01T10:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"q1","content":"answered"}]}}"#
+        );
+        assert_eq!(
+            pending_ask(&answered),
+            None,
+            "a call with a result is history, not something to click"
+        );
+        assert_eq!(
+            pending_ask(CHAT_LINES),
+            None,
+            "a session that never asked is not waiting on an answer"
+        );
+    }
+
+    #[test]
+    fn pending_ask_takes_the_newest_unanswered_question() {
+        let two = format!("{}\n{}", ask_line("q1"), ask_line("q2"));
+        assert_eq!(
+            pending_ask(&two).map(|a| a.id),
+            Some("q2".to_string()),
+            "a session asks one thing at a time: the last one is the open one"
+        );
+        let sidechain = ask_line("q3").replace(r#""type":"assistant""#, r#""type":"assistant","isSidechain":true"#);
+        assert_eq!(
+            pending_ask(&sidechain),
+            None,
+            "a subagent's question belongs to its own transcript, the same \
+             main-thread-only rule the turns follow"
         );
     }
 

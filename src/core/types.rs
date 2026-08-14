@@ -1601,6 +1601,54 @@ pub struct CcSessionChat {
     /// count: the byte window drops an *unknown* number of turns, so any
     /// number here would be invented.
     pub truncated: bool,
+    /// The `AskUserQuestion` call this session is **waiting on**, when it is
+    /// waiting on one (task 866) — the one turn a reader can do something
+    /// about rather than only watch. Derived on every read from the same
+    /// window the turns come from (the last such `tool_use` carrying no
+    /// `tool_result`), never stored, and `None` for every session that is not
+    /// blocked on a question.
+    pub pending_question: Option<CcChatAsk>,
+}
+
+/// The `AskUserQuestion` call a session is blocked on — see
+/// [`CcSessionChat::pending_question`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcChatAsk {
+    /// The `tool_use_id` of the call. Also the id of the `tool` turn it
+    /// appears as in `turns`, so a client can tell the two apart across polls
+    /// — a *second* question is a different id, and answering the first one
+    /// makes this whole field `None`.
+    pub id: String,
+    /// The questions of that one call, in the order the agent asked them —
+    /// which is also the order its own chooser walks them in.
+    pub questions: Vec<CcChatQuestion>,
+}
+
+/// One question of a [`CcChatAsk`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcChatQuestion {
+    /// The question itself, bounded (`sanitize_capped`) like every other
+    /// transcript-derived label: this is model-authored text on a button.
+    pub question: String,
+    /// The short chip the tool asks for beside it; empty when it carried none.
+    pub header: String,
+    /// Whether the chooser takes more than one answer.
+    pub multi_select: bool,
+    /// The offered answers, in order. The tool's own `preview` is deliberately
+    /// dropped: it is unbounded and this payload is a 3s poll.
+    pub options: Vec<CcChatOption>,
+}
+
+/// One offered answer of a [`CcChatQuestion`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcChatOption {
+    /// What the agent's own chooser shows on the row — bounded.
+    pub label: String,
+    /// Why that answer, when the call gave a reason; empty when it did not.
+    pub description: String,
 }
 
 /// One turn of a [`CcSessionChat`] — a human prompt, an assistant reply, or

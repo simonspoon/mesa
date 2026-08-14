@@ -3842,6 +3842,140 @@ body.files-tree-resizing {
   color: var(--text);
 }
 
+/* The question a session is waiting on (task 866). Green, which nothing else
+   in this block claims: the accent split here is cyan = you, amber = agent,
+   and this is neither — it is the one row that is *stopped*, and it must be
+   findable at a glance in a 200px tile. */
+.agent-chat-ask {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  border: 1px solid var(--green);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: var(--panel-raised);
+  padding: 0.45rem 0.6rem;
+  min-width: 0;
+}
+
+.agent-chat-ask-title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--green);
+}
+
+.agent-chat-ask-question {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.agent-chat-ask-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.agent-chat-ask-chip {
+  flex: none;
+  border: 1px solid var(--border-bright);
+  border-radius: 3px;
+  padding: 0 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--muted);
+}
+
+.agent-chat-ask-text {
+  font-size: 0.78rem;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+/* One offered answer. A whole row rather than a chip: the description is what
+   tells two similar labels apart, and it wraps. */
+.agent-chat-ask-option {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  width: 100%;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border-bright);
+  border-radius: 4px;
+  /* 24px minimum (WCAG 2.2 SC 2.5.8), as every control in this block. */
+  padding: 0.3rem 0.45rem;
+  min-height: 24px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.agent-chat-ask-option:hover:not(:disabled) {
+  border-color: var(--green);
+}
+
+/* A ticked box on a multi-select question: the chooser holds it, so the card
+   shows it held. */
+.agent-chat-ask-ticked {
+  border-color: var(--green);
+  background: var(--panel-raised);
+}
+
+/* A question the chooser has not reached yet: shown, because reading what is
+   coming is half of deciding the current one, but not answerable. */
+.agent-chat-ask-option:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.agent-chat-ask-label {
+  font-size: 0.76rem;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+.agent-chat-ask-desc {
+  font-size: 0.68rem;
+  /* `--muted` on this panel is only 4.4:1; small text takes `--text`. */
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.agent-chat-ask-picked {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--green);
+  overflow-wrap: anywhere;
+}
+
+.agent-chat-ask-submit {
+  align-self: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  color: var(--green);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  padding: 0.25rem 0.6rem;
+  min-height: 24px;
+  cursor: pointer;
+}
+
+.agent-chat-ask-sent {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--muted);
+}
+
 /* Pinned to the pane's own bottom-right rather than sitting in the column:
    the reader has scrolled away from the tail, so a control that scrolls with
    the content would be somewhere else entirely. */

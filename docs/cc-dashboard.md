@@ -612,6 +612,21 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     come out in file order (a transcript is append-only), with one line's prose
     before that line's own calls — the same response-before-tool rule
     `session_graph` applies at an equal timestamp.
+  - **`pending_question` — the one turn a reader can act on** (task 866).
+    Beside the turns, the payload carries the `AskUserQuestion` call the
+    session is *waiting on*: its `tool_use_id`, and each question's text,
+    header, `multi_select` and offered options (label + description). It is
+    derived on every read from the same window the turns come from — the last
+    such `tool_use` carrying no `tool_result` — and is `None` for every
+    session that is working rather than waiting. This is the only place mesa
+    reads a tool **by name**; the name is Claude Code's (`ASK_TOOL` in
+    `cc.rs`), and what the Agent sidebar does with it is `docs/agents.md`.
+    The question and every label go through `sanitize_capped` like a tool
+    target — this is model-authored text bound for a button — and the tool's
+    own `preview` is dropped outright: it is unbounded and this is a 3-second
+    poll. A question older than the byte window is not offered, which is
+    right: its chooser closed long ago. An option with no `label` is dropped
+    rather than rendered as a blank button.
   - Errors, both already-scoped codes: `validation` for an id that is not a
     session id, `unavailable` for a session with no transcript on disk. There
     is deliberately **no `not_found`** — with no db consulted, "never ingested"

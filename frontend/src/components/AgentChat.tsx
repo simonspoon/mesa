@@ -4,14 +4,19 @@ import { useFetch } from '../useFetch'
 import { Markdown } from './Markdown'
 import * as ptyPool from '../lib/ptyPool'
 import {
+  CHAT_COMMIT_KEYS,
+  CHAT_SUBMIT_KEYS,
+  chatAnswerKeys,
   chatClock,
   chatGroups,
+  chatNeedsReview,
   chatSendKeys,
   chatToolLabel,
   chatToolSummary,
   chatToolTarget,
   isNearBottom,
 } from '../agentChat'
+import type { CcChatAsk } from '../types/CcChatAsk'
 import type { CcChatTurn } from '../types/CcChatTurn'
 
 /**
@@ -170,6 +175,18 @@ export function AgentChat({
             </div>
           )
         })}
+        {/* Last in the column because that is where it is in the
+            conversation: the question is the newest thing the session said,
+            and it is the only thing here a reader can act on. Keyed by the
+            call, so the next question starts with a clean card. */}
+        {data.pending_question !== null && (
+          <QuestionCard
+            key={data.pending_question.id}
+            ask={data.pending_question}
+            agentId={agentId}
+            onAnswered={jumpToTail}
+          />
+        )}
         {adrift && (
           <button type="button" className="agent-chat-jump" onClick={jumpToTail}>
             ↓ latest
@@ -177,6 +194,145 @@ export function AgentChat({
         )}
       </div>
       <Composer agentId={agentId} onSent={jumpToTail} />
+    </div>
+  )
+}
+
+/**
+ * The question a session is **waiting on** (task 866), as buttons.
+ *
+ * A chat pane is otherwise a read: the agent works, you watch. An
+ * `AskUserQuestion` is the one turn where it has stopped and is waiting for a
+ * person, and answering it meant switching to the terminal view and driving
+ * the agent's own chooser by keyboard. So the chooser is rendered here — one
+ * button per offered answer — and a click types the keystroke that picks it.
+ *
+ * Like the composer, it has no API: the only channel into a live session is
+ * the PTY the pane is attached to (`ptyPool.send`), and the chooser is driven
+ * exactly as a person at the terminal drives it — by the row's own number.
+ *
+ * **Mesa cannot see the chooser**, only the transcript, which records nothing
+ * until the whole call is answered. What it knows is that a *fresh* chooser
+ * opens on the call's first question and steps forward one question per
+ * answer — so the card walks the same steps in the same order: the question
+ * being answered is the live one, the ones before it show what was picked,
+ * and the ones after wait their turn. A reader who answered in the terminal
+ * instead is not stranded by this: the next poll clears the whole card.
+ */
+function QuestionCard({
+  ask,
+  agentId,
+  onAnswered,
+}: {
+  ask: CcChatAsk
+  /** The pane's own id — the PTY the answer is typed into, exactly as for the
+   *  composer. */
+  agentId: string
+  onAnswered: () => void
+}) {
+  // The answers given so far, one entry per question in order — so its length
+  // is also *which* question the chooser is showing. Local because it is: the
+  // transcript carries none of it until the call resolves, at which point this
+  // card is gone.
+  const [answers, setAnswers] = useState<string[][]>([])
+  // The boxes ticked so far on the multi-select question being answered. Its
+  // own state, because a tick is not an answer: it is a keystroke the chooser
+  // has taken, and the question is not finished until `commit`.
+  const [ticked, setTicked] = useState<string[]>([])
+  const [submitted, setSubmitted] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const type = (keys: string) => {
+    if (!ptyPool.send(agentId, keys)) {
+      setError('not connected — reopen the terminal view to reconnect')
+      return false
+    }
+    setError(null)
+    return true
+  }
+
+  const live = answers.length
+  const question = ask.questions[live]
+  const done = live === ask.questions.length
+  const needsSubmit = done && !submitted && chatNeedsReview(ask.questions)
+
+  const pick = (index: number, label: string) => {
+    if (!type(chatAnswerKeys(index))) return
+    if (question.multi_select) {
+      // The same digit ticks and unticks, so the card follows the chooser
+      // rather than accumulating: what it shows is what the chooser holds.
+      setTicked((t) => (t.includes(label) ? t.filter((l) => l !== label) : [...t, label]))
+      return
+    }
+    setAnswers((a) => [...a, [label]])
+    // Answering is following: the reply to what you just picked is the thing
+    // you are here for.
+    onAnswered()
+  }
+
+  const commit = () => {
+    if (!type(CHAT_COMMIT_KEYS)) return
+    setAnswers((a) => [...a, ticked])
+    setTicked([])
+    onAnswered()
+  }
+
+  return (
+    <div className="agent-chat-ask">
+      <p className="agent-chat-ask-title">waiting for your answer</p>
+      {ask.questions.map((q, qi) => (
+        <div key={qi} className="agent-chat-ask-question">
+          <div className="agent-chat-ask-head">
+            {q.header && <span className="agent-chat-ask-chip">{q.header}</span>}
+            <span className="agent-chat-ask-text">{q.question}</span>
+          </div>
+          {qi < live ? (
+            <p className="agent-chat-ask-picked">{answers[qi].join(', ') || 'nothing'}</p>
+          ) : (
+            q.options.map((o, oi) => (
+              <button
+                key={oi}
+                type="button"
+                className={`agent-chat-ask-option${
+                  qi === live && ticked.includes(o.label) ? ' agent-chat-ask-ticked' : ''
+                }`}
+                // Only the question the chooser is on can be answered: a
+                // keystroke meant for a later one would land on this one.
+                disabled={qi !== live || submitted}
+                aria-pressed={q.multi_select ? ticked.includes(o.label) : undefined}
+                onClick={() => pick(oi, o.label)}
+              >
+                <span className="agent-chat-ask-label">{o.label}</span>
+                {o.description && <span className="agent-chat-ask-desc">{o.description}</span>}
+              </button>
+            ))
+          )}
+          {/* A checkbox question has no keystroke that both ticks and
+              finishes, so finishing it is its own press. */}
+          {qi === live && q.multi_select && !submitted && (
+            <button type="button" className="agent-chat-ask-submit" onClick={commit}>
+              done with this question
+            </button>
+          )}
+        </div>
+      ))}
+      {needsSubmit && (
+        <button
+          type="button"
+          className="agent-chat-ask-submit"
+          onClick={() => {
+            if (!type(CHAT_SUBMIT_KEYS)) return
+            setSubmitted(true)
+            onAnswered()
+          }}
+        >
+          submit answers
+        </button>
+      )}
+      {/* The card outlives its own answer by one poll at most, and saying
+          nothing in that window reads as a click that did nothing. */}
+      {done && !needsSubmit && <p className="agent-chat-ask-sent">sent</p>}
+      {error && <p className="agent-chat-send-error">{error}</p>}
     </div>
   )
 }

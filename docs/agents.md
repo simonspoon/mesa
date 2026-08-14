@@ -426,6 +426,47 @@ already use.
     - This is the one thing the chat view can do that the terminal cannot do
       better, and it is why the pane defaults to `chat`: read what it is doing,
       say the next thing, without switching views.
+  - **A question the agent is waiting on is answered from the chat** (task
+    866). When a session stops on an `AskUserQuestion`, the pane grows a card
+    at the tail of the conversation — the question, and one button per offered
+    answer — and a click answers it. Until this, the one turn where the agent
+    had stopped and was waiting for a *person* was the one turn the chat view
+    could not act on: you had to switch to the terminal and drive the agent's
+    own chooser by keyboard.
+    - **Data: `pending_question` on the same 3s payload**
+      (`docs/cc-dashboard.md` → *Session chat*) — the last `AskUserQuestion`
+      `tool_use` in the window carrying no `tool_result`. No new route, and
+      no new poll.
+    - **The answer is keystrokes, for the composer's reason.** There is no
+      send API; the only channel into a live session is the pane's PTY. The
+      chooser numbers its rows (`1. Alpha  2. Beta  3. Gamma`), so a click
+      types that **digit** — never "down-arrow *n* times then Enter", because
+      the arrows are relative to a cursor mesa cannot see while the digit
+      names the row. The rows the chooser appends itself ("Type something",
+      "Chat about this") sort after every real option, so a number in range
+      never hits one. `chatAnswerKeys` / `CHAT_COMMIT_KEYS` /
+      `CHAT_SUBMIT_KEYS` in `frontend/src/agentChat.ts` are the one place
+      that encoding lives, vitest-covered like `chatSendKeys`.
+    - **Mesa cannot see the chooser, so the card walks its steps.** The
+      transcript records nothing about a call until the whole call is
+      answered; what is known is that a fresh chooser opens on the first
+      question and steps forward one question per answer. So the card answers
+      in that order — the live question's options are clickable, earlier ones
+      show what was picked, later ones are shown but disabled, since a
+      keystroke meant for a later question would land on this one. A reader
+      who answers in the terminal instead is not stranded: the next poll
+      clears the card.
+    - **Three keystrokes, because the chooser has three states**, each
+      observed against the real CLI rather than assumed: a **single-select**
+      row's digit selects *and* commits; a **multi-select** row's digit
+      *toggles* it, so that question is finished by a `Tab` onto the chooser's
+      own `✔ Submit` tab (the card's "done with this question"); and every
+      call except a single single-select one ends on a **review** step
+      (`Ready to submit your answers?`), whose `1` the card's "submit answers"
+      sends. `chatNeedsReview` is that last rule.
+    - It fails exactly as the composer does — `ptyPool.send` returning false
+      says the socket is gone, and the card says so rather than pretending the
+      click landed.
   - **Untrusted text, rendered as markup — deliberately, and narrowly.** Every
     body here is model-authored transcript text, which the CC surfaces
     otherwise render only as a text child or a `title`. The chat view is the

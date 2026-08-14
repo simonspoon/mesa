@@ -1,3 +1,4 @@
+import type { CcChatQuestion } from './types/CcChatQuestion'
 import type { CcChatTurn } from './types/CcChatTurn'
 
 /**
@@ -159,6 +160,57 @@ export function isNearBottom(scrollTop: number, scrollHeight: number, clientHeig
  * the same text dropped into the terminal by hand does. CRLF is normalised
  * first for the same reason: a stray `\r` from a paste would submit early.
  */
+/**
+ * The keystroke that picks option `index` of the question a session's own
+ * chooser is currently showing (task 866).
+ *
+ * The chooser numbers its rows — `1. Alpha  2. Beta  3. Gamma` — and a digit
+ * selects that row outright. That is why this is a digit and not "down-arrow
+ * `index` times, then Enter": the arrows are relative to wherever the cursor
+ * happens to be, and mesa cannot see the cursor. A digit names the row, so it
+ * lands on the intended option whether or not something moved first.
+ *
+ * The index is the option's position in the *question's own* option list,
+ * which is the order the chooser lists them in — the extra rows it appends
+ * ("Type something", "Chat about this") come after every real option, so they
+ * are never what a number in this range hits.
+ *
+ * On a **multi-select** question the same digit *toggles* its row instead of
+ * answering, which is why that case needs [`CHAT_COMMIT_KEYS`] after it.
+ */
+export function chatAnswerKeys(index: number): string {
+  return String(index + 1)
+}
+
+/**
+ * Whether this call ends on the chooser's **review** step — i.e. whether
+ * answering every question still leaves a `submit` to press.
+ *
+ * Exactly one shape skips it: a single single-select question, which its own
+ * answer commits. More than one question, or any checkbox question, and the
+ * chooser gathers the answers and asks for confirmation.
+ */
+export function chatNeedsReview(questions: CcChatQuestion[]): boolean {
+  return questions.length > 1 || questions.some((q) => q.multi_select)
+}
+
+/**
+ * The keystroke that closes a **multi-select** question, whose rows are
+ * checkboxes: there a digit *toggles* its row rather than answering, so the
+ * question is finished by moving on — Tab, which the chooser's own footer
+ * offers ("Tab/Arrow keys to navigate") and which lands on its `✔ Submit`
+ * tab.
+ */
+export const CHAT_COMMIT_KEYS = '\t'
+
+/**
+ * The keystroke that commits a whole call at the chooser's **review** step
+ * (`Ready to submit your answers?  1. Submit answers  2. Cancel`). The
+ * chooser shows that step for every call except the simplest one — a single
+ * single-select question, which its own answer commits outright.
+ */
+export const CHAT_SUBMIT_KEYS = '1'
+
 export function chatSendKeys(text: string): string | null {
   const body = text.replace(/\r\n?/g, '\n').trim()
   if (body === '') return null

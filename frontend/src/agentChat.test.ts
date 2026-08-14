@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
+  chatAnswerKeys,
   chatClock,
   chatGroups,
+  chatNeedsReview,
   chatSendKeys,
   chatToolLabel,
   chatToolSummary,
   chatToolTarget,
   isNearBottom,
 } from './agentChat'
+import type { CcChatQuestion } from './types/CcChatQuestion'
 import type { CcChatTurn } from './types/CcChatTurn'
 
 function turn(over: Partial<CcChatTurn> & { id: string; kind: CcChatTurn['kind'] }): CcChatTurn {
@@ -178,5 +181,34 @@ describe('chatSendKeys', () => {
   it('normalises CRLF, which would otherwise submit early', () => {
     expect(chatSendKeys('one\r\ntwo')).toBe('\x1b[200~one\ntwo\x1b[201~\r')
     expect(chatSendKeys('one\rtwo')).toBe('\x1b[200~one\ntwo\x1b[201~\r')
+  })
+})
+
+describe('chatAnswerKeys', () => {
+  it("names the chooser's row rather than moving to it", () => {
+    // The chooser numbers its options `1. … 2. … 3. …` and a digit picks that
+    // row outright. Arrow keys would be relative to a cursor mesa cannot see.
+    expect(chatAnswerKeys(0)).toBe('1')
+    expect(chatAnswerKeys(2)).toBe('3')
+  })
+
+  it('sends no Enter of its own', () => {
+    // On a single-select question the digit both selects and commits; a
+    // trailing `\r` would land on whatever the chooser showed next.
+    expect(chatAnswerKeys(1)).not.toContain('\r')
+  })
+})
+
+describe('chatNeedsReview', () => {
+  function question(over: Partial<CcChatQuestion> = {}): CcChatQuestion {
+    return { question: 'q', header: '', multi_select: false, options: [], ...over }
+  }
+
+  it('is false only for a single single-select question', () => {
+    // That one shape is committed by its own answer; every other shape ends
+    // on the chooser's "Ready to submit your answers?" step.
+    expect(chatNeedsReview([question()])).toBe(false)
+    expect(chatNeedsReview([question(), question()])).toBe(true)
+    expect(chatNeedsReview([question({ multi_select: true })])).toBe(true)
   })
 })

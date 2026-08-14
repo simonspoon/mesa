@@ -695,9 +695,11 @@ assert not [s for s in json.load(sys.stdin) if s["session_id"]=="cx"], "cx must 
 python3 -c '
 import json
 d=json.load(open("'"$TMP"'/chat-cli"))
-for k in ["session_id","turns","truncated"]:
+for k in ["session_id","turns","truncated","pending_question"]:
     assert k in d, f"missing key {k}"
 assert d["session_id"]=="cx" and d["truncated"] is False, d
+# This session is working, not waiting: the question card has nothing to show.
+assert d["pending_question"] is None, d["pending_question"]
 shape=[(t["kind"], t["id"]) for t in d["turns"]]
 # An injected `user` line, a tool_result carrier and a subagent transcript all
 # produce nothing; one assistant line emits its prose BEFORE its own calls.
@@ -729,6 +731,38 @@ assert [t["id"] for t in d["turns"]]==["ct_1","ct_2"], d["turns"]
 assert d["truncated"] is True, d
 print("cc chat: --limit keeps the newest turns ok")
 ' || fail "cc chat --limit did not keep the newest turns"
+
+# ---- cc chat: the question a session is BLOCKED on (task 866) ----
+#
+# Its own session, because the state is the whole point: a transcript whose
+# last `AskUserQuestion` carries no `tool_result` is a session waiting on a
+# person, and that is what the chat pane renders as clickable options. `cq`
+# asks twice — the first answered, the second not — so the fixture pins both
+# halves at once: the answered call is history, the open one is the payload.
+mkdir -p "$TMP/tree/-chat-project"
+cat > "$TMP/tree/-chat-project/cq.jsonl" <<'JSONL'
+{"type":"user","uuid":"qp1","sessionId":"cq","timestamp":"2026-06-21T03:00:00.000Z","origin":{"kind":"human"},"message":{"role":"user","content":"add caching"}}
+{"type":"assistant","uuid":"qm1","sessionId":"cq","timestamp":"2026-06-21T03:00:01.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"cq_1","name":"AskUserQuestion","input":{"questions":[{"question":"ANSWERED-ALREADY","header":"Old","multiSelect":false,"options":[{"label":"yes"},{"label":"no"}]}]}}]}}
+{"type":"user","uuid":"qr1","sessionId":"cq","timestamp":"2026-06-21T03:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"cq_1","content":"answered"}]}}
+{"type":"assistant","uuid":"qm2","sessionId":"cq","timestamp":"2026-06-21T03:00:03.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"cq_2","name":"AskUserQuestion","input":{"questions":[{"question":"Redis or in memory?","header":"Cache","multiSelect":false,"options":[{"label":"Redis","description":"shared across processes","preview":"PREVIEW-NEVER-SENT"},{"label":"In memory"},{"description":"NO-LABEL-DROPPED"}]},{"question":"Which suites?","header":"Tests","multiSelect":true,"options":[{"label":"unit"},{"label":"e2e"}]}]}}]}}
+JSONL
+"$BIN" cc chat cq | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+a=d["pending_question"]
+assert a is not None, "a session whose last AskUserQuestion has no result is waiting"
+assert a["id"]=="cq_2", a["id"]
+assert [q["question"] for q in a["questions"]]==["Redis or in memory?","Which suites?"], a
+q1,q2=a["questions"]
+assert q1["header"]=="Cache" and q1["multi_select"] is False, q1
+assert q2["multi_select"] is True, q2
+assert [(o["label"],o["description"]) for o in q1["options"]]==[
+    ("Redis","shared across processes"),("In memory","")], q1["options"]
+assert "PREVIEW-NEVER-SENT" not in json.dumps(d), "the unbounded preview is not part of a poll"
+assert "NO-LABEL-DROPPED" not in json.dumps(d), "an option with no label is not a blank button"
+assert "ANSWERED-ALREADY" not in json.dumps(a), "an answered call is history, not a prompt"
+print("cc chat: the pending question ok")
+' || fail "cc chat did not report the question the session is waiting on"
 
 # An id that is not a session id never becomes a path: refused before any
 # filesystem access, and as `validation` rather than `unavailable`.

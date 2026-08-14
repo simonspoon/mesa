@@ -114,12 +114,16 @@ describe('liveAgentCount', () => {
     expect(liveAgentCount(task, 'mesa', [session({ ...named, pid: null })])).toBe(0)
   })
 
-  // mesa task 858: a listed session is live whatever `state` it reports, so
-  // the card keeps animating until the session leaves the list.
-  it('counts a listed session whatever state it reports', () => {
+  // mesa task 861: `done` is the one `state` that stops the animation; every
+  // other listed session is still under way (task 858).
+  it('excludes a session reporting done', () => {
+    const named = { name: 'mesa: Animate a task card' }
+    expect(liveAgentCount(task, 'mesa', [session({ ...named, state: 'done' })])).toBe(0)
+  })
+
+  it('counts a listed session in any other state', () => {
     const named = { name: 'mesa: Animate a task card' }
     for (const over of [
-      { state: 'done' },
       { state: 'failed' },
       { state: 'stopped' },
       { status: 'idle', state: 'working' },

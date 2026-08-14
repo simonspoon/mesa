@@ -14,36 +14,37 @@ export function projectForCwd(cwd: string, projects: Project[]): Project | undef
     .sort((a, b) => b.local_path!.length - a.local_path!.length)[0]
 }
 
-/** A session still under way. **Being listed at all is the liveness signal**
- * (mesa task 858): `claude agents --json` lists live processes, so a session
- * mesa can see in that list is still active, whatever its `state` says. The
- * only exclusion left is upstream reporting the session with no process
- * (`pid: null`) — that is upstream's own field, not an inference mesa draws.
+/** A session still under way: **on the list and not reporting `done`**
+ * (mesa task 861). Two exclusions, both upstream's own fields rather than an
+ * inference mesa draws:
+ * - `pid: null` — upstream listing a session with no process;
+ * - `state === 'done'` — the session says its work is finished.
  *
- * This replaces every `state`-derived verdict mesa used to layer on top:
- * - a terminal `state` never meant the process was gone — every session
- *   reported `done` was still running (measured, mesa task 571 — 33 of 33),
- *   and the work its turn started (a Bash call, a subagent) routinely
- *   outlives the `done` report (mesa task 802);
- * - upstream computes `state` live (it is persisted nowhere), and it sticks:
- *   a background session that ended its turn can sit at `idle` + `working`
- *   for 90+ minutes with no self-heal (mesa task 571).
+ * Being listed is the rest of the signal (mesa task 858): `claude agents
+ * --json` lists live processes, so a session mesa can see there is still
+ * under way whatever *else* `state` says. In particular the sticky
+ * `idle` + `working` pair mesa used to reclassify (a background session can
+ * sit there for 90+ minutes after its turn, mesa task 571) is running, and so
+ * is a `failed`/`stopped` one — mesa no longer second-guesses those.
  *
- * Both of those were mesa second-guessing a field it does not own, in
- * opposite directions. Presence in the list needs neither.
+ * Note `done` does not mean the process has exited (task 571 measured 33 of
+ * 33 `done` sessions still alive) and work the turn started can outlive the
+ * report (task 802, `liveWorkLabel`). It means upstream considers the session
+ * finished, which is what "active" is asking about.
  *
  * Lives here rather than beside a caller because the Agent sidebar's
  * bucketing, the board's live-agent count and the nav's "an agent is running
  * here" dot are the same question asked by three surfaces. */
 export function isRunningAgent(a: AgentSession): boolean {
-  return a.pid !== null
+  return a.pid !== null && a.state !== 'done'
 }
 
 /** The Agent sidebar's badge for the work a session holds in flight *right
  * now* — e.g. `2 shells`, `1 subagent`, `2 shells · 1 subagent`. Both counts
  * are mesa-derived (see `AgentSession`), not upstream `state`. Informational
- * only: since task 858 liveness is list presence, so this says what a session
- * is doing rather than whether it is running. `null` when
+ * only: liveness is `isRunningAgent` above, so this says what a session is
+ * doing rather than whether it is running — which is why a `done` session can
+ * still carry the badge (task 802: the work outlives the turn). `null` when
  * there is nothing live to report, so the caller renders no badge. */
 export function liveWorkLabel(a: AgentSession): string | null {
   const parts: string[] = []

@@ -100,31 +100,39 @@ describe('isRunningAgent', () => {
     ).toBe(true)
   })
 
-  // mesa task 858: being on the list IS the liveness signal, so no `state`
-  // demotes a session any more — not a terminal one (task 571 measured every
-  // `done` session still running), and not the sticky idle+working pair.
-  it.each(['done', 'failed', 'stopped'])('keeps a listed %s session', (state) => {
+  // mesa task 861: `done` is the one `state` that demotes a listed session.
+  it('drops a session reporting done', () => {
+    expect(isRunningAgent(session({ status: 'idle', state: 'done' }))).toBe(false)
+  })
+
+  // …and only `done`: being on the list is the rest of the signal (task 858),
+  // so the other terminal states no longer demote anything.
+  it.each(['failed', 'stopped'])('keeps a listed %s session', (state) => {
     expect(isRunningAgent(session({ status: 'idle', state }))).toBe(true)
   })
 
   it('keeps a session sitting at idle + working', () => {
+    // Upstream's `state` can stick there for 90+ minutes after a background
+    // session's turn ends (task 571) — mesa no longer reclassifies it.
     expect(isRunningAgent(session({ status: 'idle', state: 'working' }))).toBe(
       true,
     )
   })
 
-  it('keeps a listed done session with no live work of its own', () => {
+  it('drops a done session even while it still holds live work', () => {
+    // The work-in-flight counts are informational (task 802's badge); they do
+    // not override upstream's own completion report.
     expect(
       isRunningAgent(
-        session({ status: 'idle', state: 'done', liveShells: 0, liveSubagents: 0 }),
+        session({ status: 'idle', state: 'done', liveShells: 2, liveSubagents: 1 }),
       ),
-    ).toBe(true)
+    ).toBe(false)
   })
 
-  it('keeps a listed done session whose counts are absent entirely', () => {
+  it('drops a done session whose counts are absent entirely', () => {
     expect(
       isRunningAgent(sessionWithoutCounts({ status: 'idle', state: 'done' })),
-    ).toBe(true)
+    ).toBe(false)
   })
 
   it('drops a session whose process has exited', () => {

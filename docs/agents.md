@@ -132,47 +132,52 @@ already use.
   nested folders) — the same path-prefix relationship `agents::is_under`
   matches on for the per-project route above. A session under no known
   project's folder shows its raw `cwd`.
-- **Being on the list is the liveness signal** (mesa task 858). `claude agents
-  --json` lists live processes, so a session mesa can see there is still
-  active — whatever `state` it reports. A session is over when it **drops out
-  of the list**, not when a field says so, and the list is therefore grouped
-  into just two collapsible sections — BLOCKED (`state === "blocked"`) and
-  ACTIVE (everything else) — each a `<button>` header toggling its own
-  `collapsedSections[bucket]` entry, both starting open. An empty bucket
-  renders no header at all (not an empty section). `blocked` keeps its own
-  section because a session waiting on a permission prompt is live but is the
-  one that needs a person.
-- **There is no DONE bucket, and `state` demotes nothing.** mesa used to
-  derive "finished" from `state` in two ways, and both were mesa
-  second-guessing a field it does not own:
-  - a terminal `state` (`done`/`failed`/`stopped`) never meant the process was
-    gone — every session reported `done` was still running (measured, mesa
-    task 571 — 33 of 33), and the work that turn started routinely outlives
-    the report (task 802, the counts below);
-  - upstream computes `state` live (it is persisted nowhere, and
-    `~/.claude/sessions/<pid>.json` has no `state` key) and it **sticks**: on
-    claude 2.1.220 three inbox-watcher sessions sat at `status: "idle"` +
-    `state: "working"` for 90+ minutes after their final turn, while sessions
-    with byte-identical transcript tails reported `done`. Age, process
-    liveness and the daemon's `bg settled` sweep were all ruled out as the
-    mechanism (mesa task 571).
-
-  The `idle`+`working` reclassification (`isStaleWorking`) and its muted
-  dashed badge are gone with the bucket they fed: list presence answers the
-  question without inferring anything about upstream's field, and it survives
-  a future `claude` release changing how `state` behaves.
+- **A session is active if it is on the list and not `done`** (mesa task 861).
+  Those are the two halves: `claude agents --json` lists live processes, so a
+  session mesa can see there is still under way (task 858) — and upstream
+  reporting `state === "done"` is the one claim mesa takes at face value,
+  because it is the session saying its own work is finished. The list is
+  therefore grouped into three collapsible sections — BLOCKED (`state ===
+  "blocked"`, tested first), DONE (`state === "done"`) and ACTIVE (everything
+  else) — each a `<button>` header toggling its own
+  `collapsedSections[bucket]` entry; DONE starts collapsed, BLOCKED/ACTIVE
+  start open. An empty bucket renders no header at all (not an empty section).
+  `blocked` keeps its own section because a session waiting on a permission
+  prompt is live but is the one that needs a person. `AgentSession` carries no
+  completion timestamp (`claude agents --json` reports only `startedAt`), so
+  DONE keeps the list's own `startedAt` desc order as the closest available
+  proxy for "most recently finished".
+- **Only `done` demotes; no other `state` does.** mesa used to derive
+  "finished" from `state` in two further ways, and both were mesa
+  second-guessing a field it does not own — they are gone (task 858) and stay
+  gone:
+  - `failed`/`stopped` are still ACTIVE. A terminal `state` never meant the
+    process was gone — every session reported `done` was still running
+    (measured, mesa task 571 — 33 of 33), and the work that turn started
+    routinely outlives the report (task 802, the counts below). DONE here
+    means "upstream calls the work finished", not "the process exited"; a
+    session still leaves the sidebar only by dropping out of the list.
+  - the `idle`+`working` reclassification (`isStaleWorking`) and its muted
+    dashed badge are gone. Upstream computes `state` live (it is persisted
+    nowhere, and `~/.claude/sessions/<pid>.json` has no `state` key) and it
+    **sticks**: on claude 2.1.220 three inbox-watcher sessions sat at
+    `status: "idle"` + `state: "working"` for 90+ minutes after their final
+    turn, while sessions with byte-identical transcript tails reported `done`.
+    Age, process liveness and the daemon's `bg settled` sweep were all ruled
+    out as the mechanism (mesa task 571). mesa now reports that pair as what
+    upstream says it is — working — rather than inferring past it.
 - **Two mesa-derived counts report what a session is doing**
   (mesa task 802): `liveShells` and `liveSubagents` on every `AgentSession`.
   Upstream's `state` reaches `done` the moment a turn ends, while the work
   that turn started is still running — mesa computes the liveness upstream
   doesn't report. Since task 858 these no longer decide whether a session is
-  running (the list already did), so in the sidebar they are the
-  work-in-flight badge (`liveWorkLabel`, e.g. `2 shells · 1 subagent`) and its
-  tooltip. They still **do** decide a slot in the todo watcher, where the
-  question is different: a project is busy if a session under it holds work
-  in flight, not merely if a finished-but-alive process is still listed —
-  counting mere presence there would wedge dispatch behind an idle session
-  (`docs/todo-watcher.md`).
+  running (list presence and `state` do, above), so in the sidebar they are
+  the work-in-flight badge (`liveWorkLabel`, e.g. `2 shells · 1 subagent`) and
+  its tooltip — which is why a DONE session can still carry one. They still
+  **do** decide a slot in the todo watcher, where the question is different: a
+  project is busy if a session under it holds work in flight, not merely if a
+  finished-but-alive process is still listed — counting mere presence there
+  would wedge dispatch behind an idle session (`docs/todo-watcher.md`).
   - `liveShells` counts the session pid's **direct** children whose `comm`
     basename is in `{zsh, bash, sh, dash}`, from **one** `ps -A -o
     pid=,ppid=,comm=` per list refresh — not one `ps` per session. Claude Code
@@ -206,9 +211,9 @@ already use.
   same question and must not drift: the sidebar's `bucketOf` above, the
   project sidebar's per-project "an agent is running here" dot
   (`Sidebar.tsx`), and the board card's live marker
-  (`boardView.ts::liveAgentCount`). Its one exclusion is `pid !== null` —
-  upstream's own field, reporting a session with no process, rather than an
-  inference mesa draws from `state`. This bucketed list is the body of
+  (`boardView.ts::liveAgentCount`). Its two exclusions are `pid !== null` and
+  `state !== "done"` — both upstream's own fields, rather than an inference
+  mesa draws on top of them. This bucketed list is the body of
   the 'Agents' rail's own content (`AgentListContent`), rendered directly by
   `AgentSidebar` next to the tile area — not a member of the pane tree below.
 - **The 'Agents' list rail** (mesa task 414): a fixed sibling of the tile
@@ -508,12 +513,13 @@ already use.
   per-render sorted `agents` copy — so it only re-runs when a poll actually
   returns new data) keeps the pane tree in sync with agent state instead of
   requiring a click per open/close: every attachable session (`id !== null`)
-  on the list without an open pane gets one (`insertLeaf`), and every open
-  pane whose session has left the list gets closed (`ptyPool.remove` +
-  `removeLeaf`) — blocked sessions auto-open too, not just working ones,
-  since a blocked agent is the one most likely waiting on the user. Since
-  task 858 leaving the list is the *only* close signal: a session mesa can
-  still see is still tiled, however upstream labels it.
+  in the ACTIVE or BLOCKED bucket without an open pane gets one
+  (`insertLeaf`), and every open pane whose session has reached DONE — or has
+  left the list — gets closed (`ptyPool.remove` + `removeLeaf`); blocked
+  sessions auto-open too, not just working ones, since a blocked agent is the
+  one most likely waiting on the user. Because this keys off `bucketOf`, the
+  close signal moves with the active rule above (task 861): a `failed` or
+  stuck-`working` session stays tiled, a `done` one does not.
   The effect depends on `autoTile` itself, so switching it on syncs
   immediately against whatever `sessions` already holds rather than only
   reacting to future transitions; switching it off just stops the sync — it
@@ -573,10 +579,10 @@ column, and an `in_progress` row whose agent is gone does not animate.
   `"{project.name}: {task.name}"` — the string the todo watcher spawns with
   (`src/api.rs`). The frontend holds both halves and reconstructs it.
 - **Liveness** is the existing `isRunningAgent()` (`agentProject.ts`), the same
-  predicate the sidebar's bucketing uses: since task 858 a matching session on
-  the list animates its card whatever `state` it reports, and only `pid: null`
-  (or the session leaving the list) leaves the card still. There is no second
-  liveness predicate.
+  predicate the sidebar's bucketing uses: a matching session on the list
+  animates its card whatever `state` it reports (task 858) except `done`
+  (task 861), and `pid: null` — or the session leaving the list — leaves the
+  card still. There is no second liveness predicate.
 - **Best-effort by construction**, and it must always degrade to *no
   animation*: sidebar `+ agent` sessions carry no `--name`
   (`DEFAULT_AGENT_SPAWN` has no `{name}`) and never match; a replaced

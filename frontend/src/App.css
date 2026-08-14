@@ -3001,7 +3001,7 @@ main {
 /* Work mesa observed running (shell children / subagent transcripts) on a
    session upstream already calls done (mesa task 802). Amber, like the other
    "this agent is running" badges, because that is exactly the claim it makes
-   — and it is what explains a `done` badge on a session mesa still lists. */
+   — and it is what explains a `done` badge sitting in the DONE bucket. */
 .badge.agent-live-work {
   color: var(--amber);
   border-color: rgba(255, 180, 68, 0.5);

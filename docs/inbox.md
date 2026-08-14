@@ -207,6 +207,31 @@ instructions**; `author` is free-text attribution.
     case of its own). Paused-ness is mirrored from the element's own
     `play`/`pause` events, never decided by the page, so the browser's media
     keys can't desync the label.
+  - The **New view reads its whole queue** (mesa task 853): one "read all
+    aloud" button above the list plays every unread item **oldest first**,
+    starting the next the moment one ends. It is the page's button, not a
+    row's, and it exists only on New — Read and Archived are not a queue —
+    and only while something in it is unread, so it goes away as the run
+    finishes. The run is a **snapshot of ids** taken at the press
+    (`frontend/src/inboxQueue.ts`), never recomputed: hearing an item is what
+    marks it read, so a queue derived from the live list would lose each item
+    as it sounded, and an item arriving mid-run would jump a queue it was
+    never part of. The list arrives newest-first, so oldest-first is a real
+    decision, ordered by `id` — the arrival order the server itself lists by,
+    and the only tiebreak two items sent in the same second have. Nothing new
+    marks an item read: the item sounding is what does, exactly as a single
+    press does, so each item is marked as it plays and drops out of New behind
+    the run. Every later item reuses the **same element and the same clock**
+    the first press unlocked, which is why no press is needed per item. A run
+    ends on its last item, on any press that stops playback (a row's own
+    stop button included — one row's button is a press about that row), on a
+    failure (a synthesiser that just refused would refuse every item after it,
+    silently), and on **leaving New**: the sub-views are a filter over one
+    list rather than three pages, so the page does not remount when the reader
+    switches, and a run left going on Read or Archived would read on with the
+    button that stops it gone. An item deleted or assigned out from under the run is
+    treated as one that ended, so the run moves on rather than wedging on a
+    row that is gone.
   - There is **one `<audio>` element for the page**, mounted for its whole life
     and never re-keyed; a press sets its `src` and calls `play()` **itself**
     (mesa task 829). Both halves matter. Starting playback from inside the

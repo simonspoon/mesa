@@ -12,6 +12,7 @@ import { ConfirmDelete } from '../components/ConfirmDelete'
 import { Markdown } from '../components/Markdown'
 import { filterInbox, INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
 import { inboxKindClass, inboxKindLabel } from '../inboxKind'
+import { nextInQueue, readAllQueue } from '../inboxQueue'
 import { inboxOriginLabel } from '../inboxOrigin'
 import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
 import {
@@ -152,6 +153,27 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   // Which press is current. A decoded play is awaited, so the item it belongs
   // to can be stopped — or swapped for another — before it ever sounds.
   const press = useRef(0)
+  // What an item reaching its end does — which is where a "read all" run starts
+  // the next one. Held in a ref because a decoded item's callbacks are wired
+  // inside its own press, before the item that follows it is known.
+  const ended = useRef<(id: number) => void>(() => {})
+  // The item the player is actually on. `speakingId` is state, and a run starts
+  // its next item from an event rather than a click — a commit React defers —
+  // so between two items the rendered id lags the one that is sounding. Every
+  // event that has to name the current item reads this instead, which is also
+  // what stops an end arriving twice for the same item from advancing twice.
+  const sounding = useRef<number | null>(null)
+  // The items a "read all" run still has to speak, oldest first — empty when no
+  // run is going (mesa task 853). A snapshot taken at the press: hearing an
+  // item is what marks it read, so a queue derived from the live list would
+  // lose each item as it sounded. Held as state because the button on the
+  // header reads it, and mirrored into a ref below because the run advances
+  // from a stream callback wired several items ago.
+  const [queue, setQueue] = useState<readonly number[]>([])
+  const queued = useRef(queue)
+  useEffect(() => {
+    queued.current = queue
+  }, [queue])
   // Which items are opened out to their full body. Collapsed is the default:
   // the list is a triage queue, so every item shows a few lines and the one
   // being read is opened on purpose. Playback is deliberately *not* gated on
@@ -244,6 +266,7 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   // `error` this page would have to tell from a real one.
   const releasePlayer = useCallback(() => {
     press.current += 1
+    sounding.current = null
     fetching.current?.abort()
     fetching.current = null
     decoded.current?.stop()
@@ -273,6 +296,9 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
           message: err instanceof Error ? err.message : String(err),
         })
         setSpeakingId((current) => (current === id ? null : current))
+        // A run cannot carry on past a synthesiser that just refused: every
+        // item after this one would fail the same way, silently.
+        setQueue([])
       }
       const request = new AbortController()
       fetching.current = request
@@ -295,9 +321,7 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
             },
             onEnded: () => {
               if (press.current !== attempt) return
-              releasePlayer()
-              setSpeakingId(null)
-              setSpeaking(false)
+              ended.current(id)
             },
             onError: failed,
           },
@@ -317,21 +341,24 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
         failed(err)
       }
     },
-    [markRead, releasePlayer],
+    [markRead],
   )
 
-  // Stops if this item is already the one playing, starts it otherwise.
-  // Starting happens here, inside the press, rather than as a side effect of
-  // the render it schedules — see `player`.
-  function toggleSpeak(id: number) {
-    const stopping = speakingId === id
+  // Starts reading one item, whatever was sounding before. Called from inside
+  // the press rather than as a side effect of the render it schedules — see
+  // `player` — and, once a run is going, from the end of the item before it:
+  // the element and the clock a gesture unlocked are the same ones either way,
+  // which is what lets the second item start without a second press.
+  function startSpeaking(id: number) {
     releasePlayer()
+    const attempt = press.current
+    sounding.current = id
     setSpeakError(null)
     setSpeaking(false)
     setPaused(false)
-    setSpeakingId(stopping ? null : id)
+    setSpeakingId(id)
     const el = player.current
-    if (stopping || !el) return
+    if (!el) return
     // Unlock the Web Audio clock from inside the gesture whether or not this
     // press turns out to need it: the failure that says it does arrives from
     // the element afterwards, by which time a resume would be refused.
@@ -346,10 +373,68 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
     // which is where the fallback lives; the only rejection to report from here
     // is the browser refusing to start at all.
     el.play().catch((err: DOMException) => {
-      if (err.name !== 'NotAllowedError') return
+      // A refusal for a press that has already been abandoned belongs to
+      // nobody: the item it names is not the one on the player any more.
+      if (err.name !== 'NotAllowedError' || press.current !== attempt) return
       setSpeakError({ id, message: 'this browser would not start playback' })
       setSpeakingId((current) => (current === id ? null : current))
+      setQueue([])
     })
+  }
+
+  /** Silence, and the end of any run: the press that stops what is sounding. */
+  const stopSpeaking = useCallback(() => {
+    releasePlayer()
+    setSpeakingId(null)
+    setSpeaking(false)
+    setPaused(false)
+    // The error belonged to the item that was being read; stopping is the end
+    // of that, so the row must not keep showing it.
+    setSpeakError(null)
+    setQueue([])
+  }, [releasePlayer])
+
+  // Stops if this item is already the one playing, starts it otherwise. Either
+  // way it ends a "read all" run — one row's button is a press about that row,
+  // so it takes the page back to reading exactly what was asked for.
+  function toggleSpeak(id: number) {
+    if (speakingId === id) {
+      stopSpeaking()
+      return
+    }
+    setQueue([])
+    startSpeaking(id)
+  }
+
+  // The end of an item: the next one in the run, or silence. Kept in the ref
+  // the decoded path reaches, and called directly by the element's own event.
+  function itemEnded(id: number) {
+    // An end for an item the player has already left is an echo — a media
+    // event and the effect that watches the list can both arrive for the same
+    // item, and advancing twice would restart the item after it.
+    if (sounding.current !== id) return
+    const next = nextInQueue(queued.current, id)
+    if (next === null) {
+      stopSpeaking()
+      return
+    }
+    startSpeaking(next)
+  }
+  useEffect(() => {
+    ended.current = itemEnded
+  })
+
+  // Reads every unread item, oldest first (mesa task 853). The press starts the
+  // first one — and unlocks the element and the clock every later one reuses.
+  function toggleReadAll() {
+    if (queue.length > 0) {
+      stopSpeaking()
+      return
+    }
+    const run = readAllQueue(items ?? [])
+    if (run.length === 0) return
+    setQueue(run)
+    startSpeaking(run[0])
   }
 
   // An element that failed has a second thing to try — and one whose source
@@ -359,13 +444,14 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   function playerFailed() {
     const el = player.current
     const ctx = clock.current
-    if (el === null || ctx === null || speakingId === null) return
-    if (playFailure(el.src, inboxSpeakUrl(speakingId)) === 'ignore') return
+    const id = sounding.current
+    if (el === null || ctx === null || id === null) return
+    if (playFailure(el.src, inboxSpeakUrl(id)) === 'ignore') return
     // The element is done with for this press; clearing its source keeps its
     // dead connection from being confused for the decoded one.
     el.removeAttribute('src')
     el.load()
-    void playDecoded(speakingId, ctx)
+    void playDecoded(id, ctx)
   }
 
   function togglePause() {
@@ -392,13 +478,30 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   // The item being read can be assigned or deleted underneath us — by this
   // person on another device, or by an agent. Playback follows the list: an
   // item that is no longer there has no button left to stop it with, so the
-  // audio must not outlive its row. Only the element is touched here; the
-  // state describing it is read by that row alone, which is already gone.
+  // audio must not outlive its row. A row that vanishes mid-run is treated as
+  // an item that ended, so the run moves on rather than wedging on it.
   const listed =
     speakingId === null || !items || items.some((it) => it.id === speakingId)
   useEffect(() => {
-    if (!listed) releasePlayer()
-  }, [listed, releasePlayer])
+    if (listed || speakingId === null) return
+    ended.current(speakingId)
+  }, [listed, speakingId])
+
+  // A run belongs to the New view: the button that stops it is that view's, and
+  // Read and Archived are not a queue. Switching sub-view is a prop change, not
+  // a remount — the page keeps polling the one list — so without this the run
+  // would carry on reading with nothing on screen to stop it. One item played
+  // on its own is not a run and is left alone: its row goes with it.
+  // Edge-triggered on the sub-view changing, and reached through the same kind
+  // of ref the run's own advance is: stopping touches the element and the
+  // stream, which is not something to do while rendering.
+  const leftTheQueue = useRef(stopSpeaking)
+  useEffect(() => {
+    leftTheQueue.current = stopSpeaking
+  }, [stopSpeaking])
+  useEffect(() => {
+    if (filter !== 'new' && queued.current.length > 0) leftTheQueue.current()
+  }, [filter])
 
   // Leaving the page drops the body still arriving and silences what is
   // scheduled. Removing the element from the document is what stops its own
@@ -455,6 +558,34 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
             ? 'Items you have already read, still waiting to be triaged.'
             : 'Items set aside without being triaged. Put one back to return it to the queue it came from.'}
       </p>
+
+      {/* Reading the whole queue (mesa task 853): the New view's own button,
+          not a row's. It is offered only where there is a queue to read — the
+          Read and Archived views are not one — and only while something in it
+          is still unread, so it disappears as the run finishes rather than
+          offering a run with nothing in it. */}
+      {filter === 'new' &&
+        (queue.length > 0 || readAllQueue(items ?? []).length > 0) && (
+          <div className="inbox-readall">
+            <button
+              type="button"
+              aria-label={
+                queue.length > 0
+                  ? 'stop reading the inbox'
+                  : 'read every new item aloud, oldest first'
+              }
+              title={
+                queue.length > 0
+                  ? 'stop reading the inbox'
+                  : 'read every new item aloud, oldest first'
+              }
+              onClick={toggleReadAll}
+            >
+              {queue.length > 0 ? <StopIcon /> : <PlayIcon />}
+              {queue.length > 0 ? 'stop reading' : 'read all aloud'}
+            </button>
+          </div>
+        )}
 
       {/* No compose form (mesa task 847): items are sent by agents, over the
           CLI and the API, and each one names the task it came from — which is
@@ -646,15 +777,15 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
         ref={player}
         onPlaying={() => {
           setSpeaking(true)
-          // Same rule as the decoded path: sounding is what reads the item.
-          if (speakingId !== null) markRead(speakingId)
+          // Same rule as the decoded path: sounding is what reads the item —
+          // and the item is the one the player is on, which mid-run is ahead
+          // of the id the last render drew.
+          if (sounding.current !== null) markRead(sounding.current)
         }}
         onPlay={() => setPaused(false)}
         onPause={() => setPaused(true)}
         onEnded={() => {
-          releasePlayer()
-          setSpeakingId(null)
-          setSpeaking(false)
+          if (sounding.current !== null) itemEnded(sounding.current)
         }}
         onError={playerFailed}
       />

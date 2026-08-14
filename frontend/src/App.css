@@ -416,6 +416,20 @@ header {
 
 /* Playback sits at the right edge of the row, never shrinking: the preview is
    what gives way when the row is narrow. */
+/* "Read all aloud" (mesa task 853): the New view's own transport, above the
+   list rather than on a row, since the run belongs to the queue and not to any
+   one item. The glyph sits beside the words for the same reason the row's
+   buttons carry one — it says which way the press goes at a glance. */
+.inbox-readall {
+  margin: 0 0 1rem;
+}
+
+.inbox-readall button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
 .inbox-playback {
   flex: none;
   display: flex;

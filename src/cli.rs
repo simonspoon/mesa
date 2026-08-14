@@ -3254,6 +3254,25 @@ fn bind_live_agent_or_end(
     }
 }
 
+/// Stops the agent the ended session was spawned with, so hanging up also
+/// finishes the background session in the Agents sidebar instead of leaving
+/// one idling per conversation.
+///
+/// **Best-effort, by design.** The store write is what ended the conversation;
+/// the agent's own loop stops on the next `mesa live status` either way. So a
+/// missing `agent_id` (a start command that printed no receipt, or
+/// `--no-agent`) is nothing to do, and a failing `claude stop` is a warning on
+/// **stderr** — never a nonzero exit, and never anything on stdout, which is
+/// the ended session and nothing else.
+fn stop_live_agent(session: &LiveSession) {
+    let Some(agent_id) = session.agent_id.as_deref() else {
+        return;
+    };
+    if let Err(e) = agents::stop(agent_id) {
+        eprintln!("live session {}: could not stop its agent: {e}", session.id);
+    }
+}
+
 fn run_live(cmd: LiveCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
@@ -3291,7 +3310,9 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
         }
         LiveCmd::Stop { quiet } => {
             let session = current_live_session(&store)?;
-            print_live_session(&store.end_live_session(session.id)?, quiet);
+            let ended = store.end_live_session(session.id)?;
+            stop_live_agent(&ended);
+            print_live_session(&ended, quiet);
         }
         LiveCmd::Status { quiet } => match store.current_live_session()? {
             Some(session) => print_live_session(&session, quiet),

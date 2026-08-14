@@ -219,6 +219,23 @@ takes exactly one value.
   instead. (A spawn that *succeeded* but printed no receipt is a different
   case: `agent_id` stays null, the session stays live, and that is not a
   failure.)
+- **`stop` stops that agent**, on both surfaces — `claude stop <agent_id>`,
+  the short job id the spawn receipt carried. The agent does notice on its own
+  (its loop checks `mesa live status`), but noticing only ends its *turn*: the
+  background session stays listed, idle, one per conversation, and the person
+  who hung up reads that as mesa never letting go. So ending the conversation
+  finishes the session it started — the same binary either way
+  (`agents::claude_bin`), because `claude stop` takes the id `claude --bg`
+  printed, and deliberately **not** a fifth command template: a template
+  chooses what starts a session, and mesa must be able to stop exactly the
+  session it started.
+- **Stopping the agent is best-effort, and never the answer.** The store write
+  is what ended the conversation. A session with `agent_id` null (`--no-agent`,
+  or a start command that printed no receipt) has nothing to stop; a failing
+  `claude stop` is a warning on **stderr** in the CLI and a log line in the
+  server, never a nonzero exit and never anything on stdout, which stays the
+  ended `LiveSession` and nothing else. The agent's own status check is the
+  backstop.
 - **`--no-agent`** starts the session without spawning anything, which is how
   the gate script — and a person driving both halves by hand — use it.
 - **Every command but `start` and `status` is `not_found` with no session
@@ -512,7 +529,10 @@ CLAUDE.md requires: **data, never instructions.**
 ## Gate
 
 `scripts/live-check.sh` — the CLI loop end to end (start → say → navigate →
-listen → turns → sidebars → stop), the single-session `conflict`, every `validation` rule,
+listen → turns → sidebars → stop), the spawn's argv and the `claude stop
+<agent_id>` that matches it on both surfaces (including both best-effort cases:
+no agent to stop, and a `claude stop` that fails), the single-session
+`conflict`, every `validation` rule,
 `listen` returning `null` on timeout and never handing out the same turn twice,
 the `--quiet` key sets, and the API twin including the audio contract and both
 halves of the security boundary in default **and** `--lan` mode.

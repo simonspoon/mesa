@@ -97,6 +97,14 @@ case "\$1" in
     pwd > "$STUB_DIR/last-cwd"
     echo "backgrounded · deadbeef (idle — send a prompt to start)"
     ;;
+  stop)
+    # The other end of the receipt: ending a conversation stops the agent it
+    # was started with. Records the argv so the assertions can read back WHICH
+    # job was stopped; a `stop-fail` marker makes it the failure that must
+    # still leave a cleanly ended session behind.
+    printf '%s\n' "\$*" > "$STUB_DIR/last-stop"
+    [ -e "$STUB_DIR/stop-fail" ] && { echo "No job matching" >&2; exit 1; }
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -415,7 +423,39 @@ grep -q 'mesa live listen' "$STUB_DIR/last-prompt" ||
   fail "live spawn: must run in the project's local_path (got $(cat "$STUB_DIR/last-cwd"))"
 ok "live spawn: the built-in live-agent argv, the session name, the prompt as one argument, the project's folder"
 
-run 0 "$MESA" live stop >/dev/null
+# ---- stopping the conversation stops its agent ----
+#
+# The other half of the spawn: hanging up finishes the background session
+# rather than leaving one idling per conversation. The job named is the short
+# id from the receipt, and nothing else.
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live stop
+[ "$(jqs .status)" = "ended" ] || fail "live stop: status must be ended"
+[ "$(cat "$STUB_DIR/last-stop")" = "stop deadbeef" ] ||
+  fail "live stop: must run \`claude stop <agent_id>\` (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+ok "live stop: ends the session AND stops the agent it was started with, by its short job id"
+
+# Best-effort, both ways round: a session with no agent has nothing to stop,
+# and a `claude stop` that fails is a warning on stderr — never a nonzero exit,
+# and never anything on stdout but the ended session.
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live start --no-agent
+run 0 "$MESA" live stop
+[ ! -e "$STUB_DIR/last-stop" ] ||
+  fail "live stop on a --no-agent session: there is no agent to stop"
+[ -z "$STDERR" ] || fail "live stop on a --no-agent session: nothing to warn about"
+
+touch "$STUB_DIR/stop-fail"
+run 0 "$MESA" live start
+run 0 "$MESA" live stop
+rm -f "$STUB_DIR/stop-fail"
+[ "$(jqs .status)" = "ended" ] ||
+  fail "live stop with a failing \`claude stop\`: the conversation is still ended"
+grep -q 'could not stop its agent' <<<"$STDERR" ||
+  fail "live stop with a failing \`claude stop\`: the warning belongs on stderr"
+run 0 "$MESA" live status
+[ "$STDOUT" = "null" ] || fail "a failed agent stop must still leave no live session"
+ok "live stop is best-effort: no agent is a no-op, a failing \`claude stop\` warns on stderr and still exits 0"
 
 # By ID, and a project with no local_path: the folder degrades to $HOME rather
 # than refusing to start (a conversation needs no checkout).
@@ -655,18 +695,34 @@ ok "two concurrent listeners, one utterance: heard exactly once"
 "$MESA" live listen --wait 60 >"$TMP/listen-end.json" 2>/dev/null &
 LE=$!
 sleep 1
+rm -f "$STUB_DIR/last-stop"
 api 200 DELETE "/api/live"
 [ "$(jqb .status)" = "ended" ] || fail "DELETE /api/live: status must be ended"
 wait "$LE"
 [ "$(cat "$TMP/listen-end.json")" = "null" ] ||
   fail "live listen must return null when the session ends under it"
-ok "DELETE /api/live: 200 the ended session, and a waiting \`live listen\` returns null early"
+# The API twin of the CLI's stop: the same short job id, stopped the same way.
+[ "$(cat "$STUB_DIR/last-stop")" = "stop deadbeef" ] ||
+  fail "DELETE /api/live: must stop the agent it spawned (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+ok "DELETE /api/live: 200 the ended session, its agent stopped, and a waiting \`live listen\` returns null early"
 
 api 404 DELETE "/api/live"
 [ "$(jqb .error.code)" = "not_found" ] || fail "second DELETE /api/live: error.code"
 api 200 GET "/api/live"
 [ "$(jqb .session)" = "null" ] || fail "after DELETE: back to the idle state"
 ok "DELETE /api/live twice: the second is 404 not_found, and the page is idle again"
+
+# Best-effort there too: a `claude stop` that fails must not turn hanging up
+# into an error — the store write is what ended the conversation.
+api 201 POST "/api/live" '{}'
+touch "$STUB_DIR/stop-fail"
+api 200 DELETE "/api/live"
+rm -f "$STUB_DIR/stop-fail"
+[ "$(jqb .status)" = "ended" ] ||
+  fail "DELETE /api/live with a failing \`claude stop\`: the conversation is still ended"
+api 200 GET "/api/live"
+[ "$(jqb .session)" = "null" ] || fail "a failed agent stop must still leave no live session"
+ok "DELETE /api/live is best-effort: a failing \`claude stop\` still answers the ended session"
 
 # =====================================================================
 # 7. GET /api/live/turns/{id}/speak — the audio contract

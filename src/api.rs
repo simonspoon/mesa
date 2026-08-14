@@ -2355,21 +2355,49 @@ async fn spawn_live_agent(
 /// `require_agent_access` with `start_live`: hanging up on an agent mid-turn is
 /// the other half of the same capability, and the pair must not drift apart.
 ///
-/// The agent stops itself — it checks `mesa live status` each time round its
-/// loop — so this writes the status and nothing else. `Store::end_live_session`
-/// is idempotent, but a stop with nothing live is still `not_found`: the caller
-/// asked to end a conversation that isn't there.
+/// `Store::end_live_session` is idempotent, but a stop with nothing live is
+/// still `not_found`: the caller asked to end a conversation that isn't there.
+///
+/// Ending the conversation also **stops the agent it was started with**
+/// (`claude stop <agent_id>`), the other half of `start_live`'s spawn: the
+/// agent does notice on its own — it checks `mesa live status` each time round
+/// its loop — but noticing leaves an idle background session behind per
+/// conversation, and the person who hung up expects the session to be finished.
+/// Best-effort, exactly like the CLI's `live stop`: the store write is what
+/// ended the conversation, so a session with no `agent_id` is nothing to stop
+/// and a failing `claude stop` is a log line, never this route's answer.
 async fn stop_live(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
-    let mut store = state.store.lock().unwrap();
-    let Some(session) = store.current_live_session()? else {
-        return Err(no_live_session());
+    // The store lock is dropped before the blocking `claude stop` shell-out,
+    // like every other agent call in this file.
+    let session = {
+        let mut store = state.store.lock().unwrap();
+        let Some(session) = store.current_live_session()? else {
+            return Err(no_live_session());
+        };
+        store.end_live_session(session.id)?
     };
-    Ok(Json(store.end_live_session(session.id)?).into_response())
+    if let Some(agent_id) = session.agent_id.clone() {
+        let id = session.id;
+        match tokio::task::spawn_blocking(move || agents::stop(&agent_id)).await {
+            Ok(Ok(())) => {
+                // Same cache invalidation as a spawn: the Agents sidebar must
+                // show the session finishing on the next poll, not after the
+                // TTL. Cleared whole — the spawn folder is the conversation's
+                // project path or `$HOME`, and the global list caches under
+                // its own key.
+                state.agents_cache.lock().unwrap().clear();
+                state.agents_gen.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Err(e)) => eprintln!("live session {id}: could not stop its agent: {e}"),
+            Err(e) => eprintln!("live session {id}: stopping its agent panicked: {e}"),
+        }
+    }
+    Ok(Json(session).into_response())
 }
 
 /// The dictated user turn — what the person said, on its way to the agent that

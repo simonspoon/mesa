@@ -316,6 +316,42 @@ pub fn spawn_bg(
     }
 }
 
+/// Stops the background session with short job id `job_id`
+/// (`claude stop <id>`), the other end of [`spawn_bg`]'s receipt.
+///
+/// Deliberately **not** a config template: a template chooses which program
+/// starts a session and what it is told to do, and mesa must be able to stop
+/// exactly the session it started — `claude stop` takes the id `claude --bg`
+/// printed, so both halves are the same binary ([`claude_bin`]) whatever the
+/// start template says. A replacement command that prints no receipt leaves
+/// mesa no id, and therefore nothing to stop; that is the same limitation the
+/// attach pane already has.
+///
+/// Errors are the module's usual concise strings. Callers treat a failure as
+/// best-effort: the store write that ended the conversation is the truth, and
+/// an agent that outlives it stops itself on its next loop.
+pub fn stop(job_id: &str) -> Result<(), String> {
+    stop_session(&claude_bin(), job_id)
+}
+
+/// The binary is threaded in — like `list_sessions` under `list_all` — so the
+/// argv is unit-testable against a stub without mutating process-global env.
+fn stop_session(bin: &str, job_id: &str) -> Result<(), String> {
+    let out = Command::new(bin)
+        .arg("stop")
+        .arg(job_id)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run {bin}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "claude stop {job_id} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// The argv is threaded in rather than resolved here so tests pin a whole
 /// command line without mutating process-global env state.
 fn spawn_argv(argv: &[String], dir: &str) -> Result<Option<String>, String> {
@@ -536,6 +572,30 @@ mod tests {
 echo '[]'"#,
         );
         assert_eq!(list_sessions(&bin).unwrap(), vec![]);
+    }
+
+    /// The other end of a spawn receipt: `claude stop <short id>`, the short
+    /// job id and nothing else (the full `sessionId` UUID is not a job).
+    #[test]
+    fn stop_passes_the_short_job_id_to_claude_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_claude(
+            dir.path(),
+            r#"[ "$*" = "stop e34b8ed9" ] || { echo "bad argv: $*" >&2; exit 1; }"#,
+        );
+        assert_eq!(stop_session(&bin, "e34b8ed9"), Ok(()));
+    }
+
+    /// A stop that fails surfaces the binary's stderr, so the caller's warning
+    /// says what went wrong. (Callers treat it as best-effort — the ended
+    /// session is already written.)
+    #[test]
+    fn stop_surfaces_stderr_on_a_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_claude(dir.path(), r#"echo "No job matching" >&2; exit 1"#);
+        let err = stop_session(&bin, "nope").unwrap_err();
+        assert!(err.contains("No job matching"), "{err}");
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[test]

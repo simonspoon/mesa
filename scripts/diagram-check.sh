@@ -533,4 +533,174 @@ ok "error path: exit 1 and byte-identical stderr with and without --quiet"
 
 run 0 "$MESA" project delete "$QP"
 
+# ---- shapes + connector properties (mesa task 854) ----
+# `mesa diagram types` is the discovery command: it must state EXACTLY what
+# `frame create --shape` and `edge create --*-marker` accept per board type, so
+# the whole matrix below is driven off its output rather than a copy of the
+# value sets. A listed value must create; an unlisted one must be rejected.
+
+run 2 "$MESA" diagram types --quiet
+[ "$(jqe .error.code)" = "usage" ] || fail "diagram types --quiet: code=usage"
+ok "diagram types --quiet: exit 2 (a read command, out of scope)"
+
+run 0 "$MESA" diagram types
+capture "$TMP/types.json"
+[ "$(jqs type)" = "array" ] || fail "diagram types: bare array"
+[ "$(jqs 'all(.[]; has("type") and has("shapes") and has("generic_frame")
+        and has("edge_styles") and has("edge_markers"))')" = "true" ] ||
+  fail "diagram types: every row must carry all five keys"
+[ "$(jqs 'map(select(.type == "erd")) | .[0].edge_markers | index("crows_foot") != null')" = "true" ] ||
+  fail "diagram types: erd must list the cardinality markers"
+[ "$(jqs 'map(select(.type != "erd")) | all(.[]; .edge_markers | index("crows_foot") == null)')" = "true" ] ||
+  fail "diagram types: only erd may list the cardinality markers"
+ok "diagram types: one row per type, cardinality markers on erd alone"
+
+ALL_SHAPES=$(jq -r '[.[].shapes[]] | unique | .[]' "$TMP/types.json")
+ALL_MARKERS=$(jq -r '[.[].edge_markers[]] | unique | .[]' "$TMP/types.json")
+
+run 0 "$MESA" project create "Shape matrix project" --no-git
+MP=$(jqs .id)
+
+for T in $(jq -r '.[].type' "$TMP/types.json"); do
+  LISTED_SHAPES=$(jq -r --arg t "$T" '.[] | select(.type == $t) | .shapes[]' "$TMP/types.json")
+  LISTED_MARKERS=$(jq -r --arg t "$T" '.[] | select(.type == $t) | .edge_markers[]' "$TMP/types.json")
+  GENERIC=$(jq -r --arg t "$T" '.[] | select(.type == $t) | .generic_frame' "$TMP/types.json")
+  FIRST_SHAPE=$(head -n1 <<<"$LISTED_SHAPES")
+
+  run 0 "$MESA" diagram create "$MP" "Board $T" --type "$T"
+  MB=$(jqs .id)
+
+  # the generic card (no --shape at all) exactly where `generic_frame` says
+  if [ "$GENERIC" = "true" ]; then
+    run 0 "$MESA" diagram frame create "$MB" "generic"
+    [ "$(jqs .shape)" = "null" ] || fail "$T: omitted --shape must store null"
+  else
+    run 1 "$MESA" diagram frame create "$MB" "generic"
+    [ "$(jqe .error.code)" = "validation" ] || fail "$T: omitted --shape must be validation"
+  fi
+
+  for S in $ALL_SHAPES; do
+    if grep -qx "$S" <<<"$LISTED_SHAPES"; then
+      run 0 "$MESA" diagram frame create "$MB" "f-$S" --shape "$S"
+      [ "$(jqs .shape)" = "$S" ] || fail "$T/--shape $S: shape echoed"
+    else
+      run 1 "$MESA" diagram frame create "$MB" "f-$S" --shape "$S"
+      [ "$(jqe .error.code)" = "validation" ] || fail "$T/--shape $S: code=validation"
+    fi
+  done
+
+  # two frames to hang connectors off, shaped however this board demands
+  if [ "$GENERIC" = "true" ]; then
+    run 0 "$MESA" diagram frame create "$MB" "edge A"
+  else
+    run 0 "$MESA" diagram frame create "$MB" "edge A" --shape "$FIRST_SHAPE"
+  fi
+  MA=$(jqs .id)
+  if [ "$GENERIC" = "true" ]; then
+    run 0 "$MESA" diagram frame create "$MB" "edge B" --x 400
+  else
+    run 0 "$MESA" diagram frame create "$MB" "edge B" --x 400 --shape "$FIRST_SHAPE"
+  fi
+  MBB=$(jqs .id)
+
+  for M in $ALL_MARKERS; do
+    if grep -qx "$M" <<<"$LISTED_MARKERS"; then
+      run 0 "$MESA" diagram edge create "$MB" "$MA" "$MBB" --to-marker "$M"
+      [ "$(jqs .to_marker)" = "$M" ] || fail "$T/--to-marker $M: marker echoed"
+    else
+      run 1 "$MESA" diagram edge create "$MB" "$MA" "$MBB" --to-marker "$M"
+      [ "$(jqe .error.code)" = "validation" ] || fail "$T/--to-marker $M: code=validation"
+      [ "$(jqe .error.message)" = "marker '$M' is not valid for a $T board" ] ||
+        fail "$T/--to-marker $M: message"
+    fi
+  done
+done
+ok "diagram types: every listed shape/marker creates, every unlisted one is validation"
+
+run 2 "$MESA" diagram frame create "$MB" "bad" --shape bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "unknown --shape literal: code=usage"
+run 2 "$MESA" diagram edge create "$MB" "$MA" "$MBB" --to-marker bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "unknown --to-marker literal: code=usage"
+run 2 "$MESA" diagram edge create "$MB" "$MA" "$MBB" --style bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "unknown --style literal: code=usage"
+ok "unknown shape/marker/style literals: exit 2, code=usage (never reach Store)"
+
+# ---- style + markers on one connector, created and patched ----
+run 0 "$MESA" diagram create "$MP" "Connector board" --type flowchart
+CB=$(jqs .id)
+run 0 "$MESA" diagram frame create "$CB" "Start" --shape start_end
+CF1=$(jqs .id)
+run 0 "$MESA" diagram frame create "$CB" "Store it" --shape database --x 400
+CF2=$(jqs .id)
+
+run 0 "$MESA" diagram edge create "$CB" "$CF1" "$CF2" \
+  --style dashed --from-marker circle --to-marker hollow_arrow --author agent-1
+CE=$(jqs .id)
+[ "$(jqs .style)" = "dashed" ] || fail "edge create --style"
+[ "$(jqs .from_marker)" = "circle" ] || fail "edge create --from-marker"
+[ "$(jqs .to_marker)" = "hollow_arrow" ] || fail "edge create --to-marker"
+ok "edge create --style/--from-marker/--to-marker: all three echoed"
+
+# an untouched edge keeps the default rendering: all three null
+run 0 "$MESA" diagram edge create "$CB" "$CF2" "$CF1"
+[ "$(jqs '.style == null and .from_marker == null and .to_marker == null')" = "true" ] ||
+  fail "edge create without the flags: all three must be null (today's rendering)"
+ok "edge create without the new flags: style/markers null (unchanged rendering)"
+
+run 0 "$MESA" diagram edge update "$CE" --style dotted --to-marker diamond
+[ "$(jqs .style)" = "dotted" ] || fail "edge update --style"
+[ "$(jqs .to_marker)" = "diamond" ] || fail "edge update --to-marker"
+[ "$(jqs .from_marker)" = "circle" ] || fail "edge update: an omitted field is untouched"
+ok "edge update --style/--to-marker: set; omitted fields untouched"
+
+run 0 "$MESA" diagram edge update "$CE" --style "" --from-marker "" --to-marker ""
+[ "$(jqs '.style == null and .from_marker == null and .to_marker == null')" = "true" ] ||
+  fail 'edge update --style "": must clear all three back to the default'
+ok 'edge update --style ""/--from-marker ""/--to-marker "": clears back to the default'
+
+run 2 "$MESA" diagram edge update "$CE" --style bogus
+[ "$(jqe .error.code)" = "usage" ] || fail "edge update --style bogus: code=usage"
+ok "edge update --style bogus: exit 2, code=usage"
+
+# the erd-only family is rejected on this flowchart board, at both verbs
+run 1 "$MESA" diagram edge create "$CB" "$CF1" "$CF2" --to-marker crows_foot
+[ "$(jqe .error.code)" = "validation" ] || fail "crows_foot on flowchart create: code"
+run 1 "$MESA" diagram edge update "$CE" --to-marker one_or_many
+[ "$(jqe .error.code)" = "validation" ] || fail "one_or_many on flowchart update: code"
+[ "$(jqe .error.message)" = "marker 'one_or_many' is not valid for a flowchart board" ] ||
+  fail "erd-only marker on a flowchart: message"
+ok "erd-only markers on a flowchart board: exit 1, code=validation (create and update)"
+
+# ...and accepted on an erd board
+run 0 "$MESA" diagram create "$MP" "Schema" --type erd
+EB=$(jqs .id)
+run 0 "$MESA" diagram frame create "$EB" "orders" --shape entity
+EF1=$(jqs .id)
+run 0 "$MESA" diagram frame create "$EB" "line_items" --shape weak_entity --x 400
+EF2=$(jqs .id)
+run 0 "$MESA" diagram edge create "$EB" "$EF1" "$EF2" --from-marker one --to-marker crows_foot
+[ "$(jqs .from_marker)" = "one" ] || fail "erd board: --from-marker one"
+[ "$(jqs .to_marker)" = "crows_foot" ] || fail "erd board: --to-marker crows_foot"
+ok "cardinality markers on an erd board: accepted"
+
+# ---- the restyle event ----
+run 0 "$MESA" diagram events "$CB"
+[ "$(jqs 'any(.[]; .action == "edge_restyled")')" = "true" ] ||
+  fail "events: edge_restyled must be logged"
+[ "$(jqs '[.[] | select(.action == "edge_restyled")] | length')" = "2" ] ||
+  fail "events: one edge_restyled per landing patch (set, then clear)"
+[ "$(jqs '[.[] | select(.action == "edge_restyled")] | .[-1].summary | contains("style: default")')" = "true" ] ||
+  fail "events: the clearing patch's summary names the default"
+ok "diagram events: edge_restyled logged once per landing style/marker patch"
+
+# a patch that re-asserts what is stored logs nothing
+run 0 "$MESA" diagram events "$CB"
+BEFORE=$(jqs length)
+run 0 "$MESA" diagram edge update "$CE" --style ""
+run 0 "$MESA" diagram events "$CB"
+[ "$(jqs length)" = "$BEFORE" ] || fail "no-op restyle patch must log no event"
+ok "no-op style patch: no event appended"
+
+run 0 "$MESA" project delete "$MP"
+
 echo "all $CHECKS checks passed"

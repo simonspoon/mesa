@@ -24,10 +24,10 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    Diagram, DiagramPatch, DiagramType, DiagramView, EdgePatch, Error, Frame, FrameEdge, FrameNew,
-    FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind, NextResult, Priority, Project,
-    ProjectPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
-    TaskPatch,
+    Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
+    Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
+    NextResult, Priority, Project, ProjectPatch, Result, Script, ScriptArg, ScriptArgKind,
+    ScriptPatch, Status, Store, Task, TaskPatch,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1367,6 +1367,16 @@ EXAMPLES
         /// Diagram id
         id: i64,
     },
+    /// Print what each diagram type accepts, as a JSON array
+    ///
+    /// One object per type: {type, shapes, generic_frame, edge_styles,
+    /// edge_markers}. `shapes` is exactly what `diagram frame create --shape`
+    /// takes on a board of that type and `generic_frame` says whether the
+    /// shape may be omitted entirely; `edge_markers` is exactly what
+    /// `diagram edge create --from-marker/--to-marker` takes there (the
+    /// cardinality markers are erd-only). It prints the value sets
+    /// themselves, so it needs no board id and opens no database.
+    Types,
     /// Create, update, and delete frames (cards) on a diagram
     #[command(subcommand)]
     Frame(FrameCmd),
@@ -1421,10 +1431,12 @@ EXAMPLES
         /// Optional task id to link (must be in the diagram's project)
         #[arg(long)]
         task: Option<i64>,
-        /// Node shape, required to match the board's diagram type: omit it on
-        /// a storyboard board, process|decision|start_end on a flowchart,
-        /// entity on an erd, central|idea on a brainstorm. Any mismatch —
-        /// including omitting it on a typed board — is a "validation" error.
+        /// Node shape, required to match the board's diagram type — run
+        /// `mesa diagram types` for the exact set each type accepts. A
+        /// storyboard board also takes no shape at all (the generic card);
+        /// every other type requires one. Any mismatch — including omitting it
+        /// on a typed board — is a "validation" error (exit 1), while an
+        /// unknown value is a usage error (exit 2).
         /// Immutable after creation — no --shape on `diagram frame update`
         #[arg(long, value_parser = parse_frame_shape)]
         shape: Option<FrameShape>,
@@ -1512,10 +1524,14 @@ enum EdgeCmd {
     ///
     /// Both frames must belong to the diagram. Self-edges are rejected
     /// (code "validation"); cycles are allowed (a diagram is a freeform
-    /// diagram, not a dependency graph).
+    /// diagram, not a dependency graph). --style and the two --*-marker flags
+    /// are the connector's professional properties; `mesa diagram types` lists
+    /// what this board's type accepts.
     #[command(after_help = "\
 EXAMPLES
-  mesa diagram edge create 1 3 4 --label \"then\"")]
+  mesa diagram edge create 1 3 4 --label \"then\"
+  mesa diagram edge create 1 3 4 --style dashed --to-marker hollow_arrow
+  mesa diagram edge create 2 5 6 --to-marker crows_foot   # erd boards only")]
     Create {
         /// Diagram both frames belong to
         #[arg(value_name = "DIAGRAM", required_unless_present = "diagram")]
@@ -1538,6 +1554,19 @@ EXAMPLES
         /// Optional edge label
         #[arg(long)]
         label: Option<String>,
+        /// Line style: solid|dashed|dotted (absent = solid, the default
+        /// rendering). Valid on every diagram type
+        #[arg(long, value_parser = parse_edge_style)]
+        style: Option<EdgeStyle>,
+        /// Decoration at the FROM end (absent = nothing, the default). The
+        /// cardinality markers are accepted on erd boards only; see
+        /// `mesa diagram types`
+        #[arg(long, value_parser = parse_edge_marker)]
+        from_marker: Option<EdgeMarker>,
+        /// Decoration at the TO end (absent = a closed arrowhead, the
+        /// default). Same per-type rule as --from-marker
+        #[arg(long, value_parser = parse_edge_marker)]
+        to_marker: Option<EdgeMarker>,
         /// Free-text actor id of the creator (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
@@ -1546,12 +1575,19 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Update an edge's label; prints the full updated edge (`--quiet` is
-    /// accepted for uniformity; an edge has no unbounded field, so the output
-    /// is the same either way)
+    /// Update an edge's label, style or end markers; prints the full updated
+    /// edge (`--quiet` is accepted for uniformity; an edge has no unbounded
+    /// field, so the output is the same either way)
     ///
-    /// `--label ""` clears the label. Endpoints are immutable (delete and
-    /// re-create to re-route an edge).
+    /// `--label ""`, `--style ""`, `--from-marker ""` and `--to-marker ""`
+    /// clear those fields back to their defaults. Endpoints are immutable
+    /// (delete and re-create to re-route an edge); style and markers are not,
+    /// unlike a frame's --shape, because restyling a connector never moves it
+    /// into another type system.
+    #[command(after_help = "\
+EXAMPLES
+  mesa diagram edge update 3 --style dotted --to-marker circle
+  mesa diagram edge update 3 --style \"\"           # back to a solid line")]
     #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
     Update {
         /// Edge id
@@ -1559,6 +1595,15 @@ EXAMPLES
         /// New label; pass "" to clear it
         #[arg(long, group = "fields")]
         label: Option<String>,
+        /// New line style: solid|dashed|dotted; pass "" to clear it
+        #[arg(long, group = "fields", value_parser = parse_edge_style_or_clear)]
+        style: Option<String>,
+        /// New decoration at the FROM end; pass "" to clear it
+        #[arg(long, group = "fields", value_parser = parse_edge_marker_or_clear)]
+        from_marker: Option<String>,
+        /// New decoration at the TO end; pass "" to clear it
+        #[arg(long, group = "fields", value_parser = parse_edge_marker_or_clear)]
+        to_marker: Option<String>,
         /// Free-text actor id for the change history (an agent name or "user")
         #[arg(long)]
         author: Option<String>,
@@ -1603,10 +1648,58 @@ fn parse_diagram_type(s: &str) -> std::result::Result<DiagramType, String> {
         .ok_or_else(|| format!("'{s}' is not one of storyboard|flowchart|erd|brainstorm"))
 }
 
+/// Renders a value set as clap's `a|b|c` help/error alternation. Built from
+/// the enum's own `ALL`, so a new shape/style/marker cannot be legal but
+/// unmentioned.
+fn alternation(values: impl IntoIterator<Item = &'static str>) -> String {
+    values.into_iter().collect::<Vec<_>>().join("|")
+}
+
 fn parse_frame_shape(s: &str) -> std::result::Result<FrameShape, String> {
     FrameShape::parse(s).ok_or_else(|| {
-        format!("'{s}' is not one of process|decision|start_end|entity|central|idea")
+        format!(
+            "'{s}' is not one of {}",
+            alternation(FrameShape::ALL.iter().map(|v| v.as_str()))
+        )
     })
+}
+
+fn parse_edge_style(s: &str) -> std::result::Result<EdgeStyle, String> {
+    EdgeStyle::parse(s).ok_or_else(|| {
+        format!(
+            "'{s}' is not one of {}",
+            alternation(EdgeStyle::ALL.iter().map(|v| v.as_str()))
+        )
+    })
+}
+
+fn parse_edge_marker(s: &str) -> std::result::Result<EdgeMarker, String> {
+    EdgeMarker::parse(s).ok_or_else(|| {
+        format!(
+            "'{s}' is not one of {}",
+            alternation(EdgeMarker::ALL.iter().map(|v| v.as_str()))
+        )
+    })
+}
+
+/// `diagram edge update`'s validating pass-through: `""` clears the field back
+/// to its default (exactly how `--label ""` clears), anything else must be a
+/// legal literal, so an unknown one is a clap **usage** error (exit 2) rather
+/// than reaching `Store`. The accepted string is returned verbatim and read
+/// back through `EdgeStyle::parse`/`EdgeMarker::parse` at the call site, where
+/// `""` parses to `None` — which is the clear.
+fn parse_edge_style_or_clear(s: &str) -> std::result::Result<String, String> {
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    parse_edge_style(s).map(|v| v.as_str().to_string())
+}
+
+fn parse_edge_marker_or_clear(s: &str) -> std::result::Result<String, String> {
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    parse_edge_marker(s).map(|v| v.as_str().to_string())
 }
 
 /// Comma-separated tags; empty string yields the empty set (clears tags).
@@ -2403,7 +2496,120 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
     Ok(())
 }
 
+/// One row of `mesa diagram types`: what a board of this type accepts. Every
+/// list is read straight off the enums the `Store` validators consult
+/// (`DiagramType::shapes`/`allows_generic_frame`/`edge_markers`,
+/// `EdgeStyle::ALL`), so what this prints and what `create` accepts are the
+/// same answer by construction, not by two lists kept in step.
+#[derive(serde::Serialize)]
+struct DiagramTypeInfo {
+    #[serde(rename = "type")]
+    diagram_type: &'static str,
+    /// Values `diagram frame create --shape` takes on this board type.
+    shapes: Vec<&'static str>,
+    /// Whether `--shape` may be omitted (the generic card).
+    generic_frame: bool,
+    /// Values `diagram edge create --style` takes — the same on every type.
+    edge_styles: Vec<&'static str>,
+    /// Values `--from-marker`/`--to-marker` take on this board type.
+    edge_markers: Vec<&'static str>,
+}
+
+fn diagram_type_catalog() -> Vec<DiagramTypeInfo> {
+    DiagramType::ALL
+        .iter()
+        .map(|dt| DiagramTypeInfo {
+            diagram_type: dt.as_str(),
+            shapes: dt.shapes().iter().map(|s| s.as_str()).collect(),
+            generic_frame: dt.allows_generic_frame(),
+            edge_styles: EdgeStyle::ALL.iter().map(|s| s.as_str()).collect(),
+            edge_markers: dt.edge_markers().iter().map(|m| m.as_str()).collect(),
+        })
+        .collect()
+}
+
+/// `mesa diagram types` is only useful if it is the same answer `create`
+/// gives, so this asserts the agreement directly: every printed shape is
+/// accepted by `validate_frame_shape` for that type, every shape it omits is
+/// rejected, and the same both ways for markers against
+/// `validate_edge_markers`. Both validators are exercised through their public
+/// callers in `store.rs`'s own matrix tests; here the subject is the *lists*.
+#[cfg(test)]
+mod diagram_types_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_states_exactly_what_each_type_accepts() {
+        let catalog = diagram_type_catalog();
+        assert_eq!(catalog.len(), DiagramType::ALL.len());
+        for (info, dt) in catalog.iter().zip(DiagramType::ALL.iter().copied()) {
+            assert_eq!(info.diagram_type, dt.as_str());
+            assert_eq!(info.generic_frame, dt.allows_generic_frame());
+            for shape in FrameShape::ALL.iter().copied() {
+                assert_eq!(
+                    info.shapes.contains(&shape.as_str()),
+                    dt.shapes().contains(&shape),
+                    "shape {} on {}",
+                    shape.as_str(),
+                    dt.as_str()
+                );
+            }
+            for marker in EdgeMarker::ALL.iter().copied() {
+                assert_eq!(
+                    info.edge_markers.contains(&marker.as_str()),
+                    dt.edge_markers().contains(&marker),
+                    "marker {} on {}",
+                    marker.as_str(),
+                    dt.as_str()
+                );
+            }
+            // Style has no per-type rule at all: every type lists every style.
+            let all_styles: Vec<&str> = EdgeStyle::ALL.iter().map(|s| s.as_str()).collect();
+            assert_eq!(info.edge_styles, all_styles);
+        }
+        // The cardinality family is on the erd row and nowhere else.
+        for info in &catalog {
+            let has_cardinality = EdgeMarker::CARDINALITY
+                .iter()
+                .any(|m| info.edge_markers.contains(&m.as_str()));
+            assert_eq!(has_cardinality, info.diagram_type == "erd");
+        }
+    }
+
+    /// Every value the catalog prints is a literal the CLI's own value parsers
+    /// accept — the flags and the discovery command speak one vocabulary.
+    #[test]
+    fn every_printed_value_parses_as_a_flag_argument() {
+        for info in diagram_type_catalog() {
+            for shape in info.shapes {
+                assert!(parse_frame_shape(shape).is_ok(), "{shape}");
+            }
+            for style in info.edge_styles {
+                assert!(parse_edge_style(style).is_ok(), "{style}");
+                assert!(parse_edge_style_or_clear(style).is_ok(), "{style}");
+            }
+            for marker in info.edge_markers {
+                assert!(parse_edge_marker(marker).is_ok(), "{marker}");
+                assert!(parse_edge_marker_or_clear(marker).is_ok(), "{marker}");
+            }
+        }
+        // `""` is the clear, not a value — and only on the update flags.
+        assert_eq!(parse_edge_style_or_clear(""), Ok(String::new()));
+        assert_eq!(parse_edge_marker_or_clear(""), Ok(String::new()));
+        assert!(parse_edge_style("").is_err());
+        assert!(parse_edge_marker("").is_err());
+        assert!(parse_edge_style_or_clear("bogus").is_err());
+        assert!(parse_edge_marker_or_clear("bogus").is_err());
+    }
+}
+
 fn run_diagram(cmd: DiagramCmd) -> Result<()> {
+    // The value sets are compiled in, so this is the one diagram command that
+    // answers without a database — and must not create one as a side effect.
+    if let DiagramCmd::Types = cmd {
+        print_json(&diagram_type_catalog());
+        return Ok(());
+    }
     let mut store = Store::open_default()?;
     match cmd {
         DiagramCmd::Create {
@@ -2449,6 +2655,7 @@ fn run_diagram(cmd: DiagramCmd) -> Result<()> {
         }
         DiagramCmd::Delete { id, quiet } => print_diagram_view(&store.delete_diagram(id)?, quiet),
         DiagramCmd::Events { id } => print_json(&store.list_diagram_events(id)?),
+        DiagramCmd::Types => unreachable!("answered before the store is opened"),
         DiagramCmd::Frame(cmd) => run_frame(&mut store, cmd)?,
         DiagramCmd::Edge(cmd) => run_edge(&mut store, cmd)?,
     }
@@ -2545,30 +2752,47 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
             from,
             to,
             label,
-            author,
-            quiet,
-        } => print_edge(
-            &store.create_edge(
-                // clap guarantees exactly one of each positional/flag pair.
-                diagram.or(diagram_pos).unwrap(),
-                from.or(from_pos).unwrap(),
-                to.or(to_pos).unwrap(),
-                label.as_deref(),
-                author.as_deref(),
-            )?,
-            quiet,
-        ),
-        EdgeCmd::Update {
-            id,
-            label,
+            style,
+            from_marker,
+            to_marker,
             author,
             quiet,
         } => {
+            let new = EdgeNew {
+                // clap guarantees exactly one of each positional/flag pair.
+                from_frame: from.or(from_pos).unwrap(),
+                to_frame: to.or(to_pos).unwrap(),
+                label,
+                author,
+                style,
+                from_marker,
+                to_marker,
+            };
+            print_edge(
+                &store.create_edge(diagram.or(diagram_pos).unwrap(), &new)?,
+                quiet,
+            );
+        }
+        EdgeCmd::Update {
+            id,
+            label,
+            style,
+            from_marker,
+            to_marker,
+            author,
+            quiet,
+        } => {
+            // The value parsers already rejected anything but a legal literal
+            // or `""`, and `""` parses to `None` — which is the clear, the
+            // same three-state shape `--label ""` has.
             let patch = EdgePatch {
                 label: label.map(clear_if_empty),
                 waypoints: None,
                 from_anchor: None,
                 to_anchor: None,
+                style: style.map(|s| EdgeStyle::parse(&s)),
+                from_marker: from_marker.map(|m| EdgeMarker::parse(&m)),
+                to_marker: to_marker.map(|m| EdgeMarker::parse(&m)),
             };
             print_edge(&store.update_edge(id, &patch, author.as_deref())?, quiet);
         }
@@ -2893,8 +3117,8 @@ mod tests {
 
     use super::*;
     use crate::core::{
-        AnchorSide, Diagram, DiagramType, Frame, FrameEdge, FrameShape, InboxItem, Project,
-        TaskSummary, Waypoint,
+        AnchorSide, Diagram, DiagramType, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape,
+        InboxItem, Project, TaskSummary, Waypoint,
     };
 
     /// Serialized top-level key set of any record, sorted.
@@ -3027,6 +3251,9 @@ mod tests {
             waypoints: vec![Waypoint { x: 1.0, y: 2.0 }],
             from_anchor: Some(AnchorSide::Right),
             to_anchor: Some(AnchorSide::Left),
+            style: Some(EdgeStyle::Dashed),
+            from_marker: Some(EdgeMarker::Circle),
+            to_marker: Some(EdgeMarker::Arrow),
         }
     }
 
@@ -3213,6 +3440,12 @@ mod tests {
                 "waypoints",
                 "from_anchor",
                 "to_anchor",
+                // Task 854. All three are bounded enum values — the same kind
+                // of field as `from_anchor` — so the decision this test forces
+                // is "keep", and quiet stays a pass-through.
+                "style",
+                "from_marker",
+                "to_marker",
             ]),
             "FrameEdge gained/lost a field: it has no unbounded free text \
              today, so --quiet == full; revisit if that changes",

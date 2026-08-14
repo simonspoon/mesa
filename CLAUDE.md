@@ -120,8 +120,8 @@ The code is the source of truth. These are the invariants you must not break:
   long form only (no `-q`, no env var, no config key, never default-on), accepted
   on every mutation and `show`/`get` across `task`, `project`, `diagram`
   (+ `frame`, `edge`) and `inbox` — and on nothing else (`list`, `deps`,
-  `events`, `next`, `resolve`, `execute`, `attachment`, `cc`, `backup`, `serve`
-  reject it as an unknown argument, exit 2). The quiet shape is the record minus
+  `events`, `types`, `next`, `resolve`, `execute`, `attachment`, `cc`,
+  `backup`, `serve` reject it as an unknown argument, exit 2). The quiet shape is the record minus
   its unbounded free-text field(s), derived by removing named keys from the
   serialized record — never a hand-written second projection (`quiet()` in
   `src/cli.rs`, with a key-parity `#[test]` per record type so a new field on a

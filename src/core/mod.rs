@@ -13,18 +13,18 @@ pub mod usage;
 pub mod version;
 
 pub use store::{
-    DiagramPatch, EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult, ProjectPatch,
-    Result, ScriptPatch, Store, TaskPatch, default_db_path,
+    DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch, ImportDoc, NextResult,
+    ProjectPatch, Result, ScriptPatch, Store, TaskPatch, default_db_path,
 };
 pub use types::{
     AgentSession, AgentSpawned, AnchorSide, Attachment, CcAgentStat, CcDashboard, CcDayPoint,
     CcModelStat, CcOverview, CcProjectStat, CcSessionBucket, CcSessionDetail, CcSessionModelStat,
     CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat,
     CcTokens, CcUsage, CcUsageExtra, CcUsageWindow, ConfigCommand, ConfigPrice, Dependency,
-    Diagram, DiagramEvent, DiagramType, DiagramView, DirEntry, DirListing, FileContentView,
-    FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind, MesaVersion, ModelRates,
-    Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    Diagram, DiagramEvent, DiagramType, DiagramView, DirEntry, DirListing, EdgeMarker, EdgeStyle,
+    FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
+    GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind, MesaVersion,
+    ModelRates, Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
     ProjectGitView, ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task,
     TaskSummary, Waypoint, task_name,
 };

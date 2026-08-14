@@ -3,10 +3,10 @@
 /**
  * A diagram's style, chosen at creation and immutable thereafter
  * (no field on `DiagramPatch` — the same structural-immutability posture
- * as `project_id`/`author`). Picks the shape set offered for its frames: a
- * `storyboard` board takes the generic frame card, a `flowchart` board takes
- * `process`/`decision`/`start_end` node shapes, an `erd` board takes only the
- * `entity` shape, and a `brainstorm` board takes `central`/`idea` mind-map
- * shapes.
+ * as `project_id`/`author`). Picks the shape set offered for its frames and
+ * the connector markers its edges may carry — see [`DiagramType::shapes`],
+ * [`DiagramType::allows_generic_frame`] and [`DiagramType::edge_markers`],
+ * which are the single source of truth both `Store`'s validators and
+ * `mesa diagram types` read.
  */
 export type DiagramType = "storyboard" | "flowchart" | "erd" | "brainstorm";

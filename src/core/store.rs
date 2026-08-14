@@ -6,9 +6,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
-    AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, Frame, FrameEdge,
-    FrameShape, InboxItem, InboxKind, Priority, Project, Script, ScriptArg, ScriptArgKind, Status,
-    Task, TaskEvent, Waypoint, task_name,
+    AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, EdgeMarker, EdgeStyle,
+    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, Priority, Project, Script, ScriptArg,
+    ScriptArgKind, Status, Task, TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -514,6 +514,14 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE diagram_events RENAME COLUMN storyboard_id TO diagram_id;
      UPDATE diagram_events SET action = 'diagram_created' WHERE action = 'storyboard_created';
      UPDATE diagram_events SET action = 'diagram_edited'  WHERE action = 'storyboard_edited';",
+    // Task 854: a connector carries professional properties — a line style and
+    // a marker per endpoint. All three nullable, and NULL *is* today's
+    // rendering (solid line, nothing at the start, a closed arrowhead at the
+    // `to` end), so every edge that predates this migration draws
+    // byte-identically. Additive; nothing else changes.
+    "ALTER TABLE frame_edges ADD COLUMN style TEXT;
+     ALTER TABLE frame_edges ADD COLUMN from_marker TEXT;
+     ALTER TABLE frame_edges ADD COLUMN to_marker TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -619,7 +627,8 @@ const DIAGRAM_COLUMNS: &str =
     "id, project_id, title, description, author, diagram_type, created_at, updated_at";
 const FRAME_COLUMNS: &str = "id, diagram_id, title, body, x, y, w, h, color, task_id, author, \
      shape, created_at, updated_at";
-const EDGE_COLUMNS: &str = "id, diagram_id, from_frame, to_frame, label, author, created_at, waypoints, from_anchor, to_anchor";
+const EDGE_COLUMNS: &str = "id, diagram_id, from_frame, to_frame, label, author, created_at, \
+     waypoints, from_anchor, to_anchor, style, from_marker, to_marker";
 const DIAGRAM_EVENT_COLUMNS: &str = "id, diagram_id, actor, action, summary, at";
 /// The item's own columns plus the two the origin task contributes: its
 /// description (the `task_name` is derived from it on every read, never stored)
@@ -806,24 +815,15 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
     })
 }
 
-/// Validates a frame's `shape` against its board's `diagram_type` shape set:
-/// `storyboard` boards take no shape, `flowchart` boards take
-/// `process`/`decision`/`start_end`, `erd` boards take only `entity`, and
-/// `brainstorm` boards take `central`/`idea`.
+/// Validates a frame's `shape` against its board's `diagram_type` shape set —
+/// `DiagramType::shapes` plus `allows_generic_frame` for the `None` card, the
+/// same pair `mesa diagram types` prints, so the validator and the discovery
+/// command cannot answer differently.
 fn validate_frame_shape(diagram_type: DiagramType, shape: Option<FrameShape>) -> Result<()> {
-    let ok = matches!(
-        (diagram_type, shape),
-        (DiagramType::Storyboard, None)
-            | (
-                DiagramType::Flowchart,
-                Some(FrameShape::Process | FrameShape::Decision | FrameShape::StartEnd),
-            )
-            | (DiagramType::Erd, Some(FrameShape::Entity))
-            | (
-                DiagramType::Brainstorm,
-                Some(FrameShape::Central | FrameShape::Idea),
-            )
-    );
+    let ok = match shape {
+        None => diagram_type.allows_generic_frame(),
+        Some(shape) => diagram_type.shapes().contains(&shape),
+    };
     if ok {
         Ok(())
     } else {
@@ -835,6 +835,30 @@ fn validate_frame_shape(diagram_type: DiagramType, shape: Option<FrameShape>) ->
     }
 }
 
+/// Validates an edge's endpoint markers against its board's `diagram_type`
+/// marker set (`DiagramType::edge_markers`, again the list `mesa diagram
+/// types` prints). The general family draws on any board; the cardinality
+/// family states an ERD relation's multiplicity and is `erd`-only. `None` —
+/// the default rendering — is always valid, as is any `style`: a dashed line
+/// means the same weakening on every board type, so `EdgeStyle` has no
+/// per-type check at all.
+fn validate_edge_markers(
+    diagram_type: DiagramType,
+    from_marker: Option<EdgeMarker>,
+    to_marker: Option<EdgeMarker>,
+) -> Result<()> {
+    for marker in [from_marker, to_marker].into_iter().flatten() {
+        if !diagram_type.edge_markers().contains(&marker) {
+            return Err(Error::Validation(format!(
+                "marker '{}' is not valid for a {} board",
+                marker.as_str(),
+                diagram_type.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
     let waypoints_json: Option<String> = row.get(7)?;
     let waypoints = waypoints_json
@@ -844,6 +868,9 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
         .unwrap_or_default();
     let from_anchor: Option<String> = row.get(8)?;
     let to_anchor: Option<String> = row.get(9)?;
+    let style: Option<String> = row.get(10)?;
+    let from_marker: Option<String> = row.get(11)?;
+    let to_marker: Option<String> = row.get(12)?;
     Ok(FrameEdge {
         id: row.get(0)?,
         diagram_id: row.get(1)?,
@@ -859,6 +886,15 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameEdge> {
         to_anchor: to_anchor
             .as_deref()
             .map(|s| AnchorSide::parse(s).expect("invalid anchor in db")),
+        style: style
+            .as_deref()
+            .map(|s| EdgeStyle::parse(s).expect("invalid edge style in db")),
+        from_marker: from_marker
+            .as_deref()
+            .map(|s| EdgeMarker::parse(s).expect("invalid edge marker in db")),
+        to_marker: to_marker
+            .as_deref()
+            .map(|s| EdgeMarker::parse(s).expect("invalid edge marker in db")),
     })
 }
 
@@ -927,6 +963,40 @@ fn anchor_state_str(side: Option<AnchorSide>) -> &'static str {
         Some(s) => s.as_str(),
         None => "unlocked",
     }
+}
+
+/// Describes a style/marker change to `edge` relative to `current` for the
+/// `edge_restyled` diagram event (mesa task 854). Only called once at least
+/// one of the three differs, and names only the parts that actually changed —
+/// `default` for a cleared one, mirroring `anchor_summary`'s `unlocked`.
+fn restyle_summary(edge: &FrameEdge, current: &FrameEdge) -> String {
+    let mut changed: Vec<String> = Vec::new();
+    if edge.style != current.style {
+        changed.push(format!(
+            "style: {}",
+            edge.style.map(EdgeStyle::as_str).unwrap_or("default")
+        ));
+    }
+    if edge.from_marker != current.from_marker {
+        changed.push(format!(
+            "from-marker: {}",
+            edge.from_marker
+                .map(EdgeMarker::as_str)
+                .unwrap_or("default")
+        ));
+    }
+    if edge.to_marker != current.to_marker {
+        changed.push(format!(
+            "to-marker: {}",
+            edge.to_marker.map(EdgeMarker::as_str).unwrap_or("default")
+        ));
+    }
+    format!(
+        "restyled edge #{} \u{2192} #{} ({})",
+        edge.from_frame,
+        edge.to_frame,
+        changed.join(", ")
+    )
 }
 
 /// Reads a diagram's frames, ordered by id. Operates on any `Connection`
@@ -1081,9 +1151,33 @@ pub struct FramePatch {
     pub task_id: Option<Option<i64>>,
 }
 
-/// Fields to change on an edge; `None` means leave unchanged. Only the label,
-/// waypoints, and anchor locks are mutable — endpoints and author are fixed
-/// at creation.
+/// A new edge to add to a diagram. The endpoints must be two distinct frames
+/// of that board; `from_marker`/`to_marker`, if given, must be members of the
+/// board's `diagram_type` marker set (validated by `Store::create_edge`).
+/// Mirrors `FrameNew` — a struct rather than a longer argument list, since an
+/// edge now carries as many optional properties as a frame does.
+#[derive(Debug, Default, Clone)]
+pub struct EdgeNew {
+    pub from_frame: i64,
+    pub to_frame: i64,
+    pub label: Option<String>,
+    pub author: Option<String>,
+    /// `None` is today's rendering (solid).
+    pub style: Option<EdgeStyle>,
+    /// `None` is today's rendering (nothing at the start).
+    pub from_marker: Option<EdgeMarker>,
+    /// `None` is today's rendering (a closed arrowhead).
+    pub to_marker: Option<EdgeMarker>,
+}
+
+/// Fields to change on an edge; `None` means leave unchanged. Endpoints and
+/// author are fixed at creation; everything else — label, waypoints, anchor
+/// locks, and the task 854 style/markers — is mutable. Style and markers are
+/// deliberately *not* immutable the way `Frame::shape`/`Diagram::diagram_type`
+/// are: re-shaping a frame would move it into another type system, whereas
+/// restyling a connector only changes how the same relation is drawn, and
+/// `validate_edge_markers` re-runs on every patch so a marker can never land
+/// on a board type that rejects it.
 #[derive(Debug, Default, Clone)]
 pub struct EdgePatch {
     /// `Some(None)` clears the label.
@@ -1097,6 +1191,14 @@ pub struct EdgePatch {
     pub from_anchor: Option<Option<AnchorSide>>,
     /// Same three-state contract as `from_anchor`, independent per endpoint.
     pub to_anchor: Option<Option<AnchorSide>>,
+    /// `Some(None)` clears back to the default (solid); `Some(Some(style))`
+    /// sets it; `None` leaves it untouched — `from_anchor`'s three-state
+    /// contract exactly.
+    pub style: Option<Option<EdgeStyle>>,
+    /// Same three-state contract, for the `from_frame` end's decoration.
+    pub from_marker: Option<Option<EdgeMarker>>,
+    /// Same three-state contract, for the `to_frame` end's decoration.
+    pub to_marker: Option<Option<EdgeMarker>>,
 }
 
 /// Result of `next_task`: either the single actionable task, or — when none is
@@ -2818,23 +2920,27 @@ impl Store {
 
     /// Connects two frames of the same diagram with a directed edge. Rejects
     /// an unknown board, a self-edge, or an endpoint that is not a frame of this
-    /// board — all validation errors. Cycles are allowed.
-    pub fn create_edge(
-        &mut self,
-        diagram_id: i64,
-        from_frame: i64,
-        to_frame: i64,
-        label: Option<&str>,
-        author: Option<&str>,
-    ) -> Result<FrameEdge> {
-        let diagram_exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM diagrams WHERE id = ?1)",
-            [diagram_id],
-            |r| r.get(0),
-        )?;
-        if !diagram_exists {
+    /// board — all validation errors. Cycles are allowed. `new.from_marker`/
+    /// `new.to_marker`, if given, must be members of the board's
+    /// `diagram_type` marker set (the cardinality family is `erd`-only); a
+    /// mismatch is a validation error. `new.style` needs no check — every
+    /// style is valid on every board type.
+    pub fn create_edge(&mut self, diagram_id: i64, new: &EdgeNew) -> Result<FrameEdge> {
+        // The board's own type, read by the existence check itself rather than
+        // a second query: the marker rule needs it.
+        let diagram_type: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT diagram_type FROM diagrams WHERE id = ?1",
+                [diagram_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(diagram_type) = diagram_type else {
             return Err(Error::Validation(format!("diagram {diagram_id} not found")));
-        }
+        };
+        let diagram_type = DiagramType::parse(&diagram_type).expect("invalid diagram type in db");
+        let (from_frame, to_frame) = (new.from_frame, new.to_frame);
         if from_frame == to_frame {
             return Err(Error::Validation(format!(
                 "frame {from_frame} cannot connect to itself"
@@ -2842,7 +2948,8 @@ impl Store {
         }
         self.check_frame_in_diagram(from_frame, diagram_id, "from")?;
         self.check_frame_in_diagram(to_frame, diagram_id, "to")?;
-        let summary = match label {
+        validate_edge_markers(diagram_type, new.from_marker, new.to_marker)?;
+        let summary = match new.label.as_deref() {
             Some(l) if !l.is_empty() => {
                 format!("connected #{from_frame} \u{2192} #{to_frame} ({l})")
             }
@@ -2851,12 +2958,28 @@ impl Store {
         let id = {
             let tx = self.conn.transaction()?;
             tx.execute(
-                "INSERT INTO frame_edges (diagram_id, from_frame, to_frame, label, author, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-                (diagram_id, from_frame, to_frame, label, author),
+                "INSERT INTO frame_edges \
+                 (diagram_id, from_frame, to_frame, label, author, style, from_marker, to_marker, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
+                rusqlite::params![
+                    diagram_id,
+                    from_frame,
+                    to_frame,
+                    new.label,
+                    new.author,
+                    new.style.map(EdgeStyle::as_str),
+                    new.from_marker.map(EdgeMarker::as_str),
+                    new.to_marker.map(EdgeMarker::as_str),
+                ],
             )?;
             let id = tx.last_insert_rowid();
-            insert_diagram_event(&tx, diagram_id, author, "edge_added", &summary)?;
+            insert_diagram_event(
+                &tx,
+                diagram_id,
+                new.author.as_deref(),
+                "edge_added",
+                &summary,
+            )?;
             tx.commit()?;
             id
         };
@@ -2898,26 +3021,56 @@ impl Store {
         if let Some(to_anchor) = &patch.to_anchor {
             edge.to_anchor = *to_anchor;
         }
+        if let Some(style) = &patch.style {
+            edge.style = *style;
+        }
+        if let Some(from_marker) = &patch.from_marker {
+            edge.from_marker = *from_marker;
+        }
+        if let Some(to_marker) = &patch.to_marker {
+            edge.to_marker = *to_marker;
+        }
         // No-op patch: change nothing and log nothing.
         if edge == current {
             return Ok(current);
         }
+        // The board's type is only needed to judge markers, so it is only read
+        // when a marker is actually being set — a label or waypoint patch
+        // still costs exactly the queries it did before.
+        if patch.from_marker.is_some() || patch.to_marker.is_some() {
+            let diagram = self.get_diagram(edge.diagram_id)?;
+            validate_edge_markers(diagram.diagram_type, edge.from_marker, edge.to_marker)?;
+        }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE frame_edges SET label = ?1, waypoints = ?2, from_anchor = ?3, to_anchor = ?4 \
-             WHERE id = ?5",
-            (
+            "UPDATE frame_edges SET label = ?1, waypoints = ?2, from_anchor = ?3, to_anchor = ?4, \
+             style = ?5, from_marker = ?6, to_marker = ?7 \
+             WHERE id = ?8",
+            rusqlite::params![
                 &edge.label,
                 serde_json::to_string(&edge.waypoints).unwrap(),
                 edge.from_anchor.map(|a| a.as_str()),
                 edge.to_anchor.map(|a| a.as_str()),
+                edge.style.map(EdgeStyle::as_str),
+                edge.from_marker.map(EdgeMarker::as_str),
+                edge.to_marker.map(EdgeMarker::as_str),
                 id,
-            ),
+            ],
         )?;
         let anchor_changed =
             edge.from_anchor != current.from_anchor || edge.to_anchor != current.to_anchor;
+        let restyled = edge.style != current.style
+            || edge.from_marker != current.from_marker
+            || edge.to_marker != current.to_marker;
+        // One event per call, most-structural first. Anchors stay at the top
+        // (they decide where the connector attaches at all); `edge_restyled`
+        // sits next because a style or a marker changes what the connector
+        // *means* — a crow's foot states a cardinality — while a reroute or a
+        // relabel only changes how that same meaning is drawn or annotated.
         let (action, summary) = if anchor_changed {
             ("edge_anchor_changed", anchor_summary(&edge, &current))
+        } else if restyled {
+            ("edge_restyled", restyle_summary(&edge, &current))
         } else if patch.waypoints.is_some() && edge.waypoints != current.waypoints {
             (
                 "edge_rerouted",
@@ -6365,6 +6518,16 @@ mod tests {
         }
     }
 
+    /// A plain connector: no label, no author, and every task 854 property at
+    /// its default, which is the shape almost every test here wants.
+    fn edge_new(from_frame: i64, to_frame: i64) -> EdgeNew {
+        EdgeNew {
+            from_frame,
+            to_frame,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn diagram_crud_round_trip_with_view() {
         let (mut store, _dir) = temp_store();
@@ -6419,68 +6582,205 @@ mod tests {
         assert!(err.to_string().contains("999"));
     }
 
+    /// The whole matrix, driven off the value sets rather than a hand-written
+    /// copy of them: **every** (diagram_type, shape) pair, the generic `None`
+    /// card included, is created for real and its outcome checked against
+    /// `DiagramType::shapes`/`allows_generic_frame`. A shape added to a type's
+    /// set is therefore covered the moment it is listed, and a shape moved out
+    /// of one is asserted to be rejected there.
     #[test]
     fn frame_shape_must_belong_to_its_boards_diagram_type() {
         let (mut store, _dir) = temp_store();
         let p = store.create_project("p", None, None, None, None).unwrap();
-        // Each board type accepts exactly its own shape set and rejects every
-        // other one (including the generic `None` card on a typed board).
-        let sets = [
-            (
-                DiagramType::Storyboard,
-                vec![None],
-                vec![Some(FrameShape::Process), Some(FrameShape::Idea)],
-            ),
-            (
-                DiagramType::Flowchart,
-                vec![
-                    Some(FrameShape::Process),
-                    Some(FrameShape::Decision),
-                    Some(FrameShape::StartEnd),
-                ],
-                vec![None, Some(FrameShape::Entity), Some(FrameShape::Central)],
-            ),
-            (
-                DiagramType::Erd,
-                vec![Some(FrameShape::Entity)],
-                vec![None, Some(FrameShape::Process), Some(FrameShape::Idea)],
-            ),
-            (
-                DiagramType::Brainstorm,
-                vec![Some(FrameShape::Central), Some(FrameShape::Idea)],
-                vec![None, Some(FrameShape::Process), Some(FrameShape::Entity)],
-            ),
-        ];
-        for (diagram_type, valid, invalid) in sets {
+        let candidates: Vec<Option<FrameShape>> = std::iter::once(None)
+            .chain(FrameShape::ALL.iter().copied().map(Some))
+            .collect();
+        for diagram_type in DiagramType::ALL.iter().copied() {
             let sb = store
                 .create_diagram(p.id, diagram_type.as_str(), None, None, Some(diagram_type))
                 .unwrap();
-            for shape in valid {
-                let f = store
-                    .create_frame(
-                        sb.id,
-                        &FrameNew {
-                            shape,
-                            ..frame_new("ok")
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(f.shape, shape);
-            }
-            for shape in invalid {
-                let err = store
-                    .create_frame(
-                        sb.id,
-                        &FrameNew {
-                            shape,
-                            ..frame_new("bad")
-                        },
-                    )
-                    .unwrap_err();
-                assert!(matches!(err, Error::Validation(_)));
-                assert!(err.to_string().contains(diagram_type.as_str()));
+            for shape in candidates.iter().copied() {
+                let allowed = match shape {
+                    None => diagram_type.allows_generic_frame(),
+                    Some(s) => diagram_type.shapes().contains(&s),
+                };
+                let result = store.create_frame(
+                    sb.id,
+                    &FrameNew {
+                        shape,
+                        ..frame_new("f")
+                    },
+                );
+                let named = shape.map(FrameShape::as_str).unwrap_or("none");
+                if allowed {
+                    let f = result
+                        .unwrap_or_else(|e| panic!("{named} on {}: {e}", diagram_type.as_str()));
+                    assert_eq!(f.shape, shape);
+                } else {
+                    let err = result.err().unwrap_or_else(|| {
+                        panic!("{named} must not be legal on a {}", diagram_type.as_str())
+                    });
+                    assert!(matches!(err, Error::Validation(_)));
+                    assert!(err.to_string().contains(diagram_type.as_str()));
+                    assert!(err.to_string().contains(named));
+                }
             }
         }
+    }
+
+    /// The marker twin of the shape matrix: every marker against every board
+    /// type, on both `create_edge` and `update_edge`, checked against
+    /// `DiagramType::edge_markers` — which is what makes the cardinality
+    /// family `erd`-only in one place rather than two.
+    #[test]
+    fn edge_markers_must_belong_to_its_boards_diagram_type() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        for diagram_type in DiagramType::ALL.iter().copied() {
+            let sb = store
+                .create_diagram(p.id, diagram_type.as_str(), None, None, Some(diagram_type))
+                .unwrap();
+            let shape = diagram_type.shapes().first().copied();
+            let a = store
+                .create_frame(
+                    sb.id,
+                    &FrameNew {
+                        shape,
+                        ..frame_new("a")
+                    },
+                )
+                .unwrap();
+            let b = store
+                .create_frame(
+                    sb.id,
+                    &FrameNew {
+                        shape,
+                        ..frame_new("b")
+                    },
+                )
+                .unwrap();
+            let plain = store.create_edge(sb.id, &edge_new(a.id, b.id)).unwrap();
+            for marker in EdgeMarker::ALL.iter().copied() {
+                let allowed = diagram_type.edge_markers().contains(&marker);
+                let created = store.create_edge(
+                    sb.id,
+                    &EdgeNew {
+                        to_marker: Some(marker),
+                        ..edge_new(a.id, b.id)
+                    },
+                );
+                let patched = store.update_edge(
+                    plain.id,
+                    &EdgePatch {
+                        from_marker: Some(Some(marker)),
+                        ..Default::default()
+                    },
+                    None,
+                );
+                if allowed {
+                    assert_eq!(created.unwrap().to_marker, Some(marker));
+                    assert_eq!(patched.unwrap().from_marker, Some(marker));
+                } else {
+                    for err in [created.unwrap_err(), patched.unwrap_err()] {
+                        assert!(matches!(err, Error::Validation(_)));
+                        assert_eq!(
+                            err.to_string(),
+                            format!(
+                                "marker '{}' is not valid for a {} board",
+                                marker.as_str(),
+                                diagram_type.as_str()
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Style/markers are mutable (unlike `shape`), with `from_anchor`'s
+    /// three-state patch contract, and a change that lands logs exactly one
+    /// `edge_restyled` event.
+    #[test]
+    fn edge_style_and_markers_are_patchable_and_log_one_restyle_event() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
+        let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
+        let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
+        let e = store
+            .create_edge(
+                sb.id,
+                &EdgeNew {
+                    style: Some(EdgeStyle::Dashed),
+                    ..edge_new(a.id, b.id)
+                },
+            )
+            .unwrap();
+        assert_eq!(e.style, Some(EdgeStyle::Dashed));
+        assert_eq!(e.from_marker, None);
+
+        // Omitted leaves it alone; the marker set lands.
+        let e = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    to_marker: Some(Some(EdgeMarker::HollowArrow)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(e.style, Some(EdgeStyle::Dashed));
+        assert_eq!(e.to_marker, Some(EdgeMarker::HollowArrow));
+
+        // Re-asserting what is already stored is a no-op: no event.
+        let before = store.list_diagram_events(sb.id).unwrap().len();
+        store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    style: Some(Some(EdgeStyle::Dashed)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(store.list_diagram_events(sb.id).unwrap().len(), before);
+
+        // Explicit `None` clears back to the default, and logs one event.
+        let e = store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    style: Some(None),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        assert_eq!(e.style, None);
+        let events = store.list_diagram_events(sb.id).unwrap();
+        assert_eq!(events.len(), before + 1);
+        let last = events.last().unwrap();
+        assert_eq!(last.action, "edge_restyled");
+        assert!(last.summary.contains("style: default"), "{}", last.summary);
+
+        // An anchor change in the same call outranks the restyle: one event.
+        let before = events.len();
+        store
+            .update_edge(
+                e.id,
+                &EdgePatch {
+                    from_anchor: Some(Some(AnchorSide::Top)),
+                    to_marker: Some(Some(EdgeMarker::Circle)),
+                    ..Default::default()
+                },
+                Some("user"),
+            )
+            .unwrap();
+        let events = store.list_diagram_events(sb.id).unwrap();
+        assert_eq!(events.len(), before + 1);
+        assert_eq!(events.last().unwrap().action, "edge_anchor_changed");
     }
 
     #[test]
@@ -6532,6 +6832,59 @@ mod tests {
         let view = store.get_diagram_view(boards[0].id).unwrap();
         assert_eq!(view.frames.len(), 1);
         assert_eq!(view.frames[0].shape, None);
+    }
+
+    #[test]
+    fn migration_leaves_style_and_markers_null_on_pre_854_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-854.db");
+        // Index 42 — migration 43 — pinned, NOT `MIGRATIONS.len() - 1`: the
+        // positional form silently re-aims at whatever ships next (see
+        // `CURSOR_RESET` above). The db is built from everything *before* it.
+        const EDGE_STYLE: usize = 42;
+        assert!(
+            MIGRATIONS[EDGE_STYLE].contains("ADD COLUMN from_marker"),
+            "migration {EDGE_STYLE} is no longer the edge style/marker migration — \
+             a shipped migration was edited or reordered, which is never allowed"
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..EDGE_STYLE] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", EDGE_STYLE as i64)
+                .unwrap();
+            conn.execute("INSERT INTO projects (name) VALUES ('kept')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO diagrams (project_id, title, author, created_at, updated_at) \
+                 VALUES (1, 'pre-feature board', NULL, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            for title in ["a", "b"] {
+                conn.execute(
+                    "INSERT INTO frames (diagram_id, title, x, y, w, h, created_at, updated_at) \
+                     VALUES (1, ?1, 0, 0, 240, 140, datetime('now'), datetime('now'))",
+                    [title],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO frame_edges (diagram_id, from_frame, to_frame, created_at) \
+                 VALUES (1, 1, 2, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        // Every pre-feature edge reads back at the default rendering — the
+        // whole point of the three columns being nullable.
+        let store = Store::open(&path).unwrap();
+        let edges = store.get_diagram_view(1).unwrap().edges;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].style, None);
+        assert_eq!(edges[0].from_marker, None);
+        assert_eq!(edges[0].to_marker, None);
     }
 
     #[test]
@@ -6676,29 +7029,34 @@ mod tests {
         let foreign = store.create_frame(other.id, &frame_new("foreign")).unwrap();
 
         // self-edge rejected
-        let err = store
-            .create_edge(sb.id, a.id, a.id, None, None)
-            .unwrap_err();
+        let err = store.create_edge(sb.id, &edge_new(a.id, a.id)).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
         // endpoint not on this board rejected
         let err = store
-            .create_edge(sb.id, a.id, foreign.id, None, None)
+            .create_edge(sb.id, &edge_new(a.id, foreign.id))
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
         // unknown diagram rejected
-        let err = store.create_edge(999, a.id, b.id, None, None).unwrap_err();
+        let err = store.create_edge(999, &edge_new(a.id, b.id)).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
         // valid edge, and the reverse edge too: cycles are allowed
         let e1 = store
-            .create_edge(sb.id, a.id, b.id, Some("then"), Some("user"))
+            .create_edge(
+                sb.id,
+                &EdgeNew {
+                    label: Some("then".into()),
+                    author: Some("user".into()),
+                    ..edge_new(a.id, b.id)
+                },
+            )
             .unwrap();
         assert_eq!(e1.from_frame, a.id);
         assert_eq!(e1.to_frame, b.id);
         assert_eq!(e1.label.as_deref(), Some("then"));
-        let e2 = store.create_edge(sb.id, b.id, a.id, None, None).unwrap();
+        let e2 = store.create_edge(sb.id, &edge_new(b.id, a.id)).unwrap();
 
         let view = store.get_diagram_view(sb.id).unwrap();
         assert_eq!(view.edges.len(), 2);
@@ -6741,9 +7099,9 @@ mod tests {
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let c = store.create_frame(sb.id, &frame_new("c")).unwrap();
-        let e_ab = store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
-        let e_ba = store.create_edge(sb.id, b.id, a.id, None, None).unwrap();
-        let e_bc = store.create_edge(sb.id, b.id, c.id, None, None).unwrap();
+        let e_ab = store.create_edge(sb.id, &edge_new(a.id, b.id)).unwrap();
+        let e_ba = store.create_edge(sb.id, &edge_new(b.id, a.id)).unwrap();
+        let e_bc = store.create_edge(sb.id, &edge_new(b.id, c.id)).unwrap();
 
         // deleting b removes the two edges touching it, not e? none other; a-c has none
         let (deleted, edges) = store.delete_frame(b.id, None).unwrap();
@@ -6764,7 +7122,7 @@ mod tests {
         let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
-        store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
+        store.create_edge(sb.id, &edge_new(a.id, b.id)).unwrap();
 
         let view = store.delete_diagram(sb.id).unwrap();
         assert_eq!(view.frames.len(), 2);
@@ -6783,7 +7141,7 @@ mod tests {
         let sb = store.create_diagram(p.id, "b", None, None, None).unwrap();
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
-        store.create_edge(sb.id, a.id, b.id, None, None).unwrap();
+        store.create_edge(sb.id, &edge_new(a.id, b.id)).unwrap();
 
         store.delete_project(p.id).unwrap();
         assert!(matches!(store.get_diagram(sb.id), Err(Error::NotFound(_))));
@@ -6809,7 +7167,14 @@ mod tests {
             .unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let e = store
-            .create_edge(sb.id, a.id, b.id, Some("then"), Some("user"))
+            .create_edge(
+                sb.id,
+                &EdgeNew {
+                    label: Some("then".into()),
+                    author: Some("user".into()),
+                    ..edge_new(a.id, b.id)
+                },
+            )
             .unwrap();
 
         // a move (geometry only) vs an edit (a field change)
@@ -6919,7 +7284,13 @@ mod tests {
         let f = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let g = store.create_frame(sb.id, &frame_new("g")).unwrap();
         let e = store
-            .create_edge(sb.id, f.id, g.id, Some("lbl"), None)
+            .create_edge(
+                sb.id,
+                &EdgeNew {
+                    label: Some("lbl".into()),
+                    ..edge_new(f.id, g.id)
+                },
+            )
             .unwrap();
         let before = store.list_diagram_events(sb.id).unwrap().len();
         let frame_updated_at = store.get_frame(f.id).unwrap().updated_at;
@@ -6982,7 +7353,13 @@ mod tests {
         let a = store.create_frame(sb.id, &frame_new("a")).unwrap();
         let b = store.create_frame(sb.id, &frame_new("b")).unwrap();
         let e = store
-            .create_edge(sb.id, a.id, b.id, Some("lbl"), None)
+            .create_edge(
+                sb.id,
+                &EdgeNew {
+                    label: Some("lbl".into()),
+                    ..edge_new(a.id, b.id)
+                },
+            )
             .unwrap();
         assert_eq!(e.from_anchor, None);
         assert_eq!(e.to_anchor, None);

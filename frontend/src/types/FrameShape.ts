@@ -6,6 +6,13 @@
  * reason: a board should never hold a shape from the "wrong" type system).
  * `None` on `Frame.shape` means the generic card, valid only on a
  * `storyboard`-type board; `Store::create_frame` validates a given shape
- * against the parent board's `DiagramType`.
+ * against the parent board's `DiagramType` (see [`DiagramType::shapes`],
+ * which is the shape set itself).
+ *
+ * The tail of this list is mesa task 854's professional-tool-grade widening:
+ * the flowchart set gained the four ANSI process-chart shapes, the ERD set
+ * the three Chen shapes beside `entity`, and `storyboard`/`brainstorm` gained
+ * the shapes their boards were writing as bare cards. Widening only — every
+ * shape that was legal on a board type before is still legal on it.
  */
-export type FrameShape = "process" | "decision" | "start_end" | "entity" | "central" | "idea";
+export type FrameShape = "process" | "decision" | "start_end" | "entity" | "central" | "idea" | "scene" | "note" | "data" | "document" | "database" | "predefined_process" | "weak_entity" | "relationship" | "attribute";

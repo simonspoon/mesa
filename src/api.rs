@@ -39,12 +39,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
-    EdgePatch, Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile,
-    GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, MesaVersion,
-    ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
-    ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch,
-    Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git,
-    hooks, scripts, speech, version,
+    EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
+    FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
+    InboxItem, InboxKind, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents,
+    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
+    Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
+    attachments, config, files, git, hooks, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -1739,6 +1739,19 @@ struct EdgeCreate {
     label: Option<String>,
     #[serde(default)]
     author: Option<String>,
+    /// Missing/`null` is the default rendering (solid); an unknown literal
+    /// fails to deserialize -> the existing 422 `validation` path.
+    #[serde(default)]
+    style: Option<EdgeStyle>,
+    /// Missing/`null` is the default rendering (nothing at the start). A
+    /// syntactically valid but wrong-for-board-type marker is the `Store`
+    /// `validation` error instead.
+    #[serde(default)]
+    from_marker: Option<EdgeMarker>,
+    /// Missing/`null` is the default rendering (a closed arrowhead). Same
+    /// contract as `from_marker`.
+    #[serde(default)]
+    to_marker: Option<EdgeMarker>,
 }
 
 #[derive(Deserialize)]
@@ -1751,6 +1764,17 @@ struct EdgeUpdate {
     from_anchor: Option<Option<AnchorSide>>,
     #[serde(default, deserialize_with = "double_option")]
     to_anchor: Option<Option<AnchorSide>>,
+    /// Omitted leaves the style untouched, explicit `null` clears it back to
+    /// the default (solid), a literal sets it — `from_anchor`'s three-state
+    /// contract exactly.
+    #[serde(default, deserialize_with = "double_option")]
+    style: Option<Option<EdgeStyle>>,
+    /// Same three-state contract, for the `from_frame` end's decoration.
+    #[serde(default, deserialize_with = "double_option")]
+    from_marker: Option<Option<EdgeMarker>>,
+    /// Same three-state contract, for the `to_frame` end's decoration.
+    #[serde(default, deserialize_with = "double_option")]
+    to_marker: Option<Option<EdgeMarker>>,
     /// Recorded as the change author.
     #[serde(default)]
     author: Option<String>,
@@ -1874,13 +1898,16 @@ async fn create_edge(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    let edge = store.create_edge(
-        diagram_id,
-        body.from_frame,
-        body.to_frame,
-        body.label.as_deref(),
-        body.author.as_deref(),
-    )?;
+    let new = EdgeNew {
+        from_frame: body.from_frame,
+        to_frame: body.to_frame,
+        label: body.label,
+        author: body.author,
+        style: body.style,
+        from_marker: body.from_marker,
+        to_marker: body.to_marker,
+    };
+    let edge = store.create_edge(diagram_id, &new)?;
     Ok((StatusCode::CREATED, Json(edge)).into_response())
 }
 
@@ -1900,6 +1927,9 @@ async fn update_edge(
         waypoints: body.waypoints,
         from_anchor: body.from_anchor,
         to_anchor: body.to_anchor,
+        style: body.style,
+        from_marker: body.from_marker,
+        to_marker: body.to_marker,
     };
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.update_edge(id, &patch, body.author.as_deref())?).into_response())

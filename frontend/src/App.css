@@ -1378,17 +1378,27 @@ main {
   background: rgba(6, 10, 16, 0.85);
 }
 
-/* Add-frame shape picker (flowchart/erd boards only — story 360): one button
-   per valid shape, stacked like the rest of .canvas-controls's children. */
+/* Add-frame shape picker (story 360; every board type since mesa task 854, a
+   storyboard board's first button being the generic "add frame" card): one
+   button per valid shape, stacked like the rest of .canvas-controls's
+   children. A flowchart board offers 7 of them, which as a single stacked
+   column ran the toolbar past 600px down the canvas and covered the frames
+   underneath it (mesa task 854 QA) — so the picker **wraps** instead: buttons
+   size to their label and flow into rows inside the panel's own width, which
+   caps the cluster at a few short rows however many shapes a board type
+   gains. */
 .add-frame-picker {
   display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
+  flex-wrap: wrap;
+  gap: 0.25rem;
 }
 
 .add-frame-picker button {
-  width: 100%;
+  width: auto;
+  flex: 0 0 auto;
   background: rgba(6, 10, 16, 0.85);
+  padding: 0.1rem 0.3rem;
+  font-size: 0.66rem;
 }
 
 .canvas-hint,
@@ -1545,14 +1555,37 @@ main {
      pointer events — the renderer layer has them off. */
   position: absolute;
   pointer-events: all;
+  /* A column of one row (the label + its controls), plus the properties
+     popover below it when open — see `.edge-props`. */
   display: inline-flex;
+  flex-direction: column;
   gap: 0.25rem;
-  align-items: center;
+  align-items: stretch;
   background: var(--panel-raised);
   border: 1px solid var(--border);
   padding: 0 0.2rem;
   font-size: 0.75rem;
   white-space: nowrap;
+}
+
+/* While the properties block is open the whole cluster has to paint above the
+   nodes (mesa task 854 QA: a frame's card covered the open block). `z-index`
+   has to go **here**, not on the block: `.edge-label` carries the
+   EdgeLabelRenderer positioning transform, which makes it a stacking context,
+   so a z-index on any child only sorts inside it — the cluster's own painting
+   order against React Flow's node layer is decided by this element alone.
+   React Flow gives a node `z-index: 0` (1000 while dragging/elevated), so this
+   clears both. Only while open: a plain label must keep sitting under the
+   cards, as it always has. */
+.edge-label.open {
+  z-index: 1001;
+}
+
+/* The label's own row: the inline-editable text plus the ⋮/✕ controls. */
+.edge-label-row {
+  display: flex;
+  gap: 0.25rem;
+  align-items: center;
 }
 
 /* Inline-editable connector label: render compactly, no block wrapper. */
@@ -1575,9 +1608,80 @@ main {
   visibility: hidden;
 }
 
+/* Connector-properties toggle (mesa task 854), same restraint as the delete
+   control beside it: revealed on hover/focus, plus held visible while its own
+   popover is open (`.open`) so the button the popover hangs off doesn't vanish
+   under the pointer that opened it. */
+.edge-props-toggle {
+  padding: 0 0.3rem;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  visibility: hidden;
+}
+
 .edge-label:hover .edge-del,
-.edge-label:focus-within .edge-del {
+.edge-label:focus-within .edge-del,
+.edge-label.open .edge-del,
+.edge-label:hover .edge-props-toggle,
+.edge-label:focus-within .edge-props-toggle,
+.edge-label.open .edge-props-toggle {
   visibility: visible;
+}
+
+/* The popover itself: line style + both end markers, opening under the label
+   cluster it belongs to (the edge's one selected affordance) rather than in a
+   panel of its own.
+
+   It is a **flow child** of `.edge-label`, deliberately not an absolutely
+   positioned overlay: as an overlay it laid out at the right coordinates but
+   painted nothing at all (mesa task 854 QA). `.edge-label` is an
+   EdgeLabelRenderer child inside React Flow's transformed viewport, and it is
+   centred on the connector midpoint by its own `translate(-50%, -50%)` — so a
+   panel hanging *below* that box escapes into a layer this canvas does not
+   own and, near the bottom of the board, straight through
+   `.diagram-viewport`'s `overflow: hidden`. In flow it is part of the one box
+   that is already known to paint, and the label's centring transform
+   re-centres the taller cluster on the connector, which keeps it on screen. */
+.edge-props {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.35rem 0.4rem;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.45);
+}
+
+.edge-props label {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.7rem;
+}
+
+/* The row's name is a fixed column rather than a bare text node: as a flex
+   item that could shrink it lost against the select beside it and rendered as
+   nothing at all on the widest row (mesa task 854 QA — `line` vanished while
+   `start`/`end` still read). */
+.edge-props-name {
+  flex: 0 0 2.4rem;
+}
+
+.edge-props select {
+  flex: 1 1 auto;
+  min-width: 7rem;
+  font-size: 0.7rem;
+  padding: 0.1rem 0.3rem;
+}
+
+/* Endpoint marker definitions (mesa task 854): a zero-size carrier SVG whose
+   `<marker>`s every connector references by `url(#id)`. Never painted itself —
+   it only has to be in the document. */
+.edge-marker-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
 }
 
 /* Empty connector label (#17): show nothing on the line by default so blank
@@ -1592,12 +1696,14 @@ main {
   opacity: 0;
 }
 .edge-label.empty:hover,
-.edge-label.empty:focus-within {
+.edge-label.empty:focus-within,
+.edge-label.empty.open {
   background: var(--panel-raised);
   border-color: var(--border);
 }
 .edge-label.empty:hover .edge-label-text,
-.edge-label.empty:focus-within .edge-label-text {
+.edge-label.empty:focus-within .edge-label-text,
+.edge-label.empty.open .edge-label-text {
   opacity: 1;
 }
 
@@ -1794,6 +1900,218 @@ main {
   clip-path: none;
   border-radius: 12px;
   border-color: var(--green);
+}
+
+/* ---- mesa task 854's shapes ----------------------------------------------
+   Nine more silhouettes, under one hard rule learned from `.frame-decision`
+   and `.frame-central`: a silhouette that would eat the header (the title's
+   leading letter and the `#id` badge both sit in the top corners) is drawn as
+   an *oversized `::before` backdrop* behind an unclipped card — never as a
+   `clip-path` or a large radius on the card itself. Content is never clipped.
+
+   Two groups follow. The first three shapes only decorate the card's own box
+   (a band, a double border, an extra rule), so they need no backdrop; the six
+   below them are true silhouettes and all share the backdrop treatment. */
+
+/* Storyboard "scene": the card a storyboard is made of. A film-strip band
+   along the bottom is enough to say "a shot" — the card keeps its own
+   background and border, and the band is inset (not a clip), so nothing can
+   be cut off. The matching padding keeps the foot line off the band. */
+.frame.frame-scene {
+  position: relative;
+  clip-path: none;
+  border-radius: 4px;
+  border-color: var(--cyan-dim);
+  padding-bottom: 8px;
+}
+.frame.frame-scene::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 8px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--cyan-dim) 0 6px,
+    transparent 6px 12px
+  );
+  opacity: 0.6;
+}
+
+/* ERD "weak entity": an entity whose identity depends on another. The
+   notation's double border is a `border-style: double`, i.e. still just the
+   card's own border — no silhouette change, so nothing to clip. Its body
+   reuses `.frame-entity-body` (WeakEntityNode passes entity's renderBody). */
+.frame.frame-weak-entity {
+  clip-path: none;
+  border-radius: 2px;
+  border: 4px double var(--magenta);
+}
+
+/* Flowchart "predefined process" (a call into a named subroutine): the
+   notation is a rectangle with a bar inset down each side. `border-style:
+   double` on just the two sides draws exactly that pair of rules, and the
+   header padding clears them so the title never sits on one. */
+.frame.frame-predefined-process {
+  clip-path: none;
+  border-radius: 2px;
+  border: 1px solid var(--cyan-dim);
+  border-left: 5px double var(--cyan);
+  border-right: 5px double var(--cyan);
+}
+.frame.frame-predefined-process .frame-header {
+  padding-left: 0.6rem;
+  padding-right: 0.6rem;
+}
+
+/* --- the backdrop shapes -------------------------------------------------
+   Same construction as `.frame-decision`: the card goes fully transparent and
+   keeps its content unclipped, while an oversized `::before` (z-index -1,
+   behind the content) carries the silhouette. Each shape only differs in how
+   far the backdrop is inflated and which clip/radius it wears — inflated
+   enough, in every case, that the shaped edge falls outside the header. */
+.frame.frame-note,
+.frame.frame-data,
+.frame.frame-document,
+.frame.frame-database,
+.frame.frame-relationship,
+.frame.frame-attribute {
+  position: relative;
+  clip-path: none;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.frame.frame-note::before,
+.frame.frame-data::before,
+.frame.frame-document::before,
+.frame.frame-database::before,
+.frame.frame-relationship::before,
+.frame.frame-attribute::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  background: var(--panel-raised);
+  border: 1px solid var(--border-bright);
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+
+.frame.frame-note.selected::before,
+.frame.frame-note.editing::before,
+.frame.frame-data.selected::before,
+.frame.frame-data.editing::before,
+.frame.frame-document.selected::before,
+.frame.frame-document.editing::before,
+.frame.frame-database.selected::before,
+.frame.frame-database.editing::before,
+.frame.frame-relationship.selected::before,
+.frame.frame-relationship.editing::before,
+.frame.frame-attribute.selected::before,
+.frame.frame-attribute.editing::before {
+  border-color: var(--cyan);
+  box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+/* "Note": a folded-corner sticky (storyboard + brainstorm — commentary, in
+   neither type system). The fold is a clipped corner, which is exactly where
+   the `#id` badge lives, so the backdrop is inflated 22px to the *right*: the
+   whole fold then falls past the card's own right edge and the badge stays
+   clear of it. `::after` paints the turned-up flap over that corner (both
+   pseudo-elements sit at z-index -1, so DOM order puts the flap on top of the
+   sticky and both behind the content). */
+.frame.frame-note::before {
+  inset: -8px -26px -8px -8px;
+  background: rgba(255, 180, 68, 0.1);
+  border-color: var(--amber);
+  clip-path: polygon(0 0, calc(100% - 22px) 0, 100% 22px, 100% 100%, 0 100%);
+}
+.frame.frame-note::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  top: -8px;
+  right: -26px;
+  width: 22px;
+  height: 22px;
+  background: var(--amber);
+  opacity: 0.35;
+  clip-path: polygon(0 0, 100% 100%, 0 100%);
+}
+
+/* Flowchart "data" (ANSI input/output): a parallelogram. Inflated 22px on
+   each side so both slanted edges clear the card's content entirely. */
+.frame.frame-data::before {
+  inset: -6px -22px;
+  border-color: var(--cyan);
+  clip-path: polygon(14% 0, 100% 0, 86% 100%, 0 100%);
+}
+
+/* Flowchart "document": a rectangle whose bottom edge waves. The wave is cut
+   from the bottom 22px of an inflated backdrop, so it hangs below the card
+   rather than through the foot line. */
+.frame.frame-document::before {
+  inset: -6px -6px -24px -6px;
+  border-color: var(--cyan);
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% 84%,
+    75% 100%,
+    50% 88%,
+    25% 100%,
+    0 86%
+  );
+}
+
+/* Flowchart "database": a cylinder. The elliptical top/bottom come from an
+   asymmetric `border-radius` on the backdrop (50% horizontally, 14%
+   vertically); `::after` redraws the top ellipse as a rule so the cylinder
+   reads as one rather than as a lozenge. The backdrop's vertical inflation is
+   what keeps both curves off the header and the foot. */
+.frame.frame-database::before {
+  inset: -18px -6px;
+  border-color: var(--cyan);
+  border-radius: 50% / 14%;
+}
+.frame.frame-database::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  top: -18px;
+  left: -6px;
+  right: -6px;
+  height: 30px;
+  border: 1px solid var(--cyan);
+  border-radius: 50%;
+  background: var(--panel-raised);
+}
+
+/* ERD "relationship" (Chen): a diamond, drawn exactly the way the flowchart
+   decision diamond is — the failure that technique exists for is the same one
+   here — but magenta, with the ERD shapes. */
+.frame.frame-relationship::before {
+  inset: -35% -20%;
+  border-color: var(--magenta);
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}
+
+/* ERD "attribute" (Chen): an ellipse. The inflation is symmetric, so the oval
+   stays centred on the card; the measurement is what it has to clear (the
+   discipline `.frame-start-end`/`.frame-central` record). At -26% vertically
+   the card's top edge sat at 17% of the oval's height, where the curve is only
+   ~122px wide against the card's own 240 — i.e. exactly on the title and the
+   `#id` badge (mesa task 854 QA: the header read as sitting *on* the oval's
+   rim rather than inside it). At -50%/-30% the card's top edge falls at 25% of
+   the height, where the oval is ~360px wide against the card's 240 — the whole
+   header, badge included, clears the curve with 60px to spare on each side,
+   at the cost of a larger silhouette. */
+.frame.frame-attribute::before {
+  inset: -50% -30%;
+  border-color: var(--magenta);
+  border-radius: 50%;
 }
 
 .frame-header {
@@ -7276,4 +7594,90 @@ button:focus-visible,
    exactly the markup that used to sit here directly. */
 .project-view-drop {
   position: relative;
+}
+
+/* ── Diagram index rows (mesa task 854) ────────────────────────────────────
+   Each board on its own row: a mini-map of its saved state on the left, then
+   title / description / meta. `.card-list li` still supplies the panel, notch
+   and hover glow — only the inside of the row is new, so nothing else that
+   uses `.card-list` moves. */
+.diagram-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.diagram-row-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.diagram-row-title {
+  font-family: var(--font-display);
+  font-size: 0.9rem;
+}
+
+/* One-line clamp: a description is free text and a row is an index entry, not
+   the board. */
+.diagram-row-desc {
+  margin: 0.15rem 0 0;
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The thumbnail is a fixed box so the titles line up down the list whatever
+   each board's aspect ratio is; `diagramThumb.ts` letterboxes into it. */
+.diagram-thumb {
+  flex: none;
+  width: 128px;
+  height: 80px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.diagram-thumb rect {
+  fill: var(--panel-raised);
+  stroke: var(--border-bright);
+  stroke-width: 1;
+}
+
+.diagram-thumb line {
+  stroke: var(--cyan-dim);
+  stroke-width: 1;
+}
+
+/* Loading, failed and genuinely empty all land here — an inert box rather
+   than a broken `<svg>` or an error the page doesn't need to report. */
+.diagram-thumb-empty {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--bg),
+    var(--bg) 6px,
+    var(--panel) 6px,
+    var(--panel) 12px
+  );
+}
+
+/* Narrow tier: the row still reads side-by-side, the mini-map just gives up
+   the width the text needs (docs/mobile.md — no new matchMedia, CSS only). */
+@media (max-width: 860px) {
+  .diagram-thumb {
+    width: 88px;
+    height: 56px;
+  }
+}
+
+/* Phone: below ~90px the mini-map is a smudge, so the row stacks — thumbnail
+   full-width above the text rather than squeezed beside it. */
+@media (max-width: 600px) {
+  .diagram-row {
+    flex-direction: column;
+  }
+
+  .diagram-thumb {
+    width: 100%;
+    height: 72px;
+  }
 }

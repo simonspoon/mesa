@@ -681,11 +681,11 @@ mod task_name_tests {
 
 /// A diagram's style, chosen at creation and immutable thereafter
 /// (no field on `DiagramPatch` — the same structural-immutability posture
-/// as `project_id`/`author`). Picks the shape set offered for its frames: a
-/// `storyboard` board takes the generic frame card, a `flowchart` board takes
-/// `process`/`decision`/`start_end` node shapes, an `erd` board takes only the
-/// `entity` shape, and a `brainstorm` board takes `central`/`idea` mind-map
-/// shapes.
+/// as `project_id`/`author`). Picks the shape set offered for its frames and
+/// the connector markers its edges may carry — see [`DiagramType::shapes`],
+/// [`DiagramType::allows_generic_frame`] and [`DiagramType::edge_markers`],
+/// which are the single source of truth both `Store`'s validators and
+/// `mesa diagram types` read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -697,6 +697,15 @@ pub enum DiagramType {
 }
 
 impl DiagramType {
+    /// Every board type, in offer order. The one list a new type has to be
+    /// added to — `mesa diagram types` walks it.
+    pub const ALL: &'static [DiagramType] = &[
+        DiagramType::Storyboard,
+        DiagramType::Flowchart,
+        DiagramType::Erd,
+        DiagramType::Brainstorm,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             DiagramType::Storyboard => "storyboard",
@@ -715,6 +724,53 @@ impl DiagramType {
             _ => None,
         }
     }
+
+    /// The named shapes a board of this type accepts, in offer order (the
+    /// first entry is what the canvas mints for a quick-create gesture). The
+    /// generic card is **not** a member — it is `shape: None`, answered by
+    /// [`DiagramType::allows_generic_frame`]. `Store::validate_frame_shape`
+    /// and `mesa diagram types` both read this, so the validator and the
+    /// discovery command cannot drift apart.
+    pub fn shapes(self) -> &'static [FrameShape] {
+        match self {
+            DiagramType::Storyboard => &[FrameShape::Scene, FrameShape::Note],
+            DiagramType::Flowchart => &[
+                FrameShape::Process,
+                FrameShape::Decision,
+                FrameShape::StartEnd,
+                FrameShape::Data,
+                FrameShape::Document,
+                FrameShape::Database,
+                FrameShape::PredefinedProcess,
+            ],
+            DiagramType::Erd => &[
+                FrameShape::Entity,
+                FrameShape::WeakEntity,
+                FrameShape::Relationship,
+                FrameShape::Attribute,
+            ],
+            DiagramType::Brainstorm => &[FrameShape::Idea, FrameShape::Central, FrameShape::Note],
+        }
+    }
+
+    /// Whether a board of this type accepts the generic frame card
+    /// (`shape: None`). Only a `storyboard` board does — every pre-feature
+    /// frame reads back `shape: null`, and that must stay legal.
+    pub fn allows_generic_frame(self) -> bool {
+        matches!(self, DiagramType::Storyboard)
+    }
+
+    /// The endpoint markers a board of this type accepts: the general family
+    /// everywhere, plus the ERD cardinality family on an `erd` board — a
+    /// crow's foot means "many" of a relation, which says nothing on a
+    /// flowchart. `Store::validate_edge_markers` and `mesa diagram types`
+    /// both read this.
+    pub fn edge_markers(self) -> &'static [EdgeMarker] {
+        match self {
+            DiagramType::Erd => EdgeMarker::ALL,
+            _ => EdgeMarker::GENERAL,
+        }
+    }
 }
 
 /// A frame's node shape, chosen at creation and immutable thereafter (no
@@ -722,7 +778,14 @@ impl DiagramType {
 /// reason: a board should never hold a shape from the "wrong" type system).
 /// `None` on `Frame.shape` means the generic card, valid only on a
 /// `storyboard`-type board; `Store::create_frame` validates a given shape
-/// against the parent board's `DiagramType`.
+/// against the parent board's `DiagramType` (see [`DiagramType::shapes`],
+/// which is the shape set itself).
+///
+/// The tail of this list is mesa task 854's professional-tool-grade widening:
+/// the flowchart set gained the four ANSI process-chart shapes, the ERD set
+/// the three Chen shapes beside `entity`, and `storyboard`/`brainstorm` gained
+/// the shapes their boards were writing as bare cards. Widening only — every
+/// shape that was legal on a board type before is still legal on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -733,9 +796,50 @@ pub enum FrameShape {
     Entity,
     Central,
     Idea,
+    /// A storyboard beat — one shot/step of the narrative.
+    Scene,
+    /// A sticky annotation. Deliberately valid on both the `storyboard` and
+    /// `brainstorm` sets: a note is commentary, not a member of either type
+    /// system, so it is the one shape two board types share.
+    Note,
+    /// Flowchart I/O (the ANSI parallelogram).
+    Data,
+    /// Flowchart printed output (the wavy-bottomed page).
+    Document,
+    /// Flowchart stored data (the cylinder).
+    Database,
+    /// Flowchart call into a named subroutine (the double-barred box).
+    PredefinedProcess,
+    /// An ERD entity whose identity depends on another's (the double box).
+    WeakEntity,
+    /// An ERD relationship (the Chen diamond).
+    Relationship,
+    /// An ERD attribute (the Chen ellipse).
+    Attribute,
 }
 
 impl FrameShape {
+    /// Every shape, grouped by the board type that offers it. The one list a
+    /// new shape has to be added to; `DiagramType::shapes` decides which board
+    /// accepts which.
+    pub const ALL: &'static [FrameShape] = &[
+        FrameShape::Process,
+        FrameShape::Decision,
+        FrameShape::StartEnd,
+        FrameShape::Entity,
+        FrameShape::Central,
+        FrameShape::Idea,
+        FrameShape::Scene,
+        FrameShape::Note,
+        FrameShape::Data,
+        FrameShape::Document,
+        FrameShape::Database,
+        FrameShape::PredefinedProcess,
+        FrameShape::WeakEntity,
+        FrameShape::Relationship,
+        FrameShape::Attribute,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             FrameShape::Process => "process",
@@ -744,19 +848,136 @@ impl FrameShape {
             FrameShape::Entity => "entity",
             FrameShape::Central => "central",
             FrameShape::Idea => "idea",
+            FrameShape::Scene => "scene",
+            FrameShape::Note => "note",
+            FrameShape::Data => "data",
+            FrameShape::Document => "document",
+            FrameShape::Database => "database",
+            FrameShape::PredefinedProcess => "predefined_process",
+            FrameShape::WeakEntity => "weak_entity",
+            FrameShape::Relationship => "relationship",
+            FrameShape::Attribute => "attribute",
         }
     }
 
     pub fn parse(s: &str) -> Option<FrameShape> {
-        match s {
-            "process" => Some(FrameShape::Process),
-            "decision" => Some(FrameShape::Decision),
-            "start_end" => Some(FrameShape::StartEnd),
-            "entity" => Some(FrameShape::Entity),
-            "central" => Some(FrameShape::Central),
-            "idea" => Some(FrameShape::Idea),
-            _ => None,
+        FrameShape::ALL
+            .iter()
+            .copied()
+            .find(|shape| shape.as_str() == s)
+    }
+}
+
+/// How a `FrameEdge`'s line is drawn (mesa task 854). `None` on
+/// `FrameEdge.style` is today's rendering — a solid line — so an edge that
+/// predates the feature is byte-identical; `solid` is the same picture said
+/// explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum EdgeStyle {
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+impl EdgeStyle {
+    /// Every style, in offer order. Valid on **every** board type — a dashed
+    /// line means "weaker" on any diagram, so unlike `EdgeMarker` there is no
+    /// per-type subset.
+    pub const ALL: &'static [EdgeStyle] = &[EdgeStyle::Solid, EdgeStyle::Dashed, EdgeStyle::Dotted];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EdgeStyle::Solid => "solid",
+            EdgeStyle::Dashed => "dashed",
+            EdgeStyle::Dotted => "dotted",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<EdgeStyle> {
+        EdgeStyle::ALL.iter().copied().find(|s2| s2.as_str() == s)
+    }
+}
+
+/// What one end of a `FrameEdge` is decorated with (mesa task 854). Two
+/// families, told apart by which board types accept them
+/// ([`DiagramType::edge_markers`]): the **general** family draws on any board,
+/// while the **cardinality** family states an ERD relation's multiplicity and
+/// is therefore accepted only on an `erd` board.
+///
+/// `EdgeMarker::None` and `Option::None` are different answers: `None` on
+/// `FrameEdge.from_marker`/`to_marker` is the default — today's rendering, no
+/// start marker and a closed arrowhead at the `to` end — while
+/// `EdgeMarker::None` explicitly draws nothing at that end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum EdgeMarker {
+    None,
+    Arrow,
+    HollowArrow,
+    Circle,
+    Diamond,
+    CrowsFoot,
+    One,
+    ZeroOrOne,
+    OneOrMany,
+    ZeroOrMany,
+}
+
+impl EdgeMarker {
+    /// The family every board type accepts.
+    pub const GENERAL: &'static [EdgeMarker] = &[
+        EdgeMarker::None,
+        EdgeMarker::Arrow,
+        EdgeMarker::HollowArrow,
+        EdgeMarker::Circle,
+        EdgeMarker::Diamond,
+    ];
+
+    /// The ERD-only family: relation multiplicity, meaningless off an `erd`
+    /// board.
+    pub const CARDINALITY: &'static [EdgeMarker] = &[
+        EdgeMarker::CrowsFoot,
+        EdgeMarker::One,
+        EdgeMarker::ZeroOrOne,
+        EdgeMarker::OneOrMany,
+        EdgeMarker::ZeroOrMany,
+    ];
+
+    /// `GENERAL` followed by `CARDINALITY` — what an `erd` board accepts, and
+    /// the list a new marker has to be added to.
+    pub const ALL: &'static [EdgeMarker] = &[
+        EdgeMarker::None,
+        EdgeMarker::Arrow,
+        EdgeMarker::HollowArrow,
+        EdgeMarker::Circle,
+        EdgeMarker::Diamond,
+        EdgeMarker::CrowsFoot,
+        EdgeMarker::One,
+        EdgeMarker::ZeroOrOne,
+        EdgeMarker::OneOrMany,
+        EdgeMarker::ZeroOrMany,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EdgeMarker::None => "none",
+            EdgeMarker::Arrow => "arrow",
+            EdgeMarker::HollowArrow => "hollow_arrow",
+            EdgeMarker::Circle => "circle",
+            EdgeMarker::Diamond => "diamond",
+            EdgeMarker::CrowsFoot => "crows_foot",
+            EdgeMarker::One => "one",
+            EdgeMarker::ZeroOrOne => "zero_or_one",
+            EdgeMarker::OneOrMany => "one_or_many",
+            EdgeMarker::ZeroOrMany => "zero_or_many",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<EdgeMarker> {
+        EdgeMarker::ALL.iter().copied().find(|m| m.as_str() == s)
     }
 }
 
@@ -889,6 +1110,19 @@ pub struct FrameEdge {
     /// Side of `to_frame` this edge is locked to, if any. Same contract as
     /// `from_anchor`, independent per endpoint.
     pub to_anchor: Option<AnchorSide>,
+    /// How the connector's line is drawn. `None` renders exactly as today
+    /// (solid) — see `EdgeStyle`. Unlike `shape`/`diagram_type` this is
+    /// mutable: restyling a connector never moves it into another type
+    /// system, so there is nothing for immutability to protect.
+    pub style: Option<EdgeStyle>,
+    /// Decoration at the `from_frame` end. `None` renders exactly as today
+    /// (nothing at the start) — see `EdgeMarker`. Validated against the
+    /// board's `diagram_type`: the cardinality family is `erd`-only.
+    pub from_marker: Option<EdgeMarker>,
+    /// Decoration at the `to_frame` end. `None` renders exactly as today (a
+    /// closed arrowhead). Same contract as `from_marker`, independent per
+    /// endpoint.
+    pub to_marker: Option<EdgeMarker>,
 }
 
 /// The full contents of one diagram: the board plus all of its frames and
@@ -2038,55 +2272,122 @@ mod tests {
         );
     }
 
+    /// The serialized value and `as_str()` are two spellings of one wire
+    /// string: `parse()` reads the second, every JSON client the first, and a
+    /// db column holds whichever was written. Asserted variant by variant so a
+    /// multi-word name (`start_end`, `predefined_process`, `hollow_arrow`,
+    /// `zero_or_many`) cannot pick up a different casing on one side only.
     #[test]
-    fn frame_shape_serializes_to_bare_lowercase_strings() {
+    fn diagram_vocabulary_serializes_to_bare_lowercase_strings() {
+        for dt in DiagramType::ALL {
+            assert_eq!(
+                serde_json::to_string(dt).unwrap(),
+                format!("\"{}\"", dt.as_str())
+            );
+        }
+        for shape in FrameShape::ALL {
+            assert_eq!(
+                serde_json::to_string(shape).unwrap(),
+                format!("\"{}\"", shape.as_str())
+            );
+        }
+        for style in EdgeStyle::ALL {
+            assert_eq!(
+                serde_json::to_string(style).unwrap(),
+                format!("\"{}\"", style.as_str())
+            );
+        }
+        for marker in EdgeMarker::ALL {
+            assert_eq!(
+                serde_json::to_string(marker).unwrap(),
+                format!("\"{}\"", marker.as_str())
+            );
+        }
+        // The two the arch doc flagged to confirm rather than assume: an
+        // acronym and the widest multi-word name.
+        assert_eq!(serde_json::to_string(&DiagramType::Erd).unwrap(), "\"erd\"");
         assert_eq!(
-            serde_json::to_string(&FrameShape::Process).unwrap(),
-            "\"process\""
-        );
-        assert_eq!(
-            serde_json::to_string(&FrameShape::Decision).unwrap(),
-            "\"decision\""
-        );
-        assert_eq!(
-            serde_json::to_string(&FrameShape::StartEnd).unwrap(),
-            "\"start_end\""
-        );
-        assert_eq!(
-            serde_json::to_string(&FrameShape::Entity).unwrap(),
-            "\"entity\""
-        );
-        assert_eq!(
-            serde_json::to_string(&FrameShape::Central).unwrap(),
-            "\"central\""
-        );
-        assert_eq!(
-            serde_json::to_string(&FrameShape::Idea).unwrap(),
-            "\"idea\""
+            serde_json::to_string(&FrameShape::PredefinedProcess).unwrap(),
+            "\"predefined_process\""
         );
     }
 
     #[test]
-    fn diagram_type_and_frame_shape_round_trip_through_parse() {
+    fn diagram_vocabulary_round_trips_through_parse() {
+        for dt in DiagramType::ALL {
+            assert_eq!(DiagramType::parse(dt.as_str()), Some(*dt));
+        }
+        for shape in FrameShape::ALL {
+            assert_eq!(FrameShape::parse(shape.as_str()), Some(*shape));
+        }
+        for style in EdgeStyle::ALL {
+            assert_eq!(EdgeStyle::parse(style.as_str()), Some(*style));
+        }
+        for marker in EdgeMarker::ALL {
+            assert_eq!(EdgeMarker::parse(marker.as_str()), Some(*marker));
+        }
+        assert_eq!(DiagramType::parse("bogus"), None);
+        assert_eq!(FrameShape::parse("bogus"), None);
+        assert_eq!(EdgeStyle::parse("bogus"), None);
+        assert_eq!(EdgeMarker::parse("bogus"), None);
+    }
+
+    /// `parse()` walks `ALL`, so a variant left out of it would be
+    /// unreadable — silently, since `as_str()`'s exhaustive match would still
+    /// compile. The counts are the tripwire: adding a variant fails this test
+    /// until it is listed.
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        assert_eq!(DiagramType::ALL.len(), 4);
+        assert_eq!(FrameShape::ALL.len(), 15);
+        assert_eq!(EdgeStyle::ALL.len(), 3);
+        assert_eq!(EdgeMarker::ALL.len(), 10);
+        // ALL is GENERAL then CARDINALITY — the split the ERD-only marker
+        // rule is enforced on, so the two halves must add back up.
+        let split: Vec<EdgeMarker> = EdgeMarker::GENERAL
+            .iter()
+            .chain(EdgeMarker::CARDINALITY)
+            .copied()
+            .collect();
+        assert_eq!(split, EdgeMarker::ALL);
+    }
+
+    /// The per-type sets the `Store` validators and `mesa diagram types` share.
+    #[test]
+    fn each_diagram_type_offers_its_own_shape_and_marker_set() {
+        assert!(DiagramType::Storyboard.allows_generic_frame());
         for dt in [
-            DiagramType::Storyboard,
             DiagramType::Flowchart,
             DiagramType::Erd,
             DiagramType::Brainstorm,
         ] {
-            assert_eq!(DiagramType::parse(dt.as_str()), Some(dt));
+            assert!(
+                !dt.allows_generic_frame(),
+                "{} takes no generic card",
+                dt.as_str()
+            );
         }
-        for shape in [
-            FrameShape::Process,
-            FrameShape::Decision,
-            FrameShape::StartEnd,
-            FrameShape::Entity,
-            FrameShape::Central,
-            FrameShape::Idea,
+        assert_eq!(
+            DiagramType::Storyboard.shapes(),
+            &[FrameShape::Scene, FrameShape::Note]
+        );
+        assert_eq!(DiagramType::Erd.edge_markers(), EdgeMarker::ALL);
+        for dt in [
+            DiagramType::Storyboard,
+            DiagramType::Flowchart,
+            DiagramType::Brainstorm,
         ] {
-            assert_eq!(FrameShape::parse(shape.as_str()), Some(shape));
+            assert_eq!(dt.edge_markers(), EdgeMarker::GENERAL);
         }
-        assert_eq!(DiagramType::parse("bogus"), None);
-        assert_eq!(FrameShape::parse("bogus"), None);
+        // Every named shape belongs to exactly one type's set, except `note`,
+        // which is deliberately shared by storyboard and brainstorm.
+        for shape in FrameShape::ALL {
+            let owners = DiagramType::ALL
+                .iter()
+                .filter(|dt| dt.shapes().contains(shape))
+                .count();
+            let expected = if *shape == FrameShape::Note { 2 } else { 1 };
+            assert_eq!(owners, expected, "shape {}", shape.as_str());
+        }
     }
 }

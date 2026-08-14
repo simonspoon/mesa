@@ -41,10 +41,22 @@ import { loadBoardView, saveBoardView } from './boardView'
 import { ConfirmDelete } from './components/ConfirmDelete'
 import { InlineEdit } from './components/InlineEdit'
 import { Markdown } from './components/Markdown'
+import {
+  EDGE_STYLES,
+  MARKER_LABELS,
+  SHAPES_FOR_TYPE,
+  SHAPE_LABELS,
+  dashArrayFor,
+  markerUrl,
+  markersForType,
+  shapeLabel,
+} from './diagramOptions'
 import { layoutFrames, type LayoutDirection } from './layout'
 import type { AnchorSide } from './types/AnchorSide'
 import type { DiagramType } from './types/DiagramType'
 import type { DiagramView } from './types/DiagramView'
+import type { EdgeMarker } from './types/EdgeMarker'
+import type { EdgeStyle } from './types/EdgeStyle'
 import type { Frame } from './types/Frame'
 import type { FrameShape } from './types/FrameShape'
 import type { Waypoint } from './types/Waypoint'
@@ -57,34 +69,10 @@ const MAX_ZOOM = 3
  *  null`) plus every `FrameShape` value. */
 type FrameNodeKind = FrameShape | 'frame'
 
-/** The valid `Frame.shape` set for each `Diagram.diagram_type`, per
- *  `Store::validate_frame_shape` (src/core/store.rs) — a `storyboard` board
- *  takes no shape (the generic card, `shape: null`), a `flowchart` board
- *  takes exactly one of process/decision/start_end, an `erd` board takes
- *  only entity. Drives both the add-frame picker's offered options (story
- *  360) and the default shape handed to the other frame-creating gestures
- *  below (pane double-click, drag-to-empty-canvas, duplicate) so those keep
- *  working on flowchart/erd boards instead of hitting the `Store` validation
- *  error a `shape: null` create would now draw on those board types. */
-const SHAPES_FOR_TYPE: Record<DiagramType, FrameShape[]> = {
-  storyboard: [],
-  flowchart: ['process', 'decision', 'start_end'],
-  erd: ['entity'],
-  // `idea` first, deliberately: the first entry doubles as `defaultShape` for
-  // the quick-create gestures (pane double-click, drag-to-empty-canvas,
-  // Cmd+D), and those should mint a branch idea, not a second hub.
-  brainstorm: ['idea', 'central'],
-}
-
-/** Display label for each shape's add-frame picker button. */
-const SHAPE_LABELS: Record<FrameShape, string> = {
-  process: 'process',
-  decision: 'decision',
-  start_end: 'start/end',
-  entity: 'entity',
-  central: 'central topic',
-  idea: 'idea',
-}
+// The per-board-type shape/marker vocabularies (`SHAPES_FOR_TYPE`,
+// `markersForType`, their labels) live in `diagramOptions.ts` — they mirror
+// the server's own matrix (`DiagramType::shapes`/`edge_markers`), and that
+// lockstep is what `diagramOptions.test.ts` checks.
 
 /** Node payload: the server frame, its selected/editing state (owned by this
  *  component, not React Flow's own click-select, so they can never disagree
@@ -120,10 +108,26 @@ type FrameEdgeType = Edge<
      *  it shares both endpoint frames with one or more other edges — see
      *  `parallelOffsets` below. Zero for a lone edge between its two frames. */
     dupOffset: number
+    /** Connector properties (mesa task 854). All three `null` — the stored
+     *  default, and every edge predating the feature — renders exactly as
+     *  before: a solid line, nothing at the start, React Flow's own closed
+     *  arrowhead at the `to` end. */
+    style: EdgeStyle | null
+    fromMarker: EdgeMarker | null
+    toMarker: EdgeMarker | null
+    /** The board's type, which decides which markers may be *offered*: the
+     *  ERD cardinality family is `erd`-only server-side, so offering it
+     *  elsewhere would only produce a 422. */
+    diagramType: DiagramType
     onSaveLabel: (next: string) => Promise<void>
     onDelete: () => void
     onSaveWaypoints: (next: Waypoint[]) => Promise<void>
     onSaveAnchor: (end: 'from' | 'to', side: AnchorSide | null) => Promise<void>
+    onSaveProps: (patch: {
+      style?: EdgeStyle | null
+      from_marker?: EdgeMarker | null
+      to_marker?: EdgeMarker | null
+    }) => Promise<void>
   },
   'frame'
 >
@@ -465,6 +469,80 @@ function IdeaNode(props: NodeProps<FrameNodeType>) {
   return <FrameCardNode {...props} shapeClass="frame-idea" />
 }
 
+// --- mesa task 854's shapes ---
+//
+// Same story as every shape above: one shared `FrameCardNode`, distinguished
+// only by `shapeClass` (and, for `weak_entity`, the same `renderBody` override
+// `entity` uses — a weak entity is an entity, so its attribute list should read
+// identically). Which CSS technique each silhouette uses, and why, is in
+// App.css beside the rules; the constraint they all obey is that a silhouette
+// that would clip the header (title + `#id` badge) is drawn as an oversized
+// `::before` backdrop behind an unclipped card, never as a `clip-path` on the
+// card itself — the lesson `decision` and `central` were fixed by.
+
+/** Storyboard "scene": the shot card a storyboard is made of — a plain card
+ *  with a film-strip band, so it reads as a frame of film beside a `note`. */
+function SceneNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-scene" />
+}
+
+/** "Note": a folded-corner sticky annotation. The one shape two board types
+ *  share (storyboard and brainstorm) — commentary belongs to neither type
+ *  system. */
+function NoteNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-note" />
+}
+
+/** Flowchart "data" (ANSI input/output): a parallelogram. */
+function DataNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-data" />
+}
+
+/** Flowchart "document": a rectangle with a wavy bottom edge. */
+function DocumentNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-document" />
+}
+
+/** Flowchart "database": a cylinder. */
+function DatabaseNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-database" />
+}
+
+/** Flowchart "predefined process" (a call into a named subroutine): a
+ *  rectangle with a double bar down each side. */
+function PredefinedProcessNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-predefined-process" />
+}
+
+/** ERD "weak entity": an entity whose identity depends on another, drawn with
+ *  the double border the notation gives it. Reuses `EntityNode`'s attribute
+ *  list treatment verbatim — a weak entity's attributes are read exactly like
+ *  an entity's. */
+function WeakEntityNode(props: NodeProps<FrameNodeType>) {
+  return (
+    <FrameCardNode
+      {...props}
+      shapeClass="frame-weak-entity"
+      renderBody={(body) => (
+        <div className="frame-entity-body">
+          <Markdown text={body} breaks />
+        </div>
+      )}
+    />
+  )
+}
+
+/** ERD "relationship" (Chen notation): a diamond, drawn the same backdrop way
+ *  the flowchart `decision` diamond is. */
+function RelationshipNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-relationship" />
+}
+
+/** ERD "attribute" (Chen notation): an ellipse. */
+function AttributeNode(props: NodeProps<FrameNodeType>) {
+  return <FrameCardNode {...props} shapeClass="frame-attribute" />
+}
+
 type Rect = { x: number; y: number; w: number; h: number }
 type Point = { x: number; y: number }
 type Anchor = Point & { position: Position }
@@ -766,6 +844,11 @@ function FrameEdgeView({
   // see arch.md §6). Set from both the wide hit-target path and each dot
   // itself (below), so hover survives the path-to-dot handoff.
   const [hovered, setHovered] = useState(false)
+  // The connector-properties popover (line style + both end markers, mesa task
+  // 854), opened from the label cluster's ⋮ button. Local like `hovered`: it is
+  // view state on one edge, and this canvas has no edge selection to hang it
+  // off (see the `hovered` note above).
+  const [propsOpen, setPropsOpen] = useState(false)
   // A same-side dot sits right next to the path (inside its 28px hit band),
   // so path->dot is a seamless handoff there — but the *other* 3 sides per
   // endpoint can be 100+px away across empty canvas, well outside that band.
@@ -813,6 +896,17 @@ function FrameEdgeView({
     data.dupOffset,
   )
   const isEmpty = !(data.label && data.label.trim())
+  // Connector properties (mesa task 854). Each falls back to exactly what this
+  // canvas drew before the feature when the stored value is `null`: no
+  // dasharray, no start marker, and — at the `to` end — React Flow's own
+  // `markerEnd` (the closed cyan arrowhead the parent still puts on the edge
+  // object). `EdgeMarker::None` is the *explicit* "draw nothing" answer and is
+  // a different thing from that `null`, so it clears the arrowhead.
+  const strokeDasharray = dashArrayFor(data.style)
+  const startMarker =
+    data.fromMarker === null ? undefined : markerUrl(data.fromMarker)
+  const endMarker =
+    data.toMarker === null ? markerEnd : markerUrl(data.toMarker)
 
   const commit = (next: Waypoint[]) => {
     setLocalWaypoints(next)
@@ -885,7 +979,13 @@ function FrameEdgeView({
 
   return (
     <>
-      <BaseEdge id={id} path={path} markerEnd={markerEnd} />
+      <BaseEdge
+        id={id}
+        path={path}
+        markerStart={startMarker}
+        markerEnd={endMarker}
+        style={strokeDasharray ? { strokeDasharray } : undefined}
+      />
       {/* Wider invisible hit target for click-to-insert — the visible path
           (BaseEdge's `.react-flow__edge-path`) is only 2px wide, too thin to
           reliably double-click (mesa task 334: 16px was still too thin). */}
@@ -901,24 +1001,96 @@ function FrameEdgeView({
       />
       <EdgeLabelRenderer>
         <div
-          className={'edge-label nodrag nopan' + (isEmpty ? ' empty' : '')}
+          className={
+            'edge-label nodrag nopan' +
+            (isEmpty ? ' empty' : '') +
+            (propsOpen ? ' open' : '')
+          }
           style={{
             transform: `translate(-50%, -50%) translate(${mid.x}px, ${mid.y}px)`,
           }}
         >
-          <InlineEdit
-            className="edge-label-text"
-            value={data.label ?? ''}
-            placeholder="label"
-            onSave={data.onSaveLabel}
-          />
-          <button
-            className="edge-del"
-            title="delete edge"
-            onClick={data.onDelete}
-          >
-            ✕
-          </button>
+          <div className="edge-label-row">
+            <InlineEdit
+              className="edge-label-text"
+              value={data.label ?? ''}
+              placeholder="label"
+              onSave={data.onSaveLabel}
+            />
+            {/* Connector properties live behind this toggle rather than in
+                their own panel: the label cluster is already the edge's one
+                selected affordance (label, delete, and the anchor-lock dots
+                hanging off the same hover), so a second surface would only
+                compete with it. */}
+            <button
+              className="edge-props-toggle"
+              title="connector style and end markers"
+              onClick={() => setPropsOpen((o) => !o)}
+            >
+              ⋮
+            </button>
+            <button
+              className="edge-del"
+              title="delete edge"
+              onClick={data.onDelete}
+            >
+              ✕
+            </button>
+          </div>
+          {propsOpen && (
+            <div className="edge-props">
+              <label>
+                <span className="edge-props-name">line</span>
+                <select
+                  value={data.style ?? ''}
+                  onChange={(e) =>
+                    data
+                      .onSaveProps({
+                        style: (e.target.value || null) as EdgeStyle | null,
+                      })
+                      .catch(() => {})
+                  }
+                >
+                  <option value="">default</option>
+                  {EDGE_STYLES.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {/* Only the markers this board's `diagram_type` accepts — the ERD
+                  cardinality family is erd-only server-side, so offering it on
+                  a flowchart would just 422 the PATCH. */}
+              {(
+                [
+                  ['start', 'from_marker', data.fromMarker],
+                  ['end', 'to_marker', data.toMarker],
+                ] as const
+              ).map(([label, field, current]) => (
+                <label key={field}>
+                  <span className="edge-props-name">{label}</span>
+                  <select
+                    value={current ?? ''}
+                    onChange={(e) =>
+                      data
+                        .onSaveProps({
+                          [field]: (e.target.value || null) as EdgeMarker | null,
+                        })
+                        .catch(() => {})
+                    }
+                  >
+                    <option value="">default</option>
+                    {markersForType(data.diagramType).map((m) => (
+                      <option key={m} value={m}>
+                        {MARKER_LABELS[m]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+          )}
         </div>
         {anchors.slice(1, -1).map((w, i) => (
           <div
@@ -1016,6 +1188,105 @@ function FrameConnectionLine({
   return <path d={path} fill="none" className="react-flow__connection-path" />
 }
 
+/**
+ * The `<marker>` elements every connector's endpoints reference by id (mesa
+ * task 854). React Flow's built-in `MarkerType` only knows two arrowheads, so
+ * everything past `arrow` — the hollow arrow, circle, diamond, and the whole
+ * ERD crow's-foot cardinality family — has to be defined here.
+ *
+ * Three things make these work at both ends of a path:
+ * - **`orient="auto-start-reverse"`** means one definition serves both
+ *   `marker-start` and `marker-end`: at the start it is flipped, so it points
+ *   back down the path rather than into the frame it is attached to. That is
+ *   why there is one marker per value rather than a start/end pair.
+ * - **`context-stroke`** for fill/stroke picks up the *edge's* stroke colour
+ *   rather than a hardcoded one, so a marker can never disagree with the line
+ *   it terminates. The hollow shapes fill with the canvas panel colour so the
+ *   line behind them does not show through.
+ * - **`markerUnits="userSpaceOnUse"`** keeps every glyph one size in flow
+ *   coordinates instead of scaling with the 2px stroke.
+ *
+ * Rendered once per canvas into its own zero-size `<svg>`: a `url(#id)`
+ * reference resolves document-wide, so the markers do not need to live inside
+ * React Flow's own SVG (which we do not own).
+ *
+ * Geometry convention: +x runs along the path *toward* the endpoint, so x=0 is
+ * back down the line and the right edge of each viewBox sits on the frame.
+ */
+function EdgeMarkerDefs() {
+  const line = { stroke: 'context-stroke', strokeWidth: 1.6, fill: 'none' }
+  const hollow = { stroke: 'context-stroke', strokeWidth: 1.2, fill: 'var(--panel)' }
+  const solid = { fill: 'context-stroke', stroke: 'none' }
+  /** A crow's foot: three lines fanning from one point back on the line out to
+   *  the frame — the "many" glyph, shared by three cardinality markers. */
+  const crow = (x0: number, x1: number) => (
+    <path d={`M${x1},0 L${x0},6 L${x1},12 M${x0},6 L${x1},6`} style={line} />
+  )
+  const marker = (
+    id: string,
+    width: number,
+    children: React.ReactNode,
+  ) => (
+    <marker
+      key={id}
+      id={`mesa-edge-marker-${id}`}
+      viewBox={`0 0 ${width} 12`}
+      markerWidth={width}
+      markerHeight={12}
+      refX={width}
+      refY={6}
+      orient="auto-start-reverse"
+      markerUnits="userSpaceOnUse"
+    >
+      {children}
+    </marker>
+  )
+  return (
+    <svg className="edge-marker-defs" aria-hidden="true">
+      <defs>
+        {marker('arrow', 12, <path d="M0,1 L12,6 L0,11 z" style={solid} />)}
+        {marker(
+          'hollow_arrow',
+          12,
+          <path d="M0.6,1.4 L11.4,6 L0.6,10.6 z" style={hollow} />,
+        )}
+        {marker('circle', 12, <circle cx={6} cy={6} r={4.6} style={hollow} />)}
+        {marker(
+          'diamond',
+          14,
+          <path d="M0.6,6 L7,1.4 L13.4,6 L7,10.6 z" style={hollow} />,
+        )}
+        {marker('crows_foot', 14, crow(0, 14))}
+        {marker('one', 12, <path d="M8,1 L8,11" style={line} />)}
+        {marker(
+          'zero_or_one',
+          20,
+          <>
+            <circle cx={5} cy={6} r={4} style={hollow} />
+            <path d="M15,1 L15,11" style={line} />
+          </>,
+        )}
+        {marker(
+          'one_or_many',
+          20,
+          <>
+            <path d="M2,1 L2,11" style={line} />
+            {crow(6, 20)}
+          </>,
+        )}
+        {marker(
+          'zero_or_many',
+          22,
+          <>
+            <circle cx={5} cy={6} r={4} style={hollow} />
+            {crow(10, 22)}
+          </>,
+        )}
+      </defs>
+    </svg>
+  )
+}
+
 const nodeTypes = {
   frame: FrameNode,
   process: ProcessNode,
@@ -1024,6 +1295,15 @@ const nodeTypes = {
   entity: EntityNode,
   central: CentralNode,
   idea: IdeaNode,
+  scene: SceneNode,
+  note: NoteNode,
+  data: DataNode,
+  document: DocumentNode,
+  database: DatabaseNode,
+  predefined_process: PredefinedProcessNode,
+  weak_entity: WeakEntityNode,
+  relationship: RelationshipNode,
+  attribute: AttributeNode,
 }
 const edgeTypes = { frame: FrameEdgeView }
 
@@ -1211,6 +1491,32 @@ export function DiagramCanvas({
     [author, onChanged, showError],
   )
 
+  /** Save one connector property — line style or either end marker (mesa task
+   *  854). Mirrors `editEdgeAnchor` above: one discrete choice per call, no
+   *  local optimistic copy, and the same three-state contract on the wire
+   *  (a `null` clears back to the default, an omitted key is untouched). */
+  const editEdgeProps = useCallback(
+    (
+      id: number,
+      patch: {
+        style?: EdgeStyle | null
+        from_marker?: EdgeMarker | null
+        to_marker?: EdgeMarker | null
+      },
+    ) =>
+      updateEdge(id, patch, author).then(
+        () => {
+          setError(null)
+          onChanged()
+        },
+        (e) => {
+          showError(e)
+          throw e
+        },
+      ),
+    [author, onChanged, showError],
+  )
+
   // Edges derive straight from the server view — no local edge state to sync.
   const edges: FrameEdgeType[] = useMemo(() => {
     const dupOffsets = parallelOffsets(view.edges)
@@ -1225,25 +1531,43 @@ export function DiagramCanvas({
         fromAnchor: e.from_anchor,
         toAnchor: e.to_anchor,
         dupOffset: dupOffsets.get(e.id) ?? 0,
+        style: e.style,
+        fromMarker: e.from_marker,
+        toMarker: e.to_marker,
+        diagramType: view.diagram.diagram_type,
         onSaveLabel: (next: string) => editEdgeLabel(e.id, next),
         onDelete: () => removeEdge(e.id),
         onSaveWaypoints: (next: Waypoint[]) => editEdgeWaypoints(e.id, next),
         onSaveAnchor: (end: 'from' | 'to', side: AnchorSide | null) =>
           editEdgeAnchor(e.id, end, side),
+        onSaveProps: (patch) => editEdgeProps(e.id, patch),
       },
+      // Left in place unconditionally so an edge with `to_marker: null` keeps
+      // drawing exactly this arrowhead (`FrameEdgeView` falls back to the
+      // resolved `markerEnd` prop); an edge that names its own `to_marker`
+      // ignores it and references one of `EdgeMarkerDefs`' markers instead.
       markerEnd: { type: MarkerType.ArrowClosed, color: '#00e5ff' },
     }))
-  }, [view.edges, editEdgeLabel, removeEdge, editEdgeWaypoints, editEdgeAnchor])
+  }, [
+    view.edges,
+    view.diagram.diagram_type,
+    editEdgeLabel,
+    removeEdge,
+    editEdgeWaypoints,
+    editEdgeAnchor,
+    editEdgeProps,
+  ])
 
   // The shape set this board's diagram_type allows, and — for the gestures
   // that don't offer an explicit shape choice (pane double-click,
   // drag-a-connection-to-empty-canvas) — the shape to default to so those
   // still work on flowchart/erd boards instead of drawing the `Store`
-  // validation error a `shape: null` create now hits there. `[0]` is
-  // `undefined` for a `storyboard`-type board (empty array), matching
-  // pre-360 behavior exactly.
+  // validation error a `shape: null` create now hits there. Since task 854 a
+  // `storyboard` board's first entry is an explicit `null` (the generic card)
+  // rather than an empty set, so its quick-create gestures still mint exactly
+  // the plain card they always did.
   const boardShapes = SHAPES_FOR_TYPE[view.diagram.diagram_type]
-  const defaultShape = boardShapes[0]
+  const defaultShape = boardShapes[0] ?? undefined
 
   /** Creates the frame untitled and opens it for editing, so the user lands in
    *  a focused, empty title input and just types (task 448) — rather than
@@ -1436,6 +1760,10 @@ export function DiagramCanvas({
   return (
     <div className={`diagram${expanded ? ' expanded' : ''}`}>
       <div className="diagram-viewport">
+        {/* Endpoint marker definitions, once per canvas. A `url(#id)` reference
+            resolves document-wide, so these need not (and cannot) live inside
+            React Flow's own SVG. */}
+        <EdgeMarkerDefs />
         <ReactFlow
           colorMode="dark"
           nodes={nodes}
@@ -1489,25 +1817,28 @@ export function DiagramCanvas({
           <Controls showInteractive={false} />
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="canvas-controls">
-            {boardShapes.length === 0 ? (
-              // `storyboard`-type board: exactly today's single button, shape
-              // implicitly null — zero UI regression (Must #6).
-              <button onClick={() => addFrame()}>add frame</button>
-            ) : (
-              // flowchart/erd board: a picker offering only the shape set
-              // valid for this board's diagram_type (SHAPES_FOR_TYPE above).
-              <span className="add-frame-picker">
-                {boardShapes.map((shape) => (
-                  <button
-                    key={shape}
-                    onClick={() => addFrame(shape)}
-                    title={`add a ${SHAPE_LABELS[shape]} frame`}
-                  >
-                    + {SHAPE_LABELS[shape]}
-                  </button>
-                ))}
-              </span>
-            )}
+            {/* One button per shape this board's diagram_type accepts
+                (`SHAPES_FOR_TYPE`). A `storyboard` board's first entry is the
+                generic card, whose button keeps the original "add frame"
+                wording and leading position so the familiar affordance is
+                still the one at the top. Up to 7 buttons: they stack in the
+                panel's own column and the labels shrink, so the cluster never
+                overflows the canvas. */}
+            <span className="add-frame-picker">
+              {boardShapes.map((shape) => (
+                <button
+                  key={shape ?? 'generic'}
+                  onClick={() => addFrame(shape ?? undefined)}
+                  title={
+                    shape === null
+                      ? 'add a plain frame'
+                      : `add a ${SHAPE_LABELS[shape]} frame`
+                  }
+                >
+                  {shapeLabel(shape)}
+                </button>
+              ))}
+            </span>
             <button onClick={autoLayout} title="Arrange frames by flow direction">
               auto layout
             </button>

@@ -23,6 +23,8 @@ import type { DiagramType } from './types/DiagramType'
 import type { DiagramView } from './types/DiagramView'
 import type { DirEntry } from './types/DirEntry'
 import type { DirListing } from './types/DirListing'
+import type { EdgeMarker } from './types/EdgeMarker'
+import type { EdgeStyle } from './types/EdgeStyle'
 import type { FileContentView } from './types/FileContentView'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
@@ -686,6 +688,12 @@ export interface EdgePatch {
   waypoints?: Waypoint[]
   from_anchor?: AnchorSide | null
   to_anchor?: AnchorSide | null
+  /** Connector properties (mesa task 854). Same three-state `double_option`
+   *  contract as the anchors: omitted leaves the field untouched, an explicit
+   *  `null` clears it back to the default, a value sets it. */
+  style?: EdgeStyle | null
+  from_marker?: EdgeMarker | null
+  to_marker?: EdgeMarker | null
 }
 
 export function updateEdge(

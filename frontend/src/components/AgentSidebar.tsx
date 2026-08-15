@@ -19,6 +19,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
 import { liveWorkLabel, projectForCwd } from '../agentProject'
+import { formatContextTokens, responsePreview } from '../agentRow'
 import {
   clampAgentSidebarWidth,
   DEFAULT_AGENT_SIDEBAR_WIDTH,
@@ -451,6 +452,47 @@ function SoloAgentPane({
   )
 }
 
+/**
+ * The list rail's maximize/restore mark (mesa task 869) — drawn here rather
+ * than borrowed from a glyph font: `⛶`/`🗖` and friends render at wildly
+ * different weights per platform and sit off the text baseline, which is
+ * exactly what the rest of this chrome (thin 1px strokes, corner brackets)
+ * is not. Four corner brackets, pointing out to maximize and in to restore,
+ * on a 14-unit grid at half-pixel coordinates so the strokes stay crisp.
+ */
+function MaximizeGlyph({ restore }: { restore: boolean }) {
+  return (
+    <svg
+      className="agent-sidebar-list-maximize-glyph"
+      viewBox="0 0 14 14"
+      width="13"
+      height="13"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="square"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {restore ? (
+        <>
+          <path d="M1.5 5H5V1.5" />
+          <path d="M12.5 5H9V1.5" />
+          <path d="M12.5 9H9V12.5" />
+          <path d="M1.5 9H5V12.5" />
+        </>
+      ) : (
+        <>
+          <path d="M1.5 5V1.5H5" />
+          <path d="M9 1.5H12.5V5" />
+          <path d="M12.5 9V12.5H9" />
+          <path d="M5 12.5H1.5V9" />
+        </>
+      )}
+    </svg>
+  )
+}
+
 /** Props the 'Agents' list rail needs from `AgentSidebar`'s own state/data —
  * bundled into one object and spread onto `AgentListContent` below. */
 type ListPaneProps = {
@@ -507,6 +549,12 @@ function AgentListContent({
                   <ul className="card-list agent-list">
                     {bucketAgents.map((a) => {
                       const proj = projectForCwd(a.cwd, projects ?? [])
+                      // Both may be absent (no transcript yet / no usage line
+                      // yet), and both then render nothing at all rather than
+                      // a placeholder that would read as an empty reply or as
+                      // zero tokens — see `agentRow.ts`.
+                      const preview = responsePreview(a.lastResponse)
+                      const context = formatContextTokens(a.contextTokens)
                       return (
                         <li
                           key={a.sessionId}
@@ -518,21 +566,58 @@ function AgentListContent({
                             if (a.id !== null) onTogglePane(a.id)
                           }}
                         >
-                          <span className="agent-name">{agentLabel(a)}</span>
-                          <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
-                          {a.status && <span className={`badge agent-status-${a.status}`}>{a.status}</span>}
-                          {a.state && a.state !== a.status && (
-                            <span className={`badge agent-state-${a.state}`}>{a.state}</span>
+                          <div className="agent-row-title">
+                            <span className="agent-name">{agentLabel(a)}</span>
+                          </div>
+                          <div className="agent-row-badges">
+                            <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
+                            {a.status && <span className={`badge agent-status-${a.status}`}>{a.status}</span>}
+                            {a.state && a.state !== a.status && (
+                              <span className={`badge agent-state-${a.state}`}>{a.state}</span>
+                            )}
+                            {liveWorkLabel(a) && (
+                              <span className="badge agent-live-work" title={LIVE_WORK_HINT}>
+                                {liveWorkLabel(a)}
+                              </span>
+                            )}
+                            {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
+                          </div>
+                          {/* Model-authored text: a plain text node, never
+                              HTML/markdown/a URL — and the same string in
+                              `title`, so the clamped line is readable in full
+                              without the row growing. */}
+                          {preview && (
+                            <div className="agent-row-response" title={preview}>
+                              {preview}
+                            </div>
                           )}
-                          {liveWorkLabel(a) && (
-                            <span className="badge agent-live-work" title={LIVE_WORK_HINT}>
-                              {liveWorkLabel(a)}
+                          <div className="muted agent-meta agent-row-meta">
+                            {/* The project (or the raw cwd when no project
+                                claims it) is the only part that may be
+                                ellipsized: a cwd is long enough to eat the
+                                whole line, and the age is the half that
+                                actually changes. */}
+                            <span className="agent-row-meta-where" title={proj ? proj.name : a.cwd}>
+                              {proj ? proj.name : a.cwd}
+                              {a.id === null && ' · external terminal — not attachable'}
                             </span>
-                          )}
-                          {a.waitingFor && <span className="badge blocked">{a.waitingFor}</span>}
-                          <div className="muted agent-meta">
-                            {proj ? proj.name : a.cwd} · started {startedAgo(a.startedAt)}
-                            {a.id === null && ' · external terminal — not attachable'}
+                            {/* Bare age, with the sentence in the tooltip: at
+                                the rail's 240px the word "started" is what
+                                ellipsizes the project name away. */}
+                            <span
+                              className="agent-row-meta-age"
+                              title={`started ${startedAgo(a.startedAt)}`}
+                            >
+                              {startedAgo(a.startedAt)}
+                            </span>
+                            {context && (
+                              <span
+                                className="agent-row-context"
+                                title={`${a.contextTokens} tokens in the context window`}
+                              >
+                                {context}
+                              </span>
+                            )}
                           </div>
                         </li>
                       )
@@ -730,6 +815,11 @@ export function AgentSidebar({
   const [listWidth, setListWidth] = useState(DEFAULT_LIST_WIDTH)
   const [listCollapsed, setListCollapsed] = useState(false)
   const [listResizing, setListResizing] = useState(false)
+  // The rail maximized *within* the sidebar body (mesa task 869) — it takes
+  // the whole body and the tile area beside it goes to nothing. Distinct
+  // from `maximized` below, which is the whole sidebar taking over the main
+  // content area; the two are independent and compose.
+  const [listMaximized, setListMaximized] = useState(false)
   const bodyRef = useRef<HTMLDivElement>(null)
   // Live size of the tile area, the box Auto Tile lays its grid out inside
   // (mesa task 466). Measured, not derived from `width`: that box is resized
@@ -1125,7 +1215,34 @@ export function AgentSidebar({
     // out of its own way — otherwise the terminal you just attached is
     // rendered underneath the list you attached it from.
     if (!wasOpen && phone) setListCollapsed(true)
+    // Opening a pane while the rail is maximized has to give the pane
+    // somewhere to be — maximized, the tile area is zero-width, so the
+    // session you just attached would render nowhere.
+    if (!wasOpen) setListMaximized(false)
     refetch()
+  }
+
+  /**
+   * Maximize/restore the list rail inside the sidebar body (mesa task 869).
+   *
+   * Maximizing closes every open pane — through `ptyPool.remove` + `removeLeaf`,
+   * the same pair `closePane` uses, since a bare tree edit would strand the
+   * pooled terminal — and switches Auto Tile off, which would otherwise
+   * reopen them on the next poll. Restoring puts nothing back: the rail
+   * returns to its dragged width beside an empty tile area.
+   */
+  function toggleListMaximized() {
+    if (listMaximized) {
+      setListMaximized(false)
+      return
+    }
+    // Read off the current `root` rather than inside the updater, for
+    // `togglePane`'s reason: `ptyPool.remove` is a real side effect and an
+    // updater can run twice.
+    for (const id of collectLeafIds(root)) ptyPool.remove(id)
+    setRoot((r) => collectLeafIds(r).reduce((acc, id) => removeLeaf(acc, id), r))
+    setAutoTile(false)
+    setListMaximized(true)
   }
 
   function closePane(id: string) {
@@ -1346,7 +1463,12 @@ export function AgentSidebar({
                   ? 'Disable auto tile'
                   : 'Auto tile: open a pane for every active or blocked agent, close it when done'
               }
-              onClick={() => setAutoTile((v) => !v)}
+              onClick={() => {
+                // Same rule as opening a pane by hand: Auto Tile is about to
+                // open panes, and a maximized rail leaves them nowhere to be.
+                if (!autoTile) setListMaximized(false)
+                setAutoTile((v) => !v)
+              }}
             >
               auto tile
             </button>
@@ -1411,7 +1533,10 @@ export function AgentSidebar({
           </form>
         )}
 
-        <div className="agent-sidebar-body" ref={bodyRef}>
+        <div
+          className={`agent-sidebar-body${listMaximized ? ' list-maximized' : ''}`}
+          ref={bodyRef}
+        >
           <div className="agent-sidebar-tile-area" ref={tileAreaRef}>
             {phone ? (
               <div className="agent-sidebar-panes agent-sidebar-panes-column">
@@ -1467,10 +1592,10 @@ export function AgentSidebar({
               from the tile area's agent-pane split tree above, which reflows
               into whatever space this rail leaves it. */}
           <div
-            className={`agent-sidebar-list-rail${listCollapsed ? ' collapsed' : ''}${listResizing ? ' resizing' : ''}`}
+            className={`agent-sidebar-list-rail${listCollapsed ? ' collapsed' : ''}${listResizing ? ' resizing' : ''}${listMaximized ? ' maximized' : ''}`}
             style={listCollapsed ? undefined : ({ '--agent-list-width': `${listWidth}px` } as CSSProperties)}
           >
-            {!listCollapsed && (
+            {!listCollapsed && !listMaximized && (
               <div
                 className="agent-sidebar-list-resize-handle"
                 onMouseDown={(e) => {
@@ -1494,6 +1619,23 @@ export function AgentSidebar({
                   <span>Agents</span>
                   {agents.length > 0 && <span className="agent-sidebar-count">{agents.length}</span>}
                 </span>
+              )}
+              {!listCollapsed && (
+                <button
+                  type="button"
+                  className={`agent-sidebar-list-maximize${listMaximized ? ' active' : ''}`}
+                  aria-label={
+                    listMaximized ? 'Restore agents list width' : 'Maximize the agents list'
+                  }
+                  title={
+                    listMaximized
+                      ? 'Restore list width'
+                      : 'Maximize the list: close every open agent pane and fill the panel'
+                  }
+                  onClick={toggleListMaximized}
+                >
+                  <MaximizeGlyph restore={listMaximized} />
+                </button>
               )}
             </div>
             {!listCollapsed && <AgentListContent {...listProps} />}

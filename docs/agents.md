@@ -206,6 +206,36 @@ already use.
     `scripts/agents-check.sh` only pins that both fields are on the wire and
     `0` for the stub's nonexistent pids — faking a process tree from bash
     would test the fake.
+- **Two more mesa-derived fields report what a session is *saying*** (mesa task
+  869): `lastResponse` and `contextTokens`, also on every `AgentSession`, also
+  `#[serde(default)]` and camelCase, and filled in the same `list_sessions`
+  enrichment step so both routes and the cache agree. They ride on the existing
+  payload deliberately — the sidebar polls one list, and a per-row fetch would
+  turn one poll into one request per session.
+  - Both are read **live off the session's `.jsonl` transcript**
+    (`cc::session_pulse`), not out of the `cc_*` tables: what a session said
+    seconds ago is younger than any ingest. That makes it the fourth read to go
+    to the files rather than the db, beside `cc live`, `cc text` and `cc chat`.
+  - `lastResponse` is the newest assistant prose, chosen by exactly the rule
+    `cc::chat_turns` uses (`type == "assistant"` plus the message's `text`
+    blocks) — Claude Code writes its own injections as `user` lines whose
+    content is an array of `text` blocks, so a shape test alone would report a
+    skill body as something the agent said. It is untrusted model-authored text
+    on a 3-second poll, so it goes through `cc::sanitize_capped` (≤200 chars,
+    control characters dropped) like every other transcript-derived string.
+  - `contextTokens` is the newest assistant message's `input +
+    cache_read + cache_creation` tokens: the size of the newest *request's*
+    input, which is what "how full is the context window" means. Not output
+    tokens, and not a sum across messages. It is picked independently of
+    `lastResponse` — a session's newest line is routinely a tool call, which
+    carries usage but no prose.
+  - The transcript tail read here is 256 KiB, not the chat view's 2 MiB: this
+    runs for **every** listed session on every poll, where the chat window
+    backs one open pane.
+  - Fails open exactly as the counts do — no transcript, an unreadable file, no
+    assistant line, no usage all answer `null`, never an `Err`. Rust unit tests
+    in `src/core/cc.rs` cover the token arithmetic, newest-prose-wins, the
+    injected-`user`/sidechain exclusions and the missing transcript.
 - The liveness test is `isRunningAgent` in `frontend/src/agentProject.ts`,
   **not** a local helper in `AgentSidebar.tsx`, because three surfaces ask the
   same question and must not drift: the sidebar's `bucketOf` above, the

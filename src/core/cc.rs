@@ -2681,8 +2681,9 @@ const CHAT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const CHAT_TAIL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// One session's conversation, read **live from its transcript file** rather
-/// than from the `cc_*` tables (task 814) — the third and last read to do so,
-/// beside [`live`] and [`node_text`], and for both of their reasons at once:
+/// than from the `cc_*` tables (task 814) — one of the four reads to do so,
+/// beside [`live`], [`node_text`] and [`session_pulse`], and for two of their
+/// reasons at once:
 /// the newest turns of a running session are younger than any ingest, and the
 /// bodies a chat window renders were deliberately never stored (a stored
 /// preview is 200 sanitized characters).
@@ -2713,7 +2714,7 @@ pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
         Error::Unavailable(format!("no transcript on disk for session {session_id}"))
     })?;
     let path = transcript_path(&path.to_string_lossy())?;
-    let (text, windowed) = read_tail(&path)?;
+    let (text, windowed) = read_tail(&path, CHAT_TAIL_BYTES)?;
 
     let mut turns = chat_turns(&text);
     let pending_question = pending_ask(&text);
@@ -2913,6 +2914,100 @@ fn chat_turns(text: &str) -> Vec<CcChatTurn> {
     turns
 }
 
+/// The tail [`session_pulse`] reads — two orders of magnitude under
+/// [`CHAT_TAIL_BYTES`] on purpose. The chat window backs **one** open pane;
+/// the pulse runs for **every** session in the agents list on every poll of
+/// it, so its cost is multiplied by the session count and paid again every
+/// couple of seconds. All it has to find is the newest assistant line, which
+/// on a live session is within a few KB of EOF; 256 KiB is slack for a tail
+/// full of large tool results, not a budget it expects to spend.
+const PULSE_TAIL_BYTES: u64 = 256 * 1024;
+
+/// What one running session is saying and how full its context is — the two
+/// mesa-derived fields the Agents sidebar row shows (task 869).
+#[derive(Debug, Default, PartialEq)]
+pub struct SessionPulse {
+    /// The assistant's newest prose, sanitized and capped by
+    /// [`sanitize_capped`].
+    pub last_response: Option<String>,
+    /// The newest assistant message's occupied context window.
+    pub context_tokens: Option<i64>,
+}
+
+/// One session's pulse, read **live off its transcript** — the fourth read to
+/// go to the files rather than the `cc_*` tables, beside [`live`],
+/// [`node_text`] and [`session_chat`], and for [`live`]'s reason: what a
+/// session said seconds ago is younger than any ingest, and this backs a
+/// 3-second poll on a *running* session.
+///
+/// **Fails open in every direction** — an unknown session, no transcript on
+/// disk, an unreadable file, a window holding no assistant line and a session
+/// that has never carried usage all answer an all-`None` [`SessionPulse`],
+/// never an error. It hangs off the agents endpoints and off the list the
+/// todo watcher reads: neither may be turned into a failure by a missing file.
+pub fn session_pulse(session_id: &str) -> SessionPulse {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return SessionPulse::default();
+    }
+    let Some(path) = find_transcript(session_id) else {
+        return SessionPulse::default();
+    };
+    let Ok((text, _)) = read_tail(&path, PULSE_TAIL_BYTES) else {
+        return SessionPulse::default();
+    };
+    pulse_from_text(&text)
+}
+
+/// Pure half of [`session_pulse`]: fold a transcript window into the newest
+/// assistant prose and the newest occupied context. Split out so the
+/// line-classification rule is unit-testable against literal lines, like
+/// [`chat_turns`].
+///
+/// The two answers come from **independently** chosen lines: a session's
+/// newest message is routinely a tool call, which carries usage but no prose,
+/// while the reply before it carries the prose. Taking both off one line would
+/// blank whichever half that line lacks.
+///
+/// "Assistant" is [`chat_turns`]' rule exactly — `type == "assistant"` plus
+/// [`RawMessage::assistant_text_raw`] — because Claude Code writes its own
+/// injections (hook output, a skill body, a caveat banner) as `user` lines
+/// whose content is an array of `text` blocks, and a shape test alone would
+/// report one of those as something the agent said.
+fn pulse_from_text(text: &str) -> SessionPulse {
+    let mut pulse = SessionPulse::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
+        // A subagent's turns are its own; the same main-thread-only rule
+        // `chat_turns` keeps.
+        if raw.is_sidechain == Some(true) || raw.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = raw.message.as_ref() else {
+            continue;
+        };
+        if let Some(prose) = msg.assistant_text() {
+            pulse.last_response = Some(prose);
+        }
+        if let Some(u) = msg.usage.as_ref() {
+            // Input side only: the context window is the size of the newest
+            // request, not of the whole conversation and not of the reply.
+            pulse.context_tokens =
+                Some(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens);
+        }
+    }
+    pulse
+}
+
 /// The main-thread transcript of `session_id`: `<projects_dir>/*/<id>.jsonl`.
 ///
 /// The project slug is unknown here — it encodes the session's cwd, which the
@@ -2931,12 +3026,17 @@ fn find_transcript(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// The last [`CHAT_TAIL_BYTES`] of `path` as text, plus whether the window
+/// The last `window` bytes of `path` as text, plus whether the window
 /// actually cut anything. A cut lands mid-line, so the first (partial) line is
 /// dropped — losing at most one turn that a caller was told is truncated
 /// anyway. Lossy UTF-8 for the same reason the parsers elsewhere are lenient:
 /// one bad byte must not blank a whole conversation.
-fn read_tail(path: &Path) -> Result<(String, bool)> {
+///
+/// The window is a parameter because its two callers have opposite budgets:
+/// [`session_chat`] backs one open pane and asks for [`CHAT_TAIL_BYTES`],
+/// while [`session_pulse`] runs for every listed session on every poll and
+/// asks for [`PULSE_TAIL_BYTES`].
+fn read_tail(path: &Path, mut window: u64) -> Result<(String, bool)> {
     let mut f = fs::File::open(path)?;
     let len = f.metadata()?.len();
     let read_all = |f: &mut fs::File| -> Result<(String, bool)> {
@@ -2945,7 +3045,6 @@ fn read_tail(path: &Path) -> Result<(String, bool)> {
         f.read_to_end(&mut buf)?;
         Ok((String::from_utf8_lossy(&buf).into_owned(), false))
     };
-    let mut window = CHAT_TAIL_BYTES;
     // `buf` holds the bytes from `have_from` to EOF, and **grows downward**:
     // widening reads only the newly exposed prefix and prepends it, never the
     // whole window again. This is a poll, and the widening case is by
@@ -5494,5 +5593,102 @@ mod tests {
             "a line wholly inside the window is not a partial line and must survive"
         );
         assert!(chat.truncated, "`old` really was dropped, so say so");
+    }
+
+    // ---- session pulse (task 869) ----
+
+    /// One transcript ending the way a working session's does: prose, then a
+    /// tool call that carries usage but no prose. Also holds an *older*
+    /// assistant turn, an injected `user` line whose content is text blocks,
+    /// and a sidechain line — none of which may become the pulse.
+    const PULSE_LINES: &str = concat!(
+        r#"{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","message":{"id":"m1","model":"claude-opus-5","content":[{"type":"text","text":"an earlier reply"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"i1","sessionId":"s","timestamp":"2026-08-01T10:00:01.000Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"sa1","isSidechain":true,"agentId":"g1","sessionId":"s","timestamp":"2026-08-01T10:00:02.000Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"subagent prose"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"a2","sessionId":"s","timestamp":"2026-08-01T10:00:03.000Z","message":{"id":"m2","model":"claude-opus-5","content":[{"type":"text","text":"the newest reply"}],"usage":{"input_tokens":100,"output_tokens":9000,"cache_read_input_tokens":200,"cache_creation_input_tokens":300}}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"a3","sessionId":"s","timestamp":"2026-08-01T10:00:04.000Z","message":{"id":"m3","model":"claude-opus-5","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}],"usage":{"input_tokens":1000,"output_tokens":5,"cache_read_input_tokens":2000,"cache_creation_input_tokens":3000}}}"#,
+        "\n",
+        "not json at all\n",
+    );
+
+    #[test]
+    fn pulse_takes_the_newest_prose_and_the_newest_context_independently() {
+        let pulse = pulse_from_text(PULSE_LINES);
+        assert_eq!(
+            pulse.last_response.as_deref(),
+            Some("the newest reply"),
+            "the newest assistant prose wins over an earlier one — and the \
+             newest line of all is a tool call, which has no prose to offer"
+        );
+        assert_eq!(
+            pulse.context_tokens,
+            Some(1000 + 2000 + 3000),
+            "context is the newest message's input + cache_read + \
+             cache_creation — never output, never a sum across messages"
+        );
+    }
+
+    #[test]
+    fn pulse_ignores_a_synthesized_user_line_and_a_subagent() {
+        // Claude Code writes its own injections (a skill body, hook output, a
+        // caveat banner) as `user` lines whose content is an array of `text`
+        // blocks — exactly the shape assistant prose has.
+        let injected = r#"{"type":"user","uuid":"i1","sessionId":"s","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}],"usage":{"input_tokens":7,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        let sidechain = r#"{"type":"assistant","uuid":"sa1","isSidechain":true,"sessionId":"s","message":{"model":"m","content":[{"type":"text","text":"subagent prose"}],"usage":{"input_tokens":9,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        assert_eq!(
+            pulse_from_text(&format!("{injected}\n{sidechain}\n")),
+            SessionPulse::default(),
+            "neither an injected user line nor a subagent is this session \
+             speaking"
+        );
+    }
+
+    #[test]
+    fn pulse_prose_is_bounded_and_a_usageless_session_has_no_context() {
+        let long = "z".repeat(TARGET_MAX_CHARS + 500);
+        let line = assistant_line("a1", &long, None);
+        let pulse = pulse_from_text(&line);
+        let got = pulse.last_response.unwrap();
+        assert_eq!(
+            got.chars().count(),
+            TARGET_MAX_CHARS + 1,
+            "model-authored text on a 3-second poll is capped, with the `…` \
+             that marks the cut"
+        );
+        assert!(got.ends_with('…'));
+        assert_eq!(
+            pulse.context_tokens, None,
+            "a line with no usage block leaves the context unknown, not zero"
+        );
+    }
+
+    #[test]
+    fn session_pulse_fails_open_on_a_missing_transcript() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let proj = root.join("-some-project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("sess-1.jsonl"), PULSE_LINES).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", &root) };
+        let found = session_pulse("sess-1");
+        let missing = session_pulse("sess-2");
+        let bogus = session_pulse("../../etc/passwd");
+        // SAFETY: same window, same lock.
+        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+
+        assert_eq!(found.last_response.as_deref(), Some("the newest reply"));
+        assert_eq!(found.context_tokens, Some(6000));
+        assert_eq!(
+            missing,
+            SessionPulse::default(),
+            "a session with no transcript on disk is silent, not an error"
+        );
+        assert_eq!(bogus, SessionPulse::default());
     }
 }

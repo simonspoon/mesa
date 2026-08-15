@@ -105,6 +105,7 @@ fn list_sessions(bin: &str) -> Result<Vec<AgentSession>, String> {
     // global one — and so both surfaces (and the `agents_cache` TTL in
     // `src/api.rs`, which caches whatever this returns) see the same numbers.
     enrich_liveness(&mut sessions);
+    enrich_pulse(&mut sessions);
     Ok(sessions)
 }
 
@@ -148,6 +149,27 @@ fn enrich_liveness(sessions: &mut [AgentSession]) {
             Some(root) => count_live_subagents(root, &session.session_id, now),
             None => 0,
         };
+    }
+}
+
+/// Fills in the two mesa-derived pulse fields — what the session last said
+/// and how much context it is holding — from each session's transcript
+/// (task 869).
+///
+/// A sibling of [`enrich_liveness`] rather than part of it: the counts come
+/// from `ps` and directory mtimes, these come from reading a file's tail, and
+/// both are best-effort probes that must **fail open**. A session with no
+/// transcript (never started, or a transcript Claude Code has removed) simply
+/// keeps its `None`s — [`cc::session_pulse`] returns no error to swallow.
+///
+/// Runs on the same list, at the same place, for the same reason
+/// [`enrich_liveness`] does: so `list_all` and `list_under` and the
+/// `agents_cache` TTL in `src/api.rs` all see one set of numbers.
+fn enrich_pulse(sessions: &mut [AgentSession]) {
+    for session in sessions.iter_mut() {
+        let pulse = cc::session_pulse(&session.session_id);
+        session.last_response = pulse.last_response;
+        session.context_tokens = pulse.context_tokens;
     }
 }
 
@@ -1081,21 +1103,32 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // is asserted only through the pure counter above — these synthetic
         // pids could belong to anything on the machine running the tests.)
         assert!(sessions.iter().all(|s| s.live_subagents == 0));
+        // Same rule for the pulse: no transcript to read is silence, not an
+        // Err — the todo watcher reads this list.
+        assert!(sessions.iter().all(|s| s.last_response.is_none()));
+        assert!(sessions.iter().all(|s| s.context_tokens.is_none()));
     }
 
     #[test]
     fn liveness_counts_serialize_camel_case_and_default_when_absent() {
         // The CLI payload never carries these — parsing must not require them
-        // — but the web UI reads them as `liveShells`/`liveSubagents`.
+        // — but the web UI reads them as `liveShells`/`liveSubagents`, and the
+        // pulse pair as `lastResponse`/`contextTokens`.
         let sessions = parse_sessions(SESSIONS_JSON.as_bytes()).unwrap();
         assert_eq!(sessions[0].live_shells, 0);
         assert_eq!(sessions[0].live_subagents, 0);
+        assert_eq!(sessions[0].last_response, None);
+        assert_eq!(sessions[0].context_tokens, None);
         let mut session = sessions[1].clone();
         session.live_shells = 3;
         session.live_subagents = 1;
+        session.last_response = Some("on it".into());
+        session.context_tokens = Some(6000);
         let json = serde_json::to_value(&session).unwrap();
         assert_eq!(json["liveShells"], 3);
         assert_eq!(json["liveSubagents"], 1);
+        assert_eq!(json["lastResponse"], "on it");
+        assert_eq!(json["contextTokens"], 6000);
     }
 
     #[test]

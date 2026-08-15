@@ -23,6 +23,8 @@ function session(over: Partial<AgentSession> = {}): AgentSession {
     waitingFor: null,
     liveShells: 0,
     liveSubagents: 0,
+    lastResponse: null,
+    contextTokens: null,
     ...over,
   }
 }

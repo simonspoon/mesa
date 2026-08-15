@@ -155,6 +155,14 @@ ok "GET /api/projects/{id}/agents lists sessions under local_path"
 [ "$(jqb '.agents[0].liveSubagents')" = "0" ] || fail "GET agents: liveSubagents must be present and 0"
 ok "sessions carry mesa-derived liveShells/liveSubagents, failing open to 0"
 
+# lastResponse/contextTokens are the other mesa-derived pair (mesa task 869),
+# read off the session's transcript. There is no transcript here, so both must
+# fail open to null — present on the wire, camelCase, and never an error. The
+# derivation itself is pinned by the Rust unit tests in src/core/cc.rs.
+[ "$(jqb '.agents[0].lastResponse')" = "null" ] || fail "GET agents: lastResponse must be present and null"
+[ "$(jqb '.agents[0].contextTokens')" = "null" ] || fail "GET agents: contextTokens must be present and null"
+ok "sessions carry mesa-derived lastResponse/contextTokens, failing open to null"
+
 api 200 GET "/api/projects/$D/agents"
 [ "$(jqb .path)" = "null" ] || fail "GET agents (no path): path null"
 [ "$(jqb '.agents | length')" = "0" ] || fail "GET agents (no path): empty list"
@@ -193,6 +201,8 @@ api 200 GET "/api/agents"
 [ "$(jqb '.[2].cwd')" = "$TOPLEVEL" ] || fail "GET /api/agents: third session cwd"
 [ "$(jqb '[.[] | select(.liveShells == 0 and .liveSubagents == 0)] | length')" = "3" ] ||
   fail "GET /api/agents: every session must carry both liveness counts, 0 here"
+[ "$(jqb '[.[] | select(.lastResponse == null and .contextTokens == null)] | length')" = "3" ] ||
+  fail "GET /api/agents: every session must carry the pulse pair, null here"
 ok "GET /api/agents lists sessions across every folder (bare array, no --cwd), each enriched with the liveness counts"
 
 # Cross-site defense: list/spawn reject a foreign browser Origin (like the

@@ -50,4 +50,21 @@ liveShells: number,
  * run in-process (no child process), so their jsonl mtimes are the only
  * available liveness signal.
  */
-liveSubagents: number, };
+liveSubagents: number, 
+/**
+ * **mesa-derived, not from the CLI payload.** The tail of what this
+ * session's assistant last said, read live off its transcript and
+ * **bounded** by `cc::sanitize_capped` — it is untrusted model-authored
+ * text on a 3-second poll, so it is capped and stripped of control
+ * characters exactly as a stored preview is. `null` when the transcript
+ * is missing or has no assistant prose in its window.
+ */
+lastResponse: string | null, 
+/**
+ * **mesa-derived, not from the CLI payload.** The context window this
+ * session currently occupies: the newest assistant message's
+ * `input + cache_read + cache_creation` tokens. Not a sum across
+ * messages and not output tokens — a context window is the size of the
+ * newest *request's* input. `null` when no usage is in the window.
+ */
+contextTokens: number | null, };

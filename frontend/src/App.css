@@ -3004,6 +3004,78 @@ main {
   overflow-wrap: anywhere;
 }
 
+/* The Agent sidebar's list row (mesa task 869): four stacked lines — title,
+   pills, latest response, meta. Each line is its own block so a long value
+   on one can never push another out of the rail. */
+.agent-row-title {
+  display: flex;
+  min-width: 0;
+}
+
+.agent-row-title .agent-name {
+  margin-right: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.agent-row-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.25rem;
+}
+
+/* The agent's latest prose. Clamped to two lines: enough to tell what it is
+   doing, never enough to turn the row into a paragraph. `overflow-wrap`
+   because a model can emit a long unbroken path or identifier, and the rail
+   is only ~240px wide. */
+.agent-row-response {
+  margin-top: 0.3rem;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--muted);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* Meta line: project + age on the left, the context-window figure pinned
+   right. Only the project/cwd may shrink (`min-width: 0` + ellipsis); the age
+   and the token count are short, fixed and never pushed off the row — a bare
+   cwd, which is what a session under no project shows, is long enough to eat
+   the whole line otherwise. */
+.agent-row-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.agent-row-meta-where {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-row-meta-age {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* `margin-left: auto` pushes it to the trailing edge whatever the two spans
+   before it measure. */
+.agent-row-context {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--cyan);
+}
+
 .badge.agent-kind-background {
   color: var(--cyan);
   border-color: var(--cyan-dim);
@@ -3390,6 +3462,45 @@ body.files-tree-resizing {
 
 .agent-sidebar-list-toggle:hover {
   color: var(--cyan);
+}
+
+/* Maximize/restore the rail inside the sidebar body (mesa task 869) — sits
+   at the header's trailing edge, so the title track between it and the
+   collapse toggle takes the slack. */
+.agent-sidebar-list-rail-header .agent-sidebar-pane-title {
+  flex: 1;
+}
+
+.agent-sidebar-list-maximize {
+  display: flex;
+  align-items: center;
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 0.25rem;
+}
+
+.agent-sidebar-list-maximize:hover,
+.agent-sidebar-list-maximize.active {
+  color: var(--cyan);
+}
+
+.agent-sidebar-list-maximize-glyph {
+  display: block;
+}
+
+/* Maximized: the rail takes the whole body and the tile area beside it goes
+   to nothing. Every pane was closed on the way in (`toggleListMaximized`),
+   so no attached terminal is being zeroed here — the tile area is empty. */
+.agent-sidebar-body.list-maximized .agent-sidebar-tile-area {
+  display: none;
+}
+
+.agent-sidebar-list-rail.maximized {
+  flex: 1;
+  width: auto;
 }
 
 /* Body of the 'Agents' list rail — fills the remaining flex space below the

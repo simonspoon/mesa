@@ -11,12 +11,15 @@ files, so history survives Claude Code's own transcript cleanup and nothing is
 ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
 CLI and API share it and never diverge.
 
-**Three reads carve out of "db only", and only three**: `cc live` (a direct
+**Four reads carve out of "db only", and only four**: `cc live` (a direct
 parse of the last few minutes, where the files are by definition still
 present), `cc text` (one node's full body, which is deliberately not in the db
-— see *Node text* below) and `cc chat` (one session's whole conversation, for
-both of those reasons at once — see *Session chat* below). Everything else
-answers from `cc_*` alone.
+— see *Node text* below), `cc chat` (one session's whole conversation, for
+both of those reasons at once — see *Session chat* below) and
+`cc::session_pulse` (mesa task 869: a listed session's newest reply and
+occupied context, for `live`'s reason — it backs the Agent sidebar's list row
+and is the one carve-out with no route of its own, riding on `/api/agents`;
+see `docs/agents.md`). Everything else answers from `cc_*` alone.
 
 Migration numbers in this file are the **resulting `user_version`**, i.e.
 1-based: `MIGRATIONS` in `src/core/store.rs` is a 0-indexed array, so
@@ -555,7 +558,8 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   main thread as an ordered list of turns: a human prompt, an assistant reply,
   or one tool call the assistant made.
   - **The third carve-out from "the dashboard reads only the db", and the only
-    one that is both of the other two at once.** It is `live`'s case — the
+    one that is both of the first two at once.** (The fourth,
+    `cc::session_pulse`, came later — task 869 — and is `live`'s case only.) It is `live`'s case — the
     turns a reader wants are the ones being appended *right now*, younger than
     any ingest, and for a session mesa spawned moments ago there is no row at
     all — *and* `node_text`'s: what a chat window renders is the bodies, and

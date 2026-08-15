@@ -55,6 +55,15 @@ The instruction block the agent is spawned with is
 punctuation) and the untrusted-input posture below. `live::agent_prompt(id)`
 appends the session id — the only per-call part.
 
+That block is the **default**, not the only possibility: `~/.mesa/config.json`'s
+`live.prompt` replaces it whenever the Settings page has one (mesa task 867,
+`docs/config.md`). Read on every start, so an edit lands on the next
+conversation with no restart; blank means the built-in, and the session line is
+the one thing mesa still appends either way. A rewritten prompt is how the
+conversation changes character — but the loop `AGENT_PROMPT` describes is what
+makes the feature work, and a prompt that never mentions `mesa live listen`
+produces an agent that hears nothing.
+
 ## Why the queue lives in SQLite
 
 The turn queue is two tables, not a channel in the server's memory, because
@@ -487,8 +496,10 @@ The spawn is the fourth configurable command: **`live-agent`**, defaulting to
 `{bin} --bg --agent {agent} --name {name} -- {prompt}` — the union of the two
 existing shapes, since a live session is a mesa record (so it has an `{id}` and
 a `{name}`) *and* carries a prompt mesa supplies. That prompt is
-`live::agent_prompt`, so the feature works with **no user configuration**.
-Everything else about the template — argv vs script mode, tokenize-then-
+`live::agent_prompt`, so the feature works with **no user configuration** — and
+the prompt itself is the file's fifth section, `live.prompt`, which **replaces**
+the built-in block when it is set (an empty one is never stored; blank is the
+reset). Everything else about the template — argv vs script mode, tokenize-then-
 substitute, the `MESA_*` environment handoff, a `{placeholder}` refused inside
 a script — is inherited, not re-implemented. See `docs/config.md`.
 

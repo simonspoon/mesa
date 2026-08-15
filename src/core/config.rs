@@ -86,6 +86,22 @@
 //! default mesa names: it means no `-v` is passed at all, so the synthesiser's
 //! own default applies and an unconfigured install runs the argv it ran before
 //! this setting existed. See [`speech_voice`] and `docs/inbox.md`.
+//!
+//! ## Live
+//!
+//! A fifth section holds the instruction block a live conversation's agent is
+//! spawned with (mesa task 867):
+//!
+//! ```json
+//! { "live": { "prompt": "You are the voice of mesa …" } }
+//! ```
+//!
+//! One key, [`LIVE_PROMPT`], read on every `mesa live start`. Absent or blank
+//! is the block mesa ships ([`crate::core::live::AGENT_PROMPT`]), so an
+//! unconfigured install spawns exactly the agent it spawned before this
+//! setting existed; a configured value **replaces** it — what the Settings box
+//! holds is the whole of what mesa sends. See [`live_prompt`] and
+//! `docs/live.md`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -94,7 +110,9 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::core::speech;
-use crate::core::types::{ConfigCommand, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates};
+use crate::core::types::{
+    ConfigCommand, ConfigLive, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
+};
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
 pub const TODO_WATCHER: &str = "todo-watcher";
@@ -1326,6 +1344,164 @@ pub fn validate_voice(voice: &str, offered: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Live (mesa task 867)
+// ---------------------------------------------------------------------------
+
+/// The config key holding the instruction block a live agent is spawned with.
+pub const LIVE_PROMPT: &str = "prompt";
+
+/// Every key the `live` section understands, for the unknown-key error.
+const LIVE_KEYS: &[&str] = &[LIVE_PROMPT];
+
+/// How long a configured prompt may be. Generous — the built-in is a few
+/// kilobytes and a person elaborating on it should not hit a wall — but
+/// bounded, because the text becomes one `Command::arg` on every spawn.
+pub const MAX_LIVE_PROMPT: usize = 16 * 1024;
+
+/// The `live` map, deserialized on its own for the reason every other section
+/// is: five independent features share one file, and a broken value in any of
+/// them must not take the other four down.
+#[derive(Debug, Default, Deserialize)]
+struct LiveConfig {
+    #[serde(default)]
+    live: LiveSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LiveSection {
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+fn read_live(path: &Path) -> Result<LiveSection, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LiveSection::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: LiveConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.live)
+}
+
+/// The configured live prompt, or `None` for "the block mesa ships"
+/// ([`crate::core::live::AGENT_PROMPT`]).
+///
+/// Read **on every spawn**, like [`command_for`] is, so an edit lands on the
+/// next conversation with no restart. Blank is absence — the file's own
+/// spelling of "the default". Only the *outer* whitespace is trimmed: the text
+/// is prose a person wrote, and its internal shape is theirs.
+pub fn live_prompt() -> Result<Option<String>, String> {
+    live_prompt_in(&config_file())
+}
+
+fn live_prompt_in(path: &Path) -> Result<Option<String>, String> {
+    Ok(read_live(path)?
+        .prompt
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty()))
+}
+
+/// The live settings for the Settings page (`GET /api/config/live`): the
+/// configured prompt (`null` when the file says nothing) plus the built-in
+/// block, so the editor can show what blank means and start an edit from it
+/// without shipping a second copy of the text.
+pub fn live() -> Result<ConfigLive, String> {
+    live_in(&config_file())
+}
+
+fn live_in(path: &Path) -> Result<ConfigLive, String> {
+    Ok(ConfigLive {
+        prompt: live_prompt_in(path)?,
+        default_prompt: crate::core::live::AGENT_PROMPT.to_string(),
+    })
+}
+
+/// Writes the `live` entries named in `updates` into the config file.
+///
+/// - `None` (or blank) **removes** the key, restoring the block mesa ships —
+///   the same meaning blank has for a command and `null` for a watcher limit.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_commands`], [`save_pricing`], [`save_watchers`] and
+///   [`save_speech`]: one read-modify-write over the whole document, so all
+///   five sections (and any mesa doesn't know) survive each other's edits.
+pub fn save_live(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    save_live_in(&config_file(), updates)
+}
+
+fn save_live_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        // Nothing named, nothing to do — and no empty `"live": {}` written into
+        // a file the user never configured.
+        return Ok(());
+    }
+    let mut keys: Vec<&String> = updates.keys().collect();
+    keys.sort();
+    for key in &keys {
+        if !LIVE_KEYS.contains(&key.as_str()) {
+            return Err(SaveError::Validation(format!(
+                "unknown live setting {key:?}; mesa configures {}",
+                LIVE_KEYS.join(", ")
+            )));
+        }
+        // Blank is the reset, not a value to check — same rule as a command box.
+        if let Some(value) = updates[*key].as_deref().map(str::trim)
+            && !value.is_empty()
+        {
+            validate_live_prompt(value).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("live")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"live\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for key in keys {
+        match updates[key].as_deref().map(str::trim) {
+            None | Some("") => {
+                section.remove(key);
+            }
+            Some(value) => {
+                section.insert(key.clone(), serde_json::Value::String(value.to_string()));
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// A live prompt is free prose — it is spoken instructions for a model, not a
+/// command line — so the only rule is a length bound. It is never parsed by a
+/// shell and never substituted into one: it reaches the agent as a single
+/// `Command::arg` (or as `$MESA_PROMPT` in script mode), exactly as the
+/// built-in block does.
+pub fn validate_live_prompt(prompt: &str) -> Result<(), String> {
+    if prompt.len() > MAX_LIVE_PROMPT {
+        return Err(format!(
+            "the live prompt is {} bytes; the limit is {MAX_LIVE_PROMPT}",
+            prompt.len()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2236,6 +2412,11 @@ mod tests {
             survives("speech")["commands"]["todo-watcher"],
             "mytool run {id}"
         );
+        // And the live saver is the fifth (mesa task 867).
+        save_live_in(&path, &live_update(&[(LIVE_PROMPT, Some("Be brief."))])).unwrap();
+        let root = survives("live");
+        assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
+        assert_eq!(root["live"][LIVE_PROMPT], "Be brief.");
     }
 
     #[test]
@@ -2417,6 +2598,85 @@ mod tests {
         assert!(speech_in(&path).is_err());
         let err =
             save_speech_in(&path, &voice(&[(VOICE, Some("af_heart"))]), &offered()).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    fn live_update(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    /// The whole live-prompt contract in one pass: nothing configured is the
+    /// built-in block, a saved prompt is what the spawn path reads, and blank
+    /// or `null` removes the key rather than storing an empty prompt that
+    /// would spawn an agent with no instructions at all.
+    #[test]
+    fn live_prompt_round_trips_and_resets_to_the_built_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(live_prompt_in(&path).unwrap(), None);
+        assert_eq!(
+            live_in(&path).unwrap().default_prompt,
+            crate::core::live::AGENT_PROMPT
+        );
+
+        save_live_in(&path, &live_update(&[(LIVE_PROMPT, Some("  Be brief.  "))])).unwrap();
+        assert_eq!(live_prompt_in(&path).unwrap().as_deref(), Some("Be brief."));
+        assert_eq!(live_in(&path).unwrap().prompt.as_deref(), Some("Be brief."));
+
+        for reset in [None, Some("")] {
+            save_live_in(&path, &live_update(&[(LIVE_PROMPT, Some("Be brief."))])).unwrap();
+            save_live_in(&path, &live_update(&[(LIVE_PROMPT, reset)])).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(written["live"].get(LIVE_PROMPT).is_none(), "{reset:?}");
+            assert_eq!(live_prompt_in(&path).unwrap(), None);
+        }
+    }
+
+    /// A rejected save leaves the file byte-identical, and an unknown key in
+    /// the section is named rather than silently written.
+    #[test]
+    fn save_live_rejects_an_oversized_prompt_and_an_unknown_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"live": {"prompt": "Be brief."}}"#;
+        let path = write_config(dir.path(), before);
+
+        let huge = "x".repeat(MAX_LIVE_PROMPT + 1);
+        let err = save_live_in(&path, &live_update(&[(LIVE_PROMPT, Some(&huge))])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("live prompt")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let err = save_live_in(&path, &live_update(&[("voice", Some("af_heart"))])).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unknown live setting")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Nothing named writes nothing — no empty `"live": {}` appears.
+        let path = dir.path().join("untouched.json");
+        save_live_in(&path, &HashMap::new()).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn live_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = live_prompt_in(&path).unwrap_err();
+        assert!(err.contains("malformed mesa config"), "{err}");
+        assert!(live_in(&path).is_err());
+        let err = save_live_in(&path, &live_update(&[(LIVE_PROMPT, Some("hi"))])).unwrap_err();
         assert!(
             matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
             "{err:?}"

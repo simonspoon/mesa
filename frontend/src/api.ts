@@ -16,6 +16,7 @@ import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
 import type { ConfigPrice } from './types/ConfigPrice'
 import type { ConfigSpeech } from './types/ConfigSpeech'
+import type { ConfigLive } from './types/ConfigLive'
 import type { ConfigWatchers } from './types/ConfigWatchers'
 import type { Diagram } from './types/Diagram'
 import type { DiagramEvent } from './types/DiagramEvent'
@@ -1098,6 +1099,28 @@ export function updateSpeech(
  */
 export function speechPreviewUrl(voice: string): string {
   return `/api/config/speech/preview?voice=${encodeURIComponent(voice)}`
+}
+
+/**
+ * The live settings in `~/.mesa/config.json`: the instruction block a live
+ * conversation's agent is spawned with (mesa task 867), plus the block mesa
+ * ships. `prompt: null` means the config says nothing, so `default_prompt` is
+ * what the agent gets. 502 `unavailable` means the config file itself is
+ * unreadable, exactly as for `getConfig`.
+ */
+export function getLiveConfig(): Promise<ConfigLive> {
+  return request('/api/config/live')
+}
+
+/**
+ * Writes live settings and echoes them as re-read from disk. Only the keys
+ * passed are touched; `null` removes one, restoring the block mesa ships. 422
+ * `validation` is a prompt past the length bound, and nothing is written then.
+ */
+export function updateLiveConfig(
+  live: Record<string, string | null>,
+): Promise<ConfigLive> {
+  return request('/api/config/live', jsonInit('PUT', live))
 }
 
 // ---- scripts (user-authored shell) ----

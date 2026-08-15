@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
   getConfig,
+  getLiveConfig,
   getPricing,
   getSpeech,
   getWatchers,
@@ -9,6 +10,7 @@ import {
   restartServer,
   speechPreviewUrl,
   updateConfig,
+  updateLiveConfig,
   updatePricing,
   updateSpeech,
   updateWatchers,
@@ -53,6 +55,15 @@ import {
   valueError as voiceError,
   type SpeechDraft,
 } from '../speechDraft'
+import {
+  changedLive,
+  draftFrom as liveDraftFrom,
+  isDirty as isLiveDirty,
+  isSavable as isLiveSavable,
+  usesDefault,
+  valueError as livePromptError,
+  type LivePromptDraft,
+} from '../livePromptDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
 import { useFetch } from '../useFetch'
 import {
@@ -266,6 +277,7 @@ export function SettingsView() {
       {saveError && <p className="error">{saveError}</p>}
 
       <WatchersSection />
+      <LivePromptSection />
       <SpeechSection />
       <PricingSection />
     </div>
@@ -372,6 +384,131 @@ function WatchersSection() {
           onClick={save}
         >
           {saving ? 'saving…' : 'save watchers'}
+        </button>
+        {dirty && savable && !saving && (
+          <span className="muted">unsaved changes</span>
+        )}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {saveError && <p className="error">{saveError}</p>}
+    </>
+  )
+}
+
+/**
+ * Live: the instruction block the conversation's agent is spawned with (mesa
+ * task 867). Its own section, draft and save button, for the same reason
+ * watchers and pricing have theirs — a separate endpoint, so one form's
+ * rejection must not strand the other's edits.
+ *
+ * Two things it must not soften:
+ * - **Blank is the block mesa ships**, never "no instructions": a live agent
+ *   with an empty prompt is an agent that does not know it is in a
+ *   conversation, so clearing the box removes the key rather than storing "".
+ * - **What is in the box is the whole of what mesa sends.** The "start from
+ *   the built-in" button fills the box with the shipped text so an edit is a
+ *   change to it, rather than an addition mesa would have to merge.
+ */
+function LivePromptSection() {
+  const { data: live, error, refetch } = useFetch(() => getLiveConfig(), 'live')
+  const [draft, setDraft] = useState<LivePromptDraft | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const seeded: LivePromptDraft =
+    draft ?? (live ? liveDraftFrom(live) : { prompt: '' })
+
+  function edit(value: string) {
+    setDraft({ prompt: value })
+    setSaved(false)
+  }
+
+  function save() {
+    if (!live) return
+    setSaving(true)
+    setSaveError(null)
+    updateLiveConfig(changedLive(live, seeded)).then(
+      (fresh) => {
+        // Re-seed from what the server read back, so the box shows what landed.
+        setDraft(liveDraftFrom(fresh))
+        setSaving(false)
+        setSaved(true)
+        refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Live conversation</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!live) {
+    return (
+      <>
+        <h2>Live conversation</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isLiveDirty(live, seeded)
+  const savable = isLiveSavable(seeded)
+  const fieldError = livePromptError(seeded.prompt)
+  const onDefault = usesDefault(seeded)
+
+  return (
+    <>
+      <h2>Live conversation</h2>
+      <section className="settings-command">
+        <label htmlFor="live-prompt">
+          <span className="settings-command-title">
+            Agent prompt
+          </span>
+          <code className="settings-command-key">live.prompt</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          What the agent driving a spoken conversation is told to do. Blank = the
+          prompt mesa ships; anything here <strong>replaces</strong> it, so this
+          box is the whole of what the agent is sent. mesa adds one line naming
+          the session it is driving, and nothing else.
+        </p>
+        <textarea
+          id="live-prompt"
+          className="settings-prompt-input"
+          rows={onDefault ? 6 : 18}
+          spellCheck={false}
+          value={seeded.prompt}
+          placeholder={live.default_prompt}
+          onChange={(e) => edit(e.target.value)}
+        />
+        {fieldError && <p className="error">{fieldError}</p>}
+        {onDefault && (
+          <button
+            type="button"
+            className="settings-inline-button"
+            onClick={() => edit(live.default_prompt)}
+          >
+            start from the built-in prompt
+          </button>
+        )}
+      </section>
+
+      <div className="settings-actions">
+        <button
+          type="button"
+          disabled={!dirty || !savable || saving}
+          onClick={save}
+        >
+          {saving ? 'saving…' : 'save live prompt'}
         </button>
         {dirty && savable && !saving && (
           <span className="muted">unsaved changes</span>

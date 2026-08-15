@@ -976,6 +976,13 @@ fn router(state: AppState) -> Router {
         // the voice named on the query string rather than the one on disk.
         // A read that changes nothing, gated like the speak route it copies.
         .route("/api/config/speech/preview", get(preview_speech))
+        // The same file's `live` section — the instruction block a live
+        // conversation's agent is spawned with (mesa task 867). A fifth route
+        // for the same reason as the other three.
+        .route(
+            "/api/config/live",
+            get(get_config_live).put(update_config_live),
+        )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -4604,6 +4611,74 @@ async fn update_config_speech(
             },
         })?;
     get_config_speech(State(state), ConnectInfo(addr), headers).await
+}
+
+/// `GET /api/config/live` — the instruction block a live conversation's agent
+/// is spawned with, plus the block mesa ships so the editor can show what blank
+/// means (`docs/config.md`, `docs/live.md`, mesa task 867).
+///
+/// Gated like `get_config_speech` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`.
+async fn get_config_live(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match blocking(config::live).await? {
+        Ok(live) => Ok(Json(live).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct LiveUpdate {
+    /// Absent leaves the prompt alone; `null` (or blank) removes it, restoring
+    /// the block mesa ships.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    prompt: Option<Option<String>>,
+}
+
+/// `PUT /api/config/live` — writes the prompt and echoes the settings.
+///
+/// **Loopback-only in both modes**, like every other config write: this text is
+/// what mesa's own agent is told to do, which is the same class of capability
+/// the command templates carry.
+async fn update_config_live(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<LiveUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    let mut updates = HashMap::new();
+    if let Some(value) = body.prompt {
+        updates.insert(config::LIVE_PROMPT.to_string(), value);
+    }
+    blocking(move || config::save_live(&updates))
+        .await?
+        .map_err(|e| match e {
+            config::SaveError::Validation(message) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message,
+            },
+            config::SaveError::Unavailable(message) => ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "unavailable",
+                message,
+            },
+        })?;
+    get_config_live(State(state), ConnectInfo(addr), headers).await
 }
 
 #[derive(Deserialize)]

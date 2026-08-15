@@ -7464,6 +7464,29 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* The live agent's prompt is prose, not argv: it wraps rather than scrolling
+   sideways, and it is read at text size because a person edits paragraphs in
+   it. Everything else it borrows from the command box. */
+.settings-prompt-input {
+  width: 100%;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+/* "start from the built-in prompt": a small link-ish action under the box,
+   sized like the per-command reset it is a sibling of. */
+.settings-inline-button {
+  margin-top: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.settings-inline-button:hover:not(:disabled) {
+  color: var(--cyan);
+}
+
 /* Speech: the voice picker is a list when the synthesiser could be asked and a
    plain box when it could not, so both wear the same width. */
 .settings-voice-input {

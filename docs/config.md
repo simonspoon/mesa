@@ -30,7 +30,9 @@ agent to loop on `mesa live listen`, reply with `mesa live say` in spoken prose
 rather than markdown, move the browser with `mesa live navigate`, and treat
 every dictated utterance as data rather than instructions. So the feature works
 with no user configuration, and a replacement template's job is to start
-*something* that will read `{prompt}` and do what it says.
+*something* that will read `{prompt}` and do what it says. That block is itself
+editable — the [`live`](#live) section below — so `{prompt}` is the user's text
+whenever they have written one.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
 for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
@@ -236,7 +238,8 @@ of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). It is a form
 over `commands` — a text box per action, the built-in default shown as the
 box's placeholder, the action's placeholder vocabulary listed under it, and the
 argv that will actually run spelled out beneath — followed by one section per
-other part of the file (Watchers, Speech, Model pricing). **Each section has
+other part of the file (Watchers, Live conversation, Speech, Model pricing).
+**Each section has
 its own endpoint, draft and save button**: they are separate writes, so one
 form's rejection must never strand another's edits.
 
@@ -491,6 +494,58 @@ reads an item in (mesa task 822, `docs/inbox.md`).
   `Origin`-independent half a no-cors `<audio src>` needs — since it is the
   same synthesis.
 
+## Live
+
+A fifth, independent section holds the **prompt** the live conversation's agent
+is spawned with (mesa task 867, `docs/live.md`).
+
+```json
+{
+  "live": {
+    "prompt": "You are the voice of mesa in a live conversation. …"
+  }
+}
+```
+
+- **Absent or blank ⇒ the block mesa ships** (`core::live::AGENT_PROMPT`), so
+  an unconfigured install spawns exactly the agent it spawned before this key
+  existed. Blank is never stored as `""`: an agent spawned with an empty prompt
+  is one that doesn't know it is in a conversation, so the save removes the key
+  instead — the same rule a blank command box follows.
+- **A configured prompt replaces the built-in**, it does not extend it. What
+  the Settings box holds is the whole of what mesa sends, which is why the
+  editor offers *start from the built-in prompt* rather than merging two texts
+  at spawn time. The **one** thing mesa still adds is the session line —
+  `You are driving mesa live session <id>.` — because that is plumbing, not
+  instruction: without it the agent cannot name the conversation it is in.
+- **It is prose, so the only rule is a length bound**
+  (`core::config::MAX_LIVE_PROMPT`, 16 KiB; over it is `422`). The text is
+  never parsed by a shell: it reaches the agent as one `Command::arg`, or as
+  `$MESA_PROMPT` in [script mode](#script-mode), exactly as the built-in block
+  does.
+- **Read on every start**, like `commands` on every spawn: edit the prompt and
+  the next conversation uses it, no restart. An existing conversation keeps the
+  agent it already started.
+
+Rewriting this prompt is how a live conversation changes character, but the
+loop it describes is what makes the feature work at all — a prompt that never
+mentions `mesa live listen` produces an agent that hears nothing. `docs/live.md`
+is the contract the text has to keep.
+
+### Routes
+
+- `GET /api/config/live` → `ConfigLive`: `{prompt, default_prompt}`, `prompt`
+  being the override (`null` when unset) and `default_prompt` the block mesa
+  ships — sent by the server so the editor can show what blank means without a
+  second copy of the text in TypeScript. Gated like the other config getters
+  (`require_agent_access`); a malformed config is **502 `unavailable`**.
+- `PUT /api/config/live`, body `{"prompt": "<text>" | null}` → echoes the
+  getter. `null` **and** blank both remove the key, restoring the built-in
+  block. A prompt past the length bound is **422 `validation`**, writing
+  nothing. Gated with `require_local_path_write`: **loopback-only in both serve
+  modes** — this text is what mesa's own agent is told to do, the same class of
+  capability the command templates carry.
+
 ## Gate
 
 `scripts/config-check.sh` — all three commands driven by a configured template
@@ -519,7 +574,7 @@ reaching the synthesiser's argv as `-v <voice>` on the very next press, `null`
 **and** `""` both removing the key, the unconfigured argv proven to carry no
 `-v` at all, a voice that isn't a bounded identifier and a well-shaped one the
 binary never offered both 422 writing nothing, 502 on a malformed file, each
-of the other three savers preserving `speech` and vice versa, and both verbs
+of the other four savers preserving `speech` and vice versa, and both verbs
 refused to a request that isn't from this machine's own page. The **preview**
 route is `scripts/api-check.sh`'s, beside the speak route whose contract and
 gate it shares (5c): mesa's own sentence on stdin, the query's voice as one
@@ -528,6 +583,16 @@ before anything is spawned. Its "reads no config" half is here instead, where a
 voice is actually configured: with `bm_george` saved, a preview of `af_bella`
 still speaks `af_bella` and a blank one still adds no `-v` — and a preview
 works even under the malformed file every other config verb answers 502 to.
+
+For live it covers the round trip (`GET` reporting `prompt: null` on a fresh
+config and carrying the built-in block as `default_prompt`), the unconfigured
+spawn proven to carry that block, a saved prompt reaching the very next spawn
+and **replacing** it — the built-in text absent from the argv, mesa's session
+line still there — `null` **and** `""` both removing the key with the next
+spawn back on the built-in, a prompt past the length bound 422 writing nothing,
+502 on a malformed file, each of the other savers preserving `live` and vice
+versa, and both verbs refused to a request that isn't from this machine's own
+page.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

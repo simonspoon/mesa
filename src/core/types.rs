@@ -260,6 +260,22 @@ pub struct ConfigSpeech {
     pub voices: Vec<String>,
 }
 
+/// The live-conversation settings as the Settings page sees them
+/// (`core::config`, `docs/config.md`, mesa task 867) — a fifth view of
+/// `~/.mesa/config.json`, with the same null-means-fallback rule as
+/// [`ConfigWatchers`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigLive {
+    /// The instruction block a live agent is spawned with, or `null` when the
+    /// config says nothing — then `default_prompt` is what the agent gets.
+    pub prompt: Option<String>,
+    /// The prompt mesa ships (`core::live::AGENT_PROMPT`), so the editor can
+    /// show what blank means — and offer it as the starting point for an edit
+    /// — without a copy of it in TypeScript.
+    pub default_prompt: String,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

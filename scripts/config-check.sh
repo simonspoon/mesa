@@ -706,6 +706,137 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused speech PUT must not touch the file"
 ok "both speech verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
+# ---- the live section: GET/PUT /api/config/live (mesa task 867) ----
+#
+# The fifth section, and the second whose value has to survive into another
+# program's argv: the prompt is what mesa hands the live conversation's agent.
+# So this covers the sibling-section rules once more, and then the thing that
+# makes the setting real — the saved text, and only the saved text, reaching
+# the spawn.
+
+start_live() { api POST /api/live '{"project_id": null}'; }
+stop_live() { api DELETE /api/live; }
+
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}, "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}}, "watchers": {"todo-concurrency": 3}, "speech": {"voice": "bm_george"}}
+EOF
+api GET /api/config/live
+[ "$CODE" = "200" ] || fail "GET live: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.prompt' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured live prompt must report null, got $STDOUT"
+# The editor shows what blank means, so the built-in text is data on the route
+# rather than a second copy in TypeScript.
+jq -e '.default_prompt | test("mesa live listen")' <<<"$STDOUT" >/dev/null ||
+  fail "GET live: default_prompt must be the block mesa ships: $STDOUT"
+ok "GET /api/config/live reports prompt: null on a fresh config and carries the built-in block as default_prompt"
+
+# Unconfigured: the agent is spawned with the block mesa ships — the pre-867
+# behaviour, unchanged.
+: > "$CLAUDE_LOG"
+start_live
+[ "$CODE" = "201" ] || fail "live start (unconfigured): expected 201, got $CODE: $STDOUT"
+grep -q "mesa live listen" "$CLAUDE_LOG" ||
+  fail "an unconfigured live prompt must spawn the built-in block: $(cat "$CLAUDE_LOG")"
+stop_live
+ok "with nothing configured, a live session spawns with the block mesa ships"
+
+api PUT /api/config/live '{"prompt": "Speak only in haiku."}'
+[ "$CODE" = "200" ] || fail "PUT live: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.prompt' <<<"$STDOUT")" = "Speak only in haiku." ] ||
+  fail "PUT must echo the stored prompt: $STDOUT"
+[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+  fail "PUT live did not write the prompt: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "a live write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
+  fail "a live write clobbered the pricing section: $(cat "$CONFIG")"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "a live write clobbered the watchers section: $(cat "$CONFIG")"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "bm_george" ] ||
+  fail "a live write clobbered the speech section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "a live write dropped a section it doesn't own: $(cat "$CONFIG")"
+ok "PUT /api/config/live sets the prompt, leaving commands, pricing, watchers, speech and an unknown section untouched"
+
+# The whole point of the setting: the saved text is what the agent is spawned
+# with — read on the start, no restart — and it REPLACES the built-in block
+# rather than joining it. The one thing mesa still adds is the session line.
+: > "$CLAUDE_LOG"
+start_live
+[ "$CODE" = "201" ] || fail "live start (configured): expected 201, got $CODE: $STDOUT"
+SESSION=$(jq -r '.id' <<<"$STDOUT")
+grep -q "Speak only in haiku." "$CLAUDE_LOG" ||
+  fail "the saved prompt must reach the spawn: $(cat "$CLAUDE_LOG")"
+! grep -q "mesa live listen" "$CLAUDE_LOG" ||
+  fail "a configured prompt must REPLACE the built-in block, not extend it: $(cat "$CLAUDE_LOG")"
+grep -q "You are driving mesa live session $SESSION" "$CLAUDE_LOG" ||
+  fail "the session line must still be there: $(cat "$CLAUDE_LOG")"
+stop_live
+ok "a configured prompt is what the live agent is spawned with — replacing the built-in block, keeping only mesa's session line"
+
+# The other savers have to leave the prompt alone, exactly as it leaves them.
+api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
+[ "$CODE" = "200" ] || fail "PUT commands after live: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+  fail "a commands write clobbered the live section: $(cat "$CONFIG")"
+api PUT /api/config/speech '{"voice": "af_bella"}'
+[ "$CODE" = "200" ] || fail "PUT speech after live: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+  fail "a speech write clobbered the live section: $(cat "$CONFIG")"
+api PUT /api/config/watchers '{"todo_concurrency": 2}'
+[ "$CODE" = "200" ] || fail "PUT watchers after live: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+  fail "a watchers write clobbered the live section: $(cat "$CONFIG")"
+ok "saving commands, speech or watchers preserves the live section, exactly as live preserves them"
+
+# Both spellings of "no prompt" remove the key: an empty prompt would spawn an
+# agent that does not know it is in a conversation, so it is never stored.
+for RESET in 'null' '""'; do
+  api PUT /api/config/live '{"prompt": "Speak only in haiku."}'
+  [ "$CODE" = "200" ] || fail "PUT live before reset $RESET: got $CODE: $STDOUT"
+  api PUT /api/config/live "{\"prompt\": $RESET}"
+  [ "$CODE" = "200" ] || fail "PUT live $RESET: expected 200, got $CODE: $STDOUT"
+  [ "$(jq -r '.prompt' <<<"$STDOUT")" = "null" ] ||
+    fail "PUT live $RESET must report no prompt, got $STDOUT"
+  [ "$(jq -r '.live | has("prompt")' < "$CONFIG")" = "false" ] ||
+    fail "PUT live $RESET must remove the key, never store it: $(cat "$CONFIG")"
+done
+# …and with the key gone the agent is spawned with the built-in block again.
+: > "$CLAUDE_LOG"
+start_live
+[ "$CODE" = "201" ] || fail "live start after reset: expected 201, got $CODE: $STDOUT"
+grep -q "mesa live listen" "$CLAUDE_LOG" ||
+  fail "a cleared prompt must spawn the built-in block again: $(cat "$CLAUDE_LOG")"
+stop_live
+ok "PUT prompt null and prompt \"\" both remove the key, and the next session spawns with the built-in block again"
+
+BEFORE=$(cat "$CONFIG")
+# The one rule a prompt has is a length bound — it is prose, not a command line.
+BIG=$(head -c 16385 /dev/zero | tr '\0' 'x')
+api PUT /api/config/live "$(jq -n --arg p "$BIG" '{prompt: $p}')"
+[ "$CODE" = "422" ] || fail "oversized live prompt: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "oversized live prompt: expected code validation, got $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected live PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT /api/config/live rejects a prompt past the length bound as 422 validation, writing nothing"
+
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/live")
+[ "$CODE" = "403" ] || fail "GET live with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
+  -H 'Content-Type: application/json' \
+  --data '{"prompt": "hi"}' \
+  "http://127.0.0.1:$PORT/api/config/live")
+[ "$CODE" = "403" ] || fail "PUT live with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused live PUT must not touch the file"
+ok "both live verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
+
+# A live prompt is many lines, so the spawns above left a log the later
+# `wait_lines` counters would misread. They assert about the built-in argv, not
+# about this section, so the log starts clean again here.
+: > "$CLAUDE_LOG"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"
@@ -725,9 +856,13 @@ api GET /api/config/speech
 [ "$CODE" = "502" ] || fail "malformed config speech GET: expected 502, got $CODE: $STDOUT"
 api PUT /api/config/speech '{"voice": "af_bella"}'
 [ "$CODE" = "502" ] || fail "malformed config speech PUT: expected 502, got $CODE: $STDOUT"
+api GET /api/config/live
+[ "$CODE" = "502" ] || fail "malformed config live GET: expected 502, got $CODE: $STDOUT"
+api PUT /api/config/live '{"prompt": "hi"}'
+[ "$CODE" = "502" ] || fail "malformed config live PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
-ok "a malformed config is 502 unavailable on all eight config verbs, and a PUT never overwrites a file it could not read"
+ok "a malformed config is 502 unavailable on all ten config verbs, and a PUT never overwrites a file it could not read"
 
 # The preview is the one speech surface a malformed file cannot break, because
 # it reads no config at all — which is what makes it usable on the page whose

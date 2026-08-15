@@ -8,7 +8,6 @@ import {
   markerId,
   markerUrl,
   markersForType,
-  shapeLabel,
 } from './diagramOptions'
 import type { EdgeMarker } from './types/EdgeMarker'
 import type { FrameShape } from './types/FrameShape'
@@ -58,17 +57,6 @@ describe('SHAPES_FOR_TYPE', () => {
         if (shape !== null) expect(SHAPE_LABELS[shape]).toBeTruthy()
       }
     }
-  })
-})
-
-describe('shapeLabel', () => {
-  it('keeps the generic card the recognizable "add frame" button', () => {
-    expect(shapeLabel(null)).toBe('add frame')
-  })
-
-  it('prefixes a named shape', () => {
-    expect(shapeLabel('process')).toBe('+ process')
-    expect(shapeLabel('predefined_process')).toBe('+ predefined')
   })
 })
 

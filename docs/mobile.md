@@ -147,6 +147,14 @@ accidents:
   ceiling, i.e. the guard is currently slack; it exists so a future
   `--tab-viewport-height` change cannot strand the reader. Scrolled to the
   bottom the whole canvas sits on screen (top 231, bottom 787, tab bar at 796).
+- **The shape palette is a strip above the box, not a column beside it** (mesa
+  task 868). A finger cannot start an HTML5 drag, so on this tier the rail is
+  what it already is underneath: one horizontally-scrolling row of
+  tap-to-add shapes, one 44px row tall, which is page chrome the reader can
+  still scroll the page by. Takeover mode is `flex-wrap: nowrap`, so there the
+  two are stacked explicitly (`.diagram.expanded { flex-direction: column }`)
+  — a full-width, unshrinkable strip in that row would otherwise leave the
+  canvas zero pixels wide.
 
 ### The hazard this tier actually has: invisible hit targets
 
@@ -181,7 +189,8 @@ Touch targets at the phone tier, all measured after the change:
 | Control | Before | After |
 |---|---|---|
 | React Flow zoom buttons | 26×26 | 44×44 |
-| add frame / auto layout / direction | 128×26 | ~110×44, wrapped into a row |
+| auto layout / direction | 128×26 | ~110×44, wrapped into a row |
+| shape palette row (mesa task 868) | — | ~120×44, in a scrolling strip |
 | expand | 87×26 | 87×44 |
 | `.frame-header` (the drag handle) | 238×28 | 238×44 |
 | edge label ✕ | 19×18 | 28×28 |

@@ -1393,7 +1393,9 @@ main {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  width: 7.5rem;
+  /* Wide enough for the longest name a board type offers ("predefined"),
+     which is the whole point of a palette that names its shapes. */
+  width: 8.5rem;
   max-height: var(--tab-viewport-height);
   overflow-y: auto;
   padding: 0.35rem;
@@ -6628,6 +6630,27 @@ body.files-tree-resizing {
     flex: 0 0 auto;
     min-height: 44px;
     white-space: nowrap;
+  }
+
+  /* Takeover mode is `flex-wrap: nowrap`, so a full-width, unshrinkable strip
+     in that row would take the whole content box and leave the canvas zero
+     wide. On this tier the two stack instead: the strip on top, the canvas
+     taking what is left (`height: auto` because the desktop rule's `100%` is
+     the whole row's height, which here is only the canvas's share of it). */
+  .diagram.expanded {
+    flex-direction: column;
+    /* `.diagram`'s `align-items: flex-start` is the cross axis in a column,
+       so without this both children shrink to their content width and the
+       canvas draws 2px wide. */
+    align-items: stretch;
+  }
+
+  .diagram.expanded .shape-rail {
+    max-height: none;
+  }
+
+  .diagram.expanded .diagram-viewport {
+    height: auto;
   }
 
   /* Primary canvas actions to the 44px floor (measured: 26px tall before).

@@ -529,8 +529,16 @@ board's vocabulary reads as pictures, not as a list of words.
   wrapped (`{shape}`) precisely so the legitimate generic card (`shape: null`)
   stays distinguishable from a rejected drop. The private mime
   (`application/x-mesa-frame-shape`, not `text/plain`) is what lets `dragover`
-  decide whether to accept the drop at all, so a file dragged onto the canvas
-  still behaves as it did.
+  tell a palette drag from anything else *before* the drop, so a file dragged
+  onto the canvas still behaves as it did. It cannot tell which *board* the
+  row came from — protected mode hides the payload until the drop — so a row
+  dragged across tabs onto a board of a different type is accepted by
+  `dragover` and then refused by `decodeShapeDrag`, silently. That is the
+  right way round: the alternative is a 422.
+  `dragenter` is bound to the same handler as `dragover` (as the files tree
+  and the pane tabs do): an element is a drop target only from the moment one
+  of the two calls `preventDefault()`, so a flick that releases before the
+  first `dragover` tick would otherwise be refused.
 - **It is a real column beside the viewport, not an overlay.** A flowchart
   board offers 7 shapes and 7 rows tall enough to carry a silhouette would have
   covered the drawing — the same failure the wrapped button cluster was the fix

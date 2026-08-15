@@ -1419,7 +1419,7 @@ function ShapePalette({
   onAdd: (shape: FrameShape | null) => void
 }) {
   return (
-    <div className="shape-rail" aria-label="Shapes">
+    <div className="shape-rail" role="group" aria-label="Shapes">
       <span className="shape-rail-title muted">shapes</span>
       {paletteItems(diagramType).map((item) => (
         <button
@@ -1428,6 +1428,9 @@ function ShapePalette({
           draggable
           onDragStart={(e) => {
             e.dataTransfer.setData(SHAPE_DRAG_MIME, encodeShapeDrag(item.shape))
+            // Some browsers cancel a drag that carries no `text/plain` at all
+            // — the same reason the files tree and the pane tabs set one.
+            e.dataTransfer.setData('text/plain', item.label)
             e.dataTransfer.effectAllowed = 'copy'
           }}
           onClick={() => onAdd(item.shape)}
@@ -1789,7 +1792,13 @@ export function DiagramCanvas({
    *  board's own shape set (`decodeShapeDrag`) — a drop can carry anything,
    *  and a shape this board type rejects would be a 422 on a gesture the user
    *  cannot undo. Anything else is not a shape drop and is left alone, so a
-   *  file dragged onto the canvas still behaves as it did. */
+   *  file dragged onto the canvas still behaves as it did.
+   *
+   *  Bound to `dragEnter` as well as `dragOver`: a browser treats an element
+   *  as a drop target only from the moment one of the two calls
+   *  `preventDefault()`, so a quick flick that releases before the first
+   *  `dragover` tick would otherwise be refused (the same pairing the files
+   *  tree and the pane tabs already make). */
   function onPaneDragOver(e: React.DragEvent) {
     if (!e.dataTransfer.types.includes(SHAPE_DRAG_MIME)) return
     e.preventDefault()
@@ -1947,6 +1956,7 @@ export function DiagramCanvas({
       />
       <div
         className="diagram-viewport"
+        onDragEnter={onPaneDragOver}
         onDragOver={onPaneDragOver}
         onDrop={onPaneDrop}
       >

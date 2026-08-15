@@ -68,13 +68,6 @@ export const SHAPE_LABELS: Record<FrameShape, string> = {
   attribute: 'attribute',
 }
 
-/** Wording for one add-frame button, including the generic (`null`) card —
- *  whose button keeps the original "add frame" wording so a storyboard board's
- *  familiar affordance stays recognizable next to the two new shapes. */
-export function shapeLabel(shape: FrameShape | null): string {
-  return shape === null ? 'add frame' : '+ ' + SHAPE_LABELS[shape]
-}
-
 /** Line styles, offered on every board type — `null` (the stored default) is
  *  a solid line, which is what an edge predating task 854 already draws. */
 export const EDGE_STYLES: readonly EdgeStyle[] = ['solid', 'dashed', 'dotted']

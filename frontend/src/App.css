@@ -1381,27 +1381,67 @@ main {
   background: rgba(6, 10, 16, 0.85);
 }
 
-/* Add-frame shape picker (story 360; every board type since mesa task 854, a
-   storyboard board's first button being the generic "add frame" card): one
-   button per valid shape, stacked like the rest of .canvas-controls's
-   children. A flowchart board offers 7 of them, which as a single stacked
-   column ran the toolbar past 600px down the canvas and covered the frames
-   underneath it (mesa task 854 QA) — so the picker **wraps** instead: buttons
-   size to their label and flow into rows inside the panel's own width, which
-   caps the cluster at a few short rows however many shapes a board type
-   gains. */
-.add-frame-picker {
+/* Shape palette (mesa task 868) — the toolbar down the left of the diagram
+   space, replacing the wrapped add-frame button cluster that used to sit in
+   the in-canvas panel (story 360, widened by task 854). It is a real column
+   beside the viewport rather than an overlay: a flowchart board offers 7
+   shapes, and 7 rows tall enough to show a silhouette would have covered the
+   drawing. It scrolls at the viewport's own height, so a board type gaining
+   shapes lengthens the rail rather than the page. */
+.shape-rail {
+  flex: 0 0 auto;
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 0.25rem;
+  width: 7.5rem;
+  max-height: var(--tab-viewport-height);
+  overflow-y: auto;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
 }
 
-.add-frame-picker button {
-  width: auto;
+.shape-rail-title {
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* A row is a button (clickable + keyboard-reachable) that is also the drag
+   source; `grab` is the affordance the drag needs to advertise. */
+.shape-rail-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.2rem 0.3rem;
+  text-align: left;
+  cursor: grab;
+}
+
+.shape-rail-item:active {
+  cursor: grabbing;
+}
+
+.shape-rail-icon {
   flex: 0 0 auto;
-  background: rgba(6, 10, 16, 0.85);
-  padding: 0.1rem 0.3rem;
-  font-size: 0.66rem;
+  width: 26px;
+  height: 16px;
+  /* The silhouette is stroked in `currentColor`, so it picks up the button's
+     own hover/focus colour with no second rule. */
+  color: inherit;
+}
+
+.shape-rail-name {
+  font-size: 0.7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Takeover mode: the rail is part of the fixed, full-height row. */
+.diagram.expanded .shape-rail {
+  max-height: 100%;
 }
 
 .canvas-hint,
@@ -6567,22 +6607,37 @@ body.files-tree-resizing {
     gap: 0.3rem;
   }
 
-  .add-frame-picker {
+  /* The shape rail is a left-hand column on a screen that has no room for a
+     column — and a finger cannot start an HTML5 drag anyway, so on this tier
+     it is the tap-to-add strip it degrades to: one scrolling row above the
+     canvas, rows at the 44px floor. */
+  .shape-rail {
     flex-direction: row;
-    flex-wrap: wrap;
-    gap: 0.3rem;
+    width: 100%;
+    max-height: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .shape-rail-title {
+    display: none;
+  }
+
+  .shape-rail-item {
+    width: auto;
+    flex: 0 0 auto;
+    min-height: 44px;
+    white-space: nowrap;
   }
 
   /* Primary canvas actions to the 44px floor (measured: 26px tall before).
      Width goes from 100% to content, which is what lets them sit in a row. */
   .canvas-controls button,
-  .add-frame-picker button,
   .canvas-expand {
     min-height: 44px;
   }
 
-  .canvas-controls button,
-  .add-frame-picker button {
+  .canvas-controls button {
     width: auto;
     padding: 0 0.55rem;
     white-space: nowrap;

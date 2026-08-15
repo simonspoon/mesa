@@ -103,7 +103,8 @@ The code is the source of truth. These are the invariants you must not break:
   `markdownAssets`, `modalDrag`, `navCollapse`, `navOrder`,
   `navWidth`, `newFile`, `openFiles`, `pricingDraft`, `projectPanes`,
   `projectTree`, `scriptDraft`, `sessionDetail`, `sessionGraph`,
-  `sessionTimeline`, `settingsDraft`, `speechDraft`, `speechPlayback`,
+  `sessionTimeline`, `settingsDraft`, `shapePalette`, `speechDraft`,
+  `speechPlayback`,
   `syntaxHighlighter`,
   `time`, `usageMeter`, `watchersDraft`, `wavStream`, `wordWrap`) —
   predicates that historically shipped wrong.

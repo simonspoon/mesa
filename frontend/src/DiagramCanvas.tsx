@@ -45,13 +45,18 @@ import {
   EDGE_STYLES,
   MARKER_LABELS,
   SHAPES_FOR_TYPE,
-  SHAPE_LABELS,
   dashArrayFor,
   markerUrl,
   markersForType,
-  shapeLabel,
 } from './diagramOptions'
 import { layoutFrames, type LayoutDirection } from './layout'
+import {
+  SHAPE_DRAG_MIME,
+  decodeShapeDrag,
+  dropPosition,
+  encodeShapeDrag,
+  paletteItems,
+} from './shapePalette'
 import type { AnchorSide } from './types/AnchorSide'
 import type { DiagramType } from './types/DiagramType'
 import type { DiagramView } from './types/DiagramView'
@@ -1287,6 +1292,155 @@ function EdgeMarkerDefs() {
   )
 }
 
+/**
+ * The silhouette drawn beside a palette row's name (mesa task 868).
+ *
+ * One flat 40×24 line drawing per shape — the same *idea* as the node's CSS
+ * silhouette in App.css, redrawn in SVG rather than reusing it: a node's
+ * silhouette is built from card-sized rules (oversized `::before` backdrops,
+ * clip-paths sized to a 240×140 card) that do not survive being shrunk to a
+ * palette row, and a picture of the shape is all a palette row needs.
+ */
+function ShapeIcon({ shape }: { shape: FrameShape | null }) {
+  const s = { fill: 'none', stroke: 'currentColor', strokeWidth: 1.5 }
+  const body = () => {
+    switch (shape) {
+      // The generic card: a rectangle with the cut corner the plain frame draws.
+      case null:
+        return <path d="M2,2 H30 L38,10 V22 H2 Z" style={s} />
+      case 'process':
+        return <rect x="2" y="3" width="36" height="18" style={s} />
+      case 'decision':
+      case 'relationship':
+        return <path d="M20,2 L38,12 L20,22 L2,12 Z" style={s} />
+      case 'start_end':
+        return <rect x="2" y="3" width="36" height="18" rx="9" style={s} />
+      case 'data':
+        return <path d="M8,3 H38 L32,21 H2 Z" style={s} />
+      case 'document':
+        return (
+          <path
+            d="M2,3 H38 V17 Q32,23 20,18 Q8,13 2,19 Z"
+            style={s}
+          />
+        )
+      case 'database':
+        return (
+          <>
+            <path d="M4,6 V18 Q4,22 20,22 Q36,22 36,18 V6" style={s} />
+            <ellipse cx="20" cy="6" rx="16" ry="4" style={s} />
+          </>
+        )
+      case 'predefined_process':
+        return (
+          <>
+            <rect x="2" y="3" width="36" height="18" style={s} />
+            <path d="M8,3 V21 M32,3 V21" style={s} />
+          </>
+        )
+      // An entity is a table: a titled box. A weak entity is the same box
+      // doubled, which is the notation's own way of saying it.
+      case 'entity':
+        return (
+          <>
+            <rect x="2" y="3" width="36" height="18" style={s} />
+            <path d="M2,9 H38" style={s} />
+          </>
+        )
+      case 'weak_entity':
+        return (
+          <>
+            <rect x="2" y="3" width="36" height="18" style={s} />
+            <rect x="5" y="6" width="30" height="12" style={s} />
+          </>
+        )
+      case 'attribute':
+        return <ellipse cx="20" cy="12" rx="18" ry="9" style={s} />
+      case 'central':
+        return (
+          <rect
+            x="2"
+            y="4"
+            width="36"
+            height="16"
+            rx="8"
+            style={{ ...s, fill: 'currentColor', opacity: 0.35 }}
+          />
+        )
+      case 'idea':
+        return (
+          <>
+            <rect x="14" y="4" width="24" height="16" rx="8" style={s} />
+            <path d="M2,12 H14" style={s} />
+          </>
+        )
+      // A scene is a frame of film: the card plus its perforation band.
+      case 'scene':
+        return (
+          <>
+            <rect x="2" y="3" width="36" height="18" style={s} />
+            <path d="M2,7 H38" style={s} />
+            <path d="M6,3 V7 M12,3 V7 M18,3 V7 M24,3 V7 M30,3 V7" style={s} />
+          </>
+        )
+      // A note is a sticky with its corner turned up.
+      case 'note':
+        return (
+          <>
+            <path d="M4,3 H36 V15 L30,21 H4 Z" style={s} />
+            <path d="M36,15 H30 V21" style={s} />
+          </>
+        )
+    }
+  }
+  return (
+    <svg viewBox="0 0 40 24" className="shape-rail-icon" aria-hidden="true">
+      {body()}
+    </svg>
+  )
+}
+
+/**
+ * The shape palette: the toolbar down the left of the diagram space (mesa task
+ * 868). One row per shape this board type accepts, each showing the silhouette
+ * and the name, each **draggable onto the canvas** to place that frame where it
+ * is dropped — and still clickable, which is the create-at-a-default-spot
+ * gesture the old wrapped button cluster in the canvas panel offered.
+ *
+ * A row is a `<button>` so it stays keyboard-reachable and activates on Enter;
+ * drag is HTML5 drag-and-drop (a pointer gesture layered on top), not a
+ * replacement for the click.
+ */
+function ShapePalette({
+  diagramType,
+  onAdd,
+}: {
+  diagramType: DiagramType
+  onAdd: (shape: FrameShape | null) => void
+}) {
+  return (
+    <div className="shape-rail" aria-label="Shapes">
+      <span className="shape-rail-title muted">shapes</span>
+      {paletteItems(diagramType).map((item) => (
+        <button
+          key={item.key}
+          className="shape-rail-item"
+          draggable
+          onDragStart={(e) => {
+            e.dataTransfer.setData(SHAPE_DRAG_MIME, encodeShapeDrag(item.shape))
+            e.dataTransfer.effectAllowed = 'copy'
+          }}
+          onClick={() => onAdd(item.shape)}
+          title={`drag a ${item.label} onto the canvas, or click to add one`}
+        >
+          <ShapeIcon shape={item.shape} />
+          <span className="shape-rail-name">{item.label}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
 const nodeTypes = {
   frame: FrameNode,
   process: ProcessNode,
@@ -1630,6 +1784,32 @@ export function DiagramCanvas({
     addFrame(defaultShape, inst.screenToFlowPosition({ x: e.clientX, y: e.clientY }))
   }
 
+  /** A palette row dropped on the canvas creates that frame centred on the
+   *  drop point (mesa task 868). The payload is re-checked against this
+   *  board's own shape set (`decodeShapeDrag`) — a drop can carry anything,
+   *  and a shape this board type rejects would be a 422 on a gesture the user
+   *  cannot undo. Anything else is not a shape drop and is left alone, so a
+   *  file dragged onto the canvas still behaves as it did. */
+  function onPaneDragOver(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes(SHAPE_DRAG_MIME)) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+  }
+
+  function onPaneDrop(e: React.DragEvent) {
+    const drop = decodeShapeDrag(
+      e.dataTransfer.getData(SHAPE_DRAG_MIME),
+      view.diagram.diagram_type,
+    )
+    const inst = rfInstance.current
+    if (!drop || !inst) return
+    e.preventDefault()
+    addFrame(
+      drop.shape ?? undefined,
+      dropPosition(inst.screenToFlowPosition({ x: e.clientX, y: e.clientY })),
+    )
+  }
+
   function onNodeDragStop(_e: unknown, node: FrameNodeType) {
     const f = view.frames.find((fr) => String(fr.id) === node.id)
     const x = Math.round(node.position.x)
@@ -1759,7 +1939,17 @@ export function DiagramCanvas({
 
   return (
     <div className={`diagram${expanded ? ' expanded' : ''}`}>
-      <div className="diagram-viewport">
+      {/* The shape toolbar, outside the canvas so it never covers the drawing
+          and never eats a pan gesture (mesa task 868). */}
+      <ShapePalette
+        diagramType={view.diagram.diagram_type}
+        onAdd={(shape) => addFrame(shape ?? undefined)}
+      />
+      <div
+        className="diagram-viewport"
+        onDragOver={onPaneDragOver}
+        onDrop={onPaneDrop}
+      >
         {/* Endpoint marker definitions, once per canvas. A `url(#id)` reference
             resolves document-wide, so these need not (and cannot) live inside
             React Flow's own SVG. */}
@@ -1817,28 +2007,10 @@ export function DiagramCanvas({
           <Controls showInteractive={false} />
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="canvas-controls">
-            {/* One button per shape this board's diagram_type accepts
-                (`SHAPES_FOR_TYPE`). A `storyboard` board's first entry is the
-                generic card, whose button keeps the original "add frame"
-                wording and leading position so the familiar affordance is
-                still the one at the top. Up to 7 buttons: they stack in the
-                panel's own column and the labels shrink, so the cluster never
-                overflows the canvas. */}
-            <span className="add-frame-picker">
-              {boardShapes.map((shape) => (
-                <button
-                  key={shape ?? 'generic'}
-                  onClick={() => addFrame(shape ?? undefined)}
-                  title={
-                    shape === null
-                      ? 'add a plain frame'
-                      : `add a ${SHAPE_LABELS[shape]} frame`
-                  }
-                >
-                  {shapeLabel(shape)}
-                </button>
-              ))}
-            </span>
+            {/* The add-a-shape affordance is no longer here: since mesa task
+                868 it is the palette rail down the left of the diagram space
+                (`ShapePalette`), which names each shape *and* draws it. What
+                stays in this cluster is the canvas-wide actions. */}
             <button onClick={autoLayout} title="Arrange frames by flow direction">
               auto layout
             </button>

@@ -499,16 +499,55 @@ that the cardinality markers are offered on an `erd` board **only**.
 **first** rather than expressing it by being the empty set. The first entry is
 still `defaultShape` for the quick-create gestures (pane double-click,
 drag-to-empty-canvas, Cmd+D), so that ordering is what keeps a storyboard
-board's quick-create minting exactly the plain card it always did. Its
-add-frame button keeps the original "add frame" wording and the leading
-position, so the familiar single affordance is still the one at the top of
-what is now a 3-button picker; the picker itself is no longer conditional (a
-`storyboard` board renders it too). A flowchart board offers 7 buttons, and
-the picker **wraps** them: each sizes to its own label and they flow into rows
-inside `.canvas-controls`' width. As a single stacked column (the first
-attempt) those 7 ran the toolbar 600px down the canvas and covered the frames
-under it — a wrapping cluster stays a few short rows however many shapes a
-board type gains later.
+board's quick-create minting exactly the plain card it always did.
+
+Where those shapes are *offered* moved in mesa task 868 — see "Shape palette"
+below. Until then they were a wrapping cluster of text buttons inside the
+in-canvas `.canvas-controls` panel, the generic card's button keeping the
+original "add frame" wording at the head of it.
+
+### Shape palette (the left toolbar, mesa task 868)
+
+The shapes a board offers are a **rail down the left of the diagram space**:
+one row per entry of `SHAPES_FOR_TYPE[diagram_type]`, in that same offer
+order, each row drawing the shape's **silhouette** beside its **name** — so a
+board's vocabulary reads as pictures, not as a list of words.
+
+- **A row is dragged onto the canvas** and the frame lands where it is dropped,
+  centred on the drop point (`dropPosition` — the create sends no `w`/`h`, so
+  `src/api.rs`'s 240×140 default stays the single definition of frame size and
+  the palette only borrows the number to centre). Drag is HTML5
+  drag-and-drop on a `<button>`, layered *on top of* the click: clicking a row
+  still creates the frame at the old stagger position, which is what the button
+  cluster did, and keeps the palette keyboard-reachable (Enter activates).
+- **The drop payload is re-checked against this board's own shape set.** A drop
+  can carry anything — a file, a drag from another app, a row dragged out of a
+  board of a different type in another tab — so `decodeShapeDrag` honours a
+  payload only when `SHAPES_FOR_TYPE` lists it for *this* `diagram_type`, and
+  answers "not a shape drop" otherwise. Offering the canvas a shape the server
+  rejects would be a 422 on a gesture with no undo. The success value is
+  wrapped (`{shape}`) precisely so the legitimate generic card (`shape: null`)
+  stays distinguishable from a rejected drop. The private mime
+  (`application/x-mesa-frame-shape`, not `text/plain`) is what lets `dragover`
+  decide whether to accept the drop at all, so a file dragged onto the canvas
+  still behaves as it did.
+- **It is a real column beside the viewport, not an overlay.** A flowchart
+  board offers 7 shapes and 7 rows tall enough to carry a silhouette would have
+  covered the drawing — the same failure the wrapped button cluster was the fix
+  for. Outside the canvas box it also cannot eat a pan gesture. The rail
+  scrolls at the viewport's own height, so a board type gaining shapes
+  lengthens the rail rather than the page.
+- **Phone tier**: a finger cannot start an HTML5 drag, so the rail degrades to
+  what it already is underneath — one horizontally-scrolling strip of
+  tap-to-add rows above the canvas, at the tier's 44px floor.
+- The decidable-without-a-tree part (which rows a board offers, the payload
+  encoding, the drop position) is `shapePalette.ts` with
+  `shapePalette.test.ts` over it; the silhouettes are markup and stay in
+  `DiagramCanvas.tsx` (`ShapeIcon`) beside the node components they mirror.
+  They are **redrawn in SVG rather than reusing the nodes' CSS**: a node's
+  silhouette is built from card-sized rules (oversized `::before` backdrops,
+  clip-paths sized to a 240×140 card) that do not survive being shrunk into a
+  palette row.
 
 ### Shape silhouettes
 

@@ -1097,14 +1097,21 @@ EXAMPLES
     /// seconds have passed and then prints `null` and exits 0: a quiet minute
     /// is DATA, not an error. It also returns `null` early if the session ends
     /// while waiting, so the loop notices a stopped conversation promptly.
+    ///
+    /// The default wait is DELIBERATELY long (mesa task 871). Waiting inside
+    /// this process costs nothing; waiting in the agent's loop costs a whole
+    /// model turn per `null`, so a short default burns tokens for every quiet
+    /// minute of a conversation. 570s sits just inside the 10-minute ceiling a
+    /// Claude Code session puts on one command, so the wait ends by printing
+    /// `null` rather than by being killed.
     #[command(after_help = "\
 EXAMPLES
-  mesa live listen                # wait up to 60s
+  mesa live listen                # wait up to 570s (the quiet-is-free default)
   mesa live listen --wait 5
   mesa live listen --wait 0       # poll once and return")]
     Listen {
         /// Seconds to wait for an utterance; 0 polls once and returns
-        #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+        #[arg(long, value_name = "SECONDS", default_value_t = 570)]
         wait: u64,
         /// Print the turn without its `text` instead of in full
         #[arg(long)]

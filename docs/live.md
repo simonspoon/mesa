@@ -23,8 +23,9 @@ design:
 
 A live session is a loop the **agent** runs, not one mesa drives:
 
-1. `mesa live listen --wait 60` — the agent asks for the next thing the person
-   said. A turn, or `null` when nobody spoke for that long.
+1. `mesa live listen` — the agent asks for the next thing the person said. A
+   turn, or `null` when nobody spoke for the whole wait (570s by default, and
+   long on purpose: see *quiet time is spent inside `listen`* below).
 2. It does the work with the ordinary mesa CLI and its own tools.
 3. `mesa live say "…"` — the reply, which the browser speaks.
 4. `mesa live navigate '#/…' --say "…"` — optionally, it moves the person's
@@ -169,7 +170,7 @@ actually changing things.
 | `live start [PROJECT]` | `--project P` (id **or** name), `--no-agent` to skip the spawn | the started `LiveSession` |
 | `live stop` | — | the ended `LiveSession` |
 | `live status` (alias `get`, `show`) | — | the live `LiveSession`, or `null` |
-| `live listen` | `--wait <SECONDS>` (default 60, `0` = poll once) | the next undelivered user `LiveTurn`, or `null` |
+| `live listen` | `--wait <SECONDS>` (default 570, `0` = poll once) | the next undelivered user `LiveTurn`, or `null` |
 | `live say <TEXT>…` | trailing var arg, like `inbox add` — put every flag **before** the message | the `LiveTurn` |
 | `live navigate <ROUTE>` | `--say <TEXT>`; without it the turn is a pure action and says nothing | the `LiveTurn` |
 | `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route | the `LiveTurn` |
@@ -207,7 +208,21 @@ takes exactly one value.
   the middle of it. A quiet minute is not the end of a conversation. It also
   returns `null` **early** when the session ends while it is waiting, so a
   conversation stopped from the web UI is noticed in the same second rather
-  than up to a minute later.
+  than up to a wait later.
+- **Quiet time is spent inside `listen`, not in the agent's loop** (mesa task
+  871). Both ends of the wait are a wait — but one is free and the other is
+  not: blocking inside this process costs a sleeping thread, while every `null`
+  the agent sees costs a whole model turn carrying the conversation so far. A
+  session left idle at the old 60s default spent ten turns an hour saying
+  nothing (and, prompted to check `mesa live status` each time round, more than
+  that). So the default wait is **570s** and `AGENT_PROMPT` names no `--wait` at
+  all: it tells the agent to give the command ten minutes and to run *nothing
+  else* while it is quiet — no status check, no "still quiet" narration. 570
+  rather than 600 because a Claude Code session caps one command at ten
+  minutes: the wait must end by printing `null`, not by being killed. The
+  session's end is still noticed promptly — `listen` returns early on it, and
+  every later `live` command reports there is no live session, which is the
+  stop signal the routine `status` poll used to be.
 - **`start` spawns the agent** through `agents::spawn_bg` with the
   `live-agent` command template (`docs/config.md`), in the project's
   `local_path` when that is a live directory and `$HOME` otherwise — the

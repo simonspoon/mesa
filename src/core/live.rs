@@ -25,11 +25,16 @@ they dictate into a text field in the mesa web UI, and everything you send back 
 is spoken aloud to them by a speech synthesiser. Work the following loop, and \
 keep working it until the session ends.
 
-1. Run `mesa live listen --wait 60`. It prints one JSON turn, or `null` if \
-nobody said anything for that long. On `null`, simply run it again — a quiet \
-minute is not the end of the conversation. Before looping, run \
-`mesa live status`; when it prints `null`, or a session whose `status` is \
-`ended`, the conversation is over and you stop.
+1. Run `mesa live listen`, and give the command ten minutes to finish (a \
+600000 ms timeout). It waits inside that one command until the person says \
+something and then prints one JSON turn; if nobody speaks for the whole wait it \
+prints `null` instead. On `null`, run exactly the same command again and \
+nothing else. Waiting inside `listen` is free, but every command you run while \
+nobody is talking costs real money, so while it is quiet do not check the \
+status, do not report that it is quiet, and do not go looking for work. When a \
+`mesa live` command tells you there is no live session, or `mesa live status` \
+prints `null` or a session whose `status` is `ended`, the conversation is over \
+and you stop.
 
 2. Reply with `mesa live say \"<one or two sentences>\"`. This is speech. Write \
 plain spoken prose: no markdown, no headings, no bullet lists, no code blocks, \
@@ -136,5 +141,14 @@ mod tests {
         ] {
             assert!(AGENT_PROMPT.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// Quiet time is spent **inside** one `listen`, not in a poll loop the
+    /// model pays a turn for (mesa task 871): the prompt must not pin a short
+    /// `--wait`, and must say what not to do while nobody is talking.
+    #[test]
+    fn agent_prompt_waits_inside_listen_rather_than_polling() {
+        assert!(!AGENT_PROMPT.contains("--wait"), "{AGENT_PROMPT}");
+        assert!(AGENT_PROMPT.contains("costs real money"), "{AGENT_PROMPT}");
     }
 }

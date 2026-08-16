@@ -82,6 +82,35 @@ import { useFetch } from '../useFetch'
  * would. The hub owns neither sidebar's state (App does, for both of them and
  * for the phone tab bar), so collapsing is one call back up.
  */
+/**
+ * The Mesa Live mark (mesa task 872), drawn rather than typed: the toggle used
+ * to carry a 💬 emoji, which rendered in whatever emoji font the platform
+ * picked — its own colour, its own weight, its own size, none of them the
+ * button's. This is the same vocabulary as the brand mark and the inbox's
+ * transport glyphs: one flat sharp-cornered polygon in `currentColor`, so it
+ * takes the toggle's cyan-when-open and its hover state for free.
+ *
+ * The shape is a speech container built as the brand mark's ziggurat — a
+ * narrower tier standing on a wider one — with a sharp tail dropped from the
+ * base: a mesa that talks. One step rather than the brand mark's three,
+ * because the stepping has to survive as *silhouette* at the ~14px this
+ * renders at, and three tiers there stop reading as a plateau and start
+ * reading as a lump.
+ */
+function LiveMark() {
+  return (
+    <svg
+      className="live-mark"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <polygon points="1,12 1,7 3,7 3,2 13,2 13,7 15,7 15,12 5,12 2,15 2,12" />
+    </svg>
+  )
+}
+
 export function LiveHub({
   onSidebars,
 }: {
@@ -638,7 +667,7 @@ export function LiveHub({
             reclaim('hub-press', armed.current)
           }}
         >
-          💬
+          <LiveMark />
         </button>
       )}
       <button

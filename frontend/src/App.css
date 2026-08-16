@@ -8051,6 +8051,25 @@ button:focus-visible,
   border-color: rgba(0, 229, 255, 0.5);
 }
 
+/* The toggle's whole content is the drawn mark (mesa task 872), so it centres
+   the glyph instead of sitting it on a text baseline, and stretches to the
+   height its lettered siblings set — otherwise the icon-only button rides
+   short in the cluster. */
+.live-overlay-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+}
+
+/* Sized off the button's own text, coloured by `currentColor`: the same deal
+   the transport glyphs get, so open/hover/disabled carry straight through. */
+.live-mark {
+  width: 1em;
+  height: 1em;
+  display: block;
+}
+
 /* The talking indicator: five bars breathing in the middle of the header
    band, the visible sign she is speaking while the popup is closed. Absolute
    against the header, so it takes no room from the flex row. */

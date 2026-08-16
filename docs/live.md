@@ -407,10 +407,28 @@ conversation") working with no backend change.
   and a routed page would be torn down by the very navigation it just
   performed — cutting its own sentence off mid-word and stopping the route
   reports below.
-- **While she speaks, a five-bar indicator animates centered in the header
-  band** — the visible sign of speech while the popup is closed. It freezes to
-  steady half-height bars under `prefers-reduced-motion`, the same rule as
-  `.live-dot`'s pulse.
+- **A five-bar indicator sits centered in the header band, in one of three
+  states** (`liveIndicator.ts`, task 874) — the only sign of the conversation
+  while the popup is closed, so it answers for *both* sides of it rather than
+  only for mesa:
+  - **mesa speaking** (cyan) — the loudest of the three, and deliberately not
+    one wave: each bar runs its own keyframes at its own awkward duration, so
+    the five never fall into the shared ripple that reads as a spinner.
+  - **being heard** (green) — words are arriving, by either route in: an
+    interim result from the recognizer, or a draft sitting in the capture box.
+    One travelling wave, quieter than mesa's, because it reflects input rather
+    than performing.
+  - **listening** (muted) — the microphone is open and the room is quiet. Shown
+    only where recognition really is the way in (`recognizesSpeech`); a browser
+    that types into the fallback box gets no resting indicator, since a
+    permanent glyph meaning "a text box exists" is noise.
+
+  The order is the decision: **speaking outranks everything** (while she talks
+  the microphone is shut, so a band claiming to hear the person would be
+  describing a microphone that is not open), and **being heard outranks
+  listening**. Whitespace is not speech. All three freeze under
+  `prefers-reduced-motion` — the same rule as `.live-dot`'s pulse — to steady
+  bars whose heights keep the ranking the motion carried.
 - **The popup opens and closes without touching the session.** A speech-bubble
   toggle sits beside the live button whenever there is a session at all —
   running, or ended with a transcript still worth reading

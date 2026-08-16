@@ -16,6 +16,7 @@ import {
   userTookFocus,
   type ReclaimCause,
 } from '../liveCapture'
+import { headerIndicator, indicatorLabel } from '../liveIndicator'
 import {
   captureHint,
   isBlockingError,
@@ -789,17 +790,33 @@ export function LiveHub({
     postRef.current = post
   })
 
+  // What the header band says about the conversation (`liveIndicator.ts`):
+  // mesa speaking, the person being heard, or the microphone simply open.
+  const indicator = headerIndicator({
+    live,
+    joined: unlocked,
+    speaking,
+    recognizes,
+    interim,
+    draft,
+  })
+
   const groups = turnGroups(turns)
   // Pulled out of the object so its narrowing survives into the handler below.
   const secondary = controls.secondary
 
   return (
     <div className="live-hub">
-      {/* The talking indicator, centered in the header band (the header is the
-          positioning context) — the visible sign she is speaking when the
-          popup is closed. */}
-      {speaking && (
-        <div className="live-talk" aria-label="mesa is speaking" role="status">
+      {/* The conversation indicator, centered in the header band (the header is
+          the positioning context) — with the popup closed it is the only sign
+          of either side talking. One element in three states, so the band
+          never shows two things at once (`liveIndicator.ts`). */}
+      {indicator !== null && (
+        <div
+          className={`live-talk live-talk-${indicator}`}
+          aria-label={indicatorLabel(indicator)}
+          role="status"
+        >
           <span /><span /><span /><span /><span />
         </div>
       )}

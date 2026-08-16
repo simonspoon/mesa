@@ -8070,9 +8070,13 @@ button:focus-visible,
   display: block;
 }
 
-/* The talking indicator: five bars breathing in the middle of the header
-   band, the visible sign she is speaking while the popup is closed. Absolute
-   against the header, so it takes no room from the flex row. */
+/* The conversation indicator (mesa task 874): five bars in the middle of the
+   header band, in one of three states — mesa speaking, the person being heard,
+   or the microphone simply open. With the popup closed this is the only sign
+   of either side talking, so which state it is has to read at a glance:
+   colour carries who (cyan is mesa, green is the person, muted is nobody yet)
+   and the motion carries how much is happening. Absolute against the header,
+   so it takes no room from the flex row. */
 .live-talk {
   position: absolute;
   left: 50%;
@@ -8088,30 +8092,100 @@ button:focus-visible,
 .live-talk span {
   width: 3px;
   height: 100%;
-  background: var(--cyan);
+  /* Coloured off the container so each state sets one property, not five. */
+  background: currentColor;
   border-radius: 2px;
   transform-origin: center;
-  animation: live-talk-bar 1s ease-in-out infinite;
 }
 
-.live-talk span:nth-child(1) { animation-delay: 0s; }
-.live-talk span:nth-child(2) { animation-delay: 0.15s; }
-.live-talk span:nth-child(3) { animation-delay: 0.3s; }
-.live-talk span:nth-child(4) { animation-delay: 0.45s; }
-.live-talk span:nth-child(5) { animation-delay: 0.6s; }
+/* mesa speaking: the loudest of the three, and deliberately not one wave —
+   every bar runs its own keyframes at its own duration, so the five never fall
+   back into the lockstep ripple a single shared animation gives. Durations are
+   mutually awkward (0.53s … 0.71s) so the pattern takes minutes to repeat,
+   which is what reads as a voice rather than as a loading spinner. */
+.live-talk-speaking {
+  color: var(--cyan);
+  filter: drop-shadow(0 0 4px var(--cyan-dim));
+}
 
-@keyframes live-talk-bar {
+.live-talk-speaking span:nth-child(1) { animation: live-talk-short 0.61s ease-in-out infinite; }
+.live-talk-speaking span:nth-child(2) { animation: live-talk-mid 0.53s ease-in-out infinite 0.08s; }
+.live-talk-speaking span:nth-child(3) { animation: live-talk-tall 0.67s ease-in-out infinite 0.04s; }
+.live-talk-speaking span:nth-child(4) { animation: live-talk-mid 0.59s ease-in-out infinite 0.19s; }
+.live-talk-speaking span:nth-child(5) { animation: live-talk-short 0.71s ease-in-out infinite 0.11s; }
+
+/* The person being heard: the same shape in the other colour, as one wave
+   travelling left to right — a reflection of what the microphone is taking in,
+   answered rather than performed, so it stays quieter than mesa's own. */
+.live-talk-hearing {
+  color: var(--green);
+}
+
+.live-talk-hearing span {
+  animation: live-talk-heard 0.9s ease-in-out infinite;
+}
+
+.live-talk-hearing span:nth-child(1) { animation-delay: 0s; }
+.live-talk-hearing span:nth-child(2) { animation-delay: 0.1s; }
+.live-talk-hearing span:nth-child(3) { animation-delay: 0.2s; }
+.live-talk-hearing span:nth-child(4) { animation-delay: 0.3s; }
+.live-talk-hearing span:nth-child(5) { animation-delay: 0.4s; }
+
+/* The microphone open and the room quiet: low, slow and muted — present enough
+   to say the page is listening, dim enough that nobody reads it as speech. */
+.live-talk-listening {
+  color: var(--muted);
+}
+
+.live-talk-listening span {
+  transform: scaleY(0.22);
+  animation: live-talk-idle 2.4s ease-in-out infinite;
+}
+
+.live-talk-listening span:nth-child(2) { animation-delay: 0.2s; }
+.live-talk-listening span:nth-child(3) { animation-delay: 0.4s; }
+.live-talk-listening span:nth-child(4) { animation-delay: 0.6s; }
+.live-talk-listening span:nth-child(5) { animation-delay: 0.8s; }
+
+@keyframes live-talk-tall {
+  0%, 100% { transform: scaleY(0.2); }
+  45% { transform: scaleY(1); }
+  70% { transform: scaleY(0.5); }
+}
+
+@keyframes live-talk-mid {
+  0%, 100% { transform: scaleY(0.45); }
+  30% { transform: scaleY(0.22); }
+  60% { transform: scaleY(0.9); }
+}
+
+@keyframes live-talk-short {
   0%, 100% { transform: scaleY(0.3); }
-  50% { transform: scaleY(1); }
+  50% { transform: scaleY(0.72); }
+}
+
+@keyframes live-talk-heard {
+  0%, 100% { transform: scaleY(0.25); opacity: 0.7; }
+  50% { transform: scaleY(0.8); opacity: 1; }
+}
+
+@keyframes live-talk-idle {
+  0%, 100% { transform: scaleY(0.22); opacity: 0.45; }
+  50% { transform: scaleY(0.34); opacity: 0.85; }
 }
 
 /* Motion-sensitive readers keep the signal, not the dance — the same rule as
-   `.live-dot`'s pulse: the bars hold steady at half height. */
+   `.live-dot`'s pulse. Colour still says which of the three it is, and the
+   heights keep the ranking the motion carried: mesa loudest, the person heard
+   below her, the open microphone lowest of all. */
 @media (prefers-reduced-motion: reduce) {
   .live-talk span {
     animation: none;
-    transform: scaleY(0.5);
+    opacity: 1;
   }
+  .live-talk-speaking span { transform: scaleY(0.7); }
+  .live-talk-hearing span { transform: scaleY(0.5); }
+  .live-talk-listening span { transform: scaleY(0.25); }
 }
 
 /* The conversation popup, anchored under the header's right edge. Absolute

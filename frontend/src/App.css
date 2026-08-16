@@ -8243,6 +8243,15 @@ button:focus-visible,
   font-size: 0.75rem;
 }
 
+/* What the recognizer is still guessing at (mesa task 873): a preview, never a
+   turn. Italic and muted so it reads as provisional next to the transcript
+   above it, which is the record of what was actually said. */
+.live-interim {
+  font-size: 0.8rem;
+  font-style: italic;
+  color: var(--muted);
+}
+
 /* Phone: the popup takes the width, and the header is allowed to wrap
    (docs/mobile.md — CSS only, no new matchMedia). Brand + three live buttons
    + two usage chips overrun a 390px viewport, and #root is overflow:hidden —

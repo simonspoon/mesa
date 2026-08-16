@@ -17,6 +17,16 @@ import {
   type ReclaimCause,
 } from '../liveCapture'
 import {
+  captureHint,
+  isBlockingError,
+  readResults,
+  recognitionCtor,
+  recognizesSpeech,
+  shouldListen,
+  utteranceFrom,
+  type SpeechRecognitionLike,
+} from '../liveRecognition'
+import {
   isLive,
   liveControls,
   liveStatusLine,
@@ -42,9 +52,15 @@ import { useFetch } from '../useFetch'
  * Mesa Live, in the header (mesa tasks 855, 857): the whole conversation lives
  * here now, not on a routed page.
  *
- * The person dictates into the capture box in the popup below — system
- * dictation, the OS's own, since mesa ships no STT and never touches a
- * microphone — and each settled line becomes a `user` turn. An agent spawned
+ * The person just talks: while the conversation is live and this browser has
+ * joined it, the page opens the microphone through the browser's own speech
+ * recognition (`liveRecognition.ts`, task 873) and each **final** result
+ * becomes a `user` turn as it settles. The capture box in the popup below
+ * stays as the fallback — a browser with no recognizer, or a refused
+ * microphone, is the surface as it was: system dictation types into the box,
+ * mesa holds the keyboard for it, and a settled line goes on a timer. Either
+ * way the audio stays in the page: mesa ships no STT and no route takes an
+ * audio body. An agent spawned
  * by `Go live` pulls those over the CLI and answers with `mesa live say`,
  * which lands here as a `mesa` turn and is spoken through the same `kokoro-rs`
  * route and the same decoding machinery the inbox's play button uses. A turn
@@ -69,12 +85,15 @@ import { useFetch } from '../useFetch'
  *   the feature, and a routed page would be unmounted by the navigation it
  *   just performed — cutting its own sentence off mid-word. The popup opens
  *   and closes without touching the session; only `End` ends it.
- * - **While joined, the capture box holds the keyboard** (`liveCapture.ts`):
- *   a `navigate` turn is mesa's doing, and the words after it are still meant
- *   for mesa, not for whatever field the opened page focused. A deliberate
- *   click into another field wins the fight and stands capture down; mesa's
- *   next action re-arms it. Dictation never presses Enter, so a draft that
- *   sits untouched for a beat is sent on mesa's own clock.
+ * - **While joined and not recognizing, the capture box holds the keyboard**
+ *   (`liveCapture.ts`): a `navigate` turn is mesa's doing, and the words after
+ *   it are still meant for mesa, not for whatever field the opened page
+ *   focused. A deliberate click into another field wins the fight and stands
+ *   capture down; mesa's next action re-arms it. Dictation never presses
+ *   Enter, so a draft that sits untouched for a beat is sent on mesa's own
+ *   clock. With the microphone open none of that applies — a recognized
+ *   sentence reaches the conversation with the keyboard anywhere — so both
+ *   rules stand down and the box is a plain fallback.
  *
  * The two page verbs — `navigate` and the sidebar pair (task 859) — are both
  * performed here, in transcript order, when the run *reaches* the turn: the
@@ -154,6 +173,17 @@ export function LiveHub({
   // The conversation popup. Purely visual: closing it calls no route and stops
   // nothing — the session, the audio and the capture box all carry on.
   const [open, setOpen] = useState(false)
+  // The engine still guessing. Shown, never sent (`liveRecognition.ts`).
+  const [interim, setInterim] = useState('')
+  // The microphone was refused — by the person or by the browser's policy.
+  // Terminal for this page: retrying would reopen the permission prompt for
+  // ever, and the typed box is exactly the surface to fall back to.
+  const [blocked, setBlocked] = useState(false)
+  // Whether this browser has a recognizer at all. Asked once: it cannot change
+  // under a loaded page, and every other decision reads the answer.
+  const [supported] = useState(
+    () => recognitionCtor(window as unknown as Record<string, unknown>) !== null,
+  )
 
   // Which session the held transcript belongs to. A new conversation is a new
   // transcript — going live again is a fresh session with its own turns, and
@@ -352,6 +382,19 @@ export function LiveHub({
   const standingDown = useRef(false)
   // Mid-IME-composition, for the auto-send guard.
   const composing = useRef(false)
+  // The steady question — is the person talking to mesa through the microphone
+  // — which is what the capture box's two rules and the composer's hint read.
+  // Deliberately not `wantsMic` below: that one goes false for the length of
+  // every reply, and a focus fight or an auto-send deadline that re-arms
+  // itself while mesa speaks is decided by playback timing rather than by any
+  // rule.
+  const recognizes = recognizesSpeech({ live, joined: unlocked, supported, blocked })
+  // The same answer for the two that read it outside a render: the focus
+  // arbiter runs from blur handlers and the auto-send deadline from a timer.
+  const listeningRef = useRef(false)
+  useEffect(() => {
+    listeningRef.current = recognizes
+  }, [recognizes])
 
   useEffect(() => {
     // Capture phase, so the stamp lands before any focus change the gesture
@@ -374,6 +417,7 @@ export function LiveHub({
           live: armed.live,
           unlocked: armed.unlocked,
           standingDown: standingDown.current,
+          listening: listeningRef.current,
           cause,
         })
       ) {
@@ -416,6 +460,9 @@ export function LiveHub({
   // than assumed, and `refused` so a line the server rejected is not retried
   // every two seconds for ever — it waits to be edited (or sent by hand).
   const sendRef = useRef<() => void>(() => {})
+  // The same, for the recognizer: its handlers are set once per start and post
+  // sentences long after the render that installed them.
+  const postRef = useRef<(text: string) => void>(() => {})
   const draftRef = useRef('')
   const editedAt = useRef(0)
   const refused = useRef<string | null>(null)
@@ -428,12 +475,23 @@ export function LiveHub({
     const timer = window.setTimeout(() => {
       const text = draftRef.current
       if (text.trim() === refused.current) return
-      if (shouldAutoSend(text, Date.now() - editedAt.current, composing.current)) {
+      if (
+        shouldAutoSend(
+          text,
+          Date.now() - editedAt.current,
+          composing.current,
+          listeningRef.current,
+        )
+      ) {
         sendRef.current()
       }
     }, AUTO_SEND_IDLE_MS)
     return () => window.clearTimeout(timer)
-  }, [draft, live, composeTick])
+    // `recognizes` is a dependency, not just a read inside the timer: a draft
+    // left in the box when recognition stops being the way in (the microphone
+    // refused, the browser's answer changing) must get its deadline back
+    // rather than sit there for ever because the decision was sampled once.
+  }, [draft, live, composeTick, recognizes])
 
   /** The one write path for the draft: state for the render, refs for the timer. */
   const updateDraft = useCallback((value: string) => {
@@ -441,6 +499,91 @@ export function LiveHub({
     editedAt.current = Date.now()
     setDraft(value)
   }, [])
+
+  // ---- the microphone (liveRecognition.ts) ----
+
+  const wantsMic = shouldListen({ live, joined: unlocked, supported, blocked, speaking })
+  // Whether the conversation still wants the microphone, for the handler that
+  // learns the engine stopped: `onend` fires from the browser's own schedule,
+  // outside any render, and it is where restarting is decided.
+  const wants = useRef(wantsMic)
+  useEffect(() => {
+    wants.current = wantsMic
+  }, [wantsMic])
+
+  useEffect(() => {
+    if (!wantsMic) return
+    const Recognizer = recognitionCtor(window as unknown as Record<string, unknown>)
+    if (Recognizer === null) return
+    // This effect's own run. A recognizer stopped by the cleanup below still
+    // fires its `end`, and that echo must not restart the microphone the
+    // cleanup just closed.
+    let running = true
+    let current: SpeechRecognitionLike | null = null
+
+    const open = () => {
+      const engine = new Recognizer()
+      current = engine
+      // How far this engine's own results list has been consumed. Per engine:
+      // a restart is a new list, starting again at zero.
+      let settled = 0
+      // Continuous so a pause is a sentence rather than the end of listening,
+      // interim so the person can see they are being heard.
+      engine.continuous = true
+      engine.interimResults = true
+      engine.onresult = (event) => {
+        const heard = readResults(Math.max(event.resultIndex, settled), event.results)
+        settled = heard.settledThrough
+        if (running) setInterim(heard.interim)
+        const text = utteranceFrom(heard.final)
+        if (text === null) return
+        // Not guarded on `running`: `stop()` below delivers whatever was
+        // pending as a final, and that is the sentence the person was still
+        // finishing as mesa began to speak — heard before the audio started,
+        // so it is theirs, not an echo. Only the conversation itself ending
+        // drops it, because there is nothing left to say it to.
+        if (running) {
+          // The preview is cleared here rather than waiting for the next
+          // event: the words it showed have just become a turn, and leaving
+          // them under the box would read as a second sentence still coming.
+          setInterim('')
+        }
+        if (armed.current.live) postRef.current(text)
+      }
+      engine.onerror = (event) => {
+        if (!running) return
+        if (!isBlockingError(event.error)) return
+        // Not an error the conversation recovers from: say so once, in the
+        // status line, and leave the typed box as the way in.
+        setBlocked(true)
+        setActionError(`the microphone is unavailable (${event.error})`)
+      }
+      engine.onend = () => {
+        if (!running) return
+        setInterim('')
+        // The browser ends recognition by itself — after about a minute, and
+        // on a long enough silence — and reports it as an ordinary end. So the
+        // question is asked again rather than retried: as long as the
+        // conversation still wants the microphone, open a new one.
+        if (wants.current) open()
+      }
+      try {
+        engine.start()
+      } catch (err: unknown) {
+        // A refused start fires no `start` and no `end`, so nothing here will
+        // reopen it — say so rather than going quiet, and let the next change
+        // of the answer (mesa's next reply ending, most likely) try again.
+        if (running) setActionError(err instanceof Error ? err.message : String(err))
+      }
+    }
+    open()
+
+    return () => {
+      running = false
+      setInterim('')
+      current?.stop()
+    }
+  }, [wantsMic])
 
   // The run: the oldest mesa turn nobody has played, one at a time. A turn that
   // navigates moves the browser when it is *reached*, whether or not it also
@@ -618,6 +761,11 @@ export function LiveHub({
     const text = draftRef.current.trim()
     if (text === '' || !live) return
     updateDraft('')
+    post(text)
+  }
+
+  /** The one way an utterance leaves this page — typed, or heard. */
+  function post(text: string) {
     sendLiveUtterance(text).then(
       () => {
         refused.current = null
@@ -638,6 +786,7 @@ export function LiveHub({
   }
   useEffect(() => {
     sendRef.current = send
+    postRef.current = post
   })
 
   const groups = turnGroups(turns)
@@ -774,7 +923,11 @@ export function LiveHub({
             value={draft}
             disabled={!live}
             placeholder={
-              live ? 'dictate here…' : 'go live to start the conversation'
+              !live
+                ? 'go live to start the conversation'
+                : recognizes
+                  ? 'listening — or type here'
+                  : 'dictate or type here…'
             }
             aria-label="say something to mesa"
             onChange={(e) => updateDraft(e.target.value)}
@@ -816,11 +969,16 @@ export function LiveHub({
               send()
             }}
           />
+          {/* What the engine is still guessing at. Shown so the person can see
+              they are being heard, and never sent: only a settled result
+              becomes a turn. */}
+          {interim !== '' && (
+            <div className="live-interim" aria-live="polite">
+              {interim}
+            </div>
+          )}
           <div className="live-hint muted">
-            This is where system dictation types — while you are live, your
-            words land here wherever the app has navigated, and a settled line
-            is sent on its own. Enter sends at once; click into another field
-            to type there instead. mesa captures no microphone of its own.
+            {captureHint({ supported, blocked, listening: recognizes })} Enter sends at once.
           </div>
         </form>
       </div>

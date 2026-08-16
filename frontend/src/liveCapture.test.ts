@@ -39,7 +39,12 @@ describe('userTookFocus', () => {
 })
 
 describe('shouldReclaimFocus', () => {
-  const armed = { live: true, unlocked: true, standingDown: false } as const
+  const armed = {
+    live: true,
+    unlocked: true,
+    standingDown: false,
+    listening: false,
+  } as const
 
   it('never reclaims without a live session', () => {
     for (const cause of ['went-live', 'navigated', 'hub-press', 'focus-lost-no-gesture'] as const) {
@@ -59,6 +64,12 @@ describe('shouldReclaimFocus', () => {
     }
   })
 
+  it('never reclaims while the browser is listening for itself', () => {
+    for (const cause of ['went-live', 'navigated', 'hub-press', 'focus-lost-no-gesture'] as const) {
+      expect(shouldReclaimFocus({ ...armed, listening: true, cause })).toBe(false)
+    }
+  })
+
   it('while standing down, only mesa acting again re-arms', () => {
     const down = { ...armed, standingDown: true }
     expect(shouldReclaimFocus({ ...down, cause: 'went-live' })).toBe(true)
@@ -70,19 +81,23 @@ describe('shouldReclaimFocus', () => {
 
 describe('shouldAutoSend', () => {
   it('sends a settled non-empty draft', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, false)).toBe(true)
+    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, false, false)).toBe(true)
   })
 
   it('waits while the draft is still moving', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS - 1, false)).toBe(false)
+    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS - 1, false, false)).toBe(false)
   })
 
   it('never sends blank or whitespace-only text', () => {
-    expect(shouldAutoSend('', AUTO_SEND_IDLE_MS, false)).toBe(false)
-    expect(shouldAutoSend('   \n', AUTO_SEND_IDLE_MS, false)).toBe(false)
+    expect(shouldAutoSend('', AUTO_SEND_IDLE_MS, false, false)).toBe(false)
+    expect(shouldAutoSend('   \n', AUTO_SEND_IDLE_MS, false, false)).toBe(false)
   })
 
   it('never sends mid-IME-composition', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, true)).toBe(false)
+    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, true, false)).toBe(false)
+  })
+
+  it('never sends on a timer while the browser is listening for itself', () => {
+    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, false, true)).toBe(false)
   })
 })

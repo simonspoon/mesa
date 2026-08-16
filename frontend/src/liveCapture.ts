@@ -14,6 +14,15 @@
  * Enter, so waiting for one means the conversation stalls until the person
  * touches the keyboard — the opposite of hands-free. mesa decides instead: a
  * draft nobody has edited for a beat is a finished thought.
+ *
+ * Both halves stand down entirely while the browser is doing the listening
+ * itself (`listening`, from `liveRecognition.ts` — mesa task 873). The fight
+ * was only ever about *where the words land*, and a recognized sentence lands
+ * in the conversation no matter what holds the keyboard; so with the
+ * microphone open the box stops grabbing focus and stops sending on a timer,
+ * and it is a plain fallback the person may type in. This module keeps both
+ * rules because recognition is not everywhere: an unsupported browser, or a
+ * refused microphone, is exactly the old surface, unchanged.
  */
 
 /** How long after a pointer/key gesture a focus loss still counts as deliberate. */
@@ -56,7 +65,10 @@ export type ReclaimCause =
   | 'focus-lost-no-gesture'
 
 /**
- * Whether the capture box takes focus now. Never before this browser has both
+ * Whether the capture box takes focus now. Never while the browser is
+ * `listening` for itself: the whole point of the fight is that dictated words
+ * must reach the conversation rather than the page, and recognized ones do
+ * that with the keyboard anywhere. Never before this browser has both
  * a live session and a press behind it (`unlocked` — a browser that has not
  * joined must not grab the keyboard). While standing down — the person
  * deliberately took focus elsewhere — only mesa acting again (`went-live`,
@@ -67,8 +79,10 @@ export function shouldReclaimFocus(input: {
   live: boolean
   unlocked: boolean
   standingDown: boolean
+  listening: boolean
   cause: ReclaimCause
 }): boolean {
+  if (input.listening) return false
   if (!input.live || !input.unlocked) return false
   if (input.standingDown) return input.cause !== 'focus-lost-no-gesture'
   return true
@@ -76,9 +90,17 @@ export function shouldReclaimFocus(input: {
 
 /**
  * Whether an untouched draft is ready to send: non-blank, idle past the
- * threshold, and not mid-IME-composition — sending half-converted text would
- * ship a word the person never said.
+ * threshold, not mid-IME-composition — sending half-converted text would
+ * ship a word the person never said — and not while the browser is
+ * `listening`, where the engine's own final results are what get sent and a
+ * timer firing on top of them would post the same sentence twice.
  */
-export function shouldAutoSend(draft: string, idleMs: number, composing: boolean): boolean {
+export function shouldAutoSend(
+  draft: string,
+  idleMs: number,
+  composing: boolean,
+  listening: boolean,
+): boolean {
+  if (listening) return false
   return !composing && draft.trim() !== '' && idleMs >= AUTO_SEND_IDLE_MS
 }

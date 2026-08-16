@@ -8,10 +8,17 @@ group, `/api/live*`, and the header's conversation hub (`LiveHub`).
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
 
-- **Person → mesa is typed text.** The hub's popup has a plain `<textarea>`, and
-  the person's *own* system dictation (macOS Dictation, a phone keyboard's mic
-  key, or their fingers) types into it. **mesa ships no speech-to-text,
-  captures no microphone, and accepts no audio request body.** See
+- **Person → mesa is text, recognised in the browser.** While a session is live
+  and this browser has joined it, the page opens the microphone through the
+  browser's **own** speech recognition (`SpeechRecognition` /
+  `webkitSpeechRecognition`) and posts each *final* result as a `user` turn
+  (task 873). The hub's popup also has a plain `<textarea>`, which is the
+  fallback wherever recognition is not on offer: a browser without it (Firefox
+  today), or a refused microphone. There the person's *own* system dictation
+  (macOS Dictation, a phone keyboard's mic key, or their fingers) types into it,
+  exactly as before. Either way, **mesa ships no speech-to-text of its own,
+  never sees the audio, and accepts no audio request body** — the recognition
+  is the browser's and stays in the page. See
   [What is deliberately absent](#what-is-deliberately-absent).
 - **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
@@ -412,8 +419,69 @@ conversation") working with no backend change.
   conversation. The closed state hides by **clipping**, never `display: none`
   or `visibility: hidden`, so the capture box inside keeps its focus — and the
   dictation flowing into it — while the popup is shut.
-- **While joined, the capture box holds the keyboard** (`liveCapture.ts`, the
-  tested module for all of this). The person does not aim their dictation;
+- **While joined, the browser listens** (`liveRecognition.ts`, the tested
+  module for all of this — task 873). Two questions, deliberately not one:
+  - `recognizesSpeech` — is the microphone the way in *at all*: the session is
+    live, *this* browser has had its press (`unlocked` — the gesture that
+    unlocks audio is the one that may open a microphone), the browser has a
+    recognizer, and the microphone was not refused.
+  - `shouldListen` — that, **and mesa is not speaking**. The microphone would
+    otherwise hear her own reply out of the speakers and answer it, so speech
+    is a gate on listening rather than a separate mute, and the microphone
+    reopens when she stops.
+
+  Everything *about the person's input method* reads the first — the capture
+  box's two rules, the composer's hint — and only the recognizer's own
+  lifecycle reads the second. Keying the former on the latter is the bug that
+  looks like a shortcut: mesa speaks for most of the conversation's wall time,
+  so a focus fight or an auto-send deadline that re-arms itself while she
+  talks is decided by playback timing rather than by any rule.
+  - **Only a final result is an utterance.** An interim result is the engine
+    thinking out loud — shown as a preview under the capture box, in italics,
+    and never sent. `readResults` splits one event into the two and answers how
+    far the list is now consumed (`settledThrough`); the hub floors the next
+    read at that mark rather than trusting the event's `resultIndex`, because
+    an engine that reports an index it already settled (Chromium on Android
+    has) would otherwise re-post every sentence before it — and an utterance is
+    an irreversible write and an answer the agent gives twice. `utteranceFrom`
+    drops a settled result with no words in it (a cough, a door), which the
+    engine produces routinely.
+  - **The last sentence before she speaks is not dropped.** Stopping the
+    engine *delivers* what was pending as a final, and that sentence was heard
+    before the audio started, so it is the person's and it is posted. Only the
+    conversation ending discards it — there is nothing left to say it to.
+  - **Recognition restarts itself.** Chrome ends it after about a minute and on
+    a long enough silence, and reports that as an ordinary end, not an error.
+    So `onend` asks `shouldListen` again and opens a new recognizer if the
+    answer is still yes — a re-answer, not a retry loop. A recognizer stopped
+    by the hub's own cleanup still fires its end; that echo is guarded, or
+    ending a conversation would reopen the microphone it just closed.
+  - **A refusal is terminal for the page** (`isBlockingError`): `not-allowed`
+    and `service-not-allowed` set `blocked`, name themselves in the status
+    line, and leave the typed box as the way in. Everything else the engine
+    reports — `no-speech`, `aborted`, `network`, `audio-capture` — arrives in
+    normal use and is followed by an end that `shouldListen` answers on its own
+    merits. Treating those as fatal would silence recognition on the first
+    quiet stretch; treating a refusal as transient would reopen the permission
+    prompt for ever. A `start()` that throws outright fires neither event, so
+    nothing would reopen it: it names itself in the status line instead of
+    going quiet, and the next change of the answer (mesa's next reply ending,
+    most likely) tries again.
+  - **The composer always says which of the four it is** (`captureHint`, over
+    `recognizesSpeech`): this browser cannot listen, the microphone was
+    refused, it is listening, or the conversation has not started — because
+    "is it hearing me" is the only question a hands-free surface has to answer
+    without being asked. That she pauses while she speaks is said *in* the
+    listening line, rather than by the line flipping to "go live" on every
+    reply.
+- **While joined *and not listening*, the capture box holds the keyboard**
+  (`liveCapture.ts`, the tested module for all of this). With the microphone
+  open, none of the rule below applies: the fight was always about *where the
+  words land*, and a recognized sentence lands in the conversation with the
+  keyboard anywhere. So `shouldReclaimFocus` answers `false` outright while
+  `listening`, and the box becomes a plain fallback the person may click into
+  and type. The rest holds unchanged wherever recognition is not running.
+  The person does not aim their dictation;
   mesa does: while a session is live *and* this browser has had its press,
   the box takes focus — so when a `navigate` turn opens a page with a text
   field, the words that follow still land in the conversation, not in the
@@ -430,7 +498,10 @@ conversation") working with no backend change.
   precede a navigate cannot make its autofocus read as deliberate.
   Nothing grabs the keyboard before the press: an un-joined browser has no
   business stealing focus.
-- **A settled line is sent on mesa's clock** (`shouldAutoSend`): dictation
+- **A settled line is sent on mesa's clock** (`shouldAutoSend`) — while the
+  browser is not listening for itself, where the engine's own finals are what
+  get sent and a timer firing on top of them would post the same sentence
+  twice. Otherwise: dictation
   never presses Enter, so a non-blank draft untouched for `AUTO_SEND_IDLE_MS`
   (2s) is sent as the utterance — hands-free end to end. Enter still sends at
   once, Shift+Enter still opens a line, and the IME guard holds it while
@@ -470,8 +541,9 @@ conversation") working with no backend change.
   the last call failed is the one way it can lie. It also calls out a live
   session with **no agent bound**, which would otherwise listen for ever and
   never answer.
-- The **capture textarea** carries a visible hint that this is where system
-  dictation types, wherever the app has navigated. Enter sends, Shift+Enter
+- The **capture textarea** carries a visible hint saying which of the four
+  listening states it is in, and that this is where the fallback typing (or
+  system dictation) goes, wherever the app has navigated. Enter sends, Shift+Enter
   opens a line, and an `isComposing` guard keeps an IME's Enter out of it —
   the same composer contract as the Agent sidebar's chat box.
 - The **transcript is accumulated by the hub**: each poll answers only with
@@ -502,8 +574,12 @@ conversation") working with no backend change.
   starting" and "a session running in a browser with no gesture" are four
   different buttons and the label has to be right in each — plus the popup
   toggle's `overlay` flag, and the status line) and
-  `frontend/src/liveCapture.ts` (the focus referee and the auto-send rule),
-  each with a sibling vitest file.
+  `frontend/src/liveCapture.ts` (the focus referee and the auto-send rule, and
+  when both stand aside) and
+  `frontend/src/liveRecognition.ts` (the two listening questions and why they
+  are two, which errors end listening, a result event's final text, its preview
+  and its high-water mark, what a settled result is worth sending, and the
+  composer's hint), each with a sibling vitest file.
 
 ## Config
 
@@ -538,12 +614,20 @@ CLAUDE.md requires: **data, never instructions.**
 
 ## What is deliberately absent
 
-- **Speech-to-text.** mesa does not capture a microphone, does not ship or
-  shell out to an STT engine, and no route accepts an audio body. The person's
-  own system dictation types into a text field, which means the recognition
-  quality, the language, and the privacy question are all already theirs and
-  mesa adds nothing to answer for. The audio path stays **one-directional,
-  server to browser**.
+- **Speech-to-text of mesa's own.** mesa does not ship or shell out to an STT
+  engine, no route accepts an audio body, and no audio ever reaches the server:
+  recognition is the **browser's**, running in the page, and mesa receives only
+  the text it produced (task 873). The recognition quality, the language and
+  the privacy question are therefore the browser's — which, for Chrome and
+  Safari, means the speech may be sent to *their* service, a thing worth
+  knowing and not something mesa can answer for. Where there is no recognizer
+  at all, the person's own system dictation types into the text field, exactly
+  as it always did. The mesa audio path stays **one-directional, server to
+  browser**.
+  - A **fully local pipeline** — mic capture and VAD in the page, audio chunks
+    to a mesa route, a local whisper — is the follow-up that would take the
+    privacy question and the non-Chromium browsers off this list. It is not
+    here yet, and it is the only reason a route would ever accept audio.
 - **A second live session.** One conversation, one page, one player.
 - **A per-session voice.** The voice is `speech.voice` in
   `~/.mesa/config.json`, read on every press, shared with the inbox.

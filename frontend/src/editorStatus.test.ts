@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   caretPosition,
+  carriedOffset,
   gutterDigits,
   gutterText,
   lineAtScroll,
@@ -180,6 +181,33 @@ describe('normalizeNewlines', () => {
     expect(crlf.indexOf('three')).toBe(10)
     expect(normalized.indexOf('three')).toBe(8)
     expect(normalized).toBe(crlf.split('\r\n').join('\n'))
+  })
+})
+
+describe('carriedOffset', () => {
+  const crlf = 'one\r\ntwo\r\nthree'
+  const lf = normalizeNewlines(crlf)
+
+  it('translates a CRLF offset onto the LF draft and back', () => {
+    // The crossing the Files tab makes on Edit and on Cancel: the same word,
+    // two dialects, two offsets.
+    expect(carriedOffset(crlf, crlf.indexOf('three'), lf)).toBe(lf.indexOf('three'))
+    expect(carriedOffset(lf, lf.indexOf('three'), crlf)).toBe(crlf.indexOf('three'))
+  })
+
+  it('is the identity when the two strings are the same', () => {
+    expect(carriedOffset(lf, 6, lf)).toBe(6)
+    expect(carriedOffset(lf, 0, lf)).toBe(0)
+  })
+
+  it('keeps the column inside the line it lands on', () => {
+    // A column past the end of the target text clamps rather than pointing
+    // outside it — a step's anchor, not a claim about a character.
+    expect(carriedOffset('a-long-first-line', 12, 'ab')).toBe(2)
+  })
+
+  it('lands on the same line when a lone CR is the break', () => {
+    expect(carriedOffset('a\rbb', 2, 'a\nbb')).toBe(2)
   })
 })
 

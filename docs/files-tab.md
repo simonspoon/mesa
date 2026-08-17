@@ -1025,11 +1025,23 @@ and `shouldIgnoreFilesShortcut` in `keyboardScope.ts`.
   file: Enter four times to a match 800 lines down and then one more character
   of query would otherwise teleport them back to the first hit of the *original*
   search. Re-anchoring on the current match is what makes refining narrow in
-  place, and it leaves the fresh-open behaviour above untouched. The crossing
-  between view and edit mode resets the anchor and the index instead of moving
-  them: the two modes search different strings (the bytes on disk vs the
-  LF-normalised draft), so in a CRLF file a carried offset is one character per
-  preceding line wrong — the same reason `startEdit` resets the caret.
+  place, and it leaves the fresh-open behaviour above untouched. **The crossing
+  between view and edit mode carries the current match across** (task 879,
+  `carryFind`): the two modes search different strings (the bytes on disk vs the
+  LF-normalised draft), so in a CRLF file a raw offset is one character per
+  preceding line wrong — but line and column are coordinates the two dialects
+  agree on, so the offset is *translated* through them (`carriedOffset`) rather
+  than discarded. The index is then the ordinary `matchIndexFrom` answer for
+  that anchor over the new string, and the reveal is armed for the render that
+  crosses, since the editor is not mounted (and the mark not in the DOM) until
+  React has painted the mode being entered. It used to reset both to `-1`/`0`,
+  which was correct about the offsets and wrong about the reader: pressing Edit
+  on the match you had just found dropped you at line 1 with the counter still
+  claiming a match — "the counter says N and the view sat still", the failure
+  the whole reveal machinery exists to prevent, arrived at from the one
+  direction nothing was watching. With no match to carry (bar closed, empty
+  query, nothing found) the crossing is still that reset, and the caret is still
+  reset with it.
 
   **Cmd/Ctrl+F selects the query every time the bar comes up**, open or closed,
   because Cmd+F-then-type is the reflex the bar is for. On an already-open bar

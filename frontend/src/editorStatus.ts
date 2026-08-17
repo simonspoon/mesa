@@ -105,6 +105,26 @@ export function offsetForLine(value: string, line: number): number {
   return value.length
 }
 
+/**
+ * The same place in `to` as `offset` is in `from`, when the two are the same
+ * text in two newline dialects — the bytes on disk and the LF-normalised draft
+ * a `<textarea>` hands back (`normalizeNewlines`).
+ *
+ * This is what carries a find across the Edit/Cancel crossing (task 879):
+ * a CRLF file's offsets are one character per preceding line apart in the two
+ * strings, so the offset the bar is holding is an answer about the *other*
+ * one — which is why the crossing used to drop it and start the search over at
+ * the top of the file. Line and column are the coordinates the two dialects
+ * agree on (`endsLine` counts a CRLF pair once), so mapping through them is
+ * exact for the re-encoding and a best effort — the same line, clamped into it
+ * — for anything else.
+ */
+export function carriedOffset(from: string, offset: number, to: string): number {
+  const { line, col } = caretPosition(from, offset)
+  const start = offsetForLine(to, line)
+  return Math.min(start + col - 1, to.length)
+}
+
 /** The 1-based line at the top of a viewport, given how many pixels of the text
  * have scrolled above it and how tall one line is.
  *

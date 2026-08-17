@@ -41,6 +41,7 @@ import {
   saveFilesTreeWidth,
 } from '../filesTreeWidth'
 import {
+  carriedOffset,
   gutterText,
   lineAtScroll,
   lineCount,
@@ -633,6 +634,41 @@ function ContentPane({
     reveal(matches[index])
   }
 
+  /** Carry the match the bar is showing across the Edit/Cancel crossing into
+   * `next`, the string the other mode searches (task 879).
+   *
+   * The crossing used to reset the bar to `index: -1, anchor: 0`, because the
+   * two strings are not offset-for-offset each other — the draft is the file's
+   * bytes LF-normalised, so in a CRLF file every offset the bar holds is one
+   * character per preceding line out. That was correct about the offsets and
+   * wrong about the reader: pressing Edit on the match you just found dropped
+   * you at line 1 of the file with the counter still claiming a match, which is
+   * "the counter says N and the view sat still" — the failure the whole reveal
+   * machinery exists to prevent, arrived at from the one direction nothing was
+   * watching.
+   *
+   * So the offsets are *translated* rather than discarded (`carriedOffset`,
+   * through the line/column the two dialects agree on), and the index is the
+   * ordinary `matchIndexFrom` answer for that anchor over the new string —
+   * never the old index, which the other text has no reason to agree with. The
+   * reveal is armed rather than performed for the same reason a step's is: the
+   * editor is not mounted, and the mark to measure is not in the DOM, until
+   * React has rendered the mode being crossed into.
+   *
+   * With no match to carry (bar closed, empty query, nothing found) this is the
+   * old reset, which is what a bar with nothing selected should be. */
+  function carryFind(next: string) {
+    const held = matches[current]
+    if (held === undefined) {
+      setFind((f) => ({ ...f, index: -1, anchor: 0 }))
+      return
+    }
+    const anchor = carriedOffset(searchText, held.start, next)
+    const { matches: found } = findMatches(next, find.query, find)
+    setFind((f) => ({ ...f, index: matchIndexFrom(found, anchor, true), anchor }))
+    pendingReveal.current = true
+  }
+
   // The one keystroke the Files tab takes off the browser. Scoped three ways
   // before it is claimed: this pane must be the focused one, the file must be
   // findable at all, and `shouldIgnoreFilesShortcut` must agree the caret is not
@@ -719,8 +755,12 @@ function ContentPane({
       landingActive && current >= 0 && revealedLanding.current !== landing.seq
     if (!pendingReveal.current && !landed) return
     pendingReveal.current = false
-    if (landed && ui.editing) {
-      revealedLanding.current = landing.seq
+    // Editing, there is no mark of this pane's to measure and the editor does
+    // its own reveal — the branch a landing takes, and the one `carryFind`
+    // takes on the crossing into edit mode, where `reveal` could not call the
+    // editor directly because it was not mounted yet.
+    if (ui.editing) {
+      if (landed) revealedLanding.current = landing.seq
       const match = matches[current]
       if (match !== undefined) editorRef.current?.reveal(match.start, match.end)
       return
@@ -816,13 +856,7 @@ function ContentPane({
     // select a range one character per line early in the textarea underneath.
     // See `normalizeNewlines`.
     const content = normalizeNewlines(data!.content)
-    // A find running over the viewer was running over the file's bytes; the
-    // draft is those bytes LF-normalised, so in a CRLF file every offset the
-    // bar is holding is one character per preceding line too large. The bar
-    // stays up (source is findable), but its anchor and its index are answers
-    // about the other string — same reason the caret above is reset rather than
-    // carried.
-    setFind((f) => ({ ...f, index: -1, anchor: 0 }))
+    carryFind(content)
     onUi({
       historyOpen: false,
       selectedCommit: null,
@@ -836,10 +870,9 @@ function ContentPane({
 
   function cancelEdit() {
     setSaveError(null)
-    // The crossing back is the same offset problem as `startEdit`'s, in the
-    // other direction: the viewer searches the bytes on disk, the draft was
-    // LF-normalised.
-    setFind((f) => ({ ...f, index: -1, anchor: 0 }))
+    // The crossing back is the same one, in the other direction: the viewer
+    // searches the bytes on disk, the draft was LF-normalised.
+    carryFind(data!.content)
     onUi({ editing: false })
   }
 

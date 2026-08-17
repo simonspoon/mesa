@@ -3,11 +3,13 @@
 //! cross-area contract). Like `core::git`/`core::agents`, this module touches
 //! EXTERNAL filesystem state only — `std::fs`, no `Store` dependency beyond
 //! whatever `local_path` string its caller (279's API layer) already
-//! resolved. Three writes live here, all narrow: `write_file` (task 327)
+//! resolved. Five writes live here, all narrow: `write_file` (task 327)
 //! overwrites an existing text file's content in place, `create_dir`
-//! (task 489) makes one empty directory for the folder picker, and
-//! `create_file` (task 672) makes one empty file inside a project's tree.
-//! Nothing in this module deletes or renames anything.
+//! (task 489) makes one empty directory for the folder picker, `create_file`
+//! (task 672) makes one empty file inside a project's tree, and `rename_path`
+//! / `delete_path` (task 877) rename or destroy ONE entry of that tree.
+//! Nothing in this module moves anything: a rename takes a new name, never a
+//! new path.
 
 use std::fs;
 use std::io::Read;
@@ -551,6 +553,236 @@ pub fn create_file(root: &str, rel: &str) -> Result<(), CreateFileError> {
         std::io::ErrorKind::AlreadyExists => CreateFileError::Conflict,
         _ => CreateFileError::NotFound,
     })
+}
+
+/// The single-component rules [`create_file`] applies to the final component
+/// of a new path, lifted out because the two entry writes below need them more
+/// than once between them ([`rename_path`] holds BOTH the existing name and the
+/// new one to them). Returns the trimmed name, or the reason it is not usable
+/// as one component. The wording is name-not-file-name because the entry on the
+/// other side may be a directory.
+fn single_component(name: &str) -> Result<&str, &'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name cannot be empty");
+    }
+    if name == "." || name == ".." {
+        return Err("name cannot be . or ..");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err("name must be a single name, not a path");
+    }
+    Ok(name)
+}
+
+/// What [`resolve_entry`] answers when it will not hand back an entry — mapped
+/// onto each caller's own public error enum, which is why this one is private
+/// and carries only the two variants both writes share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryError {
+    NotFound,
+    Validation(&'static str),
+}
+
+/// One resolved tree entry, as [`resolve_entry`] hands it to the two writes
+/// below: the directory holding it, its absolute path, the two halves of `rel`
+/// the echoed [`FileTreeEntry`] is rebuilt from, and how [`tree_level`] would
+/// classify it. Borrowed from `rel` rather than owned — nothing here outlives
+/// the call.
+struct ResolvedEntry<'a> {
+    parent: PathBuf,
+    target: PathBuf,
+    parent_rel: &'a str,
+    name: &'a str,
+    is_dir: bool,
+}
+
+/// The shared front half of [`rename_path`] and [`delete_path`]: turns `rel`
+/// into the entry it names.
+///
+/// It resolves the **PARENT** through [`safe_path`] and never the target
+/// itself — [`create_file`]'s rule, and load-bearing for a second reason here.
+/// `safe_path` canonicalizes, which *follows symlinks*: resolving the target
+/// through it would turn "rename/delete this symlink" into "rename/delete
+/// whatever it points at", and would answer `None` for the very symlinks
+/// [`tree_level`] happily lists (any pointing outside `root`) — so the entry a
+/// user can see would be the one entry they could not act on. Holding the final
+/// component to the same single-component rules [`create_file`] applies is what
+/// keeps `parent.join(name)` provably inside `parent`, so `safe_path` stays the
+/// module's sole request-path-to-fs-path chokepoint with no second containment
+/// model.
+///
+/// `rel` naming the root itself (empty, whitespace-only, or `.`) is
+/// `Validation`: the project folder is not an entry of its own tree, and
+/// neither write may rename or destroy it.
+///
+/// `is_dir` comes from `symlink_metadata().file_type()`, so a symlinked
+/// directory is a file leaf — [`tree_level`]'s classification, so the echoed
+/// entry matches the row it came from.
+fn resolve_entry<'a>(root: &str, rel: &'a str) -> Result<ResolvedEntry<'a>, EntryError> {
+    let trimmed = rel.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Err(EntryError::Validation(
+            "the project folder itself is not a tree entry",
+        ));
+    }
+    let (parent_rel, name) = match rel.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", rel),
+    };
+    let name = single_component(name).map_err(EntryError::Validation)?;
+    let anchor = if parent_rel.is_empty() {
+        "."
+    } else {
+        parent_rel
+    };
+    let parent = safe_path(root, anchor).ok_or(EntryError::NotFound)?;
+    if !parent.is_dir() {
+        return Err(EntryError::NotFound);
+    }
+    let target = parent.join(name);
+    // `symlink_metadata`, never `exists()`: a dangling symlink is a real row in
+    // the tree, so it has to be an entry these writes can act on rather than a
+    // name that reads as missing.
+    let meta = target
+        .symlink_metadata()
+        .map_err(|_| EntryError::NotFound)?;
+    Ok(ResolvedEntry {
+        parent,
+        target,
+        parent_rel,
+        name,
+        is_dir: meta.file_type().is_dir(),
+    })
+}
+
+/// The relative path an entry named `name` inside `parent_rel` carries — the
+/// same `{rel}/{name}` shape [`tree_level`] gives the rows the caller clicked.
+fn entry_path(parent_rel: &str, name: &str) -> String {
+    if parent_rel.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_rel}/{name}")
+    }
+}
+
+/// Why [`rename_path`] rejected the request, the same three-way split
+/// [`CreateFileError`] uses (and mapped to the same 404/422/409 at the API
+/// layer):
+///   - `NotFound`: the PARENT directory doesn't resolve through [`safe_path`]
+///     (traversal, absolute-path smuggling, symlink escape, nonexistent), is
+///     not a directory, the source entry doesn't exist, or the `fs::rename`
+///     itself failed.
+///   - `Validation(reason)`: `rel` names the root itself, or either name isn't
+///     a usable single component.
+///   - `Conflict`: something already occupies the new name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenamePathError {
+    NotFound,
+    Validation(&'static str),
+    Conflict,
+}
+
+impl From<EntryError> for RenamePathError {
+    fn from(err: EntryError) -> Self {
+        match err {
+            EntryError::NotFound => RenamePathError::NotFound,
+            EntryError::Validation(reason) => RenamePathError::Validation(reason),
+        }
+    }
+}
+
+/// Renames the entry at `rel` — a file, a directory or a symlink — to
+/// `new_name` (task 877), returning the entry it became: the NEW name, its new
+/// relative path, and the `is_dir` [`tree_level`] would list it with.
+///
+/// **Within the same directory only.** `new_name` is one name, never a path, so
+/// this is a rename and not a move — moving an entry is a separate feature with
+/// its own question (which directory, and what happens to the tabs open under
+/// the old prefix), and the single-component check is what makes the narrower
+/// promise enforceable rather than merely intended. Both names go through
+/// [`single_component`]; the containment story is [`resolve_entry`]'s, i.e.
+/// [`create_file`]'s.
+///
+/// An existing destination is `Conflict`, tested with `symlink_metadata()`
+/// rather than `exists()` — `create_file`'s rule, for its reason (a dangling
+/// symlink is a name taken). Renaming an entry onto its own name therefore
+/// conflicts too, which is the honest answer: nothing to do, and the caller
+/// asked for a rename.
+pub fn rename_path(
+    root: &str,
+    rel: &str,
+    new_name: &str,
+) -> Result<FileTreeEntry, RenamePathError> {
+    let entry = resolve_entry(root, rel)?;
+    let new_name = single_component(new_name).map_err(RenamePathError::Validation)?;
+    let dest = entry.parent.join(new_name);
+    if dest.symlink_metadata().is_ok() {
+        return Err(RenamePathError::Conflict);
+    }
+    fs::rename(&entry.target, &dest).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => RenamePathError::Conflict,
+        _ => RenamePathError::NotFound,
+    })?;
+    Ok(FileTreeEntry {
+        name: new_name.to_string(),
+        path: entry_path(entry.parent_rel, new_name),
+        // A rename does not change what the entry IS, so this is the
+        // classification `resolve_entry` already read off it — not a second
+        // `symlink_metadata` on the new name.
+        is_dir: entry.is_dir,
+    })
+}
+
+/// Why [`delete_path`] rejected the request — the two-way split
+/// [`WriteFileError`] uses, since a delete has no destination to collide with:
+///   - `NotFound`: the PARENT directory doesn't resolve through [`safe_path`]
+///     (traversal, absolute-path smuggling, symlink escape, nonexistent), is
+///     not a directory, the entry doesn't exist, or the removal itself failed.
+///   - `Validation(reason)`: `rel` names the root itself, or its final
+///     component isn't a usable single name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletePathError {
+    NotFound,
+    Validation(&'static str),
+}
+
+impl From<EntryError> for DeletePathError {
+    fn from(err: EntryError) -> Self {
+        match err {
+            EntryError::NotFound => DeletePathError::NotFound,
+            EntryError::Validation(reason) => DeletePathError::Validation(reason),
+        }
+    }
+}
+
+/// Destroys the entry at `rel` (task 877), returning the [`FileTreeEntry`] it
+/// was — captured BEFORE the removal, which is the delete-echo precedent the
+/// rest of mesa runs on (CLAUDE.md: the echoed record is the recovery
+/// transcript that substitutes for a confirmation prompt this app deliberately
+/// does not have).
+///
+/// **A directory is removed recursively** (`fs::remove_dir_all`), and that is
+/// the intent rather than a convenience: the affordance is "delete this folder"
+/// on a tree row, and refusing a non-empty one would leave the only way to
+/// empty it being to delete every descendant one row at a time. Everything else
+/// — a file, or a symlink of any kind — goes through `fs::remove_file`, so a
+/// symlink is unlinked as the NAME it is and whatever it points at is never
+/// touched (see [`resolve_entry`] for why the target is never canonicalized).
+pub fn delete_path(root: &str, rel: &str) -> Result<FileTreeEntry, DeletePathError> {
+    let entry = resolve_entry(root, rel)?;
+    let destroyed = FileTreeEntry {
+        name: entry.name.to_string(),
+        path: entry_path(entry.parent_rel, entry.name),
+        is_dir: entry.is_dir,
+    };
+    let removed = if entry.is_dir {
+        fs::remove_dir_all(&entry.target)
+    } else {
+        fs::remove_file(&entry.target)
+    };
+    removed.map_err(|_| DeletePathError::NotFound)?;
+    Ok(destroyed)
 }
 
 /// The two toggles a search carries, mirroring the in-file find bar's
@@ -1737,6 +1969,320 @@ mod tests {
             fs::read_to_string(dir.path().join("taken.txt")).unwrap(),
             "keep me"
         );
+    }
+
+    // --- rename_path (mesa task 877) -----------------------------------------
+
+    #[test]
+    fn rename_path_renames_a_file_and_echoes_its_new_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/old.rs"), "fn main() {}\n").unwrap();
+
+        let entry = rename_path(root, "src/old.rs", "new.rs").unwrap();
+        assert_eq!(entry.name, "new.rs");
+        assert_eq!(entry.path, "src/new.rs");
+        assert!(!entry.is_dir);
+        assert!(!dir.path().join("src/old.rs").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/new.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    #[test]
+    fn rename_path_renames_a_root_level_entry_without_a_path_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("notes.md"), "hi").unwrap();
+
+        let entry = rename_path(root, "notes.md", "  README.md  ").unwrap();
+        // The name is trimmed, `create_file`'s rule.
+        assert_eq!(entry.name, "README.md");
+        assert_eq!(entry.path, "README.md");
+        assert!(dir.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn rename_path_renames_a_directory_and_its_contents_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("old/nested")).unwrap();
+        fs::write(dir.path().join("old/nested/deep.txt"), "still here").unwrap();
+
+        let entry = rename_path(root, "old", "new").unwrap();
+        assert_eq!(entry.name, "new");
+        assert_eq!(entry.path, "new");
+        assert!(entry.is_dir);
+        // The whole subtree moved with the name, readable through the module's
+        // own readers under the new path.
+        assert_eq!(
+            read_file(root, "new/nested/deep.txt").unwrap().content,
+            "still here"
+        );
+        let (level, _) = tree_level(root, "new/nested").unwrap();
+        assert_eq!(level.len(), 1);
+        assert_eq!(level[0].path, "new/nested/deep.txt");
+    }
+
+    #[test]
+    fn rename_path_conflicts_on_an_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        fs::create_dir_all(dir.path().join("adir")).unwrap();
+
+        assert_eq!(
+            rename_path(root, "a.txt", "b.txt"),
+            Err(RenamePathError::Conflict)
+        );
+        assert_eq!(
+            rename_path(root, "a.txt", "adir"),
+            Err(RenamePathError::Conflict)
+        );
+        // Renaming onto its own name is a conflict too, and nothing moved.
+        assert_eq!(
+            rename_path(root, "a.txt", "a.txt"),
+            Err(RenamePathError::Conflict)
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b");
+    }
+
+    #[test]
+    fn rename_path_rejects_a_new_name_that_is_not_a_single_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+
+        // `..`, a separator and an empty name are the three shapes that would
+        // turn a rename into a move or an escape — the reason `new_name` is one
+        // name and never a path.
+        for bad in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "sub/a.txt",
+            "../a.txt",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(
+                matches!(
+                    rename_path(root, "a.txt", bad),
+                    Err(RenamePathError::Validation(_))
+                ),
+                "expected validation error for {bad:?}"
+            );
+        }
+        assert!(dir.path().join("a.txt").exists());
+        assert!(!dir.path().join("sub/a.txt").exists());
+    }
+
+    #[test]
+    fn rename_path_not_found_for_traversal_absolute_and_missing_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        let root = root.to_str().unwrap();
+
+        for bad in [
+            "../secret.txt",
+            "../../secret.txt",
+            "a/../../secret.txt",
+            "nope.txt",
+            "gone/x.txt",
+        ] {
+            assert_eq!(
+                rename_path(root, bad, "owned.txt"),
+                Err(RenamePathError::NotFound),
+                "path {bad:?}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("secret.txt")).unwrap(),
+            "top secret"
+        );
+    }
+
+    #[test]
+    fn rename_path_not_found_for_an_absolute_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("secret.txt");
+        fs::write(&outside, "top secret").unwrap();
+
+        assert_eq!(
+            rename_path(root.to_str().unwrap(), outside.to_str().unwrap(), "x.txt"),
+            Err(RenamePathError::NotFound)
+        );
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn rename_path_rejects_the_project_root_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.to_str().unwrap();
+
+        for bad in ["", "   ", "."] {
+            assert!(
+                matches!(
+                    rename_path(root, bad, "renamed"),
+                    Err(RenamePathError::Validation(_))
+                ),
+                "expected validation error for {bad:?}"
+            );
+        }
+        assert!(fs::metadata(root).unwrap().is_dir());
+    }
+
+    // --- delete_path (mesa task 877) -----------------------------------------
+
+    #[test]
+    fn delete_path_removes_a_file_and_echoes_the_destroyed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/gone.rs"), "bye").unwrap();
+
+        let entry = delete_path(root, "src/gone.rs").unwrap();
+        assert_eq!(entry.name, "gone.rs");
+        assert_eq!(entry.path, "src/gone.rs");
+        assert!(!entry.is_dir);
+        assert!(!dir.path().join("src/gone.rs").exists());
+        // Only the entry named went — its directory is untouched.
+        assert!(dir.path().join("src").is_dir());
+    }
+
+    #[test]
+    fn delete_path_removes_a_non_empty_directory_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::create_dir_all(dir.path().join("doomed/nested")).unwrap();
+        fs::write(dir.path().join("doomed/a.txt"), "a").unwrap();
+        fs::write(dir.path().join("doomed/nested/b.txt"), "b").unwrap();
+        fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+
+        let entry = delete_path(root, "doomed").unwrap();
+        assert_eq!(entry.name, "doomed");
+        assert_eq!(entry.path, "doomed");
+        assert!(entry.is_dir);
+        assert!(!dir.path().join("doomed").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn delete_path_not_found_for_traversal_absolute_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("secret.txt");
+        fs::write(&outside, "top secret").unwrap();
+        let root_str = root.to_str().unwrap();
+
+        for bad in [
+            "../secret.txt",
+            "../../secret.txt",
+            "a/../../secret.txt",
+            "nope.txt",
+            "gone/x.txt",
+        ] {
+            assert_eq!(
+                delete_path(root_str, bad),
+                Err(DeletePathError::NotFound),
+                "path {bad:?}"
+            );
+        }
+        assert_eq!(
+            delete_path(root_str, outside.to_str().unwrap()),
+            Err(DeletePathError::NotFound)
+        );
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn delete_path_rejects_the_project_root_and_unusable_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let root_str = root.to_str().unwrap();
+
+        for bad in ["", "   ", ".", "..", "sub/", "sub/.", "a\\b", "x\0y"] {
+            assert!(
+                matches!(
+                    delete_path(root_str, bad),
+                    Err(DeletePathError::Validation(_))
+                ),
+                "expected validation error for {bad:?}"
+            );
+        }
+        // Neither the project folder nor its parent was touched.
+        assert!(root.is_dir());
+        assert!(root.join("sub").is_dir());
+        assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delete_path_unlinks_a_symlink_without_touching_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("secret.txt");
+        fs::write(&target, "top secret").unwrap();
+        symlink(&target, root.join("link.txt")).unwrap();
+        // `safe_path` refuses this path outright (it canonicalizes, and the
+        // target is outside the root) — which is exactly why `delete_path`
+        // resolves the PARENT instead: the row the tree lists has to be
+        // deletable as the name it is.
+        assert_eq!(safe_path(root.to_str().unwrap(), "link.txt"), None);
+
+        let entry = delete_path(root.to_str().unwrap(), "link.txt").unwrap();
+        assert_eq!(entry.name, "link.txt");
+        // `tree_level`'s classification: a symlink is a file leaf, whatever it
+        // points at.
+        assert!(!entry.is_dir);
+        assert!(root.join("link.txt").symlink_metadata().is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "top secret");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rename_path_renames_a_symlink_as_a_name_not_as_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("secret.txt");
+        fs::write(&target, "top secret").unwrap();
+        symlink(&target, root.join("link.txt")).unwrap();
+
+        let entry = rename_path(root.to_str().unwrap(), "link.txt", "renamed.txt").unwrap();
+        assert_eq!(entry.name, "renamed.txt");
+        assert!(!entry.is_dir);
+        assert!(
+            root.join("renamed.txt")
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
+        // The link still points at the untouched original.
+        assert_eq!(fs::read_to_string(&target).unwrap(), "top secret");
+        assert!(outside.join("secret.txt").exists());
     }
 
     // --- search_files (mesa task 813) ----------------------------------

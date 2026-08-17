@@ -7,6 +7,7 @@ import type {
 import { SyntaxHighlighter, vscDarkPlus, prismGrammar } from '../syntaxHighlighter'
 import {
   activateTab,
+  closeSubtree,
   closeTab,
   collapseSplit,
   cycleTab,
@@ -16,6 +17,7 @@ import {
   openFile,
   openPaths,
   paneOf,
+  renameSubtree,
   setRatio,
   splitPane,
   splitWithTab,
@@ -78,12 +80,14 @@ import { loadOpenFiles, saveOpenFiles } from '../openFiles'
 import {
   ApiError,
   createProjectFile,
+  deleteProjectFileEntry,
   getProjectFiles,
   getProjectFilesContent,
   getProjectGitCommitDiff,
   getProjectGitFileLog,
   projectFileDownloadUrl,
   projectFileRawUrl,
+  renameProjectFileEntry,
   searchProjectFiles,
   updateProjectFilesContent,
 } from '../api'
@@ -1526,17 +1530,40 @@ type DirState =
   | 'error'
   | { entries: FileTreeEntry[]; truncated: boolean }
 
-/** The create-a-file affordance's whole state, threaded through the tree as
- * one object rather than five props (mesa task 672). `parent` is the directory
- * whose naming row is open — `''` for the project root, `null` for none, and
- * at most one at a time, which is why this is a single field and not a set.
- * The naming *decision* isn't here: it is `newFile.ts`. */
-interface TreeCreate {
-  parent: string | null
+/**
+ * The one inline thing the tree has open, if any — create (mesa task 672),
+ * rename or delete (task 877).
+ *
+ * **One value, not three flags**, and that is the point: all three occupy a row
+ * of the tree, and two of them open at once would be two prompts fighting over
+ * the same strip of pixels. Opening any one is therefore a write of this whole
+ * field, which closes whatever was there.
+ *
+ * `create.parent` is the directory the naming row belongs to (`''` = the project
+ * root). `rename`/`delete` name an existing entry, and carry `is_dir` because
+ * both read differently for a folder — a rename of a directory re-points a
+ * subtree of tabs, and a delete of one takes its contents with it.
+ */
+type TreeAction =
+  | { kind: 'create'; parent: string }
+  | { kind: 'rename'; path: string; name: string; isDir: boolean }
+  | { kind: 'delete'; path: string; name: string; isDir: boolean }
+
+/** The tree's inline actions, threaded down as one object rather than a dozen
+ * props. The naming *decision* isn't here: it is `newFile.ts`, shared by create
+ * and rename since both ask exactly "parent + single component → path". */
+interface TreeOps {
+  action: TreeAction | null
+  /** The message under the open row — either `newFile.ts`'s reason (no request
+   *  made) or the server's own 409/422/404, rendered the same way for both. */
   error: string | null
   busy: boolean
-  onStart: (parent: string) => void
-  onSubmit: (name: string) => void
+  onCreateStart: (parent: string) => void
+  onCreateSubmit: (name: string) => void
+  onRenameStart: (entry: FileTreeEntry) => void
+  onRenameSubmit: (name: string) => void
+  onDeleteStart: (entry: FileTreeEntry) => void
+  onDeleteConfirm: () => void
   onCancel: () => void
 }
 
@@ -1546,11 +1573,11 @@ interface TreeCreate {
 function NewFileButton({
   parent,
   label,
-  create,
+  ops,
 }: {
   parent: string
   label: string
-  create: TreeCreate
+  ops: TreeOps
 }) {
   return (
     <button
@@ -1560,7 +1587,7 @@ function NewFileButton({
       title={label}
       onClick={(e) => {
         e.stopPropagation()
-        create.onStart(parent)
+        ops.onCreateStart(parent)
       }}
     >
       +
@@ -1568,12 +1595,47 @@ function NewFileButton({
   )
 }
 
+/** Rename and delete, on **every** row — file and directory alike, unlike `+`,
+ * which only a directory can hold. Same reveal rules as `+` (hover or
+ * `:focus-visible`, always up under `@media (hover: none)`) so a column of
+ * paths stays quiet, and the same `stopPropagation`, since the row's own click
+ * selects a file or toggles a folder. */
+function TreeRowButtons({ entry, ops }: { entry: FileTreeEntry; ops: TreeOps }) {
+  const what = entry.is_dir ? 'folder' : 'file'
+  return (
+    <>
+      <button
+        type="button"
+        className="files-tree-add"
+        aria-label={`Rename ${what} ${entry.path}`}
+        title={`Rename ${entry.name}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          ops.onRenameStart(entry)
+        }}
+      >
+        ✎
+      </button>
+      <button
+        type="button"
+        className="files-tree-add files-tree-danger"
+        aria-label={`Delete ${what} ${entry.path}`}
+        title={`Delete ${entry.name}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          ops.onDeleteStart(entry)
+        }}
+      >
+        ⨯
+      </button>
+    </>
+  )
+}
+
 /** The inline naming row: one autofocused input, Enter to create, Escape or
  * blur to cancel. The typed name is local — nothing above needs a keystroke,
- * only the submitted name — while the error below it comes from the parent,
- * since it can be either `newFile.ts`'s reason (no request made) or the
- * server's own 409/422/404, rendered the same way for both. */
-function NewFileRow({ depth, create }: { depth: number; create: TreeCreate }) {
+ * only the submitted name. */
+function NewFileRow({ depth, ops }: { depth: number; ops: TreeOps }) {
   const [name, setName] = useState('')
   const indent = { paddingLeft: `${depth * 1.1 + 0.5}rem` }
   return (
@@ -1590,27 +1652,181 @@ function NewFileRow({ depth, create }: { depth: number; create: TreeCreate }) {
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
               e.preventDefault()
-              create.onSubmit(name)
+              ops.onCreateSubmit(name)
             }
             if (e.key === 'Escape') {
               e.preventDefault()
-              create.onCancel()
+              ops.onCancel()
             }
           }}
           // Deliberately never `disabled` while a create is in flight: the
           // browser blurs a control it disables, and blur cancels — so
           // disabling would close the row mid-request. `busy` is enforced in
           // the submit handler instead.
-          onBlur={create.onCancel}
+          onBlur={ops.onCancel}
         />
       </li>
-      {create.error !== null && (
+      {ops.error !== null && (
         <li className="files-tree-note error" style={indent}>
-          {create.error}
+          {ops.error}
         </li>
       )}
     </>
   )
+}
+
+/**
+ * The rename input, standing **in place of the row's own label** rather than on
+ * a row of its own — a rename is an edit of that name, and putting the box
+ * anywhere else would leave the old name on screen beside the new one.
+ *
+ * Prefilled with the current name and opened with the *basename* selected, so
+ * the common case (retype the name, keep the extension) is one gesture. Focus
+ * and selection are set once from an effect, not from the `ref` callback, which
+ * fires again on every keystroke and would eat the caret.
+ *
+ * Enter submits, Escape and blur cancel — the naming row's rules exactly, since
+ * this is the same kind of thing.
+ */
+function RenameInput({ current, ops }: { current: string; ops: TreeOps }) {
+  const [name, setName] = useState(current)
+  const ref = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (el === null) return
+    el.focus()
+    const dot = current.lastIndexOf('.')
+    el.setSelectionRange(0, dot > 0 ? dot : current.length)
+    // `current` is fixed for this row's lifetime (a different row is a
+    // different mount, keyed by path), so this runs once.
+  }, [current])
+  return (
+    <input
+      ref={ref}
+      className="files-tree-new-input"
+      value={name}
+      spellCheck={false}
+      aria-label={`Rename ${current}`}
+      // The row underneath selects a file / toggles a folder, and every one of
+      // these would otherwise reach it.
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setName(e.target.value)}
+      onKeyDown={(e) => {
+        e.stopPropagation()
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          ops.onRenameSubmit(name)
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault()
+          ops.onCancel()
+        }
+      }}
+      // Same reason as the naming row: never `disabled` mid-request, since the
+      // browser's own blur would cancel the row the request belongs to.
+      onBlur={ops.onCancel}
+    />
+  )
+}
+
+/**
+ * The delete prompt, inline on the row (mesa task 877) — never
+ * `window.confirm`, the same call `CloseConfirmBar` makes one pane over, and it
+ * earns being the app's second confirmation for the same reason the first did:
+ * the click destroys work irrecoverably. There is no undo and no trash, and the
+ * server's delete of a directory is recursive, so a folder's wording says that
+ * outright rather than asking a bare yes/no.
+ *
+ * It wears `.confirm-delete`'s classes, so the confirm/cancel pair matches every
+ * other two-step in the app, with the destructive answer red and the *safe* one
+ * autofocused — so Enter resolves the harmless way and the keyboard has a route
+ * back out. Escape cancels and is stopped from bubbling, since the tree's own
+ * key handling is not what should answer this.
+ */
+function DeleteConfirmRow({
+  depth,
+  action,
+  ops,
+}: {
+  depth: number
+  action: { path: string; name: string; isDir: boolean }
+  ops: TreeOps
+}) {
+  const indent = { paddingLeft: `${depth * 1.1 + 0.5}rem` }
+  return (
+    <>
+      <li className="files-tree-confirm" style={indent}>
+        <div
+          className="confirm-delete"
+          role="alert"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            if (e.key !== 'Escape') return
+            e.preventDefault()
+            e.stopPropagation()
+            ops.onCancel()
+          }}
+        >
+          <span className="confirm-message">
+            {action.isDir
+              ? `Delete ${action.name} and everything in it?`
+              : `Delete ${action.name}?`}
+          </span>
+          <button className="danger" onClick={ops.onDeleteConfirm}>
+            delete
+          </button>
+          <button autoFocus onClick={ops.onCancel}>
+            cancel
+          </button>
+        </div>
+      </li>
+      {ops.error !== null && (
+        <li className="files-tree-note error" style={indent}>
+          {ops.error}
+        </li>
+      )}
+    </>
+  )
+}
+
+/** The inline row a tree entry has open below it, if it is the one holding the
+ *  tree's single action — a delete prompt, or a rename's message (the rename
+ *  *input* renders in the row itself, but its message needs a row of its own,
+ *  the same one the naming row puts it on; create belongs to the directory it
+ *  is creating into). Both messages read identically whether they are
+ *  `newFile.ts`'s reason or the server's own 409/422/404. */
+function TreeRowAction({
+  entry,
+  depth,
+  ops,
+}: {
+  entry: FileTreeEntry
+  depth: number
+  ops: TreeOps
+}) {
+  const action = ops.action
+  if (action === null || action.kind === 'create' || action.path !== entry.path) {
+    return null
+  }
+  if (action.kind === 'delete') {
+    return <DeleteConfirmRow depth={depth} action={action} ops={ops} />
+  }
+  if (action.kind === 'rename' && ops.error !== null) {
+    return (
+      <li
+        className="files-tree-note error"
+        style={{ paddingLeft: `${depth * 1.1 + 0.5}rem` }}
+      >
+        {ops.error}
+      </li>
+    )
+  }
+  return null
+}
+
+/** Whether this row's label is currently being retyped. */
+function renamingRow(ops: TreeOps, path: string): boolean {
+  return ops.action?.kind === 'rename' && ops.action.path === path
 }
 
 /** One tree row (directory or file), recursing into an expanded directory's
@@ -1626,7 +1842,7 @@ function TreeNode({
   childrenCache,
   selectedPath,
   onSelectFile,
-  create,
+  ops,
 }: {
   entry: FileTreeEntry
   depth: number
@@ -1635,9 +1851,10 @@ function TreeNode({
   childrenCache: Map<string, DirState>
   selectedPath: string | null
   onSelectFile: (path: string) => void
-  create: TreeCreate
+  ops: TreeOps
 }) {
   const indent = { paddingLeft: `${depth * 1.1 + 0.5}rem` }
+  const renaming = renamingRow(ops, entry.path)
   if (entry.is_dir) {
     const isOpen = expanded.has(entry.path)
     const state = childrenCache.get(entry.path)
@@ -1651,18 +1868,26 @@ function TreeNode({
           <span className={`files-tree-toggle ${isOpen ? 'open' : ''}`}>
             {isOpen ? '▾' : '▸'}
           </span>
-          {entry.name}
-          <NewFileButton
-            parent={entry.path}
-            label={`New file in ${entry.path}`}
-            create={create}
-          />
+          {renaming ? (
+            <RenameInput current={entry.name} ops={ops} />
+          ) : (
+            <>
+              {entry.name}
+              <NewFileButton
+                parent={entry.path}
+                label={`New file in ${entry.path}`}
+                ops={ops}
+              />
+              <TreeRowButtons entry={entry} ops={ops} />
+            </>
+          )}
         </li>
+        <TreeRowAction entry={entry} depth={depth} ops={ops} />
         {/* First row of this directory's children — above the loading note as
             much as above the entries, so it never jumps once the level
             lands. */}
-        {create.parent === entry.path && (
-          <NewFileRow depth={depth + 1} create={create} />
+        {ops.action?.kind === 'create' && ops.action.parent === entry.path && (
+          <NewFileRow depth={depth + 1} ops={ops} />
         )}
         {isOpen && state === 'loading' && (
           <li className="files-tree-note muted" style={indent}>
@@ -1688,7 +1913,7 @@ function TreeNode({
               childrenCache={childrenCache}
               selectedPath={selectedPath}
               onSelectFile={onSelectFile}
-              create={create}
+              ops={ops}
             />
           ))}
         {isOpen &&
@@ -1708,15 +1933,25 @@ function TreeNode({
   }
   const language = languageOfName(entry.name)
   return (
-    <li
-      className={`files-tree-file ${accentClass(language)} ${
-        entry.path === selectedPath ? 'selected' : ''
-      }`}
-      style={indent}
-      onClick={() => onSelectFile(entry.path)}
-    >
-      {entry.name}
-    </li>
+    <>
+      <li
+        className={`files-tree-file ${accentClass(language)} ${
+          entry.path === selectedPath ? 'selected' : ''
+        }`}
+        style={indent}
+        onClick={() => onSelectFile(entry.path)}
+      >
+        {renaming ? (
+          <RenameInput current={entry.name} ops={ops} />
+        ) : (
+          <>
+            {entry.name}
+            <TreeRowButtons entry={entry} ops={ops} />
+          </>
+        )}
+      </li>
+      <TreeRowAction entry={entry} depth={depth} ops={ops} />
+    </>
   )
 }
 
@@ -2356,12 +2591,14 @@ export function FilesView({ projectId }: { projectId: number }) {
   // `matchMedia` for the component to keep in sync (same rule the phone tab
   // bar follows, App.css).
   const [treeOpen, setTreeOpen] = useState(true)
-  // The open naming row (mesa task 672), if any: the directory it belongs to
-  // (`''` = the project root), the message under it, and whether its create is
-  // in flight. One row at a time, so one slot, not a map.
-  const [newFileParent, setNewFileParent] = useState<string | null>(null)
-  const [newFileError, setNewFileError] = useState<string | null>(null)
-  const [creating, setCreating] = useState(false)
+  // The tree's one open inline row — a naming row (mesa task 672), a rename or
+  // a delete prompt (task 877) — plus the message under it and whether its
+  // request is in flight. **One** slot, not three flags and not a map: see
+  // `TreeAction`. Opening any of the three overwrites this field, which is what
+  // makes "at most one at a time" true by construction.
+  const [treeAction, setTreeAction] = useState<TreeAction | null>(null)
+  const [treeActionError, setTreeActionError] = useState<string | null>(null)
+  const [treeBusy, setTreeBusy] = useState(false)
   // The wide-tier tree pane's own width and collapse (mesa task 671), both
   // persisted globally for the Files tab (`filesTreeWidth.ts`). Deliberately
   // independent of `treeOpen` above: that one is the phone tier's control and
@@ -2639,8 +2876,8 @@ export function FilesView({ projectId }: { projectId: number }) {
     setExpanded(new Set())
     setChildrenCache(new Map())
     setTreeOpen(true)
-    setNewFileParent(null)
-    setNewFileError(null)
+    setTreeAction(null)
+    setTreeActionError(null)
     setPendingClose(null)
     // A search is about one project's tree, and so is the result open on
     // screen; both are meaningless against the next one. The query itself goes
@@ -2855,11 +3092,32 @@ export function FilesView({ projectId }: { projectId: number }) {
     if (opening) ensureChildren(entry.path)
   }
 
+  /** Opens one of the three inline rows, closing whatever was open and clearing
+   *  the last one's message — the single chokepoint that makes `TreeAction`'s
+   *  "at most one" hold however the row was reached. */
+  function openTreeAction(action: TreeAction) {
+    setTreeActionError(null)
+    setTreeAction(action)
+  }
+
+  function cancelTreeAction() {
+    setTreeAction(null)
+    setTreeActionError(null)
+  }
+
+  /** Re-reads the directory level a change landed in. The server has already
+   *  evicted its own 5s cache entry for that level, so this sees the result;
+   *  the root is the tab's own loader, anything deeper is the per-directory
+   *  cache. */
+  function reloadLevel(parent: string) {
+    if (parent === '') refetch()
+    else loadDir(parent)
+  }
+
   /** Opens the naming row under `parent` (`''` = the project root), expanding
    *  that directory first so the row has somewhere to appear. */
   function startCreate(parent: string) {
-    setNewFileError(null)
-    setNewFileParent(parent)
+    openTreeAction({ kind: 'create', parent })
     if (parent === '') return
     setExpanded((prev) => new Set(prev).add(parent))
     ensureChildren(parent)
@@ -2870,47 +3128,159 @@ export function FilesView({ projectId }: { projectId: number }) {
    *  a round trip; the server re-validates everything regardless, and its own
    *  409/422/404 lands in the same place. */
   async function submitCreate(name: string) {
-    if (newFileParent === null || creating) return
-    const parent = newFileParent
+    if (treeAction?.kind !== 'create' || treeBusy) return
+    const parent = treeAction.parent
     const decided = newFilePath(parent, name)
     if (!decided.ok) {
-      setNewFileError(decided.reason)
+      setTreeActionError(decided.reason)
       return
     }
-    setCreating(true)
-    setNewFileError(null)
+    setTreeBusy(true)
+    setTreeActionError(null)
     try {
       await createProjectFile(projectId, decided.path)
-      setNewFileParent(null)
-      // The server already evicted its own tree cache for this level, so a
-      // re-fetch now sees the new file. The root level is the tab's own
-      // loader; anything deeper is the per-directory cache.
-      if (parent === '') refetch()
-      else loadDir(parent)
+      setTreeAction(null)
+      reloadLevel(parent)
       commit((prev) => openFile(prev, decided.path))
       // Same reason the tree closes when a file is picked: on the phone tier
       // a full column of rows would push the file below the fold. Inert above
       // 600px.
       setTreeOpen(false)
     } catch (e) {
-      setNewFileError(
+      setTreeActionError(
         e instanceof ApiError ? e.message : 'Failed to create file.',
       )
     } finally {
-      setCreating(false)
+      setTreeBusy(false)
     }
   }
 
-  const create: TreeCreate = {
-    parent: newFileParent,
-    error: newFileError,
-    busy: creating,
-    onStart: startCreate,
-    onSubmit: submitCreate,
-    onCancel: () => {
-      setNewFileParent(null)
-      setNewFileError(null)
-    },
+  /**
+   * Enter on the rename input (mesa task 877).
+   *
+   * The same client-side gate the create row uses, and for the same reason: a
+   * rename is "this entry's parent + one component → a path", which is exactly
+   * `newFilePath`'s question, so an obviously bad name is an instant message and
+   * fires no request. The server stays authoritative.
+   *
+   * A name equal to the current one is a plain cancel — the request would be a
+   * no-op at best and a spurious 409 at worst.
+   *
+   * On success the file stays open and viewing: the tabs transition goes through
+   * `commit()` like every other, so `fileUi` for a path that is no longer open
+   * is dropped by the machinery that already does that, and a renamed file's
+   * draft/history follow it under the new path.
+   */
+  async function submitRename(name: string) {
+    if (treeAction?.kind !== 'rename' || treeBusy) return
+    const { path, isDir } = treeAction
+    const parent = dirname(path)
+    const decided = newFilePath(parent, name)
+    if (!decided.ok) {
+      setTreeActionError(decided.reason)
+      return
+    }
+    if (decided.path === path) {
+      cancelTreeAction()
+      return
+    }
+    setTreeBusy(true)
+    setTreeActionError(null)
+    try {
+      const entry = await renameProjectFileEntry(projectId, path, name.trim())
+      setTreeAction(null)
+      reloadLevel(parent)
+      // A renamed directory's cached children and expanded flags are all filed
+      // under the old path. The cache entries are simply dead — nothing can ask
+      // for that level again — but the expanded flags still mean something: the
+      // user has those folders open, so they are re-keyed onto the new prefix
+      // *and re-fetched*. Re-keying alone is what shipped wrong first: a row
+      // that is expanded with no cache entry is neither 'loading' nor a level
+      // with entries, so a renamed folder sat open and blank until it was
+      // collapsed and opened again.
+      if (isDir) {
+        const rekey = (key: string) => entry.path + key.slice(path.length)
+        const under = (key: string) => key === path || key.startsWith(`${path}/`)
+        const reopened = [...expanded].filter(under).map(rekey)
+        setChildrenCache((prev) => {
+          const next = new Map(prev)
+          for (const key of prev.keys()) {
+            if (under(key)) next.delete(key)
+          }
+          return next
+        })
+        setExpanded((prev) => {
+          const next = new Set<string>()
+          for (const key of prev) next.add(under(key) ? rekey(key) : key)
+          return next
+        })
+        for (const dir of reopened) loadDir(dir)
+      }
+      commit((prev) => renameSubtree(prev, path, entry.path))
+    } catch (e) {
+      setTreeActionError(
+        e instanceof ApiError ? e.message : 'Failed to rename.',
+      )
+    } finally {
+      setTreeBusy(false)
+    }
+  }
+
+  /** "delete" — the prompt's one destructive answer (mesa task 877). A
+   *  directory goes recursively, which is what its wording says; the tabs it
+   *  had open close through `closeSubtree`, since the bytes they were showing
+   *  are gone. */
+  async function confirmDeleteEntry() {
+    if (treeAction?.kind !== 'delete' || treeBusy) return
+    const { path, isDir } = treeAction
+    setTreeBusy(true)
+    setTreeActionError(null)
+    try {
+      await deleteProjectFileEntry(projectId, path)
+      setTreeAction(null)
+      reloadLevel(dirname(path))
+      if (isDir) {
+        setChildrenCache((prev) => {
+          const next = new Map(prev)
+          for (const key of prev.keys()) {
+            if (key === path || key.startsWith(`${path}/`)) next.delete(key)
+          }
+          return next
+        })
+      }
+      commit((prev) => closeSubtree(prev, path))
+    } catch (e) {
+      setTreeActionError(
+        e instanceof ApiError ? e.message : 'Failed to delete.',
+      )
+    } finally {
+      setTreeBusy(false)
+    }
+  }
+
+  const treeOps: TreeOps = {
+    action: treeAction,
+    error: treeActionError,
+    busy: treeBusy,
+    onCreateStart: startCreate,
+    onCreateSubmit: submitCreate,
+    onRenameStart: (entry) =>
+      openTreeAction({
+        kind: 'rename',
+        path: entry.path,
+        name: entry.name,
+        isDir: entry.is_dir,
+      }),
+    onRenameSubmit: submitRename,
+    onDeleteStart: (entry) =>
+      openTreeAction({
+        kind: 'delete',
+        path: entry.path,
+        name: entry.name,
+        isDir: entry.is_dir,
+      }),
+    onDeleteConfirm: confirmDeleteEntry,
+    onCancel: cancelTreeAction,
   }
 
   // Same `dragenter`-as-well-as-`dragover` rule as the strips above.
@@ -3052,7 +3422,7 @@ export function FilesView({ projectId }: { projectId: number }) {
             <NewFileButton
               parent=""
               label="New file in the project root"
-              create={create}
+              ops={treeOps}
             />
             {/* The mouse route to the same panel Cmd/Ctrl+Shift+F opens, and
                 the control the panel hands the caret back to when it closes.
@@ -3115,7 +3485,10 @@ export function FilesView({ projectId }: { projectId: number }) {
             />
           ) : (
           <ul className="files-tree">
-            {create.parent === '' && <NewFileRow depth={0} create={create} />}
+            {treeOps.action?.kind === 'create' &&
+              treeOps.action.parent === '' && (
+                <NewFileRow depth={0} ops={treeOps} />
+              )}
             {data.tree.map((entry) => (
               <TreeNode
                 key={entry.path}
@@ -3137,7 +3510,7 @@ export function FilesView({ projectId }: { projectId: number }) {
                   // 600px, per `treeOpen` above.
                   setTreeOpen(false)
                 }}
-                create={create}
+                ops={treeOps}
               />
             ))}
             {data.tree.length === 0 && (

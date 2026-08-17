@@ -5,6 +5,7 @@ import {
   MIN_RATIO,
   activateTab,
   clampRatio,
+  closeSubtree,
   closeTab,
   collapseSplit,
   cycleTab,
@@ -14,6 +15,7 @@ import {
   moveTab,
   openFile,
   openPaths,
+  renameSubtree,
   setRatio,
   splitPane,
   splitWithTab,
@@ -127,6 +129,99 @@ describe('closeTab', () => {
     const s = three()
     expect(closeTab(s, 'left', 'nope.rs')).toBe(s)
     expect(closeTab(s, 'right', 'a.rs')).toBe(s)
+  })
+})
+
+describe('renameSubtree', () => {
+  it('keeps a renamed file in place, active and open', () => {
+    const s = renameSubtree(activateTab(three(), 'left', 'b.ts'), 'b.ts', 'z.ts')
+    expect(s.left.tabs).toEqual(['a.rs', 'z.ts', 'c.md'])
+    expect(s.left.active).toBe('z.ts')
+    assertWellFormed(s)
+  })
+
+  it('rewrites every tab under a renamed directory, in both panes', () => {
+    let s = ['src/a.rs', 'src/deep/b.rs', 'src2/keep.rs'].reduce(
+      openFile,
+      emptyTabsState(),
+    )
+    s = splitPane(s)! // right pane holds src2/keep.rs
+    s = openFile(s, 'src/a.rs') // …and re-focuses left, where it lives
+    s = renameSubtree(s, 'src', 'lib')
+    expect(s.left.tabs).toEqual(['lib/a.rs', 'lib/deep/b.rs', 'src2/keep.rs'])
+    expect(s.left.active).toBe('lib/a.rs')
+    // A sibling whose name merely starts with the renamed one is untouched:
+    // `src2` is not under `src`.
+    expect(s.right!.tabs).toEqual(['src2/keep.rs'])
+    assertWellFormed(s)
+  })
+
+  it('drops the duplicate when a rename lands on an already-open path', () => {
+    const s = renameSubtree(three(), 'a.rs', 'c.md')
+    expect(s.left.tabs).toEqual(['c.md', 'b.ts'])
+    expect(s.left.active).toBe('c.md')
+    assertWellFormed(s)
+  })
+
+  it('dedupes per pane, leaving the other pane its own copy', () => {
+    // Both panes hold c.md (splitPane copies it); renaming a.rs onto it must
+    // collide in the left pane only.
+    const s = renameSubtree(split(), 'a.rs', 'c.md')
+    expect(s.left.tabs).toEqual(['c.md', 'b.ts'])
+    expect(s.right!.tabs).toEqual(['c.md'])
+    assertWellFormed(s)
+  })
+
+  it('is a no-op for an unopened path, or a rename to the same name', () => {
+    const s = three()
+    expect(renameSubtree(s, 'nope.rs', 'other.rs')).toBe(s)
+    expect(renameSubtree(s, 'a.rs', 'a.rs')).toBe(s)
+    expect(renameSubtree(emptyTabsState(), 'a.rs', 'b.rs').left.active).toBeNull()
+  })
+})
+
+describe('closeSubtree', () => {
+  it('closes one file exactly as closeTab would', () => {
+    const s = closeSubtree(activateTab(three(), 'left', 'b.ts'), 'b.ts')
+    expect(s.left.tabs).toEqual(['a.rs', 'c.md'])
+    expect(s.left.active).toBe('c.md')
+    assertWellFormed(s)
+  })
+
+  it('closes every tab under a deleted directory and keeps the rest', () => {
+    const s = closeSubtree(
+      ['src/a.rs', 'src/deep/b.rs', 'src2/keep.rs'].reduce(openFile, emptyTabsState()),
+      'src',
+    )
+    expect(s.left.tabs).toEqual(['src2/keep.rs'])
+    expect(s.left.active).toBe('src2/keep.rs')
+    assertWellFormed(s)
+  })
+
+  it('collapses the split when it empties a pane', () => {
+    const s = closeSubtree(split(), 'c.md')
+    expect(s.right).toBeNull()
+    expect(s.focused).toBe('left')
+    expect(s.left.tabs).toEqual(['a.rs', 'b.ts'])
+    assertWellFormed(s)
+  })
+
+  it('empties both panes of a split without stranding one', () => {
+    // Every open path is under `src`, so the loop has to keep going after the
+    // collapse renamed the survivor to `left`.
+    let s = ['src/a.rs', 'src/b.rs'].reduce(openFile, emptyTabsState())
+    s = splitPane(s)!
+    s = closeSubtree(s, 'src')
+    expect(s.right).toBeNull()
+    expect(s.left.tabs).toEqual([])
+    expect(s.left.active).toBeNull()
+    assertWellFormed(s)
+  })
+
+  it('is a no-op when nothing under the target is open', () => {
+    const s = three()
+    expect(closeSubtree(s, 'src')).toBe(s)
+    expect(closeSubtree(s, 'a')).toBe(s)
   })
 })
 

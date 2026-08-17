@@ -5,12 +5,12 @@ the file tree of the project's `local_path`, reads individual file contents,
 and (task 327) can edit and save a text file's content back to disk —
 `local_path`-anchored like the Git tab (touches the store only to read
 `local_path`, no CLI: an agent in a terminal edits files directly). Browsing
-(the tree, reading content) stays read-only; there are exactly two writes —
-overwriting an existing text file's full content, and creating one new empty
-file from the tree (task 672) — and no delete, rename or move anywhere in
-this surface. Creating a *folder* is not here either: the new-project picker's
-`POST /api/fs/dirs` remains the only folder create, on its own stricter gate
-(`docs/fs-browse.md`).
+(the tree, reading content) stays read-only; there are exactly **four** writes —
+overwriting an existing text file's full content, creating one new empty file
+from the tree (task 672), and renaming or deleting one tree entry, file or
+folder (task 877). **Moving** an entry is still a non-goal, and so is creating a
+*folder*: the new-project picker's `POST /api/fs/dirs` remains the only folder
+create, on its own stricter gate (`docs/fs-browse.md`).
 
 - `pub fn safe_path(root: &str, rel: &str) -> Option<PathBuf>`
   (`src/core/files.rs`) is the sole traversal-defense chokepoint: canonicalizes
@@ -18,9 +18,10 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   requires the result to be `root` itself or a descendant — rejects
   `../` traversal, absolute-path smuggling, symlink escapes, and nonexistent
   paths in one check. `read_file`, `read_file_download`, `write_file`,
-  `tree_level` and `create_file` are its only callers — and `create_file` is
-  the one that resolves something other than the request path itself (see
-  below).
+  `tree_level`, `create_file` and `resolve_entry` (the shared front half of
+  `rename_path`/`delete_path`) are its only callers — and the last two are the
+  ones that resolve something other than the request path itself: they resolve
+  the target's **parent**, for reasons each of their sections below spells out.
 - `pub fn tree_level(root: &str, rel: &str) -> Option<(Vec<FileTreeEntry>, bool)>`
   (mesa task 410) lists ONE directory level — `root` itself when `rel` is
   `""`, else the subdirectory `rel` resolves to underneath `root`, resolved
@@ -148,8 +149,9 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   Gate: the standard `guard` only, like the content GET and the git reads —
   it is a read, so neither `require_local_path_write` nor
   `require_agent_access` applies and the Content-Type gate doesn't fire on a
-  GET. Adding a download does not make this surface a delete, rename or move:
-  it still has none of those.
+  GET. A download is a read and added no write of its own — rename and delete
+  arrived later, on task 877's separate `/files/entry` route with its own gate
+  (below); a **move** is still a non-goal.
 - `GET /api/projects/{id}/files/raw?path=<relpath>` (task 801) → the file's
   raw bytes with a **real image mime type**, for an `<img src>`. Same `?path=`
   contract and the same `files::read_file_download` read as the download route
@@ -210,12 +212,17 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   here. The commit a user then picks is diffed through the **existing**
   `GET /api/projects/{id}/git/commits/{sha}/diff?path=` route unchanged; no
   new diff endpoint exists for this feature.
+- `PATCH`/`DELETE /api/projects/{id}/files/entry` (task 877) rename and delete
+  one entry of the tree — a fifth route, described with the rest of that
+  feature in its own section at the end of this file.
 - Tree listing, content reads and the byte download stay standard-guard-only,
   like the Git tab —
   no agent-style gate (browsing executes nothing) and no Content-Type gate
-  (GET-only). The two writes above are the exception: both are gated by
-  `require_agent_access` and both, being mutations with JSON bodies, sit
-  inside the global Content-Type/CSRF gate.
+  (GET-only). The four writes are the exception: content `PATCH`/`POST` and the
+  entry `PATCH`/`DELETE` are all gated by `require_agent_access`, and all four,
+  being mutations, sit inside the global Content-Type/CSRF gate — the `DELETE`
+  included, since that gate's method set covers it and only its *path* rides
+  the query string.
 - Web UI: `FilesView` (`frontend/src/pages/FilesView.tsx`) under the project
   tabs — a left-hand expandable file tree (`.files-tree`, directories
   toggled open/closed in local component state, no deep-linking) and a
@@ -291,8 +298,9 @@ this surface. Creating a *folder* is not here either: the new-project picker's
   since it was loaded) render inline and keep edit mode open, mirroring
   `InlineEdit`'s own error handling. **Closing** a tab mid-edit discarded its
   draft silently until task 809, which put one inline prompt in front of that
-  one click — the app's only confirmation, and only where the close actually
-  destroys work (see the task 809 section below). Merely *switching* tabs
+  one click — the app's *first* confirmation (task 877's delete prompt is the
+  second), and only where the close actually destroys work (see the task 809
+  section below). Merely *switching* tabs
   discards nothing: see the tabs section below for which half of that changed
   in task 670 and why.
   Beside **Edit** sits a **History** toggle (task 542). Open, it renders
@@ -459,7 +467,10 @@ twice.
   - **Stale paths are not pruned.** A remembered file deleted or renamed on
     disk since is restored as a tab and shows `ContentPane`'s ordinary per-file
     fetch error; closing it drops it from storage. No validation round-trip, no
-    reconciliation against the tree fetch.
+    reconciliation against the tree fetch. Task 877's rename/delete do re-point
+    or close the tabs they touch, but only because *this* browser performed the
+    write and knows which paths moved — a change made anywhere else is still
+    unreconciled.
 - **Mobile.** No split below the **narrow** tier (≤860px): a two-up split of a
   360px screen is unusable, the Split control is not rendered, and a split open
   when the viewport crosses that tier is folded onto the focused pane. That
@@ -483,8 +494,8 @@ twice.
 Non-goals of *that* task, deliberately: no new file operations, no recursive
 or stacked splits, no third pane, and nothing about `SideBySideDiff`, the
 markdown path or `syntaxHighlighter.ts` changed. (Task 672 later added exactly
-one file operation — create — described in its own section below; delete,
-rename and move remain non-goals.)
+one file operation — create — and task 877 two more — rename and delete — each
+described in its own section below; **move** remains a non-goal.)
 
 ## Tree pane: drag-resize and collapse (task 671)
 
@@ -552,11 +563,12 @@ Scope is the tree pane only: the `files-panes` split ratio divider (task 670),
 
 ## Creating a file from the tree (task 672)
 
-The surface's one create. Scope is deliberately a *file*: no delete, rename,
-move or duplicate, no folder create (that stays `POST /api/fs/dirs` in the
-new-project picker, on its own stricter loopback-only gate), and no implicit
-intermediate directories — `create_file` is one `fs::write`, never
-`create_dir_all`.
+The surface's one create. Scope is deliberately a *file*: no duplicate, no
+folder create (that stays `POST /api/fs/dirs` in the new-project picker, on its
+own stricter loopback-only gate), and no implicit intermediate directories —
+`create_file` is one `fs::write`, never `create_dir_all`. Rename and delete were
+out of scope here and arrived in task 877, whose section at the end of this file
+reuses this one's containment rule; a **move** is still a non-goal.
 
 - **The affordance.** A `+` on every directory row (`.files-tree-add`), and one
   for the project root in the tree pane's header rail (`.files-tree-head`,
@@ -685,8 +697,9 @@ missing-`?path=` cases, the download route's unchanged headers, and — in
 
 Four slices that make the pane behave like an editor rather than a textarea.
 **Frontend-only**: no route, no `src/core/files.rs` function, no store method,
-no migration, and the same two writes as before (`PATCH` content, `POST`
-create). Everything here is a rendering or a keystroke.
+no migration, and it left the surface with the same two writes it already had
+(`PATCH` content, `POST` create — the entry writes are task 877's, below).
+Everything here is a rendering or a keystroke.
 
 As everywhere in this app, the decisions are pure modules with vitest
 coverage and the `.tsx` files hold only the DOM: `editorStatus.ts`
@@ -1298,3 +1311,281 @@ refusal; `fileSearch.test.ts` covers the summary, the query gate and the
 snippet highlighting; `keyboardScope.test.ts` covers the `'search'` chord.
 Everything else — the panel's focus routing, the landing's reveal — is khora's,
 per CLAUDE.md's standing split.
+
+## Renaming and deleting an entry (task 877)
+
+The tab's third and fourth writes, and its first destructive one: a `✎` and a
+`⨯` on every tree row, renaming or destroying that entry — **file or folder
+alike**.
+`core::files` gains `rename_path` and `delete_path`, the API one route carrying
+two verbs, and `fileTabs.ts` two pure subtree transitions. No new ts-rs type —
+both writes echo the existing `FileTreeEntry`, the same object `tree_level`
+already hands the row that was clicked — no migration, no `Store` method, and
+**no CLI surface**: an agent in a terminal has `mv` and `rm`, which is the same
+reason this tab has never had a CLI twin.
+
+- `pub fn rename_path(root: &str, rel: &str, new_name: &str) ->
+  Result<FileTreeEntry, RenamePathError>` renames the entry at `rel` to
+  `new_name`, answering the entry it *became*: the new name, the new relative
+  path, and the `is_dir` `tree_level` would list it with.
+- `pub fn delete_path(root: &str, rel: &str) -> Result<FileTreeEntry,
+  DeletePathError>` destroys it, answering the entry it *was*.
+- Both share a private front half — `resolve_entry` turning `rel` into a
+  `ResolvedEntry { parent, target, parent_rel, name, is_dir }`, `single_component`
+  (`create_file`'s final-component rules as a named function, because a rename
+  holds **both** names to them), `entry_path` rebuilding the `{parent}/{name}`
+  shape the tree's rows carry,
+  and an `EntryError` with the two variants both writes share, `From`-mapped onto
+  each public enum. `RenamePathError` is `create_file`'s three-way split
+  (`NotFound`/`Validation(reason)`/`Conflict`); `DeletePathError` is
+  `write_file`'s two-way one, since a delete has no destination to collide with.
+
+### The containment story
+
+**The PARENT is resolved through `safe_path` and the target never is** —
+`create_file`'s rule, and here it is load-bearing for a *second* reason.
+
+The first is the one `create_file` already documents above: `safe_path`
+canonicalizes, so it answers `None` for a path that does not exist, and relaxing
+that is not available because `read_file`/`write_file`/`tree_level` rely on it.
+
+The second is specific to these two writes: canonicalizing **follows symlinks**.
+Resolving the target through `safe_path` would turn "rename this symlink" into
+"rename what it points at" and "delete this symlink" into "delete the file at the
+other end" — and for any link pointing outside `root` it would answer `None`
+outright, i.e. refuse the very symlinks `tree_level` happily lists as file
+leaves. The row a user can see would be the one row they could not act on, and
+the ones that did work would act somewhere else. So `rel` is split on its
+last `/`, the parent is resolved with `safe_path` and required to be a directory,
+and the final component is held to `single_component`'s rules (trim, no empty,
+not `.`/`..`, no `/`, `\` or NUL) — which is exactly what makes
+`parent.join(name)` provably stay inside `parent`. One chokepoint, one
+containment rule, no second path-resolution model. (`core::files`' unit tests
+pin this from both ends: `safe_path(root, "link.txt")` is asserted to be `None`
+for an escaping symlink *and* `delete_path` is asserted to unlink it by name with
+its target's bytes untouched.)
+
+`is_dir` comes from `symlink_metadata().file_type()`, so a symlinked directory is
+a file leaf — `tree_level`'s classification, which is what makes the echoed entry
+match the row it came from rather than describing something the tree never
+showed.
+
+### Rename is within one directory, and that is enforceable
+
+`new_name` is a **name, never a path**. A rename therefore cannot move anything,
+and the promise is enforced by `single_component` rather than merely intended: a
+`sub/x.txt`, a `../x.txt` or a bare `..` is `Validation` and nothing touches
+disk. Moving an entry is a separate feature with its own open questions — which
+directory the destination is picked from, and what happens to the tabs open under
+the old prefix when it lands somewhere the tree may not even have fetched — and
+none of those are answered by loosening this check.
+
+Three more decisions:
+
+- **The root itself is `Validation`.** `rel` that is empty, whitespace-only or
+  `.` names the project folder, which is not an entry of its own tree; neither
+  write may rename or destroy it. This is the one refusal that is not about
+  containment, and it is `Validation` rather than `NotFound` because the path
+  resolves perfectly well — it just isn't a row.
+- **A dangling symlink is a real entry**, tested with `symlink_metadata()` and
+  never `exists()` — `create_file`'s rule, on both sides here: it is how the
+  source is found, and how a taken destination is detected. Renaming an entry
+  onto its own name is therefore `Conflict` too, which is the honest answer:
+  nothing to do, and the caller asked for a rename.
+- **A directory delete is recursive** (`fs::remove_dir_all`), and that is the
+  intent rather than a convenience. The affordance is "delete this folder" on a
+  tree row; refusing a non-empty one would make the only route to an empty folder
+  deleting every descendant a row at a time. Everything else — a file, a symlink
+  of any kind — is `fs::remove_file`, so a link is unlinked as the *name* it is.
+- **The echo is captured BEFORE the removal.** That is CLAUDE.md's
+  delete-echo-as-recovery-transcript precedent, the thing that substitutes for
+  the confirmation prompt mesa deliberately does not have anywhere else; the
+  bytes are gone, but the transcript still names exactly what was destroyed and
+  whether it was a folder.
+
+### The routes
+
+`PATCH /api/projects/{id}/files/entry` (body `{path, name}`) and
+`DELETE /api/projects/{id}/files/entry?path=<rel>`, both echoing the
+`FileTreeEntry`.
+
+- **A fifth route on `/entry`, not a mode of `/files/content`.** A tree entry is
+  a file **or** a directory, while everything on the content path is
+  file-content-shaped: its GET reads bytes, its PATCH writes them, its POST
+  creates a file to put bytes in. Renaming a folder has no content in it
+  anywhere, and hanging it off that path would mean a route whose response type
+  depends on which body it was handed.
+- **Error mapping is `create_project_file`'s**, unchanged: `NotFound` → 404
+  `not_found` `file not found: <path>` (the parent doesn't resolve, isn't a
+  directory, the entry is missing, or the `fs` call failed — plus the
+  no-`local_path`/dead-folder rung every route on this tab shares),
+  `Validation(reason)` → 422 `validation` carrying the reason verbatim,
+  `Conflict` → 409 `conflict` `already exists: <name>`. The delete adds one 422
+  of its own for a missing or empty `?path=`, the content GET's contract.
+- **`DELETE` carrying its path in the query is still inside the CSRF gate.**
+  `DELETE` is in the global Content-Type gate's method set, so a caller still has
+  to send `Content-Type: application/json` — exactly as for every other delete in
+  this API, and the reason a body-less delete is not a hole. The query string is
+  a *shape* choice (there is nothing to send but one path, and the content GET
+  already names a path that way), not an exit from the gate.
+- **Gate: `require_agent_access`, the same one the content writes use.** Not the
+  plain `guard` the reads use, and not `require_local_path_write` either. The
+  reasoning is the content PATCH's, verbatim: these bytes live under a project's
+  `local_path`, so touching them is code-execution-adjacent, and a peer who can
+  already overwrite a file in that folder gains nothing new from being able to
+  rename or remove one. Reusing that gate is the coherent choice, not a looser
+  one — and the *pairing* (`require_agent_access` + Content-Type) is what
+  `files-check.sh` asserts per mode, since that is what could drift apart.
+- **Both writes evict the `files_tree_cache` entry for the affected level.**
+  `create_project_file`'s inline eviction is now a shared
+  `evict_files_tree_level(state, root, rel)` — key `(local_path, parent_rel)`,
+  `""` for the root — called by all three. It is a **requirement, not a nicety**:
+  the cache has a 5s TTL and the client refetches that level the moment the write
+  returns, so leaving the entry in place would paint a tree still listing a name
+  that no longer exists (or still missing one that now does). Only the one key is
+  dropped, since nothing about any other level changed. Renaming or deleting a
+  *directory* does leave cached entries filed under its old relative path, and
+  that is deliberately not swept: they name a level no client can ask for again,
+  and they expire on the same TTL.
+
+### The tree's controls
+
+- **Two buttons on every row**, `✎` and `⨯`, unlike `+` — which only a directory
+  can hold, because only a directory is something to create *into*. They wear
+  `.files-tree-add` rather than copying it: the same chromeless glyph and the
+  same reveal rules (`:hover` on the row, `:focus-visible` on the button, and
+  always up under `@media (hover: none)`, where there is no hover to reveal them
+  with), with one new rule for the file row's hover and one `.files-tree-danger`
+  giving the delete a red hover — the tree's only destructive control. Both
+  `stopPropagation()`, since a row's own click selects a file or toggles a
+  folder.
+- **The rename input stands in place of the row's label**, not on a row of its
+  own: a rename is an edit *of that name*, and a box anywhere else would leave
+  the old name on screen beside the new one. It is prefilled with the current
+  name and opens with the **basename preselected** (`setSelectionRange(0, …)` up
+  to the last `.`), so the common case — retype the name, keep the extension — is
+  one gesture. Focus and selection are set from an effect rather than the `ref`
+  callback, which fires on every keystroke and would eat the caret. Enter
+  submits, Escape and blur cancel, and it is never `disabled` while the request
+  is in flight — the naming row's rules exactly, for the naming row's reason (the
+  browser blurs a control it disables, and blur cancels). On a *directory* row it
+  shares the line with the ▸/▾ toggle, so it gives that 1.25rem up; the row clips
+  its overflow, which would otherwise eat the box's own right-hand edge.
+- **The delete prompt is the app's second inline two-step**, never
+  `window.confirm` — the same call `CloseConfirmBar` makes one pane over, and it
+  earns one for the same reason that one did: the click destroys work
+  irrecoverably, with no undo, no trash and (for a folder) recursively. So the
+  wording says that outright — `Delete <name> and everything in it?` for a
+  directory, `Delete <name>?` for anything else — rather than asking a bare
+  yes/no. It reuses `.confirm-delete`'s classes, so the pair matches every other
+  two-step in the app: the destructive answer red, the **safe** one autofocused,
+  so Enter resolves harmlessly and the keyboard has a route back out. Escape
+  cancels and is stopped from bubbling, since the tree's own key handling is not
+  what should answer this. Its `<li>` (`.files-tree-confirm`) relaxes the tree
+  row's `nowrap`/`overflow: hidden`, which would clip the buttons, and drops the
+  row hover — it is a prompt, not a row a click does something with.
+- **One `TreeAction` slot makes "at most one inline row open at a time" true by
+  construction.** `TreeCreate` (task 672's `{parent, error, busy, …}`) became a
+  discriminated `TreeAction` — `{kind: 'create', parent}` |
+  `{kind: 'rename', path, name, isDir}` | `{kind: 'delete', …}` — held in one
+  `treeAction` state field beside the one shared `error` and `busy`. Three flags
+  or a map would allow two prompts fighting over the same strip of pixels;
+  opening any one is a write of this whole field through a single
+  `openTreeAction()`, which closes whatever was there and clears its message.
+  `TreeOps` threads that field, the shared message and every callback down as one
+  object rather than a dozen props. `newFile.ts`
+  is shared by create and rename unchanged — a rename asks exactly
+  `newFilePath`'s question ("this entry's parent + one component → a path"), so
+  an obviously bad name is an instant inline message and fires no request, with
+  the server still authoritative and its 404/422/409 landing in the same slot. A
+  name equal to the current one is a **plain cancel**, not a request: it would be
+  a no-op at best and a spurious 409 at worst.
+- **After either write** the affected level is re-read (`reloadLevel` — the
+  root through the tab's own loader, anything deeper through `loadDir`, both
+  seeing the change because the handler already evicted the server's cache
+  entry), and a *directory* write additionally re-keys the frontend's own two
+  path-keyed structures: `childrenCache` entries at or under the old path are
+  dropped (nothing will ask for that level again), and on a rename `expanded` is
+  rewritten onto the new prefix, so a folder the user had open stays open under
+  its new name.
+
+  **Re-keying `expanded` without re-fetching those levels was the first thing
+  this shipped wrong**, and it is why the rename also calls `loadDir` for every
+  level it just re-keyed: a row that is expanded with *no* `childrenCache` entry
+  is neither `'loading'` nor a level with entries, so the renamed folder sat open
+  and blank — silently, and repaired by collapsing and re-opening it, the
+  flaky-not-broken signature this tab has produced before. The cache is keyed by
+  path and the paths all moved at once, so the fetch has to move with them; only
+  a delete can drop a level and ask for nothing back.
+
+### The tab consequences
+
+`fileTabs.ts` gains two pure transitions, both taking a *subtree* rather than a
+path, because the server moves or destroys a folder in one step and the strip has
+to follow in one step:
+
+- **`renameSubtree(state, from, to)`.** A renamed file keeps its place in the
+  strip and its pane's activation and focus — losing the open editor because the
+  file was renamed would be the bug. A renamed directory is the same operation
+  over every path at or under it. `isUnder` requires the `/`, so `src2` is not
+  under `src`; a prefix test without it says otherwise. The one collision is a
+  rename landing on a path **already open in the same pane** (the server allows
+  it whenever the name is free on disk, and a *stale* tab for the destination is
+  entirely possible): only one survives, the leftmost, because `TabsState`
+  forbids a pane listing a path twice, and `active` lands on it either way since
+  both copies now name the same file. Dedupe is per pane, so the other pane keeps
+  its own copy.
+- **`closeSubtree(state, target)`** closes the target and everything under it —
+  the bytes those tabs were showing are gone. Expressed as repeated `closeTab`
+  rather than its own filter, so activation, focus and the empty-pane
+  split-collapse resolve by exactly the rules a manual close already follows;
+  each pass closes one tab (so it terminates) and re-asks which pane holds an
+  affected path, which is what keeps it correct across a collapse that renames
+  the surviving pane to `'left'` mid-loop.
+
+Both go through `FilesView`'s existing `commit()`, never a hand-rolled
+`TabsState` write — which has one consequence worth stating: `commit()` drops the
+`FileUiState` of every path no longer open, and it is keyed **by path**, so a
+renamed file's tab survives while its per-tab UI state (edit draft, edit mode,
+open History, selected commit) does not. `ContentPane`'s `key={path}` remounts it
+and re-fetches under the new name, in view mode. A rename therefore discards an
+unsaved draft in that file unprompted, unlike the tab's own × (task 809) — the
+rename box is not one of the four exits the dirty dot covers.
+
+### The gate
+
+`scripts/files-check.sh` grew section 6 for the routes and extended section 7's
+per-mode block:
+
+- Rename: the echoed entry for a file (and its content readable under the new
+  name, 404 under the old one) and for a folder (whose nested level re-anchors in
+  the tree listing and whose content still reads through it); 409 on a taken
+  name with the existing file asserted untouched; 422 for a path-shaped, dotted
+  or empty `name` and for a `path` naming the project root, with the folder
+  asserted to survive; 404 for a traversal (the file above the root asserted
+  untouched) and for a missing source.
+- Delete: the echoed entry and the file gone from disk and from the content
+  route; a non-empty folder removed recursively; the **cache eviction** proven
+  the only way it can be — warm the root level first, delete, then assert the
+  very next read no longer lists it; 422 for a missing, empty or root `?path=`;
+  404 for a traversal and a missing entry.
+- Per mode (default **and** `--lan`): both verbs refused with 415 without a JSON
+  Content-Type *and* succeeding from a local page, so the 415s are the
+  Content-Type half firing rather than the routes being unreachable. The
+  successes are a round-trip rename and a create-then-delete, leaving the
+  fixtures exactly as they were so the block runs identically in either mode.
+
+`core::files` carries unit tests for both functions (the file/root-level/directory
+renames, the three conflict shapes, every non-single-component name, traversal and
+absolute-path sources, the root refusal, the recursive folder delete, and the two
+`#[cfg(unix)]` symlink cases that pin the parent-not-target rule);
+`src/api.rs` covers the handlers (both echoes, the whole error table, a
+non-loopback peer refused in default mode with disk asserted untouched, the
+no-`local_path` rung, and the tree-cache eviction from both writes);
+`fileTabs.test.ts` covers `renameSubtree` (file in place and active, a directory
+rewriting both panes with `src2` untouched, the already-open collision, per-pane
+dedupe, and the two no-ops) and `closeSubtree` (one file exactly as `closeTab`,
+a whole directory, the split collapse, emptying both panes of a split without
+stranding one, and the no-op). Everything left — the reveal-on-hover, the
+preselected basename, the prompt's focus routing — is khora's, per CLAUDE.md's
+standing split.

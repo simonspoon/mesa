@@ -168,6 +168,85 @@ export function closeTab(state: TabsState, side: PaneSide, path: string): TabsSt
   return { left: survivor, right: null, focused: 'left', ratio: state.ratio }
 }
 
+/** Whether `path` *is* `target` or lives under it. The `'/'` matters: `src2`
+ *  is not under `src`, and a prefix test without the separator says it is. */
+function isUnder(path: string, target: string): boolean {
+  return path === target || path.startsWith(`${target}/`)
+}
+
+/**
+ * Re-point every open tab a rename touched (mesa task 877).
+ *
+ * A renamed *file* keeps its tab's place in the strip, and its pane's focus and
+ * activation, under the new path — losing the open editor because the file was
+ * renamed would be the bug. A renamed *directory* is the same operation over
+ * every path at or under it, which is the whole reason this is a subtree
+ * transition and not a one-path swap: the server moves the folder in one step,
+ * so the strip has to follow in one step too.
+ *
+ * The one collision: the new path may already be open in the same pane (rename
+ * `a.ts` onto an open `b.ts` — the server allows it only when it isn't taken on
+ * disk, but a *stale* tab for the destination is entirely possible). Only one
+ * survives, the leftmost in the strip, because `TabsState` forbids a pane
+ * listing a path twice; `active` still lands on it either way, since both
+ * copies now name the same file.
+ */
+export function renameSubtree(state: TabsState, from: string, to: string): TabsState {
+  if (from === to) return state
+  const move = (path: string): string =>
+    isUnder(path, from) ? to + path.slice(from.length) : path
+  let changed = false
+  const rewrite = (pane: Pane | null): Pane | null => {
+    if (pane === null) return null
+    const seen = new Set<string>()
+    const tabs: string[] = []
+    for (const path of pane.tabs) {
+      const next = move(path)
+      if (next !== path) changed = true
+      if (seen.has(next)) {
+        changed = true
+        continue
+      }
+      seen.add(next)
+      tabs.push(next)
+    }
+    // `active` moves with its own tab, and dedupe never empties a pane, so a
+    // pane that had an active file still has one — and it is a member of
+    // `tabs`, since every surviving path went through the same `move`.
+    return { tabs, active: pane.active === null ? null : move(pane.active) }
+  }
+  const left = rewrite(state.left)!
+  const right = rewrite(state.right)
+  return changed ? { ...state, left, right } : state
+}
+
+/**
+ * Close the tab at `target` and every tab under it — what a delete leaves
+ * behind (mesa task 877), since the bytes those tabs are showing are gone.
+ *
+ * Expressed as repeated `closeTab` rather than its own filter, so activation,
+ * focus and the empty-pane split-collapse resolve by exactly the rules a manual
+ * close already follows. Each pass closes one tab, so it terminates; re-asking
+ * which pane holds an affected path on every pass is what keeps it correct
+ * across a collapse, which renames the surviving pane to `'left'` mid-loop.
+ */
+export function closeSubtree(state: TabsState, target: string): TabsState {
+  let next = state
+  for (;;) {
+    let found: { side: PaneSide; path: string } | null = null
+    for (const side of ['left', 'right'] as const) {
+      const pane = paneOf(next, side)
+      const path = pane?.tabs.find((p) => isUnder(p, target))
+      if (path !== undefined) {
+        found = { side, path }
+        break
+      }
+    }
+    if (found === null) return next
+    next = closeTab(next, found.side, found.path)
+  }
+}
+
 /**
  * Split into two panes, the new right one showing the focused pane's active
  * file. `null` — no change — when already split, or when there is nothing open

@@ -21,9 +21,16 @@
 #      binary are skipped server-side, not filtered by the client), the two
 #      option toggles, a miss as a 200, and the `?q=` contract (missing, empty
 #      or over-long is 422 `validation`);
-#   6. both serve modes — raw and search are reads, reachable in default AND
-#      `--lan`, while the PATCH write keeps its `require_agent_access` +
-#      Content-Type gate in both.
+#   6. `PATCH`/`DELETE /api/projects/{id}/files/entry` (task 877) — renaming
+#      and deleting one entry of the tree: the echoed `FileTreeEntry` for a
+#      file and a folder (whose contents stay readable under the new name), the
+#      409 on a taken name, the 422s for an unusable name and for the project
+#      root itself, the 404s for a traversal and a missing entry, a recursive
+#      folder delete, the tree no longer listing a deleted entry *immediately*
+#      (the cache-eviction assertion), and the 422 for a missing `?path=`;
+#   7. both serve modes — raw and search are reads, reachable in default AND
+#      `--lan`, while the content PATCH and both entry writes keep their
+#      `require_agent_access` + Content-Type gates in both.
 #
 # The tree/content/create/write contract at large is exercised by the Rust
 # unit tests in src/core/files.rs; this script is the HTTP-surface gate.
@@ -91,6 +98,17 @@ fn main() {
 RS
 printf 'needle needle needle\n' > "$REPO/node_modules/dep.js"
 printf 'needle inside a binary\n\0\n' > "$REPO/blob.dat"
+
+# Rename/delete fixtures (task 877): an entry of each kind to rename, a name
+# already taken to collide with, and an entry of each kind to destroy. None of
+# them mention the search query above, so section 5's counts are unaffected.
+printf 'content survives\n' > "$REPO/oldname.txt"
+printf 'taken\n' > "$REPO/taken.txt"
+mkdir -p "$REPO/oldfolder/nested"
+printf 'still here\n' > "$REPO/oldfolder/nested/deep.txt"
+printf 'bye\n' > "$REPO/doomed.txt"
+mkdir -p "$REPO/doomedfolder/nested"
+printf 'also bye\n' > "$REPO/doomedfolder/nested/b.txt"
 
 STDOUT=$("$MESA" project create "Files project" --path "$REPO")
 PROJ=$(jq -r .id <<<"$STDOUT")
@@ -306,7 +324,113 @@ api 422 GET "/api/projects/$PROJ/files/search?q=$LONG"
 ok "GET .../files/search with a missing, empty or over-long ?q=: 422 validation"
 
 # =====================================================================
-# 6. both serve modes
+# 6. rename + delete one tree entry (task 877)
+# =====================================================================
+
+api 200 PATCH "/api/projects/$PROJ/files/entry" \
+  '{"path":"oldname.txt","name":"newname.txt"}'
+[ "$(jqb .name)" = "newname.txt" ] || fail "rename file: echoed name, got $(jqb .name)"
+[ "$(jqb .path)" = "newname.txt" ] || fail "rename file: echoed path, got $(jqb .path)"
+[ "$(jqb .is_dir)" = "false" ] || fail "rename file: is_dir must be false"
+ok "PATCH .../files/entry on a file: 200 and the new FileTreeEntry"
+
+api 200 GET "/api/projects/$PROJ/files/content?path=newname.txt"
+[ "$(jqb .content)" = "content survives" ] ||
+  fail "rename file: content must survive the rename, got '$(jqb .content)'"
+api 404 GET "/api/projects/$PROJ/files/content?path=oldname.txt"
+ok "rename file: readable under the new name, gone under the old one"
+
+api 200 PATCH "/api/projects/$PROJ/files/entry" \
+  '{"path":"oldfolder","name":"newfolder"}'
+[ "$(jqb .name)" = "newfolder" ] || fail "rename folder: echoed name"
+[ "$(jqb .path)" = "newfolder" ] || fail "rename folder: echoed path"
+[ "$(jqb .is_dir)" = "true" ] || fail "rename folder: is_dir must be true"
+ok "PATCH .../files/entry on a folder: 200 and the new FileTreeEntry"
+
+# The whole subtree moved with the name — asserted through the tree listing and
+# the content read, i.e. the routes the browser would use next.
+api 200 GET "/api/projects/$PROJ/files?path=newfolder/nested"
+[ "$(jqb '.tree | length')" = "1" ] || fail "rename folder: nested level must list one entry ($BODY)"
+[ "$(jqb '.tree[0].path')" = "newfolder/nested/deep.txt" ] ||
+  fail "rename folder: nested path must re-anchor, got $(jqb '.tree[0].path')"
+api 200 GET "/api/projects/$PROJ/files/content?path=newfolder/nested/deep.txt"
+[ "$(jqb .content)" = "still here" ] || fail "rename folder: nested content must survive"
+ok "rename folder: its contents are still readable under the new name"
+
+api 409 PATCH "/api/projects/$PROJ/files/entry" \
+  '{"path":"newname.txt","name":"taken.txt"}'
+[ "$(jqb .error.code)" = "conflict" ] || fail "rename onto a taken name: error.code"
+api 200 GET "/api/projects/$PROJ/files/content?path=taken.txt"
+[ "$(jqb .content)" = "taken" ] || fail "rename conflict: the existing file must be untouched"
+ok "PATCH .../files/entry onto an existing name: 409 conflict, nothing overwritten"
+
+# A new name that is a path would be a MOVE, which this route cannot express.
+for BADNAME in 'sub/x.txt' '..' '.' '' 'a\\b'; do
+  api 422 PATCH "/api/projects/$PROJ/files/entry" \
+    "{\"path\":\"newname.txt\",\"name\":\"$BADNAME\"}"
+  [ "$(jqb .error.code)" = "validation" ] || fail "rename name '$BADNAME': error.code"
+done
+ok "PATCH .../files/entry with a path-shaped, dotted or empty name: 422 validation"
+
+# The project folder itself is not an entry of its own tree.
+for ROOTPATH in '' '.'; do
+  api 422 PATCH "/api/projects/$PROJ/files/entry" \
+    "{\"path\":\"$ROOTPATH\",\"name\":\"renamed\"}"
+  [ "$(jqb .error.code)" = "validation" ] || fail "rename root '$ROOTPATH': error.code"
+done
+[ -d "$REPO" ] || fail "rename root: the project folder must survive"
+ok "PATCH .../files/entry naming the project root: 422 validation"
+
+api 404 PATCH "/api/projects/$PROJ/files/entry" \
+  '{"path":"../outside.png","name":"owned.png"}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "rename traversal: error.code"
+[ -f "$TMP/outside.png" ] || fail "rename traversal: the file above the root must be untouched"
+api 404 PATCH "/api/projects/$PROJ/files/entry" '{"path":"nope.txt","name":"x.txt"}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "rename missing source: error.code"
+ok "PATCH .../files/entry for a traversal or a missing entry: 404 not_found"
+
+api 200 DELETE "/api/projects/$PROJ/files/entry?path=doomed.txt"
+[ "$(jqb .name)" = "doomed.txt" ] || fail "delete file: echoed name"
+[ "$(jqb .path)" = "doomed.txt" ] || fail "delete file: echoed path"
+[ "$(jqb .is_dir)" = "false" ] || fail "delete file: is_dir must be false"
+[ ! -e "$REPO/doomed.txt" ] || fail "delete file: it must be gone from disk"
+api 404 GET "/api/projects/$PROJ/files/content?path=doomed.txt"
+ok "DELETE .../files/entry on a file: 200, the destroyed entry echoed, gone from disk"
+
+# Warm the root level FIRST: the 5s tree cache is what the handler has to evict,
+# so a stale entry here would still list the folder after it was destroyed.
+api 200 GET "/api/projects/$PROJ/files"
+jqb '.tree[].name' | grep -qx 'doomedfolder' || fail "delete folder: fixture must be listed first"
+
+api 200 DELETE "/api/projects/$PROJ/files/entry?path=doomedfolder"
+[ "$(jqb .name)" = "doomedfolder" ] || fail "delete folder: echoed name"
+[ "$(jqb .is_dir)" = "true" ] || fail "delete folder: is_dir must be true"
+[ ! -e "$REPO/doomedfolder" ] || fail "delete folder: a non-empty folder must be removed recursively"
+ok "DELETE .../files/entry on a non-empty folder: 200 and a recursive removal"
+
+api 200 GET "/api/projects/$PROJ/files"
+jqb '.tree[].name' | grep -qx 'doomedfolder' &&
+  fail "delete folder: the tree must not list it on the very next read (cache eviction)"
+ok "DELETE .../files/entry evicts the tree cache: the next read no longer lists it"
+
+api 422 DELETE "/api/projects/$PROJ/files/entry"
+[ "$(jqb .error.code)" = "validation" ] || fail "delete no ?path=: error.code"
+api 422 DELETE "/api/projects/$PROJ/files/entry?path="
+[ "$(jqb .error.code)" = "validation" ] || fail "delete empty ?path=: error.code"
+api 422 DELETE "/api/projects/$PROJ/files/entry?path=."
+[ "$(jqb .error.code)" = "validation" ] || fail "delete the root: error.code"
+[ -d "$REPO" ] || fail "delete root: the project folder must survive"
+ok "DELETE .../files/entry with a missing, empty or root ?path=: 422 validation"
+
+api 404 DELETE "/api/projects/$PROJ/files/entry?path=../outside.png"
+[ "$(jqb .error.code)" = "not_found" ] || fail "delete traversal: error.code"
+[ -f "$TMP/outside.png" ] || fail "delete traversal: the file above the root must be untouched"
+api 404 DELETE "/api/projects/$PROJ/files/entry?path=nope.txt"
+[ "$(jqb .error.code)" = "not_found" ] || fail "delete missing entry: error.code"
+ok "DELETE .../files/entry for a traversal or a missing entry: 404 not_found"
+
+# =====================================================================
+# 7. both serve modes
 # =====================================================================
 #
 # raw is a READ on the plain `guard`, so it is reachable in default mode and
@@ -340,6 +464,39 @@ check_modes() { # check_modes <label>
     '{"path":"notes.md","content":"plain notes\n"}'
   [ "$(jqb .path)" = "notes.md" ] || fail "$label: PATCH echo path"
   ok "$label: PATCH .../files/content with JSON from a local page succeeds"
+
+  # The two entry writes (task 877) share that gate pair exactly — the pairing
+  # is what must not drift apart, so both halves are asserted per mode.
+  status=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    -d 'path=notes.md&name=owned.md' \
+    "$BASE/api/projects/$PROJ/files/entry")
+  [ "$status" = "415" ] ||
+    fail "$label: PATCH .../files/entry without a JSON Content-Type must be 415, got $status"
+  status=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    "$BASE/api/projects/$PROJ/files/entry?path=notes.md")
+  [ "$status" = "415" ] ||
+    fail "$label: DELETE .../files/entry without a JSON Content-Type must be 415, got $status"
+  [ -f "$REPO/notes.md" ] || fail "$label: a refused entry write must never touch disk"
+  ok "$label: PATCH/DELETE .../files/entry without a JSON Content-Type are refused (415)"
+
+  # ...and both work from a local page, so the 415s above are the Content-Type
+  # half firing rather than the routes being unreachable. A round-trip rename
+  # and a create-then-delete leave the fixtures exactly as they were, so this
+  # runs identically in either mode.
+  api 200 PATCH "/api/projects/$PROJ/files/entry" \
+    '{"path":"newname.txt","name":"gatename.txt"}'
+  [ "$(jqb .path)" = "gatename.txt" ] || fail "$label: entry rename echo path"
+  api 200 PATCH "/api/projects/$PROJ/files/entry" \
+    '{"path":"gatename.txt","name":"newname.txt"}'
+  ok "$label: PATCH .../files/entry with JSON from a local page succeeds"
+
+  api 200 POST "/api/projects/$PROJ/files/content" '{"path":"gate-doomed.txt"}'
+  api 200 DELETE "/api/projects/$PROJ/files/entry?path=gate-doomed.txt"
+  [ "$(jqb .name)" = "gate-doomed.txt" ] || fail "$label: entry delete echo name"
+  [ ! -e "$REPO/gate-doomed.txt" ] || fail "$label: entry delete must remove the file"
+  ok "$label: DELETE .../files/entry with JSON from a local page succeeds"
 }
 
 check_modes "default mode"

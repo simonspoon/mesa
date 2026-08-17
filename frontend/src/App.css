@@ -4641,6 +4641,7 @@ body.files-tree-resizing {
 }
 
 .files-tree-dir:hover .files-tree-add,
+.files-tree-file:hover .files-tree-add,
 .files-tree-head:hover .files-tree-add,
 .files-tree-add:focus-visible {
   opacity: 1;
@@ -4650,6 +4651,14 @@ body.files-tree-resizing {
   background: none;
   box-shadow: none;
   color: var(--cyan);
+}
+
+/* Rename/delete (mesa task 877). They wear `.files-tree-add` rather than
+   copying it: same chromeless glyph, same reveal-on-hover-or-focus rules, on
+   every row rather than only a directory's. Delete alone tints red on hover,
+   the one destructive control in the tree. */
+.files-tree-danger:hover {
+  color: var(--red);
 }
 
 /* A touch device has no hover to reveal it with, so there it is simply
@@ -4717,6 +4726,33 @@ body.files-tree-resizing {
   color: var(--text-h);
   font-family: var(--font-mono);
   font-size: 0.85rem;
+}
+
+/* The rename box stands in place of a row's label (mesa task 877), so on a
+   directory row it shares the line with the 1rem ▸/▾ toggle and cannot take the
+   whole width — the row clips its overflow, which would eat the box's own
+   right-hand edge. A file row has no toggle and keeps the full width above. */
+.files-tree-dir .files-tree-new-input {
+  width: calc(100% - 1.25rem);
+}
+
+/* The inline delete prompt (mesa task 877), on its own row under the entry it
+   is asking about. It wears `.confirm-delete` for the confirm/cancel pair; this
+   rule only lets the row hold it — a tree `li` is `nowrap`/`overflow: hidden`,
+   which would clip the buttons. */
+.files-tree-confirm {
+  cursor: default;
+  white-space: normal;
+  overflow: visible;
+  font-size: 0.8rem;
+}
+
+.files-tree-confirm:hover {
+  background: none;
+}
+
+.files-tree-confirm .confirm-delete {
+  flex-wrap: wrap;
 }
 
 /* Loading/error/truncated rows under a lazily-expanded directory (mesa task

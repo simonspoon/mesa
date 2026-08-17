@@ -903,6 +903,18 @@ fn router(state: AppState) -> Router {
         // search is keyed on a query and cached by nothing. Standard guard
         // only, like every other read on this tab.
         .route("/api/projects/{id}/files/search", get(search_project_files))
+        // Renaming and deleting one entry of that tree (task 877). A FIFTH
+        // route, on `/entry` rather than on `/files/content`, because a tree
+        // entry is a file OR a directory and everything on the content path is
+        // file-content-shaped (its GET reads bytes, its PATCH writes them).
+        // Both verbs are mutations under `require_agent_access` — the same gate
+        // as the content PATCH/POST, for the same reason: a peer who can
+        // already overwrite a file under `local_path` gains nothing new from
+        // being able to rename or remove one.
+        .route(
+            "/api/projects/{id}/files/entry",
+            patch(rename_project_file_entry).delete(delete_project_file_entry),
+        )
         // New-project folder picker: unscoped (not one project's local_path)
         // server-side directory listing, plus creating one folder to pick.
         // Loopback-only in BOTH serve modes, reusing `require_local_path_write`
@@ -3873,8 +3885,24 @@ async fn create_project_file(
             }),
         };
     }
-    // The key `get_project_files` caches under: `""` is the root level, else
-    // the parent's own relative path.
+    evict_files_tree_level(&state, &root, &rel);
+    let view = tokio::task::spawn_blocking(move || files::read_file(&root, &rel))
+        .await
+        .unwrap_or(None);
+    view.map(|v| Json(v).into_response()).ok_or_else(not_found)
+}
+
+/// Drops the `files_tree_cache` entry for the directory LEVEL holding `rel`,
+/// which is what every write on this surface has to do before responding: the
+/// cache has a 5s TTL and the client refetches that level immediately, so
+/// leaving the entry in place would show a tree that still lists the old set of
+/// names. The key is `get_project_files`' own — `""` for the root level, else
+/// the parent's relative path — and only that one is dropped, since nothing
+/// about any other level changed. (Renaming or deleting a *directory* does leave
+/// cached entries under its old relative path, but no client can ask for them
+/// again — they name a level that no longer exists — and they expire on the same
+/// TTL.)
+fn evict_files_tree_level(state: &AppState, root: &str, rel: &str) {
     let rel_key = match rel.rsplit_once('/') {
         Some((parent, _)) => parent.to_string(),
         None => String::new(),
@@ -3883,11 +3911,135 @@ async fn create_project_file(
         .files_tree_cache
         .lock()
         .unwrap()
-        .remove(&(root.clone(), rel_key));
-    let view = tokio::task::spawn_blocking(move || files::read_file(&root, &rel))
-        .await
-        .unwrap_or(None);
-    view.map(|v| Json(v).into_response()).ok_or_else(not_found)
+        .remove(&(root.to_string(), rel_key));
+}
+
+#[derive(Deserialize)]
+struct FilesEntryRename {
+    path: String,
+    name: String,
+}
+
+/// Files tab rename (task 877) — `PATCH /api/projects/{id}/files/entry`, body
+/// `{path, name}`, echoing the `FileTreeEntry` the entry became.
+///
+/// On `/entry` rather than on `/files/content` because a tree entry is a file
+/// **or** a directory, while everything on the content path is file-content-
+/// shaped; and `name` is one name rather than a destination path, so this route
+/// cannot express a move (see `core::files::rename_path`).
+///
+/// Gated by [`require_agent_access`] — the SAME gate as the content PATCH/POST
+/// beside it, for the same reason: these bytes live under a project's
+/// `local_path`, and a peer who can already overwrite a file there gains nothing
+/// new from being able to rename one. Being a mutation with a JSON body, it also
+/// sits inside the global Content-Type/CSRF gate.
+///
+/// Error mapping is `create_project_file`'s: `NotFound` → 404 `not_found` (the
+/// parent doesn't resolve, isn't a directory, the entry is missing, or the
+/// rename failed — plus the no-`local_path`/dead-folder rung its neighbours
+/// share), `Validation(reason)` → 422 `validation`, `Conflict` → 409
+/// `conflict`.
+async fn rename_project_file_entry(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<FilesEntryRename>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {}", body.path),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let rel = body.path.clone();
+    let rename_root = root.clone();
+    let rename_rel = rel.clone();
+    let new_name = body.name.clone();
+    let renamed = tokio::task::spawn_blocking(move || {
+        files::rename_path(&rename_root, &rename_rel, &new_name)
+    })
+    .await
+    .unwrap_or(Err(files::RenamePathError::NotFound));
+    let entry = match renamed {
+        Ok(entry) => entry,
+        Err(files::RenamePathError::NotFound) => return Err(not_found()),
+        Err(files::RenamePathError::Validation(message)) => {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: message.into(),
+            });
+        }
+        Err(files::RenamePathError::Conflict) => {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                code: "conflict",
+                message: format!("already exists: {}", body.name),
+            });
+        }
+    };
+    evict_files_tree_level(&state, &root, &rel);
+    Ok(Json(entry).into_response())
+}
+
+/// Files tab delete (task 877) — `DELETE /api/projects/{id}/files/entry?path=`,
+/// echoing the `FileTreeEntry` that was destroyed (read before the removal, the
+/// delete-echo precedent every other delete in this API follows). A directory is
+/// removed recursively; see `core::files::delete_path`.
+///
+/// `?path=` rather than a JSON body, matching the content GET's own contract for
+/// naming one path — a missing or empty one is 422 `validation`. That does NOT
+/// take the route outside the CSRF gate: `DELETE` is in the global
+/// Content-Type gate's method set, so a caller still has to send
+/// `Content-Type: application/json`, exactly as for every other delete here.
+/// Same [`require_agent_access`] gate and same error mapping as the rename
+/// above, minus `Conflict` (a delete has no destination to collide with).
+async fn delete_project_file_entry(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<FilesContentQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let wanted = q.path.filter(|p| !p.is_empty()).ok_or(ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: "path query parameter is required".into(),
+    })?;
+    let not_found = || ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: format!("file not found: {wanted}"),
+    };
+    let (path, is_dir) = project_files_root(&state, id).await?;
+    let (Some(root), true) = (path, is_dir) else {
+        return Err(not_found());
+    };
+    let delete_root = root.clone();
+    let delete_rel = wanted.clone();
+    let deleted =
+        tokio::task::spawn_blocking(move || files::delete_path(&delete_root, &delete_rel))
+            .await
+            .unwrap_or(Err(files::DeletePathError::NotFound));
+    let entry = match deleted {
+        Ok(entry) => entry,
+        Err(files::DeletePathError::NotFound) => return Err(not_found()),
+        Err(files::DeletePathError::Validation(message)) => {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: message.into(),
+            });
+        }
+    };
+    evict_files_tree_level(&state, &root, &wanted);
+    Ok(Json(entry).into_response())
 }
 
 #[derive(Deserialize)]
@@ -6509,6 +6661,411 @@ mod tests {
             Path(id),
             Json(FilesContentCreate {
                 path: "a.txt".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Files tab: PATCH/DELETE /files/entry (mesa task 877) ---------------
+
+    #[tokio::test]
+    async fn rename_files_entry_renames_a_file_and_echoes_its_new_entry() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/old.rs"), "fn main() {}\n").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = rename_project_file_entry(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesEntryRename {
+                path: "src/old.rs".to_string(),
+                name: "new.rs".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["name"], "new.rs");
+        assert_eq!(body["path"], "src/new.rs");
+        assert_eq!(body["is_dir"], false);
+        assert!(!root.join("src/old.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/new.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_files_entry_renames_a_directory_with_its_contents() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("old/nested")).unwrap();
+        std::fs::write(root.join("old/nested/deep.txt"), "still here").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = rename_project_file_entry(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesEntryRename {
+                path: "old".to_string(),
+                name: "new".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], "new");
+        assert_eq!(body["is_dir"], true);
+
+        // Readable through the content route under the new name — the rename
+        // moved the whole subtree, not just the row.
+        let resp = get_project_files_content(
+            State(state),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("new/nested/deep.txt".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(json_body(resp).await["content"], "still here");
+    }
+
+    #[tokio::test]
+    async fn rename_files_entry_maps_not_found_validation_and_conflict() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("taken.txt"), "keep me").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for (path, name, expect_status, expect_code) in [
+            (
+                "../secret.txt",
+                "owned.txt",
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            ("nope.txt", "x.txt", StatusCode::NOT_FOUND, "not_found"),
+            ("a.txt/x.txt", "y.txt", StatusCode::NOT_FOUND, "not_found"),
+            // The project folder itself is not an entry of its own tree.
+            (
+                "",
+                "renamed",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            (
+                ".",
+                "renamed",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            // A new name that is a path would be a move, not a rename.
+            (
+                "a.txt",
+                "sub/a.txt",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            (
+                "a.txt",
+                "..",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            ("a.txt", "", StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            ("a.txt", "taken.txt", StatusCode::CONFLICT, "conflict"),
+        ] {
+            let err = rename_project_file_entry(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(id),
+                Json(FilesEntryRename {
+                    path: path.to_string(),
+                    name: name.to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, expect_status, "{path:?} -> {name:?}");
+            assert_eq!(err.code, expect_code, "{path:?} -> {name:?}");
+        }
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a");
+        assert_eq!(
+            std::fs::read_to_string(root.join("taken.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("secret.txt")).unwrap(),
+            "top secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_files_entry_rejects_non_loopback_peer_in_default_mode() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hi").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = rename_project_file_entry(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesEntryRename {
+                path: "a.txt".to_string(),
+                name: "pwned.sh".to_string(),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+        assert!(
+            root.join("a.txt").exists() && !root.join("pwned.sh").exists(),
+            "rejected rename must never touch disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_files_entry_no_local_path_is_not_found() {
+        let (_dir, state) = test_state();
+        let id = new_project(&state, None);
+        let resp = rename_project_file_entry(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesEntryRename {
+                path: "a.txt".to_string(),
+                name: "b.txt".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.unwrap_err().status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_files_entry_removes_a_file_and_echoes_the_destroyed_entry() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/gone.rs"), "bye").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = delete_project_file_entry(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("src/gone.rs".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["name"], "gone.rs");
+        assert_eq!(body["path"], "src/gone.rs");
+        assert_eq!(body["is_dir"], false);
+        assert!(!root.join("src/gone.rs").exists());
+        assert!(root.join("src").is_dir());
+    }
+
+    #[tokio::test]
+    async fn delete_files_entry_removes_a_non_empty_directory() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("doomed/nested")).unwrap();
+        std::fs::write(root.join("doomed/nested/b.txt"), "b").unwrap();
+        std::fs::write(root.join("keep.txt"), "keep").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = delete_project_file_entry(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("doomed".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = json_body(resp).await;
+        assert_eq!(body["path"], "doomed");
+        assert_eq!(body["is_dir"], true);
+        assert!(!root.join("doomed").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    /// The 5s tree cache must not outlive either write — a client refetching the
+    /// level it just changed has to see the new set of names.
+    #[tokio::test]
+    async fn files_entry_writes_evict_the_tree_cache_for_their_level() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/old.rs"), "x").unwrap();
+        std::fs::write(root.join("src/doomed.rs"), "x").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let warm = |state: AppState, level: Option<String>| async move {
+            get_project_files(
+                State(state),
+                Path(id),
+                Query(FilesTreeQuery { path: level }),
+            )
+            .await
+            .unwrap()
+        };
+        warm(state.clone(), None).await;
+        warm(state.clone(), Some("src".to_string())).await;
+        assert_eq!(state.files_tree_cache.lock().unwrap().len(), 2);
+
+        rename_project_file_entry(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Json(FilesEntryRename {
+                path: "src/old.rs".to_string(),
+                name: "new.rs".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        {
+            // Only the renamed entry's own level is evicted; the root entry
+            // stays (nothing about it changed).
+            let cache = state.files_tree_cache.lock().unwrap();
+            assert!(!cache.contains_key(&(root_str.clone(), "src".to_string())));
+            assert!(cache.contains_key(&(root_str.clone(), String::new())));
+        }
+
+        // Re-warm, then delete, and read the level back through the route: the
+        // fresh listing is what proves the eviction, not just the map contents.
+        warm(state.clone(), Some("src".to_string())).await;
+        delete_project_file_entry(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("src/doomed.rs".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let resp = warm(state, Some("src".to_string())).await;
+        let body = json_body(resp).await;
+        let names: Vec<&str> = body["tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["new.rs"]);
+    }
+
+    #[tokio::test]
+    async fn delete_files_entry_maps_missing_path_traversal_and_the_root() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        for (path, expect_status, expect_code) in [
+            (None, StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            (Some(""), StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            (Some("."), StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            (Some("../secret.txt"), StatusCode::NOT_FOUND, "not_found"),
+            (Some("nope.txt"), StatusCode::NOT_FOUND, "not_found"),
+        ] {
+            let err = delete_project_file_entry(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(id),
+                Query(FilesContentQuery {
+                    path: path.map(str::to_string),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, expect_status, "path {path:?}");
+            assert_eq!(err.code, expect_code, "path {path:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("secret.txt")).unwrap(),
+            "top secret"
+        );
+        assert!(root.is_dir(), "the project folder itself must survive");
+    }
+
+    #[tokio::test]
+    async fn delete_files_entry_rejects_non_loopback_peer_in_default_mode() {
+        let (dir, state) = test_state();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hi").unwrap();
+        let root_str = root.to_str().unwrap().to_string();
+        let id = new_project(&state, Some(&root_str));
+
+        let resp = delete_project_file_entry(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("a.txt".to_string()),
+            }),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "hi",
+            "rejected delete must never touch disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_files_entry_no_local_path_is_not_found() {
+        let (_dir, state) = test_state();
+        let id = new_project(&state, None);
+        let resp = delete_project_file_entry(
+            State(state),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(id),
+            Query(FilesContentQuery {
+                path: Some("a.txt".to_string()),
             }),
         )
         .await;

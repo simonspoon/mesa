@@ -27,6 +27,7 @@ import type { DirListing } from './types/DirListing'
 import type { EdgeMarker } from './types/EdgeMarker'
 import type { EdgeStyle } from './types/EdgeStyle'
 import type { FileContentView } from './types/FileContentView'
+import type { FileTreeEntry } from './types/FileTreeEntry'
 import type { Frame } from './types/Frame'
 import type { FrameEdge } from './types/FrameEdge'
 import type { FrameShape } from './types/FrameShape'
@@ -525,6 +526,50 @@ export function createProjectFile(
   return request(
     `/api/projects/${id}/files/content`,
     jsonInit('POST', { path }),
+  )
+}
+
+/**
+ * Renames one tree entry — file or directory — **within its own directory**
+ * (mesa task 877). `name` is a single component, never a path: this moves
+ * nothing between folders, which is what keeps the operation checkable against
+ * the same `safe_path` chokepoint every other Files route goes through.
+ *
+ * An unsafe/unlisted/nonexistent `path` 404s; a `name` that isn't a usable
+ * single component (empty, `.`/`..`, containing a separator), or a `path` naming
+ * the project root itself, 422s; a name already taken on disk 409s. Returns the
+ * renamed `FileTreeEntry`, whose `path` is what the open tabs are re-pointed at.
+ */
+export function renameProjectFileEntry(
+  id: number,
+  path: string,
+  name: string,
+): Promise<FileTreeEntry> {
+  return request(
+    `/api/projects/${id}/files/entry`,
+    jsonInit('PATCH', { path, name }),
+  )
+}
+
+/**
+ * Deletes one tree entry (mesa task 877). A directory goes **recursively**,
+ * with its whole contents — the same no-confirmation, no-`--force` posture the
+ * rest of mesa takes, so the confirmation is the caller's job (the Files tree
+ * raises an inline two-step prompt before it gets here).
+ *
+ * The path rides the query rather than a body, matching the other body-less
+ * DELETEs; the JSON Content-Type still goes out, since the guard middleware
+ * requires it on every mutating method. An unsafe/unlisted/nonexistent path
+ * 404s; the project root itself 422s. Returns the destroyed `FileTreeEntry`,
+ * which is what tells the tree whether a whole subtree of tabs just went away.
+ */
+export function deleteProjectFileEntry(
+  id: number,
+  path: string,
+): Promise<FileTreeEntry> {
+  return request(
+    `/api/projects/${id}/files/entry?path=${encodeURIComponent(path)}`,
+    jsonDelete(),
   )
 }
 

@@ -77,6 +77,21 @@ export function paneLabel(tab: PaneTab): string {
   return LABELS[tab]
 }
 
+/** The tabs whose body is a box sized to its container — the ones that must
+ *  reach the bottom of the project view rather than stopping at a fixed
+ *  `--tab-viewport-height` guess (mesa task 875).
+ *
+ *  Files and Terminal are the two single-view tabs whose whole body is one
+ *  such box; the Custom layout is the third case and the page adds it
+ *  directly, since it is not a `PaneTab`. Everything else here — Board,
+ *  Dashboard, Settings, the Diagrams *index* — is a column that flows down
+ *  the page and scrolls in `main`, and Git and an open diagram board are
+ *  mixed (a flowing header above a bounded pane), so all of them keep the
+ *  document-flow frame they have always had. */
+export function fillsViewport(tab: PaneTab): boolean {
+  return tab === 'files' || tab === 'terminal'
+}
+
 function leaf(tab: PaneTab): ViewLeaf {
   return { kind: 'leaf', contentKind: 'view', id: tab }
 }

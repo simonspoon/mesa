@@ -80,6 +80,14 @@ tabs (Files, Git, Terminal, Diagrams) size their bodies off
 redefines that variable (and `--tab-viewport-min`) to the pane's own box, so
 one CSS declaration rebinds every one of them with no per-view change.
 
+The pane *tree* is bounded the same way, one rung up (task 875): the project
+page becomes a `height: 100%` flex column and `.project-panes` takes what the
+title and the tab strip leave, with `--tab-viewport-*` rebound to that box —
+so the panes reach the bottom of the project view instead of stopping at the
+fixed `calc(100vh - 18rem)` guess with dead space below. Same treatment, same
+two declarations, one level out. Wide tier only: below 861px the tabs stack
+and the page scrolls, which is `docs/mobile.md`'s business.
+
 ## Opening a task from a Board pane
 
 A card's link is a route (`#/projects/7/tasks/12`), so following it from a

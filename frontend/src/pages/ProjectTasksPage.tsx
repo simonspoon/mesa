@@ -12,6 +12,7 @@ import { ProjectPanes, TabDropArea } from '../components/ProjectPanes'
 import {
   closePane,
   dropTab,
+  fillsViewport,
   getLayout,
   isEmpty,
   paneLabel,
@@ -415,8 +416,15 @@ export function ProjectTasksPage({
         : `#/projects/${projectId}`
   }
 
+  // Whether the view on screen is one that sizes itself to its container
+  // rather than flowing down the page (mesa task 875) — the Custom layout, or
+  // a tab whose body is a viewport-bound box. Only those get the filling frame
+  // below; a Board or a Dashboard still scrolls in `main` as it always has.
+  const fills = onCustom || fillsViewport(soloTab)
+
   return (
     <>
+      <div className={fills ? 'project-page project-page-fills' : 'project-page'}>
         <h1>
           {project ? (
             <InlineEdit
@@ -522,6 +530,7 @@ export function ProjectTasksPage({
             {viewFor(soloTab)}
           </TabDropArea>
         )}
+      </div>
 
     {taskId !== null && (
       <TaskModal

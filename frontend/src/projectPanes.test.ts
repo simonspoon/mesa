@@ -3,8 +3,10 @@ import type { ClientRect } from '@dnd-kit/core'
 import {
   closePane,
   dropTab,
+  fillsViewport,
   getLayout,
   isEmpty,
+  PANE_TABS,
   normalizeRatios,
   paneTabs,
   parseLayout,
@@ -130,6 +132,24 @@ describe('taskHrefFrom', () => {
     expect(taskHrefFrom('#/projects/7/files', 7, 12)).toBe('#/projects/7/tasks/12')
     // Another project's Custom layout is not this card's project.
     expect(taskHrefFrom('#/projects/8/custom', 7, 12)).toBe('#/projects/7/tasks/12')
+  })
+})
+
+describe('fillsViewport', () => {
+  it('is the tabs whose whole body is a box, not a column', () => {
+    expect(fillsViewport('files')).toBe(true)
+    expect(fillsViewport('terminal')).toBe(true)
+  })
+
+  it('leaves every flowing tab scrolling in main', () => {
+    // Git and the Diagrams index flow a header/list down the page, so they
+    // keep the document-flow frame even though Git's diff pane is bounded.
+    for (const tab of ['board', 'dashboard', 'diagrams', 'git', 'settings'] as const)
+      expect(fillsViewport(tab)).toBe(false)
+  })
+
+  it('answers for every tab on the strip', () => {
+    for (const tab of PANE_TABS) expect(typeof fillsViewport(tab)).toBe('boolean')
   })
 })
 

@@ -7934,6 +7934,79 @@ button:focus-visible,
   position: relative;
 }
 
+/* ── The project view fills its container (mesa task 875) ──────────────────
+   Files, Terminal and the Custom layout are boxes, not columns: each asks for
+   `--tab-viewport-height`, which is the fixed guess `calc(100vh - 18rem)` at
+   the chrome above it. The guess over-subtracts (a project with no
+   description, or a one-line title, has less chrome than 18rem) and `main`'s
+   own `padding-bottom: 3rem` sits under it either way, so those tabs stopped
+   short of the bottom with dead space below.
+
+   The fix is the one `.cc-timeline-page` already uses: `main` has a definite
+   height (`#root` is viewport-locked, index.css), so a `height: 100%` flex
+   column inside it resolves, and the body takes whatever the title/tabs
+   leave — a measured remainder instead of a guess. `--tab-viewport-*` is then
+   rebound to that box exactly as `.project-pane-body` rebinds it to a pane,
+   so no view needs a rule of its own.
+
+   Wide tier only. Below 861px `.files-layout` stacks and hands the box to
+   `.files-panes`, and the phone tier's `main` padding is the tab bar's
+   clearance rather than breathing room — both are `docs/mobile.md`'s
+   business, and neither wants a filling frame. */
+@media (min-width: 861px) {
+  /* The 3rem is for a page that scrolls; a page that fills has nowhere to
+     scroll to, so it is the top padding mirrored and nothing more. */
+  main:has(> .project-page-fills) {
+    padding-bottom: 1rem;
+  }
+
+  .project-page-fills {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+  }
+
+  .project-page-fills > .project-view-drop,
+  .project-page-fills > .project-panes {
+    --tab-viewport-height: 100%;
+    --tab-viewport-min: 0px;
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* The drop wrapper is layout-neutral everywhere else; here it has to pass
+     its own height down to the one view inside it. */
+  .project-page-fills > .project-view-drop {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* `.files-view` is a plain block around an optional "tree was capped" note
+     and the layout itself, so the box has to be handed down one more rung —
+     as `flex: 1` rather than the `height: 100%` `.files-layout` asks for,
+     which would ignore the note and overflow by its height. */
+  .project-page-fills > .project-view-drop > .files-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .project-page-fills > .project-view-drop > .files-view > .files-layout {
+    height: auto;
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* The gap under the pane tree was the strip's own spacing when the tree was
+     a fixed box; filling, it is the same dead space as main's. */
+  .project-page-fills > .project-panes {
+    height: auto;
+    margin-bottom: 0;
+  }
+}
+
 /* ── Diagram index rows (mesa task 854) ────────────────────────────────────
    Each board on its own row: a mini-map of its saved state on the left, then
    title / description / meta. `.card-list li` still supplies the panel, notch

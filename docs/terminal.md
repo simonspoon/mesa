@@ -202,7 +202,11 @@ page's code unchanged.
   the standalone padding/scroll and binds the pane body to the same
   `--tab-viewport-*` box the Files/Agents layouts use — inside the project
   frame's block flow, `flex: 1` has nothing to grow against and the panes
-  would otherwise collapse to zero height. At the phone tier this box drops
+  would otherwise collapse to zero height. Above 860px that box is no longer
+  the window: the project frame is a `height: 100%` flex column there and
+  rebinds `--tab-viewport-*` to the room the title and tab strip leave (task
+  875), so the shell reaches the bottom of the project view rather than
+  stopping 18rem short of it. At the phone tier this box drops
   `--tab-viewport-min`'s 256px floor and hides its own
   `.terminal-page-header`: with an on-screen keyboard up the tab has 112px to
   work with, and the floor alone put the prompt back under the keyboard

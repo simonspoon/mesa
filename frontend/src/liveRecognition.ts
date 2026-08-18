@@ -79,6 +79,12 @@ export function recognitionCtor(
  * gesture that may open a microphone, and a browser watching a conversation it
  * never joined has no business listening to the room.
  *
+ * `paused` belongs here rather than in `shouldListen` for the same reason
+ * `joined` does, and the opposite one from `speaking`: pausing is the person
+ * saying they are not in the conversation for now, so the microphone stops
+ * being the way in *at all* — the capture rules and the hint must see it, and
+ * unlike a reply it does not end on its own.
+ *
  * This, and not `shouldListen`, is what the capture box's two rules stand down
  * for (`liveCapture.ts`) and what the composer's hint reports. Those are
  * questions about *how the person is talking to mesa*, and the answer must not
@@ -90,8 +96,10 @@ export function recognizesSpeech(input: {
   joined: boolean
   supported: boolean
   blocked: boolean
+  /** The person stepped out of the conversation (mesa task 882). */
+  paused: boolean
 }): boolean {
-  return input.live && input.joined && input.supported && !input.blocked
+  return input.live && input.joined && input.supported && !input.blocked && !input.paused
 }
 
 /**
@@ -107,6 +115,7 @@ export function shouldListen(input: {
   joined: boolean
   supported: boolean
   blocked: boolean
+  paused: boolean
   speaking: boolean
 }): boolean {
   return recognizesSpeech(input) && !input.speaking
@@ -176,21 +185,31 @@ export function utteranceFrom(text: string): string | null {
 /**
  * What the composer says about listening — one line, always present, because
  * "is it hearing me" is the only question a hands-free surface has to answer
- * without being asked. The four states are the four honest ones: this browser
- * cannot, the microphone was refused, it is listening, or the conversation has
- * not started yet.
+ * without being asked. The five states are the five honest ones: the person
+ * paused it, this browser cannot listen, the microphone was refused, it is
+ * listening, or the conversation has not started yet.
  *
  * `listening` here is `recognizesSpeech`, not whether the engine is running
  * this second: a line that says "listening" and then "go live" and then
  * "listening" again on every reply is answering the question wrong on a
  * several-second cycle. That mesa pauses while she speaks is said *in* the
  * listening line, where it belongs.
+ *
+ * `paused` outranks the rest (mesa task 882), and it is the one state that
+ * has to: the box itself is disabled while paused, so every other line here
+ * would be inviting the person to type into a field that will not take it.
+ * The other three describe *how* words reach mesa; this one says none of them
+ * do right now, and names the press that changes that.
  */
 export function captureHint(input: {
   supported: boolean
   blocked: boolean
   listening: boolean
+  paused: boolean
 }): string {
+  if (input.paused) {
+    return 'Paused. Press Resume to talk to mesa again — the conversation is still running.'
+  }
   if (!input.supported) {
     return 'This browser cannot listen for itself. Type here, or use your system dictation — a settled line is sent on its own.'
   }

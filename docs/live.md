@@ -407,13 +407,18 @@ conversation") working with no backend change.
   and a routed page would be torn down by the very navigation it just
   performed — cutting its own sentence off mid-word and stopping the route
   reports below.
-- **A five-bar indicator sits centered in the header band, in one of three
-  states** (`liveIndicator.ts`, task 874) — the only sign of the conversation
+- **A five-bar indicator sits centered in the header band, in one of four
+  states** (`liveIndicator.ts`, tasks 874 and 882) — the only sign of the conversation
   while the popup is closed, so it answers for *both* sides of it rather than
   only for mesa:
-  - **mesa speaking** (cyan) — the loudest of the three, and deliberately not
+  - **mesa speaking** (cyan) — the loudest of the four, and deliberately not
     one wave: each bar runs its own keyframes at its own awkward duration, so
     the five never fall into the shared ripple that reads as a spinner.
+  - **paused** (amber, and the only one that does not move) — the person
+    stepped out (task 882). Everything else in the band is something
+    happening; paused is the absence of all three, so the honest drawing of it
+    is bars that sit still, lower and dimmer than listening — the state it is
+    most easily confused with.
   - **being heard** (green) — words are arriving, by either route in: an
     interim result from the recognizer, or a draft sitting in the capture box.
     One travelling wave, quieter than mesa's, because it reflects input rather
@@ -425,10 +430,13 @@ conversation") working with no backend change.
 
   The order is the decision: **speaking outranks everything** (while she talks
   the microphone is shut, so a band claiming to hear the person would be
-  describing a microphone that is not open), and **being heard outranks
-  listening**. Whitespace is not speech. All three freeze under
-  `prefers-reduced-motion` — the same rule as `.live-dot`'s pulse — to steady
-  bars whose heights keep the ranking the motion carried.
+  describing a microphone that is not open), **paused outranks both of the
+  states under it** (the microphone is shut and the box is disabled, so a
+  draft left over from before the pause must not read as the person still
+  talking), and **being heard outranks listening**. Whitespace is not speech.
+  All four freeze under `prefers-reduced-motion` — the same rule as
+  `.live-dot`'s pulse — to steady bars whose heights keep the ranking the
+  motion carried.
 - **The popup opens and closes without touching the session.** A speech-bubble
   toggle sits beside the live button whenever there is a session at all —
   running, or ended with a transcript still worth reading
@@ -442,7 +450,9 @@ conversation") working with no backend change.
   - `recognizesSpeech` — is the microphone the way in *at all*: the session is
     live, *this* browser has had its press (`unlocked` — the gesture that
     unlocks audio is the one that may open a microphone), the browser has a
-    recognizer, and the microphone was not refused.
+    recognizer, the microphone was not refused, and the person has not
+    **paused** (task 882 — a pause does not end on its own, so unlike a reply
+    it belongs to this question rather than to the one below).
   - `shouldListen` — that, **and mesa is not speaking**. The microphone would
     otherwise hear her own reply out of the speakers and answer it, so speech
     is a gate on listening rather than a separate mute, and the microphone
@@ -466,8 +476,12 @@ conversation") working with no backend change.
     engine produces routinely.
   - **The last sentence before she speaks is not dropped.** Stopping the
     engine *delivers* what was pending as a final, and that sentence was heard
-    before the audio started, so it is the person's and it is posted. Only the
-    conversation ending discards it — there is nothing left to say it to.
+    before the audio started, so it is the person's and it is posted. Two
+    stops discard it, for the same reason: there is nobody left to say it to.
+    The conversation **ending** is one. A **pause** is the other (task 882) —
+    the pending words are exactly what the person was saying as they pressed a
+    button meaning "hear nothing from me", so posting them would have the agent
+    answer a half-line they cut off on purpose.
   - **Recognition restarts itself.** Chrome ends it after about a minute and on
     a long enough silence, and reports that as an ordinary end, not an error.
     So `onend` asks `shouldListen` again and opens a new recognizer if the
@@ -485,13 +499,16 @@ conversation") working with no backend change.
     nothing would reopen it: it names itself in the status line instead of
     going quiet, and the next change of the answer (mesa's next reply ending,
     most likely) tries again.
-  - **The composer always says which of the four it is** (`captureHint`, over
-    `recognizesSpeech`): this browser cannot listen, the microphone was
-    refused, it is listening, or the conversation has not started — because
+  - **The composer always says which of the five it is** (`captureHint`, over
+    `recognizesSpeech`): the person paused it, this browser cannot listen, the
+    microphone was refused, it is listening, or the conversation has not
+    started — because
     "is it hearing me" is the only question a hands-free surface has to answer
     without being asked. That she pauses while she speaks is said *in* the
     listening line, rather than by the line flipping to "go live" on every
-    reply.
+    reply. The paused line outranks the other four and has to: the box is
+    disabled while paused, so every other line would be inviting the person to
+    type into a field that will not take it.
 - **While joined *and not listening*, the capture box holds the keyboard**
   (`liveCapture.ts`, the tested module for all of this). With the microphone
   open, none of the rule below applies: the fight was always about *where the
@@ -539,6 +556,35 @@ conversation") working with no backend change.
   **Listen**, with **End** beside it. A press in flight replaces the label
   (`Going live…`, `Ending…`) and disables it, so a slow spawn cannot be clicked
   twice.
+- **Pause is a fourth control, and it is this browser's own** (task 882).
+  **Pause** / **Resume** sits beside the toggle whenever the conversation is
+  live and *this* browser has joined it — and nowhere else: a browser that
+  never pressed is already silent, so there would be nothing for a pause to
+  stop, and mid-press there is nothing yet to step out of.
+
+  It **calls no route and touches no session state**. There is no `paused`
+  column, no CLI verb and no server change of any kind: the session stays
+  `live`, the agent keeps working, `mesa live listen` keeps being answered and
+  the turns keep arriving. What stops is *this page's part in the
+  conversation* — the run halts **whole**, so nothing is spoken, nothing
+  `navigate`s and no sidebar folds, and the microphone is shut
+  (`recognizesSpeech`) with the capture box disabled beside it. The transcript
+  keeps accumulating and stays readable in the popup, which is the point:
+  pausing is how a person reads what was said instead of being talked at.
+
+  Pausing silences the player through the same `silence()` that ending a
+  conversation uses, so **the sentence a pause interrupts is not repeated** —
+  it is already in the hub's `handled` set, exactly as `End` leaves it, and it
+  is still there to *read*. Everything that lands while paused is caught up on
+  Resume, in transcript order, navigates included; Resume needs no new gesture,
+  since `unlocked` was never given up. A conversation ending clears the pause,
+  so the next `Go live` starts talking rather than starting silently with the
+  control gone.
+
+  Deliberately a separate control rather than a state of the primary toggle:
+  that button answers "is this conversation running", which pause does not
+  change, and folding the two together would put "quiet for a minute" and
+  "destroy the conversation" one mis-click apart.
 - **`Listen` calls no route at all** — it exists purely to *be a gesture*, the
   thing a browser weighs its autoplay policy against, and it starts the run on
   whatever the conversation has already said. Two ordinary situations produce a
@@ -590,12 +636,15 @@ conversation") working with no backend change.
   `frontend/src/liveSession.ts` (the is-live predicate, `liveControls` — the
   four presses above, since "no session", "an ended session", "a session still
   starting" and "a session running in a browser with no gesture" are four
-  different buttons and the label has to be right in each — plus the popup
-  toggle's `overlay` flag, and the status line) and
+  different buttons and the label has to be right in each — plus the pause
+  control and where it is *not* offered, the popup toggle's `overlay` flag,
+  and the status line, where paused ranks under the two not-live states and
+  above everything the running conversation would otherwise say) and
   `frontend/src/liveCapture.ts` (the focus referee and the auto-send rule, and
   when both stand aside) and
   `frontend/src/liveRecognition.ts` (the two listening questions and why they
-  are two, which errors end listening, a result event's final text, its preview
+  are two — and why a pause belongs to the first and a reply to the second —
+  which errors end listening, a result event's final text, its preview
   and its high-water mark, what a settled result is worth sending, and the
   composer's hint), each with a sibling vitest file.
 
@@ -647,6 +696,11 @@ CLAUDE.md requires: **data, never instructions.**
     privacy question and the non-Chromium browsers off this list. It is not
     here yet, and it is the only reason a route would ever accept audio.
 - **A second live session.** One conversation, one page, one player.
+- **A server-side pause.** Pausing is one browser stepping out (task 882), not
+  a state of the conversation: there is no `paused` column, no route and no CLI
+  verb, and the agent is never told. Two pages on one conversation therefore
+  pause independently, which is the honest answer — the person at the paused
+  one is not listening, and the other one still is.
 - **A per-session voice.** The voice is `speech.voice` in
   `~/.mesa/config.json`, read on every press, shared with the inbox.
 - **A push channel**, in either direction — see the loop above.

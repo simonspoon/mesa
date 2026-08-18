@@ -13,6 +13,13 @@
  * - **mesa speaking outranks everything.** While she talks the microphone is
  *   deliberately shut (`shouldListen`), so anything the band said about hearing
  *   the person would be describing a microphone that is not open.
+ * - **Paused comes next** (mesa task 882) — in practice it is the top state,
+ *   since pausing silences whatever was sounding, and it is written below
+ *   speaking only so that a tail of audio still shows as audio rather than as
+ *   a lie. It outranks both of the states under it because a paused page is
+ *   neither hearing nor listening: the microphone is shut and nothing is being
+ *   taken in. A draft left sitting in the box from before the pause must not
+ *   make the band claim she is still being heard.
  * - **Being heard outranks being listened to.** Words arriving — an interim
  *   result from the recognizer, or a draft in the capture box — is the stronger
  *   news, and it is the one the person is waiting for.
@@ -28,7 +35,7 @@
  */
 
 /** What the band is showing, or `null` for a band with nothing to say. */
-export type LiveIndicator = 'speaking' | 'hearing' | 'listening'
+export type LiveIndicator = 'speaking' | 'paused' | 'hearing' | 'listening'
 
 export function headerIndicator(input: {
   live: boolean
@@ -42,9 +49,12 @@ export function headerIndicator(input: {
   interim: string
   /** What is sitting in the capture box. */
   draft: string
+  /** The person stepped out of the conversation without ending it. */
+  paused: boolean
 }): LiveIndicator | null {
   if (input.speaking) return 'speaking'
   if (!input.live || !input.joined) return null
+  if (input.paused) return 'paused'
   if (input.interim.trim() !== '' || input.draft.trim() !== '') return 'hearing'
   return input.recognizes ? 'listening' : null
 }
@@ -57,6 +67,7 @@ export function headerIndicator(input: {
  */
 export function indicatorLabel(state: LiveIndicator): string {
   if (state === 'speaking') return 'mesa is speaking'
+  if (state === 'paused') return 'mesa is paused'
   if (state === 'hearing') return 'mesa is hearing you'
   return 'mesa is listening'
 }

@@ -9,6 +9,7 @@ function input(patch: Partial<Parameters<typeof headerIndicator>[0]> = {}) {
     recognizes: true,
     interim: '',
     draft: '',
+    paused: false,
     ...patch,
   }
 }
@@ -56,11 +57,34 @@ describe('headerIndicator', () => {
       'speaking',
     )
   })
+
+  it('shows a paused conversation above either way of being heard', () => {
+    // Paused, the microphone is shut and nothing is taken in — so a draft left
+    // in the box from before the pause must not read as the person talking.
+    expect(headerIndicator(input({ paused: true }))).toBe('paused')
+    expect(headerIndicator(input({ paused: true, interim: 'left over' }))).toBe('paused')
+    expect(headerIndicator(input({ paused: true, draft: 'left over' }))).toBe('paused')
+    // …and it is shown whether or not the microphone was ever this browser's
+    // way in: the typed box is shut too.
+    expect(headerIndicator(input({ paused: true, recognizes: false }))).toBe('paused')
+  })
+
+  it('still shows a tail of audio over a pause', () => {
+    // Pausing silences the player, so in practice these do not overlap — but
+    // while a sound is actually coming out, saying otherwise would be a lie.
+    expect(headerIndicator(input({ paused: true, speaking: true }))).toBe('speaking')
+  })
+
+  it('says nothing about a pause in a conversation this browser is not in', () => {
+    expect(headerIndicator(input({ paused: true, live: false }))).toBeNull()
+    expect(headerIndicator(input({ paused: true, joined: false }))).toBeNull()
+  })
 })
 
 describe('indicatorLabel', () => {
   it('names who is talking, in each state', () => {
     expect(indicatorLabel('speaking')).toBe('mesa is speaking')
+    expect(indicatorLabel('paused')).toBe('mesa is paused')
     expect(indicatorLabel('hearing')).toBe('mesa is hearing you')
     expect(indicatorLabel('listening')).toBe('mesa is listening')
   })

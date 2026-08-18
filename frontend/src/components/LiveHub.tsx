@@ -86,6 +86,12 @@ import { useFetch } from '../useFetch'
  *   the feature, and a routed page would be unmounted by the navigation it
  *   just performed — cutting its own sentence off mid-word. The popup opens
  *   and closes without touching the session; only `End` ends it.
+ * - **Pause is this browser's own** (task 882). Stepping out stops the run
+ *   whole — no speech, no `navigate`, no sidebar fold — and shuts the
+ *   microphone, while the session stays `live` and the agent keeps working;
+ *   the turns pile up in the transcript and Resume performs them in order.
+ *   No route, no session state: pausing a conversation is not the same event
+ *   as ending one, and only one of the two is recoverable.
  * - **While joined and not recognizing, the capture box holds the keyboard**
  *   (`liveCapture.ts`): a `navigate` turn is mesa's doing, and the words after
  *   it are still meant for mesa, not for whatever field the opened page
@@ -174,6 +180,20 @@ export function LiveHub({
   // The conversation popup. Purely visual: closing it calls no route and stops
   // nothing — the session, the audio and the capture box all carry on.
   const [open, setOpen] = useState(false)
+  // The person stepped out of the conversation without ending it (mesa task
+  // 882): this browser speaks nothing, hears nothing and is driven nowhere
+  // until Resume. Deliberately *this browser's* state and nothing more — no
+  // route, no column, no effect on the session or the agent, which both carry
+  // on. The ref beside it is what `run()`, the recognizer's lifecycle and the
+  // auto-send deadline read, since all three run outside the render that
+  // changed it; every write goes through `setPausedNow` so the two can never
+  // disagree by a render.
+  const [paused, setPaused] = useState(false)
+  const pausedRef = useRef(false)
+  const setPausedNow = useCallback((next: boolean) => {
+    pausedRef.current = next
+    setPaused(next)
+  }, [])
   // The engine still guessing. Shown, never sent (`liveRecognition.ts`).
   const [interim, setInterim] = useState('')
   // The microphone was refused — by the person or by the browser's policy.
@@ -389,7 +409,13 @@ export function LiveHub({
   // every reply, and a focus fight or an auto-send deadline that re-arms
   // itself while mesa speaks is decided by playback timing rather than by any
   // rule.
-  const recognizes = recognizesSpeech({ live, joined: unlocked, supported, blocked })
+  const recognizes = recognizesSpeech({
+    live,
+    joined: unlocked,
+    supported,
+    blocked,
+    paused,
+  })
   // The same answer for the two that read it outside a render: the focus
   // arbiter runs from blur handlers and the auto-send deadline from a timer.
   const listeningRef = useRef(false)
@@ -472,7 +498,10 @@ export function LiveHub({
   // re-arm a timer the composition suppressed.
   const [composeTick, setComposeTick] = useState(0)
   useEffect(() => {
-    if (!live || draft.trim() === '') return
+    // Paused, the box is disabled and nothing in it is an utterance the person
+    // is still making — a deadline that fired here would send a line dictated
+    // before they stepped out.
+    if (!live || paused || draft.trim() === '') return
     const timer = window.setTimeout(() => {
       const text = draftRef.current
       if (text.trim() === refused.current) return
@@ -492,7 +521,7 @@ export function LiveHub({
     // left in the box when recognition stops being the way in (the microphone
     // refused, the browser's answer changing) must get its deadline back
     // rather than sit there for ever because the decision was sampled once.
-  }, [draft, live, composeTick, recognizes])
+  }, [draft, live, paused, composeTick, recognizes])
 
   /** The one write path for the draft: state for the render, refs for the timer. */
   const updateDraft = useCallback((value: string) => {
@@ -503,7 +532,14 @@ export function LiveHub({
 
   // ---- the microphone (liveRecognition.ts) ----
 
-  const wantsMic = shouldListen({ live, joined: unlocked, supported, blocked, speaking })
+  const wantsMic = shouldListen({
+    live,
+    joined: unlocked,
+    supported,
+    blocked,
+    paused,
+    speaking,
+  })
   // Whether the conversation still wants the microphone, for the handler that
   // learns the engine stopped: `onend` fires from the browser's own schedule,
   // outside any render, and it is where restarting is decided.
@@ -541,15 +577,22 @@ export function LiveHub({
         // Not guarded on `running`: `stop()` below delivers whatever was
         // pending as a final, and that is the sentence the person was still
         // finishing as mesa began to speak — heard before the audio started,
-        // so it is theirs, not an echo. Only the conversation itself ending
-        // drops it, because there is nothing left to say it to.
+        // so it is theirs, not an echo. Two stops *do* drop it, and for the
+        // same reason: there is nobody left to say it to. The conversation
+        // ending is one. A **pause** is the other (task 882) — the person
+        // pressed a button that means "hear nothing from me", and the pending
+        // sentence is exactly what they were saying when they pressed it, so
+        // posting it would have the agent answer a half-line the person cut
+        // off on purpose. `setPausedNow(true)` runs before this effect's
+        // cleanup calls `stop()`, so the ref is already true by the time that
+        // final arrives.
         if (running) {
           // The preview is cleared here rather than waiting for the next
           // event: the words it showed have just become a turn, and leaving
           // them under the box would read as a second sentence still coming.
           setInterim('')
         }
-        if (armed.current.live) postRef.current(text)
+        if (armed.current.live && !pausedRef.current) postRef.current(text)
       }
       engine.onerror = (event) => {
         if (!running) return
@@ -591,6 +634,12 @@ export function LiveHub({
   // speaks — the order of the conversation is the order of the turns.
   function run() {
     const ctx = clock.current
+    // Paused: the whole run stops, not just the audio. A turn that navigated
+    // or folded the sidebars while the person had stepped out would be the
+    // conversation driving a browser nobody is listening to — and the turns
+    // are still there, so Resume performs them in order rather than losing
+    // them.
+    if (pausedRef.current) return
     // No press on this browser yet: the conversation may be live elsewhere, but
     // nothing here may sound or navigate without a gesture behind it.
     if (ctx === null || sounding.current !== null) return
@@ -651,9 +700,15 @@ export function LiveHub({
   // something to do while rendering.
   const wasLive = useRef(live)
   useEffect(() => {
-    if (wasLive.current && !live) silence()
+    if (wasLive.current && !live) {
+      silence()
+      // Pause is about a conversation that is still running, so it does not
+      // outlive one: the next `Go live` starts talking rather than starting
+      // paused with no control on screen to say why.
+      setPausedNow(false)
+    }
     wasLive.current = live
-  }, [live, silence])
+  }, [live, silence, setPausedNow])
 
   // The header never unmounts, but strict-mode remounts in dev do pass here:
   // drop the body still arriving and hand the clock back.
@@ -717,7 +772,7 @@ export function LiveHub({
 
   // ---- the press ----
 
-  const controls = liveControls(session, pending, unlocked)
+  const controls = liveControls(session, pending, unlocked, paused)
 
   function act(button: LiveButton) {
     if (button.disabled) return
@@ -753,6 +808,43 @@ export function LiveHub({
     setPending('stop')
     silence()
     stopLive().then(() => refetch(), failed).finally(() => setPending(null))
+  }
+
+  /**
+   * Stepping out of the conversation, and back in (mesa task 882).
+   *
+   * Deliberately not part of `act`: this calls no route, spends no gesture and
+   * touches neither `unlocked` nor the session. Pausing silences whatever was
+   * sounding — the same `silence()` ending a conversation uses, so the turn it
+   * cut off stays in `handled` and is not said again on Resume; it is still
+   * there to read in the transcript. Resuming just starts the run, which
+   * catches up on everything that landed in the meantime, in order.
+   */
+  function togglePause(button: LiveButton) {
+    if (button.action === 'pause') {
+      silence()
+      setPausedNow(true)
+      return
+    }
+    setPausedNow(false)
+    // `reclaim` decides on `listeningRef`, which the render's effect only
+    // rewrites on the *next* pass — so read from here it still holds the
+    // paused answer (`false`), and capture would grab the keyboard even where
+    // the microphone is the way in. Answer the question for the resumed page
+    // and write it first; the effect re-affirms the same value a render later.
+    listeningRef.current = recognizesSpeech({
+      live,
+      joined: unlocked,
+      supported,
+      blocked,
+      paused: false,
+    })
+    // A press on mesa's own controls hands the keyboard back — which is what
+    // this does wherever the typed box is the way in. With the microphone
+    // open `reclaim` now declines, as it should: a recognized sentence reaches
+    // the conversation with the keyboard anywhere.
+    reclaim('hub-press', armed.current)
+    pump.current()
   }
 
   function send() {
@@ -799,11 +891,13 @@ export function LiveHub({
     recognizes,
     interim,
     draft,
+    paused,
   })
 
   const groups = turnGroups(turns)
   // Pulled out of the object so its narrowing survives into the handler below.
   const secondary = controls.secondary
+  const pauseButton = controls.pause
 
   return (
     <div className="live-hub">
@@ -836,6 +930,20 @@ export function LiveHub({
           <LiveMark />
         </button>
       )}
+      {/* Stepping out without ending it (mesa task 882) — offered only while
+          the conversation is live and this browser is in it. Sits before the
+          primary control so the press that destroys the conversation stays
+          where it has always been: last. */}
+      {pauseButton && (
+        <button
+          type="button"
+          className={`live-toggle${paused ? ' live-paused' : ''}`}
+          disabled={pauseButton.disabled}
+          onClick={() => togglePause(pauseButton)}
+        >
+          {pauseButton.label}
+        </button>
+      )}
       <button
         type="button"
         className={`live-toggle${controls.primary.action === 'stop' ? ' live-on' : ''}`}
@@ -866,7 +974,7 @@ export function LiveHub({
       <div className={`live-overlay${open ? '' : ' live-closed'}`}>
         <div className="live-overlay-head">
           <span className={actionError !== null ? 'error' : 'muted'}>
-            {liveStatusLine(session, speaking, actionError)}
+            {liveStatusLine(session, speaking, actionError, paused)}
           </span>
           <button
             type="button"
@@ -938,13 +1046,18 @@ export function LiveHub({
             className="live-input"
             rows={2}
             value={draft}
-            disabled={!live}
+            // Paused is the same answer as not-live for the box: nothing typed
+            // here would be heard until Resume, and a field that accepts words
+            // nobody will read is worse than one that says it is shut.
+            disabled={!live || paused}
             placeholder={
               !live
                 ? 'go live to start the conversation'
-                : recognizes
-                  ? 'listening — or type here'
-                  : 'dictate or type here…'
+                : paused
+                  ? 'paused — press Resume to talk to mesa'
+                  : recognizes
+                    ? 'listening — or type here'
+                    : 'dictate or type here…'
             }
             aria-label="say something to mesa"
             onChange={(e) => updateDraft(e.target.value)}
@@ -995,7 +1108,8 @@ export function LiveHub({
             </div>
           )}
           <div className="live-hint muted">
-            {captureHint({ supported, blocked, listening: recognizes })} Enter sends at once.
+            {captureHint({ supported, blocked, listening: recognizes, paused })}{' '}
+            {!paused && 'Enter sends at once.'}
           </div>
         </form>
       </div>

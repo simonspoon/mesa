@@ -45,7 +45,13 @@ describe('recognitionCtor', () => {
 })
 
 describe('recognizesSpeech', () => {
-  const open = { live: true, joined: true, supported: true, blocked: false } as const
+  const open = {
+    live: true,
+    joined: true,
+    supported: true,
+    blocked: false,
+    paused: false,
+  } as const
 
   it('is the way in while the conversation is live in a browser that joined it', () => {
     expect(recognizesSpeech(open)).toBe(true)
@@ -56,6 +62,14 @@ describe('recognizesSpeech', () => {
     expect(recognizesSpeech({ ...open, joined: false })).toBe(false)
     expect(recognizesSpeech({ ...open, supported: false })).toBe(false)
     expect(recognizesSpeech({ ...open, blocked: true })).toBe(false)
+  })
+
+  it('is not the way in while the person has stepped out', () => {
+    // Unlike a reply, a pause does not end on its own — the person is not in
+    // the conversation until they press Resume, so the capture rules and the
+    // hint that read this must see it, not just the recognizer's lifecycle.
+    expect(recognizesSpeech({ ...open, paused: true })).toBe(false)
+    expect(shouldListen({ ...open, paused: true, speaking: false })).toBe(false)
   })
 
   it('does not blink while mesa speaks — the capture rules key on this', () => {
@@ -74,6 +88,7 @@ describe('shouldListen', () => {
     joined: true,
     supported: true,
     blocked: false,
+    paused: false,
     speaking: false,
   } as const
 
@@ -99,6 +114,10 @@ describe('shouldListen', () => {
 
   it('stops listening while mesa is speaking, so she does not hear herself', () => {
     expect(shouldListen({ ...open, speaking: true })).toBe(false)
+  })
+
+  it('never listens while the conversation is paused', () => {
+    expect(shouldListen({ ...open, paused: true })).toBe(false)
   })
 })
 
@@ -198,7 +217,7 @@ describe('utteranceFrom', () => {
 })
 
 describe('captureHint', () => {
-  const base = { supported: true, blocked: false, listening: false }
+  const base = { supported: true, blocked: false, listening: false, paused: false }
 
   it('says so where the browser cannot listen', () => {
     expect(captureHint({ ...base, supported: false })).toMatch(/cannot listen/)
@@ -218,5 +237,13 @@ describe('captureHint', () => {
 
   it('offers the microphone before the conversation starts', () => {
     expect(captureHint(base)).toMatch(/Go live/)
+  })
+
+  it('names the press that undoes a pause, above every other line', () => {
+    // The box is disabled while paused, so each of the other three would be
+    // inviting the person to type into a field that will not take it.
+    expect(captureHint({ ...base, paused: true })).toMatch(/Resume/)
+    expect(captureHint({ ...base, paused: true, supported: false })).toMatch(/Resume/)
+    expect(captureHint({ ...base, paused: true, blocked: true })).toMatch(/Resume/)
   })
 })

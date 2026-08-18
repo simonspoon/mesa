@@ -8185,6 +8185,14 @@ button:focus-visible,
   border-color: rgba(255, 59, 92, 0.5);
 }
 
+/* Paused is a held state, not an action in flight: the button carries the
+   colour of the conversation it is holding open, so a paused hub is readable
+   from across the room and never mistaken for one that has ended. */
+.live-toggle.live-paused {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
 .live-overlay-toggle.live-open {
   color: var(--cyan);
   border-color: rgba(0, 229, 255, 0.5);
@@ -8286,6 +8294,22 @@ button:focus-visible,
 .live-talk-listening span:nth-child(4) { animation-delay: 0.6s; }
 .live-talk-listening span:nth-child(5) { animation-delay: 0.8s; }
 
+/* Paused: the one state that does not move at all. Everything else in this
+   band is something happening — she is talking, the room is being taken in,
+   the microphone is open — and paused is the absence of all three, so the
+   honest drawing of it is bars that sit still. Lower and dimmer than
+   listening, which is the state it is most easily confused with, and the only
+   one it has to be told apart from at a glance. */
+.live-talk-paused {
+  color: var(--muted);
+  opacity: 0.5;
+}
+
+.live-talk-paused span {
+  transform: scaleY(0.15);
+  animation: none;
+}
+
 @keyframes live-talk-tall {
   0%, 100% { transform: scaleY(0.2); }
   45% { transform: scaleY(1); }
@@ -8325,6 +8349,10 @@ button:focus-visible,
   .live-talk-speaking span { transform: scaleY(0.7); }
   .live-talk-hearing span { transform: scaleY(0.5); }
   .live-talk-listening span { transform: scaleY(0.25); }
+  /* Lowest of the four, which is the ranking it already has: paused is the
+     one state that was still to begin with, so this block changes nothing
+     about it and says so rather than leaving it to inherit by accident. */
+  .live-talk-paused span { transform: scaleY(0.15); }
 }
 
 /* The conversation popup, anchored under the header's right edge. Absolute

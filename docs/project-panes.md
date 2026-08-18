@@ -80,6 +80,17 @@ tabs (Files, Git, Terminal, Diagrams) size their bodies off
 redefines that variable (and `--tab-viewport-min`) to the pane's own box, so
 one CSS declaration rebinds every one of them with no per-view change.
 
+A pane's box then has to reach the layout that wants it (task 880). Files and
+Git are two-column layouts asking for `height: var(--tab-viewport-height)` —
+which in a pane is `100%`, and a percentage only resolves against a definite
+height, which their wrapper (`.files-view` / `.git-view`, a plain block) has
+not got. Unresolved, both fell back to their content height: the tree and the
+file list grew to full length and the *pane* scrolled the whole view as one
+block instead of each column scrolling inside itself. `.project-pane-body`
+therefore hands the box down a rung — `flex: 1` on the wrapper, then on the
+layout — the same two declarations task 875 used one level out, and wide-tier
+only for the same reason.
+
 The pane *tree* is bounded the same way, one rung up (task 875): the project
 page becomes a `height: 100%` flex column and `.project-panes` takes what the
 title and the tab strip leave, with `--tab-viewport-*` rebound to that box —

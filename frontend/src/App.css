@@ -7956,6 +7956,36 @@ button:focus-visible,
   padding: 0 0.5rem 0.5rem;
 }
 
+/* …and the box has to reach the layout that actually wants it. `.files-layout`
+   and `.git-layout` ask for `height: var(--tab-viewport-height)`, which in a
+   pane is the percentage `100%` — and a percentage resolves only against a
+   definite height, which their wrapper (`.files-view` / `.git-view`, a plain
+   block flex item) has not got. Unresolved, both fall back to their content
+   height: the tree and the diff grew to their full length and the *pane*
+   scrolled the whole view as one block instead of each column scrolling
+   inside itself, which is what mesa task 880 reported. Handing the box down a
+   rung — `flex: 1` on the wrapper, then on the layout — is the same two
+   declarations task 875 used one level out.
+
+   Wide tier only: below 861px both layouts stack on purpose and the page
+   scrolls (docs/mobile.md), which is exactly what these rules would undo. */
+@media (min-width: 861px) {
+  .project-pane-body > .files-view,
+  .project-pane-body > .git-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .project-pane-body > .files-view > .files-layout,
+  .project-pane-body > .git-view > .git-layout {
+    height: auto;
+    flex: 1;
+    min-height: 0;
+  }
+}
+
 /* The pane header doubles as its grip (dragging it moves the pane), so it
    takes the grab cursor the sidebar's own grips have. */
 .project-pane > .agent-terminal-header {

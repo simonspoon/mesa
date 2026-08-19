@@ -3174,14 +3174,27 @@ pub fn is_usage_window(window: &str) -> bool {
 /// the caller reports `unavailable` rather than inventing a cutoff. Pure: the
 /// fetch, and the cache in front of it, belong to the caller.
 pub fn usage_window_start(window: &str, usage: &CcUsage) -> Option<i64> {
-    let (w, len) = if window.eq_ignore_ascii_case("cc-5h") {
-        (usage.five_hour.as_ref(), 5 * 3_600)
-    } else if window.eq_ignore_ascii_case("cc-7d") {
-        (usage.seven_day.as_ref(), 7 * 86_400)
+    let w = if window.eq_ignore_ascii_case("cc-5h") {
+        usage.five_hour.as_ref()
     } else {
-        return None;
+        usage.seven_day.as_ref()
     };
+    let len = usage_window_len(window)?;
     parse_ts(w?.resets_at.as_deref()?).map(|resets| resets - len)
+}
+
+/// The fixed length (seconds) of the window `window` names — 5 hours or 7 days,
+/// set by the plan rather than by anything mesa reads. `None` for every other
+/// token. Public because a caller holding an older snapshot needs it to ask
+/// whether the window that snapshot names has since closed.
+pub fn usage_window_len(window: &str) -> Option<i64> {
+    if window.eq_ignore_ascii_case("cc-5h") {
+        Some(5 * 3_600)
+    } else if window.eq_ignore_ascii_case("cc-7d") {
+        Some(7 * 86_400)
+    } else {
+        None
+    }
 }
 
 /// UTC-midnight cutoff for `window`: `<n>d` is **n calendar days ending

@@ -5735,7 +5735,22 @@ async fn usage_window_since(state: &AppState, window: &str) -> Result<Option<i64
     let cached = state.usage_cache.lock().unwrap().clone();
     let usage = match cached {
         Some((at, usage)) if now - at < USAGE_TTL_SECS => usage,
-        _ => refresh_usage(state).await?,
+        // A refresh that fails falls back to the last snapshot **if the window
+        // it names has not closed yet** — a still-open window is still the
+        // right answer no matter how old the reading is, and this endpoint is
+        // polled from several places and rate-limits (429). A snapshot whose
+        // window has since rolled over is useless, so that failure is real.
+        Some((_, stale)) => match refresh_usage(state).await {
+            Ok(usage) => usage,
+            Err(e) => match (
+                crate::core::cc::usage_window_start(window, &stale),
+                crate::core::cc::usage_window_len(window),
+            ) {
+                (Some(start), Some(len)) if start + len > now => stale,
+                _ => return Err(e),
+            },
+        },
+        None => refresh_usage(state).await?,
     };
     crate::core::cc::usage_window_start(window, &usage)
         .map(Some)

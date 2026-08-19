@@ -350,7 +350,16 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     `AppState.usage_cache` the Subscription card polls (stale-tolerant on
     purpose: a boundary moves once every 5 hours, and a `curl` per 20-second
     dashboard poll is the 429 source `refresh_usage` exists to avoid); the CLI,
-    which never talks to the server, calls `usage::fetch()` itself.
+    which never talks to the server, calls `usage::fetch()` itself. A refresh
+    that *fails* falls back to the last snapshot **while the window it names is
+    still open** (`start + usage_window_len > now`) — a still-open window is
+    the right answer however old the reading is, and this endpoint really does
+    hand out 429s. A snapshot whose window has rolled over is useless, so that
+    failure is passed through.
+  - The **CLI has no cache** (it never talks to the server), so every
+    `--window cc-5h` call is one outbound request: polling these two windows in
+    a loop earns a `429` from the endpoint, reported as `unavailable` like any
+    other failure. Ask for them when you want them, not on a timer.
   - Nothing open, or an endpoint that cannot be reached, is **`unavailable`**
     (exit 1 / 502) — mesa never substitutes a cutoff and labels some other span
     as this session. `collect(store, "cc-5h")` — the cutoff-less entry point —

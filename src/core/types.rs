@@ -1985,9 +1985,11 @@ pub struct CcDashboard {
     /// Unix seconds at which this snapshot was computed.
     #[ts(type = "number")]
     pub generated_at_unix: i64,
-    /// The requested window token (`7d`/`30d`/`90d`/`all`/`<n>d`).
+    /// The requested window token (`7d`/`30d`/`90d`/`all`/`<n>d`, or
+    /// `cc-5h`/`cc-7d` for the open Claude Code subscription window).
     pub window: String,
-    /// Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
+    /// Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`. A subscription
+    /// window starts mid-day, so this is the date its cutoff falls on.
     pub since: Option<String>,
     pub overview: CcOverview,
     pub daily: Vec<CcDayPoint>,

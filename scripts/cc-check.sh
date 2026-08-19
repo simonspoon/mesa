@@ -170,6 +170,78 @@ assert any(s["skill"]=="build" for s in rows), rows
 print("skills ok")
 ' || fail "skills shape"
 
+# ---- subscription windows (`cc-5h` / `cc-7d`, task 883) ----
+# These two windows have no clock-derived cutoff: they start when the live usage
+# endpoint says the currently-open window started, i.e. its `resets_at` minus the
+# window's fixed length. `MESA_CC_USAGE_URL` feeds that endpoint a file, so the
+# whole path (curl -> parse -> cutoff -> dashboard) runs for real without a
+# network or a token.
+cat > "$TMP/usage-5h.json" <<'JSON'
+{"five_hour":{"utilization":12.5,"resets_at":"2026-06-15T06:05:30+00:00"},"seven_day":{"utilization":30.0,"resets_at":"2026-06-22T01:30:00+00:00"}}
+JSON
+# 5h: resets 06:05:30 => the window opened at 01:05:30, so `u1` (01:05:00) is
+# out and the duplicate-response pair (01:06) plus the subagent line (01:10)
+# are in — 650 tokens over 2 responses, not the session's full 1000 over 3.
+env MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/usage-5h.json" \
+  "$BIN" cc summary --window cc-5h | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["window"]=="cc-5h", d["window"]
+assert d["since"]=="2026-06-15", d["since"]
+o=d["overview"]
+assert o["sessions"]==1 and o["messages"]==2 and o["total_tokens"]==650, o
+print("cc-5h ok")
+' || fail "cc summary --window cc-5h did not scope to the open 5-hour window"
+
+# 7d: resets 2026-06-22T01:30 => opened 2026-06-15T01:30, which is AFTER the
+# whole session — an empty dashboard. The assertion that matters is that this
+# is empty rather than the 30-day fallback wearing a `cc-7d` label.
+env MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/usage-5h.json" \
+  "$BIN" cc summary --window cc-7d | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["window"]=="cc-7d", d["window"]
+assert d["since"]=="2026-06-15", d["since"]
+assert d["overview"]["sessions"]==0 and d["overview"]["total_tokens"]==0, d["overview"]
+print("cc-7d ok")
+' || fail "cc summary --window cc-7d did not use the 7-day window start"
+
+# `cc sessions`/`cc skills` take the same windows through the same resolution.
+env MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/usage-5h.json" \
+  "$BIN" cc sessions --window cc-5h | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+assert len(rows)==1 and rows[0]["session_id"]=="a", rows
+print("cc sessions cc-5h ok")
+' || fail "cc sessions --window cc-5h did not scope to the open window"
+
+# Nothing open (the endpoint reports no such window) is `unavailable`, exit 1 —
+# never a silently substituted cutoff.
+cat > "$TMP/usage-none.json" <<'JSON'
+{"five_hour":null,"seven_day":{"utilization":1.0,"resets_at":null}}
+JSON
+RC=0
+env MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/usage-none.json" \
+  "$BIN" cc summary --window cc-5h >"$TMP/win-none" 2>&1 || RC=$?
+[ "$RC" = "1" ] || fail "cc summary --window cc-5h with no open window expected exit 1, got $RC"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/win-none"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "no open window did not return error.code=unavailable"
+
+# An unreachable endpoint is the same answer, from the fetch rather than the parse.
+RC=0
+env MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/nope.json" \
+  "$BIN" cc summary --window cc-7d >"$TMP/win-down" 2>&1 || RC=$?
+[ "$RC" = "1" ] || fail "cc summary --window cc-7d with an unreachable endpoint expected exit 1, got $RC"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/win-down"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "unreachable usage endpoint did not return error.code=unavailable"
+echo "subscription windows: cc-5h/cc-7d + unavailable split ok"
+
 # persistence: delete the ingested transcripts — the dashboard reads only the
 # db, so totals, the session row, and its subagent/tool attribution all survive.
 rm -rf "$TMP/tree/-demo-project"
@@ -865,7 +937,10 @@ RC=0
 echo "cc session: --quiet rejected (exit 2) ok"
 
 PORT=17773
-"$BIN" serve --port "$PORT" >/dev/null 2>&1 &
+# The server resolves `cc-5h`/`cc-7d` through the same usage fetch the CLI does,
+# so it gets the same file-backed endpoint.
+MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/usage-5h.json" \
+  "$BIN" serve --port "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
   curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null 2>&1 && break
@@ -903,6 +978,31 @@ d=json.load(sys.stdin)
 assert d["overview"]["sessions"]==0, d["overview"]
 print("project cc: local_path with no matching sessions -> empty dashboard ok")
 ' || fail "project cc dashboard with an unmatched local_path was not empty"
+
+# Both dashboard routes take the subscription windows, global and scoped, with
+# the cutoff coming from the usage endpoint rather than the clock.
+ALLN=$(curl -sf "http://127.0.0.1:$PORT/api/cc?window=all" | python3 -c 'import json,sys;print(json.load(sys.stdin)["overview"]["sessions"])')
+curl -sf "http://127.0.0.1:$PORT/api/cc?window=cc-7d" | ALLN="$ALLN" python3 -c '
+import json,os,sys
+d=json.load(sys.stdin)
+assert d["window"]=="cc-7d", d["window"]
+# resets 2026-06-22T01:30 => the window opened 2026-06-15T01:30, after the
+# first synthetic session ended: windowed, not just relabelled `all`.
+assert d["since"]=="2026-06-15", d["since"]
+assert 0 < d["overview"]["sessions"] < int(os.environ["ALLN"]), (d["overview"], os.environ["ALLN"])
+print("api cc: cc-7d window ok")
+' || fail "api cc dashboard did not honor window=cc-7d"
+
+curl -sf "http://127.0.0.1:$PORT/api/projects/$SCOPED_ID/cc?window=cc-5h" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["window"]=="cc-5h", d["window"]
+assert d["since"]=="2026-06-15", d["since"]
+# Still scoped to the one session this project owns, under a subscription window.
+assert d["overview"]["sessions"]==1, d["overview"]
+assert d["sessions"][0]["session_id"]=="scoped1", d["sessions"]
+print("api project cc: cc-5h window ok")
+' || fail "api project cc dashboard did not honor window=cc-5h"
 
 # unknown project id: 404 not_found, never a crash/500.
 STATUS=$(curl -s -o "$TMP/cc-body" -w '%{http_code}' "http://127.0.0.1:$PORT/api/projects/999999999/cc")
@@ -1053,6 +1153,36 @@ d=json.load(open("'"$TMP"'/chat-http-503"))
 assert d["error"]["code"]=="unavailable", d
 ' || fail "api cc chat: missing transcript did not return error.code=unavailable"
 echo "api cc chat: 422 / 503 split ok"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+unset SERVER_PID
+
+# A server whose usage endpoint is unreachable answers the subscription windows
+# `502 unavailable` — the API half of the CLI's exit-1 split above, and the
+# reason the dashboard shows an error rather than some other span's numbers.
+PORT2=17774
+MESA_CC_TOKEN=t MESA_CC_USAGE_URL="file://$TMP/nope.json" \
+  "$BIN" serve --port "$PORT2" >/dev/null 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:$PORT2/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "http://127.0.0.1:$PORT2/api/projects" >/dev/null || fail "second server did not start"
+STATUS=$(curl -s -o "$TMP/cc-win-body" -w '%{http_code}' "http://127.0.0.1:$PORT2/api/cc?window=cc-5h")
+[ "$STATUS" = "502" ] || fail "api cc window=cc-5h with an unreachable usage endpoint expected 502, got $STATUS ($(cat "$TMP/cc-win-body"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/cc-win-body"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "api cc window=cc-5h did not return error.code=unavailable"
+# An ordinary window on the same server is untouched by the dead endpoint.
+curl -sf "http://127.0.0.1:$PORT2/api/cc?window=all" | python3 -c '
+import json,sys
+assert json.load(sys.stdin)["window"]=="all"
+' || fail "api cc window=all broke when the usage endpoint was unreachable"
+echo "api cc: subscription window -> 502 unavailable ok"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

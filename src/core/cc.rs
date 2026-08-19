@@ -63,6 +63,7 @@ use super::types::{
     CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket,
     CcSessionChat, CcSessionDetail, CcSessionGraph, CcSessionModelStat, CcSessionRow,
     CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
+    CcUsage,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -674,7 +675,16 @@ const LIVE_BUCKET_SECS: i64 = 60;
 /// transcript lines in. Returns **all** session rows (newest first); callers
 /// that need a bounded payload cap `sessions` themselves ([`MAX_SESSION_ROWS`]).
 pub fn collect(store: &Store, window: &str) -> Result<CcDashboard> {
-    collect_inner(store, window, None)
+    collect_inner(store, window, None, None)
+}
+
+/// [`collect`] with the cutoff supplied by the caller instead of derived from
+/// the clock — the one case mesa cannot derive: a [`USAGE_WINDOWS`] token,
+/// whose start is the live usage endpoint's `resets_at` minus the window's
+/// length ([`usage_window_start`]). The fetch and its cache stay with the
+/// caller, so this module still reads nothing but the db.
+pub fn collect_since(store: &Store, window: &str, since: i64) -> Result<CcDashboard> {
+    collect_inner(store, window, None, Some(since))
 }
 
 /// Project-scoped variant of [`collect`]: aggregation is restricted to
@@ -689,10 +699,27 @@ pub fn collect_for_project(
     window: &str,
     local_path: Option<&str>,
 ) -> Result<CcDashboard> {
+    // Same rule `collect_inner` enforces, applied before the zero-state
+    // shortcut can hand back a 30-day cutoff wearing a `cc-5h` label.
+    reject_usage_window(window)?;
     let Some(local_path) = local_path else {
-        return Ok(empty_dashboard(window));
+        return Ok(empty_dashboard(window, None));
     };
-    collect_inner(store, window, Some(local_path))
+    collect_inner(store, window, Some(local_path), None)
+}
+
+/// [`collect_for_project`] with a caller-supplied cutoff, for the same reason
+/// [`collect_since`] has one.
+pub fn collect_for_project_since(
+    store: &Store,
+    window: &str,
+    since: i64,
+    local_path: Option<&str>,
+) -> Result<CcDashboard> {
+    let Some(local_path) = local_path else {
+        return Ok(empty_dashboard(window, Some(since)));
+    };
+    collect_inner(store, window, Some(local_path), Some(since))
 }
 
 /// Zero-valued dashboard for `window`, built by running the same cutoff/now
@@ -701,18 +728,30 @@ pub fn collect_for_project(
 /// `window`/`since`/`generated_at_unix`) as a real dashboard that happens to
 /// match nothing, with no hand-maintained "empty CcDashboard" literal to
 /// drift out of sync.
-fn empty_dashboard(window: &str) -> CcDashboard {
+fn empty_dashboard(window: &str, since: Option<i64>) -> CcDashboard {
     let now = now_unix();
-    Agg::default().finish(window, window_cutoff(window, now), now)
+    Agg::default().finish(window, since.or_else(|| window_cutoff(window, now)), now)
 }
 
 /// Shared body of [`collect`] and [`collect_for_project`]. `cwd_filter: None`
 /// is unfiltered (the global dashboard); `Some(path)` restricts every
 /// aggregation loop to sessions whose `cwd` exactly equals `path`.
-fn collect_inner(store: &Store, window: &str, cwd_filter: Option<&str>) -> Result<CcDashboard> {
+fn collect_inner(
+    store: &Store,
+    window: &str,
+    cwd_filter: Option<&str>,
+    since: Option<i64>,
+) -> Result<CcDashboard> {
     let prices = load_prices()?;
     let now = now_unix();
-    let cutoff = window_cutoff(window, now);
+    // A subscription window has no clock-derived cutoff: it starts when the
+    // live usage endpoint says the open window started. Reaching here without
+    // one would silently serve the 30-day fallback under a `cc-5h` label, so
+    // it is an error rather than a quiet substitution.
+    if since.is_none() {
+        reject_usage_window(window)?;
+    }
+    let cutoff = since.or_else(|| window_cutoff(window, now));
 
     let mut agg = Agg::default();
 
@@ -3101,6 +3140,50 @@ fn dedupe_key(m: &CcMessageRow) -> &str {
     m.message_id.as_deref().unwrap_or(&m.uuid)
 }
 
+/// The two windows whose start mesa cannot compute from the clock: the
+/// currently-open Claude Code **subscription** windows, the same 5-hour and
+/// 7-day limits the Subscription card reports. Their cutoff is that window's
+/// `resets_at` minus its fixed length, which only the live usage endpoint
+/// knows — so a caller resolves it with [`usage_window_start`] and hands it to
+/// [`collect_since`]. Nothing else about the dashboard changes: the cutoff is
+/// still one Unix second, merely not a midnight.
+pub const USAGE_WINDOWS: [&str; 2] = ["cc-5h", "cc-7d"];
+
+/// Refuse a [`USAGE_WINDOWS`] token on an entry point that derives its own
+/// cutoff: there is nothing to derive it from, and falling through would serve
+/// the 30-day default under a `cc-5h` label. Callers with a snapshot use
+/// [`collect_since`] / [`collect_for_project_since`] instead.
+fn reject_usage_window(window: &str) -> Result<()> {
+    if is_usage_window(window) {
+        return Err(Error::Validation(format!(
+            "window {window} needs a live usage snapshot; use collect_since"
+        )));
+    }
+    Ok(())
+}
+
+/// True iff `window` names one of [`USAGE_WINDOWS`].
+pub fn is_usage_window(window: &str) -> bool {
+    USAGE_WINDOWS.iter().any(|w| window.eq_ignore_ascii_case(w))
+}
+
+/// Start (Unix seconds) of the open subscription window `window` names, read
+/// off a usage snapshot: `resets_at` minus the window's fixed length. `None`
+/// when `window` is not one of [`USAGE_WINDOWS`], or the snapshot carries no
+/// such window / no reset time — there is then no open window to scope to, and
+/// the caller reports `unavailable` rather than inventing a cutoff. Pure: the
+/// fetch, and the cache in front of it, belong to the caller.
+pub fn usage_window_start(window: &str, usage: &CcUsage) -> Option<i64> {
+    let (w, len) = if window.eq_ignore_ascii_case("cc-5h") {
+        (usage.five_hour.as_ref(), 5 * 3_600)
+    } else if window.eq_ignore_ascii_case("cc-7d") {
+        (usage.seven_day.as_ref(), 7 * 86_400)
+    } else {
+        return None;
+    };
+    parse_ts(w?.resets_at.as_deref()?).map(|resets| resets - len)
+}
+
 /// UTC-midnight cutoff for `window`: `<n>d` is **n calendar days ending
 /// today**, i.e. midnight of `today - (n - 1)`, so `since` is the true
 /// inclusive first day and `active_days <= n`. (Subtracting n days would make
@@ -4145,6 +4228,74 @@ mod tests {
         let d2 = collect(&store, "2d").unwrap();
         assert_eq!(d2.overview.sessions, 1);
         assert_eq!(d2.overview.total_tokens, 11);
+
+        // A subscription window is the same aggregation over a caller-supplied
+        // cutoff: two minutes ago keeps only the recent message, and asking for
+        // one without that cutoff is an error rather than a silent 30-day
+        // dashboard wearing a `cc-5h` label.
+        let open = collect_since(&store, "cc-5h", now_unix() - 120).unwrap();
+        assert_eq!(open.window, "cc-5h");
+        assert_eq!(open.overview.sessions, 1);
+        assert_eq!(open.overview.messages, 1);
+        assert_eq!(open.overview.total_tokens, 11);
+        assert!(matches!(
+            collect(&store, "cc-5h"),
+            Err(Error::Validation(_))
+        ));
+        // Including the project-scoped zero-state shortcut, which returns
+        // before `collect_inner` would have caught it.
+        assert!(matches!(
+            collect_for_project(&store, "cc-7d", None),
+            Err(Error::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn a_subscription_window_starts_its_reset_time_minus_its_length() {
+        use super::super::types::CcUsageWindow;
+        let win = |resets: &str| CcUsageWindow {
+            utilization: 0.0,
+            resets_at: Some(resets.to_string()),
+        };
+        let usage = CcUsage {
+            five_hour: Some(win("2026-08-19T17:20:00.468279+00:00")),
+            seven_day: Some(win("2026-08-21T13:00:00.468304+00:00")),
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: None,
+            plan_tier: None,
+            fetched_at_unix: 0,
+        };
+        // The endpoint reports when the window closes; its length is fixed by
+        // the plan, so the open window started that much earlier.
+        assert_eq!(
+            usage_window_start("cc-5h", &usage),
+            parse_ts("2026-08-19T12:20:00Z")
+        );
+        assert_eq!(
+            usage_window_start("cc-7d", &usage),
+            parse_ts("2026-08-14T13:00:00Z")
+        );
+        // Not a subscription token, and a snapshot with nothing open: both
+        // `None`, which is what makes the caller say `unavailable` instead of
+        // inventing a cutoff.
+        assert_eq!(usage_window_start("30d", &usage), None);
+        assert!(is_usage_window("cc-5h") && is_usage_window("CC-7D"));
+        assert!(!is_usage_window("7d"));
+        let empty = CcUsage {
+            five_hour: None,
+            seven_day: Some(CcUsageWindow {
+                utilization: 0.0,
+                resets_at: None,
+            }),
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: None,
+            plan_tier: None,
+            fetched_at_unix: 0,
+        };
+        assert_eq!(usage_window_start("cc-5h", &empty), None);
+        assert_eq!(usage_window_start("cc-7d", &empty), None);
     }
 
     // ---- tool targets (task 583) ----

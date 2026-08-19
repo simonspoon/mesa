@@ -18,11 +18,18 @@ import { usagePct, usageSeverity } from '../usageMeter'
 // ~/.claude/projects via the API, not the mesa store. The headline use is
 // optimizing skills/agents (which burn the most tokens per use).
 
+// The `cc-*` tokens are not fixed spans: they scope the dashboard to the
+// Claude Code subscription window that is open *right now*, cut off at the
+// reset time the live usage endpoint reports. With no such window open (or
+// that endpoint unavailable) the route answers `unavailable` and the page
+// shows the error it already renders for any failed fetch.
 const WINDOWS: { id: string; label: string }[] = [
   { id: '7d', label: '7 days' },
   { id: '30d', label: '30 days' },
   { id: '90d', label: '90 days' },
   { id: 'all', label: 'All time' },
+  { id: 'cc-5h', label: 'Current 5H CC session' },
+  { id: 'cc-7d', label: 'Current 7D CC session' },
 ]
 
 // Donut palette for the model split.
@@ -84,18 +91,18 @@ export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: nu
     <div className="cc-dashboard-page">
       <div className="cc-head">
         <h1>{scoped ? 'Dashboard' : 'CC Dashboard'}</h1>
-        <div className="cc-window">
+        <select
+          className="cc-window-select"
+          aria-label="Timeframe"
+          value={window}
+          onChange={(e) => setWindow(e.target.value)}
+        >
           {WINDOWS.map((w) => (
-            <button
-              key={w.id}
-              type="button"
-              className={w.id === window ? 'active' : ''}
-              onClick={() => setWindow(w.id)}
-            >
+            <option key={w.id} value={w.id}>
               {w.label}
-            </button>
+            </option>
           ))}
-        </div>
+        </select>
       </div>
       {tab === 'overview' && (
         <p className="muted">

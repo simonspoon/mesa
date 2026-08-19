@@ -5353,7 +5353,9 @@ async fn pump_pty(mut socket: WebSocket, cmd: CommandBuilder, size: PtySize) -> 
 
 #[derive(Deserialize)]
 struct CcQuery {
-    /// `7d` | `30d` | `90d` | `all` | `<n>d`; defaults to `30d`.
+    /// `7d` | `30d` | `90d` | `all` | `<n>d` | `cc-5h` | `cc-7d`; defaults to
+    /// `30d`. The two `cc-*` tokens scope the dashboard to the currently-open
+    /// Claude Code subscription window (see [`usage_window_since`]).
     #[serde(default)]
     window: Option<String>,
 }
@@ -5369,14 +5371,16 @@ async fn get_cc_dashboard(
     Query(q): Query<CcQuery>,
 ) -> ApiResult<Response> {
     let window = q.window.unwrap_or_else(|| "30d".to_string());
+    let since = usage_window_since(&state, &window).await?;
     let stamp = {
         let mut store = state.store.lock().unwrap();
         crate::core::cc::sync(&mut store, false)?;
         store.cc_stamp()?
     };
+    let key = cache_key(&window, since);
     {
         let cache = state.cc_cache.lock().unwrap();
-        if let Some((cached, dash)) = cache.get(&window)
+        if let Some((cached, dash)) = cache.get(&key)
             && *cached == stamp
         {
             return Ok(Json(dash.clone()).into_response());
@@ -5384,7 +5388,10 @@ async fn get_cc_dashboard(
     }
     let mut dash = {
         let store = state.store.lock().unwrap();
-        crate::core::cc::collect(&store, &window)?
+        match since {
+            Some(s) => crate::core::cc::collect_since(&store, &window, s)?,
+            None => crate::core::cc::collect(&store, &window)?,
+        }
     };
     // `collect` returns every session; the web payload is bounded (the true
     // total stays in `overview.sessions`).
@@ -5396,7 +5403,7 @@ async fn get_cc_dashboard(
         if cache.len() >= 16 {
             cache.clear();
         }
-        cache.insert(window, (stamp, dash.clone()));
+        cache.insert(key, (stamp, dash.clone()));
     }
     Ok(Json(dash).into_response())
 }
@@ -5571,6 +5578,7 @@ async fn get_project_cc_dashboard(
     Query(q): Query<CcQuery>,
 ) -> ApiResult<Response> {
     let window = q.window.unwrap_or_else(|| "30d".to_string());
+    let since = usage_window_since(&state, &window).await?;
     let local_path = {
         let store = state.store.lock().unwrap();
         store.get_project(id)?.local_path // unknown id -> not_found here
@@ -5580,7 +5588,7 @@ async fn get_project_cc_dashboard(
         crate::core::cc::sync(&mut store, false)?;
         store.cc_stamp()?
     };
-    let key = (id, window.clone());
+    let key = (id, cache_key(&window, since));
     {
         let cache = state.project_cc_cache.lock().unwrap();
         if let Some((cached, dash)) = cache.get(&key)
@@ -5591,7 +5599,15 @@ async fn get_project_cc_dashboard(
     }
     let mut dash = {
         let store = state.store.lock().unwrap();
-        crate::core::cc::collect_for_project(&store, &window, local_path.as_deref())?
+        match since {
+            Some(s) => crate::core::cc::collect_for_project_since(
+                &store,
+                &window,
+                s,
+                local_path.as_deref(),
+            )?,
+            None => crate::core::cc::collect_for_project(&store, &window, local_path.as_deref())?,
+        }
     };
     dash.sessions.truncate(crate::core::cc::MAX_SESSION_ROWS);
     {
@@ -5698,6 +5714,46 @@ async fn refresh_usage(state: &AppState) -> Result<CcUsage, ApiError> {
         })?;
     *state.usage_cache.lock().unwrap() = Some((unix_secs(), usage.clone()));
     Ok(usage)
+}
+
+/// Cutoff for the two subscription windows (`cc::USAGE_WINDOWS`), read off the
+/// same cached snapshot the Subscription card polls — `Ok(None)` for every
+/// ordinary window, which derives its cutoff from the clock alone.
+///
+/// The cached snapshot is good enough on purpose: a window boundary moves once
+/// every five hours (or seven days), so a reading up to [`USAGE_TTL_SECS`] old
+/// still names the same open window, and the dashboard's 20s poll must not turn
+/// into a `curl` per poll — that is the 429 source `refresh_usage` exists to
+/// avoid. An unreachable endpoint, or one reporting no open window, is
+/// `unavailable`: mesa never invents the cutoff and silently labels some other
+/// span as this session.
+async fn usage_window_since(state: &AppState, window: &str) -> Result<Option<i64>, ApiError> {
+    if !crate::core::cc::is_usage_window(window) {
+        return Ok(None);
+    }
+    let now = unix_secs();
+    let cached = state.usage_cache.lock().unwrap().clone();
+    let usage = match cached {
+        Some((at, usage)) if now - at < USAGE_TTL_SECS => usage,
+        _ => refresh_usage(state).await?,
+    };
+    crate::core::cc::usage_window_start(window, &usage)
+        .map(Some)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message: format!("no open {window} usage window to report on"),
+        })
+}
+
+/// Dashboard cache key. A subscription window's span moves when the window
+/// rolls over while its `cc_stamp` may not have, so the resolved cutoff is part
+/// of the key rather than the window token alone.
+fn cache_key(window: &str, since: Option<i64>) -> String {
+    match since {
+        Some(s) => format!("{window}@{s}"),
+        None => window.to_string(),
+    }
 }
 
 fn unix_secs() -> i64 {

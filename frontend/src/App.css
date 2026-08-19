@@ -2499,6 +2499,16 @@ main {
   gap: 0.4rem;
 }
 
+/* The dashboard's timeframe picker is a dropdown rather than the segmented
+   `.cc-window` buttons the Live Sessions minute picker still uses: the two
+   open-subscription-window entries made the list too long to sit across the
+   header. The look comes from the global `select` rule in index.css; only the
+   sizing is local. */
+.cc-window-select {
+  font-size: 0.85rem;
+  max-width: 100%;
+}
+
 .cc-window button.active {
   color: var(--bg);
   background: var(--cyan);

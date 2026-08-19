@@ -324,7 +324,8 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   retroactively restates every historical figure — intended. The table is
   loaded **once per request**, never per message. Labelled "estimated" in the
   UI.
-- Window is `7d`/`30d`/`90d`/`all`/`<n>d`, applied at read time over persisted
+- Window is `7d`/`30d`/`90d`/`all`/`<n>d` (plus the two subscription windows
+  below), applied at read time over persisted
   rows (ingest is always total). **`<n>d` means n calendar days ending today**:
   the cutoff is UTC midnight of `today - (n - 1)` (`cc::window_cutoff`, the one
   place it is computed — `empty_dashboard` and `collect_inner` share it), so
@@ -334,6 +335,32 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   Days are bucketed in **UTC** (`fmt_date`), deliberately not local time: the
   measured difference over a week is ~0.6% (585.0m local vs 588.4m UTC) and
   switching would churn every date across the API and TS surface.
+- **Two windows have no clock-derived cutoff** (task 883): `cc-5h` and `cc-7d`,
+  the currently-open Claude Code *subscription* windows — the same 5-hour and
+  7-day limits the Subscription card reports, so "what has this session cost
+  me" is answerable on the same page that shows how much of it is left. Their
+  start is that window's `resets_at` **minus its fixed length**, which only the
+  live usage endpoint knows, so:
+  - `cc::usage_window_start(window, &usage)` does that arithmetic and nothing
+    else — pure, no network, `None` when the snapshot reports no such window.
+    `cc::is_usage_window` / `cc::USAGE_WINDOWS` name the pair.
+  - The **caller** owns the fetch and hands the answer to
+    `cc::collect_since` / `cc::collect_for_project_since`, so this module still
+    reads nothing but the db. The API resolves it off the same
+    `AppState.usage_cache` the Subscription card polls (stale-tolerant on
+    purpose: a boundary moves once every 5 hours, and a `curl` per 20-second
+    dashboard poll is the 429 source `refresh_usage` exists to avoid); the CLI,
+    which never talks to the server, calls `usage::fetch()` itself.
+  - Nothing open, or an endpoint that cannot be reached, is **`unavailable`**
+    (exit 1 / 502) — mesa never substitutes a cutoff and labels some other span
+    as this session. `collect(store, "cc-5h")` — the cutoff-less entry point —
+    is a `validation` error for the same reason.
+  - The cutoff is still one Unix second, merely not a midnight: everything
+    downstream (clamped durations, day buckets, `active_days`) is unchanged, and
+    `since` is the date that cutoff falls on.
+  - The resolved cutoff is part of the dashboard **cache key**
+    (`api::cache_key`), since a window rolling over moves the span while
+    `cc_stamp` may not have changed.
 - **Reconciliation with Claude Code's own stats screen** (recorded once so the
   next reader doesn't re-derive it): mesa rolls **subagent/sidechain** usage
   into the parent session; Claude's screen counts main-session transcripts
@@ -652,7 +679,8 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   *Session chat* above; `scripts/cc-check.sh` pins it with a fixture that is
   never ingested).
 - API: `GET /api/cc?window=<w>` syncs, then serves the dashboard from an
-  in-memory cache in `AppState.cc_cache` keyed per-window by `Store::cc_stamp()`
+  in-memory cache in `AppState.cc_cache` keyed per-window (by `api::cache_key`,
+  which folds in a subscription window's resolved cutoff) by `Store::cc_stamp()`
   — a monotone count over the cc tables (rows are never deleted), so it sees
   cross-process ingest (a CLI `cc sync` between requests) that file mtimes
   can't, and deleting a transcript invalidates nothing. Read-only, so the
@@ -669,7 +697,10 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
   and sortable skill/agent/project/session tables. The **skills** table is the
-  headline view for optimizing where token spend goes. Every table is wrapped in
+  headline view for optimizing where token spend goes. The timeframe picker in
+  the head is a **dropdown** (`.cc-window-select`), on both the global and the
+  project-scoped page — the two subscription windows made the list too long for
+  the segmented buttons, which the Live Sessions minute picker still uses. Every table is wrapped in
   a `.cc-table-wrap` scroll box — the cells are `white-space: nowrap`, so a
   table's min-content width routinely exceeds its panel; scrolling the panel
   instead carries its own heading and hint off-screen. Phone-tier readability

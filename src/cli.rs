@@ -1276,17 +1276,20 @@ enum CcCmd {
 EXAMPLES
   mesa cc summary                 # last 30 days
   mesa cc summary --window all    # everything
-  mesa cc summary --window 7d")]
+  mesa cc summary --window 7d
+  mesa cc summary --window cc-5h  # the open 5-hour subscription window")]
     Summary {
         /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
-        /// falls back to 30d)
+        /// falls back to 30d), or cc-5h | cc-7d for the currently-open Claude
+        /// Code subscription window (needs the live usage endpoint)
         #[arg(long, default_value = "30d")]
         window: String,
     },
     /// Print per-session rows as a bare JSON array, newest first
     Sessions {
         /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
-        /// falls back to 30d)
+        /// falls back to 30d), or cc-5h | cc-7d for the currently-open Claude
+        /// Code subscription window (needs the live usage endpoint)
         #[arg(long, default_value = "30d")]
         window: String,
         /// Cap the number of rows
@@ -1379,7 +1382,8 @@ EXAMPLES
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
         /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
-        /// falls back to 30d)
+        /// falls back to 30d), or cc-5h | cc-7d for the currently-open Claude
+        /// Code subscription window (needs the live usage endpoint)
         #[arg(long, default_value = "30d")]
         window: String,
     },
@@ -3020,10 +3024,27 @@ fn run_edge(store: &mut Store, cmd: EdgeCmd) -> Result<()> {
     Ok(())
 }
 
+/// The windowed dashboard for a `cc` verb. Ordinary windows derive their cutoff
+/// from the clock; the two subscription windows (`cc-5h`/`cc-7d`) get theirs
+/// from the live usage endpoint — the CLI fetches it itself, since it never
+/// talks to the server and so has none of the server's cache. A window nothing
+/// is open for, or an endpoint that cannot be reached, is `unavailable`.
+fn cc_collect(store: &Store, window: &str) -> Result<crate::core::CcDashboard> {
+    if !crate::core::cc::is_usage_window(window) {
+        return crate::core::cc::collect(store, window);
+    }
+    let usage = crate::core::usage::fetch().map_err(Error::Unavailable)?;
+    let since = crate::core::cc::usage_window_start(window, &usage)
+        .ok_or_else(|| Error::Unavailable(format!("no open {window} usage window to report on")))?;
+    crate::core::cc::collect_since(store, window, since)
+}
+
 /// Dashboard reads (`summary`/`sessions`/`skills`) auto-ingest new transcript
 /// lines first (`cc::sync`) and are then served from the persisted `cc_*`
 /// tables, so they open the database like every other handler; `live`/`usage`
-/// read external state directly and stay store-less (spec W3/W4). `text` is
+/// read external state directly and stay store-less (spec W3/W4). The two
+/// subscription windows are the one thing that sends a dashboard read outside
+/// the db, and only for its cutoff ([`cc_collect`]). `text` is
 /// the one hybrid: it opens the store to locate the node, then reads the body
 /// from the transcript file, which is why it alone can answer `unavailable`.
 fn run_cc(cmd: CcCmd) -> Result<()> {
@@ -3031,12 +3052,12 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
         CcCmd::Summary { window } => {
             let mut store = Store::open_default()?;
             crate::core::cc::sync(&mut store, false)?;
-            print_json(&crate::core::cc::collect(&store, &window)?)
+            print_json(&cc_collect(&store, &window)?)
         }
         CcCmd::Sessions { window, limit } => {
             let mut store = Store::open_default()?;
             crate::core::cc::sync(&mut store, false)?;
-            let mut rows = crate::core::cc::collect(&store, &window)?.sessions;
+            let mut rows = cc_collect(&store, &window)?.sessions;
             if let Some(n) = limit {
                 rows.truncate(n);
             }
@@ -3088,7 +3109,7 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;
             crate::core::cc::sync(&mut store, false)?;
-            print_json(&crate::core::cc::collect(&store, &window)?.skills)
+            print_json(&cc_collect(&store, &window)?.skills)
         }
         CcCmd::Sync { rebuild } => {
             let mut store = Store::open_default()?;

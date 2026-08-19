@@ -17,11 +17,13 @@ export type CcDashboard = {
  */
 generated_at_unix: number, 
 /**
- * The requested window token (`7d`/`30d`/`90d`/`all`/`<n>d`).
+ * The requested window token (`7d`/`30d`/`90d`/`all`/`<n>d`, or
+ * `cc-5h`/`cc-7d` for the open Claude Code subscription window).
  */
 window: string, 
 /**
- * Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
+ * Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`. A subscription
+ * window starts mid-day, so this is the date its cutoff falls on.
  */
 since: string | null, overview: CcOverview, daily: Array<CcDayPoint>, models: Array<CcModelStat>, skills: Array<CcSkillStat>, agents: Array<CcAgentStat>, projects: Array<CcProjectStat>, 
 /**

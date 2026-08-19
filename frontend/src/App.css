@@ -8188,6 +8188,18 @@ button:focus-visible,
   flex: none;
 }
 
+/* The microphone chooser (mesa task 884). A <select>'s intrinsic width is its
+   widest <option>, and a device name is routinely longer than the whole live
+   cluster ("MacBook Pro Microphone (Built-in)"), so it is capped and allowed
+   to ellipsis rather than pushing the buttons off the header. Sized down to
+   sit as a setting beside presses rather than as one of them. */
+.live-input-choice {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.3rem;
+  max-width: 9rem;
+  text-overflow: ellipsis;
+}
+
 /* Live is a state, not just a button: it carries the colour of the thing it
    will do next, so a running conversation is readable at a glance. */
 .live-toggle.live-on {
@@ -8514,7 +8526,26 @@ button:focus-visible,
     padding: 0.5rem 0.75rem;
   }
 
+  /* `flex: none` (the desktop rule) makes this box as wide as its content, so
+     its own `flex-wrap` can never fire — the row simply overhangs the screen
+     and `#root`'s `overflow: hidden` clips whatever is rightmost. Letting it
+     take the width that is left, and floor at zero, is what turns the wrap
+     below from decoration into the thing that keeps the usage chips on
+     screen once the live cluster grows (mesa task 884). */
   .header-right {
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: 0.3rem;
+  }
+
+  /* The live cluster is one item of `.header-right`, so its own contents do
+     not wrap with it: at 390px the microphone chooser (mesa task 884) alone
+     is enough to push the usage chips off the screen edge, which is the exact
+     clipping the wrap above exists to prevent. Wrapping it too is what keeps
+     every control reachable once the cluster grows. */
+  .live-hub {
     flex-wrap: wrap;
     justify-content: flex-end;
     row-gap: 0.3rem;

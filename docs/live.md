@@ -488,6 +488,53 @@ conversation") working with no backend change.
     answer is still yes — a re-answer, not a retry loop. A recognizer stopped
     by the hub's own cleanup still fires its end; that echo is guarded, or
     ending a conversation would reopen the microphone it just closed.
+  - **Which microphone is a browser-local choice, not a recognizer state**
+    (`liveDevices.ts`, mesa task 884). `SpeechRecognition.start()` grew an
+    optional `MediaStreamTrack` argument — passing one is how a specific device
+    is chosen, and passing none, which is what mesa always did, is still what
+    every browser that has ever supported speech recognition understands. So
+    the chooser is offered only where three things are all true: this browser
+    accepts the argument (proved, not probed — a `start(track)` that throws
+    `TypeError` is a browser answering "no", latched into `routes` and never
+    asked again for the life of the page), there is more than one
+    microphone to choose from, and mesa can enumerate them. Verified present in
+    Chrome 151, absent in Safari and Firefox. Choosing a device opens
+    `getUserMedia({audio:{deviceId:{exact:id}}})` and hands the resulting track
+    to `start()`; choosing "Default mic" passes nothing and opens no stream of
+    mesa's own — the untouched call, byte-for-byte what shipped before this
+    task. The stream is held for as long as the microphone is wanted: the
+    engine ending itself (the ~60s cap, a long silence) reuses it, and it is
+    re-acquired only once its track stops being `live`. It is deliberately
+    **not** held across mesa speaking — `shouldListen` goes false for the
+    length of every reply, so the device closes and reopens once a turn, which
+    is the promise "mesa stops listening while she speaks" made visible. An
+    indicator still lit through a reply would say the opposite, and that is
+    worth one `getUserMedia` per turn against a permission already granted.
+    Both the recognizer and the held stream close in the same cleanup —
+    including a stream that arrives *after* the conversation stopped, which
+    would otherwise leave a microphone open with nobody on the other end.
+    A device that is listed and still refuses to open — another application is
+    holding it, the everyday case — is **asked once**: the refusal is latched
+    against that device id, so it is not retried at every reply for the rest
+    of the conversation, and picking it again in the dropdown is what asks
+    again. The device *list* is re-read on mount, on
+    `devicechange`, and on every recognizer start, because a browser withholds
+    every device **label** until permission is granted and starting a
+    recognizer is what grants it — before that, entries read as `Microphone 1`,
+    `Microphone 2`. A remembered id that has since vanished (unplugged, or
+    storage cleared and ids rotated) falls back to the default rather than to
+    silence, and a `getUserMedia` failure — the device just went away, or
+    permission was refused — reports itself in the status line and falls back
+    the same way — as does a choice whose control has been withdrawn: unplug
+    the second microphone and the dropdown goes, and the survivor goes back to
+    the untouched call rather than staying routed through a `getUserMedia`
+    nobody can now undo. The choice lives in `localStorage` (`mesa.live.input`),
+    machine-local like a pane width, and the default is remembered as
+    **nothing at all**, not as an empty string, so a fresh browser and an
+    explicitly-reset one read the same. None of it moves the audio boundary:
+    the chosen track never leaves the page, it is handed straight to the
+    browser's own recognizer, and mesa still ships no speech-to-text, still
+    sees no audio, and still accepts no audio body.
   - **A refusal is terminal for the page** (`isBlockingError`): `not-allowed`
     and `service-not-allowed` set `blocked`, name themselves in the status
     line, and leave the typed box as the way in. Everything else the engine
@@ -646,7 +693,11 @@ conversation") working with no backend change.
   are two — and why a pause belongs to the first and a reply to the second —
   which errors end listening, a result event's final text, its preview
   and its high-water mark, what a settled result is worth sending, and the
-  composer's hint), each with a sibling vitest file.
+  composer's hint) and
+  `frontend/src/liveDevices.ts` (which microphones there are, whether two
+  readings of that list say the same thing, what to call one before its label
+  is known, which one is actually chosen, and whether the chooser is offered at
+  all), each with a sibling vitest file.
 
 ## Config
 
@@ -703,6 +754,12 @@ CLAUDE.md requires: **data, never instructions.**
   one is not listening, and the other one still is.
 - **A per-session voice.** The voice is `speech.voice` in
   `~/.mesa/config.json`, read on every press, shared with the inbox.
+- **A per-session or server-side microphone.** Which device to listen through
+  is `liveDevices.ts`'s `localStorage` choice, this browser's own — like
+  pause, there is no column, no route and no CLI verb, and the agent is never
+  told which microphone was in use. Two pages on one conversation may listen
+  through two different microphones, and that is the honest answer: each page
+  hears its own room.
 - **A push channel**, in either direction — see the loop above.
 - **A page vocabulary beyond "what am I looking at".** `navigate` and the two
   sidebar verbs are the whole list; clicking, typing and scrolling on the

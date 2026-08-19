@@ -16,6 +16,17 @@ import {
   userTookFocus,
   type ReclaimCause,
 } from '../liveCapture'
+import {
+  audioInputs,
+  chosenInput,
+  DEFAULT_INPUT,
+  inputLabel,
+  offersInputChoice,
+  readInputChoice,
+  sameInputs,
+  writeInputChoice,
+  type AudioInput,
+} from '../liveDevices'
 import { headerIndicator, indicatorLabel } from '../liveIndicator'
 import {
   captureHint,
@@ -205,6 +216,23 @@ export function LiveHub({
   const [supported] = useState(
     () => recognitionCtor(window as unknown as Record<string, unknown>) !== null,
   )
+  // Which microphone to listen through (mesa task 884, `liveDevices.ts`), and
+  // what there is to choose from. The list is the browser's, re-read whenever
+  // it changes; the choice is this machine's, remembered across visits.
+  const [inputs, setInputs] = useState<AudioInput[]>([])
+  const [storedInput, setStoredInput] = useState(readInputChoice)
+  // Whether this browser takes a track on `start()`. Assumed until it is
+  // disproved by the one call that can disprove it — there is no probe for the
+  // argument that does not involve opening a recognizer, and opening one is
+  // exactly what asks a person for their microphone.
+  const [routes, setRoutes] = useState(true)
+  // A device that is here, is chosen, and will not open — another application
+  // holding the input is the everyday case, and unlike an unplugged one it
+  // never leaves `inputs`, so nothing else would stop mesa asking it again on
+  // every turn for the rest of the conversation. Latched per device rather
+  // than for the page: picking a different one is a fresh question, and so is
+  // picking this one again after quitting whatever was holding it.
+  const [refusedInput, setRefusedInput] = useState<string | null>(null)
 
   // Which session the held transcript belongs to. A new conversation is a new
   // transcript — going live again is a fresh session with its own turns, and
@@ -530,7 +558,53 @@ export function LiveHub({
     setDraft(value)
   }, [])
 
-  // ---- the microphone (liveRecognition.ts) ----
+  // ---- the microphone (liveRecognition.ts, liveDevices.ts) ----
+
+  /**
+   * The microphones this machine offers. Asked on mount, again on every
+   * `devicechange` (a headset plugged in mid-conversation is the whole point
+   * of the control), and again whenever a recognizer starts — a browser
+   * redacts every device *label* until microphone permission has been granted,
+   * and starting one is what grants it, so that is when the numbered
+   * placeholders turn into real names.
+   */
+  const listInputs = useCallback(() => {
+    const media = navigator.mediaDevices
+    if (!media?.enumerateDevices) return
+    media
+      .enumerateDevices()
+      .then((devices) => {
+        const next = audioInputs(devices)
+        setInputs((prev) => (sameInputs(prev, next) ? prev : next))
+      })
+      // A browser that will not enumerate offers no choice — which is exactly
+      // what an empty list says, and there is nothing else worth reporting:
+      // the conversation still listens through the default.
+      .catch(() => setInputs([]))
+  }, [])
+
+  useEffect(() => {
+    if (!supported) return
+    listInputs()
+    const media = navigator.mediaDevices
+    if (!media?.addEventListener) return
+    media.addEventListener('devicechange', listInputs)
+    return () => media.removeEventListener('devicechange', listInputs)
+  }, [supported, listInputs])
+
+  // Whether the header offers the chooser at all — and, because the two must
+  // never disagree, the same answer decides whether a device is routed. A
+  // choice still in force under a withdrawn control is one nobody can undo:
+  // unplug the second microphone and the dropdown goes, but without this the
+  // survivor would still be opened through `getUserMedia` for ever rather than
+  // falling back to the untouched call.
+  const choosesInput = offersInputChoice({ supported, routes, inputs })
+  // The device to listen through: the remembered one while it is still here
+  // and still opens, and the browser's own default otherwise.
+  const chosen =
+    choosesInput && storedInput !== refusedInput
+      ? chosenInput(storedInput, inputs)
+      : DEFAULT_INPUT
 
   const wantsMic = shouldListen({
     live,
@@ -557,6 +631,74 @@ export function LiveHub({
     // cleanup just closed.
     let running = true
     let current: SpeechRecognitionLike | null = null
+    // The chosen microphone's stream, held for as long as this effect run is:
+    // the engine ends and reopens by itself (the ~60s cap, a long silence),
+    // and reacquiring the device on each of those would blink the browser's
+    // recording indicator through a quiet stretch nothing changed in.
+    //
+    // It is deliberately NOT held across mesa speaking. `wantsMic` goes false
+    // for the length of every reply, so this run ends and the device closes —
+    // which is the promise `shouldListen` makes made visible: while mesa
+    // talks, the microphone is shut, and an indicator still lit would say the
+    // opposite. The cost is one `getUserMedia` per turn on the chosen-device
+    // path, against a permission already granted.
+    //
+    // Null while the default is chosen — that path opens no device of mesa's
+    // own at all.
+    let stream: MediaStream | null = null
+
+    /**
+     * The track to listen through, or `undefined` for the untouched call.
+     * Re-acquired when the held one is no longer live: a track can be stopped
+     * from outside the page (unplugged, or claimed by another application) and
+     * `start()` refuses one that is not live.
+     */
+    const microphone = async (): Promise<MediaStreamTrack | undefined> => {
+      if (chosen === DEFAULT_INPUT) return undefined
+      const media = navigator.mediaDevices
+      if (!media?.getUserMedia) return undefined
+      const held = stream?.getAudioTracks().find((t) => t.readyState === 'live')
+      if (held) return held
+      stream?.getTracks().forEach((t) => t.stop())
+      stream = await media.getUserMedia({ audio: { deviceId: { exact: chosen } } })
+      return stream.getAudioTracks()[0]
+    }
+
+    /**
+     * Start one engine, on the given track or on the browser's default.
+     *
+     * A `TypeError` from a track is this browser saying it has no such
+     * argument (Safari, and Chromium before 135). That is not a failure to
+     * report — nothing was opened and nothing was lost — it is the answer to a
+     * question mesa could not ask any other way: stop offering the chooser and
+     * listen exactly as mesa always did.
+     */
+    const startWith = (engine: SpeechRecognitionLike, track?: MediaStreamTrack) => {
+      try {
+        // Two calls rather than one with an optional argument: Chrome's
+        // `start(undefined)` is a `TypeError`, not an omitted argument, so
+        // forwarding a `track` that happens to be undefined would break the
+        // default path — the one path that has to keep working everywhere.
+        if (track === undefined) engine.start()
+        else engine.start(track)
+      } catch (err: unknown) {
+        if (track !== undefined) {
+          // A `TypeError` is this browser saying it has no such argument; a
+          // track that ended between the liveness check and this call is the
+          // other way here. Either way the engine did not start and the
+          // default still would, so fall back to it rather than leaving the
+          // conversation deaf until something else moves.
+          if (err instanceof TypeError) setRoutes(false)
+          else setRefusedInput(chosen)
+          startWith(engine)
+          return
+        }
+        // A refused start fires no `start` and no `end`, so nothing here will
+        // reopen it — say so rather than going quiet, and let the next change
+        // of the answer (mesa's next reply ending, most likely) try again.
+        if (running) setActionError(err instanceof Error ? err.message : String(err))
+      }
+    }
 
     const open = () => {
       const engine = new Recognizer()
@@ -611,14 +753,42 @@ export function LiveHub({
         // conversation still wants the microphone, open a new one.
         if (wants.current) open()
       }
-      try {
-        engine.start()
-      } catch (err: unknown) {
-        // A refused start fires no `start` and no `end`, so nothing here will
-        // reopen it — say so rather than going quiet, and let the next change
-        // of the answer (mesa's next reply ending, most likely) try again.
-        if (running) setActionError(err instanceof Error ? err.message : String(err))
-      }
+      // Real names for the devices: permission is granted by the time an
+      // engine starts, so this is when the numbered placeholders resolve.
+      engine.onstart = listInputs
+      microphone()
+        .then((track) => {
+          if (running) {
+            startWith(engine, track)
+            return
+          }
+          // The conversation stopped while the device was still opening. The
+          // cleanup below already ran, at a moment when there was no stream to
+          // close, so closing it is this branch's job — a track nothing will
+          // ever listen to leaves the browser's recording indicator lit with
+          // nobody on the other end of it.
+          stream?.getTracks().forEach((t) => t.stop())
+          stream = null
+        })
+        .catch((err: unknown) => {
+          if (!running) return
+          // The named device is gone, or the permission behind it was refused.
+          // Listen through the default rather than not at all — a conversation
+          // that hears nothing is worse than one that hears the wrong
+          // microphone — and say which it is, because the chooser above will
+          // still be showing the device that is not being used.
+          setActionError(
+            `that microphone is unavailable (${
+              err instanceof Error ? err.message : String(err)
+            }) — listening through the default`,
+          )
+          // Asked once. A device that is gone drops out of `inputs` on its own
+          // and needs nothing; one that is still listed and still refuses —
+          // another application has it — would otherwise be asked again at
+          // every reply, for ever, with the same failure and the same line.
+          setRefusedInput(chosen)
+          startWith(engine)
+        })
     }
     open()
 
@@ -626,8 +796,9 @@ export function LiveHub({
       running = false
       setInterim('')
       current?.stop()
+      stream?.getTracks().forEach((t) => t.stop())
     }
-  }, [wantsMic])
+  }, [wantsMic, chosen, listInputs])
 
   // The run: the oldest mesa turn nobody has played, one at a time. A turn that
   // navigates moves the browser when it is *reached*, whether or not it also
@@ -929,6 +1100,36 @@ export function LiveHub({
         >
           <LiveMark />
         </button>
+      )}
+      {/* Which microphone the conversation listens through (mesa task 884).
+          Offered only where there is more than one of them and the browser
+          takes a track (`liveDevices.ts`) — a control that cannot change what
+          mesa hears is worse than no control. It leads the presses: it is a
+          setting rather than one of them, and the press that destroys the
+          conversation stays last. */}
+      {choosesInput && (
+        <select
+          className="live-input-choice"
+          aria-label="microphone"
+          value={chosen}
+          onChange={(event) => {
+            const next = event.target.value
+            writeInputChoice(next)
+            setStoredInput(next)
+            // Choosing is asking again: a device that refused before may be
+            // free now, and the person picking it is who decides to retry.
+            setRefusedInput(null)
+            // A press on mesa's own controls hands the keyboard back to mesa.
+            reclaim('hub-press', armed.current)
+          }}
+        >
+          <option value={DEFAULT_INPUT}>Default mic</option>
+          {inputs.map((input, index) => (
+            <option key={input.deviceId} value={input.deviceId}>
+              {inputLabel(input, index)}
+            </option>
+          ))}
+        </select>
       )}
       {/* Stepping out without ending it (mesa task 882) — offered only while
           the conversation is live and this browser is in it. Sits before the

@@ -44,7 +44,15 @@ export type RecognitionResult = {
 export type SpeechRecognitionLike = {
   continuous: boolean
   interimResults: boolean
-  start(): void
+  /**
+   * The optional argument is the microphone (mesa task 884): a live audio
+   * `MediaStreamTrack` the engine listens to instead of whatever the operating
+   * system calls default. Omitting it is the call mesa has always made, and is
+   * still what every browser understands — the argument is Chromium's, and one
+   * that ignores it throws rather than silently listening to the wrong device
+   * (`liveDevices.ts`).
+   */
+  start(track?: MediaStreamTrack): void
   stop(): void
   onstart: (() => void) | null
   onend: (() => void) | null

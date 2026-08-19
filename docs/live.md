@@ -584,8 +584,19 @@ conversation") working with no backend change.
   browser is not listening for itself, where the engine's own finals are what
   get sent and a timer firing on top of them would post the same sentence
   twice. Otherwise: dictation
-  never presses Enter, so a non-blank draft untouched for `AUTO_SEND_IDLE_MS`
-  (2s) is sent as the utterance — hands-free end to end. Enter still sends at
+  never presses Enter, so a non-blank draft untouched for the auto-send wait
+  is sent as the utterance — hands-free end to end. That wait is
+  **configurable** (mesa task 886): `live.auto-send-ms` in
+  `~/.mesa/config.json`, edited on the **Settings** page in the same *Live
+  conversation* section as the agent prompt — 250..=60000 ms, absent/blank
+  meaning the 2000 ms mesa ships (`AUTO_SEND_IDLE_MS`), because how long a
+  pause means "finished" is the person's own cadence. `LiveHub` reads the
+  section once per conversation it joins, so an edit lands on the next
+  conversation with no restart, and a read that fails is the built-in wait
+  rather than a stall; `autoSendIdleMs` clamps what the file says, since the
+  editor is not the only way into it. It governs this box only — with the
+  microphone open the recognizer's own finals are what get sent and the timer
+  never fires. Enter still sends at
   once, Shift+Enter still opens a line, and the IME guard holds it while
   composing (an IME commit re-arms the timer, since committing changes no
   draft text). The firing timer reads the draft, the measured idle time and
@@ -708,8 +719,10 @@ a `{name}`) *and* carries a prompt mesa supplies. That prompt is
 `live::agent_prompt`, so the feature works with **no user configuration** — and
 the prompt itself is the file's fifth section, `live.prompt`, which **replaces**
 the built-in block when it is set (an empty one is never stored; blank is the
-reset). Everything else about the template — argv vs script mode, tokenize-then-
-substitute, the `MESA_*` environment handoff, a `{placeholder}` refused inside
+reset). That section holds one other key, `live.auto-send-ms` — the capture
+box's wait above, read by the page rather than by the spawn. Everything else
+about the template — argv vs script mode, tokenize-then-substitute, the
+`MESA_*` environment handoff, a `{placeholder}` refused inside
 a script — is inherited, not re-implemented. See `docs/config.md`.
 
 ## Untrusted input

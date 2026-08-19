@@ -62,6 +62,9 @@ import {
   isSavable as isLiveSavable,
   usesDefault,
   valueError as livePromptError,
+  MAX_AUTO_SEND_MS,
+  MIN_AUTO_SEND_MS,
+  waitError,
   type LivePromptDraft,
 } from '../livePromptDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
@@ -397,17 +400,20 @@ function WatchersSection() {
 
 /**
  * Live: the instruction block the conversation's agent is spawned with (mesa
- * task 867). Its own section, draft and save button, for the same reason
+ * task 867), and how long a dictated line sits before the page sends it (mesa
+ * task 886). Its own section, draft and save button, for the same reason
  * watchers and pricing have theirs — a separate endpoint, so one form's
  * rejection must not strand the other's edits.
  *
- * Two things it must not soften:
+ * Three things it must not soften:
  * - **Blank is the block mesa ships**, never "no instructions": a live agent
  *   with an empty prompt is an agent that does not know it is in a
  *   conversation, so clearing the box removes the key rather than storing "".
  * - **What is in the box is the whole of what mesa sends.** The "start from
  *   the built-in" button fills the box with the shipped text so an edit is a
  *   change to it, rather than an addition mesa would have to merge.
+ * - **A blank wait is the two seconds mesa ships**, not "never send": the box
+ *   is empty on an unconfigured install and clearing it removes the key.
  */
 function LivePromptSection() {
   const { data: live, error, refetch } = useFetch(() => getLiveConfig(), 'live')
@@ -417,10 +423,10 @@ function LivePromptSection() {
   const [saving, setSaving] = useState(false)
 
   const seeded: LivePromptDraft =
-    draft ?? (live ? liveDraftFrom(live) : { prompt: '' })
+    draft ?? (live ? liveDraftFrom(live) : { prompt: '', auto_send_ms: '' })
 
-  function edit(value: string) {
-    setDraft({ prompt: value })
+  function edit(patch: Partial<LivePromptDraft>) {
+    setDraft({ ...seeded, ...patch })
     setSaved(false)
   }
 
@@ -463,6 +469,7 @@ function LivePromptSection() {
   const dirty = isLiveDirty(live, seeded)
   const savable = isLiveSavable(seeded)
   const fieldError = livePromptError(seeded.prompt)
+  const waitFieldError = waitError(seeded.auto_send_ms)
   const onDefault = usesDefault(seeded)
 
   return (
@@ -488,18 +495,47 @@ function LivePromptSection() {
           spellCheck={false}
           value={seeded.prompt}
           placeholder={live.default_prompt}
-          onChange={(e) => edit(e.target.value)}
+          onChange={(e) => edit({ prompt: e.target.value })}
         />
         {fieldError && <p className="error">{fieldError}</p>}
         {onDefault && (
           <button
             type="button"
             className="settings-inline-button"
-            onClick={() => edit(live.default_prompt)}
+            onClick={() => edit({ prompt: live.default_prompt })}
           >
             start from the built-in prompt
           </button>
         )}
+      </section>
+
+      <section className="settings-command">
+        <label htmlFor="live-auto-send">
+          <span className="settings-command-title">
+            Wait before sending a dictated line
+          </span>
+          <code className="settings-command-key">live.auto-send-ms</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          How long a line typed or dictated into the conversation box sits
+          untouched before mesa takes it as a finished thought and sends it —
+          dictation never presses Enter, so this pause is what ends a sentence.
+          Blank = {live.auto_send_ms_default} ms (the default). It does not
+          apply while the browser is listening through the microphone: there,
+          the recognizer decides where a sentence ends.
+        </p>
+        <input
+          id="live-auto-send"
+          type="number"
+          min={MIN_AUTO_SEND_MS}
+          max={MAX_AUTO_SEND_MS}
+          step="50"
+          className="settings-watcher-input"
+          value={seeded.auto_send_ms}
+          placeholder={String(live.auto_send_ms_default)}
+          onChange={(e) => edit({ auto_send_ms: e.target.value })}
+        />
+        {waitFieldError && <p className="error">{waitFieldError}</p>}
       </section>
 
       <div className="settings-actions">
@@ -508,7 +544,7 @@ function LivePromptSection() {
           disabled={!dirty || !savable || saving}
           onClick={save}
         >
-          {saving ? 'saving…' : 'save live prompt'}
+          {saving ? 'saving…' : 'save live settings'}
         </button>
         {dirty && savable && !saving && (
           <span className="muted">unsaved changes</span>

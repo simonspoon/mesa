@@ -496,16 +496,22 @@ reads an item in (mesa task 822, `docs/inbox.md`).
 
 ## Live
 
-A fifth, independent section holds the **prompt** the live conversation's agent
-is spawned with (mesa task 867, `docs/live.md`).
+A fifth, independent section holds two settings for the live conversation
+(`docs/live.md`): the **prompt** its agent is spawned with (mesa task 867) and
+the **wait** before a settled capture-box draft is sent (mesa task 886). They
+share a section because they are one feature; each key is written and reset on
+its own, and neither save touches the other.
 
 ```json
 {
   "live": {
-    "prompt": "You are the voice of mesa in a live conversation. …"
+    "prompt": "You are the voice of mesa in a live conversation. …",
+    "auto-send-ms": 2000
   }
 }
 ```
+
+`prompt` is the instruction block:
 
 - **Absent or blank ⇒ the block mesa ships** (`core::live::AGENT_PROMPT`), so
   an unconfigured install spawns exactly the agent it spawned before this key
@@ -532,18 +538,54 @@ loop it describes is what makes the feature work at all — a prompt that never
 mentions `mesa live listen` produces an agent that hears nothing. `docs/live.md`
 is the contract the text has to keep.
 
+`auto-send-ms` is the section's other key:
+
+- **How long a line typed or dictated into the conversation's capture box sits
+  untouched before the page sends it as a `user` turn.** Dictation never
+  presses Enter, so that pause is what ends a sentence; how long a pause means
+  "finished" is the person's own cadence, which is why it is a setting rather
+  than a constant.
+- **Absent or `null` ⇒ `core::config::DEFAULT_LIVE_AUTO_SEND_MS` (2000)**, the
+  value hardcoded in `liveCapture.ts` before the key existed, so an
+  unconfigured install waits exactly as long as it always did.
+- **A whole number of milliseconds, 250..=60000** (`MIN_LIVE_AUTO_SEND_MS` /
+  `MAX_LIVE_AUTO_SEND_MS`) — sanity bounds, not policy: below the gap between
+  two spoken words mesa would post half a sentence, and a minute of silence is
+  a conversation that has stopped. Outside them, or the wrong shape (a string,
+  a fraction), is **422 `validation`** writing nothing.
+- **A hand-edited value outside the bounds is not rejected on read.**
+  `ConfigLive.auto_send_ms` reports the file verbatim, so the editor shows what
+  the file actually says; the **page** clamps it
+  (`frontend/src/liveCapture.ts::autoSendIdleMs`), so a hand-written `0` waits
+  the minimum instead of posting a word at a time.
+- **Read once per conversation the page joins** — a `useEffect` in `LiveHub`
+  on going live, not on mount, since the hub is mounted for the life of the
+  app — so an edit lands on the next conversation with no restart. If the read
+  fails, the built-in wait applies: a settings file must never be what stalls
+  a conversation.
+- **It governs the capture box only.** While the browser is listening through
+  `SpeechRecognition` the recognizer's own final results are what get sent and
+  the timer never fires (`shouldAutoSend` answers false while `listening`).
+
 ### Routes
 
-- `GET /api/config/live` → `ConfigLive`: `{prompt, default_prompt}`, `prompt`
-  being the override (`null` when unset) and `default_prompt` the block mesa
-  ships — sent by the server so the editor can show what blank means without a
-  second copy of the text in TypeScript. Gated like the other config getters
-  (`require_agent_access`); a malformed config is **502 `unavailable`**.
-- `PUT /api/config/live`, body `{"prompt": "<text>" | null}` → echoes the
-  getter. `null` **and** blank both remove the key, restoring the built-in
-  block. A prompt past the length bound is **422 `validation`**, writing
-  nothing. Gated with `require_local_path_write`: **loopback-only in both serve
-  modes** — this text is what mesa's own agent is told to do, the same class of
+- `GET /api/config/live` → `ConfigLive`:
+  `{prompt, default_prompt, auto_send_ms, auto_send_ms_default}` — each
+  override (`null` when unset) beside the value mesa ships, sent by the server
+  so the editor can show what blank means without a second copy of either in
+  TypeScript. Gated like the other config getters (`require_agent_access`); a
+  malformed config is **502 `unavailable`**.
+- `PUT /api/config/live`, body
+  `{"prompt": "<text>" | null, "auto_send_ms": <ms> | null}` → echoes the
+  getter. Each key is optional: absent leaves that setting alone, `null`
+  removes it (and blank does too for the prompt, whose editor sends what the
+  textarea holds), restoring the built-in. A prompt past the length bound, or
+  a wait outside 250..=60000, is **422 `validation`**, writing nothing.
+  (`save_live` therefore takes raw JSON values, like `save_watchers`: the
+  section holds prose *and* a number, and a bad value is named in a sentence
+  rather than rejected by the deserializer as a 400.) Gated with
+  `require_local_path_write`: **loopback-only in both serve modes** — this
+  text is what mesa's own agent is told to do, the same class of
   capability the command templates carry.
 
 ## Gate
@@ -592,7 +634,12 @@ line still there — `null` **and** `""` both removing the key with the next
 spawn back on the built-in, a prompt past the length bound 422 writing nothing,
 502 on a malformed file, each of the other savers preserving `live` and vice
 versa, and both verbs refused to a request that isn't from this machine's own
-page.
+page. For `auto-send-ms` it covers the same ground for a value that is a
+**number**: `GET` reporting `null` beside the built-in 2000, a saved wait
+written as a JSON number (a quoted one would read back as nothing) and echoed,
+the two live keys independent in both directions, `null` removing the key, and
+0 / -1 / 2.5 / 60001 / `"2000"` — and a prompt sent as a number — each 422
+`validation` writing nothing.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

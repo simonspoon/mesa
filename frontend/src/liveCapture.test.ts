@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
   AUTO_SEND_IDLE_MS,
+  autoSendIdleMs,
   GESTURE_WINDOW_MS,
+  MAX_AUTO_SEND_IDLE_MS,
+  MIN_AUTO_SEND_IDLE_MS,
   isEditableTarget,
   shouldAutoSend,
   shouldReclaimFocus,
   userTookFocus,
 } from './liveCapture'
+import type { ConfigLive } from './types/ConfigLive'
 
 describe('isEditableTarget', () => {
   it('recognises the elements a person types into', () => {
@@ -80,24 +84,60 @@ describe('shouldReclaimFocus', () => {
 })
 
 describe('shouldAutoSend', () => {
+  const D = AUTO_SEND_IDLE_MS
+
   it('sends a settled non-empty draft', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, false, false)).toBe(true)
+    expect(shouldAutoSend('make a task', D, false, false, D)).toBe(true)
   })
 
   it('waits while the draft is still moving', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS - 1, false, false)).toBe(false)
+    expect(shouldAutoSend('make a task', D - 1, false, false, D)).toBe(false)
   })
 
   it('never sends blank or whitespace-only text', () => {
-    expect(shouldAutoSend('', AUTO_SEND_IDLE_MS, false, false)).toBe(false)
-    expect(shouldAutoSend('   \n', AUTO_SEND_IDLE_MS, false, false)).toBe(false)
+    expect(shouldAutoSend('', D, false, false, D)).toBe(false)
+    expect(shouldAutoSend('   \n', D, false, false, D)).toBe(false)
   })
 
   it('never sends mid-IME-composition', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, true, false)).toBe(false)
+    expect(shouldAutoSend('make a task', D, true, false, D)).toBe(false)
   })
 
   it('never sends on a timer while the browser is listening for itself', () => {
-    expect(shouldAutoSend('make a task', AUTO_SEND_IDLE_MS, false, true)).toBe(false)
+    expect(shouldAutoSend('make a task', D, false, true, D)).toBe(false)
+  })
+
+  it('measures the idle draft against the configured wait, not the built-in one', () => {
+    // A person who set a longer wait is still mid-sentence at two seconds…
+    expect(shouldAutoSend('make a task', D, false, false, 6000)).toBe(false)
+    expect(shouldAutoSend('make a task', 6000, false, false, 6000)).toBe(true)
+    // …and one who set a shorter wait has finished before them.
+    expect(shouldAutoSend('make a task', 500, false, false, 500)).toBe(true)
+  })
+})
+
+describe('autoSendIdleMs', () => {
+  const live = (auto_send_ms: number | null): ConfigLive => ({
+    prompt: null,
+    default_prompt: '',
+    auto_send_ms,
+    auto_send_ms_default: AUTO_SEND_IDLE_MS,
+  })
+
+  it('is the built-in wait before the config has been read', () => {
+    expect(autoSendIdleMs(null)).toBe(AUTO_SEND_IDLE_MS)
+  })
+
+  it('is the built-in wait when the config says nothing', () => {
+    expect(autoSendIdleMs(live(null))).toBe(AUTO_SEND_IDLE_MS)
+  })
+
+  it('is the configured wait when there is one', () => {
+    expect(autoSendIdleMs(live(4500))).toBe(4500)
+  })
+
+  it('clamps a hand-edited value into the bounds the editor writes', () => {
+    expect(autoSendIdleMs(live(0))).toBe(MIN_AUTO_SEND_IDLE_MS)
+    expect(autoSendIdleMs(live(999999))).toBe(MAX_AUTO_SEND_IDLE_MS)
   })
 })

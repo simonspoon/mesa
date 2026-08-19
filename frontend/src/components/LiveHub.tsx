@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   getLive,
+  getLiveConfig,
   liveSpeakUrl,
   markLiveTurnPlayed,
   reportLiveRoute,
@@ -9,7 +10,7 @@ import {
   stopLive,
 } from '../api'
 import {
-  AUTO_SEND_IDLE_MS,
+  autoSendIdleMs,
   isEditableTarget,
   shouldAutoSend,
   shouldReclaimFocus,
@@ -57,6 +58,7 @@ import {
 } from '../liveTurns'
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
+import type { ConfigLive } from '../types/ConfigLive'
 import type { LiveTurn } from '../types/LiveTurn'
 import { useFetch } from '../useFetch'
 
@@ -166,6 +168,30 @@ export function LiveHub({
   )
   const session = data?.session ?? null
   const live = isLive(session)
+
+  // The live section of `~/.mesa/config.json`, for the one value this page
+  // reads out of it: how long a settled draft waits before it is sent (mesa
+  // task 886). Asked once per conversation joined rather than on mount — the
+  // hub is mounted for the life of the app, so reading it at start is what
+  // makes an edit in Settings land on the next conversation without a reload.
+  // `null` until it answers, and left `null` if it never does: the built-in
+  // wait applies then (`autoSendIdleMs`), because a settings file must never
+  // be what stalls a conversation.
+  const [liveConfig, setLiveConfig] = useState<ConfigLive | null>(null)
+  useEffect(() => {
+    if (!live) return
+    let dropped = false
+    getLiveConfig().then(
+      (config) => {
+        if (!dropped) setLiveConfig(config)
+      },
+      () => {},
+    )
+    return () => {
+      dropped = true
+    }
+  }, [live])
+  const autoSendMs = autoSendIdleMs(liveConfig)
 
   // The transcript, accumulated: each poll answers only with what is new, so
   // this component holds the conversation and the server holds the tail.
@@ -539,17 +565,18 @@ export function LiveHub({
           Date.now() - editedAt.current,
           composing.current,
           listeningRef.current,
+          autoSendMs,
         )
       ) {
         sendRef.current()
       }
-    }, AUTO_SEND_IDLE_MS)
+    }, autoSendMs)
     return () => window.clearTimeout(timer)
     // `recognizes` is a dependency, not just a read inside the timer: a draft
     // left in the box when recognition stops being the way in (the microphone
     // refused, the browser's answer changing) must get its deadline back
     // rather than sit there for ever because the decision was sampled once.
-  }, [draft, live, paused, composeTick, recognizes])
+  }, [draft, live, paused, composeTick, recognizes, autoSendMs])
 
   /** The one write path for the draft: state for the render, refs for the timer. */
   const updateDraft = useCallback((value: string) => {

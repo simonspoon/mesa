@@ -1,3 +1,5 @@
+import type { ConfigLive } from './types/ConfigLive'
+
 /**
  * When the live conversation owns the keyboard, and when it stands aside
  * (mesa task 857).
@@ -28,8 +30,38 @@
 /** How long after a pointer/key gesture a focus loss still counts as deliberate. */
 export const GESTURE_WINDOW_MS = 500
 
-/** How long a non-empty draft must sit untouched before it is sent. */
+/**
+ * How long a non-empty draft must sit untouched before it is sent, with nothing
+ * configured — `core::config::DEFAULT_LIVE_AUTO_SEND_MS`, and the wait mesa had
+ * before the setting existed. It is also the answer while the config has not
+ * been read yet (or could not be), because a conversation must not stall
+ * waiting on a settings file.
+ */
 export const AUTO_SEND_IDLE_MS = 2000
+
+/**
+ * The bounds a configured wait is held to, mirroring
+ * `core::config::MIN_LIVE_AUTO_SEND_MS`/`MAX_LIVE_AUTO_SEND_MS` — the same
+ * duplication `watchersDraft.ts` makes, so both ends name one rule.
+ */
+export const MIN_AUTO_SEND_IDLE_MS = 250
+export const MAX_AUTO_SEND_IDLE_MS = 60_000
+
+/**
+ * The wait this conversation runs on: the configured value, else the one mesa
+ * ships — and clamped, because the editor is not the only way into the config
+ * file and a hand-edited `0` would post a word at a time rather than configure
+ * anything. `null` (the config not read yet, or unreachable) is the built-in
+ * wait, never a stall.
+ */
+export function autoSendIdleMs(live: ConfigLive | null): number {
+  if (!live) return AUTO_SEND_IDLE_MS
+  const configured = live.auto_send_ms ?? live.auto_send_ms_default
+  return Math.min(
+    MAX_AUTO_SEND_IDLE_MS,
+    Math.max(MIN_AUTO_SEND_IDLE_MS, configured),
+  )
+}
 
 /**
  * Whether a focus loss was the person's own doing: a pointerdown or keydown
@@ -94,13 +126,19 @@ export function shouldReclaimFocus(input: {
  * ship a word the person never said — and not while the browser is
  * `listening`, where the engine's own final results are what get sent and a
  * timer firing on top of them would post the same sentence twice.
+ *
+ * The threshold is passed in rather than read from the constant: how long a
+ * pause means "finished" is the person's own cadence, so it is a setting
+ * (`live.auto-send-ms`, mesa task 886) and this predicate must answer for
+ * whatever they chose.
  */
 export function shouldAutoSend(
   draft: string,
   idleMs: number,
   composing: boolean,
   listening: boolean,
+  idleThresholdMs: number,
 ): boolean {
   if (listening) return false
-  return !composing && draft.trim() !== '' && idleMs >= AUTO_SEND_IDLE_MS
+  return !composing && draft.trim() !== '' && idleMs >= idleThresholdMs
 }

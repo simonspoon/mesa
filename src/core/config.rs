@@ -1351,8 +1351,26 @@ pub fn validate_voice(voice: &str, offered: &[String]) -> Result<(), String> {
 /// The config key holding the instruction block a live agent is spawned with.
 pub const LIVE_PROMPT: &str = "prompt";
 
+/// The config key holding how long a settled dictation draft waits before the
+/// page sends it (mesa task 886).
+pub const LIVE_AUTO_SEND_MS: &str = "auto-send-ms";
+
 /// Every key the `live` section understands, for the unknown-key error.
-const LIVE_KEYS: &[&str] = &[LIVE_PROMPT];
+const LIVE_KEYS: &[&str] = &[LIVE_PROMPT, LIVE_AUTO_SEND_MS];
+
+/// How long an untouched draft waits with no config — the value that keeps an
+/// unconfigured install byte-identical to mesa before task 886, when the wait
+/// was hardcoded at two seconds in `liveCapture.ts`.
+pub const DEFAULT_LIVE_AUTO_SEND_MS: u32 = 2_000;
+
+/// The shortest wait the editor will write. A **sanity bound, not a policy**:
+/// nothing breaks below it, but a wait shorter than the gap between two spoken
+/// words would post half a sentence, which reads as mesa interrupting.
+pub const MIN_LIVE_AUTO_SEND_MS: u32 = 250;
+
+/// The longest wait the editor will write — a minute of silence after a
+/// finished thought is a conversation that has stopped, not one still waiting.
+pub const MAX_LIVE_AUTO_SEND_MS: u32 = 60_000;
 
 /// How long a configured prompt may be. Generous — the built-in is a few
 /// kilobytes and a person elaborating on it should not hit a wall — but
@@ -1372,6 +1390,8 @@ struct LiveConfig {
 struct LiveSection {
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default, rename = "auto-send-ms")]
+    auto_send_ms: Option<u32>,
 }
 
 fn read_live(path: &Path) -> Result<LiveSection, String> {
@@ -1404,9 +1424,10 @@ fn live_prompt_in(path: &Path) -> Result<Option<String>, String> {
 }
 
 /// The live settings for the Settings page (`GET /api/config/live`): the
-/// configured prompt (`null` when the file says nothing) plus the built-in
-/// block, so the editor can show what blank means and start an edit from it
-/// without shipping a second copy of the text.
+/// configured prompt and auto-send wait (`null` each when the file says
+/// nothing) plus the built-in block and the built-in wait, so the editor can
+/// show what blank means and start an edit from it without shipping a second
+/// copy of either.
 pub fn live() -> Result<ConfigLive, String> {
     live_in(&config_file())
 }
@@ -1415,23 +1436,32 @@ fn live_in(path: &Path) -> Result<ConfigLive, String> {
     Ok(ConfigLive {
         prompt: live_prompt_in(path)?,
         default_prompt: crate::core::live::AGENT_PROMPT.to_string(),
+        auto_send_ms: read_live(path)?.auto_send_ms,
+        auto_send_ms_default: DEFAULT_LIVE_AUTO_SEND_MS,
     })
 }
 
 /// Writes the `live` entries named in `updates` into the config file.
 ///
-/// - `None` (or blank) **removes** the key, restoring the block mesa ships —
-///   the same meaning blank has for a command and `null` for a watcher limit.
+/// - `None` (or a blank string) **removes** the key, restoring what mesa ships
+///   — the same meaning blank has for a command and `null` for a watcher limit.
+/// - Values arrive as raw JSON, as [`save_watchers`]' do, because this section
+///   holds both prose and a number: `2.5` and `-1` are *this* layer's
+///   [`SaveError::Validation`] with a sentence naming the mistake, rather than
+///   a deserializer rejection the API would have to render as a 400.
 /// - Everything is validated before anything is written, so a rejected save
 ///   leaves the file byte-identical.
 /// - Sibling of [`save_commands`], [`save_pricing`], [`save_watchers`] and
 ///   [`save_speech`]: one read-modify-write over the whole document, so all
 ///   five sections (and any mesa doesn't know) survive each other's edits.
-pub fn save_live(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+pub fn save_live(updates: &HashMap<String, Option<serde_json::Value>>) -> Result<(), SaveError> {
     save_live_in(&config_file(), updates)
 }
 
-fn save_live_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+fn save_live_in(
+    path: &Path,
+    updates: &HashMap<String, Option<serde_json::Value>>,
+) -> Result<(), SaveError> {
     if updates.is_empty() {
         // Nothing named, nothing to do — and no empty `"live": {}` written into
         // a file the user never configured.
@@ -1447,10 +1477,10 @@ fn save_live_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Resul
             )));
         }
         // Blank is the reset, not a value to check — same rule as a command box.
-        if let Some(value) = updates[*key].as_deref().map(str::trim)
-            && !value.is_empty()
+        if let Some(value) = &updates[*key]
+            && !is_live_reset(value)
         {
-            validate_live_prompt(value).map_err(SaveError::Validation)?;
+            validate_live(key, value).map_err(SaveError::Validation)?;
         }
     }
 
@@ -1471,12 +1501,18 @@ fn save_live_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Resul
         )));
     };
     for key in keys {
-        match updates[key].as_deref().map(str::trim) {
-            None | Some("") => {
-                section.remove(key);
+        match &updates[key] {
+            Some(value) if !is_live_reset(value) => {
+                // Prose is stored trimmed (its outer whitespace is not part of
+                // what a person wrote); a number is stored as it validated.
+                let value = match value.as_str() {
+                    Some(text) => serde_json::Value::String(text.trim().to_string()),
+                    None => value.clone(),
+                };
+                section.insert(key.clone(), value);
             }
-            Some(value) => {
-                section.insert(key.clone(), serde_json::Value::String(value.to_string()));
+            _ => {
+                section.remove(key);
             }
         }
     }
@@ -1485,6 +1521,40 @@ fn save_live_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Resul
         .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
     body.push('\n');
     write_atomically(path, &body)
+}
+
+/// Whether this value is the section's spelling of "put it back to what mesa
+/// ships": `null` for either key, and a blank string for the prompt box, whose
+/// editor sends what the textarea holds.
+fn is_live_reset(value: &serde_json::Value) -> bool {
+    value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+}
+
+/// The rule for one live value, dispatched on the key: the prompt is prose with
+/// a length bound, the wait is a whole number of milliseconds inside the sanity
+/// bounds. A value of the wrong *shape* is named here too — a prompt sent as a
+/// number, or a wait sent as a string — rather than coerced into something the
+/// person did not ask for.
+fn validate_live(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    if key == LIVE_AUTO_SEND_MS {
+        let Some(ms) = value.as_u64() else {
+            return Err(format!(
+                "{key} must be a whole number of milliseconds between \
+                 {MIN_LIVE_AUTO_SEND_MS} and {MAX_LIVE_AUTO_SEND_MS}, got {value}"
+            ));
+        };
+        if ms < u64::from(MIN_LIVE_AUTO_SEND_MS) || ms > u64::from(MAX_LIVE_AUTO_SEND_MS) {
+            return Err(format!(
+                "{key} must be between {MIN_LIVE_AUTO_SEND_MS} and {MAX_LIVE_AUTO_SEND_MS} \
+                 milliseconds, got {ms}"
+            ));
+        }
+        return Ok(());
+    }
+    let Some(text) = value.as_str() else {
+        return Err(format!("{key} must be text, got {value}"));
+    };
+    validate_live_prompt(text.trim())
 }
 
 /// A live prompt is free prose — it is spoken instructions for a model, not a
@@ -2605,11 +2675,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
-    fn live_update(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+    fn live_update(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<serde_json::Value>> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .map(|(k, v)| {
+                (
+                    (*k).to_string(),
+                    v.map(|text| serde_json::Value::String(text.to_string())),
+                )
+            })
             .collect()
+    }
+
+    fn live_json(
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> HashMap<String, Option<serde_json::Value>> {
+        HashMap::from([(key.to_string(), value)])
     }
 
     /// The whole live-prompt contract in one pass: nothing configured is the
@@ -2637,6 +2719,80 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert!(written["live"].get(LIVE_PROMPT).is_none(), "{reset:?}");
             assert_eq!(live_prompt_in(&path).unwrap(), None);
+        }
+    }
+
+    /// The auto-send wait's whole contract (mesa task 886): nothing configured
+    /// is the two seconds mesa shipped before the setting existed, a saved
+    /// value is what the page reads back, `null` removes the key, and the two
+    /// live keys are written and reset independently — one section, two
+    /// settings, neither able to clobber the other.
+    #[test]
+    fn live_auto_send_round_trips_beside_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(live_in(&path).unwrap().auto_send_ms, None);
+        assert_eq!(
+            live_in(&path).unwrap().auto_send_ms_default,
+            DEFAULT_LIVE_AUTO_SEND_MS
+        );
+
+        save_live_in(&path, &live_update(&[(LIVE_PROMPT, Some("Be brief."))])).unwrap();
+        save_live_in(
+            &path,
+            &live_json(LIVE_AUTO_SEND_MS, Some(serde_json::json!(4500))),
+        )
+        .unwrap();
+        assert_eq!(live_in(&path).unwrap().auto_send_ms, Some(4500));
+        // The number is stored as a number, not as the string the box held.
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["live"][LIVE_AUTO_SEND_MS], 4500);
+        // …and the prompt beside it is untouched by that write.
+        assert_eq!(live_prompt_in(&path).unwrap().as_deref(), Some("Be brief."));
+
+        save_live_in(&path, &live_json(LIVE_AUTO_SEND_MS, None)).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written["live"].get(LIVE_AUTO_SEND_MS).is_none());
+        assert_eq!(live_in(&path).unwrap().auto_send_ms, None);
+        assert_eq!(live_prompt_in(&path).unwrap().as_deref(), Some("Be brief."));
+    }
+
+    /// A value the editor would never write is refused, and the file is left
+    /// byte-identical — the rule every other section's saver keeps. A value
+    /// *hand-edited* into the file is a different case: it is reported
+    /// verbatim, because the editor's job is to show what the file says; the
+    /// page is what clamps it into something usable (`liveCapture.ts`).
+    #[test]
+    fn a_bad_auto_send_wait_is_refused_but_a_hand_edited_one_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"live": {"auto-send-ms": 3000}}"#;
+        let path = write_config(dir.path(), before);
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(2.5),
+            serde_json::json!(MAX_LIVE_AUTO_SEND_MS as u64 + 1),
+            serde_json::json!("2000"),
+        ] {
+            let err = save_live_in(&path, &live_json(LIVE_AUTO_SEND_MS, Some(bad.clone())))
+                .expect_err(&format!("{bad} must be refused"));
+            assert!(matches!(err, SaveError::Validation(_)), "{bad}: {err:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{bad}");
+        }
+        // A prompt sent as a number is the same class of mistake.
+        assert!(matches!(
+            save_live_in(&path, &live_json(LIVE_PROMPT, Some(serde_json::json!(7)))),
+            Err(SaveError::Validation(_))
+        ));
+
+        for hand_edited in [0, 999_999] {
+            let path = write_config(
+                dir.path(),
+                &format!(r#"{{"live": {{"auto-send-ms": {hand_edited}}}}}"#),
+            );
+            assert_eq!(live_in(&path).unwrap().auto_send_ms, Some(hand_edited));
         }
     }
 

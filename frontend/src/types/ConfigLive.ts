@@ -17,4 +17,16 @@ prompt: string | null,
  * show what blank means — and offer it as the starting point for an edit
  * — without a copy of it in TypeScript.
  */
-default_prompt: string, };
+default_prompt: string, 
+/**
+ * How long a settled dictation draft waits before the page sends it, in
+ * milliseconds, or `null` when the config says nothing — then
+ * `auto_send_ms_default` is the wait (mesa task 886).
+ */
+auto_send_ms: number | null, 
+/**
+ * The wait mesa ships (`core::config::DEFAULT_LIVE_AUTO_SEND_MS`), so the
+ * page has the number to fall back to without a second copy of it in
+ * TypeScript.
+ */
+auto_send_ms_default: number, };

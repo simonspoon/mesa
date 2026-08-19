@@ -4790,9 +4790,15 @@ async fn get_config_live(
 #[derive(Deserialize)]
 struct LiveUpdate {
     /// Absent leaves the prompt alone; `null` (or blank) removes it, restoring
-    /// the block mesa ships.
+    /// the block mesa ships. Raw JSON for the reason `WatchersUpdate`'s value
+    /// is: the config layer names a bad value in a sentence, rather than the
+    /// deserializer rejecting the whole body as a 400.
     #[serde(default, deserialize_with = "deserialize_some")]
-    prompt: Option<Option<String>>,
+    prompt: Option<Option<serde_json::Value>>,
+    /// Absent leaves the wait alone; `null` removes it, restoring the two
+    /// seconds mesa ships.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    auto_send_ms: Option<Option<serde_json::Value>>,
 }
 
 /// `PUT /api/config/live` — writes the prompt and echoes the settings.
@@ -4815,6 +4821,9 @@ async fn update_config_live(
     let mut updates = HashMap::new();
     if let Some(value) = body.prompt {
         updates.insert(config::LIVE_PROMPT.to_string(), value);
+    }
+    if let Some(value) = body.auto_send_ms {
+        updates.insert(config::LIVE_AUTO_SEND_MS.to_string(), value);
     }
     blocking(move || config::save_live(&updates))
         .await?

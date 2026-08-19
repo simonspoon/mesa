@@ -1159,11 +1159,12 @@ export function getLiveConfig(): Promise<ConfigLive> {
 
 /**
  * Writes live settings and echoes them as re-read from disk. Only the keys
- * passed are touched; `null` removes one, restoring the block mesa ships. 422
- * `validation` is a prompt past the length bound, and nothing is written then.
+ * passed are touched; `null` removes one, restoring what mesa ships. 422
+ * `validation` is a prompt past the length bound or an auto-send wait outside
+ * its range, and nothing is written then.
  */
 export function updateLiveConfig(
-  live: Record<string, string | null>,
+  live: Record<string, string | number | null>,
 ): Promise<ConfigLive> {
   return request('/api/config/live', jsonInit('PUT', live))
 }

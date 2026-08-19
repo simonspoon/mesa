@@ -290,6 +290,14 @@ pub struct ConfigLive {
     /// show what blank means — and offer it as the starting point for an edit
     /// — without a copy of it in TypeScript.
     pub default_prompt: String,
+    /// How long a settled dictation draft waits before the page sends it, in
+    /// milliseconds, or `null` when the config says nothing — then
+    /// `auto_send_ms_default` is the wait (mesa task 886).
+    pub auto_send_ms: Option<u32>,
+    /// The wait mesa ships (`core::config::DEFAULT_LIVE_AUTO_SEND_MS`), so the
+    /// page has the number to fall back to without a second copy of it in
+    /// TypeScript.
+    pub auto_send_ms_default: u32,
 }
 
 /// Working-tree git status of one repo folder (see `core::git`). Decorative

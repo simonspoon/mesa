@@ -343,6 +343,11 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   live usage endpoint knows, so:
   - `cc::usage_window_start(window, &usage)` does that arithmetic and nothing
     else — pure, no network, `None` when the snapshot reports no such window.
+    It also refuses a `resets_at` whose zone is not UTC (`Z` / `+00:00`, which
+    is what the endpoint sends): `parse_ts` reads the civil fields and ignores
+    the zone — correct for transcripts, which are always `Z` — so an offset
+    stamp would be misread by exactly that offset, and a window silently
+    shifted by hours is worse than `unavailable`.
     `cc::is_usage_window` / `cc::USAGE_WINDOWS` name the pair.
   - The **caller** owns the fetch and hands the answer to
     `cc::collect_since` / `cc::collect_for_project_since`, so this module still

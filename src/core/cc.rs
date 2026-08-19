@@ -3180,7 +3180,17 @@ pub fn usage_window_start(window: &str, usage: &CcUsage) -> Option<i64> {
         usage.seven_day.as_ref()
     };
     let len = usage_window_len(window)?;
-    parse_ts(w?.resets_at.as_deref()?).map(|resets| resets - len)
+    let resets_at = w?.resets_at.as_deref()?;
+    // [`parse_ts`] reads the civil fields and ignores the zone — it was written
+    // for transcript stamps, which are always `Z`. This one comes from an
+    // endpoint mesa does not own, and today reads `…+00:00`; an offset zone
+    // would be silently misread by exactly that offset, so anything but UTC is
+    // refused and the caller reports `unavailable` rather than a window shifted
+    // by hours.
+    if !(resets_at.ends_with('Z') || resets_at.ends_with("+00:00")) {
+        return None;
+    }
+    parse_ts(resets_at).map(|resets| resets - len)
 }
 
 /// The fixed length (seconds) of the window `window` names — 5 hours or 7 days,
@@ -4309,6 +4319,18 @@ mod tests {
         };
         assert_eq!(usage_window_start("cc-5h", &empty), None);
         assert_eq!(usage_window_start("cc-7d", &empty), None);
+        // A zone `parse_ts` would ignore is refused outright: reading it would
+        // put the window's start seven hours out with nothing to show for it.
+        let offset = CcUsage {
+            five_hour: Some(win("2026-08-19T10:20:00.468279-07:00")),
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: None,
+            plan_tier: None,
+            fetched_at_unix: 0,
+        };
+        assert_eq!(usage_window_start("cc-5h", &offset), None);
     }
 
     // ---- tool targets (task 583) ----

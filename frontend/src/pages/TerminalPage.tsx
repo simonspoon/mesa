@@ -37,6 +37,7 @@ import {
 } from '../lib/paneTree'
 import { PtySlot } from '../components/PtySlot'
 import { usePhoneTier } from '../phoneTier'
+import { LiveFocus } from './LiveFocus'
 
 // This page's own `contentKind` — every pane is a plain global $HOME shell,
 // no other variant (mesa task 395 / .scratch/arch.md §2.3). A local type
@@ -307,7 +308,10 @@ function TerminalSplitView({
  * its own independent pane tree; leaf ids are globally unique, so the flat
  * pool namespace needs no scope awareness.
  */
-export function TerminalPage({ projectId = null }: { projectId?: number | null } = {}) {
+export function TerminalPage({
+  projectId = null,
+  active = true,
+}: { projectId?: number | null; active?: boolean } = {}) {
   const scope = scopeKey(projectId)
   const endpoint = scopeEndpoint(projectId)
   // Restore this scope's tree if it has one (the tab was open before), else
@@ -320,7 +324,6 @@ export function TerminalPage({ projectId = null }: { projectId?: number | null }
   useEffect(() => {
     trees.set(scope, root)
   }, [scope, root])
-
   const [paneDrag, setPaneDrag] = useState<null | {
     path: number[]
     i: number
@@ -462,6 +465,22 @@ export function TerminalPage({ projectId = null }: { projectId?: number | null }
 
   return (
     <div className={`terminal-page${projectId === null ? '' : ' terminal-page-embedded'}`}>
+      {/* What the person is looking at (mesa task 888). Rendered rather than
+          hooked, and only while this page is the visible one: the global
+          Terminal is a **permanent sibling** in `App` (shells must survive
+          navigation), so it is mounted the whole time the person is on some
+          other page. A publisher that ran on mount would pin the context to
+          `terminal` for the life of the app — and being the later sibling, it
+          would win. Mounting the publisher with the visible page is what keeps
+          "what are they looking at" answerable. The project tab renders this
+          conditionally already, so it defaults to active.
+
+          Which pane holds the keyboard is the browser's focus and nothing here
+          tracks it, so the page is the whole report — a shell's contents are
+          not mesa's to describe anyway. */}
+      {active && (
+        <LiveFocus ctx={{ kind: 'terminal', id: null, label: null, detail: null }} />
+      )}
       <div className="terminal-page-header">
         <h2>Terminal</h2>
         <span className="muted">

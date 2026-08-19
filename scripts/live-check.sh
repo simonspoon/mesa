@@ -19,8 +19,11 @@
 #      arriving as ONE argument (a hostile project name is data, never syntax),
 #      and a failed spawn ending the session it opened rather than stranding it;
 #   5. the API twin over a live `serve` — the `{session:null,turns:[]}` empty
-#      state, start/stop, the 409, the utterance and route writes, the `?after=`
-#      cursor and the idempotent played stamp;
+#      state, start/stop, the 409, the utterance write, the route write and the
+#      context riding with it (both halves recorded, the CLI reading back the
+#      same context, omitted/null clearing it, the closed `kind` vocabulary and
+#      the 200-char field bound), the `?after=` cursor and the idempotent
+#      played stamp;
 #   6. the loop the two surfaces make together: an utterance posted over HTTP is
 #      handed to `mesa live listen` exactly once, never twice, and a quiet wait
 #      prints `null` and exits 0;
@@ -624,6 +627,112 @@ api 200 GET "/api/live"
 [ "$(jqb .session.route)" = "#/projects/7/files" ] ||
   fail "a refused route must leave the recorded one alone"
 ok "POST /api/live/route: records a hash route, refuses anything else (422)"
+
+# ---- context: what is open on that page (task 888) ----
+#
+# The route says which page; the context says what is in focus on it. They
+# arrive in ONE body because they are one statement — and because omitting the
+# context is how a page with nothing open says so, which every bare-route
+# assertion above already depends on.
+CTX=$(jq -n '{route:"#/projects/7/files",
+              context:{kind:"files", id:"src/core/store.rs",
+                       label:"store.rs", detail:"line 42"}}')
+api 200 POST "/api/live/route" "$CTX"
+[ "$(jqb .route)" = "#/projects/7/files" ] || fail "route+context: must record the route"
+[ "$(jqb .id)" = "$AS" ] || fail "route+context: still answers the session"
+[ "$(jqb .context.kind)" = "files" ] || fail "route+context: must record the kind"
+[ "$(jqb .context.id)" = "src/core/store.rs" ] || fail "route+context: must record the id"
+[ "$(jqb .context.label)" = "store.rs" ] || fail "route+context: must record the label"
+[ "$(jqb .context.detail)" = "line 42" ] || fail "route+context: must record the detail"
+api 200 GET "/api/live"
+[ "$(jqb '.session.context')" != "null" ] || fail "the context must survive the write"
+ok "POST /api/live/route: records the page AND what is open on it"
+
+# The agent never reads this over HTTP — it runs `mesa live status`, which
+# opens its own Store against the same file. The two surfaces share `core` and
+# must not disagree about what the person is looking at.
+run 0 "$MESA" live status
+[ "$(jqs .context.kind)" = "files" ] || fail "live status: the CLI must see the reported kind"
+[ "$(jqs .context.id)" = "src/core/store.rs" ] || fail "live status: the CLI must see the id"
+[ "$(jqs .context.label)" = "store.rs" ] || fail "live status: the CLI must see the label"
+[ "$(jqs .context.detail)" = "line 42" ] || fail "live status: the CLI must see the detail"
+ok "mesa live status: the CLI reads back the context the page reported over HTTP"
+
+# The report is a complete statement, not a patch: no context clears.
+api 200 POST "/api/live/route" '{"route":"#/inbox"}'
+[ "$(jqb .context)" = "null" ] || fail "omitting context must clear it, not leave the old one"
+api 200 POST "/api/live/route" "$CTX"
+[ "$(jqb .context.kind)" = "files" ] || fail "re-reporting the context must record it again"
+api 200 POST "/api/live/route" '{"route":"#/inbox","context":null}'
+[ "$(jqb .context)" = "null" ] || fail "an explicit null context must clear it too"
+ok "the context is a statement, not a patch: omitted or null clears what was selected"
+
+# "Nothing selected" is genuinely absent, never "". A page whose editor is
+# empty reports its kind and no more, and the agent must not have to treat an
+# empty string as a name.
+api 200 POST "/api/live/route" \
+  '{"route":"#/projects/7/files","context":{"kind":"files","id":"","label":"   ","detail":"\t"}}'
+[ "$(jqb .context.kind)" = "files" ] || fail "a bare context still names its page"
+[ "$(jqb .context.id)" = "null" ] || fail "a blank id must come back null, not \"\""
+[ "$(jqb .context.label)" = "null" ] || fail "a whitespace label must come back null"
+[ "$(jqb .context.detail)" = "null" ] || fail "a whitespace detail must come back null"
+ok "blank/whitespace context fields fold to null: nothing selected is absent, not empty"
+
+# Each free-text field is bounded for the reason the route is — a label is
+# SPOKEN — and the bound is inclusive, exactly as the route's is.
+F200=$(printf 'x%.0s' $(seq 1 200))
+for FIELD in id label detail; do
+  BODY200=$(jq -n --arg f "$FIELD" --arg v "$F200" \
+    '{route:"#/projects/7/files", context:({kind:"files"} + {($f): $v})}')
+  api 200 POST "/api/live/route" "$BODY200"
+  [ "$(jqb ".context.$FIELD | length")" = "200" ] ||
+    fail "a 200-char $FIELD must be accepted (the bound is 200, inclusive)"
+  BODY201=$(jq -n --arg f "$FIELD" --arg v "x$F200" \
+    '{route:"#/projects/7/files", context:({kind:"files"} + {($f): $v})}')
+  api 422 POST "/api/live/route" "$BODY201"
+  [ "$(jqb .error.code)" = "validation" ] || fail "a 201-char $FIELD: error.code"
+  grep -q "$FIELD" <<<"$(jqb .error.message)" || fail "the message must name the field ($FIELD)"
+done
+ok "each context field is capped at 200 chars: 200 accepted, 201 validation naming the field"
+
+# `kind` is a CLOSED vocabulary, and serde is the gate: a page mesa does not
+# have never reaches the handler, and comes back as the same 422 `validation`
+# an over-long field gets.
+api 422 POST "/api/live/route" '{"route":"#/inbox","context":{"kind":"holodeck"}}'
+[ "$(jqb .error.code)" = "validation" ] || fail "an unknown context kind: error.code"
+api 422 POST "/api/live/route" '{"route":"#/inbox","context":{}}'
+[ "$(jqb .error.code)" = "validation" ] || fail "a context with no kind: error.code"
+# `custom` is a real project tab and deliberately NOT a context kind — a custom
+# layout is several views at once and each publishes what it holds, so the tab
+# is never the answer. Pinned here so nobody adds it back by reflex.
+api 422 POST "/api/live/route" '{"route":"#/projects/7","context":{"kind":"custom"}}'
+[ "$(jqb .error.code)" = "validation" ] || fail "the custom tab is not a context kind: error.code"
+ok "an unknown page kind is 422 validation: the vocabulary is closed"
+
+# A refused report leaves BOTH halves of the stored one alone — the route rule
+# already promises that, and validating the context before either is written is
+# what keeps the promise now that a report carries two things.
+api 200 POST "/api/live/route" "$CTX"
+api 422 POST "/api/live/route" \
+  "$(jq -n --arg v "x$F200" '{route:"#/inbox", context:{kind:"inbox", label:$v}}')"
+api 200 GET "/api/live"
+[ "$(jqb .session.route)" = "#/projects/7/files" ] ||
+  fail "a refused context must leave the recorded route alone"
+[ "$(jqb .session.context.label)" = "store.rs" ] ||
+  fail "a refused context must leave the recorded context alone"
+ok "a refused context writes nothing: the stored route AND context are untouched"
+
+# Every value of the vocabulary, because a vocabulary the gate does not
+# exercise is a vocabulary that rots. These ARE the app's pages: seven project
+# tabs plus the two global pages that have a focus. There is deliberately no
+# `custom`: a custom layout is several views at once and each publishes what
+# it holds, so the tab is never the answer (see `LiveContextKind`).
+for KIND in board dashboard diagrams files git inbox scripts settings terminal; do
+  api 200 POST "/api/live/route" \
+    "$(jq -n --arg k "$KIND" '{route:"#/projects/7", context:{kind:$k, label:"a thing"}}')"
+  [ "$(jqb .context.kind)" = "$KIND" ] || fail "context kind $KIND must be accepted"
+done
+ok "all nine page kinds are accepted: board, dashboard, diagrams, files, git, inbox, scripts, settings, terminal"
 
 # ---- the page's poll: session + turns, and the ?after= cursor ----
 "$MESA" live say "Opening the board." >/dev/null

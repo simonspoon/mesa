@@ -9,6 +9,7 @@ function session(patch: Partial<LiveSession> = {}): LiveSession {
     agent_id: 'a1b2c3',
     status: 'live',
     route: '#/live',
+    context: null,
     started_at: '2026-01-01 00:00:00',
     updated_at: '2026-01-01 00:00:00',
     ended_at: null,

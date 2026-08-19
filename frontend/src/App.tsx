@@ -583,7 +583,7 @@ function App() {
             <main>{page}</main>
           </div>
           <div className="main-slot-pane" style={{ visibility: terminalActive ? 'visible' : 'hidden' }}>
-            <TerminalPage />
+            <TerminalPage active={terminalActive} />
           </div>
         </div>
         {/* Where LiveHub portals its conversation panel (mesa task 887). The

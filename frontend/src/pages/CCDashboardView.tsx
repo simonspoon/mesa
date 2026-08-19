@@ -10,6 +10,7 @@ import { TOK, fmtInt, fmtPct, fmtTok, fmtUsd } from '../sessionDetail'
 import type { CcDashboard } from '../types/CcDashboard'
 import type { CcLiveSession } from '../types/CcLiveSession'
 import type { CcUsageWindow } from '../types/CcUsageWindow'
+import { useLiveContext } from '../liveContext'
 import { useFetch } from '../useFetch'
 import { usagePct, usageSeverity } from '../usageMeter'
 
@@ -86,6 +87,16 @@ export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: nu
     scoped ? `cc-project-${projectId}-${window}` : `cc-${window}`,
     { pollMs: 20000 },
   )
+  // What the person is looking at (mesa task 888): which panel of the
+  // dashboard, and — on the project-scoped copy — which project it is scoped
+  // to. Nothing here reads the project's *name*, so only its id is reported;
+  // the tab is the sayable half.
+  useLiveContext({
+    kind: 'dashboard',
+    id: scoped ? String(projectId) : null,
+    label: null,
+    detail: tab,
+  })
 
   return (
     <div className="cc-dashboard-page">

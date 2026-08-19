@@ -2161,8 +2161,9 @@ const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
 /// concerned. Everything else on a turn is an id, a fixed word or a timestamp.
 const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
 /// A `LiveSession` has no unbounded field either — ids, one of two status
-/// words, a 200-char route and timestamps — so quiet output equals full
-/// output. The flag is accepted across the group for uniformity.
+/// words, a 200-char route, a four-field context each of whose free-text
+/// fields `Store` caps at 200 chars, and timestamps — so quiet output equals
+/// full output. The flag is accepted across the group for uniformity.
 const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
 
 /// Quiet projection of one record: the serialized record minus `drop`ped keys.
@@ -3567,6 +3568,7 @@ mod tests {
         AnchorSide, Diagram, DiagramType, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape,
         InboxItem, Project, TaskSummary, Waypoint,
     };
+    use crate::core::{LiveContext, LiveContextKind};
 
     /// Serialized top-level key set of any record, sorted.
     fn keys(value: &impl serde::Serialize) -> Vec<String> {
@@ -3747,7 +3749,13 @@ mod tests {
             project_id: Some(2),
             agent_id: Some("e34b8ed9".into()),
             status: LiveStatus::Live,
-            route: Some("#/projects/2".into()),
+            route: Some("#/projects/2/files".into()),
+            context: Some(LiveContext {
+                kind: LiveContextKind::Files,
+                id: Some("src/core/store.rs".into()),
+                label: Some("store.rs".into()),
+                detail: Some("line 42".into()),
+            }),
             started_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
             ended_at: None,
@@ -4020,6 +4028,10 @@ mod tests {
                 "status",
                 // A hash route, capped at 200 chars by `Store`: bounded.
                 "route",
+                // What is open on that page — a fixed four-field struct whose
+                // three free-text fields `Store` caps at 200 chars each, so it
+                // is bounded the same way the route is (mesa task 888).
+                "context",
                 "started_at",
                 "updated_at",
                 // Bounded (a timestamp or null), and the field `live stop`
@@ -4028,8 +4040,10 @@ mod tests {
                 // in an inbox item's quiet shape.
                 "ended_at",
             ]),
-            "LiveSession gained/lost a field: it has no unbounded free text \
-             today, so --quiet == full; revisit if that changes",
+            "LiveSession gained/lost a field: every field it has today is \
+             bounded — ids, fixed words, timestamps, a 200-char route and a \
+             context of 200-char fields — so --quiet == full; revisit if that \
+             changes",
         );
         assert_eq!(
             sorted_owned(value_keys(&quiet(

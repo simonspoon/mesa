@@ -41,10 +41,11 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, LiveRole, LiveState, MesaVersion, ModelRates, NextResult, Priority,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary,
-    Waypoint, agents, attachments, config, files, git, hooks, live, scripts, speech, version,
+    InboxItem, InboxKind, LiveContext, LiveRole, LiveState, MesaVersion, ModelRates, NextResult,
+    Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
+    TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, live, scripts, speech,
+    version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -2201,6 +2202,13 @@ struct LiveRouteBody {
     /// Where the user's browser currently is, as a hash route. Required —
     /// reporting no route is not a thing the page has to say.
     route: String,
+    /// What is *on* that page — the file, the diagram, the task, the commit
+    /// (mesa task 888). Optional, and absent means "nothing selected": a page
+    /// with an empty editor reports its route and no more. Its `kind` is a
+    /// closed enum, so a page mesa does not have is rejected by serde before
+    /// this handler runs at all.
+    #[serde(default)]
+    context: Option<LiveContext>,
 }
 
 /// Every live write except `start` acts on **the** current session, so there is
@@ -2440,11 +2448,15 @@ async fn live_utterance(
     Ok((StatusCode::CREATED, Json(turn)).into_response())
 }
 
-/// The page reporting where the user's browser is, so the agent can talk about
-/// what they are looking at. Sent on mount and on every `hashchange`, so it is
-/// a write the page makes constantly and about itself — gated like task CRUD,
-/// and bounded by `Store` (a `#/` route, ≤ 200 chars) rather than by anything
-/// here.
+/// The page reporting where the user's browser is **and what is open on it**,
+/// so the agent can talk about what they are looking at rather than ask. Sent
+/// on mount, on every `hashchange` and whenever the page's own selection
+/// changes, so it is a write the page makes constantly and about itself —
+/// gated like task CRUD, and bounded by `Store` (a `#/` route and four fields
+/// of ≤ 200 chars) rather than by anything here.
+///
+/// Route and context arrive together because they are one statement: the
+/// context is not a patch, and omitting it clears whatever was selected.
 async fn live_route(
     State(state): State<AppState>,
     body: Result<Json<LiveRouteBody>, JsonRejection>,
@@ -2454,7 +2466,7 @@ async fn live_route(
     let Some(session) = store.current_live_session()? else {
         return Err(no_live_session());
     };
-    Ok(Json(store.set_live_route(session.id, &body.route)?).into_response())
+    Ok(Json(store.set_live_route(session.id, &body.route, body.context.as_ref())?).into_response())
 }
 
 /// Stamps one mesa turn as spoken, answering with the turn either way. The
@@ -9144,6 +9156,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             State(state),
             Ok(Json(LiveRouteBody {
                 route: "#/live".into(),
+                context: None,
             })),
         )
         .await
@@ -9153,5 +9166,86 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             assert_eq!(err.code, "not_found");
             assert!(err.message.contains("POST /api/live"), "{}", err.message);
         }
+    }
+
+    use crate::core::LiveContextKind;
+
+    /// The page reports route and context in one body, and the context is
+    /// optional: a page with nothing open sends the route alone, and that
+    /// clears whatever was selected (mesa task 888).
+    #[tokio::test]
+    async fn live_route_records_the_context_the_page_reports_with_it() {
+        let (_dir, state) = test_state();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .start_live_session(None)
+            .unwrap();
+        live_route(
+            State(state.clone()),
+            Ok(Json(LiveRouteBody {
+                route: "#/projects/1/files".into(),
+                context: Some(LiveContext {
+                    kind: LiveContextKind::Files,
+                    id: Some("src/api.rs".into()),
+                    label: Some("api.rs".into()),
+                    detail: None,
+                }),
+            })),
+        )
+        .await
+        .unwrap();
+        let session = state
+            .store
+            .lock()
+            .unwrap()
+            .current_live_session()
+            .unwrap()
+            .unwrap();
+        let ctx = session.context.unwrap();
+        assert_eq!(ctx.kind, LiveContextKind::Files);
+        assert_eq!(ctx.label.as_deref(), Some("api.rs"));
+
+        live_route(
+            State(state.clone()),
+            Ok(Json(LiveRouteBody {
+                route: "#/inbox".into(),
+                context: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let session = state
+            .store
+            .lock()
+            .unwrap()
+            .current_live_session()
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.context, None);
+    }
+
+    /// `kind` is a closed enum, so **serde** is the gate: a page mesa does not
+    /// have never reaches the handler, and the rejection comes back as the
+    /// 422 `validation` every malformed body gets (`impl From<JsonRejection>
+    /// for ApiError`). That is the right answer — an unknown page is a client
+    /// bug — and it is why there is no kind check in `Store` either.
+    #[test]
+    fn live_route_rejects_a_page_mesa_does_not_have() {
+        assert!(
+            serde_json::from_str::<LiveRouteBody>(
+                r##"{"route":"#/inbox","context":{"kind":"holodeck"}}"##
+            )
+            .is_err()
+        );
+        // The whole context is optional, and so is every field but `kind`.
+        assert!(serde_json::from_str::<LiveRouteBody>(r##"{"route":"#/inbox"}"##).is_ok());
+        assert!(
+            serde_json::from_str::<LiveRouteBody>(
+                r##"{"route":"#/inbox","context":{"kind":"inbox"}}"##
+            )
+            .is_ok()
+        );
     }
 }

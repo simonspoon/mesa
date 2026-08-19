@@ -35,6 +35,7 @@ import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { InboxKind } from './types/InboxKind'
+import type { LiveContext } from './types/LiveContext'
 import type { LiveSession } from './types/LiveSession'
 import type { LiveState } from './types/LiveState'
 import type { LiveTurn } from './types/LiveTurn'
@@ -904,9 +905,17 @@ export function sendLiveUtterance(text: string): Promise<LiveTurn> {
  * The page reporting where the browser is, so the agent knows what the person
  * is looking at. Ambient, like the inbox's read mark: sent on arrival and on
  * every hash change, and a failure is forgotten rather than shown.
+ *
+ * Route and context travel together in one report (mesa task 888): they are
+ * two halves of one answer — which page, and what is in focus on it — and a
+ * page whose focus moved has not changed route, so splitting them would mean
+ * two writes that can disagree.
  */
-export function reportLiveRoute(route: string): Promise<LiveSession> {
-  return request('/api/live/route', jsonInit('POST', { route }))
+export function reportLiveRoute(
+  route: string,
+  context: LiveContext | null,
+): Promise<LiveSession> {
+  return request('/api/live/route', jsonInit('POST', { route, context }))
 }
 
 /**

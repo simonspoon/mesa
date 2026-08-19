@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { Project } from '../types/Project'
 import { archiveProject, listProjects, unarchiveProject, updateProject } from '../api'
 import { DirBrowser } from '../components/DirBrowser'
+import { useLiveContext } from '../liveContext'
 import { descendantIds } from '../projectTree'
 import { useFetch } from '../useFetch'
 
@@ -44,6 +45,16 @@ export function ProjectSettingsView({
   // isn't already in.
   const [archiving, setArchiving] = useState(false)
   const [archiveError, setArchiveError] = useState<string | null>(null)
+
+  // What the person is looking at (mesa task 888): this project's own settings,
+  // named by the project rather than by which section is open — the sections
+  // are all one subject.
+  useLiveContext({
+    kind: 'settings',
+    id: String(projectId),
+    label: project.name,
+    detail: null,
+  })
 
   // Every project, for the parent picker. Archived ones included: nesting
   // under an archived project is legal (it just inherits being hidden), and

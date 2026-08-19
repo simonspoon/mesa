@@ -99,7 +99,7 @@ The code is the source of truth. These are the invariants you must not break:
   `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
   `fileSearch`, `fileTabs`, `filesTreeWidth`, `inboxFilter`, `inboxKind`, `inboxOrigin`, `inboxQueue`, `inboxRead`,
   `keyboardScope`,
-  `lastView`, `layout`, `liveCapture`, `liveDevices`, `liveIndicator`, `livePromptDraft`,
+  `lastView`, `layout`, `liveCapture`, `liveContext`, `liveDevices`, `liveIndicator`, `livePromptDraft`,
   `liveRecognition`,
   `liveSession`,
   `liveTurns`,

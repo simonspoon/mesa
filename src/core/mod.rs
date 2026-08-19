@@ -25,8 +25,8 @@ pub use types::{
     Diagram, DiagramEvent, DiagramType, DiagramView, DirEntry, DirListing, EdgeMarker, EdgeStyle,
     FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
     GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind, LiveAction,
-    LiveRole, LiveSession, LiveState, LiveStatus, LiveTurn, MesaVersion, ModelRates, Priority,
-    Project, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
-    ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task, TaskSummary,
-    Waypoint, task_name,
+    LiveContext, LiveContextKind, LiveRole, LiveSession, LiveState, LiveStatus, LiveTurn,
+    MesaVersion, ModelRates, Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    ProjectGitStatus, ProjectGitView, ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun,
+    Status, Task, TaskSummary, Waypoint, task_name,
 };

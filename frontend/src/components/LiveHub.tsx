@@ -18,6 +18,7 @@ import {
   userTookFocus,
   type ReclaimCause,
 } from '../liveCapture'
+import { currentContext, sameContext, subscribeContext } from '../liveContext'
 import {
   audioInputs,
   chosenInput,
@@ -62,6 +63,7 @@ import {
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
 import type { ConfigLive } from '../types/ConfigLive'
+import type { LiveContext } from '../types/LiveContext'
 import type { LiveTurn } from '../types/LiveTurn'
 import { useFetch } from '../useFetch'
 
@@ -157,6 +159,14 @@ function LiveMark() {
     </svg>
   )
 }
+
+/**
+ * How long a route/context change settles before it is reported. Ambient
+ * telemetry, so the wait costs nothing the person can feel; long enough that a
+ * caret walking down a file or a tab being flicked through is one report
+ * rather than a dozen.
+ */
+const REPORT_DEBOUNCE_MS = 300
 
 export function LiveHub({
   onSidebars,
@@ -1005,25 +1015,64 @@ export function LiveHub({
 
   // ---- where the person is ----
 
-  // The agent reads the route to know what the person is looking at. Ambient,
-  // like the inbox's read mark: sent on arrival and on every hash change, and a
-  // failure — no live session, most often — is forgotten rather than shown.
+  // The agent reads this to know what the person is looking at, in two halves:
+  // which page (the route) and what is in focus on it (the context, published
+  // up from the page through `liveContext.ts` — the hub is mounted in the
+  // header for the life of the app and the pages are deep under it, so a page
+  // cannot report for itself). Ambient, like the inbox's read mark: a failure —
+  // no live session, most often — is forgotten rather than shown.
+  //
+  // One shared *trailing* debounce over the combined report, deliberately.
+  // Context changes far faster than the route does — a selection moving, a
+  // file tab switching, a caret crossing a line — and this is telemetry the
+  // agent reads when it is asked a question, not a command anything is waiting
+  // on. A route change rides in the same window rather than jumping the queue
+  // because the two are *one* report: reporting them separately would mean two
+  // writes that can disagree about which page a focus is on, and a page that
+  // lands a fifth of a second late is still there long before the person has
+  // finished saying the sentence that follows it.
+  const reportTimer = useRef<number | null>(null)
+  const reported = useRef<{ route: string; context: LiveContext | null } | null>(null)
   const reportRoute = useCallback(() => {
-    const route = window.location.hash || '#/'
-    // `#/live` is a verb, not a place (see the intercept below), and this
-    // listener runs before the intercept's — reporting the transient hash
-    // would record a page that no longer exists.
-    if (route === '#/live') return
-    if (!route.startsWith('#/') || route.length > 200) return
-    reportLiveRoute(route).catch(() => {})
+    if (reportTimer.current !== null) window.clearTimeout(reportTimer.current)
+    reportTimer.current = window.setTimeout(() => {
+      reportTimer.current = null
+      const route = window.location.hash || '#/'
+      // `#/live` is a verb, not a place (see the intercept below) — reporting
+      // that hash would record a page that no longer exists.
+      if (route === '#/live') return
+      if (!route.startsWith('#/') || route.length > 200) return
+      // Read the focus *now* rather than closing over what it was when the
+      // report was scheduled: the whole point of waiting is to send the
+      // settled value, not the one that started the flurry.
+      const context = currentContext()
+      const last = reported.current
+      if (last !== null && last.route === route && sameContext(last.context, context)) {
+        return
+      }
+      // Remembered only once it landed, so a failed report is retried by the
+      // next trigger rather than being treated as already told.
+      reportLiveRoute(route, context)
+        .then(() => {
+          reported.current = { route, context }
+        })
+        .catch(() => {})
+    }, REPORT_DEBOUNCE_MS)
   }, [])
   useEffect(() => {
     reportRoute()
     window.addEventListener('hashchange', reportRoute)
-    return () => window.removeEventListener('hashchange', reportRoute)
+    // A change of focus on the page already open is the fourth trigger: same
+    // route, different answer to "what is this?".
+    const offContext = subscribeContext(reportRoute)
+    return () => {
+      window.removeEventListener('hashchange', reportRoute)
+      offContext()
+      if (reportTimer.current !== null) window.clearTimeout(reportTimer.current)
+    }
   }, [reportRoute])
-  // Going live is the other moment the route matters: the session that just
-  // started has no idea where its person already is.
+  // Going live is the other moment this matters: the session that just started
+  // has no idea where its person already is.
   useEffect(() => {
     if (live) reportRoute()
   }, [live, reportRoute])

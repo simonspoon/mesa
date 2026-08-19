@@ -2446,6 +2446,69 @@ impl LiveAction {
     }
 }
 
+/// Which *page* the person is on when the live session reports its context.
+///
+/// The vocabulary is deliberately not open: it is the app's own page
+/// inventory, and nothing else. Seven of these are `ProjectTab` values from
+/// `frontend/src/lastView.ts` — the tabs a project page has — and the other
+/// two are the global pages that have something in focus (the inbox and the
+/// scripts page). A page mesa does not have is therefore not expressible,
+/// which is the point: the agent reads this to talk about what is on screen,
+/// and a free-form string would let a page invent a vocabulary nobody else in
+/// mesa understands. Adding a page means adding a value here, deliberately,
+/// in the same commit.
+///
+/// The one `ProjectTab` with no value here is **`custom`**, and its absence is
+/// the same rule read the other way: a value nothing can report is as much a
+/// rot risk as a page that cannot be named. A custom layout is several views
+/// at once, and each of them already publishes what it holds — so the honest
+/// answer to "what are they looking at" on that tab is `files` and the file,
+/// not `custom` and nothing. A parent reporting the tab could only land on
+/// top of the child that knew more (its effect runs last), which would make
+/// the report worse rather than better.
+///
+/// The kind is the *page*; [`LiveContext`]'s other three fields are what is in
+/// focus on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LiveContextKind {
+    Board,
+    Dashboard,
+    Diagrams,
+    Files,
+    Git,
+    Inbox,
+    Scripts,
+    Settings,
+    Terminal,
+}
+
+/// What the person is actually looking at, as reported by the page alongside
+/// the route (mesa task 888).
+///
+/// A route says which URL the browser is at; it does not say which file is
+/// open in the editor, which diagram is on the canvas, or which commit is
+/// selected in the history. This is that second half, and it is a **small
+/// fixed shape** rather than a free-form blob so the agent can say something
+/// useful about it without parsing anything: `kind` is the page, `id` is the
+/// identity of the thing in focus (a file path, a diagram id, a task id, a
+/// commit sha), `label` is the human — and therefore *spoken* — name for it,
+/// and `detail` is whatever extra the page has (a line number, a selected
+/// frame, a mode).
+///
+/// Every field but `kind` is optional, and absent genuinely means "nothing
+/// selected": a page with an empty editor reports its kind and no more, rather
+/// than an empty string the agent would have to treat as a name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveContext {
+    pub kind: LiveContextKind,
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub detail: Option<String>,
+}
+
 /// One live conversation. **At most one is `live` at a time** (`Store`
 /// enforces it): the page has one microphone-shaped text field and one
 /// `<audio>` element, so a second concurrent conversation would have nowhere
@@ -2469,6 +2532,13 @@ pub struct LiveSession {
     /// reported by the page. The agent reads it to know what the user is
     /// looking at; it is never authority for anything mesa does.
     pub route: Option<String>,
+    /// What is *on* that page — the file, the diagram, the task, the commit —
+    /// as reported by the page alongside the route, in the same request. The
+    /// agent reads it to know what is actually on screen rather than asking
+    /// the person what they are looking at; like `route`, it is never
+    /// authority for anything mesa does. Null when the page has reported
+    /// nothing, or has reported that nothing is selected.
+    pub context: Option<LiveContext>,
     /// When the conversation started (SQLite `datetime` text, UTC).
     pub started_at: String,
     /// When the session row was last written — bound to an agent, re-routed,

@@ -33,6 +33,7 @@ import { DiagramBoardView } from './DiagramBoardView'
 import { DiagramListView } from './DiagramListView'
 import { FilesView } from './FilesView'
 import { GitView } from './GitView'
+import { LiveFocus } from './LiveFocus'
 import { ProjectSettingsView } from './ProjectSettingsView'
 import { TerminalPage } from './TerminalPage'
 
@@ -424,6 +425,27 @@ export function ProjectTasksPage({
 
   return (
     <>
+      {/* What the person is looking at (mesa task 888) — reported only for the
+          Board, the one view this component renders itself. Every other tab is
+          a component that knows its own focus and publishes it; a Custom
+          layout is several of them at once. Publishing from here in those
+          cases would be a second, shallower report landing on top of the one
+          that actually knows what is open. */}
+      {onBoard && (
+        <LiveFocus
+          ctx={{
+            kind: 'board',
+            id: taskId === null ? null : String(taskId),
+            // The task's derived `name` — the first line of its description,
+            // which is the only sayable name a task has.
+            label:
+              taskId === null
+                ? null
+                : (tasks?.find((t) => t.id === taskId)?.name ?? null),
+            detail: null,
+          }}
+        />
+      )}
       <div className={fills ? 'project-page project-page-fills' : 'project-page'}>
         <h1>
           {project ? (

@@ -10,6 +10,8 @@ import type { GitCommit } from '../types/GitCommit'
 import type { GitCommitFile } from '../types/GitCommitFile'
 import type { GitFile } from '../types/GitFile'
 import type { GitWorktree } from '../types/GitWorktree'
+import { useLiveContext } from '../liveContext'
+import { LiveFocus } from './LiveFocus'
 import { useFetch } from '../useFetch'
 
 // Human word for one porcelain-v2 status char. X = staged column,
@@ -259,6 +261,18 @@ function HistoryPane({
   const [selectedCommitPath, setSelectedCommitPath] = useState<string | null>(
     null,
   )
+  // What the person is looking at while History is open (mesa task 888).
+  // Reported from here rather than from `GitView` because the commit selection
+  // lives here — and `GitView` mounts no publisher of its own in this mode, so
+  // the two never talk over each other. A commit's subject line is its sayable
+  // name; the sha is its identity.
+  useLiveContext({
+    kind: 'git',
+    id: selectedCommit?.hash ?? null,
+    label: selectedCommit?.subject ?? null,
+    detail: selectedCommitPath,
+  })
+
   // Same prevProject-during-render reset pattern as GitView itself: this
   // component is not remounted on project change (nor on a worktree switch)
   // while History mode stays open, so a stale commit selection from one scope
@@ -439,6 +453,19 @@ export function GitView({ projectId }: { projectId: number }) {
 
   return (
     <div className="git-view">
+      {/* The working tree's own focus (mesa task 888) — the selected file, said
+          by name rather than by path. Mounted only in this mode: History has a
+          publisher of its own, and a `null` from here would land on top of it. */}
+      {mode === 'tree' && (
+        <LiveFocus
+          ctx={{
+            kind: 'git',
+            id: selected?.path ?? null,
+            label: selected?.path.split('/').pop() ?? null,
+            detail: null,
+          }}
+        />
+      )}
       <p className="git-repo-header">
         <span className="git-branch">{status.branch}</span>
         {status.ahead > 0 && <span className="git-ahead">↑{status.ahead}</span>}

@@ -14,6 +14,7 @@ import { filterInbox, INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
 import { inboxKindClass, inboxKindLabel } from '../inboxKind'
 import { nextInQueue, readAllQueue } from '../inboxQueue'
 import { inboxOriginLabel } from '../inboxOrigin'
+import { useLiveContext } from '../liveContext'
 import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
 import {
   playFailure,
@@ -187,6 +188,26 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   const held = new Set(expanded)
   if (speakingId !== null) held.add(speakingId)
   const items = all && filterInbox(all, filter, held)
+
+  // What the person is looking at (mesa task 888): the one item they have
+  // opened out. Two or more open is a list being skimmed, not an item in
+  // focus, so that reports the view alone. The origin line is the label
+  // because it is the sayable half — which project, which piece of work —
+  // falling back to the body's first line, since an item that predates 847
+  // has no origin at all. The sub-view is what is on screen, so it is the
+  // detail.
+  const opened =
+    expanded.size === 1 ? (all?.find((i) => expanded.has(i.id)) ?? null) : null
+  useLiveContext({
+    kind: 'inbox',
+    id: opened === null ? null : String(opened.id),
+    label:
+      opened === null
+        ? null
+        : (inboxOriginLabel(opened) ??
+          (opened.body.split('\n').find((l) => l.trim() !== '') ?? null)),
+    detail: INBOX_SUBNAV.find((s) => s.filter === filter)?.label ?? null,
+  })
 
   function toggleExpanded(id: number) {
     setExpanded((current) => {

@@ -7,9 +7,9 @@ use rusqlite::{Connection, OptionalExtension};
 use super::attachments;
 use super::types::{
     AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, EdgeMarker, EdgeStyle,
-    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LiveAction, LiveRole, LiveSession,
-    LiveStatus, LiveTurn, Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Task,
-    TaskEvent, Waypoint, task_name,
+    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LiveAction, LiveContext, LiveRole,
+    LiveSession, LiveStatus, LiveTurn, Priority, Project, Script, ScriptArg, ScriptArgKind, Status,
+    Task, TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -556,6 +556,12 @@ const MIGRATIONS: &[&str] = &[
         played_at    TEXT
     );
     CREATE INDEX idx_live_turns_session ON live_turns(session_id, id);",
+    // Task 888: the live session also reports *what* is on the page it is on —
+    // the file, the diagram, the task, the commit. Stored as the JSON of one
+    // small fixed struct (`LiveContext`) rather than as four columns, because
+    // it is one statement the page makes atomically and nothing queries its
+    // parts; a row written before this column simply has nothing selected.
+    "ALTER TABLE live_sessions ADD COLUMN context TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -703,7 +709,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 // ---- mesa live (task 855) ----
 
 const LIVE_SESSION_COLUMNS: &str =
-    "id, project_id, agent_id, status, route, started_at, updated_at, ended_at";
+    "id, project_id, agent_id, status, route, started_at, updated_at, ended_at, context";
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
      created_at, delivered_at, played_at";
@@ -712,6 +718,13 @@ const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
 /// page already knows how to render, not free text, so the bound is generous
 /// but real — it lands in `window.location.hash`.
 const LIVE_ROUTE_MAX: usize = 200;
+
+/// Longest each free-text field of a [`LiveContext`] may be. Same reasoning as
+/// the route bound and the same number: a label may be **spoken**, and the
+/// whole context rides in every quiet projection of a session, so a page that
+/// reported a whole file's worth of text would make both worse. Generous but
+/// real — a file path or a diagram title fits with room to spare.
+const LIVE_CONTEXT_FIELD_MAX: usize = 200;
 
 /// Longest turn text. Bounded because a mesa turn is **spoken**: a runaway
 /// body would wedge the synthesiser rather than say anything.
@@ -723,12 +736,21 @@ const LIVE_TURNS_MAX: i64 = 500;
 
 fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession> {
     let status: String = row.get(3)?;
+    // The context is parsed **leniently** (the `waypoints` precedent, not the
+    // `tags` one): a value mesa itself could not have written — a hand-edited
+    // row, or a column left by a newer build that knows a page this one does
+    // not — reads back as "nothing selected" rather than panicking a whole
+    // conversation over a decoration. Nothing mesa does depends on it.
+    let context: Option<LiveContext> = row
+        .get::<_, Option<String>>(8)?
+        .and_then(|s: String| serde_json::from_str(&s).ok());
     Ok(LiveSession {
         id: row.get(0)?,
         project_id: row.get(1)?,
         agent_id: row.get(2)?,
         status: LiveStatus::parse(&status).expect("invalid live session status in db"),
         route: row.get(4)?,
+        context,
         started_at: row.get(5)?,
         updated_at: row.get(6)?,
         ended_at: row.get(7)?,
@@ -771,6 +793,33 @@ fn validate_live_route(route: &str) -> Result<String> {
         )));
     }
     Ok(route.to_string())
+}
+
+/// The context rule, the twin of [`validate_live_route`]: trim every free-text
+/// field, turn an empty or whitespace-only one into `None` so "nothing
+/// selected" is genuinely absent rather than `""`, and bound each at
+/// [`LIVE_CONTEXT_FIELD_MAX`].
+///
+/// `kind` needs no rule at all — it is a closed enum, so serde is the gate:
+/// a page naming a page mesa does not have never reaches here.
+fn validate_live_context(ctx: &LiveContext) -> Result<LiveContext> {
+    fn field(value: Option<&String>, name: &str) -> Result<Option<String>> {
+        let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        if value.chars().count() > LIVE_CONTEXT_FIELD_MAX {
+            return Err(Error::Validation(format!(
+                "context {name} must be at most {LIVE_CONTEXT_FIELD_MAX} characters"
+            )));
+        }
+        Ok(Some(value.to_string()))
+    }
+    Ok(LiveContext {
+        kind: ctx.kind,
+        id: field(ctx.id.as_ref(), "id")?,
+        label: field(ctx.label.as_ref(), "label")?,
+        detail: field(ctx.detail.as_ref(), "detail")?,
+    })
 }
 
 const SCRIPT_COLUMNS: &str =
@@ -3522,14 +3571,35 @@ impl Store {
         self.get_live_session(id)
     }
 
-    /// The page reporting where the user's browser is. Bounded by
-    /// [`validate_live_route`] — it is a hash route, not free text.
-    pub fn set_live_route(&mut self, id: i64, route: &str) -> Result<LiveSession> {
+    /// The page reporting where the user's browser is, and what is on it.
+    /// Bounded by [`validate_live_route`] and [`validate_live_context`] — a
+    /// hash route and a small fixed struct, not free text.
+    ///
+    /// The report is a **complete statement** of where the person is, not a
+    /// patch: one poster in the page sends the route and the context together
+    /// on every move, so `context: None` writes SQL `NULL` and clears whatever
+    /// was selected before. A page that has opened nothing must be able to say
+    /// so, and it says so by reporting no context.
+    ///
+    /// Both values are validated before **either** is written, so a refused
+    /// context leaves the stored route and the stored context exactly as they
+    /// were rather than half-applying the report.
+    pub fn set_live_route(
+        &mut self,
+        id: i64,
+        route: &str,
+        context: Option<&LiveContext>,
+    ) -> Result<LiveSession> {
         let route = validate_live_route(route)?;
+        let context = context.map(validate_live_context).transpose()?;
+        let context = context
+            .as_ref()
+            .map(|c| serde_json::to_string(c).expect("json serialize"));
         self.get_live_session(id)?;
         self.conn.execute(
-            "UPDATE live_sessions SET route = ?2, updated_at = datetime('now') WHERE id = ?1",
-            (id, &route),
+            "UPDATE live_sessions SET route = ?2, context = ?3, \
+             updated_at = datetime('now') WHERE id = ?1",
+            (id, &route, &context),
         )?;
         self.get_live_session(id)
     }
@@ -4489,6 +4559,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::LiveContextKind;
 
     fn temp_store() -> (Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -8279,7 +8350,7 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let session = store.start_live_session(None).unwrap();
         let routed = store
-            .set_live_route(session.id, "  #/projects/3/files  ")
+            .set_live_route(session.id, "  #/projects/3/files  ", None)
             .unwrap();
         assert_eq!(routed.route.as_deref(), Some("#/projects/3/files"));
         assert_ne!(routed.updated_at, "");
@@ -8291,7 +8362,7 @@ mod tests {
             "https://example.com",
             &format!("#/{}", "x".repeat(LIVE_ROUTE_MAX)),
         ] {
-            let err = store.set_live_route(session.id, bad).unwrap_err();
+            let err = store.set_live_route(session.id, bad, None).unwrap_err();
             assert!(matches!(err, Error::Validation(_)), "{bad:?}: {err:?}");
         }
         // …and the route the last good call stored is still there.
@@ -8299,6 +8370,135 @@ mod tests {
             store.get_live_session(session.id).unwrap().route.as_deref(),
             Some("#/projects/3/files")
         );
+    }
+
+    /// The context the page reports alongside the route: a closed `kind` plus
+    /// three bounded free-text fields, trimmed, and `None` where the page had
+    /// nothing to say (mesa task 888).
+    #[test]
+    fn set_live_route_records_what_is_open_on_the_page() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let reported = store
+            .set_live_route(
+                session.id,
+                "#/projects/3/files",
+                Some(&LiveContext {
+                    kind: LiveContextKind::Files,
+                    id: Some("  src/core/store.rs  ".into()),
+                    label: Some("store.rs".into()),
+                    detail: Some("line 42".into()),
+                }),
+            )
+            .unwrap();
+        let ctx = reported.context.clone().unwrap();
+        assert_eq!(ctx.kind, LiveContextKind::Files);
+        assert_eq!(ctx.id.as_deref(), Some("src/core/store.rs"));
+        assert_eq!(ctx.label.as_deref(), Some("store.rs"));
+        assert_eq!(ctx.detail.as_deref(), Some("line 42"));
+        // …and it round-trips out of the column, not just out of this call.
+        assert_eq!(
+            store.get_live_session(session.id).unwrap().context,
+            reported.context
+        );
+
+        // A page that has opened nothing says so with empty fields, and
+        // "nothing selected" is genuinely absent rather than "".
+        let bare = store
+            .set_live_route(
+                session.id,
+                "#/projects/3/files",
+                Some(&LiveContext {
+                    kind: LiveContextKind::Files,
+                    id: Some("".into()),
+                    label: Some("   ".into()),
+                    detail: None,
+                }),
+            )
+            .unwrap();
+        let ctx = bare.context.unwrap();
+        assert_eq!(ctx.kind, LiveContextKind::Files);
+        assert_eq!((ctx.id, ctx.label, ctx.detail), (None, None, None));
+
+        // The report is a complete statement, not a patch: no context clears.
+        let cleared = store.set_live_route(session.id, "#/inbox", None).unwrap();
+        assert_eq!(cleared.context, None);
+    }
+
+    /// Each free-text field is bounded for the reason the route is — a label
+    /// may be spoken — and a refused report leaves **both** halves of the
+    /// stored one alone, the same guarantee the route rule already gives.
+    #[test]
+    fn a_refused_context_leaves_the_stored_report_alone() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let good = LiveContext {
+            kind: LiveContextKind::Diagrams,
+            id: Some("7".into()),
+            label: Some("Login flow".into()),
+            detail: None,
+        };
+        store
+            .set_live_route(session.id, "#/projects/3/diagrams", Some(&good))
+            .unwrap();
+
+        let long = "x".repeat(LIVE_CONTEXT_FIELD_MAX + 1);
+        for (field, bad) in [
+            (
+                "id",
+                LiveContext {
+                    id: Some(long.clone()),
+                    ..good.clone()
+                },
+            ),
+            (
+                "label",
+                LiveContext {
+                    label: Some(long.clone()),
+                    ..good.clone()
+                },
+            ),
+            (
+                "detail",
+                LiveContext {
+                    detail: Some(long.clone()),
+                    ..good.clone()
+                },
+            ),
+        ] {
+            let err = store
+                .set_live_route(session.id, "#/inbox", Some(&bad))
+                .unwrap_err();
+            match err {
+                Error::Validation(m) => assert!(m.contains(field), "{field}: {m}"),
+                e => panic!("{field}: {e:?}"),
+            }
+        }
+        let still = store.get_live_session(session.id).unwrap();
+        assert_eq!(still.route.as_deref(), Some("#/projects/3/diagrams"));
+        assert_eq!(still.context, Some(good));
+    }
+
+    /// A context mesa itself could not have written — a hand-edited row, or a
+    /// newer build's page kind — reads back as "nothing selected" rather than
+    /// panicking the whole conversation over a decoration nothing depends on.
+    #[test]
+    fn an_unreadable_context_reads_back_as_nothing_selected() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.set_live_route(session.id, "#/inbox", None).unwrap();
+        for garbage in ["not json at all", r#"{"kind":"holodeck"}"#, "{}"] {
+            store
+                .conn
+                .execute(
+                    "UPDATE live_sessions SET context = ?2 WHERE id = ?1",
+                    (session.id, garbage),
+                )
+                .unwrap();
+            let read = store.get_live_session(session.id).unwrap();
+            assert_eq!(read.context, None, "{garbage}");
+            assert_eq!(read.route.as_deref(), Some("#/inbox"));
+        }
     }
 
     #[test]

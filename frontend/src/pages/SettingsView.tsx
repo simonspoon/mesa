@@ -68,6 +68,7 @@ import {
   type LivePromptDraft,
 } from '../livePromptDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
+import { useLiveContext } from '../liveContext'
 import { useFetch } from '../useFetch'
 import {
   MAX_CONCURRENCY,
@@ -171,6 +172,9 @@ function SettingsHeader() {
  */
 export function SettingsView() {
   const { data: commands, error, refetch } = useFetch(() => getConfig(), 'config')
+  // The whole page is one subject — the config file — so the page is the whole
+  // report (mesa task 888).
+  useLiveContext({ kind: 'settings', id: null, label: null, detail: null })
   // The form is edited locally and saved explicitly. `null` = not seeded yet;
   // it is seeded from the first load (and re-seeded after a save, from the
   // echoed settings) rather than derived per render, so typing isn't clobbered

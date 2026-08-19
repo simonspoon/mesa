@@ -95,6 +95,7 @@ import {
 import type { FileTreeEntry } from '../types/FileTreeEntry'
 import type { ProjectFileSearch } from '../types/ProjectFileSearch'
 import type { GitCommit } from '../types/GitCommit'
+import { useLiveContext } from '../liveContext'
 import { useFetch } from '../useFetch'
 
 /** The content half's own floor, the twin of `MIN_MAIN_WIDTH` in Sidebar.tsx /
@@ -2766,6 +2767,20 @@ export function FilesView({ projectId }: { projectId: number }) {
   // is a function of the drafts `fileUi` already carries, and a second copy
   // would be a second thing to keep true.
   const dirty = useMemo(() => dirtyPaths(fileUi), [fileUi])
+
+  // What the person is looking at (mesa task 888): the file the *focused* pane
+  // is showing — with a split open, the other pane's file is on screen but is
+  // not what "this file" means. The path is the identity; the label is the
+  // basename, because a path read aloud by a synthesiser is a string of
+  // slashes. An empty tab strip still reports the page, so the conversation
+  // knows the Files tab is open with nothing in it.
+  const focusedPath = paneOf(tabs, tabs.focused)?.active ?? null
+  useLiveContext({
+    kind: 'files',
+    id: focusedPath,
+    label: focusedPath === null ? null : basename(focusedPath),
+    detail: focusedPath !== null && dirty.has(focusedPath) ? 'unsaved changes' : null,
+  })
 
   // Warn on a real page unload while any tab is dirty — a reload or a close is
   // the one exit this app cannot intercept and put a confirm bar in front of.

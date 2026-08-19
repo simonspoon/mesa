@@ -9,6 +9,7 @@ import { getAuthor, setAuthor } from '../author'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { InlineEdit } from '../components/InlineEdit'
 import { DiagramCanvas } from '../DiagramCanvas'
+import { useLiveContext } from '../liveContext'
 import { useFetch } from '../useFetch'
 
 /** The board's change history (who/what/when), newest first. `version` bumps
@@ -66,6 +67,17 @@ export function DiagramBoardView({
   const [showHistory, setShowHistory] = useState(false)
   // Bumped on every mutation so the history log refetches alongside the canvas.
   const [historyVersion, setHistoryVersion] = useState(0)
+  // What the person is looking at (mesa task 888) — reported ahead of the
+  // early returns below, per the rules of hooks, so a board still loading says
+  // which board it is. The title is the sayable name; the id is the identity.
+  // Which frame is selected lives inside `DiagramCanvas`, so it is not reported
+  // from here.
+  useLiveContext({
+    kind: 'diagrams',
+    id: String(diagramId),
+    label: view?.diagram.title ?? null,
+    detail: null,
+  })
 
   function refresh() {
     refetch()

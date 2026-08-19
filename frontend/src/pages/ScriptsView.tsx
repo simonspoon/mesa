@@ -6,6 +6,7 @@ import {
   listScripts,
   updateScript,
 } from '../api'
+import { useLiveContext } from '../liveContext'
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { ScriptRunModal } from '../components/ScriptRunModal'
@@ -254,6 +255,22 @@ export function ScriptsView() {
   // script. One at a time, which is why this is one field and not a set.
   const [editing, setEditing] = useState<number | 'new' | null>(null)
   const [running, setRunning] = useState<Script | null>(null)
+
+  // What the person is looking at (mesa task 888). A run wins over an open
+  // edit form: it is the modal on top, and it is the one the conversation is
+  // about while it is up. The create form has no script to name yet, so it
+  // reports the form itself.
+  const focused =
+    running ??
+    (typeof editing === 'number'
+      ? (scripts?.find((s) => s.id === editing) ?? null)
+      : null)
+  useLiveContext({
+    kind: 'scripts',
+    id: focused === null ? null : String(focused.id),
+    label: focused !== null ? focused.name : editing === 'new' ? 'new script' : null,
+    detail: running !== null ? 'running' : null,
+  })
 
   return (
     <div className="scripts-page">

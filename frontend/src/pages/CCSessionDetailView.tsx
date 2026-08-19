@@ -16,6 +16,7 @@ import {
 } from '../sessionDetail'
 import type { CcSessionDetail } from '../types/CcSessionDetail'
 import type { CcSessionThreadStat } from '../types/CcSessionThreadStat'
+import { useLiveContext } from '../liveContext'
 import { useFetch } from '../useFetch'
 
 // One session's detail page (`#/cc/sessions/:id`) — the DEFAULT drill-down from
@@ -43,6 +44,17 @@ export function CCSessionDetailView({ sessionId }: { sessionId: string }) {
     () => getCcSessionDetail(sessionId),
     `cc-detail:${sessionId}`,
   )
+  // What the person is looking at (mesa task 888). The whole session id is the
+  // identity; the label is what the heading says out loud — the project it ran
+  // in, once that has landed, and the short id nobody would read a UUID for.
+  useLiveContext({
+    kind: 'dashboard',
+    id: sessionId,
+    label: data?.project
+      ? `${data.project} session ${sessionId.split('-')[0]}`
+      : `session ${sessionId.split('-')[0]}`,
+    detail: null,
+  })
 
   return (
     <div className="cc-dashboard-page">

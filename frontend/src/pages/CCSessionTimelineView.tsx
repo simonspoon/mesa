@@ -6,6 +6,7 @@ import { filterRows, nodeTextTarget, threadOptions, timelineRows } from '../sess
 import type { TimelineRow } from '../sessionTimeline'
 import type { CcGraphNode } from '../types/CcGraphNode'
 import type { CcGraphNodeKind } from '../types/CcGraphNodeKind'
+import { useLiveContext } from '../liveContext'
 import { useFetch } from '../useFetch'
 
 // One session as a chronological, thread-grouped list (`#/cc/sessions/:id/timeline`,
@@ -45,6 +46,19 @@ export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
     () => getCcSessionGraph(sessionId, ROW_LIMIT),
     `cc-timeline:${sessionId}`,
   )
+
+  // What the person is looking at (mesa task 888) — the same session the detail
+  // page reports, one drill-down deeper, which is what `detail` says. Which row
+  // is open is deliberately not reported: a transcript node is the *agent's*
+  // own text, not a thing on screen to be asked about by name.
+  useLiveContext({
+    kind: 'dashboard',
+    id: sessionId,
+    label: data?.project
+      ? `${data.project} session ${sessionId.split('-')[0]}`
+      : `session ${sessionId.split('-')[0]}`,
+    detail: 'timeline',
+  })
 
   const [query, setQuery] = useState('')
   const [kinds, setKinds] = useState<CcGraphNodeKind[]>(ALL_KINDS)

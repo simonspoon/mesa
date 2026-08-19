@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { createDiagram, getDiagram, listDiagrams } from '../api'
+import { useLiveContext } from '../liveContext'
 import { getAuthor, setAuthor } from '../author'
 import { diagramThumb } from '../diagramThumb'
 import { formatTimestamp, timeAgo } from '../time'
@@ -104,6 +105,9 @@ export function DiagramListView({ projectId }: { projectId: number }) {
   const [diagramType, setDiagramType] = useState<DiagramType>('storyboard')
   const [createError, setCreateError] = useState<string | null>(null)
   const views = useDiagramViews(boards ? boards.map((b) => b.id) : [])
+  // The index selects nothing — the boards are links, and opening one is what
+  // gives the conversation something to talk about (mesa task 888).
+  useLiveContext({ kind: 'diagrams', id: null, label: null, detail: null })
 
   function submit(e: React.FormEvent) {
     e.preventDefault()

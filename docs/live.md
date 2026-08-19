@@ -2,8 +2,10 @@
 
 **Mesa live** is a conversation mode: a person talks to mesa, mesa talks back,
 and a dedicated Claude Code session does whatever they ask. Tables
-`live_sessions` and `live_turns` (migration index 43), the `mesa live` CLI
-group, `/api/live*`, and the header's conversation hub (`LiveHub`).
+`live_sessions` and `live_turns` (migration index 43, plus the session's
+`context` column at index **44**, so a fresh db is `user_version` 45), the
+`mesa live` CLI group, `/api/live*`, and the header's conversation hub
+(`LiveHub`).
 
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
@@ -61,8 +63,11 @@ The instruction block the agent is spawned with is
 `core::live::AGENT_PROMPT` — one constant in `core`, because both spawn sites
 (the CLI's `live start` and `POST /api/live`) hand the same text to the same
 `agents::spawn_bg` chokepoint. It states the loop, the route vocabulary, the
-"this is speech, so write prose" rule (a bulleted reply gets read aloud as
-punctuation) and the untrusted-input posture below. `live::agent_prompt(id)`
+step that tells the agent to run **`mesa live status`** to find out what the
+person is looking at — the page as `route` and what is open on it as `context`,
+*"read it instead of asking them where they are"* (task 888) — the "this is
+speech, so write prose" rule (a bulleted reply gets read aloud as punctuation)
+and the untrusted-input posture below. `live::agent_prompt(id)`
 appends the session id — the only per-call part.
 
 That block is the **default**, not the only possibility: `~/.mesa/config.json`'s
@@ -130,6 +135,32 @@ turns (schema enforces none of it, per CLAUDE.md):
   **one** route rule (`validate_live_route`): trimmed, non-empty, ≤ 200 chars,
   and starting with `#/`. Both go through it so the agent can never send the
   browser somewhere the session could not have recorded.
+- The **context** the page reports alongside that route (mesa task 888) is a
+  fixed four-field shape — `kind`, `id`, `label`, `detail` — and passes
+  `validate_live_context`: each of the three free-text fields is trimmed,
+  bounded at 200 characters (`LIVE_CONTEXT_FIELD_MAX`, the route's number for
+  the route's reason — a `label` is **spoken**), and a blank one folds to
+  **absent** rather than `""`, so "nothing selected" is genuinely nothing and
+  the agent never has to treat an empty string as a name. `kind` needs no rule
+  in `Store` at all: it is a closed enum, so serde is the gate and a page mesa
+  does not have is refused before the handler ever runs. Both halves are
+  validated **before either is written**, so a refused context leaves the
+  stored route *and* the stored context exactly as they were rather than
+  half-applying the report.
+- **The context is a fixed vocabulary rather than a free-form blob**, and that
+  is the decision the whole shape turns on. The agent has to be able to *say
+  something useful* about what is on screen without parsing anything — "you
+  have store.rs open on the Files tab" comes straight out of `kind` and
+  `label` — and a free-form payload would let every page invent its own shape,
+  so the agent would be reading a different schema per page and mesa would have
+  no bound on any of it. Four fields, one of them a closed word, is what makes
+  the report readable by something that has never seen the page that wrote it.
+- **It is read back leniently.** The column is validated JSON on the way in and
+  `serde_json::from_str(..).ok()` on the way out — the `waypoints` precedent
+  rather than the `tags` one. A value mesa itself could not have written (a
+  hand-edited row, or a column left by a newer build that knows a page this one
+  does not) reads as *nothing selected*, because nothing mesa does depends on
+  it and panicking a whole conversation over a decoration is the wrong trade.
 - `text` is trimmed and capped at 8192 characters, because it is **spoken**: a
   runaway body would wedge the synthesiser rather than say anything.
 
@@ -154,6 +185,21 @@ and that project's `tasks/<id>`, `diagrams`, `git`, `files`, `terminal`,
 what it may say; the *rule* mesa enforces is only the `#/` shape, since the
 route inventory is the frontend's business and pinning a second copy of it in
 `Store` would be a copy to go stale.
+
+`LiveContextKind` (task 888) **does** pin a page vocabulary in Rust, and that
+is not the paragraph above being quietly broken — the two are different things.
+A route is a *string the frontend owns*: it carries ids, it is built by the
+router, it changes shape whenever a page gains a tab, and mesa's only interest
+in one is that it can be handed back to `window.location.hash`. A context
+`kind` is a *word the agent reads*, and the whole value of it is that the same
+word means the same page everywhere — an enum is what makes `"files"` something
+the agent can say out loud, key a sentence on, and rely on mesa having refused
+if the page got it wrong. So the route stays a shape rule and the kind stays a
+closed list, and the cost of the list is exactly the one the doc-comment on the
+type names: a new page means adding a value, deliberately, in the same commit.
+Ten values today — the eight `ProjectTab` values in `frontend/src/lastView.ts`
+plus the two global pages that have something in focus (the inbox and the
+scripts page).
 
 `collapse-sidebars` and `expand-sidebars` (mesa task 859) fold the app's two
 side panels — the left nav and the agents sidebar — away and back. They are the
@@ -279,9 +325,12 @@ takes exactly one value.
   `listen` and on `status`, rejected with exit 2 on `turns`. A turn drops
   `text` — the one unbounded field, and the one that is *spoken* rather than
   read by the caller — and keeps its role, action and target. A session has
-  nothing unbounded to drop (ids, one of two status words, a 200-char route and
+  nothing unbounded to drop (ids, one of two status words, a 200-char route, a
+  four-field context whose free-text fields `Store` caps at 200 chars each, and
   timestamps), so its quiet output equals its full output; the flag is accepted
-  across the group for uniformity.
+  across the group for uniformity. The context being *bounded* is what keeps
+  that true — it is a report, not a body, and the key-parity test on
+  `LiveSession` is what forces the next field to answer the same question.
 
 ## API
 
@@ -291,7 +340,7 @@ takes exactly one value.
 | `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
 | `DELETE /api/live` | the ended session | `require_agent_access` |
 | `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
-| `POST /api/live/route` `{route}` | the session, route recorded | standard write |
+| `POST /api/live/route` `{route, context?}` | the session, route **and context** recorded | standard write |
 | `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
 | `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
 
@@ -312,6 +361,15 @@ normal state, not an error, and the button such a page renders is exactly what
 fixes it. One poll carries at most 500 turns — the ceiling `Store` clamps to
 anyway — so a conversation longer than that is read in cursor-sized pages,
 which is what `?after=` is for.
+
+`POST /api/live/route`'s `context` is optional and **omitting it clears the
+stored one** — the report is a complete statement of where the person is, not a
+patch, because one poster in the page sends both halves together on every move.
+A page that has opened nothing must be able to say so, and this is how it says
+it. An unknown `kind` is a **422 `validation`**, refused by serde before the
+handler runs (`JsonRejection` maps to mesa's validation body), which is the
+same code an over-long field gets from `Store` — an unknown page is a client
+bug either way. The gate is unchanged: an ordinary write.
 
 The three ordinary writes resolve the current session themselves, so with none
 live each is `not_found` with a hint naming `POST /api/live`, the same shape
@@ -779,12 +837,75 @@ conversation") working with no backend change.
   applied to, each still carrying `played_at: null` (the cursor means the
   server never sends those rows again), and the run said the entire
   conversation over again the moment the person pressed End.
-- **On arrival and on every `hashchange`** the hub `POST`s
-  `/api/live/route`, so the session records where the person actually is and
-  the agent can answer "what am I looking at" without guessing. Also the moment
-  it goes live, since a session that just started has no idea where its person
-  already was. It is **ambient**, like the inbox's read mark: a failure — no
-  live session, most often — is forgotten rather than shown.
+- **The hub reports where the person is, in two halves.** One `POST` to
+  `/api/live/route` carries the **route** (which page) and the **context**
+  (what is in focus on it), so the agent can answer "what am I looking at"
+  without guessing — and, since task 888, without asking. There are **four**
+  triggers: on arrival, on every `hashchange`, the moment the session goes live
+  (a session that just started has no idea where its person already was), and —
+  the new one — a change of focus on the page *already* open: same route,
+  different answer to "what is this?". It stays **ambient**, like the inbox's
+  read mark: a failure — no live session, most often — is forgotten rather than
+  shown.
+
+  Route and context go in **one body because they are one statement**, and
+  omitting the context is how a page with nothing open says so — a report is
+  not a patch. Sending them separately would mean two writes that can disagree
+  about which page a focus is on.
+
+  The report is **debounced** (one shared trailing 300 ms timer,
+  `REPORT_DEBOUNCE_MS`), which the route alone never needed. Context changes far
+  faster than a route does — a selection moving, a file tab flicking past, a
+  caret crossing a line — and this is telemetry the agent reads when it is
+  *asked* a question, not a command anything is waiting on. A route change rides
+  in the same window rather than jumping the queue, for the one-statement reason
+  above; a page that lands a fifth of a second late is still recorded long
+  before the person has finished saying the sentence that follows it. The timer
+  reads the focus **when it fires**, not when it was scheduled — waiting is for
+  the settled value, not the one that started the flurry — dedupes against the
+  last *successful* report (so a failed one is retried by the next trigger
+  rather than treated as already told), and is cancelled on unmount.
+- **The pages publish, the hub reports: one poster, one report**
+  (`frontend/src/liveContext.ts`). The hub is mounted in `<header>` for the life
+  of the app and the pages are deep in the routed tree beneath it, so a page
+  cannot report for itself and there is no shared ancestor but `App`. Threading
+  a setter down through every page, tab and pane to reach one telemetry field
+  would run a wire through the whole tree for a value nothing in the tree reads.
+  So the channel is a plain module-level value plus a subscriber list, and the
+  hub stays the **only** thing that talks to `/api/live/route` — the same rule
+  as everywhere else on this surface: mesa does not open a second write path.
+  The page clamps each field to 200 characters rather than letting `Store`
+  refuse it, because a deeply nested file path is a perfectly ordinary focus and
+  a 422'd report tells the agent *nothing*, where a truncated one still names
+  the page and most of the path (`…` marks the cut, as `task_name` does).
+- **A publisher stands down only if what is standing is still its own.**
+  `useLiveContext`'s cleanup calls `clearIfStanding(published)`, not a blind
+  clear, and that guard is what keeps two ordinary races from lying to the
+  agent. The cleanup runs on **every** change of the value, not only on
+  unmount — so an unconditional clear would publish a transient "nothing
+  selected" between every two focuses, and because the hub debounces, a timer
+  that happened to fire inside that gap would tell the agent nothing is open at
+  the exact moment the person changed what they are looking at. And across a
+  route swap React runs the *arriving* page's effect before the *departing*
+  page's cleanup, so an unconditional clear is the old page wiping the new
+  page's context. A publisher whose value has already been superseded simply
+  stops talking; only the one still on the air turns it off.
+- **A page that is mounted but not visible must not publish**, and a page that
+  delegates must not publish over the child it delegated to. Both are the same
+  rule — *the publisher is mounted with the thing on screen* — and both are why
+  `LiveFocus` exists: rendering a publisher is a choice a component can make
+  conditionally, where calling the hook with `null` is not (hooks are
+  unconditional, and a `null` is itself a report). `TerminalPage` is the case
+  that proves it: `App` mounts the global one as a **permanent sibling** so
+  shells survive navigation, so it is mounted the whole time the person is
+  somewhere else — an unconditional publisher there pinned the context to
+  `terminal` for the life of the app, and being the later sibling it won every
+  time. It takes an `active` prop and mounts its publisher only while it is the
+  visible pane. `ProjectTasksPage` is the delegating half: it reports only for
+  the Board, the one view it renders itself, and leaves every tab to the
+  component that actually knows what is open in it. Effects run child-first, so
+  a parent publishing "the tab" would land *on top of* the child publishing the
+  file — the shallower answer would win, which is exactly backwards.
 - **Pure logic is in tested modules, not the `.tsx`** (CLAUDE.md's
   frontend-test rule): `frontend/src/liveTurns.ts` (cursor advance, merging a
   poll's turns into the transcript, next-unplayed selection, what a turn
@@ -809,7 +930,14 @@ conversation") working with no backend change.
   `frontend/src/liveDevices.ts` (which microphones there are, whether two
   readings of that list say the same thing, what to call one before its label
   is known, which one is actually chosen, and whether the chooser is offered at
-  all), each with a sibling vitest file.
+  all) and
+  `frontend/src/liveContext.ts` (what a reported field is worth on the wire —
+  trimmed, blank folded to absent, cut to 200 with `…` — whether two contexts
+  say the same thing, and the page-to-hub channel itself: publish, read what is
+  standing, subscribe, and the conditional stand-down that keeps a departing
+  page from clearing an arriving one's focus; plus the one React binding,
+  `useLiveContext`, which is the whole of what a page has to call), each with a
+  sibling vitest file.
 
 ## Config
 
@@ -894,3 +1022,13 @@ no agent to stop, and a `claude stop` that fails), the single-session
 `listen` returning `null` on timeout and never handing out the same turn twice,
 the `--quiet` key sets, and the API twin including the audio contract and both
 halves of the security boundary in default **and** `--lan` mode.
+
+The route write is checked with its **context** riding in the same body (task
+888): both halves recorded, `mesa live status` reading back over its own
+`Store` exactly what the page reported over HTTP (the two surfaces share
+`core`, so they must not disagree about what the person is looking at),
+omitting or nulling the context clearing it, blank fields folding to `null`
+rather than `""`, the 200-char field bound inclusive on both sides, an unknown
+`kind` as 422 `validation`, a refused report leaving the stored route *and*
+context untouched — and every one of the ten `kind` values accepted in a loop,
+because a vocabulary the gate does not exercise is a vocabulary that rots.

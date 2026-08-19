@@ -36,15 +36,15 @@ describe('liveControls', () => {
         secondary: null,
         // Nothing running: there is nothing to step out of.
         pause: null,
-        // No session at all: there is no transcript, so no popup to offer.
-        overlay: false,
+        // No session at all: there is no transcript, so no panel to offer.
+        panel: false,
       })
     }
     expect(
       liveControls(session({ status: 'ended' }), null, false, false).primary.action,
     ).toBe('start')
     // An ended session still has a transcript worth opening.
-    expect(liveControls(session({ status: 'ended' }), null, false, false).overlay).toBe(
+    expect(liveControls(session({ status: 'ended' }), null, false, false).panel).toBe(
       true,
     )
     // …but nothing to pause: the conversation is over.
@@ -56,7 +56,7 @@ describe('liveControls', () => {
       primary: { label: 'End', action: 'stop', disabled: false },
       secondary: null,
       pause: { label: 'Pause', action: 'pause', disabled: false },
-      overlay: true,
+      panel: true,
     })
   })
 
@@ -70,7 +70,7 @@ describe('liveControls', () => {
       // A browser that never joined is already silent — there is nothing here
       // for a pause to stop, and `Listen` is the press that belongs there.
       pause: null,
-      overlay: true,
+      panel: true,
     })
   })
 
@@ -81,17 +81,17 @@ describe('liveControls', () => {
       primary: { label: 'Going live…', action: 'stop', disabled: true },
       secondary: null,
       pause: null,
-      overlay: false,
+      panel: false,
     })
     // Not even the join is offered mid-press to a browser that never had a
     // gesture: whichever way this call goes, the answer decides which control
-    // belongs here. The popup stays either way — the transcript is still
+    // belongs here. The panel stays either way — the transcript is still
     // worth reading while the session ends.
     expect(liveControls(session(), 'stop', false, false)).toEqual({
       primary: { label: 'Ending…', action: 'start', disabled: true },
       secondary: null,
       pause: null,
-      overlay: true,
+      panel: true,
     })
     expect(liveControls(session(), 'stop', true, false)).toEqual({
       primary: { label: 'Ending…', action: 'start', disabled: true },
@@ -99,7 +99,7 @@ describe('liveControls', () => {
       // Mid-press, even from a browser that is in the conversation: pausing
       // something that is on its way out is a press with nothing to mean.
       pause: null,
-      overlay: true,
+      panel: true,
     })
   })
 })
@@ -119,7 +119,7 @@ describe('liveControls, pausing', () => {
     // Pausing is not ending: the conversation is still running, so the primary
     // control still says so.
     expect(held.primary).toEqual({ label: 'End', action: 'stop', disabled: false })
-    expect(held.overlay).toBe(true)
+    expect(held.panel).toBe(true)
   })
 
   it('is offered nowhere else', () => {

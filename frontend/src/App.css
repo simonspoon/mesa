@@ -4,7 +4,7 @@
    a phantom column. */
 header {
   /* The positioning context for Live's centered talking indicator and its
-     conversation popup (mesa task 857). */
+     conversation panel (mesa task 857). */
   position: relative;
   display: flex;
   align-items: center;
@@ -8171,7 +8171,7 @@ button:focus-visible,
 
 /* Mesa Live (mesa tasks 855, 857): the conversation lives in the header — a
    control cluster on the right beside the plan-limit chips, a talking
-   indicator centered in the band while she speaks, and a popup transcript
+   indicator centered in the band while she speaks, and a transcript panel
    anchored under the header that opens and closes without touching the
    session. */
 .header-right {
@@ -8188,11 +8188,11 @@ button:focus-visible,
   flex: none;
 }
 
-/* The microphone chooser (mesa task 884). A <select>'s intrinsic width is its
-   widest <option>, and a device name is routinely longer than the whole live
-   cluster ("MacBook Pro Microphone (Built-in)"), so it is capped and allowed
-   to ellipsis rather than pushing the buttons off the header. Sized down to
-   sit as a setting beside presses rather than as one of them. */
+/* The microphone chooser (mesa task 884), in the conversation panel since
+   task 887. A <select>'s intrinsic width is its widest <option>, and a device
+   name is routinely longer than the row it sits in ("MacBook Pro Microphone
+   (Built-in)"), so it is capped and allowed to ellipsis rather than widening
+   the panel. */
 .live-input-choice {
   font-size: 0.75rem;
   padding: 0.2rem 0.3rem;
@@ -8215,7 +8215,7 @@ button:focus-visible,
   border-color: rgba(255, 180, 68, 0.5);
 }
 
-.live-overlay-toggle.live-open {
+.live-panel-toggle.live-open {
   color: var(--cyan);
   border-color: rgba(0, 229, 255, 0.5);
 }
@@ -8224,7 +8224,7 @@ button:focus-visible,
    the glyph instead of sitting it on a text baseline, and stretches to the
    height its lettered siblings set — otherwise the icon-only button rides
    short in the cluster. */
-.live-overlay-toggle {
+.live-panel-toggle {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -8241,7 +8241,7 @@ button:focus-visible,
 
 /* The conversation indicator (mesa task 874): five bars in the middle of the
    header band, in one of three states — mesa speaking, the person being heard,
-   or the microphone simply open. With the popup closed this is the only sign
+   or the microphone simply open. With the panel closed this is the only sign
    of either side talking, so which state it is has to read at a glance:
    colour carries who (cyan is mesa, green is the person, muted is nobody yet)
    and the motion carries how much is happening. Absolute against the header,
@@ -8377,34 +8377,69 @@ button:focus-visible,
   .live-talk-paused span { transform: scaleY(0.15); }
 }
 
-/* The conversation popup, anchored under the header's right edge. Absolute
-   against the header (which never scrolls), above the page but below every
-   modal. */
-.live-overlay {
-  position: absolute;
-  top: calc(100% + 0.5rem);
-  right: 1rem;
-  z-index: 1100;
-  width: min(420px, calc(100vw - 2rem));
-  max-height: 70vh;
+/* Where the hub portals its panel: a flex child of `.shell-body` that is not
+   itself a box. `display: contents` makes the panel inside the flex item, so
+   an empty slot — the frame before the portal lands, and every render where
+   the app has no header — takes no width at all. */
+.live-slot {
+  display: contents;
+}
+
+/* The conversation, as a right-hand sidebar (mesa task 887): a sibling of the
+   agents one, in the same flex row, so the two are independent and the page
+   is beside the conversation rather than under it. Mirrors `.agent-sidebar`
+   deliberately — same edge, same border, same sticky full-height box — since
+   they are two of a kind; it takes no drag handle, because a transcript and a
+   two-line box have no width worth choosing. The width is declared once here
+   and inherited by the body below, which has to repeat it (see there). */
+.live-sidebar {
+  /* `min`, not a flat 26rem: between the phone tier and a wide window there
+     is a band where 26rem is most of the row, and `main`'s floor is only
+     enforced against the agents sidebar's drag. 40vw keeps the conversation
+     a column rather than the page. */
+  --live-sidebar-width: min(26rem, 40vw);
+  flex: none;
+  width: var(--live-sidebar-width);
+  position: sticky;
+  top: 0;
+  /* Fills the shell-body's definite height — see `.sidebar`. */
+  height: 100%;
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: rgba(6, 10, 16, 0.6);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.15s;
+}
+
+/* Closed is a zero-width clip, never `display: none` or `visibility: hidden`:
+   the capture box inside must keep its focus — and the dictation flowing into
+   it — while the panel is shut (`liveCapture.ts`). Both of those would take
+   the focus away; clipping the aside leaves the box rendered and focusable,
+   exactly as the popup's `clip-path` did. */
+.live-sidebar.collapsed {
+  width: 0;
+  border-left: none;
+}
+
+/* Held at the open width even while the aside clips to nothing, so the
+   transcript and the box do not reflow on every open/close — the same trick,
+   for the same reason, as `.agent-sidebar-body`. */
+.live-sidebar-body {
+  flex: 1;
+  min-height: 0;
+  width: var(--live-sidebar-width);
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
   padding: 0.75rem;
-  background: var(--bg);
-  border: 1px solid var(--border-bright);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
-/* Closed is clipped, never `display: none` or `visibility: hidden`: the
-   capture box inside must keep its focus — and the dictation flowing into it
-   — while the popup is shut (`liveCapture.ts`). */
-.live-overlay.live-closed {
-  clip-path: inset(50%);
+.live-sidebar.collapsed .live-sidebar-body {
   pointer-events: none;
 }
 
-.live-overlay-head {
+.live-sidebar-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -8412,7 +8447,7 @@ button:focus-visible,
   font-size: 0.85rem;
 }
 
-.live-overlay-close {
+.live-sidebar-close {
   flex: none;
   background: none;
   border: none;
@@ -8423,15 +8458,15 @@ button:focus-visible,
   cursor: pointer;
 }
 
-.live-overlay-close:hover {
+.live-sidebar-close:hover {
   color: var(--fg);
 }
 
 /* The conversation itself: the one scrolling part, so a long exchange never
-   pushes the composer off the bottom of the popup. */
+   pushes the composer off the bottom of the panel. */
 .live-transcript {
   flex: 1 1 auto;
-  min-height: 6rem;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -8497,6 +8532,28 @@ button:focus-visible,
   gap: 0.35rem;
 }
 
+/* How mesa hears this room (mesa task 887): the switch and the microphone it
+   listens through, above the box rather than in the header — they are
+   settings on the input, read where the person decides whether to talk. */
+.live-listen-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* Listening is a state, not just a press — the same deal `.live-toggle.live-on`
+   gets, in the colour of the side of the conversation it belongs to: cyan is
+   the person. */
+.live-listen {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+}
+
+.live-listen.live-on {
+  color: var(--cyan);
+  border-color: rgba(0, 229, 255, 0.5);
+}
+
 .live-input {
   width: 100%;
   resize: vertical;
@@ -8515,7 +8572,7 @@ button:focus-visible,
   color: var(--muted);
 }
 
-/* Phone: the popup takes the width, and the header is allowed to wrap
+/* Phone: the panel becomes a drawer, and the header is allowed to wrap
    (docs/mobile.md — CSS only, no new matchMedia). Brand + three live buttons
    + two usage chips overrun a 390px viewport, and #root is overflow:hidden —
    without the wrap the rightmost controls would clip clean off the screen. */
@@ -8541,20 +8598,46 @@ button:focus-visible,
   }
 
   /* The live cluster is one item of `.header-right`, so its own contents do
-     not wrap with it: at 390px the microphone chooser (mesa task 884) alone
-     is enough to push the usage chips off the screen edge, which is the exact
-     clipping the wrap above exists to prevent. Wrapping it too is what keeps
-     every control reachable once the cluster grows. */
+     not wrap with it: at 390px its presses alone are enough to push the usage
+     chips off the screen edge, which is the exact clipping the wrap above
+     exists to prevent. Wrapping it too is what keeps every control reachable
+     as the cluster grows. */
   .live-hub {
     flex-wrap: wrap;
     justify-content: flex-end;
     row-gap: 0.3rem;
   }
 
-  .live-overlay {
-    left: 0.5rem;
-    right: 0.5rem;
-    width: auto;
+  /* The conversation takes the same drawer treatment as the agents sidebar
+     beside it: a fixed overlay on the right edge, clipped to nothing when
+     shut (never `display: none` — the capture box keeps its focus on every
+     tier). */
+  .live-sidebar.collapsed {
+    width: 0;
+    border-left: none;
+  }
+
+  /* Both right-edge drawers are the same rectangle on a 390px screen, so one
+     of them has to be on top, and it is this one: the conversation is holding
+     the keyboard and sending what is typed into it, and a drawer that is
+     doing that while invisible underneath another is the one genuinely wrong
+     outcome. Its close button is on top with it, so the agents drawer is one
+     press away. */
+  .live-sidebar:not(.collapsed) {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: min(24rem, 90vw);
+    height: calc(var(--phone-shell-height) - var(--phone-tabbar-reserve));
+    z-index: 1201;
+    background: rgba(6, 10, 16, 0.97);
+    border-left: 1px solid var(--border-bright);
+    box-shadow: -4px 0 24px rgba(0, 0, 0, 0.6);
+  }
+
+  .live-sidebar:not(.collapsed) .live-sidebar-body {
+    width: 100%;
+    padding: 0.5rem 0.5rem 0.75rem;
   }
 
   .live-transcript {

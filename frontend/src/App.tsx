@@ -45,7 +45,8 @@ import { useVisualViewportHeightVar } from './visualViewport'
 // mounted for the life of the app, because a live turn may `navigate` this
 // browser somewhere else and the conversation has to survive the navigation
 // it just performed. `#/live` survives only as a verb — LiveHub intercepts it,
-// opens the conversation popup and puts the hash back.
+// opens the conversation panel — a right-hand sidebar since task 887,
+// portalled into the `.live-slot` below — and puts the hash back.
 //
 // Every project-tab and #/cc route is *recorded* browser-local as the last
 // view (`lastView.ts`), so the nav's project and CC Dashboard links reopen it.
@@ -144,6 +145,11 @@ function App() {
   // Bumped after project create/rename/delete so the sidebar refetches.
   const [navVersion, setNavVersion] = useState(0)
   const [paletteOpen, setPaletteOpen] = useState(false)
+  // The element LiveHub portals its conversation panel into (mesa task 887).
+  // State written by a ref callback, not read out of the DOM: the slot is
+  // rendered in this same commit, so it does not exist while the hub above is
+  // rendering, and the ref landing is what says it does now.
+  const [liveSlot, setLiveSlot] = useState<HTMLDivElement | null>(null)
   useCommandPaletteShortcut(() => setPaletteOpen(true))
   // h/j/k/l + arrow-key spatial focus nav (mesa spec 449 story 454): a
   // second global window keydown listener, disjoint key set from the
@@ -541,6 +547,7 @@ function App() {
               Both flags live here already — the phone tab bar writes the same
               two — so the hub relays the request rather than owning it. */}
           <LiveHub
+            slot={liveSlot}
             onSidebars={(collapsed) => {
               setNavCollapsed(collapsed)
               setAgentsCollapsed(collapsed)
@@ -579,8 +586,17 @@ function App() {
             <TerminalPage />
           </div>
         </div>
+        {/* Where LiveHub portals its conversation panel (mesa task 887). The
+            hub itself stays in the header — everything that makes it work is
+            anchored there — but the panel is a right-hand sidebar, a sibling
+            of the agents one, so the two can be open together, singly, or not
+            at all. A slot rather than the panel itself because the state is
+            all the hub's; `display: contents`, so the panel is the flex item
+            and an empty slot takes no room. */}
+        <div className="live-slot" ref={setLiveSlot} />
         <AgentSidebar
           activeProjectId={activeProjectId}
+          liveSlot={liveSlot}
           collapsed={agentsCollapsed}
           onCollapsedChange={setAgentsCollapsed}
         />

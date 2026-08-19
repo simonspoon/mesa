@@ -62,11 +62,11 @@ export interface LiveControls {
    */
   pause: LiveButton | null
   /**
-   * Whether the header offers the conversation-popup toggle at all: there is a
+   * Whether the header offers the conversation-panel toggle at all: there is a
    * session — running, or ended with a transcript still worth reading. With no
    * session there is nothing to show, and the button would open an empty box.
    */
-  overlay: boolean
+  panel: boolean
 }
 
 /**
@@ -87,9 +87,9 @@ export function liveControls(
   unlocked: boolean,
   paused: boolean,
 ): LiveControls {
-  // The popup is about the transcript, not the press: it stays offered for as
+  // The panel is about the transcript, not the press: it stays offered for as
   // long as there is a session to read, in-flight presses included.
-  const overlay = session !== null
+  const panel = session !== null
   // The press in flight decides the label, not the session: starting takes a
   // spawn, so between the click and the session landing the button would
   // otherwise still read "Go live" and invite a second one.
@@ -100,7 +100,7 @@ export function liveControls(
       // Nothing to step out of yet, and a press mid-spawn would be pausing a
       // conversation that has not started saying anything.
       pause: null,
-      overlay,
+      panel,
     }
   }
   if (pending === 'stop') {
@@ -108,7 +108,7 @@ export function liveControls(
       primary: { label: 'Ending…', action: 'start', disabled: true },
       secondary: null,
       pause: null,
-      overlay,
+      panel,
     }
   }
   if (!isLive(session)) {
@@ -116,7 +116,7 @@ export function liveControls(
       primary: { label: 'Go live', action: 'start', disabled: false },
       secondary: null,
       pause: null,
-      overlay,
+      panel,
     }
   }
   // Live, and this browser is in it: the one situation where stepping out for
@@ -129,12 +129,12 @@ export function liveControls(
       : { label: 'Pause', action: 'pause', disabled: false }
     : null
   const end: LiveButton = { label: 'End', action: 'stop', disabled: false }
-  if (unlocked) return { primary: end, secondary: null, pause, overlay }
+  if (unlocked) return { primary: end, secondary: null, pause, panel }
   return {
     primary: { label: 'Listen', action: 'listen', disabled: false },
     secondary: end,
     pause,
-    overlay,
+    panel,
   }
 }
 

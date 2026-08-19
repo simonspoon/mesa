@@ -785,10 +785,25 @@ function SplitNodeView({
  * a collapse/expand cycle with no reconnect, exactly like leaving the tab
  * and coming back — now true for every open pane, not just one.
  */
+/** How much of the row between `main`'s left edge and the viewport's right one
+ * is already spoken for by the live conversation's sidebar (mesa task 887) —
+ * a permanent sibling that sits between `main` and this one, so the space it
+ * takes is not space this panel may claim. Zero while it is shut, which is
+ * every measurement made before that feature existed — and zero on the phone
+ * tier, where it is an overlay drawer (`position: fixed`) taking no room on
+ * the row at all: subtracting it there would narrow this panel by a box that
+ * is not in the layout, and the shrink is never given back. */
+function liveSidebarWidth(): number {
+  const live = document.querySelector('.live-sidebar')
+  if (live === null || getComputedStyle(live).position === 'fixed') return 0
+  return live.getBoundingClientRect().width
+}
+
 export function AgentSidebar({
   activeProjectId,
   collapsed,
   onCollapsedChange,
+  liveSlot,
 }: {
   activeProjectId: number | null
   // Owned by `App.tsx` since mesa task 556: the phone tab bar's "Agents" slot
@@ -797,6 +812,11 @@ export function AgentSidebar({
   // React tree, which is what lets every open pane's WebSocket survive it.
   collapsed: boolean
   onCollapsedChange: (collapsed: boolean) => void
+  /** Where the live conversation's panel is portalled (mesa task 887). Read
+   *  for one thing only: this panel's width clamp has to know when that one
+   *  opens, and the element it renders does not exist until App's own ref has
+   *  landed. `null` until then. */
+  liveSlot: HTMLElement | null
 }) {
   const setCollapsed = onCollapsedChange
   // Split tree holding every open AGENT pane + how each split's children
@@ -951,7 +971,7 @@ export function AgentSidebar({
     const onMove = (e: MouseEvent) => {
       const next = window.innerWidth - e.clientX
       const mainLeft = document.querySelector('main')?.getBoundingClientRect().left ?? 0
-      const max = window.innerWidth - mainLeft - MIN_MAIN_WIDTH
+      const max = window.innerWidth - mainLeft - MIN_MAIN_WIDTH - liveSidebarWidth()
       setWidth(clampAgentSidebarWidth(next, max))
     }
     const onUp = () => setResizing(false)
@@ -979,14 +999,29 @@ export function AgentSidebar({
     if (collapsed) return
     const clampToLayout = () => {
       const mainLeft = document.querySelector('main')?.getBoundingClientRect().left ?? 0
-      const max = window.innerWidth - mainLeft - MIN_MAIN_WIDTH
+      const max = window.innerWidth - mainLeft - MIN_MAIN_WIDTH - liveSidebarWidth()
       // `Math.min` on top of the clamp is the only-shrink rule: the clamp
       // alone would also *raise* a sub-floor width, which is not this
       // effect's business.
       setWidth((w) => Math.min(w, clampAgentSidebarWidth(w, max)))
     }
     clampToLayout()
-  }, [collapsed])
+    // The live conversation's sidebar opening is the other way this panel's
+    // room disappears (mesa task 887): it is a sibling on the same row, it
+    // opens from a press nothing here can see, and `main`'s floor is as real
+    // then as it is on an expand. Observing its box answers both — the open
+    // and the close — with one subscription, and the clamp above may only
+    // shrink, so the frames of its width transition cost nothing.
+    const live = liveSlot?.querySelector('.live-sidebar') ?? null
+    if (live === null) return
+    const ro = new ResizeObserver(() => clampToLayout())
+    ro.observe(live)
+    return () => ro.disconnect()
+    // `liveSlot` is a dependency rather than a query of the document: the
+    // panel is portalled in, so it does not exist on the first commit, and an
+    // effect that looked for it then would silently never observe anything —
+    // working only because this panel happens to start collapsed.
+  }, [collapsed, liveSlot])
 
   // List-rail drag-resize (mesa task 414): the handle sits on the rail's own
   // left edge, so the new width is the distance from the pointer to the

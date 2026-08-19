@@ -5,7 +5,7 @@ import type { ConfigLive } from './types/ConfigLive'
  * (mesa task 857).
  *
  * While a conversation is live, system dictation types into one capture box in
- * the header's conversation popup — wherever the app has navigated, since a
+ * the header's conversation panel — wherever the app has navigated, since a
  * `navigate` turn is mesa's doing and the words that follow it are still meant
  * for mesa, not for whatever field the new page focused. That means the box
  * must *hold* focus, and holding focus is a fight this module referees: the
@@ -86,7 +86,7 @@ export function isEditableTarget(tag: string | null, contentEditable: boolean): 
 
 /**
  * The moments capture may (re)take focus — all of them mesa's own actions.
- * `hub-press` is a click on the hub's own controls (the popup toggle, its
+ * `hub-press` is a click on the hub's own controls (the panel toggle, its
  * close button): the person pressing mesa's buttons is handing the keyboard
  * back to mesa, not taking it away.
  */

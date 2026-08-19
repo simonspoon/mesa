@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   captureHint,
   isBlockingError,
+  isListenChord,
   readResults,
   recognitionCtor,
   recognizesSpeech,
@@ -51,6 +52,7 @@ describe('recognizesSpeech', () => {
     supported: true,
     blocked: false,
     paused: false,
+    muted: false,
   } as const
 
   it('is the way in while the conversation is live in a browser that joined it', () => {
@@ -62,6 +64,14 @@ describe('recognizesSpeech', () => {
     expect(recognizesSpeech({ ...open, joined: false })).toBe(false)
     expect(recognizesSpeech({ ...open, supported: false })).toBe(false)
     expect(recognizesSpeech({ ...open, blocked: true })).toBe(false)
+  })
+
+  it('is not the way in while the person has muted the microphone', () => {
+    // The person's own switch (mesa task 887). Unlike a pause the conversation
+    // carries on — mesa still speaks and the typed box still works — so the
+    // capture rules must see it and take the keyboard back.
+    expect(recognizesSpeech({ ...open, muted: true })).toBe(false)
+    expect(shouldListen({ ...open, muted: true, speaking: false })).toBe(false)
   })
 
   it('is not the way in while the person has stepped out', () => {
@@ -89,6 +99,7 @@ describe('shouldListen', () => {
     supported: true,
     blocked: false,
     paused: false,
+    muted: false,
     speaking: false,
   } as const
 
@@ -118,6 +129,10 @@ describe('shouldListen', () => {
 
   it('never listens while the conversation is paused', () => {
     expect(shouldListen({ ...open, paused: true })).toBe(false)
+  })
+
+  it('never listens while the microphone is muted', () => {
+    expect(shouldListen({ ...open, muted: true })).toBe(false)
   })
 })
 
@@ -216,8 +231,40 @@ describe('utteranceFrom', () => {
   })
 })
 
+describe('isListenChord', () => {
+  const chord = { metaKey: true, ctrlKey: false, shiftKey: true, altKey: false, key: 'l' }
+
+  it('is the chord under either platform modifier', () => {
+    expect(isListenChord(chord)).toBe(true)
+    expect(isListenChord({ ...chord, metaKey: false, ctrlKey: true })).toBe(true)
+  })
+
+  it('reads the shifted key the browser actually reports', () => {
+    // Shift is held, so the key arrives capitalised on most layouts.
+    expect(isListenChord({ ...chord, key: 'L' })).toBe(true)
+  })
+
+  it('is not a bare L — the capture box is holding the keyboard', () => {
+    expect(isListenChord({ ...chord, metaKey: false })).toBe(false)
+    expect(isListenChord({ ...chord, shiftKey: false })).toBe(false)
+  })
+
+  it('leaves a different chord that happens to end in L alone', () => {
+    expect(isListenChord({ ...chord, altKey: true })).toBe(false)
+    expect(isListenChord({ ...chord, key: 'k' })).toBe(false)
+  })
+})
+
 describe('captureHint', () => {
-  const base = { supported: true, blocked: false, listening: false, paused: false }
+  const base = {
+    live: true,
+    joined: true,
+    supported: true,
+    blocked: false,
+    listening: false,
+    paused: false,
+    muted: false,
+  }
 
   it('says so where the browser cannot listen', () => {
     expect(captureHint({ ...base, supported: false })).toMatch(/cannot listen/)
@@ -236,7 +283,28 @@ describe('captureHint', () => {
   })
 
   it('offers the microphone before the conversation starts', () => {
-    expect(captureHint(base)).toMatch(/Go live/)
+    expect(captureHint({ ...base, live: false })).toMatch(/Go live/)
+  })
+
+  it('names the press that joins a conversation this browser has not joined', () => {
+    expect(captureHint({ ...base, joined: false })).toMatch(/Press Listen/)
+    // Above the mute, since the switch is not offered until this browser is in
+    // the conversation — naming the chord there names something inert.
+    expect(captureHint({ ...base, joined: false, muted: true })).toMatch(/Press Listen/)
+  })
+
+  it('a page with no conversation is not told to un-mute one', () => {
+    // The switch starts muted, so without this rank the muted line is what
+    // every cold page would say — under a placeholder telling them to go live.
+    expect(captureHint({ ...base, live: false, muted: true })).toMatch(/Go live/)
+  })
+
+  it('names the chord that unmutes the microphone', () => {
+    expect(captureHint({ ...base, muted: true })).toMatch(/Shift\+L/)
+  })
+
+  it('a refusal outranks a mute — one of the two is the person\'s to undo', () => {
+    expect(captureHint({ ...base, muted: true, blocked: true })).toMatch(/refused/)
   })
 
   it('names the press that undoes a pause, above every other line', () => {

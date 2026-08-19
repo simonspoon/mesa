@@ -93,6 +93,15 @@ export function recognitionCtor(
  * being the way in *at all* — the capture rules and the hint must see it, and
  * unlike a reply it does not end on its own.
  *
+ * `muted` is the person's own switch on the microphone (mesa task 887), and it
+ * belongs here for the same reason again: a muted page is one where the
+ * microphone is not the way in, so the capture box takes the keyboard back and
+ * the hint says to type. It starts **muted** — a browser that opens the
+ * microphone the moment a conversation starts is listening to the room for the
+ * whole of it, and the person has to be the one who asks for that. It is deliberately not
+ * `paused`: muting stops mesa hearing this room while she keeps talking and
+ * the typed box keeps working, where pausing stops the whole run.
+ *
  * This, and not `shouldListen`, is what the capture box's two rules stand down
  * for (`liveCapture.ts`) and what the composer's hint reports. Those are
  * questions about *how the person is talking to mesa*, and the answer must not
@@ -106,8 +115,17 @@ export function recognizesSpeech(input: {
   blocked: boolean
   /** The person stepped out of the conversation (mesa task 882). */
   paused: boolean
+  /** The person turned the microphone off (mesa task 887). */
+  muted: boolean
 }): boolean {
-  return input.live && input.joined && input.supported && !input.blocked && !input.paused
+  return (
+    input.live &&
+    input.joined &&
+    input.supported &&
+    !input.blocked &&
+    !input.paused &&
+    !input.muted
+  )
 }
 
 /**
@@ -124,6 +142,7 @@ export function shouldListen(input: {
   supported: boolean
   blocked: boolean
   paused: boolean
+  muted: boolean
   speaking: boolean
 }): boolean {
   return recognizesSpeech(input) && !input.speaking
@@ -191,11 +210,58 @@ export function utteranceFrom(text: string): string | null {
 }
 
 /**
+ * The chord that turns the microphone on and off (mesa task 887), as a
+ * predicate over the keystroke rather than a check inside the hub — it is a
+ * rule about which keystroke belongs to the conversation, which is exactly the
+ * kind of thing that is wrong in a component and testable here.
+ *
+ * A **chord**, not a single key, and for the reason `keyboardScope.ts` sets
+ * out: the capture box holds the keyboard for most of a conversation, so a
+ * single-key shortcut would be typed into the box rather than pressed. That is
+ * also why it cannot consult `shouldIgnoreShortcut` — that predicate's first
+ * rule is "a modifier chord belongs to its existing owner" — and why it is the
+ * hub's own listener, in the shape of the command palette's.
+ *
+ * Both modifiers are accepted because the platform differs (Cmd on a Mac,
+ * Ctrl elsewhere), the same way the palette's does; Alt is not, so a
+ * different chord that happens to end in L is not this one.
+ */
+export function isListenChord(e: {
+  metaKey: boolean
+  ctrlKey: boolean
+  shiftKey: boolean
+  altKey: boolean
+  key: string
+}): boolean {
+  if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.altKey) return false
+  return e.key.toLowerCase() === 'l'
+}
+
+/** How the chord is written wherever the page names it. One string for both
+ * platforms rather than a detected one: it is read next to the control it
+ * describes, and being told which half is yours is cheaper than mesa guessing
+ * wrong about a keyboard it cannot see. */
+export const LISTEN_CHORD = '⌘/Ctrl+Shift+L'
+
+/**
  * What the composer says about listening — one line, always present, because
  * "is it hearing me" is the only question a hands-free surface has to answer
- * without being asked. The five states are the five honest ones: the person
- * paused it, this browser cannot listen, the microphone was refused, it is
- * listening, or the conversation has not started yet.
+ * without being asked. The six states are the six honest ones: the person
+ * paused it, this browser cannot listen, the microphone was refused, the
+ * conversation has not started yet, the person muted it, or it is listening.
+ *
+ * The two states above muted are the two presses that have to come first — a
+ * conversation to listen to, and this browser joined to it, since the switch
+ * is not even offered until both are true.
+ *
+ * Muted ranks under refused and above listening (mesa task 887): a microphone
+ * the browser will not give mesa is not one the person can un-mute, so saying
+ * that first is the only line naming something they can act on. It ranks
+ * under `live` too, and has to: the switch starts muted, so without that the
+ * muted line would be what *every* page said before its first press — a
+ * composer telling the reader to un-mute a conversation that has not started,
+ * under a placeholder telling them to go live. The offer to start is the
+ * older, truer line, and it stays the one a cold page shows.
  *
  * `listening` here is `recognizesSpeech`, not whether the engine is running
  * this second: a line that says "listening" and then "go live" and then
@@ -210,10 +276,16 @@ export function utteranceFrom(text: string): string | null {
  * do right now, and names the press that changes that.
  */
 export function captureHint(input: {
+  /** There is a conversation running (the hub's `live`). */
+  live: boolean
+  /** This browser has had its press (the hub's `unlocked`). */
+  joined: boolean
   supported: boolean
   blocked: boolean
   listening: boolean
   paused: boolean
+  /** The person turned the microphone off (mesa task 887). */
+  muted: boolean
 }): string {
   if (input.paused) {
     return 'Paused. Press Resume to talk to mesa again — the conversation is still running.'
@@ -224,8 +296,22 @@ export function captureHint(input: {
   if (input.blocked) {
     return 'The microphone was refused, so mesa is not listening. Type here, or use your system dictation — a settled line is sent on its own.'
   }
+  if (!input.live) {
+    return 'Go live and mesa listens through this browser. You can also type here, or use your system dictation.'
+  }
+  if (!input.joined) {
+    // Live somewhere, but not here: the microphone cannot open until this
+    // browser has had a gesture, and the switch is not even offered yet — so
+    // naming the chord would be naming something that does nothing.
+    return 'Press Listen to join the conversation on this browser. You can also type here, or use your system dictation.'
+  }
+  if (input.muted) {
+    return `mesa is not listening. Press ${LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
+  }
   if (input.listening) {
     return 'Listening — each finished sentence is sent as you say it, and mesa stops listening while she is speaking. You can still type here.'
   }
-  return 'Go live and mesa listens through this browser. You can also type here, or use your system dictation.'
+  // Joined, unmuted, and still not the way in — nothing left that is worth a
+  // line of its own; the box is the way in and says so.
+  return 'Type here, or use your system dictation — a settled line is sent on its own.'
 }

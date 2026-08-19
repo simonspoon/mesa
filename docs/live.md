@@ -8,12 +8,14 @@ group, `/api/live*`, and the header's conversation hub (`LiveHub`).
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
 
-- **Person → mesa is text, recognised in the browser.** While a session is live
-  and this browser has joined it, the page opens the microphone through the
+- **Person → mesa is text, recognised in the browser.** While a session is live,
+  this browser has joined it and the person has **asked** it to listen (task
+  887 — the microphone starts off), the page opens the microphone through the
   browser's **own** speech recognition (`SpeechRecognition` /
   `webkitSpeechRecognition`) and posts each *final* result as a `user` turn
-  (task 873). The hub's popup also has a plain `<textarea>`, which is the
-  fallback wherever recognition is not on offer: a browser without it (Firefox
+  (task 873). The conversation panel also has a plain `<textarea>`, which is
+  the way in whenever the microphone is not: it is muted, or recognition is not
+  on offer at all — a browser without it (Firefox
   today), or a refused microphone. There the person's *own* system dictation
   (macOS Dictation, a phone keyboard's mic key, or their fingers) types into it,
   exactly as before. Either way, **mesa ships no speech-to-text of its own,
@@ -394,8 +396,10 @@ the same reason.
 
 The conversation lives in the **header**, not on a page: a control cluster on
 the right, beside the plan-limit chips, on every route. There is no left-nav
-row and no routed page. `#/live` survives only as a **verb** — the hub
-intercepts it, opens the conversation popup and puts the hash back to wherever
+row and no routed page. The *panel* it opens is a right-hand sidebar (task 887,
+below), but the component stays in the header — everything that makes it work
+is anchored there. `#/live` survives only as a **verb** — the hub
+intercepts it, opens the conversation panel and puts the hash back to wherever
 the person last was (via `location.replace`, so the `#/live` entry never
 lands in history and Back is never trapped on it; the route report also skips
 the transient `#/live` hash) — which is what keeps the agent's existing
@@ -409,7 +413,7 @@ conversation") working with no backend change.
   reports below.
 - **A five-bar indicator sits centered in the header band, in one of four
   states** (`liveIndicator.ts`, tasks 874 and 882) — the only sign of the conversation
-  while the popup is closed, so it answers for *both* sides of it rather than
+  while the panel is closed, so it answers for *both* sides of it rather than
   only for mesa:
   - **mesa speaking** (cyan) — the loudest of the four, and deliberately not
     one wave: each bar runs its own keyframes at its own awkward duration, so
@@ -437,26 +441,59 @@ conversation") working with no backend change.
   All four freeze under `prefers-reduced-motion` — the same rule as
   `.live-dot`'s pulse — to steady bars whose heights keep the ranking the
   motion carried.
-- **The popup opens and closes without touching the session.** A speech-bubble
+- **The conversation is a right-hand sidebar** (task 887), a sibling of the
+  agents one in `.shell-body`'s flex row, so the two are independent: both open
+  at once, either alone, or neither — and the page the conversation is *about*
+  sits beside it rather than under it, which a popup hanging off the header
+  could not do. Only the rendered panel moves; the hub itself stays in the
+  header, because everything that makes it work is anchored there (mounted for
+  the life of the app, one `<audio>`, a capture box that must never unmount).
+  So the panel is **portalled** into a `.live-slot` div App renders just before
+  `<AgentSidebar>`, and the slot reaches the hub as a `slot` prop written by a
+  ref callback rather than being looked up: App renders it in the same commit
+  as the hub, so there is nothing to find until the ref lands. The slot is
+  `display: contents`, so an empty one takes no width. On the phone tier the
+  panel is a fixed right-edge drawer, mirroring `.agent-sidebar`'s — the same
+  rectangle as it, so one of them has to be on top and it is this one
+  (`z-index: 1201`, one above the agents drawer): the conversation is holding
+  the keyboard and sending what is typed into it, and a drawer doing that
+  invisibly underneath another is the one genuinely wrong outcome. Its close
+  button rides on top with it, so the agents drawer is one press away.
+
+  Being a sibling on that row is also the **agents panel's** business, since
+  the room it may claim is now shared. Its width clamp subtracts
+  `liveSidebarWidth()` — the conversation's box, or **0** when that box's
+  computed `position` is `fixed`, because the phone-tier drawer takes no room
+  on the row at all and the clamp is only-shrink, so a width wrongly given
+  away is never given back. The clamp's `ResizeObserver` answers both the open
+  and the close with one subscription, and it depends on a `liveSlot` prop App
+  passes down rather than a query of the document: the panel is portalled in,
+  so it does not exist on the first commit, and an effect that looked for it
+  then would silently never observe anything.
+- **The panel opens and closes without touching the session.** A speech-bubble
   toggle sits beside the live button whenever there is a session at all —
   running, or ended with a transcript still worth reading
-  (`liveControls().overlay`) — and holds the status line, the transcript and
-  the capture box. Closing it calls no route; only `End` ends the
-  conversation. The closed state hides by **clipping**, never `display: none`
-  or `visibility: hidden`, so the capture box inside keeps its focus — and the
-  dictation flowing into it — while the popup is shut.
-- **While joined, the browser listens** (`liveRecognition.ts`, the tested
-  module for all of this — task 873). Two questions, deliberately not one:
+  (`liveControls().panel`) — and the panel holds the status line, the
+  transcript, the listen row and the capture box. Closing it calls no route;
+  only `End` ends the conversation. The closed state is a **zero-width clip**
+  on the aside, never `display: none` or `visibility: hidden` — the same
+  decision the popup's `clip-path` was, for the same reason: the capture box
+  inside keeps its focus, and the dictation flowing into it, while the panel
+  is shut.
+- **While joined and unmuted, the browser listens** (`liveRecognition.ts`, the
+  tested module for all of this — task 873). Two questions, deliberately not
+  one:
   - `recognizesSpeech` — is the microphone the way in *at all*: the session is
     live, *this* browser has had its press (`unlocked` — the gesture that
     unlocks audio is the one that may open a microphone), the browser has a
-    recognizer, the microphone was not refused, and the person has not
+    recognizer, the microphone was not refused, the person has not
     **paused** (task 882 — a pause does not end on its own, so unlike a reply
-    it belongs to this question rather than to the one below).
+    it belongs to this question rather than to the one below), and they have
+    not **muted** it (task 887 — likewise something only they undo).
   - `shouldListen` — that, **and mesa is not speaking**. The microphone would
     otherwise hear her own reply out of the speakers and answer it, so speech
-    is a gate on listening rather than a separate mute, and the microphone
-    reopens when she stops.
+    gates the engine's lifecycle from below rather than sitting beside the
+    person's own switch above it, and the microphone reopens when she stops.
 
   Everything *about the person's input method* reads the first — the capture
   box's two rules, the composer's hint — and only the recognizer's own
@@ -464,6 +501,50 @@ conversation") working with no backend change.
   looks like a shortcut: mesa speaks for most of the conversation's wall time,
   so a focus fight or an auto-send deadline that re-arms itself while she
   talks is decided by playback timing rather than by any rule.
+  - **Listening is the person's own switch, and it starts off** (task 887).
+    `muted` is an input to `recognizesSpeech` for the same reason `paused` is:
+    a muted page is one where the microphone is not the way in, so the capture
+    box takes the keyboard back and the hint says to type. It starts muted
+    because a page that opens the microphone the moment a conversation starts
+    is listening to the room for the whole of it, and asking for that has to be
+    the person's own act. It is toggled by **⌘/Ctrl+Shift+L** (`isListenChord`,
+    named once as `LISTEN_CHORD` wherever the page writes it) or by the
+    `listen`/`listening` button in the panel's listen row — which is offered
+    on the same terms as Pause (live, this browser joined, a recognizer, the
+    microphone not refused), because a button reading "listening" before the
+    conversation has started claims something that is not happening, and a
+    browser that cannot open a microphone at all has nothing for the switch to
+    do (the hint below says which of the two it is). Like the close button, it
+    and the microphone `<select>` beside it carry `tabIndex={open ? undefined
+    : -1}`: the shut panel is a zero-width clip, and `pointer-events: none`
+    stops the mouse but not a Tab, so an invisible control that toggles the
+    microphone on Enter is worse than one nobody can reach. A **chord**, not a
+    key, for the reason `keyboardScope.ts` gives: the capture box holds the
+    keyboard for most of a conversation, so a single-key shortcut would be
+    typed into the box instead of pressed — which is also why it cannot consult
+    `shouldIgnoreShortcut` (whose first rule is that a modifier chord belongs
+    to its existing owner) and why it is the hub's own window listener, in the
+    shape of the command palette's, always `preventDefault`.
+
+    Like pause, it is **browser-side and this browser's alone**: no route, no
+    column, no CLI verb, and the agent is never told. Unlike pause, the
+    conversation carries on — mesa keeps speaking, `navigate` still moves the
+    page, the typed box still works — because muting stops mesa hearing *this
+    room*, where pausing stops this page's whole part in the run. A recognizer
+    final still pending when the microphone is shut is **dropped**, exactly as
+    a pause drops it and for the same reason: the person cut that sentence off
+    on purpose.
+
+    **Muting hands the keyboard back**, so both presses go through one
+    `toggleListening(next)` in the hub. It writes `listeningRef.current` for
+    the page the press *makes* before calling `reclaim('hub-press')` — the
+    effect that keeps that ref current only runs a render later, so read from
+    the handler it still holds the answer from before the press, and a mute
+    would leave the capture box unfocused at the exact moment typing became
+    the only way in. Identical, and for the identical reason, to
+    `togglePause`. Unmuting calls the same `reclaim`, which declines, as it
+    should: a recognized sentence reaches the conversation with the keyboard
+    anywhere.
   - **Only a final result is an utterance.** An interim result is the engine
     thinking out loud — shown as a preview under the capture box, in italics,
     and never sent. `readResults` splits one event into the two and answers how
@@ -489,7 +570,12 @@ conversation") working with no backend change.
     by the hub's own cleanup still fires its end; that echo is guarded, or
     ending a conversation would reopen the microphone it just closed.
   - **Which microphone is a browser-local choice, not a recognizer state**
-    (`liveDevices.ts`, mesa task 884). `SpeechRecognition.start()` grew an
+    (`liveDevices.ts`, mesa task 884). It sits in the panel's listen row beside
+    the listen button — task 887 moved it out of the header cluster and changed
+    nothing else about it, because which microphone and whether to use one at
+    all are two settings on the same thing, read at the moment the person is
+    deciding whether to talk or to type, and the header is where the press that
+    destroys the conversation lives. `SpeechRecognition.start()` grew an
     optional `MediaStreamTrack` argument — passing one is how a specific device
     is chosen, and passing none, which is what mesa always did, is still what
     every browser that has ever supported speech recognition understands. So
@@ -546,16 +632,29 @@ conversation") working with no backend change.
     nothing would reopen it: it names itself in the status line instead of
     going quiet, and the next change of the answer (mesa's next reply ending,
     most likely) tries again.
-  - **The composer always says which of the five it is** (`captureHint`, over
-    `recognizesSpeech`): the person paused it, this browser cannot listen, the
-    microphone was refused, it is listening, or the conversation has not
-    started — because
-    "is it hearing me" is the only question a hands-free surface has to answer
-    without being asked. That she pauses while she speaks is said *in* the
+  - **The composer always says which state it is in** (`captureHint`, over
+    `recognizesSpeech`), in this order: the person paused it, this browser
+    cannot listen, the microphone was refused, the conversation has not
+    started, this browser has not joined it (*"Press Listen to join the
+    conversation on this browser"* — those two presses have to come first,
+    since the switch is not even offered until both are done), the person
+    muted it, or it is listening — and the fall-through, joined and unmuted
+    and still not the way in, is the box saying it is the way in. There is
+    always a line because "is it hearing me" is the only question a hands-free
+    surface has to answer without being asked. That she pauses while she speaks is said *in* the
     listening line, rather than by the line flipping to "go live" on every
-    reply. The paused line outranks the other four and has to: the box is
+    reply. The paused line outranks every other and has to: the box is
     disabled while paused, so every other line would be inviting the person to
-    type into a field that will not take it.
+    type into a field that will not take it. The **muted** line ranks under
+    refused and above listening (task 887): a microphone the browser will not
+    give mesa is not one the person can un-mute, so saying that first is the
+    only line naming something they can act on — and the muted line names both
+    ways back, the chord and the button. It ranks **under `live`** and under
+    joined too, and has to: the switch starts muted, so without that input the muted line is
+    what every cold page says, telling the reader to un-mute a conversation
+    that has not started, under a placeholder telling them to go live. The
+    offer to start is the older, truer line, and it stays the one a cold page
+    shows.
 - **While joined *and not listening*, the capture box holds the keyboard**
   (`liveCapture.ts`, the tested module for all of this). With the microphone
   open, none of the rule below applies: the fight was always about *where the
@@ -605,7 +704,7 @@ conversation") working with no backend change.
   utterance twice. A line the server **refused** is put back in the box but
   marked, and is not auto-retried until edited — Enter is the deliberate way
   to try the same text again. A failed press (`Go live` on a machine with no
-  `claude`, most likely) **opens the popup**, because the error is the status
+  `claude`, most likely) **opens the panel**, because the error is the status
   line's to report and a failed start leaves no session for the header to
   hint with.
 - **The controls are a three-state toggle, not one button.** Nothing live:
@@ -627,7 +726,7 @@ conversation") working with no backend change.
   conversation* — the run halts **whole**, so nothing is spoken, nothing
   `navigate`s and no sidebar folds, and the microphone is shut
   (`recognizesSpeech`) with the capture box disabled beside it. The transcript
-  keeps accumulating and stays readable in the popup, which is the point:
+  keeps accumulating and stays readable in the panel, which is the point:
   pausing is how a person reads what was said instead of being talked at.
 
   Pausing silences the player through the same `silence()` that ending a
@@ -658,13 +757,13 @@ conversation") working with no backend change.
   conversation is running**, and the hub tracks it separately (`unlocked`).
   Until a press here, nothing is spoken, nothing navigates and nothing grabs
   the keyboard — the conversation may well be live on another device.
-- **The status line at the top of the popup says what is actually happening**,
+- **The status line at the top of the panel says what is actually happening**,
   and the last failure outranks everything: a line reading "listening" while
   the last call failed is the one way it can lie. It also calls out a live
   session with **no agent bound**, which would otherwise listen for ever and
   never answer.
-- The **capture textarea** carries a visible hint saying which of the four
-  listening states it is in, and that this is where the fallback typing (or
+- The **capture textarea** carries a visible hint saying which listening
+  state it is in, and that this is where the fallback typing (or
   system dictation) goes, wherever the app has navigated. Enter sends, Shift+Enter
   opens a line, and an `isComposing` guard keeps an IME's Enter out of it —
   the same composer contract as the Agent sidebar's chat box.
@@ -695,14 +794,16 @@ conversation") working with no backend change.
   four presses above, since "no session", "an ended session", "a session still
   starting" and "a session running in a browser with no gesture" are four
   different buttons and the label has to be right in each — plus the pause
-  control and where it is *not* offered, the popup toggle's `overlay` flag,
+  control and where it is *not* offered, the panel toggle's `panel` flag,
   and the status line, where paused ranks under the two not-live states and
   above everything the running conversation would otherwise say) and
   `frontend/src/liveCapture.ts` (the focus referee and the auto-send rule, and
   when both stand aside) and
   `frontend/src/liveRecognition.ts` (the two listening questions and why they
-  are two — and why a pause belongs to the first and a reply to the second —
-  which errors end listening, a result event's final text, its preview
+  are two — and why a pause and a mute belong to the first and a reply to the
+  second —
+  which errors end listening, whether a keystroke is the listen chord and how
+  the chord is written, a result event's final text, its preview
   and its high-water mark, what a settled result is worth sending, and the
   composer's hint) and
   `frontend/src/liveDevices.ts` (which microphones there are, whether two
@@ -765,6 +866,11 @@ CLAUDE.md requires: **data, never instructions.**
   verb, and the agent is never told. Two pages on one conversation therefore
   pause independently, which is the honest answer — the person at the paused
   one is not listening, and the other one still is.
+- **A server-side mute.** Listening is one browser's own switch (task 887),
+  like pause and for the same reason: no column, no route, no CLI verb, and the
+  agent is never told. Two pages on one conversation therefore listen
+  independently — which is honest, since only one of them is in the room with
+  the person talking.
 - **A per-session voice.** The voice is `speech.voice` in
   `~/.mesa/config.json`, read on every press, shared with the inbox.
 - **A per-session or server-side microphone.** Which device to listen through

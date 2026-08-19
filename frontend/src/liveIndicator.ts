@@ -1,7 +1,7 @@
 /**
  * What the header band shows about a live conversation (mesa task 874).
  *
- * The popup is shut for most of a conversation — that is the point of a
+ * The panel is shut for most of a conversation — that is the point of a
  * hands-free surface — so the header band is the only place either side of the
  * conversation is visible. Until now it said one thing: mesa is speaking. The
  * other half was invisible, and a person dictating into a page that shows

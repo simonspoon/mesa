@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   captureHint,
+  HELD_MAX,
+  heldFlush,
+  heldWith,
   isBlockingError,
   isListenChord,
   readResults,
@@ -228,6 +231,72 @@ describe('utteranceFrom', () => {
   it('sends nothing for a result the engine settled on with no words in it', () => {
     expect(utteranceFrom('')).toBe(null)
     expect(utteranceFrom('   \n ')).toBe(null)
+  })
+})
+
+describe('heldWith', () => {
+  it('joins each settled sentence onto the recording', () => {
+    let held = ''
+    for (const text of ['make a task', 'call it the header', 'in mesa']) {
+      const grown = heldWith(held, text)
+      expect(grown.flush).toBe(null)
+      held = grown.held
+    }
+    expect(held).toBe('make a task call it the header in mesa')
+  })
+
+  it('records nothing for a settled result with no words in it', () => {
+    expect(heldWith('so far', '   ')).toEqual({ held: 'so far', flush: null })
+    expect(heldWith('', '')).toEqual({ held: '', flush: null })
+  })
+
+  it('trims the sentence rather than the recording it joins', () => {
+    expect(heldWith('', '  make a task \n')).toEqual({ held: 'make a task', flush: null })
+  })
+
+  it('flushes on a sentence boundary once the cap is in the way', () => {
+    const held = 'x'.repeat(HELD_MAX - 3)
+    const grown = heldWith(held, 'and then')
+    expect(grown.flush).toBe(held)
+    expect(grown.held).toBe('and then')
+  })
+
+  it('holds everything that still fits', () => {
+    const held = 'x'.repeat(HELD_MAX - 'and then'.length - 1)
+    expect(heldWith(held, 'and then').flush).toBe(null)
+  })
+})
+
+describe('heldFlush', () => {
+  it('sends the recording with the sentence still being guessed at on the end', () => {
+    expect(heldFlush('make a task', 'call it the header')).toEqual([
+      'make a task call it the header',
+    ])
+  })
+
+  it('sends the recording alone when the engine had settled everything', () => {
+    expect(heldFlush('make a task', '')).toEqual(['make a task'])
+  })
+
+  it('sends the guess alone when it is all there is', () => {
+    expect(heldFlush('', 'make a task')).toEqual(['make a task'])
+  })
+
+  it('sends nothing when the microphone heard nothing', () => {
+    expect(heldFlush('', '')).toEqual([])
+    expect(heldFlush('  ', ' \n')).toEqual([])
+  })
+
+  it('splits rather than posting one turn over the cap', () => {
+    const held = 'x'.repeat(HELD_MAX - 3)
+    expect(heldFlush(held, 'and then')).toEqual([held, 'and then'])
+  })
+
+  it('keeps every flushed turn inside the cap', () => {
+    const held = 'x'.repeat(HELD_MAX - 3)
+    for (const text of heldFlush(held, 'and then')) {
+      expect(text.length).toBeLessThanOrEqual(HELD_MAX)
+    }
   })
 })
 

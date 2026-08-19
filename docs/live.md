@@ -14,8 +14,9 @@ design:
   this browser has joined it and the person has **asked** it to listen (task
   887 — the microphone starts off), the page opens the microphone through the
   browser's **own** speech recognition (`SpeechRecognition` /
-  `webkitSpeechRecognition`) and posts each *final* result as a `user` turn
-  (task 873). The conversation panel also has a plain `<textarea>`, which is
+  `webkitSpeechRecognition`), **holds** every *final* result, and posts the
+  whole recording as one `user` turn when the person stops listening (tasks
+  873, 889). The conversation panel also has a plain `<textarea>`, which is
   the way in whenever the microphone is not: it is muted, or recognition is not
   on offer at all — a browser without it (Firefox
   today), or a refused microphone. There the person's *own* system dictation
@@ -588,10 +589,9 @@ conversation") working with no backend change.
     column, no CLI verb, and the agent is never told. Unlike pause, the
     conversation carries on — mesa keeps speaking, `navigate` still moves the
     page, the typed box still works — because muting stops mesa hearing *this
-    room*, where pausing stops this page's whole part in the run. A recognizer
-    final still pending when the microphone is shut is **dropped**, exactly as
-    a pause drops it and for the same reason: the person cut that sentence off
-    on purpose.
+    room*, where pausing stops this page's whole part in the run. Since task
+    889 the same press is also what **sends** the recording (below), so it is
+    the one control that both ends listening and delivers what was heard.
 
     **Muting hands the keyboard back**, so both presses go through one
     `toggleListening(next)` in the hub. It writes `listeningRef.current` for
@@ -603,24 +603,70 @@ conversation") working with no backend change.
     `togglePause`. Unmuting calls the same `reclaim`, which declines, as it
     should: a recognized sentence reaches the conversation with the keyboard
     anywhere.
-  - **Only a final result is an utterance.** An interim result is the engine
+  - **Only a final result is recorded.** An interim result is the engine
     thinking out loud — shown as a preview under the capture box, in italics,
-    and never sent. `readResults` splits one event into the two and answers how
-    far the list is now consumed (`settledThrough`); the hub floors the next
+    and never recorded. `readResults` splits one event into the two and answers
+    how far the list is now consumed (`settledThrough`); the hub floors the next
     read at that mark rather than trusting the event's `resultIndex`, because
     an engine that reports an index it already settled (Chromium on Android
-    has) would otherwise re-post every sentence before it — and an utterance is
-    an irreversible write and an answer the agent gives twice. `utteranceFrom`
+    has) would otherwise re-record every sentence before it. `utteranceFrom`
     drops a settled result with no words in it (a cough, a door), which the
     engine produces routinely.
+  - **Listening is a recording, not a stream of utterances** (task 889). Each
+    settled sentence is joined onto a held recording (`heldWith`), shown above
+    the capture box, and **nothing is sent** until the person turns listening
+    off; that press posts the whole thing as **one** `user` turn (`heldFlush`).
+    A conversation is not one sentence at a time: the engine settles wherever
+    the speaker drew breath, so posting each final made the agent answer a
+    half-thought and then answer the rest of it, and the person had to talk to
+    the pauses the engine chose rather than to mesa. The switch they already
+    have is the boundary they meant — which is why this needs no control of its
+    own, and why the listen button is the whole of the gesture.
+
+    Three consequences follow, and each is a decision:
+    - **The flush includes the interim tail.** Everywhere else the preview is
+      never a turn; here it is, because the person finished speaking and *then*
+      reached for the switch, so the sentence the engine has not settled yet is
+      the last thing they said. The engine does deliver it as a final when it
+      stops — but on the browser's own schedule, after the switch has flipped
+      and the mute rule has already discarded it. The engine's best guess now
+      beats the settled version never.
+    - **The cap is the server's** (`LIVE_TEXT_MAX`, 8192). A recording that
+      would cross it is posted as it stands and the new sentence starts a fresh
+      one, so a nine-minute monologue arrives as several turns rather than
+      being refused. The split is on a sentence boundary — the engine's, not a
+      character count. The flush runs the interim tail through that **same**
+      rule (`heldFlush` is `heldWith` plus a trim), so a recording already at
+      the cap becomes two ordered turns rather than one the server rejects;
+      only a single settled sentence longer than the whole cap is cut, there
+      being no boundary inside it to split on.
+    - **A pause keeps the recording; ending discards it.** Pausing stops the
+      microphone, so nothing is added while it lasts, but nothing is lost
+      either and Resume carries on the same recording — there is no send
+      involved, so there is nothing to drop. The switch still sends while
+      paused: those words were said to this conversation, and the `paused`
+      guard belongs to a single cut-off final, not to a recording made before
+      the press. Ending the conversation clears it: it was said to a session
+      that no longer exists and nothing will ever send it.
+    - **A microphone that dies mid-recording still delivers.** A refusal
+      (`not-allowed`/`service-not-allowed`) sets `blocked`, which withdraws the
+      listen button — so the same handler flushes, or the recording would sit
+      on screen with no control left to send it. Another application taking the
+      device, or the permission being revoked from the omnibox, is the everyday
+      way this happens.
   - **The last sentence before she speaks is not dropped.** Stopping the
     engine *delivers* what was pending as a final, and that sentence was heard
-    before the audio started, so it is the person's and it is posted. Two
-    stops discard it, for the same reason: there is nobody left to say it to.
-    The conversation **ending** is one. A **pause** is the other (task 882) —
-    the pending words are exactly what the person was saying as they pressed a
-    button meaning "hear nothing from me", so posting them would have the agent
-    answer a half-line they cut off on purpose.
+    before the audio started, so it is the person's and it joins the recording.
+    Three stops discard it instead, each for the same reason — it is not part
+    of any recording that will be sent. The conversation **ending** is one. A
+    **pause** is another (task 882) — the pending words are exactly what the
+    person was saying as they pressed a button meaning "hear nothing from me".
+    A **mute** is the third, and all but never a loss: the press already
+    flushed the recording with this very sentence's preview on the end of it,
+    so taking the late final too would say it twice. The one gap is a mute
+    landing between mesa starting to speak — which clears the preview on its
+    way past — and the stop that caused delivering the final; that sentence
+    goes, exactly as it did before task 889.
   - **Recognition restarts itself.** Chrome ends it after about a minute and on
     a long enough silence, and reports that as an ordinary end, not an error.
     So `onend` asks `shouldListen` again and opens a new recognizer if the
@@ -738,9 +784,9 @@ conversation") working with no backend change.
   Nothing grabs the keyboard before the press: an un-joined browser has no
   business stealing focus.
 - **A settled line is sent on mesa's clock** (`shouldAutoSend`) — while the
-  browser is not listening for itself, where the engine's own finals are what
-  get sent and a timer firing on top of them would post the same sentence
-  twice. Otherwise: dictation
+  browser is not listening for itself, where the microphone's recording is
+  what gets sent and a timer firing on top of it would post the same words
+  twice, from two surfaces. Otherwise: dictation
   never presses Enter, so a non-blank draft untouched for the auto-send wait
   is sent as the utterance — hands-free end to end. That wait is
   **configurable** (mesa task 886): `live.auto-send-ms` in
@@ -752,8 +798,8 @@ conversation") working with no backend change.
   conversation with no restart, and a read that fails is the built-in wait
   rather than a stall; `autoSendIdleMs` clamps what the file says, since the
   editor is not the only way into it. It governs this box only — with the
-  microphone open the recognizer's own finals are what get sent and the timer
-  never fires. Enter still sends at
+  microphone open the recording is what gets sent, on the person's own switch,
+  and the timer never fires. Enter still sends at
   once, Shift+Enter still opens a line, and the IME guard holds it while
   composing (an IME commit re-arms the timer, since committing changes no
   draft text). The firing timer reads the draft, the measured idle time and

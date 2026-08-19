@@ -11,9 +11,18 @@
  * decisions rather than plumbing, which is why they live here and not in
  * `LiveHub.tsx`:
  *
- * - **Only a final result is an utterance.** An interim result is the engine
- *   thinking out loud — it is shown as a preview and never sent, because a
- *   sentence posted mid-guess is a sentence the person never said.
+ * - **Only a final result is recorded.** An interim result is the engine
+ *   thinking out loud — it is shown as a preview and never recorded, because a
+ *   sentence held mid-guess is a sentence the person never said.
+ * - **Listening is a recording, not a stream of utterances** (mesa task 889).
+ *   Each settled sentence is *held* rather than sent, and the whole recording
+ *   becomes **one** `user` turn when the person stops listening. A conversation
+ *   is not one sentence at a time: the engine settles wherever the speaker drew
+ *   breath, so posting each final made the agent answer a half-thought and then
+ *   answer the rest of it, and the person had to talk to the pauses the engine
+ *   chose rather than to mesa. The switch the person already has
+ *   (`isListenChord`, the listen button) is the boundary, which is the one
+ *   boundary they meant.
  * - **Recognition ends on its own, constantly.** Chrome stops after roughly a
  *   minute, and on a long enough silence; the engine reports that as an
  *   ordinary end, not an error. So "should it be running" is asked again on
@@ -210,6 +219,70 @@ export function utteranceFrom(text: string): string | null {
 }
 
 /**
+ * Longest recording the page will hold before it has to let go of it — the
+ * server's own `LIVE_TEXT_MAX` (`src/core/store.rs`), mirrored here because
+ * this is where the text is assembled and a turn over the cap is a 422 the
+ * person would meet only after speaking for nine minutes.
+ */
+export const HELD_MAX = 8192
+
+/**
+ * One settled sentence joined onto the recording (mesa task 889), and whatever
+ * that no longer leaves room for.
+ *
+ * `flush` is the escape hatch and nothing more: a recording that would cross
+ * `HELD_MAX` is posted as it stands and the new sentence begins a fresh one, so
+ * a monologue long enough to break the cap arrives as several turns instead of
+ * being refused. The split is on a sentence boundary — the engine's, not a
+ * character count — because half a word is not something anybody said.
+ * Everything short of the cap, which is every ordinary turn, holds until the
+ * person stops listening.
+ *
+ * One sentence longer than the whole cap is the one case that *is* cut, at
+ * `HELD_MAX` characters: there is no boundary inside it to split on, and the
+ * server would refuse the turn whole. An engine settles on a breath, so this
+ * is a case that does not arise short of a recognizer that never finalises.
+ */
+export function heldWith(
+  held: string,
+  text: string,
+): { held: string; flush: string | null } {
+  const sentence = text.trim()
+  if (sentence === '') return { held, flush: null }
+  if (held === '') return { held: sentence.slice(0, HELD_MAX), flush: null }
+  const joined = `${held} ${sentence}`
+  if (joined.length <= HELD_MAX) return { held: joined, flush: null }
+  return { held: sentence.slice(0, HELD_MAX), flush: held }
+}
+
+/**
+ * What the recording becomes when listening stops — the held sentences plus
+ * whatever the engine was still guessing at, in the order they were said.
+ * Empty when nothing was heard.
+ *
+ * The interim is included **here and nowhere else**. Everywhere else it is a
+ * preview and never a turn, but this one moment is the exception the rule was
+ * never about: the person finished speaking and then reached for the switch, so
+ * the sentence the engine has not settled yet is the last thing they said. The
+ * engine does deliver it as a final when it stops — but that arrives after the
+ * switch has already flipped, on the browser's own schedule, and a recording
+ * that posts the last sentence a beat later (or, once muted, not at all) is
+ * worse than one that posts the engine's best guess at it now.
+ *
+ * A **list**, because the guess joins the recording under exactly the rule
+ * every other sentence joined it under — `heldWith`, cap and all. A recording
+ * already at the cap plus a long tail is two turns for the same reason a long
+ * monologue was: one implementation of the boundary, so the last sentence
+ * cannot be the one that slips over it and takes the whole flush down with a
+ * 422.
+ */
+export function heldFlush(held: string, interim: string): string[] {
+  const grown = heldWith(held, interim)
+  const last = utteranceFrom(grown.held)
+  return [grown.flush, last].filter((t): t is string => t !== null)
+}
+
+/**
  * The chord that turns the microphone on and off (mesa task 887), as a
  * predicate over the keystroke rather than a check inside the hub — it is a
  * rule about which keystroke belongs to the conversation, which is exactly the
@@ -309,7 +382,7 @@ export function captureHint(input: {
     return `mesa is not listening. Press ${LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
   }
   if (input.listening) {
-    return 'Listening — each finished sentence is sent as you say it, and mesa stops listening while she is speaking. You can still type here.'
+    return 'Listening — everything you say is held here and sent to mesa as one message when you stop listening. She stops listening while she is speaking. You can still type here.'
   }
   // Joined, unmuted, and still not the way in — nothing left that is worth a
   // line of its own; the box is the way in and says so.

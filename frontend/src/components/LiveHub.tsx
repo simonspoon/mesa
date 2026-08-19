@@ -36,6 +36,8 @@ import {
   isBlockingError,
   isListenChord,
   LISTEN_CHORD,
+  heldFlush,
+  heldWith,
   readResults,
   recognitionCtor,
   recognizesSpeech,
@@ -73,10 +75,11 @@ import { useFetch } from '../useFetch'
  *
  * The person just talks: while the conversation is live and this browser has
  * joined it, the page opens the microphone through the browser's own speech
- * recognition (`liveRecognition.ts`, task 873) and each **final** result
- * becomes a `user` turn as it settles — while the person has asked her to
- * listen, which since task 887 is a switch of their own, muted until the
- * chord (`isListenChord`) or the panel's button turns it on. The capture box
+ * recognition (`liveRecognition.ts`, task 873) and **holds** every settled
+ * result, sending the whole recording as one `user` turn when the person
+ * stops listening (task 889) — listening being a switch of their own since
+ * task 887, muted until the chord (`isListenChord`) or the panel's button
+ * turns it on, and the same press is what ends the recording and sends it. The capture box
  * in the conversation panel stays as the fallback — a browser with no recognizer, or a refused
  * microphone, is the surface as it was: system dictation types into the box,
  * mesa holds the keyboard for it, and a settled line goes on a timer. Either
@@ -267,8 +270,27 @@ export function LiveHub({
     mutedRef.current = next
     setMuted(next)
   }, [])
-  // The engine still guessing. Shown, never sent (`liveRecognition.ts`).
+  // The engine still guessing. Shown, and sent only as the tail of a flush
+  // (`liveRecognition.ts`). The ref is what the listen switch reads: it flips
+  // from a press, outside the render that last set this.
   const [interim, setInterim] = useState('')
+  const interimRef = useRef('')
+  const setInterimNow = useCallback((next: string) => {
+    interimRef.current = next
+    setInterim(next)
+  }, [])
+  // What the microphone has heard since the person turned it on (mesa task
+  // 889) — settled sentences only, joined in the order they were said, and
+  // held here until the switch goes off. Shown above the box, so a recording
+  // is never something happening out of sight. The ref is read from the
+  // recognizer's handlers and from the press that ends it, both of which run
+  // outside the render that last changed it.
+  const [recording, setRecording] = useState('')
+  const recordingRef = useRef('')
+  const setRecordingNow = useCallback((next: string) => {
+    recordingRef.current = next
+    setRecording(next)
+  }, [])
   // The microphone was refused — by the person or by the browser's policy.
   // Terminal for this page: retrying would reopen the permission prompt for
   // ever, and the typed box is exactly the surface to fall back to.
@@ -580,7 +602,7 @@ export function LiveHub({
   const sendRef = useRef<() => void>(() => {})
   // The same, for the recognizer: its handlers are set once per start and post
   // sentences long after the render that installed them.
-  const postRef = useRef<(text: string) => void>(() => {})
+  const postRef = useRef<(text: string) => Promise<void>>(() => Promise.resolve())
   const draftRef = useRef('')
   const editedAt = useRef(0)
   const refused = useRef<string | null>(null)
@@ -700,8 +722,47 @@ export function LiveHub({
    * value a render later. Identical, for the identical reason, to
    * `togglePause`.
    */
+  /**
+   * Send the recording and let go of it (mesa task 889) — the held sentences
+   * plus the one the engine has not settled yet, which is what the person had
+   * just finished saying when they reached for the switch.
+   *
+   * Deliberately **not** gated on `paused`. That gate belongs to a single
+   * pending final — the half-sentence a pause cut off — and does not transfer
+   * to a recording made before the pause: those words were said to this
+   * conversation, and destroying two minutes of them because the person
+   * stepped out first is the one outcome nothing here can undo. A pause holds
+   * the recording; only this sends it, and only ending the conversation throws
+   * it away.
+   *
+   * Ordered rather than fired together: a split recording is still one thing
+   * the person said.
+   */
+  const flushRecording = useCallback(() => {
+    const texts = heldFlush(recordingRef.current, interimRef.current)
+    setRecordingNow('')
+    setInterimNow('')
+    if (!armed.current.live) return
+    texts.reduce(
+      (queue, text) => queue.then(() => postRef.current(text)),
+      Promise.resolve(),
+    )
+  }, [setInterimNow, setRecordingNow])
+  const flushRef = useRef(flushRecording)
+  useEffect(() => {
+    flushRef.current = flushRecording
+  }, [flushRecording])
+
   const toggleListening = useCallback(
     (next: boolean) => {
+      // The switch off is the send; the switch on starts a fresh recording,
+      // because a recording belongs to the stretch of listening it was made
+      // in. Either way nothing is left held.
+      if (next) flushRecording()
+      else {
+        setRecordingNow('')
+        setInterimNow('')
+      }
       setMutedNow(next)
       listeningRef.current = recognizesSpeech({
         live,
@@ -716,7 +777,18 @@ export function LiveHub({
       // reaches the conversation with the keyboard anywhere.
       reclaim('hub-press', armed.current)
     },
-    [blocked, live, paused, reclaim, setMutedNow, supported, unlocked],
+    [
+      blocked,
+      flushRecording,
+      live,
+      paused,
+      reclaim,
+      setRecordingNow,
+      setInterimNow,
+      setMutedNow,
+      supported,
+      unlocked,
+    ],
   )
 
   // The chord that opens and shuts the microphone (mesa task 887). A window
@@ -829,32 +901,40 @@ export function LiveHub({
       engine.onresult = (event) => {
         const heard = readResults(Math.max(event.resultIndex, settled), event.results)
         settled = heard.settledThrough
-        if (running) setInterim(heard.interim)
+        if (running) setInterimNow(heard.interim)
         const text = utteranceFrom(heard.final)
         if (text === null) return
         // Not guarded on `running`: `stop()` below delivers whatever was
         // pending as a final, and that is the sentence the person was still
         // finishing as mesa began to speak — heard before the audio started,
-        // so it is theirs, not an echo. Two stops *do* drop it, and for the
-        // same reason: there is nobody left to say it to. The conversation
-        // ending is one. A **pause** is the other (task 882) — the person
-        // pressed a button that means "hear nothing from me", and the pending
-        // sentence is exactly what they were saying when they pressed it, so
-        // posting it would have the agent answer a half-line the person cut
-        // off on purpose. `setPausedNow(true)` runs before this effect's
-        // cleanup calls `stop()`, so the ref is already true by the time that
-        // final arrives.
+        // so it is theirs, not an echo, and it belongs in the recording. Three
+        // stops *do* drop it, and for the same reason: it is not part of any
+        // recording that will be sent. The conversation ending is one. A
+        // **pause** is the other (task 882) — the person pressed a button that
+        // means "hear nothing from me", and the pending sentence is exactly
+        // what they were saying when they pressed it. `setPausedNow(true)`
+        // runs before this effect's cleanup calls `stop()`, so the ref is
+        // already true by the time that final arrives. A **mute** is the third,
+        // and all but never a loss: the press already flushed the recording
+        // with this very sentence's preview on the end of it (`heldFlush`), so
+        // taking the late final too would say it twice. The exception is a
+        // mute landing in the gap between mesa starting to speak — which
+        // clears the preview on its way past — and the stop that gap caused
+        // delivering the final. That sentence goes; it is the same sentence the
+        // pre-889 page dropped on a mute, and closing it would mean holding a
+        // preview mesa is already talking over.
         if (running) {
           // The preview is cleared here rather than waiting for the next
-          // event: the words it showed have just become a turn, and leaving
+          // event: the words it showed have just been recorded, and leaving
           // them under the box would read as a second sentence still coming.
-          setInterim('')
+          setInterimNow('')
         }
-        // A mute drops the pending sentence for the same reason a pause does
-        // (task 882): the person shut the microphone in the middle of it, and
-        // posting what they cut off would have the agent answer half a line.
         if (armed.current.live && !pausedRef.current && !mutedRef.current) {
-          postRef.current(text)
+          // Held, not posted (task 889): the recording is one turn, and the
+          // person's own switch is what ends it. `flush` is only the cap.
+          const grown = heldWith(recordingRef.current, text)
+          setRecordingNow(grown.held)
+          if (grown.flush !== null) void postRef.current(grown.flush)
         }
       }
       engine.onerror = (event) => {
@@ -864,10 +944,17 @@ export function LiveHub({
         // status line, and leave the typed box as the way in.
         setBlocked(true)
         setActionError(`the microphone is unavailable (${event.error})`)
+        // And send what it did hear (task 889). A refusal withdraws the listen
+        // button — `blocked` is one of its four conditions — so the recording
+        // would otherwise sit on screen with no control left to deliver it.
+        // The microphone dying mid-sentence is the everyday case: another
+        // application takes the device, or the permission is revoked from the
+        // omnibox.
+        flushRef.current()
       }
       engine.onend = () => {
         if (!running) return
-        setInterim('')
+        setInterimNow('')
         // The browser ends recognition by itself — after about a minute, and
         // on a long enough silence — and reports it as an ordinary end. So the
         // question is asked again rather than retried: as long as the
@@ -915,11 +1002,14 @@ export function LiveHub({
 
     return () => {
       running = false
-      setInterim('')
+      // The preview goes; the recording does not. This cleanup runs every time
+      // mesa starts speaking, and a recording that emptied itself for the
+      // length of each of her replies would keep almost nothing (task 889).
+      setInterimNow('')
       current?.stop()
       stream?.getTracks().forEach((t) => t.stop())
     }
-  }, [wantsMic, chosen, listInputs])
+  }, [wantsMic, chosen, listInputs, setInterimNow, setRecordingNow])
 
   // The run: the oldest mesa turn nobody has played, one at a time. A turn that
   // navigates moves the browser when it is *reached*, whether or not it also
@@ -998,9 +1088,13 @@ export function LiveHub({
       // outlive one: the next `Go live` starts talking rather than starting
       // paused with no control on screen to say why.
       setPausedNow(false)
+      // Nor does a recording (task 889): it was said to a conversation that no
+      // longer exists, and nothing will ever send it.
+      setRecordingNow('')
+      setInterimNow('')
     }
     wasLive.current = live
-  }, [live, silence, setPausedNow])
+  }, [live, silence, setPausedNow, setRecordingNow, setInterimNow])
 
   // The header never unmounts, but strict-mode remounts in dev do pass here:
   // drop the body still arriving and hand the clock back.
@@ -1189,9 +1283,14 @@ export function LiveHub({
     post(text)
   }
 
-  /** The one way an utterance leaves this page — typed, or heard. */
+  /**
+   * The one way an utterance leaves this page — typed, or heard. Returns the
+   * request so a flush of more than one turn can send them **in order**: a
+   * recording that had to be split is still one thing the person said, and
+   * two overlapping writes could land the halves the wrong way round.
+   */
   function post(text: string) {
-    sendLiveUtterance(text).then(
+    return sendLiveUtterance(text).then(
       () => {
         refused.current = null
         refetch()
@@ -1221,7 +1320,11 @@ export function LiveHub({
     joined: unlocked,
     speaking,
     recognizes,
-    interim,
+    // The recording counts as being heard (task 889): between two settled
+    // sentences the guess is empty for a beat, and bars that drop back to
+    // "listening" there would say mesa had taken what was said and moved on
+    // — when in fact it is still held, waiting for the switch.
+    interim: interim !== '' ? interim : recording,
     draft,
     paused,
   })
@@ -1513,12 +1616,27 @@ export function LiveHub({
                     send()
                   }}
                 />
-                {/* What the engine is still guessing at. Shown so the person can see
-                    they are being heard, and never sent: only a settled result
-                    becomes a turn. */}
-                {interim !== '' && (
-                  <div className="live-interim" aria-live="polite">
-                    {interim}
+                {/* The recording (task 889): every settled sentence since the
+                    switch went on, with whatever the engine is still guessing
+                    at on the end of it. Shown together because they are one
+                    thing to the person — what mesa will be told when they stop
+                    listening — and shown at all because a microphone recording
+                    out of sight is the thing this must never be. */}
+                {(recording !== '' || interim !== '') && (
+                  <div className="live-interim">
+                    {recording}
+                    {recording !== '' && interim !== '' ? ' ' : ''}
+                    {/* The live region is the *guess*, not the recording it is
+                        joined onto: announcing the whole thing again on every
+                        interim update would read the last two minutes back to
+                        a screen reader once a second. Each sentence is
+                        announced while it is still being guessed at, which is
+                        when it is news. */}
+                    {interim !== '' && (
+                      <span className="live-guessing" aria-live="polite">
+                        {interim}
+                      </span>
+                    )}
                   </div>
                 )}
                 <div className="live-hint muted">

@@ -8563,11 +8563,21 @@ button:focus-visible,
   font-size: 0.75rem;
 }
 
-/* What the recognizer is still guessing at (mesa task 873): a preview, never a
-   turn. Italic and muted so it reads as provisional next to the transcript
-   above it, which is the record of what was actually said. */
+/* The recording (mesa tasks 873, 889): what the microphone has heard since the
+   switch went on, and what will be sent as one turn when it goes off. Upright
+   and in the ordinary text colour, because it *is* what was said — and capped
+   in height with its own scroll, since a recording runs for as long as the
+   person talks and must not push the capture box off the panel. */
 .live-interim {
   font-size: 0.8rem;
+  max-height: 8rem;
+  overflow-y: auto;
+}
+
+/* The tail of it the recognizer is still guessing at: a preview until it
+   settles. Italic and muted so it reads as provisional next to the sentences
+   before it, which are settled. */
+.live-guessing {
   font-style: italic;
   color: var(--muted);
 }

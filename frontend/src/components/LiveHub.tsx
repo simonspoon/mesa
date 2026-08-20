@@ -62,11 +62,13 @@ import {
   turnGroups,
   turnLabel,
 } from '../liveTurns'
+import { sameBox, windowBox } from '../liveWindow'
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
 import type { ConfigLive } from '../types/ConfigLive'
 import type { LiveContext } from '../types/LiveContext'
 import type { LiveTurn } from '../types/LiveTurn'
+import type { LiveWindow } from '../types/LiveWindow'
 import { useFetch } from '../useFetch'
 
 /**
@@ -171,6 +173,14 @@ function LiveMark() {
  */
 const REPORT_DEBOUNCE_MS = 300
 
+/**
+ * How often the conversation is refetched — and, while one is live, how often
+ * the window box is sampled. One number for both: a sample is only a read of
+ * four properties the browser already has, and pairing it with the poll keeps
+ * the hub's ambient cadence a single thing rather than two that drift.
+ */
+const POLL_MS = 2000
+
 export function LiveHub({
   onSidebars,
   slot,
@@ -189,7 +199,7 @@ export function LiveHub({
   const { data, error, refetch } = useFetch(
     () => getLive(cursor.current ?? undefined),
     'live',
-    { pollMs: 2000 },
+    { pollMs: POLL_MS },
   )
   const session = data?.session ?? null
   const live = isLive(session)
@@ -1124,9 +1134,16 @@ export function LiveHub({
   // because the two are *one* report: reporting them separately would mean two
   // writes that can disagree about which page a focus is on, and a page that
   // lands a fifth of a second late is still there long before the person has
-  // finished saying the sentence that follows it.
+  // finished saying the sentence that follows it. The window box (task 895)
+  // is the third member on exactly that argument: it says which desktop
+  // window the route and the focus are showing in, so the agent can take a
+  // picture of the page it is being told about.
   const reportTimer = useRef<number | null>(null)
-  const reported = useRef<{ route: string; context: LiveContext | null } | null>(null)
+  const reported = useRef<{
+    route: string
+    context: LiveContext | null
+    window: LiveWindow | null
+  } | null>(null)
   const reportRoute = useCallback(() => {
     if (reportTimer.current !== null) window.clearTimeout(reportTimer.current)
     reportTimer.current = window.setTimeout(() => {
@@ -1140,15 +1157,21 @@ export function LiveHub({
       // report was scheduled: the whole point of waiting is to send the
       // settled value, not the one that started the flurry.
       const context = currentContext()
+      const box = windowBox(window)
       const last = reported.current
-      if (last !== null && last.route === route && sameContext(last.context, context)) {
+      if (
+        last !== null &&
+        last.route === route &&
+        sameContext(last.context, context) &&
+        sameBox(last.window, box)
+      ) {
         return
       }
       // Remembered only once it landed, so a failed report is retried by the
       // next trigger rather than being treated as already told.
-      reportLiveRoute(route, context)
+      reportLiveRoute(route, context, box)
         .then(() => {
-          reported.current = { route, context }
+          reported.current = { route, context, window: box }
         })
         .catch(() => {})
     }, REPORT_DEBOUNCE_MS)
@@ -1167,8 +1190,19 @@ export function LiveHub({
   }, [reportRoute])
   // Going live is the other moment this matters: the session that just started
   // has no idea where its person already is.
+  //
+  // And while it is live, a slow sample on the poll's own cadence — because a
+  // window that has **moved** announces itself to nobody. A resize fires
+  // `resize`; dragging a window across the desktop fires no DOM event at all,
+  // there being none to fire, so the only way to notice it is to look. Looking
+  // costs nothing: the sample is four properties the browser already has, and
+  // the dedupe above swallows every tick where the box is where it was, so a
+  // window nobody touched posts exactly nothing for the whole conversation.
   useEffect(() => {
-    if (live) reportRoute()
+    if (!live) return
+    reportRoute()
+    const timer = window.setInterval(reportRoute, POLL_MS)
+    return () => window.clearInterval(timer)
   }, [live, reportRoute])
 
   // `#/live` was the conversation's page (task 855); it is a verb now: the

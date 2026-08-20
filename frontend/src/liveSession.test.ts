@@ -10,6 +10,7 @@ function session(patch: Partial<LiveSession> = {}): LiveSession {
     status: 'live',
     route: '#/live',
     context: null,
+    window: null,
     started_at: '2026-01-01 00:00:00',
     updated_at: '2026-01-01 00:00:00',
     ended_at: null,

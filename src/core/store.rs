@@ -8,8 +8,8 @@ use super::attachments;
 use super::types::{
     AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, EdgeMarker, EdgeStyle,
     Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LiveAction, LiveContext, LiveRole,
-    LiveSession, LiveStatus, LiveTurn, Priority, Project, Script, ScriptArg, ScriptArgKind, Status,
-    Task, TaskEvent, Waypoint, task_name,
+    LiveSession, LiveStatus, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg,
+    ScriptArgKind, Status, Task, TaskEvent, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -571,6 +571,15 @@ const MIGRATIONS: &[&str] = &[
     // predates this migration reads as not working, which is what an ended
     // conversation is.
     "ALTER TABLE live_sessions ADD COLUMN working_since TEXT;",
+    // Task 895: where the person's browser window is on their screen, so
+    // `mesa live look` can photograph *that* window and nothing else. Stored
+    // as the JSON of one small fixed struct (`LiveWindow`), exactly as the
+    // context above is, and for the same reason: the page states the whole box
+    // atomically and nothing queries its corners. The column is `window_box`
+    // rather than `window` because `window` is a SQLite keyword; the field and
+    // the JSON key are `window`. A row written before this column simply has
+    // no browser to look at, which is what a CLI-driven session is anyway.
+    "ALTER TABLE live_sessions ADD COLUMN window_box TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -718,7 +727,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 // ---- mesa live (task 855) ----
 
 const LIVE_SESSION_COLUMNS: &str = "id, project_id, agent_id, status, route, started_at, \
-     updated_at, ended_at, context, working_since";
+     updated_at, ended_at, context, working_since, window_box";
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
      created_at, delivered_at, played_at";
@@ -734,6 +743,11 @@ const LIVE_ROUTE_MAX: usize = 200;
 /// reported a whole file's worth of text would make both worse. Generous but
 /// real — a file path or a diagram title fits with room to spare.
 const LIVE_CONTEXT_FIELD_MAX: usize = 200;
+
+/// Largest coordinate or extent a reported window box may carry, in pixels.
+/// Far past any real display wall in either direction — the bound is there so
+/// a garbled report is refused rather than stored, not to judge a monitor.
+const LIVE_WINDOW_EXTENT_MAX: i32 = 20000;
 
 /// Longest turn text. Bounded because a mesa turn is **spoken**: a runaway
 /// body would wedge the synthesiser rather than say anything.
@@ -753,6 +767,13 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
     let context: Option<LiveContext> = row
         .get::<_, Option<String>>(8)?
         .and_then(|s: String| serde_json::from_str(&s).ok());
+    // The window box is parsed with the same leniency and for the same reason:
+    // it is a decoration on the session, and an unreadable one means "no
+    // browser has said where it is", which `live look` already knows how to
+    // report.
+    let window: Option<LiveWindow> = row
+        .get::<_, Option<String>>(10)?
+        .and_then(|s: String| serde_json::from_str(&s).ok());
     Ok(LiveSession {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -760,6 +781,7 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
         status: LiveStatus::parse(&status).expect("invalid live session status in db"),
         route: row.get(4)?,
         context,
+        window,
         started_at: row.get(5)?,
         updated_at: row.get(6)?,
         ended_at: row.get(7)?,
@@ -830,6 +852,33 @@ fn validate_live_context(ctx: &LiveContext) -> Result<LiveContext> {
         label: field(ctx.label.as_ref(), "label")?,
         detail: field(ctx.detail.as_ref(), "detail")?,
     })
+}
+
+/// The window rule: a box a real browser could be in. The bounds are absurd
+/// on purpose — they exist to refuse a hand-crafted or garbled report, not to
+/// have an opinion about anyone's monitor arrangement. A window's origin can
+/// legitimately be negative (a display to the left of the primary one), so
+/// only the extents must be positive.
+///
+/// A page reports whole pixels (it rounds before posting), so there is nothing
+/// to normalise here — the value either is a plausible box or it is refused.
+fn validate_live_window(window: &LiveWindow) -> Result<LiveWindow> {
+    for (value, name) in [(window.width, "width"), (window.height, "height")] {
+        if !(1..=LIVE_WINDOW_EXTENT_MAX).contains(&value) {
+            return Err(Error::Validation(format!(
+                "window {name} must be between 1 and {LIVE_WINDOW_EXTENT_MAX}"
+            )));
+        }
+    }
+    for (value, name) in [(window.x, "x"), (window.y, "y")] {
+        if !(-LIVE_WINDOW_EXTENT_MAX..=LIVE_WINDOW_EXTENT_MAX).contains(&value) {
+            return Err(Error::Validation(format!(
+                "window {name} must be between {} and {LIVE_WINDOW_EXTENT_MAX}",
+                -LIVE_WINDOW_EXTENT_MAX
+            )));
+        }
+    }
+    Ok(*window)
 }
 
 const SCRIPT_COLUMNS: &str =
@@ -3584,35 +3633,44 @@ impl Store {
         self.get_live_session(id)
     }
 
-    /// The page reporting where the user's browser is, and what is on it.
-    /// Bounded by [`validate_live_route`] and [`validate_live_context`] — a
-    /// hash route and a small fixed struct, not free text.
+    /// The page reporting where the user's browser is, what is on it, and
+    /// where its window sits on the screen. Bounded by [`validate_live_route`],
+    /// [`validate_live_context`] and [`validate_live_window`] — a hash route
+    /// and two small fixed structs, not free text.
     ///
     /// The report is a **complete statement** of where the person is, not a
-    /// patch: one poster in the page sends the route and the context together
-    /// on every move, so `context: None` writes SQL `NULL` and clears whatever
-    /// was selected before. A page that has opened nothing must be able to say
-    /// so, and it says so by reporting no context.
+    /// patch: one poster in the page sends all three together on every move,
+    /// so `context: None` writes SQL `NULL` and clears whatever was selected
+    /// before. A page that has opened nothing must be able to say so, and it
+    /// says so by reporting no context. The window box is the same statement
+    /// about the browser itself (mesa task 895), which is why it is written
+    /// here rather than through a route of its own: it moves when the person
+    /// moves the window, and the page already posts on every move.
     ///
-    /// Both values are validated before **either** is written, so a refused
-    /// context leaves the stored route and the stored context exactly as they
-    /// were rather than half-applying the report.
+    /// Every value is validated before **any** is written, so a refused
+    /// context leaves the stored report exactly as it was rather than
+    /// half-applying it.
     pub fn set_live_route(
         &mut self,
         id: i64,
         route: &str,
         context: Option<&LiveContext>,
+        window: Option<&LiveWindow>,
     ) -> Result<LiveSession> {
         let route = validate_live_route(route)?;
         let context = context.map(validate_live_context).transpose()?;
+        let window = window.map(validate_live_window).transpose()?;
         let context = context
             .as_ref()
             .map(|c| serde_json::to_string(c).expect("json serialize"));
+        let window = window
+            .as_ref()
+            .map(|w| serde_json::to_string(w).expect("json serialize"));
         self.get_live_session(id)?;
         self.conn.execute(
-            "UPDATE live_sessions SET route = ?2, context = ?3, \
+            "UPDATE live_sessions SET route = ?2, context = ?3, window_box = ?4, \
              updated_at = datetime('now') WHERE id = ?1",
-            (id, &route, &context),
+            (id, &route, &context, &window),
         )?;
         self.get_live_session(id)
     }
@@ -8391,7 +8449,7 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let session = store.start_live_session(None).unwrap();
         let routed = store
-            .set_live_route(session.id, "  #/projects/3/files  ", None)
+            .set_live_route(session.id, "  #/projects/3/files  ", None, None)
             .unwrap();
         assert_eq!(routed.route.as_deref(), Some("#/projects/3/files"));
         assert_ne!(routed.updated_at, "");
@@ -8403,7 +8461,9 @@ mod tests {
             "https://example.com",
             &format!("#/{}", "x".repeat(LIVE_ROUTE_MAX)),
         ] {
-            let err = store.set_live_route(session.id, bad, None).unwrap_err();
+            let err = store
+                .set_live_route(session.id, bad, None, None)
+                .unwrap_err();
             assert!(matches!(err, Error::Validation(_)), "{bad:?}: {err:?}");
         }
         // …and the route the last good call stored is still there.
@@ -8430,6 +8490,7 @@ mod tests {
                     label: Some("store.rs".into()),
                     detail: Some("line 42".into()),
                 }),
+                None,
             )
             .unwrap();
         let ctx = reported.context.clone().unwrap();
@@ -8455,6 +8516,7 @@ mod tests {
                     label: Some("   ".into()),
                     detail: None,
                 }),
+                None,
             )
             .unwrap();
         let ctx = bare.context.unwrap();
@@ -8462,8 +8524,90 @@ mod tests {
         assert_eq!((ctx.id, ctx.label, ctx.detail), (None, None, None));
 
         // The report is a complete statement, not a patch: no context clears.
-        let cleared = store.set_live_route(session.id, "#/inbox", None).unwrap();
+        let cleared = store
+            .set_live_route(session.id, "#/inbox", None, None)
+            .unwrap();
         assert_eq!(cleared.context, None);
+    }
+
+    /// The window box the page reports beside the route (mesa task 895): it
+    /// round-trips out of the column, and a report without one clears it, the
+    /// same complete-statement rule the context follows.
+    #[test]
+    fn set_live_route_records_where_the_browser_window_is() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let box_ = LiveWindow {
+            x: 22,
+            y: 22,
+            width: 1600,
+            height: 1000,
+        };
+        let reported = store
+            .set_live_route(session.id, "#/live", None, Some(&box_))
+            .unwrap();
+        assert_eq!(reported.window, Some(box_));
+        assert_eq!(
+            store.get_live_session(session.id).unwrap().window,
+            Some(box_)
+        );
+        let cleared = store
+            .set_live_route(session.id, "#/live", None, None)
+            .unwrap();
+        assert_eq!(cleared.window, None);
+    }
+
+    /// A box no browser could be in is refused, and refusing it leaves the
+    /// whole stored report alone — the guarantee the route and the context
+    /// already give. A negative origin is legal (a display to the left of the
+    /// primary one); a zero or negative extent is not.
+    #[test]
+    fn a_window_box_no_browser_could_be_in_is_refused() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let good = LiveWindow {
+            x: -1200,
+            y: -40,
+            width: 800,
+            height: 600,
+        };
+        store
+            .set_live_route(session.id, "#/live", None, Some(&good))
+            .unwrap();
+        for bad in [
+            LiveWindow {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 600,
+            },
+            LiveWindow {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: -600,
+            },
+            LiveWindow {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 20001,
+            },
+            LiveWindow {
+                x: 99999,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+        ] {
+            let err = store
+                .set_live_route(session.id, "#/inbox", None, Some(&bad))
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{bad:?}: {err:?}");
+        }
+        let still = store.get_live_session(session.id).unwrap();
+        assert_eq!(still.window, Some(good));
+        assert_eq!(still.route.as_deref(), Some("#/live"));
     }
 
     /// Each free-text field is bounded for the reason the route is — a label
@@ -8480,7 +8624,7 @@ mod tests {
             detail: None,
         };
         store
-            .set_live_route(session.id, "#/projects/3/diagrams", Some(&good))
+            .set_live_route(session.id, "#/projects/3/diagrams", Some(&good), None)
             .unwrap();
 
         let long = "x".repeat(LIVE_CONTEXT_FIELD_MAX + 1);
@@ -8508,7 +8652,7 @@ mod tests {
             ),
         ] {
             let err = store
-                .set_live_route(session.id, "#/inbox", Some(&bad))
+                .set_live_route(session.id, "#/inbox", Some(&bad), None)
                 .unwrap_err();
             match err {
                 Error::Validation(m) => assert!(m.contains(field), "{field}: {m}"),
@@ -8527,7 +8671,9 @@ mod tests {
     fn an_unreadable_context_reads_back_as_nothing_selected() {
         let (mut store, _dir) = temp_store();
         let session = store.start_live_session(None).unwrap();
-        store.set_live_route(session.id, "#/inbox", None).unwrap();
+        store
+            .set_live_route(session.id, "#/inbox", None, None)
+            .unwrap();
         for garbage in ["not json at all", r#"{"kind":"holodeck"}"#, "{}"] {
             store
                 .conn

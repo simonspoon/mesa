@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Mesa-live gate (mesa task 855): exercises the spoken-conversation surface end
 # to end — the `mesa live` CLI group and the `/api/live*` routes — against a
-# throwaway MESA_DB, a stub `claude` (MESA_CLAUDE_BIN) and a stub `kokoro-rs`
-# (MESA_KOKORO_BIN). No real agent and no real synthesiser are ever started.
+# throwaway MESA_DB, a stub `claude` (MESA_CLAUDE_BIN), a stub `kokoro-rs`
+# (MESA_KOKORO_BIN) and a stub `loki` (MESA_LOKI_BIN). No real agent, no real
+# synthesiser and no real screen are ever touched.
 #
 # Covers, in order:
 #   1. the CLI with nothing running — `status` prints null and exits 0, every
 #      other verb is `not_found` naming `mesa live start`, and the usage errors
-#      (exit 2) around them, including `--quiet` refused on `turns`;
+#      (exit 2) around them, including `--quiet` refused on `turns` and `look`;
 #   2. the CLI happy path on a --no-agent session: start -> say -> navigate ->
 #      turns -> sidebars -> stop -> status, plus the `--quiet` key sets compared
 #      with jq (a turn drops `text`; a session drops nothing);
@@ -33,11 +34,16 @@
 #      streaming WAV sizes, the header arriving mid-render, no Content-Length,
 #      `validation` for a pure-navigate turn and `unavailable` for a failing
 #      synthesiser;
-#   8. the security boundary in default mode — the Host allowlist, the
+#   8. `mesa live look` (task 895) against a stub loki — the window box riding
+#      in the route report and read back by `mesa live status`, an impossible
+#      box refused, and which window the box picks: the person's rather than
+#      the headless `mesa` beside it, `unavailable` when nothing is at the box
+#      (or no browser reported one), `conflict` when two windows are;
+#   9. the security boundary in default mode — the Host allowlist, the
 #      Content-Type gate on every live write, and the agent gate on the three
 #      routes that carry it (POST/DELETE /api/live, speak) contrasted with the
 #      plain guard on their neighbours;
-#   9. the same boundary under `--lan`: Host skipped, Content-Type still
+#  10. the same boundary under `--lan`: Host skipped, Content-Type still
 #      firing, and the agent-gated routes keeping their stronger gate.
 set -euo pipefail
 
@@ -141,6 +147,33 @@ EOF
 chmod +x "$STUB_DIR/kokoro-rs"
 export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
 
+# ---- stub loki (`live look` photographs the person's browser window) ----
+#
+# A stub, and it has to be one: a gate has no screen, no browser and no window
+# server, and the half of `live look` that is mesa's — WHICH of the windows on
+# offer the reported box picks — needs none of the three. It answers
+# `-f json windows` from a file section 8 rewrites per case, writes a file
+# wherever `--output` points for `screenshot`, and records every invocation so
+# a check can assert that nothing was run at all.
+cat > "$STUB_DIR/loki" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$STUB_DIR/last-loki"
+case "\$1" in
+  -f) cat "$STUB_DIR/windows.json" ;;
+  screenshot)
+    OUT=""
+    while [ \$# -gt 0 ]; do
+      [ "\$1" = "--output" ] && OUT=\$2
+      shift
+    done
+    printf '\x89PNG\r\n\x1a\n' > "\$OUT"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$STUB_DIR/loki"
+export MESA_LOKI_BIN="$STUB_DIR/loki"
+
 # ---- fixtures ----
 #
 # `--no-git` throughout: a scripted fixture repo would produce a root commit
@@ -165,7 +198,7 @@ run 0 "$MESA" live get
 [ "$STDOUT" = "null" ] || fail "live get (alias): expected null"
 ok "live status/show/get with no session: null, exit 0 — an answer, not a failure"
 
-for verb in stop turns listen; do
+for verb in stop turns listen look; do
   run 1 "$MESA" live "$verb"
   [ "$(jqe .error.code)" = "not_found" ] || fail "live $verb with no session: error.code"
   grep -q 'mesa live start' <<<"$STDERR" ||
@@ -185,6 +218,13 @@ run 2 "$MESA" live turns --quiet
 [ -z "$STDOUT" ] || fail "live turns --quiet: stdout must be empty on a usage error"
 [ "$(jqe .error.code)" = "usage" ] || fail "live turns --quiet: error.code"
 ok "live turns --quiet: unknown argument, exit 2, empty stdout (the --quiet contract)"
+
+# `look` is the other command with no record to project: it prints a shot, not
+# a stored object, so there is nothing for --quiet to drop.
+run 2 "$MESA" live look --quiet
+[ -z "$STDOUT" ] || fail "live look --quiet: stdout must be empty on a usage error"
+[ "$(jqe .error.code)" = "usage" ] || fail "live look --quiet: error.code"
+ok "live look --quiet: unknown argument, exit 2, empty stdout (the --quiet contract)"
 
 run 2 "$MESA" live listen --wait not-a-number
 [ "$(jqe .error.code)" = "usage" ] || fail "live listen --wait <junk>: error.code"
@@ -948,7 +988,160 @@ rm -f "$STUB_DIR/tts-fail"
 ok "speak: a missing or failing synthesiser is 503 unavailable (an outside-mesa dependency)"
 
 # =====================================================================
-# 8. The security boundary in default mode
+# 8. `mesa live look`: photographing the person's browser window (task 895)
+# =====================================================================
+#
+# The stub loki above stands in for a screen. What is under test is mesa's
+# half: the box the page reports travelling with the route, and which of the
+# windows on offer that box picks.
+
+# ---- a conversation no browser has joined ----
+#
+# Session SS was started over HTTP and has reported no window, which is every
+# CLI-driven and every --no-agent conversation. mesa must say so itself rather
+# than asking loki for a window at a box of nothing.
+rm -f "$STUB_DIR/last-loki"
+run 1 "$MESA" live look
+[ "$(jqe .error.code)" = "unavailable" ] || fail "live look with no reported window: error.code"
+grep -q 'press Listen' <<<"$STDERR" ||
+  fail "live look with no reported window: the message must name the way to get one"
+[ ! -e "$STUB_DIR/last-loki" ] ||
+  fail "live look with no reported window must not run loki at all"
+ok "live look on a session no browser has joined: exit 1 unavailable, and loki is never run"
+
+# ---- the window box rides in the route report ----
+#
+# Not a route of its own: the box says which desktop window the route and the
+# context are showing in, so all three are one statement from one poster.
+LOOKBOX='{"x":118,"y":64,"width":1512,"height":982}'
+api 200 POST "/api/live/route" "{\"route\":\"#/projects/7/files\",\"window\":$LOOKBOX}"
+[ "$(jqb .window.x)" = "118" ] || fail "route+window: must record x"
+[ "$(jqb .window.y)" = "64" ] || fail "route+window: must record y"
+[ "$(jqb .window.width)" = "1512" ] || fail "route+window: must record width"
+[ "$(jqb .window.height)" = "982" ] || fail "route+window: must record height"
+
+# The agent reads it over its own Store, never over HTTP — the two surfaces
+# share `core` and must not disagree about where the person's window is.
+run 0 "$MESA" live status
+[ "$(jqs .window.x)" = "118" ] || fail "live status: the CLI must see the reported x"
+[ "$(jqs .window.width)" = "1512" ] || fail "live status: the CLI must see the reported width"
+[ "$(jqs .window.height)" = "982" ] || fail "live status: the CLI must see the reported height"
+ok "POST /api/live/route: the window box rides with the route and reaches \`mesa live status\`"
+
+# A statement, not a patch — exactly as the context is.
+api 200 POST "/api/live/route" '{"route":"#/inbox"}'
+[ "$(jqb .window)" = "null" ] || fail "omitting the window must clear it, not leave the old box"
+ok "the window box is a statement too: a report without one clears it"
+
+# An origin may be negative: a display to the LEFT of the primary one is where
+# a great many people keep their browser.
+api 200 POST "/api/live/route" \
+  '{"route":"#/inbox","window":{"x":-1440,"y":-200,"width":1440,"height":900}}'
+[ "$(jqb .window.x)" = "-1440" ] || fail "a negative origin must be accepted (a display to the left)"
+ok "a negative window origin is legal: only the extents must be positive"
+
+# …but a box no browser could be in is refused, and refused before anything is
+# written, exactly as an over-long context field is.
+api 200 POST "/api/live/route" "{\"route\":\"#/projects/7/files\",\"window\":$LOOKBOX}"
+for BAD in '{"x":0,"y":0,"width":20001,"height":982}' \
+           '{"x":0,"y":0,"width":0,"height":982}' \
+           '{"x":0,"y":0,"width":1512,"height":-1}' \
+           '{"x":-20001,"y":0,"width":1512,"height":982}' \
+           '{"x":0,"y":20001,"width":1512,"height":982}'; do
+  api 422 POST "/api/live/route" "{\"route\":\"#/inbox\",\"window\":$BAD}"
+  [ "$(jqb .error.code)" = "validation" ] || fail "an impossible window box ($BAD): error.code"
+done
+api 200 GET "/api/live"
+[ "$(jqb .session.route)" = "#/projects/7/files" ] ||
+  fail "a refused window box must leave the recorded route alone"
+[ "$(jqb .session.window.width)" = "1512" ] ||
+  fail "a refused window box must leave the recorded box alone"
+ok "an impossible window box is 422 validation and writes nothing (route AND box untouched)"
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  # loki drives macOS's own window server, and mesa says so before it goes
+  # looking for a binary that could never have worked here — "not installed"
+  # would send someone off to install it.
+  run 1 "$MESA" live look
+  [ "$(jqe .error.code)" = "unavailable" ] || fail "live look off a Mac: error.code"
+  grep -qi 'mac' <<<"$STDERR" || fail "live look off a Mac: the message must say loki is a Mac tool"
+  ok "live look on a machine that is not a Mac: exit 1 unavailable, saying so"
+else
+  # ---- which window the box picks ----
+  #
+  # The list the stub answers with is the real situation this design exists
+  # for: a khora-launched HEADLESS Chrome titled `mesa`, the person's own
+  # window, and a menu bar. Only the size tells the first two apart, so a
+  # title match would photograph the headless one. The person's frame is
+  # deliberately fractional — the window server reports a float CGRect and the
+  # page reports integers, and rounding is what makes those one statement.
+  cat > "$STUB_DIR/windows.json" <<'JSON'
+[{"window_id":40484,"pid":34872,"title":"mesa","bundle_id":"com.google.Chrome",
+  "frame":{"x":0.0,"y":0.0,"width":1600.0,"height":1200.0},"is_on_screen":false},
+ {"window_id":40041,"pid":501,"title":"mesa","bundle_id":"com.google.Chrome",
+  "frame":{"x":118.4,"y":63.7,"width":1512.0,"height":981.5},"is_on_screen":true},
+ {"window_id":38878,"pid":403,"title":"Finder","bundle_id":"com.apple.finder",
+  "frame":{"x":0.0,"y":0.0,"width":1728.0,"height":38.0},"is_on_screen":true}]
+JSON
+  rm -f "$STUB_DIR/last-loki"
+  run 0 "$MESA" live look
+  SHOT=$(jqs .path)
+  [ "$(jqs .window_id)" = "40041" ] ||
+    fail "live look photographed window $(jqs .window_id): the box must pick the PERSON's window, not the headless mesa beside it"
+  [ "$(jqs .width)" = "1512" ] || fail "live look: width must be the reported one"
+  [ "$(jqs .height)" = "982" ] || fail "live look: height must be the reported one"
+  [ -s "$SHOT" ] || fail "live look: no file at the path it printed ($SHOT)"
+  case "$SHOT" in
+    */mesa-live-"$SS"-*.png) ;;
+    *) fail "live look: the default path must be a temp file named for the session (got $SHOT)" ;;
+  esac
+  [ "$(cat "$STUB_DIR/last-loki")" = "screenshot --window 40041 --output $SHOT" ] ||
+    fail "live look: the shot must be of the matched window (got $(cat "$STUB_DIR/last-loki"))"
+  ok "live look: the reported box picks the person's window over a lookalike titled \`mesa\`, and a PNG lands at a temp path named for the session"
+
+  run 0 "$MESA" live look --output "$TMP/screen.png"
+  [ "$(jqs .path)" = "$TMP/screen.png" ] || fail "live look --output: must print the path it was given"
+  [ -s "$TMP/screen.png" ] || fail "live look --output: no file written"
+  ok "live look --output: the shot lands exactly where the caller asked"
+
+  # Nothing at that box: the browser moved or closed since it reported. This
+  # moment is wrong, not the conversation — so `unavailable`, and a message
+  # naming the box rather than a nearest-match guess.
+  cat > "$STUB_DIR/windows.json" <<'JSON'
+[{"window_id":40484,"title":"mesa",
+  "frame":{"x":0.0,"y":0.0,"width":1600.0,"height":1200.0}}]
+JSON
+  run 1 "$MESA" live look
+  [ "$(jqe .error.code)" = "unavailable" ] || fail "live look with no window at the box: error.code"
+  grep -q '1512×982' <<<"$STDERR" ||
+    fail "live look with no window at the box: the message must name the box it looked for"
+  ok "live look with nothing at the reported box: exit 1 unavailable, never a nearest guess"
+
+  # Two windows genuinely stacked at one box is ambiguous, and ambiguity here
+  # means photographing the wrong screen — so both ids are named and the
+  # person can fix it.
+  cat > "$STUB_DIR/windows.json" <<'JSON'
+[{"window_id":11,"title":"mesa","frame":{"x":118.0,"y":64.0,"width":1512.0,"height":982.0}},
+ {"window_id":12,"title":"mesa","frame":{"x":118.0,"y":64.0,"width":1512.0,"height":982.0}}]
+JSON
+  run 1 "$MESA" live look
+  [ "$(jqe .error.code)" = "conflict" ] || fail "live look with two windows at one box: error.code"
+  grep -q '11' <<<"$STDERR" && grep -q '12' <<<"$STDERR" ||
+    fail "live look with two windows at one box: the message must name both ids"
+  ok "live look with two windows at one box: exit 1 conflict naming both — never a coin toss"
+fi
+
+# There is deliberately no HTTP route for any of this: capturing the person's
+# screen must not be reachable over a socket that `--lan` opens to the network.
+raw POST "/api/live/look" -H 'Content-Type: application/json' -d '{}'
+[ "$STATUS" = "405" ] || fail "POST /api/live/look must reach no handler at all, got $STATUS"
+raw GET "/api/live/look"
+jq -e 'type == "object" and has("path")' <<<"$BODY" >/dev/null 2>&1 &&
+  fail "GET /api/live/look answered a screenshot — this must not be reachable over HTTP"
+ok "there is no /api/live/look route: the screen is reachable only from the CLI"
+
+# =====================================================================
+# 9. The security boundary in default mode
 # =====================================================================
 
 # ---- Host-header allowlist (DNS-rebinding defense) ----
@@ -1029,7 +1222,7 @@ wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
 
 # =====================================================================
-# 9. LAN mode: Host allowlist off, Content-Type gate still on
+# 10. LAN mode: Host allowlist off, Content-Type gate still on
 # =====================================================================
 #
 # `--lan` flips the bind address and the Host policy together — two halves of

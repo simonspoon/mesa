@@ -3,7 +3,8 @@
 **Mesa live** is a conversation mode: a person talks to mesa, mesa talks back,
 and a dedicated Claude Code session does whatever they ask. Tables
 `live_sessions` and `live_turns` (migration index 43, plus the session's
-`context` column at index **44**, so a fresh db is `user_version` 45), the
+`context` column at index **44**, its `working_since` at **45** and its
+`window_box` at **46**, so a fresh db is `user_version` 47), the
 `mesa live` CLI group, `/api/live*`, and the header's conversation hub
 (`LiveHub`).
 
@@ -39,11 +40,14 @@ A live session is a loop the **agent** runs, not one mesa drives:
    turn, or `null` when nobody spoke for the whole wait (570s by default, and
    long on purpose: see *quiet time is spent inside `listen`* below).
 2. It does the work with the ordinary mesa CLI and its own tools.
-3. `mesa live say "…"` — the reply, which the browser speaks.
-4. `mesa live navigate '#/…' --say "…"` — optionally, it moves the person's
+3. `mesa live look` — optionally, it photographs the person's browser window
+   and opens the PNG, for the questions no report answers: what actually
+   rendered.
+4. `mesa live say "…"` — the reply, which the browser speaks.
+5. `mesa live navigate '#/…' --say "…"` — optionally, it moves the person's
    browser as it answers, and `mesa live sidebars collapse|expand` gives that
    page the whole window, or hands the side panels back.
-5. `mesa live status` printing `null` (or an `ended` session) is how it stops.
+6. `mesa live status` printing `null` (or an `ended` session) is how it stops.
 
 The agent **pulls**. That is not a style choice: mesa has no way to push at it.
 The only channel into a live Claude Code session is keystrokes over the attach
@@ -66,7 +70,9 @@ The instruction block the agent is spawned with is
 `agents::spawn_bg` chokepoint. It states the loop, the route vocabulary, the
 step that tells the agent to run **`mesa live status`** to find out what the
 person is looking at — the page as `route` and what is open on it as `context`,
-*"read it instead of asking them where they are"* (task 888) — the "this is
+*"read it instead of asking them where they are"* (task 888) — the step that
+tells it to run **`mesa live look`** when the answer depends on what actually
+rendered rather than on which page is open (task 895) — the "this is
 speech, so write prose" rule (a bulleted reply gets read aloud as punctuation)
 and the untrusted-input posture below. `live::agent_prompt(id)`
 appends the session id — the only per-call part.
@@ -202,6 +208,16 @@ turns (schema enforces none of it, per CLAUDE.md):
   hand-edited row, or a column left by a newer build that knows a page this one
   does not) reads as *nothing selected*, because nothing mesa does depends on
   it and panicking a whole conversation over a decoration is the wrong trade.
+- **The window box** the page reports in that same body (mesa task 895) is
+  four integers and one more thing that is bounded rather than free: extents
+  `1..=20000`, origins `±20000` (`validate_live_window`) — absurd bounds on
+  purpose, there to refuse a garbled or hand-written report rather than to have
+  an opinion about anyone's monitors, and a **negative origin is legal**,
+  because a display to the left of the primary one is where a great many people
+  keep their browser. It is validated before anything is written and read back
+  with the context's leniency, for the context's reason: it decorates, and
+  [`mesa live look`](#seeing-the-screen-mesa-live-look-task-895) already knows
+  how to say "no browser has told me where it is".
 - `text` is trimmed and capped at 8192 characters, because it is **spoken**: a
   runaway body would wedge the synthesiser rather than say anything.
 
@@ -257,6 +273,150 @@ a conversation genuinely needs; anything more — click this, fill that — is a
 remote-control vocabulary, and the agent already has the whole mesa CLI for
 actually changing things.
 
+## Seeing the screen (`mesa live look`, task 895)
+
+Everything above tells the agent *where the person is*. None of it tells it
+what they can see. The route is which page, the context is what is open on it,
+and neither is what actually **rendered** — so every question of the form "does
+this look right?", "is the diagram overlapping?", "what does that error say?"
+had exactly one answer available: ask the person to describe their own screen,
+in a conversation whose whole point is that they are not at the keyboard.
+`mesa live look` answers it directly. It photographs the browser window the
+conversation is being held in, writes a PNG and prints where it landed:
+
+```json
+{"path":"/var/folders/…/mesa-live-12-1755702312.png","window_id":40041,"width":1600,"height":1000}
+```
+
+The agent opens that path with its own image tool. Nothing else in mesa reads
+it, which is why `LiveShot` is the one type on this surface that is **not**
+ts-exported: it has no HTTP route and therefore no TypeScript consumer, and a
+generated `.ts` nobody imports is rot `build.sh`'s dirty check would then hold
+everyone to.
+
+### Which window is the whole problem
+
+A screenshot tool needs to be told which window to shoot, and the obvious
+answer — the one titled `mesa` — is wrong on exactly the machine this feature
+is developed on. khora launches **headless** Chromes to drive the web UI, and a
+headless Chrome running mesa reports a window titled `mesa` like any other; on
+the machine where this was written there was one sitting there while the work
+was being done. A title match photographs whichever of them the window server
+lists first, which is to say: something the person did not ask to be seen.
+
+So the identity is the **box** — `screenX`, `screenY`, `outerWidth`,
+`outerHeight`, rounded to whole pixels — and the page reports its own. That is
+the same rectangle the desktop tooling reports as the window's `frame`, in the
+same screen coordinates, so the two can simply be compared: page 22,22
+1600×1000; loki frame `x:22 y:22 w:1600 h:1000`. Rounding is what makes those
+one statement rather than two — the page reports integers and the window server
+reports a float `CGRect` — and it is why `windowBox()` rounds on the way out
+rather than mesa forgiving a half-pixel on the way in.
+
+Two properties come free with that choice, and both are the reason it is the
+right one:
+
+- **Only a browser with mesa open ever reports a box**, so the window is
+  never *guessed* at — it is named, by the one page that knows. Nothing else on
+  the desktop can be picked: not the person's mail client, not a headless
+  Chrome sitting on some other page, not any of the windows a title match would
+  have had to choose between. The lookalike problem is not solved by a better
+  heuristic; it is solved by asking the browser where it is.
+
+  The honest edge of that: a khora-driven browser that is *itself* showing mesa
+  posts a report like any other page, and the last report wins — which is
+  already true of `route` and `context` (task 888) and is why the second
+  property below matters more than this one. What it cannot do is hand back the
+  wrong picture: a headless window has no backing store, so the window server
+  refuses to capture it and `look` comes back `unavailable`. The failure mode
+  is "no shot", never "someone else's screen".
+- **The window mesa photographs is the window that reported the page the agent
+  was told about.** The box rides in the *existing* route report as a third
+  member beside `route` and `context`, under the one-complete-statement rule
+  those two already live by, so all three are written by one poster in one
+  request and cannot disagree. And several mesa **tabs** share one window box,
+  so two tabs of the same browser are not two answers.
+
+That is also why there is no separate write path for it. A window box is not a
+different kind of news from a route; it moves for the same reason a route
+does — the person did something — and the page that knows one knows the other.
+A `POST /api/live/window` would be a second poster that could be a debounce
+interval out of step with the first.
+
+The one thing the box does *not* inherit from the route is its triggers. A
+route changes on `hashchange` and a focus changes on the page; a window that
+has been **dragged across the desktop** announces itself to nobody, there being
+no DOM event for it (a resize at least fires `resize`). So while a session is
+live the hub samples the box on its own poll cadence — the same `POLL_MS` the
+conversation is fetched on, one number for both rather than two that drift —
+and the report's existing dedupe (`sameBox`, the field-by-field twin of
+`sameContext`) swallows every tick where nothing moved. A window nobody touches
+posts nothing at all for the whole conversation.
+
+### An exact match, or an error
+
+`match_window` filters loki's window list to the ones whose rounded frame
+equals all four reported numbers, and then:
+
+- **one** — that is the window; take the shot.
+- **none** — `unavailable`. The browser has moved or closed since it last
+  reported, so this moment is wrong rather than the conversation being wrong;
+  the message says so and says to bring the window back.
+- **two or more** — `conflict`, naming every candidate window id.
+
+It is deliberately **not** a nearest match, and the two-candidate case is
+deliberately not a coin toss. Guessing wrong here does not produce a slightly
+worse answer, it photographs a screen the person did not offer, so "I am not
+sure which" has to be an error. Two browser windows genuinely stacked at one
+box is also something the person can fix in a second once they are told, which
+a silently-picked wrong window never gives them the chance to do.
+
+A session with **no** reported box — one started `--no-agent`, one driven
+entirely from the CLI, a page that has not joined — is `unavailable` too, and
+it is caught in `cli.rs` before loki is ever run, so the message names the real
+situation ("open mesa in a browser and press Listen") rather than letting the
+match fail against a box of zeroes.
+
+### loki is optional, and macOS-only
+
+`loki` is the external desktop-automation binary (CLAUDE.md's verification
+tools), invoked exactly as every other shell-out in `core` is — as **argv**,
+never through a shell — and `MESA_LOKI_BIN` overrides the path, the same test
+seam as `MESA_CLAUDE_BIN` and `MESA_KOKORO_BIN`. Nothing on this path is built
+out of mesa data anyway: a window id mesa just parsed and a path mesa itself
+chose.
+
+It is not a dependency in the sense that `sqlite` is. A machine with no loki
+installed holds perfectly ordinary conversations, one command short: a missing
+binary, a failing one, and output mesa cannot parse are all **`unavailable`**,
+the code reserved for something outside mesa not being arranged for this — and
+`AGENT_PROMPT` tells the agent that in as many words, *"if it says it is
+unavailable, carry on without it"*. loki drives macOS's own window server, so a
+non-Mac is `unavailable` **before** the binary is looked for, with a message
+saying loki is a Mac tool: "not installed" would send someone off to install
+something that could never have worked. mesa also confirms the file exists
+after a successful `screenshot`, because loki can exit 0 having written nothing
+(a window that vanished between the two calls) and a path the agent then fails
+to open is a worse answer than saying so here.
+
+### There is no HTTP route, and there will not be one
+
+`live look` is **CLI-only**, and that is a security decision rather than an
+omission. This captures the person's screen. `serve --lan` offers the API to
+every device on the network with **no auth at all** — an opt-in posture that is
+defensible for reading tasks and dictating an utterance, and is not defensible
+for photographing the owner's desktop. No gate in this codebase is strong
+enough to make that route acceptable, so there is no route: the capability is
+reachable only by something already running as the person, which is exactly
+what the agent driving the conversation is.
+
+The file lands in a temp file named for the conversation and the second —
+`mesa-live-<session id>-<unix seconds>.png` in `std::env::temp_dir()` — so two
+looks at one conversation do not land on one path and an `ls` reads in order.
+`--output <PATH>` puts it wherever the caller wants instead. `live look` takes
+no `--quiet`: it prints a four-key bounded object with nothing to drop, so the
+flag is an unknown argument, exit 2, exactly as on `turns`.
+
 ## CLI
 
 `mesa live` — every command operates on the one current session.
@@ -271,6 +431,7 @@ actually changing things.
 | `live navigate <ROUTE>` | `--say <TEXT>`; without it the turn is a pure action and says nothing | the `LiveTurn` |
 | `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route | the `LiveTurn` |
 | `live turns` | `--after <ID>`, `--limit <N>` (clamped to 1..=500) | a bare array of turns, oldest first |
+| `live look` | `--output <PATH>` (default: a temp file named for the session) | the `LiveShot`: `path`, `window_id`, `width`, `height` |
 
 `turns` is the **transcript**, not the queue: both roles, including turns
 already delivered or spoken, and reading it delivers nothing. Only `listen`
@@ -363,11 +524,13 @@ takes exactly one value.
   **0**: "nobody is talking to mesa" is an answer, not a failure, and it is
   what the agent's loop reads as "stop looping".
 - **`--quiet`** per CLAUDE.md's contract: accepted on the mutations, on
-  `listen` and on `status`, rejected with exit 2 on `turns`. A turn drops
+  `listen` and on `status`, rejected with exit 2 on `turns` and on `look`
+  (neither is a record with an unbounded field to drop). A turn drops
   `text` — the one unbounded field, and the one that is *spoken* rather than
   read by the caller — and keeps its role, action and target. A session has
   nothing unbounded to drop (ids, one of two status words, a 200-char route, a
-  four-field context whose free-text fields `Store` caps at 200 chars each, and
+  four-field context whose free-text fields `Store` caps at 200 chars each, a
+  four-integer window box, and
   timestamps), so its quiet output equals its full output; the flag is accepted
   across the group for uniformity. The context being *bounded* is what keeps
   that true — it is a report, not a body, and the key-parity test on
@@ -381,7 +544,7 @@ takes exactly one value.
 | `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
 | `DELETE /api/live` | the ended session | `require_agent_access` |
 | `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
-| `POST /api/live/route` `{route, context?}` | the session, route **and context** recorded | standard write |
+| `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded | standard write |
 | `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
 | `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
 
@@ -403,11 +566,15 @@ fixes it. One poll carries at most 500 turns — the ceiling `Store` clamps to
 anyway — so a conversation longer than that is read in cursor-sized pages,
 which is what `?after=` is for.
 
-`POST /api/live/route`'s `context` is optional and **omitting it clears the
-stored one** — the report is a complete statement of where the person is, not a
-patch, because one poster in the page sends both halves together on every move.
+`POST /api/live/route`'s `context` and `window` are optional and **omitting
+either clears the stored one** — the report is a complete statement of where
+the person is, not a
+patch, because one poster in the page sends every part of it together on every
+move.
 A page that has opened nothing must be able to say so, and this is how it says
-it. An unknown `kind` is a **422 `validation`**, refused by serde before the
+it; the same goes for a caller that is not a browser and has no window to
+report, which is exactly the session `mesa live look` refuses to guess at. An
+unknown `kind` is a **422 `validation`**, refused by serde before the
 handler runs (`JsonRejection` maps to mesa's validation body), which is the
 same code an over-long field gets from `Store` — an unknown page is a client
 bug either way. The gate is unchanged: an ordinary write.
@@ -937,21 +1104,29 @@ conversation") working with no backend change.
   applied to, each still carrying `played_at: null` (the cursor means the
   server never sends those rows again), and the run said the entire
   conversation over again the moment the person pressed End.
-- **The hub reports where the person is, in two halves.** One `POST` to
-  `/api/live/route` carries the **route** (which page) and the **context**
-  (what is in focus on it), so the agent can answer "what am I looking at"
-  without guessing — and, since task 888, without asking. There are **four**
+- **The hub reports where the person is, in three parts.** One `POST` to
+  `/api/live/route` carries the **route** (which page), the **context**
+  (what is in focus on it) and the **window box** (which desktop window all of
+  that is showing in, task 895), so the agent can answer "what am I looking at"
+  without guessing — and, since task 888, without asking — and can
+  [photograph it](#seeing-the-screen-mesa-live-look-task-895). There are
+  **five**
   triggers: on arrival, on every `hashchange`, the moment the session goes live
-  (a session that just started has no idea where its person already was), and —
-  the new one — a change of focus on the page *already* open: same route,
-  different answer to "what is this?". It stays **ambient**, like the inbox's
+  (a session that just started has no idea where its person already was), a
+  change of focus on the page *already* open (same route, different answer to
+  "what is this?") — and, while the session is live, the poll's own 2s tick,
+  because a window dragged across the desktop fires no event for anything to
+  hear. It stays **ambient**, like the inbox's
   read mark: a failure — no live session, most often — is forgotten rather than
-  shown.
+  shown, and the dedupe below means the tick posts nothing at all unless
+  something moved.
 
-  Route and context go in **one body because they are one statement**, and
+  Route, context and window box go in **one body because they are one
+  statement**, and
   omitting the context is how a page with nothing open says so — a report is
   not a patch. Sending them separately would mean two writes that can disagree
-  about which page a focus is on.
+  about which page a focus is on, or a box that names a window some other
+  report's page was never in.
 
   The report is **debounced** (one shared trailing 300 ms timer,
   `REPORT_DEBOUNCE_MS`), which the route alone never needed. Context changes far
@@ -1031,6 +1206,11 @@ conversation") working with no backend change.
   readings of that list say the same thing, what to call one before its label
   is known, which one is actually chosen, and whether the chooser is offered at
   all) and
+  `frontend/src/liveWindow.ts` (the browser window's own box: the four
+  properties rounded to whole pixels, and whether two readings of them are the
+  same window in the same place — the `sameContext` twin, since the hub builds
+  a fresh object on every sample and identity would report a move every tick)
+  and
   `frontend/src/liveContext.ts` (what a reported field is worth on the wire —
   trimmed, blank folded to absent, cut to 200 with `…` — whether two contexts
   say the same thing, and the page-to-hub channel itself: publish, read what is
@@ -1088,6 +1268,13 @@ CLAUDE.md requires: **data, never instructions.**
     to a mesa route, a local whisper — is the follow-up that would take the
     privacy question and the non-Chromium browsers off this list. It is not
     here yet, and it is the only reason a route would ever accept audio.
+- **An HTTP route for `mesa live look`** (task 895). Capturing the person's
+  screen is a CLI-only capability on purpose: `--lan` serves the API to the
+  whole network with no auth, and no gate here makes "photograph the owner's
+  desktop" an acceptable thing to answer over a socket. mesa also never
+  *stores* a shot, never puts one in a turn, and never shows one in the web UI:
+  the PNG is a file on the person's own disk that the agent reads and nothing
+  else ever sees.
 - **A second live session.** One conversation, one page, one player.
 - **A liveness bound on `working_since`.** The stamp is cleared by the next
   waiter, so an agent killed mid-work leaves the band lit until the
@@ -1140,3 +1327,19 @@ rather than `""`, the 200-char field bound inclusive on both sides, an unknown
 `kind` as 422 `validation`, a refused report leaving the stored route *and*
 context untouched — and every one of the ten `kind` values accepted in a loop,
 because a vocabulary the gate does not exercise is a vocabulary that rots.
+
+`mesa live look` has a section of its own (task 895), driven through a **stub**
+`MESA_LOKI_BIN` — a gate cannot have a screen, a browser or a window server,
+and the half that is mesa's needs none of the three. The stub answers
+`-f json windows` from a file the section rewrites per case and writes a PNG at
+whatever `--output` names, so what is under test is which window the reported
+box picks: the **khora lookalike** (a second window titled `mesa` at a
+different size, which the shot must not land on), a box no window is at
+(`unavailable`), two windows at one box (`conflict` naming both ids), a session
+that has reported no box at all (`unavailable`, and nothing spawned), the
+window box round-tripping from the page's HTTP report to `mesa live status`
+over its own `Store`, an out-of-range box as 422 writing nothing, the default
+temp path and an explicit `--output` both landing a real file on disk, and
+`--quiet` refused with exit 2. On a machine that is not a Mac the section
+asserts the one thing that is true there instead: `unavailable`, saying loki is
+a macOS tool.

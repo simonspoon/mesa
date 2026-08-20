@@ -39,6 +39,7 @@ import type { LiveContext } from './types/LiveContext'
 import type { LiveSession } from './types/LiveSession'
 import type { LiveState } from './types/LiveState'
 import type { LiveTurn } from './types/LiveTurn'
+import type { LiveWindow } from './types/LiveWindow'
 import type { MesaVersion } from './types/MesaVersion'
 import type { ModelRates } from './types/ModelRates'
 import type { ProjectFileSearch } from './types/ProjectFileSearch'
@@ -909,13 +910,16 @@ export function sendLiveUtterance(text: string): Promise<LiveTurn> {
  * Route and context travel together in one report (mesa task 888): they are
  * two halves of one answer — which page, and what is in focus on it — and a
  * page whose focus moved has not changed route, so splitting them would mean
- * two writes that can disagree.
+ * two writes that can disagree. The window box (mesa task 895) is the third
+ * member for the same reason: it says which desktop window all of that is
+ * showing in, so the agent can photograph the page it is being told about.
  */
 export function reportLiveRoute(
   route: string,
   context: LiveContext | null,
+  window: LiveWindow | null,
 ): Promise<LiveSession> {
-  return request('/api/live/route', jsonInit('POST', { route, context }))
+  return request('/api/live/route', jsonInit('POST', { route, context, window }))
 }
 
 /**

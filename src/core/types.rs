@@ -2509,6 +2509,31 @@ pub struct LiveContext {
     pub detail: Option<String>,
 }
 
+/// The physical browser window a live conversation is being held in, as the
+/// page reports it (mesa task 895): `window.screenX`/`screenY` and
+/// `outerWidth`/`outerHeight`, rounded to whole pixels.
+///
+/// It exists because the agent otherwise has no way to *see* the screen. A
+/// route says which page, a [`LiveContext`] says what is open on it, and
+/// neither says what actually rendered — so `mesa live look` screenshots the
+/// window, and this box is how it finds the right one. The desktop tooling
+/// mesa asks (`loki`) reports every window's frame in the same screen
+/// coordinates, and a window's position and size together are its identity:
+/// several headless browsers on this machine are titled `mesa`, so matching on
+/// a title would photograph one of them, while only the browser that is
+/// actually joined to the conversation ever reports a box.
+///
+/// Reported by the page, so it needs a TS type — unlike the shot itself, which
+/// no browser ever sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveWindow {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// One live conversation. **At most one is `live` at a time** (`Store`
 /// enforces it): the page has one microphone-shaped text field and one
 /// `<audio>` element, so a second concurrent conversation would have nowhere
@@ -2539,6 +2564,12 @@ pub struct LiveSession {
     /// authority for anything mesa does. Null when the page has reported
     /// nothing, or has reported that nothing is selected.
     pub context: Option<LiveContext>,
+    /// Where the browser window *itself* is on the screen, as reported by the
+    /// page in the same request as the route (mesa task 895). Null when no
+    /// browser has joined the conversation — a session driven from the CLI
+    /// with `--no-agent` never has one — which is exactly the case
+    /// `mesa live look` reports as unavailable rather than guessing at.
+    pub window: Option<LiveWindow>,
     /// When the conversation started (SQLite `datetime` text, UTC).
     pub started_at: String,
     /// When the session row was last written — bound to an agent, re-routed,

@@ -6,6 +6,7 @@ pub mod files;
 pub mod git;
 pub mod hooks;
 pub mod live;
+pub mod look;
 pub mod scripts;
 pub mod speech;
 mod store;
@@ -26,7 +27,7 @@ pub use types::{
     FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit, GitCommitFile,
     GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind, LiveAction,
     LiveContext, LiveContextKind, LiveRole, LiveSession, LiveState, LiveStatus, LiveTurn,
-    MesaVersion, ModelRates, Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog,
-    ProjectGitStatus, ProjectGitView, ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun,
-    Status, Task, TaskSummary, Waypoint, task_name,
+    LiveWindow, MesaVersion, ModelRates, Priority, Project, ProjectAgents, ProjectFileTree,
+    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Script, ScriptArg,
+    ScriptArgKind, ScriptRun, Status, Task, TaskSummary, Waypoint, task_name,
 };

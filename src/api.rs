@@ -41,11 +41,11 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, LiveContext, LiveRole, LiveState, MesaVersion, ModelRates, NextResult,
-    Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
-    ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, live, scripts, speech,
-    version,
+    InboxItem, InboxKind, LiveContext, LiveRole, LiveState, LiveWindow, MesaVersion, ModelRates,
+    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    ProjectGitView, ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store,
+    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, live,
+    scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -2209,6 +2209,14 @@ struct LiveRouteBody {
     /// this handler runs at all.
     #[serde(default)]
     context: Option<LiveContext>,
+    /// Where the browser window itself is on the screen (mesa task 895).
+    /// Optional, and absent means "no browser is reporting one" — a session
+    /// driven from the CLI never has one, which is exactly what
+    /// `mesa live look` refuses to guess at. Only the page that is joined to
+    /// the conversation ever posts here, which is what makes the box the
+    /// identity of the *person's* window and not some other browser's.
+    #[serde(default)]
+    window: Option<LiveWindow>,
 }
 
 /// Every live write except `start` acts on **the** current session, so there is
@@ -2466,7 +2474,13 @@ async fn live_route(
     let Some(session) = store.current_live_session()? else {
         return Err(no_live_session());
     };
-    Ok(Json(store.set_live_route(session.id, &body.route, body.context.as_ref())?).into_response())
+    Ok(Json(store.set_live_route(
+        session.id,
+        &body.route,
+        body.context.as_ref(),
+        body.window.as_ref(),
+    )?)
+    .into_response())
 }
 
 /// Stamps one mesa turn as spoken, answering with the turn either way. The
@@ -9157,6 +9171,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Ok(Json(LiveRouteBody {
                 route: "#/live".into(),
                 context: None,
+                window: None,
             })),
         )
         .await
@@ -9192,6 +9207,14 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                     label: Some("api.rs".into()),
                     detail: None,
                 }),
+                // The browser reports where it is on the screen in the same
+                // body (mesa task 895) — one statement, one poster.
+                window: Some(LiveWindow {
+                    x: 22,
+                    y: 22,
+                    width: 1600,
+                    height: 1000,
+                }),
             })),
         )
         .await
@@ -9206,12 +9229,14 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let ctx = session.context.unwrap();
         assert_eq!(ctx.kind, LiveContextKind::Files);
         assert_eq!(ctx.label.as_deref(), Some("api.rs"));
+        assert_eq!(session.window.unwrap().width, 1600);
 
         live_route(
             State(state.clone()),
             Ok(Json(LiveRouteBody {
                 route: "#/inbox".into(),
                 context: None,
+                window: None,
             })),
         )
         .await
@@ -9224,6 +9249,10 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .unwrap()
             .unwrap();
         assert_eq!(session.context, None);
+        // The window box is the same complete statement: a report without one
+        // is a page saying it no longer knows, not a patch that leaves the old
+        // box standing.
+        assert_eq!(session.window, None);
     }
 
     /// `kind` is a closed enum, so **serde** is the gate: a page mesa does not

@@ -28,7 +28,7 @@ use crate::core::{
     Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
     LiveAction, LiveRole, LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project,
     ProjectPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
-    TaskPatch, agents, config, live,
+    TaskPatch, agents, config, live, look,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -57,8 +57,9 @@ OUTPUT
   Exit codes: 0 success, 1 domain/runtime error, 2 usage error. `unavailable`
   is scoped to the commands that depend on something outside mesa:
   `cc usage` (missing token or unreachable upstream), `task execute` (the
-  hook shell could not be started) and `live start` (the `claude` binary that
-  drives the conversation could not be started).
+  hook shell could not be started), `live start` (the `claude` binary that
+  drives the conversation could not be started) and `live look` (the `loki`
+  desktop tool, or the browser window it was asked to photograph).
 
 DATABASE
   Defaults to ~/Library/Application Support/mesa/mesa.db;
@@ -1196,6 +1197,33 @@ EXAMPLES
         #[arg(long, value_name = "N", default_value_t = 500)]
         limit: i64,
     },
+    /// Screenshot the person's browser window; prints the path to a PNG
+    ///
+    /// `route` and `context` say which page they are on and what is open on
+    /// it; neither says what actually RENDERED. This takes the picture, so an
+    /// answer that depends on how something looks does not have to be got by
+    /// asking the person to describe their own screen. Open the printed path
+    /// with your image tool.
+    ///
+    /// The window is found by the box the conversation's browser reports —
+    /// its position and size — not by its title, because several headless
+    /// browsers on a developer machine are titled `mesa` too. So a session
+    /// nobody has joined in a browser (one started with --no-agent, or driven
+    /// from the CLI) is `unavailable`, as is a machine with no `loki`
+    /// installed, and a window that has moved or closed since it reported.
+    /// None of that stops a conversation: carry on without the picture.
+    ///
+    /// There is deliberately no HTTP route for this. Capturing the person's
+    /// screen must not be reachable over the network.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live look
+  mesa live look --output /tmp/screen.png")]
+    Look {
+        /// Where to write the PNG (default: a temp file named for the session)
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2162,8 +2190,8 @@ const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
 const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
 /// A `LiveSession` has no unbounded field either — ids, one of two status
 /// words, a 200-char route, a four-field context each of whose free-text
-/// fields `Store` caps at 200 chars, and timestamps — so quiet output equals
-/// full output. The flag is accepted across the group for uniformity.
+/// fields `Store` caps at 200 chars, a four-integer window box, and
+/// timestamps — so quiet output equals full output. The flag is accepted across the group for uniformity.
 const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
 
 /// Quiet projection of one record: the serialized record minus `drop`ped keys.
@@ -3210,6 +3238,17 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
 /// audible pause, slow enough that a waiting agent is not a spinning CPU.
 const LISTEN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Seconds since the epoch, for naming the default screenshot file. Enough to
+/// keep two looks at one conversation from landing on the same path, and short
+/// enough to read out of a `ls` — a temp file's name is a convenience, not an
+/// identity.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// The current live session, or the `not_found` every command but `status`
 /// answers with when nobody is in a conversation.
 fn current_live_session(store: &Store) -> Result<LiveSession> {
@@ -3410,6 +3449,30 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             let session = current_live_session(&store)?;
             print_json(&store.list_live_turns(session.id, after, limit)?);
         }
+        LiveCmd::Look { output } => {
+            let session = current_live_session(&store)?;
+            // A conversation with no reported window is not a broken one: it
+            // is a session nobody has joined in a browser, which is exactly
+            // what `--no-agent` and a CLI-driven loop are. Say which it is,
+            // rather than letting the loki call fail with "no window at
+            // 0,0 0×0".
+            let Some(window) = session.window else {
+                return Err(Error::Unavailable(format!(
+                    "live session {} has no browser window to look at; open mesa in a \
+                     browser and press Listen to join the conversation",
+                    session.id
+                )));
+            };
+            let path = match output {
+                Some(path) => PathBuf::from(path),
+                None => std::env::temp_dir().join(format!(
+                    "mesa-live-{}-{}.png",
+                    session.id,
+                    unix_seconds()
+                )),
+            };
+            print_json(&look::shoot(&window, &path)?);
+        }
     }
     Ok(())
 }
@@ -3568,7 +3631,7 @@ mod tests {
         AnchorSide, Diagram, DiagramType, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape,
         InboxItem, Project, TaskSummary, Waypoint,
     };
-    use crate::core::{LiveContext, LiveContextKind};
+    use crate::core::{LiveContext, LiveContextKind, LiveWindow};
 
     /// Serialized top-level key set of any record, sorted.
     fn keys(value: &impl serde::Serialize) -> Vec<String> {
@@ -3755,6 +3818,12 @@ mod tests {
                 id: Some("src/core/store.rs".into()),
                 label: Some("store.rs".into()),
                 detail: Some("line 42".into()),
+            }),
+            window: Some(LiveWindow {
+                x: 22,
+                y: 22,
+                width: 1600,
+                height: 1000,
             }),
             started_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
@@ -4033,6 +4102,9 @@ mod tests {
                 // three free-text fields `Store` caps at 200 chars each, so it
                 // is bounded the same way the route is (mesa task 888).
                 "context",
+                // Where the browser window is on the screen: four integers
+                // `Store` bounds, so bounded twice over (mesa task 895).
+                "window",
                 "started_at",
                 "updated_at",
                 // Bounded (a timestamp or null), and the field `live stop`
@@ -4046,9 +4118,9 @@ mod tests {
                 "working_since",
             ]),
             "LiveSession gained/lost a field: every field it has today is \
-             bounded — ids, fixed words, timestamps, a 200-char route and a \
-             context of 200-char fields — so --quiet == full; revisit if that \
-             changes",
+             bounded — ids, fixed words, timestamps, a 200-char route, a \
+             context of 200-char fields and a four-integer window box — so \
+             --quiet == full; revisit if that changes",
         );
         assert_eq!(
             sorted_owned(value_keys(&quiet(

@@ -1664,6 +1664,21 @@ main {
   visibility: hidden;
 }
 
+/* `visibility: hidden` alone still reserves the two buttons' width, and the
+   cluster is centred on the connector by its own `translate(-50%, -50%)` — so
+   a `yes`/`no` label rendered as a box three times the width of its word with
+   the word itself pushed ~20px off the line it labels (mesa task 892). The
+   hidden controls collapse to zero width instead, which centres the *word* on
+   the connector; they take their width back on hover, where a small reflow of
+   a box the pointer is already on costs nothing. */
+.edge-del,
+.edge-props-toggle {
+  width: 0;
+  padding-left: 0;
+  padding-right: 0;
+  overflow: hidden;
+}
+
 .edge-label:hover .edge-del,
 .edge-label:focus-within .edge-del,
 .edge-label.open .edge-del,
@@ -1671,6 +1686,10 @@ main {
 .edge-label:focus-within .edge-props-toggle,
 .edge-label.open .edge-props-toggle {
   visibility: visible;
+  width: auto;
+  padding-left: 0.3rem;
+  padding-right: 0.3rem;
+  overflow: visible;
 }
 
 /* The popover itself: line style + both end markers, opening under the label
@@ -1868,20 +1887,140 @@ main {
   box-shadow: none;
   overflow: visible;
 }
+/* Two stacked layers, not a bordered one (mesa task 892). A `clip-path` cuts
+   the element at the polygon while a CSS border is painted around its *box*,
+   so a clipped backdrop's border survives only where polygon and box touch —
+   for a diamond, four single points. Every clipped silhouette on this canvas
+   was therefore drawing as a flat unoutlined blob, which is most of what made
+   the shapes hard to tell apart at a glance. So `::before` paints the whole
+   silhouette in the *outline* colour and `::after` repaints it in the fill,
+   inset by a hairline; both sit behind the content at `z-index: -1`, and DOM
+   order puts the fill over the outline, leaving exactly a rim. `drop-shadow`
+   rather than `box-shadow` for the selected glow, because it follows the clip
+   instead of the box. Every other clipped shape below is built the same way. */
 .frame.frame-decision::before {
   content: '';
   position: absolute;
   inset: -35% -20%;
   z-index: -1;
-  background: var(--panel-raised);
-  border: 1px solid var(--amber);
+  background: var(--amber);
   clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
-  transition: box-shadow 0.15s, border-color 0.15s;
+  transition: background 0.15s, filter 0.15s;
+}
+.frame.frame-decision::after {
+  content: '';
+  position: absolute;
+  inset: calc(-35% + 1.5px) calc(-20% + 1.5px);
+  z-index: -1;
+  background: var(--panel-raised);
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}
+/* The backdrop being *around* the card is only half the job: the card is still
+   a full-width rectangle, and a diamond is at its narrowest exactly where that
+   rectangle's top and bottom edges are — so with no further rule the title and
+   the last line of the body both cross the slanted edge and hang outside the
+   silhouette (mesa task 892, the reported defect). The content is therefore
+   inset to the rectangle the diamond actually inscribes.
+
+   The number is geometry, not taste. With the backdrop at `-35% -20%` the
+   diamond is `1.4w x 1.7h` centred on the card, so a point `(x, y)` measured
+   from the card's centre is inside it iff
+   `|x| / (0.7w) + |y| / (0.85h) <= 1`. The content spans the card's full
+   height, so `|y| = 0.5h` costs `0.588` and leaves `0.412` of the budget for
+   the width: `|x| <= 0.288w`, i.e. the content may occupy the middle `57.6%`
+   of the card. Padding each side by `21%` lands exactly on that bound, and
+   `22%` keeps a hair of margin. Raise the backdrop's inflation and this can
+   come down; do not change one without the other. */
+.frame.frame-decision .frame-header,
+.frame.frame-decision .frame-body,
+.frame.frame-relationship .frame-header,
+.frame.frame-relationship .frame-body {
+  padding-left: 22%;
+  padding-right: 22%;
+  text-align: center;
+}
+/* Centred text wants a centred header row too — the title reads as the
+   diamond's label rather than as a bar pinned to one side. The band and rule
+   the rectangular shapes wear would cut straight across the silhouette at its
+   narrowest, so both come off here. `align-items: flex-start` keeps the `#id`
+   badge level with the title's *first* line: centred against a title that
+   wraps to three lines it floats off at mid-height, reading as a stray label
+   rather than as part of the heading. */
+.frame.frame-decision .frame-header,
+.frame.frame-relationship .frame-header {
+  justify-content: center;
+  align-items: flex-start;
+  background: transparent;
+  border-bottom: none;
+}
+
+/* A diamond is widest across its middle, so that is where its text belongs.
+   Every other shape stacks header-then-body from the top and lets the body
+   take the slack (`.frame-body { flex: 1 }`), which in a diamond leaves the
+   title crammed into the narrow tip with the empty slack below it. Here the
+   body claims only what it needs and the pair is centred as a block.
+
+   The ERD `attribute` oval takes the same treatment for the same reason: it is
+   widest across its middle too, and in Chen notation an attribute is a name in
+   an oval — a title pinned to the top with a bar under it is not that. It
+   needs no horizontal padding, though: at `24%` inflation the card's own
+   corners are already inside the curve, which is the whole point of that
+   number. */
+.frame.frame-decision,
+.frame.frame-relationship,
+.frame.frame-attribute {
+  justify-content: center;
+}
+.frame.frame-decision .frame-body,
+.frame.frame-relationship .frame-body,
+.frame.frame-attribute .frame-body {
+  flex: 0 1 auto;
+}
+.frame.frame-attribute .frame-header,
+.frame.frame-attribute .frame-body {
+  text-align: center;
+}
+/* A full-width band with a rule under it, drawn inside a curve, reads as a
+   rectangle someone dropped into the oval — the same mistake the cylinder's
+   cap made with its own header (mesa task 892 QA). */
+.frame.frame-attribute .frame-header {
+  justify-content: center;
+  align-items: flex-start;
+  background: transparent;
+  border-bottom: none;
+}
+
+/* While the card is being edited it is a *form*, not a shape's label: the
+   title input, the body textarea and the colour/task/delete row all want the
+   card's full width. Centred and inset to 22% the title input was narrow
+   enough to scroll its own text out of view (mesa task 892 QA). The backdrop
+   keeps drawing behind the open editor — it is still that frame's shape — but
+   the content stands the shape's rules down until the edit ends. */
+.frame.frame-decision.editing,
+.frame.frame-relationship.editing,
+.frame.frame-attribute.editing {
+  justify-content: flex-start;
+}
+.frame.frame-decision.editing .frame-header,
+.frame.frame-decision.editing .frame-body,
+.frame.frame-relationship.editing .frame-header,
+.frame.frame-relationship.editing .frame-body,
+.frame.frame-attribute.editing .frame-header,
+.frame.frame-attribute.editing .frame-body {
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+  text-align: left;
+}
+.frame.frame-decision.editing .frame-header,
+.frame.frame-relationship.editing .frame-header,
+.frame.frame-attribute.editing .frame-header {
+  justify-content: space-between;
+  align-items: center;
 }
 .frame.frame-decision.selected::before,
 .frame.frame-decision.editing::before {
-  border-color: var(--cyan);
-  box-shadow: 0 0 16px var(--cyan-dim);
+  background: var(--cyan);
+  filter: drop-shadow(0 0 8px var(--cyan-dim));
 }
 
 .frame.frame-start-end {
@@ -2046,18 +2185,41 @@ main {
 
 .frame.frame-note.selected::before,
 .frame.frame-note.editing::before,
-.frame.frame-data.selected::before,
-.frame.frame-data.editing::before,
-.frame.frame-document.selected::before,
-.frame.frame-document.editing::before,
 .frame.frame-database.selected::before,
 .frame.frame-database.editing::before,
-.frame.frame-relationship.selected::before,
-.frame.frame-relationship.editing::before,
 .frame.frame-attribute.selected::before,
 .frame.frame-attribute.editing::before {
   border-color: var(--cyan);
   box-shadow: 0 0 16px var(--cyan-dim);
+}
+
+/* The clipped members of the group take the `.frame-decision` treatment above
+   instead of a border, for the reason recorded there: a border on a clipped
+   box is not drawn. `::after` is the fill layer, so the two shapes that use it
+   for something else (`note`'s turned-up flap, `database`'s cap rule) are the
+   two that keep a real border — and neither of them clips the edge its border
+   runs along. */
+.frame.frame-data::before,
+.frame.frame-document::before,
+.frame.frame-relationship::before {
+  border: none;
+}
+.frame.frame-data::after,
+.frame.frame-document::after,
+.frame.frame-relationship::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  background: var(--panel-raised);
+}
+.frame.frame-data.selected::before,
+.frame.frame-data.editing::before,
+.frame.frame-document.selected::before,
+.frame.frame-document.editing::before,
+.frame.frame-relationship.selected::before,
+.frame.frame-relationship.editing::before {
+  background: var(--cyan);
+  filter: drop-shadow(0 0 8px var(--cyan-dim));
 }
 
 /* "Note": a folded-corner sticky (storyboard + brainstorm — commentary, in
@@ -2085,53 +2247,122 @@ main {
   opacity: 0.35;
   clip-path: polygon(0 0, 100% 100%, 0 100%);
 }
+/* The header's cyan band is drawn across the *card*, which on a sticky stops
+   26px short of the paper's own right edge — so it read as a bar someone had
+   left misaligned on the note, in the wrong colour for the amber paper besides
+   (mesa task 892 QA). The title keeps a rule, in the sticky's own colour;
+   the band goes. */
+.frame.frame-note .frame-header {
+  background: transparent;
+  border-bottom-color: rgba(255, 180, 68, 0.35);
+}
 
-/* Flowchart "data" (ANSI input/output): a parallelogram. Inflated 22px on
-   each side so both slanted edges clear the card's content entirely. */
+/* Flowchart "data" (ANSI input/output): a parallelogram, inflated on each side
+   so both slanted edges clear the card's content entirely.
+
+   The slant used to be `14%` of an inflated backdrop — on a default card that
+   is ~40px, against only 22px of inflation, so the parallelogram's edges cut
+   ~18px *into* the card's own text (mesa task 892). Slant and inflation are now
+   the same 28px, which puts the card's left and right edges exactly on the
+   silhouette: nothing crosses, and the shape is no wider than it needs to be. */
 .frame.frame-data::before {
-  inset: -6px -22px;
-  border-color: var(--cyan);
-  clip-path: polygon(14% 0, 100% 0, 86% 100%, 0 100%);
+  inset: -6px -28px;
+  background: var(--cyan);
+  clip-path: polygon(28px 0, 100% 0, calc(100% - 28px) 100%, 0 100%);
+}
+.frame.frame-data::after {
+  inset: calc(-6px + 1.5px) calc(-28px + 1.5px);
+  clip-path: polygon(28px 0, 100% 0, calc(100% - 28px) 100%, 0 100%);
 }
 
 /* Flowchart "document": a rectangle whose bottom edge waves. The wave is cut
-   from the bottom 22px of an inflated backdrop, so it hangs below the card
-   rather than through the foot line. */
+   from the bottom of an inflated backdrop, so it hangs below the card rather
+   than through the foot line. */
 .frame.frame-document::before {
-  inset: -6px -6px -24px -6px;
-  border-color: var(--cyan);
+  inset: -6px -6px -28px -6px;
+  background: var(--cyan);
+  /* The wave is cut in px from the bottom of the backdrop, not in % of its
+     height: at `84%` a tall card put the trough ~40px up, i.e. through its own
+     last line of text (mesa task 892). Pinned to the bottom 28px — exactly the
+     backdrop's own bottom inflation — it hangs below the card at every card
+     height.
+
+     The points are one period of a sine sampled every 12.5%: midline 14px up
+     from the backdrop's bottom, amplitude 12px, so the crest sits 2px above
+     the bottom and the trough 26px, just clear of the card. The old four-point
+     polygon was a triangle wave of uneven amplitude and read as a torn page
+     rather than a curled one — the shape is a *document*, and the give-away is
+     that its bottom edge curves. */
   clip-path: polygon(
     0 0,
     100% 0,
-    100% 84%,
-    75% 100%,
-    50% 88%,
-    25% 100%,
-    0 86%
+    100% calc(100% - 14px),
+    87.5% calc(100% - 22.5px),
+    75% calc(100% - 26px),
+    62.5% calc(100% - 22.5px),
+    50% calc(100% - 14px),
+    37.5% calc(100% - 5.5px),
+    25% calc(100% - 2px),
+    12.5% calc(100% - 5.5px),
+    0 calc(100% - 14px)
+  );
+}
+.frame.frame-document::after {
+  inset: calc(-6px + 1.5px) calc(-6px + 1.5px) calc(-28px + 1.5px);
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% calc(100% - 14px),
+    87.5% calc(100% - 22.5px),
+    75% calc(100% - 26px),
+    62.5% calc(100% - 22.5px),
+    50% calc(100% - 14px),
+    37.5% calc(100% - 5.5px),
+    25% calc(100% - 2px),
+    12.5% calc(100% - 5.5px),
+    0 calc(100% - 14px)
   );
 }
 
 /* Flowchart "database": a cylinder. The elliptical top/bottom come from an
-   asymmetric `border-radius` on the backdrop (50% horizontally, 14%
+   asymmetric `border-radius` on the backdrop (50% horizontally, 22px
    vertically); `::after` redraws the top ellipse as a rule so the cylinder
    reads as one rather than as a lozenge. The backdrop's vertical inflation is
-   what keeps both curves off the header and the foot. */
+   what keeps both curves off the header and the foot.
+
+   The cap curve used to be `14%` of the backdrop's height against a flat 18px
+   of inflation — on any card taller than the default the ellipse reached
+   further down than the inflation did and clipped the header (mesa task 892).
+   Both are now 22px, so the card's top edge sits exactly at the cylinder's
+   widest point at every card height. */
 .frame.frame-database::before {
-  inset: -18px -6px;
+  inset: -22px -10px;
   border-color: var(--cyan);
-  border-radius: 50% / 14%;
+  border-radius: 50% / 22px;
 }
 .frame.frame-database::after {
   content: '';
   position: absolute;
   z-index: -1;
-  top: -18px;
-  left: -6px;
-  right: -6px;
-  height: 30px;
+  top: -22px;
+  left: -10px;
+  right: -10px;
+  height: 44px;
   border: 1px solid var(--cyan);
   border-radius: 50%;
   background: var(--panel-raised);
+}
+/* A cylinder's cap is a whole ellipse and its lower arc necessarily dips into
+   the body — by exactly the cap's own radius, 22px. That is the drawing, not a
+   bug; what *was* a bug is that the title sat in those 22px, so the arc ran
+   straight through the words (mesa task 892). The header is pushed below the
+   arc instead, and loses its band and rule while it is there: a full-width
+   bar drawn across the cap would cut the cylinder in half exactly where the
+   curve is meant to read. */
+.frame.frame-database .frame-header {
+  padding-top: 26px;
+  background: transparent;
+  border-bottom: none;
 }
 
 /* ERD "relationship" (Chen): a diamond, drawn exactly the way the flowchart
@@ -2139,7 +2370,11 @@ main {
    here — but magenta, with the ERD shapes. */
 .frame.frame-relationship::before {
   inset: -35% -20%;
-  border-color: var(--magenta);
+  background: var(--magenta);
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}
+.frame.frame-relationship::after {
+  inset: calc(-35% + 1.5px) calc(-20% + 1.5px);
   clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
 }
 
@@ -2154,7 +2389,16 @@ main {
    header, badge included, clears the curve with 60px to spare on each side,
    at the cost of a larger silhouette. */
 .frame.frame-attribute::before {
-  inset: -50% -30%;
+  /* Was `-50% -30%` — an oval `1.6w x 2h`, chosen by eye to clear the header.
+     Geometry gets there with far less: the card's corner `(0.5w, 0.5h)` is
+     inside an oval inflated by `a` on both axes iff
+     `(0.5 / (0.5 + a))^2 * 2 <= 1`, i.e. `a >= 0.207`. At `-21%` the whole
+     card — header, badge and last line — is inside the curve, in an oval a
+     third the area of the old one (mesa task 892). `24%` is that bound plus
+     the margin the bound itself does not cover: a 1px border, the card's own
+     antialiasing, and a glyph's ink not being its line box — at the exact
+     `20.7%` the curve visibly grazed the title in QA. */
+  inset: -24%;
   border-color: var(--magenta);
   border-radius: 50%;
 }

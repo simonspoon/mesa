@@ -643,3 +643,92 @@ only, so the ERD cardinality family is unreachable on a board that would 422
 it. Every change is one `PATCH /api/edges/{id}` through the existing
 `updateEdge` client (`EdgePatch` gained the three fields), then the usual
 refetch — no local optimistic copy, exactly like the anchor-lock click.
+
+## Silhouette geometry: what the shape occupies vs what the card does (mesa task 892)
+
+Every non-rectangular shape is drawn as an oversized `::before` backdrop behind
+an **unclipped** card, for the reason `.frame-decision` established and
+`App.css` records: a `clip-path` on the card itself eats the header, where the
+title's leading letter and the `#id` badge live. That rule stands. What task
+892 fixed is everything that rule left unsaid.
+
+**Three defects, one cause: nothing agreed on how big a shape actually is.**
+
+- *Content crossed its own outline.* The backdrop was inflated by eye, so text
+  hung outside the diamond and the parallelogram cut through the body. The
+  inflations are now derived, and each derivation is written beside the value
+  in `App.css` — a rectangle inscribed in a diamond `1.4w x 1.7h` may occupy
+  the middle **57.6%** of the card's width, so the two diamond shapes pad
+  their content **22%** on each side and centre it; an oval needs `>= 20.7%`
+  inflation on both axes to clear its card's corners, so `attribute` sits at
+  **24%** (the bound plus the margin the bound does not cover: a border, the
+  antialiasing, and a glyph's ink not being its line box). The `%`-based
+  silhouette details that failed at any *other* card size — the parallelogram's
+  `14%` slant against `22px` of inflation, the document's `84%` wave, the
+  cylinder's `14%` cap — are now px, matched to their own inflation.
+- *A clipped backdrop drew no outline at all.* A `clip-path` cuts the element
+  at the polygon while a CSS border is painted around its **box**, so a
+  clipped, bordered backdrop kept its border only where polygon and box touch
+  — for a diamond, four single points. Both diamonds, the parallelogram and
+  the document were flat unoutlined blobs. Those four are now **two stacked
+  layers**: `::before` paints the whole silhouette in the outline colour and
+  `::after` repaints it in the fill, inset `1.5px`, leaving exactly a rim
+  (`drop-shadow`, not `box-shadow`, for the selected glow — it follows the
+  clip). `note` and `database` keep a real border, because neither clips the
+  edge its border runs along, and both already use `::after` for something
+  else.
+- *Nothing outside the CSS knew the backdrop existed.* Auto-layout packed
+  frames by their stored `w`/`h` and connectors anchored to the card's measured
+  box, so a diamond 1.7x as tall as its card sat on both its neighbours and
+  every connector stopped well inside the shape it pointed at.
+  **`frontend/src/shapeBox.ts`** is now the one place the two worlds meet:
+  `SHAPE_BLEED` mirrors each backdrop's `inset` one-for-one and `outerBox()`
+  turns a card box into the box the shape occupies. `FrameEdgeView`'s `rect()`
+  inflates by it (so an endpoint lands on the outline), and `autoLayout()`
+  lays out the **measured** node inflated by it, then puts each frame's own
+  top-left back inside its silhouette by the same bleed — measured, because a
+  card's stored `h` is a `min-height` it grows past to fit its text.
+  `shapeBox.test.ts` is the tripwire for the table and `App.css` drifting
+  apart; **change an `inset` there and the matching entry here, or the canvas
+  silently goes back to overlapping.**
+
+Two more things follow from the silhouette becoming the node's real extent:
+
+- **The four connection dots moved out to the outline too.** A handle is a
+  sibling of the card and React Flow pins it to the node wrapper's own edge —
+  which on a shaped frame is the card, not the shape. Once a connector attached
+  to the outline, the dot you grab and the point the line lands on were the
+  whole bleed apart, and the anchor-lock dots (computed from the same outline)
+  no longer sat just past their handles. `shapeBleedCss()` is the one extra
+  export that exists for this: the same table as a CSS length per side, because
+  this consumer needs an offset the browser resolves against the card rather
+  than a number of px.
+- **A shape's own rules stand down while its card is being edited.** An open
+  card is a form — title input, body textarea, colour/task/delete row — and all
+  of it wants the card's full width; centred and inset to 22% the title input
+  was narrow enough to scroll its own text out of view. The backdrop keeps
+  drawing behind the open editor (it is still that frame's shape), but the
+  content is left alone until the edit ends.
+
+And two smaller readability fixes ride along, both in the same "the drawing
+should be followable" spirit:
+
+- **An edge label sits at the curve's own midpoint**, which `getBezierPath`
+  hands back, not at the midpoint of the straight chord between the endpoints.
+  The two agree only when the curve is nearly straight; as soon as a connector
+  leaves one frame's side and arrives at the next one's top — the common case
+  in a branching flowchart — the chord midpoint sits off in bare canvas, or on
+  top of an unrelated frame, with nothing to say which connector it labels.
+- **Auto-layout centres its layers on each other** (`layout.ts`) instead of
+  packing every layer against `ORIGIN`. Left-aligned, a one-frame layer sat at
+  the top edge of a three-frame one, so a branch and the trunk it rejoins were
+  never on the same line and every connector between them arrived at a slant.
+- **An edge that spans more than one layer gets a dummy in each layer it
+  crosses** (`layout.ts`) — the Sugiyama step this layout was missing. A dummy
+  takes no room of its own, so what it buys is the `GAP_NODE` on either side of
+  it: a clear channel from the edge's source to its target. Without one, a
+  connector spanning four layers was drawn straight across whatever sat between
+  its ends, and in QA it ran right through an unrelated node's card. Dummies
+  join the crossing-reduction pass too, which is what keeps the channel roughly
+  straight; they never reach the caller, which still only sees positions for
+  real frames.

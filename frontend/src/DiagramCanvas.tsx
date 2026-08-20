@@ -57,6 +57,8 @@ import {
   encodeShapeDrag,
   paletteItems,
 } from './shapePalette'
+import { outerBox, shapeBleed, shapeBleedCss } from './shapeBox'
+import type { Bleed } from './shapeBox'
 import type { AnchorSide } from './types/AnchorSide'
 import type { DiagramType } from './types/DiagramType'
 import type { DiagramView } from './types/DiagramView'
@@ -136,6 +138,28 @@ type FrameEdgeType = Edge<
   },
   'frame'
 >
+
+/** Where a shape's connection handle sits relative to the card's own edge:
+ *  out by the silhouette's bleed on that side, so the handle is on the outline
+ *  the connector actually attaches to. Expressed as a percentage of the card
+ *  box, which is what React Flow's own handle positioning is relative to. */
+function handleOffset(
+  shape: FrameShape | null,
+  position: Position,
+): React.CSSProperties | undefined {
+  const b = shapeBleedCss(shape)
+  if (!b) return undefined
+  switch (position) {
+    case Position.Top:
+      return { top: `calc(0px - ${b.top})` }
+    case Position.Right:
+      return { right: `calc(0px - ${b.right})` }
+    case Position.Bottom:
+      return { bottom: `calc(0px - ${b.bottom})` }
+    default:
+      return { left: `calc(0px - ${b.left})` }
+  }
+}
 
 const HANDLES = [
   { id: 'top', position: Position.Top },
@@ -396,8 +420,21 @@ function FrameCardNode({
           </div>
         )}
       </div>
+      {/* Pushed out to the *silhouette*, not the card (mesa task 892). A
+          handle is a sibling of the card and React Flow pins it to the node
+          wrapper's own edge, which on a shaped frame is the card — while the
+          connector it starts now lands on the shape's outline (`shapeBox.ts`),
+          and the anchor-lock dots that hang just past each handle are computed
+          from that same outline. Left alone, the dot you grab and the point
+          the line attaches to were the whole bleed apart. */}
       {HANDLES.map((h) => (
-        <Handle key={h.id} id={h.id} type="source" position={h.position} />
+        <Handle
+          key={h.id}
+          id={h.id}
+          type="source"
+          position={h.position}
+          style={handleOffset(f.shape, h.position)}
+        />
       ))}
       {isConnectTarget && (
         <Handle
@@ -741,7 +778,7 @@ function buildRoutedPath(
       }
       return { path: smoothPath([start, bow, end]), anchors, mid: bow }
     }
-    const [path] = getBezierPath({
+    const [path, labelX, labelY] = getBezierPath({
       sourceX: start.x,
       sourceY: start.y,
       sourcePosition: start.position,
@@ -749,7 +786,14 @@ function buildRoutedPath(
       targetY: end.y,
       targetPosition: end.position,
     })
-    return { path, anchors, mid: midpointOfPolyline(anchors) }
+    // The label goes at the curve's own midpoint, which `getBezierPath` hands
+    // back, not at the midpoint of the straight chord between the endpoints
+    // (mesa task 892). The two agree only when the curve is nearly straight;
+    // as soon as it bows — a connector leaving one frame's side and arriving
+    // at the next one's top, the common case in a branching flowchart — the
+    // chord midpoint sits off in bare canvas, or on top of a frame, with
+    // nothing to say which connector it belongs to.
+    return { path, anchors, mid: { x: labelX, y: labelY } }
   }
 
   const start = fromAnchor
@@ -821,8 +865,8 @@ function FrameEdgeView({
   data,
   markerEnd,
 }: EdgeProps<FrameEdgeType>) {
-  const sourceNode = useInternalNode(source)
-  const targetNode = useInternalNode(target)
+  const sourceNode = useInternalNode<FrameNodeType>(source)
+  const targetNode = useInternalNode<FrameNodeType>(target)
   const { screenToFlowPosition } = useReactFlow()
   // Local optimistic override of the waypoint list: live while dragging (so
   // the connector follows the pointer before the PATCH round-trips) and also
@@ -883,12 +927,22 @@ function FrameEdgeView({
   }
 
   if (!sourceNode || !targetNode || !data) return null
-  const rect = (n: typeof sourceNode): Rect => ({
-    x: n.internals.positionAbsolute.x,
-    y: n.internals.positionAbsolute.y,
-    w: n.measured.width ?? 0,
-    h: n.measured.height ?? 0,
-  })
+  // The *silhouette's* box, not the card's (mesa task 892). A shaped frame is
+  // drawn as an oversized `::before` backdrop behind an unclipped card
+  // (`shapeBox.ts`), so anchoring to the measured card left every connector
+  // stopping well inside the diamond/cylinder/parallelogram it was pointing
+  // at, with the last stretch of line hidden behind the shape. Inflating the
+  // rect by the shape's own bleed puts the endpoint back on the outline.
+  const rect = (n: NonNullable<typeof sourceNode>): Rect =>
+    outerBox(
+      {
+        x: n.internals.positionAbsolute.x,
+        y: n.internals.positionAbsolute.y,
+        w: n.measured.width ?? 0,
+        h: n.measured.height ?? 0,
+      },
+      n.data.frame.shape,
+    )
   const from = rect(sourceNode)
   const to = rect(targetNode)
   const waypoints = localWaypoints ?? data.waypoints
@@ -1832,11 +1886,48 @@ export function DiagramCanvas({
   }
 
   /** Repositions every frame into ranked layers flowing in `layoutDirection`
-   *  (see layout.ts) and PATCHes each frame whose position actually moved. */
+   *  (see layout.ts) and PATCHes each frame whose position actually moved.
+   *
+   *  What is laid out is each frame's *silhouette* box, not its stored `w`/`h`
+   *  (mesa task 892). Two things made the stored size the wrong answer: a card
+   *  grows past its stored `h` to fit its text (the height is a `min-height`),
+   *  and a shaped frame's backdrop is drawn well outside the card again
+   *  (`shapeBox.ts`). Laying out the small box and drawing the big one is
+   *  exactly how a decision diamond ended up sitting on both its neighbours.
+   *  So: measure what React Flow actually rendered, inflate it by the shape's
+   *  bleed, lay *that* out, then put each frame's own top-left back inside its
+   *  silhouette by the same bleed. */
   function autoLayout() {
-    const positions = layoutFrames(view.frames, view.edges, layoutDirection)
+    const measured = new Map<number, { w: number; h: number }>()
+    for (const n of rfInstance.current?.getNodes() ?? []) {
+      const w = n.measured?.width
+      const h = n.measured?.height
+      if (w && h) measured.set(Number(n.id), { w, h })
+    }
+    const bleeds = new Map<number, Bleed>()
+    const boxes = view.frames.map((f) => {
+      const m = measured.get(f.id) ?? { w: f.w, h: f.h }
+      const b = shapeBleed(f.shape, m.w, m.h)
+      bleeds.set(f.id, b)
+      return {
+        id: f.id,
+        w: m.w + b.left + b.right,
+        h: m.h + b.top + b.bottom,
+      }
+    })
+    const positions = layoutFrames(boxes, view.edges, layoutDirection)
     const moves = view.frames
-      .map((f) => ({ f, p: positions.get(f.id)! }))
+      .map((f) => {
+        const outer = positions.get(f.id)!
+        const b = bleeds.get(f.id)!
+        return {
+          f,
+          p: {
+            x: Math.round(outer.x + b.left),
+            y: Math.round(outer.y + b.top),
+          },
+        }
+      })
       .filter(({ f, p }) => f.x !== p.x || f.y !== p.y)
     Promise.all(
       moves.map(({ f, p }) => updateFrame(f.id, { x: p.x, y: p.y }, author)),

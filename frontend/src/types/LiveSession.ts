@@ -48,4 +48,19 @@ updated_at: string,
 /**
  * When the conversation ended, or null while it is live.
  */
-ended_at: string | null, };
+ended_at: string | null, 
+/**
+ * When the agent last **took** an utterance and started working on it, or
+ * null while it is waiting on the person (mesa task 894).
+ *
+ * The whole of the agent's loop is `listen` → work → `say`, so "waiting"
+ * has exactly one shape: a `mesa live listen` sitting inside the wait with
+ * nothing to hand out. `Store::next_user_turn` is therefore the one writer
+ * — it stamps this when it hands a turn over and clears it on every poll
+ * that finds nothing — which is why the span it marks covers *all* of the
+ * work, thinking, tool calls and file writes alike, rather than only the
+ * moments mesa happens to be talking. A conversation nobody has listened
+ * on yet reads as null, so a session started with `--no-agent` never
+ * claims someone is working on it.
+ */
+working_since: string | null, };

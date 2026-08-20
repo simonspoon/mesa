@@ -3759,6 +3759,7 @@ mod tests {
             started_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
             ended_at: None,
+            working_since: Some("2026-01-02 00:00:01".into()),
         }
     }
 
@@ -4039,6 +4040,10 @@ mod tests {
                 // "the stop didn't take", the reasoning that keeps `read_at`
                 // in an inbox item's quiet shape.
                 "ended_at",
+                // Bounded (a timestamp or null), and the one field an agent
+                // could read to tell whether another listener already took
+                // the utterance it is about to work on (mesa task 894).
+                "working_since",
             ]),
             "LiveSession gained/lost a field: every field it has today is \
              bounded — ids, fixed words, timestamps, a 200-char route and a \

@@ -25,8 +25,10 @@
 #      the 200-char field bound), the `?after=` cursor and the idempotent
 #      played stamp;
 #   6. the loop the two surfaces make together: an utterance posted over HTTP is
-#      handed to `mesa live listen` exactly once, never twice, and a quiet wait
-#      prints `null` and exits 0;
+#      handed to `mesa live listen` exactly once, never twice, a quiet wait
+#      prints `null` and exits 0, and the session's `working_since` opens when
+#      the utterance is handed over, survives a reply and closes on the next
+#      wait that finds nothing (task 894);
 #   7. GET /api/live/turns/{id}/speak — the audio contract, the patched
 #      streaming WAV sizes, the header arriving mid-render, no Content-Length,
 #      `validation` for a pure-navigate turn and `unavailable` for a failing
@@ -776,9 +778,30 @@ run 0 "$MESA" live listen --wait 5
 [ "$(jqs .delivered_at)" != "null" ] || fail "live listen: the turn must come back stamped delivered"
 ok "live listen: the API's utterance reaches the CLI, stamped delivered"
 
+# The agent's half of the header band (task 894). Taking an utterance opens a
+# working span on the session row, which is what the page's existing poll shows
+# as "she is working on it" — and what tells it apart from never having heard.
+api 200 GET "/api/live"
+[ "$(jqb .session.working_since)" != "null" ] ||
+  fail "live listen: taking an utterance must mark the session working"
+# Saying something does not close it: an agent that says "one moment" and then
+# does the job is working for the whole of it.
+run 0 "$MESA" live say "One moment."
+api 200 GET "/api/live"
+[ "$(jqb .session.working_since)" != "null" ] ||
+  fail "live say must not end the working span — the agent may still be working"
+ok "live listen: taking an utterance marks the session working, and a reply does not clear it"
+
 run 0 "$MESA" live listen --wait 1
 [ "$STDOUT" = "null" ] || fail "live listen: a delivered utterance must never be handed out twice"
 ok "live listen: never the same utterance twice (delivery is the stamp)"
+
+# …and going back to the wait with nothing to hand out is the agent genuinely
+# waiting on the person, which is the one thing that ends the span.
+api 200 GET "/api/live"
+[ "$(jqb .session.working_since)" = "null" ] ||
+  fail "live listen with nothing to hand out must clear the working span"
+ok "live listen: waiting with nothing to do clears the working span"
 
 run 0 "$MESA" live listen --wait 1
 [ "$STDOUT" = "null" ] || fail "live listen with nothing said: expected null"

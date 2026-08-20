@@ -1314,7 +1314,8 @@ export function LiveHub({
   })
 
   // What the header band says about the conversation (`liveIndicator.ts`):
-  // mesa speaking, the person being heard, or the microphone simply open.
+  // mesa speaking, the person being heard, the agent at work, or the
+  // microphone simply open.
   const indicator = headerIndicator({
     live,
     joined: unlocked,
@@ -1327,6 +1328,11 @@ export function LiveHub({
     interim: interim !== '' ? interim : recording,
     draft,
     paused,
+    // The agent's own half of the band (mesa task 894), and the only part of
+    // it the server knows: `working_since` is stamped when the agent takes an
+    // utterance and cleared when it goes back to waiting, so it arrives on the
+    // 2s poll the page already makes and needs no state of its own here.
+    working: session?.working_since != null,
   })
 
   const groups = turnGroups(turns)
@@ -1338,8 +1344,9 @@ export function LiveHub({
     <div className="live-hub">
       {/* The conversation indicator, centered in the header band (the header is
           the positioning context) — with the panel closed it is the only sign
-          of either side talking. One element in three states, so the band
-          never shows two things at once (`liveIndicator.ts`). */}
+          of either side talking, or of the agent working on what was said.
+          One element in one state at a time, so the band never shows two
+          things at once (`liveIndicator.ts`). */}
       {indicator !== null && (
         <div
           className={`live-talk live-talk-${indicator}`}

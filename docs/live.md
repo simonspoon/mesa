@@ -96,6 +96,46 @@ in-memory queue would have had to invent: `next_user_turn` is **one**
 stamps `delivered_at`, so two listeners can never be handed the same utterance
 and answer it twice.
 
+## Whether the agent is working (`working_since`, task 894)
+
+Between taking an utterance and speaking again the agent may be thinking,
+reading files, running commands or waiting on a subagent — and until this
+column existed the page looked exactly the same as one that never heard the
+person at all. "She is working on it" and "you were not heard" are the two
+readings the header band now tells apart.
+
+The signal is one nullable timestamp on `live_sessions`, and the whole of its
+logic is inside `Store::next_user_turn`:
+
+- handing a turn over **stamps** it — that call *is* the agent starting work;
+- a poll that finds nothing **clears** it — the agent's loop is
+  `listen` → work → `say`, so sitting in the wait with nothing to hand out is
+  the one shape "waiting on the person" has;
+- `end_live_session` clears it too, and the stamp is itself scoped to a live
+  session: an ended conversation is nobody's turn, so a delivery racing the end
+  cannot reopen a span nothing is left to close.
+
+Both edges live in that one method rather than in the `listen` command, so the
+column cannot drift from the loop it describes and any future caller keeps it
+honest for free. The clear is guarded on the column (`AND working_since IS NOT
+NULL`), so the twice-a-second poll of a quiet conversation is a no-op rather
+than a write, and `updated_at` is deliberately left alone — that field records
+the session being bound, re-routed or ended, and a conversation that moved
+through fifty utterances did none of those.
+
+Two consequences worth stating:
+
+- **Speaking does not end the span.** An agent that says "one moment, let me
+  look" and then does the job is working for the whole of it — which is exactly
+  the stretch a spinner tied to a request in flight goes dark for.
+- **A session nobody has listened on reads as not working.** `--no-agent` is
+  the case that makes this the right default, and it is why the column is a
+  stamp cleared by the waiter rather than a flag set by the starter.
+
+It rides on `LiveSession`, so it reaches the page on the existing 2s
+`GET /api/live` poll and the agent on `mesa live status` — no new route, no new
+state, and nothing pushed.
+
 ## One session at a time
 
 `start_live_session` refuses to start a second conversation while one is
@@ -470,10 +510,10 @@ conversation") working with no backend change.
   and a routed page would be torn down by the very navigation it just
   performed — cutting its own sentence off mid-word and stopping the route
   reports below.
-- **A five-bar indicator sits centered in the header band, in one of four
-  states** (`liveIndicator.ts`, tasks 874 and 882) — the only sign of the conversation
-  while the panel is closed, so it answers for *both* sides of it rather than
-  only for mesa:
+- **A five-bar indicator sits centered in the header band, in one of five
+  states** (`liveIndicator.ts`, tasks 874, 882 and 894) — the only sign of the
+  conversation while the panel is closed, so it answers for *both* sides of it
+  rather than only for mesa:
   - **mesa speaking** (cyan) — the loudest of the four, and deliberately not
     one wave: each bar runs its own keyframes at its own awkward duration, so
     the five never fall into the shared ripple that reads as a spinner.
@@ -486,6 +526,12 @@ conversation") working with no backend change.
     interim result from the recognizer, or a draft sitting in the capture box.
     One travelling wave, quieter than mesa's, because it reflects input rather
     than performing.
+  - **the agent working** (violet) — she has taken what was said and has not
+    gone back to waiting (task 894). Violet because violet is already what this
+    app means by *an agent* (the sidebar pane header, task 819), so the colour
+    alone separates her doing something from her saying something. One wave,
+    low, slow and unglowing: it is the one state neither side is talking in,
+    and it can be lit for minutes on a page somebody is reading.
   - **listening** (muted) — the microphone is open and the room is quiet. Shown
     only where recognition really is the way in (`recognizesSpeech`); a browser
     that types into the fallback box gets no resting indicator, since a
@@ -496,10 +542,18 @@ conversation") working with no backend change.
   describing a microphone that is not open), **paused outranks both of the
   states under it** (the microphone is shut and the box is disabled, so a
   draft left over from before the pause must not read as the person still
-  talking), and **being heard outranks listening**. Whitespace is not speech.
-  All four freeze under `prefers-reduced-motion` — the same rule as
-  `.live-dot`'s pulse — to steady bars whose heights keep the ranking the
-  motion carried.
+  talking), **being heard outranks working** (words arriving from the person
+  are the stronger news, and the agent carries on working either way), and
+  **working outranks listening** (listening is the resting state, and work is
+  not rest). Whitespace is not speech. All five freeze under
+  `prefers-reduced-motion` — the same rule as `.live-dot`'s pulse — to steady
+  bars whose heights keep the ranking the motion carried.
+
+  Working is the one state shown to a browser that types into the fallback box
+  as well: unlike listening it is not "a text box exists" — someone is doing
+  work, which is exactly the thing that surface could not otherwise tell from
+  silence. Its input is the session's own `working_since` (below), which
+  arrives on the poll the page already makes.
 - **The conversation is a right-hand sidebar** (task 887), a sibling of the
   agents one in `.shell-body`'s flex row, so the two are independent: both open
   at once, either alone, or neither — and the page the conversation is *about*
@@ -1035,6 +1089,12 @@ CLAUDE.md requires: **data, never instructions.**
     privacy question and the non-Chromium browsers off this list. It is not
     here yet, and it is the only reason a route would ever accept audio.
 - **A second live session.** One conversation, one page, one player.
+- **A liveness bound on `working_since`.** The stamp is cleared by the next
+  waiter, so an agent killed mid-work leaves the band lit until the
+  conversation is ended — which is the harmless direction, and the one that
+  needs no clock: an agent that dies while *waiting* leaves the span closed,
+  and ending the conversation clears it either way. mesa does not poll the
+  agent to ask whether it is still alive.
 - **A server-side pause.** Pausing is one browser stepping out (task 882), not
   a state of the conversation: there is no `paused` column, no route and no CLI
   verb, and the agent is never told. Two pages on one conversation therefore
@@ -1066,6 +1126,8 @@ listen → turns → sidebars → stop), the spawn's argv and the `claude stop
 no agent to stop, and a `claude stop` that fails), the single-session
 `conflict`, every `validation` rule,
 `listen` returning `null` on timeout and never handing out the same turn twice,
+the `working_since` span it opens and closes (set when the utterance is handed
+over, still set after a reply, cleared by the next wait that finds nothing),
 the `--quiet` key sets, and the API twin including the audio contract and both
 halves of the security boundary in default **and** `--lan` mode.
 

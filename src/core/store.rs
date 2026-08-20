@@ -562,6 +562,15 @@ const MIGRATIONS: &[&str] = &[
     // it is one statement the page makes atomically and nothing queries its
     // parts; a row written before this column simply has nothing selected.
     "ALTER TABLE live_sessions ADD COLUMN context TEXT;",
+    // Task 894: whether the agent is mid-turn. One nullable timestamp rather
+    // than a flag, because the useful question ("how long has she been at
+    // it?") is the same column, and because null is then the honest reading of
+    // a conversation nobody has listened on. Written from exactly one place —
+    // `next_user_turn`, the agent's only way to take an utterance — so the
+    // column can never disagree with the loop it describes. A row that
+    // predates this migration reads as not working, which is what an ended
+    // conversation is.
+    "ALTER TABLE live_sessions ADD COLUMN working_since TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -708,8 +717,8 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 
 // ---- mesa live (task 855) ----
 
-const LIVE_SESSION_COLUMNS: &str =
-    "id, project_id, agent_id, status, route, started_at, updated_at, ended_at, context";
+const LIVE_SESSION_COLUMNS: &str = "id, project_id, agent_id, status, route, started_at, \
+     updated_at, ended_at, context, working_since";
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
      created_at, delivered_at, played_at";
@@ -754,6 +763,7 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
         started_at: row.get(5)?,
         updated_at: row.get(6)?,
         ended_at: row.get(7)?,
+        working_since: row.get(9)?,
     })
 }
 
@@ -3552,7 +3562,10 @@ impl Store {
         // second stopper cannot move the stamp the first one set.
         self.get_live_session(id)?;
         self.conn.execute(
-            "UPDATE live_sessions SET status = ?2, ended_at = datetime('now'), \
+            // An ended conversation is nobody's turn: whatever the agent was
+            // in the middle of, the loop it was in is over (mesa task 894).
+            "UPDATE live_sessions SET status = ?2, working_since = NULL, \
+             ended_at = datetime('now'), \
              updated_at = datetime('now') WHERE id = ?1 AND status = ?3",
             (id, LiveStatus::Ended.as_str(), LiveStatus::Live.as_str()),
         )?;
@@ -3723,8 +3736,17 @@ impl Store {
     /// The select and the stamp are **one statement**: the CLI opens its own
     /// `Store` beside the server's, so a read-then-update pair would let two
     /// listeners be handed the same utterance and answer it twice.
+    ///
+    /// This is also where the session's `working_since` is written (mesa task
+    /// 894), because this call *is* the boundary: handing a turn over is the
+    /// agent starting work, and a poll that finds nothing is the agent sitting
+    /// in the wait with nothing to do. Putting both edges here rather than in
+    /// the `listen` command means the column cannot drift from the loop, and
+    /// every caller — CLI today, anything else later — keeps it honest for
+    /// free. The clear is guarded on the column, so the twice-a-second poll of
+    /// a quiet conversation is a no-op rather than a write.
     pub fn next_user_turn(&mut self, session_id: i64) -> Result<Option<LiveTurn>> {
-        Ok(self
+        let turn = self
             .conn
             .query_row(
                 &format!(
@@ -3737,7 +3759,26 @@ impl Store {
                 (session_id, LiveRole::User.as_str()),
                 row_to_live_turn,
             )
-            .optional()?)
+            .optional()?;
+        // `updated_at` is deliberately left alone: it records the session row
+        // being bound, re-routed or ended, and a conversation that moved
+        // through fifty utterances did none of those things.
+        match turn {
+            // Scoped to a live session, so a turn still handed out by a
+            // listener that has not noticed the conversation ended cannot
+            // reopen a span nothing will ever close.
+            Some(_) => self.conn.execute(
+                "UPDATE live_sessions SET working_since = datetime('now') \
+                 WHERE id = ?1 AND status = ?2",
+                (session_id, LiveStatus::Live.as_str()),
+            )?,
+            None => self.conn.execute(
+                "UPDATE live_sessions SET working_since = NULL \
+                 WHERE id = ?1 AND working_since IS NOT NULL",
+                [session_id],
+            )?,
+        };
+        Ok(turn)
     }
 
     /// A session's turns in id order — the transcript, and the page's poll.
@@ -8681,6 +8722,97 @@ mod tests {
                 Some(LiveAction::CollapseSidebars),
                 Some(LiveAction::ExpandSidebars)
             ]
+        );
+    }
+
+    /// `working_since` is the agent's half of the header band (mesa task
+    /// 894), and `next_user_turn` owns both of its edges: taking an utterance
+    /// starts the span, a poll that finds nothing ends it. A fresh session has
+    /// not started one, and neither has an ended one.
+    #[test]
+    fn next_user_turn_marks_the_agent_working_until_it_waits_again() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        // Nobody has listened yet, so nobody is working — the `--no-agent`
+        // reading, and the reason this is a stamp rather than a flag.
+        assert!(session.working_since.is_none());
+
+        // A poll of a quiet conversation leaves it that way.
+        assert!(store.next_user_turn(session.id).unwrap().is_none());
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_none()
+        );
+
+        store
+            .add_live_turn(session.id, LiveRole::User, "how is it going", None, None)
+            .unwrap();
+        store.next_user_turn(session.id).unwrap().unwrap();
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_some(),
+            "taking an utterance starts the working span"
+        );
+
+        // Speaking does not end it: the agent may say "one moment" and carry
+        // on working, which is the span this column exists to cover.
+        store
+            .add_live_turn(session.id, LiveRole::Mesa, "one moment", None, None)
+            .unwrap();
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_some()
+        );
+
+        // Going back to the wait does.
+        assert!(store.next_user_turn(session.id).unwrap().is_none());
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_none()
+        );
+
+        // And an ended conversation is nobody's turn, whatever it was mid-way
+        // through when it was stopped.
+        store
+            .add_live_turn(session.id, LiveRole::User, "one more thing", None, None)
+            .unwrap();
+        store.next_user_turn(session.id).unwrap().unwrap();
+        let ended = store.end_live_session(session.id).unwrap();
+        assert!(ended.working_since.is_none());
+
+        // …and a listener that has not noticed yet cannot reopen the span on
+        // its way out: an ended conversation is nobody's turn, whichever side
+        // of the race the delivery lands on.
+        store
+            .add_live_turn(session.id, LiveRole::User, "hello?", None, None)
+            .unwrap_err();
+        store
+            .conn
+            .execute(
+                "INSERT INTO live_turns (session_id, role, text, created_at) \
+                 VALUES (?1, 'user', 'hello?', datetime('now'))",
+                [session.id],
+            )
+            .unwrap();
+        store.next_user_turn(session.id).unwrap().unwrap();
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_none()
         );
     }
 

@@ -8484,12 +8484,13 @@ button:focus-visible,
 }
 
 /* The conversation indicator (mesa task 874): five bars in the middle of the
-   header band, in one of three states — mesa speaking, the person being heard,
-   or the microphone simply open. With the panel closed this is the only sign
-   of either side talking, so which state it is has to read at a glance:
-   colour carries who (cyan is mesa, green is the person, muted is nobody yet)
-   and the motion carries how much is happening. Absolute against the header,
-   so it takes no room from the flex row. */
+   header band, in one state at a time — mesa speaking, the person being heard,
+   the agent at work on what was said (task 894), a paused page, or the
+   microphone simply open. With the panel closed this is the only sign of
+   either side talking, so which state it is has to read at a glance: colour
+   carries who (cyan is mesa, green is the person, violet is the agent working,
+   muted is nobody yet) and the motion carries how much is happening. Absolute
+   against the header, so it takes no room from the flex row. */
 .live-talk {
   position: absolute;
   left: 50%;
@@ -8576,6 +8577,29 @@ button:focus-visible,
   animation: none;
 }
 
+/* The agent at work (mesa task 894): violet, because violet is what this app
+   already means by "an agent" (the sidebar pane header, task 819) — so the
+   colour alone separates her doing something from her saying something (cyan)
+   and from the person being taken in (green). It is the one state neither side
+   is talking in, and it can be lit for minutes on a page somebody is reading,
+   so the motion is the quietest thing here that still moves: one wave, low
+   amplitude, slow, and no glow. Livelier than the open microphone below it,
+   plainly less than either voice above it — the ranking the whole band is
+   read by. */
+.live-talk-working {
+  color: var(--violet);
+}
+
+.live-talk-working span {
+  transform: scaleY(0.28);
+  animation: live-talk-work 1.8s ease-in-out infinite;
+}
+
+.live-talk-working span:nth-child(2) { animation-delay: 0.16s; }
+.live-talk-working span:nth-child(3) { animation-delay: 0.32s; }
+.live-talk-working span:nth-child(4) { animation-delay: 0.48s; }
+.live-talk-working span:nth-child(5) { animation-delay: 0.64s; }
+
 @keyframes live-talk-tall {
   0%, 100% { transform: scaleY(0.2); }
   45% { transform: scaleY(1); }
@@ -8598,6 +8622,11 @@ button:focus-visible,
   50% { transform: scaleY(0.8); opacity: 1; }
 }
 
+@keyframes live-talk-work {
+  0%, 100% { transform: scaleY(0.28); opacity: 0.55; }
+  50% { transform: scaleY(0.62); opacity: 0.95; }
+}
+
 @keyframes live-talk-idle {
   0%, 100% { transform: scaleY(0.22); opacity: 0.45; }
   50% { transform: scaleY(0.34); opacity: 0.85; }
@@ -8614,6 +8643,9 @@ button:focus-visible,
   }
   .live-talk-speaking span { transform: scaleY(0.7); }
   .live-talk-hearing span { transform: scaleY(0.5); }
+  /* Between the two, which is where it sits in the band's order: work is
+     quieter than either voice and louder than an idle microphone. */
+  .live-talk-working span { transform: scaleY(0.38); }
   .live-talk-listening span { transform: scaleY(0.25); }
   /* Lowest of the four, which is the ranking it already has: paused is the
      one state that was still to begin with, so this block changes nothing

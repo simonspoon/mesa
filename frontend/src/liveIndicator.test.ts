@@ -10,6 +10,7 @@ function input(patch: Partial<Parameters<typeof headerIndicator>[0]> = {}) {
     interim: '',
     draft: '',
     paused: false,
+    working: false,
     ...patch,
   }
 }
@@ -75,6 +76,37 @@ describe('headerIndicator', () => {
     expect(headerIndicator(input({ paused: true, speaking: true }))).toBe('speaking')
   })
 
+  it('shows the agent working, over the resting state and under being heard', () => {
+    expect(headerIndicator(input({ working: true }))).toBe('working')
+    // Words arriving from the person are the stronger news, by either route in
+    // — the agent carries on working either way, and the band says so again as
+    // soon as the box is empty.
+    expect(headerIndicator(input({ working: true, interim: 'and another thing' }))).toBe(
+      'hearing',
+    )
+    expect(headerIndicator(input({ working: true, draft: 'and another thing' }))).toBe(
+      'hearing',
+    )
+    // Speaking and paused both still outrank it: she is audibly mid-reply in
+    // the first, and this page has stepped out of the conversation in the
+    // second — while the agent, in both, is very likely still working.
+    expect(headerIndicator(input({ working: true, speaking: true }))).toBe('speaking')
+    expect(headerIndicator(input({ working: true, paused: true }))).toBe('paused')
+  })
+
+  it('reports the agent working to a browser typing into the box', () => {
+    // Unlike listening, this is not "a text box exists": someone is doing
+    // work, which is the one thing the fallback surface could not otherwise
+    // tell from silence.
+    expect(headerIndicator(input({ recognizes: false, working: true }))).toBe('working')
+    expect(headerIndicator(input({ recognizes: false }))).toBeNull()
+  })
+
+  it('says nothing about work in a conversation this browser is not in', () => {
+    expect(headerIndicator(input({ working: true, live: false }))).toBeNull()
+    expect(headerIndicator(input({ working: true, joined: false }))).toBeNull()
+  })
+
   it('says nothing about a pause in a conversation this browser is not in', () => {
     expect(headerIndicator(input({ paused: true, live: false }))).toBeNull()
     expect(headerIndicator(input({ paused: true, joined: false }))).toBeNull()
@@ -86,6 +118,7 @@ describe('indicatorLabel', () => {
     expect(indicatorLabel('speaking')).toBe('mesa is speaking')
     expect(indicatorLabel('paused')).toBe('mesa is paused')
     expect(indicatorLabel('hearing')).toBe('mesa is hearing you')
+    expect(indicatorLabel('working')).toBe('mesa is working on it')
     expect(indicatorLabel('listening')).toBe('mesa is listening')
   })
 })

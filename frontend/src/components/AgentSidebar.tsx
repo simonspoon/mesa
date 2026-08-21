@@ -1093,7 +1093,18 @@ export function AgentSidebar({
     'agents-sidebar',
     { pollMs: collapsed ? undefined : 3000 },
   )
-  const { data: projects } = useFetch(() => listProjects(), 'agents-sidebar-projects')
+  // Polled on the same terms as the session list above, for the same reason
+  // (mesa task 898): this sidebar is a permanent mount, so a one-shot fetch
+  // froze its project list for the life of the page — a project added or
+  // unarchived in the nav (or created by an agent through the CLI, which no
+  // in-page counter can ever see) only appeared after a browser refresh.
+  // Gated on `collapsed` so a hidden sidebar costs nothing, which also means
+  // expanding it refetches at once (the `pollMs` change re-runs the effect);
+  // `useFetch` drops a poll that changed nothing, so an idle list never
+  // re-renders.
+  const { data: projects } = useFetch(() => listProjects(), 'agents-sidebar-projects', {
+    pollMs: collapsed ? undefined : 3000,
+  })
 
   // Tile-area measurement (mesa task 466). Observed unconditionally rather
   // than only while `autoTile` is on, so flipping the toggle already has a

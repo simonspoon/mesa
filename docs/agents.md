@@ -127,8 +127,12 @@ the same persistent-shell pattern the left `Sidebar` and `CommandPalette`
 already use.
 
 - Data: `listAllAgents()` (`GET /api/agents`, 3s poll) for the session list,
-  plus a plain `listProjects()` fetch (no poll) to label each session with the
-  project whose `local_path` is a prefix of its `cwd` (longest match wins for
+  plus `listProjects()` on that same 3s poll (mesa task 898 — this sidebar is
+  a permanent mount, so the one-shot fetch it used to make froze the list for
+  the life of the page: a project added or unarchived in the nav, or created
+  by an agent straight through the CLI, only appeared after a browser
+  refresh) to label each session with the project whose `local_path` is a
+  prefix of its `cwd` (longest match wins for
   nested folders) — the same path-prefix relationship `agents::is_under`
   matches on for the per-project route above. A session under no known
   project's folder shows its raw `cwd`.

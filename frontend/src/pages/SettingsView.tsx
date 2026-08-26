@@ -243,9 +243,9 @@ export function SettingsView() {
         a change takes effect on the next dispatch, with no server restart.
       </p>
 
-      <h2>Agent commands</h2>
+      <h2>Hooks</h2>
       <p className="muted">
-        The command mesa runs to start a coding agent. Leave a box empty to use
+        The hook mesa runs to start a coding agent. Leave a box empty to use
         the built-in default. There are two modes, chosen by what you type:
       </p>
       <ul className="muted settings-modes">

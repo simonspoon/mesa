@@ -25,6 +25,12 @@ import type { ConfigLive } from './types/ConfigLive'
  * and it is a plain fallback the person may type in. This module keeps both
  * rules because recognition is not everywhere: an unsupported browser, or a
  * refused microphone, is exactly the old surface, unchanged.
+ *
+ * The one number this module owns — `autoSendIdleMs` — is read by both
+ * surfaces (mesa task 917): the typed draft's own idle deadline, and the
+ * recording's silence boundary in `liveRecognition.ts`. One wait answering
+ * "has the person stopped" for whichever half is live, rather than two
+ * settings that could drift apart and disagree about how long a pause means.
  */
 
 /** How long after a pointer/key gesture a focus loss still counts as deliberate. */

@@ -9,6 +9,7 @@ import {
   readResults,
   recognitionCtor,
   recognizesSpeech,
+  shouldFlushSilence,
   shouldListen,
   utteranceFrom,
   type RecognitionResult,
@@ -136,6 +137,33 @@ describe('shouldListen', () => {
 
   it('never listens while the microphone is muted', () => {
     expect(shouldListen({ ...open, muted: true })).toBe(false)
+  })
+})
+
+describe('shouldFlushSilence', () => {
+  const open = { listening: true, recording: 'make a task', interim: '', idleMs: 2000, idleThresholdMs: 2000 }
+
+  it('flushes once the wait has fully elapsed', () => {
+    expect(shouldFlushSilence(open)).toBe(true)
+  })
+
+  it('is not yet silence short of the threshold', () => {
+    expect(shouldFlushSilence({ ...open, idleMs: 1999 })).toBe(false)
+  })
+
+  it('a blank recording is nothing to flush, even past the threshold', () => {
+    expect(shouldFlushSilence({ ...open, recording: '', interim: '' })).toBe(false)
+    expect(shouldFlushSilence({ ...open, recording: '   ', interim: ' \n' })).toBe(false)
+  })
+
+  it('an unsettled interim is enough on its own', () => {
+    expect(shouldFlushSilence({ ...open, recording: '', interim: 'still going' })).toBe(true)
+  })
+
+  it('never fires while the microphone is not the way in right now', () => {
+    // `listening` is `shouldListen`, not `recognizesSpeech` — while mesa is
+    // speaking the caller passes false here, and the timer must not fire.
+    expect(shouldFlushSilence({ ...open, listening: false })).toBe(false)
   })
 })
 
@@ -349,6 +377,12 @@ describe('captureHint', () => {
 
   it('says it is listening while it is', () => {
     expect(captureHint({ ...base, listening: true })).toMatch(/Listening/)
+  })
+
+  it('says the recording is sent on silence, with the switch as an early send', () => {
+    const hint = captureHint({ ...base, listening: true })
+    expect(hint).toMatch(/once you go quiet/)
+    expect(hint).toMatch(/press the switch/)
   })
 
   it('offers the microphone before the conversation starts', () => {

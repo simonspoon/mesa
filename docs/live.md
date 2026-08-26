@@ -11,13 +11,16 @@ and a dedicated Claude Code session does whatever they ask. Tables
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
 
-- **Person → mesa is text, recognised in the browser.** While a session is live,
-  this browser has joined it and the person has **asked** it to listen (task
-  887 — the microphone starts off), the page opens the microphone through the
-  browser's **own** speech recognition (`SpeechRecognition` /
-  `webkitSpeechRecognition`), **holds** every *final* result, and posts the
-  whole recording as one `user` turn when the person stops listening (tasks
-  873, 889). The conversation panel also has a plain `<textarea>`, which is
+- **Person → mesa is text, recognised in the browser.** While a session is live
+  and this browser has joined it, the microphone opens on its own (task 917 —
+  before that, task 887 had it start muted until an explicit press; a mute is
+  still the person's own switch, and stays put for the rest of that session),
+  the page opens the microphone through the browser's **own** speech
+  recognition (`SpeechRecognition` / `webkitSpeechRecognition`), **holds**
+  every *final* result, and posts the whole recording as one `user` turn once
+  the person goes quiet for a beat (the same wait `live.auto-send-ms` already
+  gives the typed box), or right away if they press the listen switch (tasks
+  873, 889, 917). The conversation panel also has a plain `<textarea>`, which is
   the way in whenever the microphone is not: it is muted, or recognition is not
   on offer at all — a browser without it (Firefox
   today), or a refused microphone. There the person's *own* system dictation
@@ -781,13 +784,19 @@ conversation") working with no backend change.
   looks like a shortcut: mesa speaks for most of the conversation's wall time,
   so a focus fight or an auto-send deadline that re-arms itself while she
   talks is decided by playback timing rather than by any rule.
-  - **Listening is the person's own switch, and it starts off** (task 887).
-    `muted` is an input to `recognizesSpeech` for the same reason `paused` is:
-    a muted page is one where the microphone is not the way in, so the capture
-    box takes the keyboard back and the hint says to type. It starts muted
-    because a page that opens the microphone the moment a conversation starts
-    is listening to the room for the whole of it, and asking for that has to be
-    the person's own act. It is toggled by **⌘/Ctrl+Shift+L** (`isListenChord`,
+  - **Listening is the person's own switch, and joining opens it** (tasks 887,
+    917). `muted` is an input to `recognizesSpeech` for the same reason
+    `paused` is: a muted page is one where the microphone is not the way in,
+    so the capture box takes the keyboard back and the hint says to type.
+    Before task 917 it started muted until an explicit press, on the theory
+    that a page that opens the microphone the moment a conversation starts is
+    listening to the room for the whole of it — but that made every hands-free
+    conversation begin with a keystroke or a click, which is the one thing the
+    microphone was for avoiding. Now joining a live session opens it on its
+    own (`micOpenedFor`, keyed on the session id so a fresh conversation opens
+    it again); a mute is still entirely the person's own act, and stays put for
+    the rest of that session — it is not re-opened underneath them. It is
+    toggled by **⌘/Ctrl+Shift+L** (`isListenChord`,
     named once as `LISTEN_CHORD` wherever the page writes it) or by the
     `listen`/`listening` button in the panel's listen row — which is offered
     on the same terms as Pause (live, this browser joined, a recognizer, the
@@ -833,16 +842,23 @@ conversation") working with no backend change.
     has) would otherwise re-record every sentence before it. `utteranceFrom`
     drops a settled result with no words in it (a cough, a door), which the
     engine produces routinely.
-  - **Listening is a recording, not a stream of utterances** (task 889). Each
-    settled sentence is joined onto a held recording (`heldWith`), shown above
-    the capture box, and **nothing is sent** until the person turns listening
-    off; that press posts the whole thing as **one** `user` turn (`heldFlush`).
-    A conversation is not one sentence at a time: the engine settles wherever
-    the speaker drew breath, so posting each final made the agent answer a
-    half-thought and then answer the rest of it, and the person had to talk to
-    the pauses the engine chose rather than to mesa. The switch they already
-    have is the boundary they meant — which is why this needs no control of its
-    own, and why the listen button is the whole of the gesture.
+  - **Listening is a recording, not a stream of utterances** (task 889), and a
+    recording has **two** boundaries (task 917). Each settled sentence is
+    joined onto a held recording (`heldWith`), shown above the capture box,
+    and posted as **one** `user` turn (`heldFlush`) either once the person has
+    gone quiet for `live.auto-send-ms` — the same wait the typed box already
+    uses (`shouldFlushSilence`) — or right away if they press the listen
+    switch. A conversation is not one sentence at a time: the engine settles
+    wherever the speaker drew breath, so posting each final made the agent
+    answer a half-thought and then answer the rest of it, and the person had
+    to talk to the pauses the engine chose rather than to mesa; silence after
+    the whole thought is the pause that means something. The silence timer is
+    measured on `shouldListen`, not `recognizesSpeech`, and restarts on every
+    result including an interim one — while mesa is talking there is no pause
+    of the person's to read, and a mid-sentence pause they fill back in must
+    not be mistaken for the end of the thought. The switch remains an explicit
+    early send for whenever the wait would be too slow or too fast for what was
+    just said.
 
     Three consequences follow, and each is a decision:
     - **The flush includes the interim tail.** Everywhere else the preview is

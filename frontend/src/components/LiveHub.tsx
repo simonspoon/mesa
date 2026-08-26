@@ -41,6 +41,7 @@ import {
   readResults,
   recognitionCtor,
   recognizesSpeech,
+  shouldFlushSilence,
   shouldListen,
   utteranceFrom,
   type SpeechRecognitionLike,
@@ -75,13 +76,14 @@ import { useFetch } from '../useFetch'
  * Mesa Live, in the header (mesa tasks 855, 857): the whole conversation lives
  * here now, not on a routed page.
  *
- * The person just talks: while the conversation is live and this browser has
- * joined it, the page opens the microphone through the browser's own speech
- * recognition (`liveRecognition.ts`, task 873) and **holds** every settled
- * result, sending the whole recording as one `user` turn when the person
- * stops listening (task 889) — listening being a switch of their own since
- * task 887, muted until the chord (`isListenChord`) or the panel's button
- * turns it on, and the same press is what ends the recording and sends it. The capture box
+ * The person just talks: joining a live conversation opens the microphone on
+ * its own (task 917) through the browser's own speech recognition
+ * (`liveRecognition.ts`, task 873), which **holds** every settled result and
+ * sends the whole recording as one `user` turn once the person goes quiet —
+ * the wait `live.auto-send-ms` names — with the listen switch (`isListenChord`
+ * or the panel's button, task 887) as an explicit early send; the same press
+ * is also what mutes the microphone and keeps it muted for the rest of that
+ * session. The capture box
  * in the conversation panel stays as the fallback — a browser with no recognizer, or a refused
  * microphone, is the surface as it was: system dictation types into the box,
  * mesa holds the keyboard for it, and a settled line goes on a timer. Either
@@ -266,14 +268,17 @@ export function LiveHub({
     pausedRef.current = next
     setPaused(next)
   }, [])
-  // The person's own switch on the microphone (mesa task 887). Starts muted,
-  // because a page that opens the microphone the moment a conversation starts
-  // is listening to the room for the whole of it; asking for it is a keystroke
-  // (`isListenChord`) or a press on the button in the conversation panel.
-  // Browser-side and this browser's alone, like pause: no route, no session
-  // state, and mesa carries on speaking while it is off. The ref is what the
-  // recognizer's own handlers read, since they fire long after the render that
-  // changed it — the same pairing as `pausedRef`.
+  // The person's own switch on the microphone (mesa task 887). Still
+  // *initialises* muted — a page with no conversation joined is not listening
+  // to the room — but joining one opens it on its own (`micOpenedFor` below,
+  // mesa task 917): a hands-free surface that waits for a press before it can
+  // hear is not hands-free. A press — the keystroke (`isListenChord`) or the
+  // button in the conversation panel — is what turns it back off, and keeps
+  // it off for the rest of that session. Browser-side and this browser's
+  // alone, like pause: no route, no session state, and mesa carries on
+  // speaking while it is off. The ref is what the recognizer's own handlers
+  // read, since they fire long after the render that changed it — the same
+  // pairing as `pausedRef`.
   const [muted, setMuted] = useState(true)
   const mutedRef = useRef(true)
   const setMutedNow = useCallback((next: boolean) => {
@@ -300,6 +305,17 @@ export function LiveHub({
   const setRecordingNow = useCallback((next: string) => {
     recordingRef.current = next
     setRecording(next)
+  }, [])
+  // When the person was last heard — interim results included (mesa task
+  // 917): the silence timer below has to restart on a mid-sentence pause the
+  // person fills back in, not only on a settled sentence. A ref because the
+  // timer reads it long after the render that bumped it; the tick is what
+  // gets the effect that owns the timer to re-run and restart the wait.
+  const heardAt = useRef(0)
+  const [heardTick, setHeardTick] = useState(0)
+  const markHeard = useCallback(() => {
+    heardAt.current = Date.now()
+    setHeardTick((t) => t + 1)
   }, [])
   // The microphone was refused — by the person or by the browser's policy.
   // Terminal for this page: retrying would reopen the permission prompt for
@@ -597,6 +613,37 @@ export function LiveHub({
     armed.current = { live, unlocked }
   }, [live, unlocked])
 
+  // Joining opens the microphone (mesa task 917): a conversation this browser
+  // has joined should be hands-free from the first word, not only after a
+  // press on the switch. `micOpenedFor` is the session this browser has
+  // already opened the microphone for, keyed on the session id rather than a
+  // boolean so a fresh conversation opens it again while a mute made *during*
+  // this one stays put — the only write to this ref is here, which is what
+  // makes it sticky rather than something this effect re-opens on its own
+  // next run. A `null` id (no session) never counts as opened, so ending a
+  // conversation leaves the next one free to trigger.
+  const micOpenedFor = useRef<number | null>(null)
+  useEffect(() => {
+    const id = session?.id ?? null
+    if (id === null || !unlocked || micOpenedFor.current === id) return
+    micOpenedFor.current = id
+    setMutedNow(false)
+    // Mirrors the reasoning already written on `togglePause`/`toggleListening`:
+    // the went-live reclaim effect just below reads `listeningRef` to decide
+    // whether the capture box may grab the keyboard, and that effect runs in
+    // the same commit as this one — a render behind, if this only set state.
+    // Writing the ref here, synchronously, is what keeps that effect from
+    // reclaiming focus for a microphone that is, by the time it checks, opening.
+    listeningRef.current = recognizesSpeech({
+      live,
+      joined: unlocked,
+      supported,
+      blocked,
+      paused,
+      muted: false,
+    })
+  }, [session?.id, unlocked, setMutedNow, live, supported, blocked, paused])
+
   // Joining is when capture starts: the same press that unlocks audio hands
   // mesa the keyboard. Edge-triggered on the pair going true together.
   useEffect(() => {
@@ -763,6 +810,29 @@ export function LiveHub({
     flushRef.current = flushRecording
   }, [flushRecording])
 
+  // The recording's other boundary (mesa task 917): silence, not just the
+  // switch. Shaped like the auto-send deadline below — a timeout re-armed on
+  // every dependency change, reading the live answer through refs rather than
+  // the closure, because the person may have gone silent well before this
+  // effect's own render.
+  useEffect(() => {
+    if (!wantsMic || (recording.trim() === '' && interim.trim() === '')) return
+    const timer = window.setTimeout(() => {
+      if (
+        shouldFlushSilence({
+          listening: wants.current,
+          recording: recordingRef.current,
+          interim: interimRef.current,
+          idleMs: Date.now() - heardAt.current,
+          idleThresholdMs: autoSendMs,
+        })
+      ) {
+        flushRef.current()
+      }
+    }, autoSendMs)
+    return () => window.clearTimeout(timer)
+  }, [heardTick, wantsMic, recording, interim, autoSendMs])
+
   const toggleListening = useCallback(
     (next: boolean) => {
       // The switch off is the send; the switch on starts a fresh recording,
@@ -909,6 +979,10 @@ export function LiveHub({
       engine.continuous = true
       engine.interimResults = true
       engine.onresult = (event) => {
+        // Every result restarts the silence wait, interim or settled alike —
+        // a pause the person fills back in mid-sentence must not be read as
+        // them having finished (mesa task 917).
+        markHeard()
         const heard = readResults(Math.max(event.resultIndex, settled), event.results)
         settled = heard.settledThrough
         if (running) setInterimNow(heard.interim)
@@ -1019,7 +1093,7 @@ export function LiveHub({
       current?.stop()
       stream?.getTracks().forEach((t) => t.stop())
     }
-  }, [wantsMic, chosen, listInputs, setInterimNow, setRecordingNow])
+  }, [wantsMic, chosen, listInputs, markHeard, setInterimNow, setRecordingNow])
 
   // The run: the oldest mesa turn nobody has played, one at a time. A turn that
   // navigates moves the browser when it is *reached*, whether or not it also

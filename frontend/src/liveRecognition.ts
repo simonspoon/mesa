@@ -14,15 +14,28 @@
  * - **Only a final result is recorded.** An interim result is the engine
  *   thinking out loud — it is shown as a preview and never recorded, because a
  *   sentence held mid-guess is a sentence the person never said.
- * - **Listening is a recording, not a stream of utterances** (mesa task 889).
- *   Each settled sentence is *held* rather than sent, and the whole recording
- *   becomes **one** `user` turn when the person stops listening. A conversation
- *   is not one sentence at a time: the engine settles wherever the speaker drew
- *   breath, so posting each final made the agent answer a half-thought and then
- *   answer the rest of it, and the person had to talk to the pauses the engine
- *   chose rather than to mesa. The switch the person already has
- *   (`isListenChord`, the listen button) is the boundary, which is the one
- *   boundary they meant.
+ * - **Listening is a recording, not a stream of utterances** (mesa task 889),
+ *   and a recording has **two** boundaries, not one (mesa task 917). Each
+ *   settled sentence is *held* rather than sent, and the whole recording
+ *   becomes **one** `user` turn — ordinarily on **silence**: the wait
+ *   `live.auto-send-ms` already names for the typed box
+ *   (`liveCapture.ts::autoSendIdleMs`), read again here so the two surfaces
+ *   answer "has the person stopped" with one number rather than two that
+ *   drift. A conversation is not one sentence at a time: the engine settles
+ *   wherever the speaker drew breath, so posting each final made the agent
+ *   answer a half-thought and then answer the rest of it, and the person had
+ *   to talk to the pauses the engine chose rather than to mesa — silence
+ *   after the *whole* thought is the pause that actually means something. The
+ *   switch the person already has (`isListenChord`, the listen button)
+ *   remains the second boundary: an explicit early send for whenever the
+ *   silence wait would be too slow or too fast for what was just said. The
+ *   silence timer is measured on `shouldListen`, not `recognizesSpeech` —
+ *   deliberately excluding the seconds mesa is talking, because a timer that
+ *   ran through her reply would read the person's own silence, sitting and
+ *   listening to mesa, as them falling quiet, and post the half-thought she
+ *   is still mid-reply to. It also restarts on every result, interim included,
+ *   so a mid-sentence pause the person fills back in does not get cut off by
+ *   a clock that only heard the settled words.
  * - **Recognition ends on its own, constantly.** Chrome stops after roughly a
  *   minute, and on a long enough silence; the engine reports that as an
  *   ordinary end, not an error. So "should it be running" is asked again on
@@ -105,9 +118,13 @@ export function recognitionCtor(
  * `muted` is the person's own switch on the microphone (mesa task 887), and it
  * belongs here for the same reason again: a muted page is one where the
  * microphone is not the way in, so the capture box takes the keyboard back and
- * the hint says to type. It starts **muted** — a browser that opens the
- * microphone the moment a conversation starts is listening to the room for the
- * whole of it, and the person has to be the one who asks for that. It is deliberately not
+ * the hint says to type. A conversation this browser **joins** opens
+ * listening on its own (mesa task 917) — a hands-free surface that needs a
+ * press before it can hear is not hands-free, and the press that joined the
+ * conversation is already the consent, the same one an autoplay policy
+ * weighs. Once muted, though, it is the person's own act and it **sticks for
+ * the session**: this module does not reopen it underneath them, only a
+ * fresh press does. It is deliberately not
  * `paused`: muting stops mesa hearing this room while she keeps talking and
  * the typed box keeps working, where pausing stops the whole run.
  *
@@ -155,6 +172,40 @@ export function shouldListen(input: {
   speaking: boolean
 }): boolean {
   return recognizesSpeech(input) && !input.speaking
+}
+
+/**
+ * Whether the recording should be sent because the person has gone quiet
+ * (mesa task 917) — the second boundary a recording has, next to the listen
+ * switch.
+ *
+ * `listening` here is `shouldListen`, not `recognizesSpeech` — the same
+ * distinction `shouldListen` itself draws, and load-bearing for the same
+ * reason: the timer is measuring a pause **in the person's speech**, and
+ * while mesa is talking the microphone is shut, so there is nothing to
+ * measure and no pause to read. A timer that ran through her reply would
+ * count the person listening to mesa as the person falling silent, and post
+ * the half-thought they were still building mid-sentence. It is also what
+ * keeps this rule from ever recording mesa herself: when she stops, the
+ * microphone reopens and the wait starts fresh.
+ *
+ * Blank is not silence worth acting on — nothing was said, so there is
+ * nothing to flush, and firing anyway would be an empty turn the server
+ * would refuse for no reason. `recording` and `interim` are checked
+ * separately from the send itself (`heldFlush` does the actual joining) so
+ * this predicate stays a pure yes/no over what the caller already has in
+ * hand.
+ */
+export function shouldFlushSilence(input: {
+  listening: boolean
+  recording: string
+  interim: string
+  idleMs: number
+  idleThresholdMs: number
+}): boolean {
+  if (!input.listening) return false
+  if (input.recording.trim() === '' && input.interim.trim() === '') return false
+  return input.idleMs >= input.idleThresholdMs
 }
 
 /**
@@ -382,7 +433,7 @@ export function captureHint(input: {
     return `mesa is not listening. Press ${LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
   }
   if (input.listening) {
-    return 'Listening — everything you say is held here and sent to mesa as one message when you stop listening. She stops listening while she is speaking. You can still type here.'
+    return 'Listening — everything you say is held here and sent to mesa once you go quiet, or right away if you press the switch. She stops listening while she is speaking. You can still type here.'
   }
   // Joined, unmuted, and still not the way in — nothing left that is worth a
   // line of its own; the box is the way in and says so.

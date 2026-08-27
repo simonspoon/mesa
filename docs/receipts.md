@@ -15,17 +15,17 @@ receipt describing a deleted task is meaningless, the same posture
 
 ## Why stored, not derived (D1)
 
-`blocked` and `name` are derived-never-stored — CLAUDE.md is explicit that a
-receipt must not follow that pattern. Both of those are recomputable from the
-*current* row at read time. A receipt cannot be: the claim window it
-describes is gone the instant it closes (`Store::update_task` nulls
-`owner`/`claimed_at` the moment status leaves `in_progress`), and the commits
-made during that window keep receding into the branch's ordinary history as
-more work lands on it. There is no way to ask "what changed while task N was
-open" after the fact once the claim is gone — not a performance question, an
-information one. The only honest option is to capture the answer once, at
-close time, and keep that capture, so the receipt is written to its own table
-and never recomputed on read.
+`blocked` and `name` are derived-never-stored, and that is the house default
+a new field is expected to justify departing from. A receipt is the
+departure. Both of those are recomputable from the *current* row at read
+time; a receipt is not: the claim window it describes is gone the instant it
+closes (`Store::update_task` nulls `owner`/`claimed_at` the moment status
+leaves `in_progress`), and the commits made during that window keep receding
+into the branch's ordinary history as more work lands on it. There is no way
+to ask "what changed while task N was open" after the fact once the claim is
+gone — not a performance question, an information one. The only honest
+option is to capture the answer once, at close time, and keep that capture,
+so the receipt is written to its own table and never recomputed on read.
 
 ## Why a sibling record, not fields on `Task` (D2)
 

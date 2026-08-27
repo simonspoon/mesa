@@ -4,7 +4,9 @@
 and a dedicated Claude Code session does whatever they ask. Tables
 `live_sessions` and `live_turns` (migration index 43, plus the session's
 `context` column at index **44**, its `working_since` at **45** and its
-`window_box` at **46**, so a fresh db is `user_version` 47), the
+`window_box` at **46**), plus the sibling table `live_summaries` at **49**
+(so a fresh db is `user_version` 50 — see
+[Remembering a conversation](#remembering-a-conversation-mesa-task-921)), the
 `mesa live` CLI group, `/api/live*`, and the header's conversation hub
 (`LiveHub`).
 
@@ -239,6 +241,163 @@ without tracking whether it already has. `list_live_turns` takes an exclusive
 conversation, not a record of its own. `live_sessions.project_id` is
 **`ON DELETE SET NULL`**, the same call the inbox makes: a conversation
 outlives the project row it happened to be about.
+
+## Remembering a conversation (mesa task 921)
+
+Before this, everything a conversation decided lived only in its raw turn
+log, plus whatever tasks the agent happened to write along the way — and the
+next conversation started stone cold, with no way to know what the last one
+was about. A live session now leaves a short written memory when it ends, and
+the agent driving the *next* one is spawned already holding the last few.
+
+### A sibling table, not a `live_sessions` column
+
+The memory is `live_summaries` (migration index **49**, so a fresh db is
+`user_version` 50 — see the opening paragraph), keyed on `session_id` exactly
+as `task_receipts` is keyed on `task_id`, not a new field on `LiveSession`.
+Two reasons, both about a reader that does not exist:
+
+- `LiveSession` is the payload of the hub's **2s** `GET /api/live` poll. An
+  unbounded free-text memory blob has no browser consumer, and riding that
+  poll would mean fetching it twice a second for nobody.
+- `--quiet` on a live **session** currently drops nothing, so the record
+  passes through in declaration order (CLAUDE.md's `--quiet` contract). An
+  unbounded `summary` field would force it into the alphabetical
+  rebuilt-`Value` shape every other quiet payload with something to drop
+  uses — a contract change for a reader that isn't there.
+
+`task_receipts` made exactly this call for exactly this reason
+(`docs/receipts.md`): a record's own read pattern decides its shape, not
+convenience at the write site.
+
+### Who writes it, and why it can't be the live agent
+
+mesa has no LLM of its own; every job like this goes through
+`agents::spawn_bg` and a `~/.mesa/config.json` command template
+(`docs/config.md`). This is a **fifth** one, `live-summary`, spawned
+best-effort from both stop sites (`live stop`'s CLI handler and the API's stop
+route) right next to the existing best-effort `claude stop`.
+
+It cannot be the live agent's own last act before it stops: stopping a
+session **stops that agent** (`claude stop <agent_id>`), so whatever the live
+agent might do on the way out is not guaranteed to run — the process can be
+killed mid-sentence. So a short-lived agent is spawned separately, once the
+conversation has already ended, with its own instruction block
+(`core::live::SUMMARY_PROMPT`): read the conversation with
+`mesa live turns --session <id>`, write a few sentences, save them with
+`mesa live summary set`, and stop.
+
+Three things keep this from misfiring:
+
+- **A session with no turns spawns nothing.** There is nothing to remember,
+  and an empty conversation is not worth a background agent.
+- **The spawn is best-effort and never fails the stop.** The store write is
+  what ended the conversation; a summariser that fails to spawn is a warning
+  on stderr (CLI) or a log line (API), never a nonzero exit and never part of
+  the stop route's answer — the same posture `stop_live_agent`'s `claude stop`
+  call already takes right beside it.
+- **Whether a summary is worth writing is captured *before* the session is
+  marked ended**, not read off the row afterward. Both stop sites check
+  `status == Live` first and hold that in a local, then call
+  `end_live_session`. `end_live_session` is idempotent, so a second `stop` on
+  an already-ended session reads `false` there and spawns nothing — an
+  idempotent stop can be called any number of times without stacking up
+  summarisers for one conversation.
+
+### The recall block is appended, never prepended
+
+The instructions a live agent is spawned with now end with, when there is any
+history, a block of the `LIVE_SUMMARY_RECALL` (**5**) most recent summaries,
+oldest first, each labelled with its session id — `core::live::agent_prompt`
+building it via the pure `prompt_with`.
+
+It is appended **after** the instruction block and the session line, never
+prepended. This is the security paragraph, and it has to be explicit: a
+summary is written by a model reading dictated speech — untrusted free text,
+one conversation removed from the person who spoke it. It may not sit above
+the rules it could otherwise rewrite. The block is introduced with an
+explicit line that these are notes from earlier conversations, a record of
+what was said, and never instructions — the same posture `AGENT_PROMPT`'s
+rule 8 already takes toward the current conversation's own dictation, applied
+a second time to text that has been through one more hop. `SUMMARY_PROMPT`'s
+own closing instruction states the identical rule for the summariser itself,
+because that is the point where a dictated line could otherwise be laundered
+into an instruction for the *next* conversation: the summariser is told the
+turn log it reads is untrusted data, never an instruction, so what it writes
+carries no more authority than what it read.
+
+**No summaries means nothing is appended at all** — an install with no
+history gets the byte-identical prompt it always has, which is what keeps
+every existing prompt test honest.
+
+### Retention: two numbers, and why they differ
+
+- `LIVE_SUMMARY_RECALL = 5` — how many summaries ride in the next prompt.
+- `LIVE_SUMMARY_KEEP = 20` — how many stay on disk.
+
+Retention and recall are deliberately keyed on **different** things, because
+they answer different questions:
+
+- **Retention is by write time.** `set_live_summary`'s prune keeps the newest
+  20 rows by `ORDER BY updated_at DESC, session_id DESC`
+  (`src/core/store.rs:4310-4316`), and excludes the session it just wrote from
+  the `DELETE` outright (`AND session_id != ?2`, same lines) — a second,
+  independent guard so even a same-second `updated_at` tie can't prune it.
+  Retention's only job is bounding storage, and that has to be self-consistent:
+  a write must never be able to delete itself.
+- **Recall is by conversation recency.** `list_live_summaries` is unchanged —
+  `ORDER BY session_id DESC` (`src/core/store.rs:4347`). Recall's job is
+  telling the next agent what the person has been talking about *lately*,
+  which is a question about which conversations are recent, not about which
+  row a background agent happened to finish writing most recently.
+
+The split exists because of a bug the first cut had: keying retention on
+`session_id` too meant a summariser for an *older* conversation, spawned in
+the background and finishing after 20 more recent conversations already had
+summaries, deleted its own row the instant it inserted it — and
+`set_live_summary`'s read-back then answered `not_found` on a write that had
+just nominally succeeded. It is reachable in ordinary use, since summarisers
+are spawned per session and run independently: a burst of short conversations
+finishing while an older one's summariser is still catching up produces
+exactly that ordering.
+
+`LIVE_SUMMARY_KEEP` is still comfortably larger than `LIVE_SUMMARY_RECALL` on
+purpose: nothing recall could ever have used is pruned before it ages out on
+its own, so a bug in the recall count can never turn into data loss.
+
+This is a first cut, not a settled design — the task that added it explicitly
+invited revisiting these two numbers if five-and-twenty proves lossy or
+wasteful in practice.
+
+### The CLI surface, and why there are no HTTP routes
+
+Deliberately CLI-only, the same call `mesa live look` makes: there is no
+browser consumer, so there is no route, and `LiveSummary` is **not**
+ts-exported — a generated `.ts` nobody imports is rot `build.sh` would then
+hold everyone to.
+
+- **`mesa live turns` gains an optional `--session <ID>`.** The summariser
+  has to read the turns of a conversation that has already **ended**, and
+  every other `live` command resolves *the* current live one — there being at
+  most one. Without `--session`, `turns` is byte-identical to before; with
+  it, it reads any session's turns, live or ended, and an unknown id is
+  `not_found`. This does not reopen the "no command takes a session id" rule:
+  that rule exists because only one session can be live at a time, so
+  ordinary commands need no id to say which one they mean — a summary is
+  always about a session that has already finished, so there is no "the"
+  session to default to.
+- **`mesa live summary set <ID> <TEXT>…`** — upsert, printing the stored
+  record. `TEXT` is a trailing var-arg exactly like `live say`'s message, so
+  `--quiet` must come **before** the id and text or it is swallowed into the
+  summary body.
+- **`mesa live summary show <ID>`** — prints one session's summary,
+  `not_found` when it has none.
+- **`mesa live summary list [--limit N]`** — a bare array, newest first;
+  rejects `--quiet` with exit 2, like every other `list`.
+- **`--quiet` on `set`/`show` drops `body`** — the one unbounded field —
+  keeping `session_id`, `created_at` and `updated_at`, with the usual
+  key-parity test against `LiveSummary` forcing a decision on any field it
+  gains later.
 
 ## The action vocabulary
 

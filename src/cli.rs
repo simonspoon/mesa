@@ -27,9 +27,9 @@ use crate::core::{
     Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
     Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveRole,
-    LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
-    Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskReceipt, agents, config, library, live, look, receipt,
+    LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch,
+    ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
+    TaskPatch, TaskReceipt, agents, config, library, live, look, receipt,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1420,11 +1420,20 @@ EXAMPLES
     ///
     /// Both roles, including turns already delivered or spoken — this is the
     /// transcript, not the queue. Reading it never delivers anything.
+    ///
+    /// Without --session this is the current live session, exactly as before.
+    /// With --session ID it reads any session's turns, live or ended — how
+    /// the summariser agent spawned by `live stop` reads a conversation that
+    /// has just finished (mesa task 921); ID must name a session that exists.
     #[command(after_help = "\
 EXAMPLES
   mesa live turns
-  mesa live turns --after 12 --limit 20    # only what came after turn 12")]
+  mesa live turns --after 12 --limit 20    # only what came after turn 12
+  mesa live turns --session 9              # a specific (possibly ended) session")]
     Turns {
+        /// Which session to read; defaults to the current live one
+        #[arg(long, value_name = "ID")]
+        session: Option<i64>,
         /// Only turns with an id greater than this one (exclusive cursor)
         #[arg(long, value_name = "ID")]
         after: Option<i64>,
@@ -1458,6 +1467,63 @@ EXAMPLES
         /// Where to write the PNG (default: a temp file named for the session)
         #[arg(long, value_name = "PATH")]
         output: Option<String>,
+    },
+    /// A session's remembered summary (mesa task 921) — set/show/list
+    #[command(subcommand)]
+    Summary(LiveSummaryCmd),
+}
+
+/// A live session's summary — a short prose memory of one ended conversation,
+/// written by the short-lived agent `live stop` spawns and recalled into the
+/// *next* session's prompt (`live::agent_prompt`). CLI-only, like `live look`:
+/// there is no browser consumer, so there is no route and no `LiveSummary`
+/// TypeScript type (`docs/live.md`).
+#[derive(Subcommand)]
+enum LiveSummaryCmd {
+    /// Save (or replace) a session's summary; prints the stored record
+    ///
+    /// Upserts on the session id: a second `set` replaces the body and moves
+    /// `updated_at`, leaving `created_at` alone. Type the summary after the
+    /// id (quoting is optional; multiple words are joined) — put --quiet
+    /// BEFORE it, exactly as `live say` requires, since everything after the
+    /// id that is not a leading flag is swallowed as the text.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live summary set 9 Discussed the roadmap and opened task 42.
+  mesa live summary set --quiet 9 \"Short session, nothing decided.\"")]
+    Set {
+        /// The session this summary is for
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// The summary text (everything after ID); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full
+        ///
+        /// Must come BEFORE the text: everything after ID that is not a
+        /// leading flag is swallowed as the summary.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Print one session's summary; `not_found` if it has none
+    #[command(visible_alias = "get")]
+    Show {
+        /// The session whose summary to print
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// List recent summaries as a bare JSON array, newest first
+    #[command(after_help = "\
+EXAMPLES
+  mesa live summary list
+  mesa live summary list --limit 5")]
+    List {
+        /// Maximum number of summaries to print (clamped to 1..=20)
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: i64,
     },
 }
 
@@ -2478,6 +2544,9 @@ const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
 /// fields `Store` caps at 200 chars, a four-integer window box, and
 /// timestamps — so quiet output equals full output. The flag is accepted across the group for uniformity.
 const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
+/// Keys dropped from a `LiveSummary` under `--quiet` (task 921): its own
+/// unbounded prose body. `session_id`/`created_at`/`updated_at` all stay.
+const QUIET_DROP_LIVE_SUMMARY: &[&str] = &["body"];
 /// Keys dropped from a `TaskReceipt` under `--quiet` (task 920): `commits`,
 /// a git log capped at `core::git::LOG_CAP` but still unbounded as far as a
 /// caller reading one JSON line is concerned, and `note`, the one field on a
@@ -2596,6 +2665,11 @@ fn print_live_session(session: &LiveSession, is_quiet: bool) {
 /// Print one live turn: the full record, or the record minus its spoken `text`.
 fn print_live_turn(turn: &LiveTurn, is_quiet: bool) {
     print_record(turn, is_quiet, QUIET_DROP_LIVE_TURN);
+}
+
+/// Print one live summary: the full record, or the record minus `body`.
+fn print_live_summary(summary: &LiveSummary, is_quiet: bool) {
+    print_record(summary, is_quiet, QUIET_DROP_LIVE_SUMMARY);
 }
 
 /// Print one task receipt: the full record, or the record minus
@@ -3678,6 +3752,54 @@ fn stop_live_agent(session: &LiveSession) {
     }
 }
 
+/// Spawns the short-lived agent that writes `session`'s memory, once it has
+/// just ended (mesa task 921). **Best-effort**, exactly like
+/// [`stop_live_agent`] beside it: the store write that ended the conversation
+/// is the truth, a failure here is a warning on stderr, and it never changes
+/// the exit code or the printed record.
+///
+/// A session with no turns spawns nothing — there is nothing to remember, and
+/// an empty conversation is not worth a background agent. Reuses
+/// [`live_agent_dir`] for the working directory, and names the session
+/// `"{name} summary"` so it reads, next to the conversation it is about, as
+/// what it is rather than as another `mesa live <id>`.
+fn spawn_live_summary(store: &mut Store, session: &LiveSession) {
+    match store.list_live_turns(session.id, None, 1) {
+        Ok(turns) if turns.is_empty() => return,
+        Err(e) => {
+            eprintln!(
+                "live session {}: could not check for turns to summarize: {e}",
+                session.id
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+    let (dir, name) = match live_agent_dir(store, session.project_id, session.id) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "live session {}: could not spawn its summariser: {e}",
+                session.id
+            );
+            return;
+        }
+    };
+    let prompt = live::summary_prompt(store, session.id);
+    if let Err(e) = agents::spawn_bg(
+        config::LIVE_SUMMARY,
+        &dir,
+        Some(session.id),
+        Some(&format!("{name} summary")),
+        Some(&prompt),
+    ) {
+        eprintln!(
+            "live session {}: could not spawn its summariser: {e}",
+            session.id
+        );
+    }
+}
+
 fn run_live(cmd: LiveCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
@@ -3715,7 +3837,15 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
         }
         LiveCmd::Stop { quiet } => {
             let session = current_live_session(&store)?;
+            // Captured before `end_live_session` moves it to `Ended`: whether
+            // a summary is worth writing is a question about the
+            // conversation that just finished, not about the row after the
+            // write.
+            let was_live = session.status == LiveStatus::Live;
             let ended = store.end_live_session(session.id)?;
+            if was_live {
+                spawn_live_summary(&mut store, &ended);
+            }
             stop_live_agent(&ended);
             print_live_session(&ended, quiet);
         }
@@ -3782,9 +3912,20 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             )?;
             print_live_turn(&turn, quiet);
         }
-        LiveCmd::Turns { after, limit } => {
-            let session = current_live_session(&store)?;
-            print_json(&store.list_live_turns(session.id, after, limit)?);
+        LiveCmd::Turns {
+            session,
+            after,
+            limit,
+        } => {
+            // Absent stays exactly what it always was: the current live
+            // session. Present resolves any session — live or ended — which
+            // is what lets the summariser `live stop` spawns read a
+            // conversation that has already finished.
+            let session_id = match session {
+                Some(id) => store.get_live_session(id)?.id,
+                None => current_live_session(&store)?.id,
+            };
+            print_json(&store.list_live_turns(session_id, after, limit)?);
         }
         LiveCmd::Look { output } => {
             let session = current_live_session(&store)?;
@@ -3809,6 +3950,24 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 )),
             };
             print_json(&look::shoot(&window, &path)?);
+        }
+        LiveCmd::Summary(cmd) => run_live_summary(&mut store, cmd)?,
+    }
+    Ok(())
+}
+
+fn run_live_summary(store: &mut Store, cmd: LiveSummaryCmd) -> Result<()> {
+    match cmd {
+        LiveSummaryCmd::Set { id, text, quiet } => {
+            let summary = store.set_live_summary(id, &text.join(" "))?;
+            print_live_summary(&summary, quiet);
+        }
+        LiveSummaryCmd::Show { id, quiet } => {
+            let summary = store.get_live_summary(id)?;
+            print_live_summary(&summary, quiet);
+        }
+        LiveSummaryCmd::List { limit } => {
+            print_json(&store.list_live_summaries(limit)?);
         }
     }
     Ok(())
@@ -4836,6 +4995,39 @@ mod tests {
                 QUIET_DROP_LIVE_TURN
             ))),
             minus(&full, QUIET_DROP_LIVE_TURN),
+        );
+    }
+
+    fn sample_live_summary() -> LiveSummary {
+        LiveSummary {
+            session_id: 2,
+            body: "Discussed the roadmap and opened task 42.".into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:01".into(),
+        }
+    }
+
+    #[test]
+    fn live_summary_quiet_drops_body() {
+        let full = keys(&sample_live_summary());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "session_id",
+                // The one free-text field: the prose memory. Dropped.
+                "body",
+                "created_at",
+                "updated_at",
+            ]),
+            "LiveSummary gained/lost a field: decide whether it belongs in \
+             the --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_live_summary(),
+                QUIET_DROP_LIVE_SUMMARY
+            ))),
+            minus(&full, QUIET_DROP_LIVE_SUMMARY),
         );
     }
 

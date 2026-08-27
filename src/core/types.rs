@@ -2930,6 +2930,28 @@ pub struct LiveTurn {
     pub played_at: Option<String>,
 }
 
+/// A short prose memory of one ended live conversation, written by the
+/// short-lived summariser agent `live stop` spawns and recalled into the
+/// *next* conversation's prompt (mesa task 921, `live::agent_prompt`) so the
+/// person is not made to repeat themselves. At most one per session
+/// (`session_id` is the primary key, exactly like `TaskReceipt::task_id`).
+///
+/// **Not ts-exported**, like [`crate::core::look::LiveShot`]: there is no
+/// HTTP route for this surface (it is CLI-only, the `mesa live look`
+/// precedent) and therefore no TypeScript consumer. A generated `.ts` nothing
+/// imports is rot the `build.sh` dirty check would then hold everyone to.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveSummary {
+    pub session_id: i64,
+    /// What was discussed, what was decided, and any task the conversation
+    /// touched — see `live::SUMMARY_PROMPT` for the shape the summariser is
+    /// asked to write. Untrusted: it is derived from dictated speech, so
+    /// `live::agent_prompt` appends it as data, never as an instruction.
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// The Live page's whole read (`GET /api/live`): the conversation that is
 /// running, and the turns after the cursor the page asked from. A **view**,
 /// never stored — it is assembled per request out of the one live session and

@@ -9,8 +9,8 @@ use super::types::{
     AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat, EdgeMarker,
     EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind, LibraryItem,
     LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveContext, LiveRole, LiveSession,
-    LiveStatus, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg, ScriptArgKind, Status,
-    Task, TaskEvent, TaskReceipt, Waypoint, task_name,
+    LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg,
+    ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -661,6 +661,29 @@ const MIGRATIONS: &[&str] = &[
         edited          INTEGER NOT NULL DEFAULT 0,
         note            TEXT
     );",
+    // Task 921: live session memory. A short prose summary of one ended
+    // conversation, written by a short-lived agent spawned at `live stop` and
+    // recalled into the *next* session's prompt (see `live::agent_prompt`) so
+    // the person is not made to repeat themselves. Keyed on `session_id`
+    // itself, not a surrogate id — a session has at most one summary, and the
+    // write is exactly a keyed upsert (`Store::set_live_summary`).
+    // `ON DELETE CASCADE` because a summary of a deleted conversation is
+    // meaningless, the same posture `task_receipts` takes on its task.
+    //
+    // A **sibling table** rather than a `live_sessions` column: `LiveSession`
+    // is the payload of the hub's 2s `GET /api/live` poll, and a free-text
+    // memory blob has no browser consumer and must not ride that tick. It
+    // also has nothing to drop under `--quiet` today (a live session passes
+    // through in declaration order); an unbounded `summary` field would force
+    // it into the alphabetical rebuilt-`Value` shape for a reader that does
+    // not exist. `task_receipts` made exactly this call for exactly this
+    // reason.
+    "CREATE TABLE live_summaries (
+        session_id  INTEGER PRIMARY KEY REFERENCES live_sessions(id) ON DELETE CASCADE,
+        body        TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -865,6 +888,19 @@ const LIVE_TEXT_MAX: usize = 8192;
 /// cursor, so a bigger page would only ever be a slower first paint.
 const LIVE_TURNS_MAX: i64 = 500;
 
+const LIVE_SUMMARY_COLUMNS: &str = "session_id, body, created_at, updated_at";
+
+/// Longest a live summary's body may be. Smaller than [`LIVE_TEXT_MAX`]: a
+/// summary is never spoken, but up to `live::LIVE_SUMMARY_RECALL` of them ride
+/// in every future `live::agent_prompt`, so a runaway one would bloat every
+/// conversation after it rather than just this one.
+pub const LIVE_SUMMARY_MAX: usize = 4096;
+
+/// How many summary rows survive on disk, oldest dropped first. Far bigger
+/// than `live::LIVE_SUMMARY_RECALL` (5) so nothing recall could ever have used
+/// is lost — this bound exists only to keep the table from growing forever.
+pub const LIVE_SUMMARY_KEEP: i64 = 20;
+
 fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession> {
     let status: String = row.get(3)?;
     // The context is parsed **leniently** (the `waypoints` precedent, not the
@@ -910,6 +946,15 @@ fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
         played_at: row.get(8)?,
+    })
+}
+
+fn row_to_live_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSummary> {
+    Ok(LiveSummary {
+        session_id: row.get(0)?,
+        body: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
     })
 }
 
@@ -4218,6 +4263,93 @@ impl Store {
             [id],
         )?;
         self.get_live_turn(id)
+    }
+
+    /// Writes a session's summary, upserting on `session_id` (task 921): the
+    /// first write inserts, a later one — the shape a `--regenerate`-style
+    /// rewrite would take, though nothing calls it that way today — updates
+    /// `body`/`updated_at` in place while leaving `created_at` alone, the same
+    /// posture receipts take. `NotFound` if the session doesn't exist, so a
+    /// caller with a stale id gets that rather than an FK error at commit
+    /// time. `body` is trimmed and bounded ([`LIVE_SUMMARY_MAX`] chars,
+    /// counted the way [`LIVE_TEXT_MAX`] is) and may not be empty.
+    ///
+    /// After the write, prunes down to the newest [`LIVE_SUMMARY_KEEP`] rows
+    /// **by `updated_at`** — the 20 most *recently written* summaries, not the
+    /// 20 highest session ids. Summarisers run in the background per ended
+    /// session, so an older session's summary can legitimately be written
+    /// after 20 newer sessions already have one; ordering the keep-set by
+    /// session id would prune that write the instant it landed. The `AND
+    /// session_id != ?2` beside it is belt and braces on top of that fix: a
+    /// same-second `updated_at` tie must still never be able to delete the row
+    /// this very call just wrote.
+    ///
+    /// This is deliberately a **different order** from [`list_live_summaries`]
+    /// — retention is about bounding storage and must be self-consistent (by
+    /// write recency), while recall is about which *conversations* are most
+    /// relevant to hand the next agent (by session recency). They are two
+    /// different questions, so they read the table two different ways.
+    pub fn set_live_summary(&mut self, session_id: i64, body: &str) -> Result<LiveSummary> {
+        self.get_live_session(session_id)?;
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(Error::Validation("a live summary may not be empty".into()));
+        }
+        if body.chars().count() > LIVE_SUMMARY_MAX {
+            return Err(Error::Validation(format!(
+                "live summary must be at most {LIVE_SUMMARY_MAX} characters"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO live_summaries (session_id, body, created_at, updated_at) \
+             VALUES (?1, ?2, datetime('now'), datetime('now')) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+                body = excluded.body, updated_at = excluded.updated_at",
+            (session_id, body),
+        )?;
+        self.conn.execute(
+            "DELETE FROM live_summaries WHERE session_id NOT IN \
+             (SELECT session_id FROM live_summaries \
+              ORDER BY updated_at DESC, session_id DESC LIMIT ?1) \
+             AND session_id != ?2",
+            (LIVE_SUMMARY_KEEP, session_id),
+        )?;
+        self.get_live_summary(session_id)
+    }
+
+    pub fn get_live_summary(&self, session_id: i64) -> Result<LiveSummary> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIVE_SUMMARY_COLUMNS} FROM live_summaries WHERE session_id = ?1"),
+                [session_id],
+                row_to_live_summary,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("live session {session_id} has no summary"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// The most recent **conversations'** summaries, newest session first —
+    /// `live::agent_prompt` reverses the slice it wants into oldest-first
+    /// before appending it, so this stays the same "most recent N" shape
+    /// every other `list_*` uses. `limit` is clamped into
+    /// `1..=`[`LIVE_SUMMARY_KEEP`], the same reasoning `list_live_turns` gives
+    /// for clamping into `LIVE_TURNS_MAX`.
+    ///
+    /// Ordered by `session_id`, **not** `updated_at` like
+    /// [`set_live_summary`]'s prune: recall answers "which conversations are
+    /// most relevant to the next agent", which is a question about session
+    /// recency, not about which row happened to be written most recently.
+    pub fn list_live_summaries(&self, limit: i64) -> Result<Vec<LiveSummary>> {
+        let limit = limit.clamp(1, LIVE_SUMMARY_KEEP);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIVE_SUMMARY_COLUMNS} FROM live_summaries ORDER BY session_id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit], row_to_live_summary)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // ---- scripts (user-authored shell) ----
@@ -9943,6 +10075,185 @@ mod tests {
             store.list_live_turns(session.id, None, 10).unwrap().len(),
             1
         );
+    }
+
+    /// The summary table arrives by this migration, pinned by index for the
+    /// same reason [`the_live_tables_arrive_by_migration`] pins its own.
+    #[test]
+    fn the_live_summaries_table_arrives_at_migration_49() {
+        const SUMMARIES: usize = 49;
+        assert!(
+            MIGRATIONS[SUMMARIES].contains("CREATE TABLE live_summaries"),
+            "migration {SUMMARIES} is no longer the live summary migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        assert_eq!(
+            MIGRATIONS.len(),
+            50,
+            "a fresh db should report user_version 50"
+        );
+        let (store, _dir) = temp_store();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 50);
+    }
+
+    /// Upserting keeps `created_at` and moves `updated_at` — the receipts
+    /// `--regenerate` posture.
+    #[test]
+    fn set_live_summary_upserts_keeping_created_at() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let first = store
+            .set_live_summary(session.id, "  discussed X  ")
+            .unwrap();
+        assert_eq!(first.body, "discussed X", "trimmed");
+        let second = store.set_live_summary(session.id, "discussed Y").unwrap();
+        assert_eq!(second.session_id, session.id);
+        assert_eq!(second.body, "discussed Y");
+        assert_eq!(second.created_at, first.created_at);
+        assert_eq!(
+            store.get_live_summary(session.id).unwrap().body,
+            "discussed Y"
+        );
+    }
+
+    #[test]
+    fn set_live_summary_rejects_empty_overlong_or_unknown_session() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert!(matches!(
+            store.set_live_summary(session.id, "   "),
+            Err(Error::Validation(_))
+        ));
+        let long = "a".repeat(LIVE_SUMMARY_MAX + 1);
+        assert!(matches!(
+            store.set_live_summary(session.id, &long),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.set_live_summary(999, "fine"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.get_live_summary(session.id),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// Bounded storage: only the newest [`LIVE_SUMMARY_KEEP`] rows survive.
+    #[test]
+    fn set_live_summary_prunes_to_the_keep_bound() {
+        let (mut store, _dir) = temp_store();
+        let mut ids = Vec::new();
+        for i in 0..(LIVE_SUMMARY_KEEP + 5) {
+            let session = store.start_live_session(None).unwrap();
+            store
+                .set_live_summary(session.id, &format!("session {i}"))
+                .unwrap();
+            store.end_live_session(session.id).unwrap();
+            ids.push(session.id);
+        }
+        let remaining = store.list_live_summaries(LIVE_SUMMARY_KEEP + 10).unwrap();
+        assert_eq!(remaining.len(), LIVE_SUMMARY_KEEP as usize);
+        let newest: Vec<i64> = ids[5..].iter().rev().cloned().collect();
+        assert_eq!(
+            remaining.iter().map(|s| s.session_id).collect::<Vec<_>>(),
+            newest
+        );
+        for dropped in &ids[..5] {
+            assert!(matches!(
+                store.get_live_summary(*dropped),
+                Err(Error::NotFound(_))
+            ));
+        }
+    }
+
+    /// The bug this guards against: pruning the keep-set by session id rather
+    /// than by write time would delete a summary the instant it was written,
+    /// whenever it named an older session than 20 others that already had
+    /// one — exactly the order a burst of short conversations produces while
+    /// an older session's background summariser is still catching up.
+    #[test]
+    fn set_live_summary_never_prunes_the_write_it_just_made() {
+        let (mut store, _dir) = temp_store();
+        // Sessions 1..=21: write every session's summary EXCEPT the first
+        // (oldest) one first, so the table already holds LIVE_SUMMARY_KEEP
+        // rows naming the 20 *highest* session ids before session 1 ever
+        // gets one.
+        let sessions: Vec<i64> = (0..=LIVE_SUMMARY_KEEP)
+            .map(|_| {
+                // Only one session may be live at a time, so each must end
+                // before the next starts; `end_live_session` is idempotent,
+                // so ending the oldest one again below is harmless.
+                let id = store.start_live_session(None).unwrap().id;
+                store.end_live_session(id).unwrap();
+                id
+            })
+            .collect();
+        for &id in &sessions[1..] {
+            store
+                .set_live_summary(id, &format!("session {id}"))
+                .unwrap();
+            store.end_live_session(id).unwrap();
+        }
+        // Now the oldest session's summariser finally catches up. Ordering
+        // the keep-set by session id would prune this write the instant it
+        // landed, since it names the lowest id in the whole table.
+        let oldest = sessions[0];
+        store.end_live_session(oldest).unwrap();
+        let written = store.set_live_summary(oldest, "late summary").unwrap();
+        assert_eq!(written.session_id, oldest);
+        assert_eq!(
+            store.get_live_summary(oldest).unwrap().body,
+            "late summary",
+            "a write must never be able to delete itself"
+        );
+    }
+
+    #[test]
+    fn list_live_summaries_is_newest_first_and_clamps_its_limit() {
+        let (mut store, _dir) = temp_store();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let session = store.start_live_session(None).unwrap();
+            store
+                .set_live_summary(session.id, &format!("summary {i}"))
+                .unwrap();
+            store.end_live_session(session.id).unwrap();
+            ids.push(session.id);
+        }
+        let all = store.list_live_summaries(100).unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.session_id).collect::<Vec<_>>(),
+            ids.iter().rev().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(store.list_live_summaries(0).unwrap().len(), 1, "clamped up");
+        assert_eq!(
+            store.list_live_summaries(i64::MAX).unwrap().len(),
+            3,
+            "clamped down to LIVE_SUMMARY_KEEP, not the whole table"
+        );
+    }
+
+    /// A summary of a deleted conversation is meaningless — same posture a
+    /// task's receipt takes on its task.
+    #[test]
+    fn deleting_a_live_session_takes_its_summary_with_it() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.set_live_summary(session.id, "notes").unwrap();
+        store
+            .conn
+            .execute("DELETE FROM live_sessions WHERE id = ?1", [session.id])
+            .unwrap();
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM live_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     // ---- scripts (user-authored shell) ----

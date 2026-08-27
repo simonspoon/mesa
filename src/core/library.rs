@@ -37,7 +37,11 @@ pub struct Builtin {
 /// The starter set — deliberately tiny. `live-agent-prompt` is the
 /// replacement for `config.json`'s old `live.prompt` key: its body is
 /// `core::live::AGENT_PROMPT` itself, so the tests that pin the loop that
-/// constant states keep working unchanged.
+/// constant states keep working unchanged. `live-summary-prompt` is its
+/// sibling (mesa task 921): the instructions for the short-lived agent that
+/// writes a live conversation's memory once it ends, body
+/// `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it
+/// belongs beside.
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
         id: "live-agent-prompt",
@@ -45,6 +49,13 @@ pub const BUILTINS: &[Builtin] = &[
         kind: LibraryKind::Prompt,
         scope: LibraryScope::User,
         body: crate::core::live::AGENT_PROMPT,
+    },
+    Builtin {
+        id: "live-summary-prompt",
+        name: "live-summary-prompt",
+        kind: LibraryKind::Prompt,
+        scope: LibraryScope::User,
+        body: crate::core::live::SUMMARY_PROMPT,
     },
     Builtin {
         id: "starter-claude-md",

@@ -44,7 +44,20 @@
 #      routes that carry it (POST/DELETE /api/live, speak) contrasted with the
 #      plain guard on their neighbours;
 #  10. the same boundary under `--lan`: Host skipped, Content-Type still
-#      firing, and the agent-gated routes keeping their stronger gate.
+#      firing, and the agent-gated routes keeping their stronger gate;
+#  11. session memory (mesa task 921): the `mesa live summary` CLI round-trip
+#      (set/show/list, the upsert keeping `created_at`), its `--quiet`
+#      contract (drops `body` only; `list --quiet` is a usage error; `--quiet`
+#      typed AFTER the text lands in the body, the `live say` trap), the
+#      validation/not_found/usage error shapes, `live turns --session` reading
+#      an ended session's turns, and the `live-summary` template firing on
+#      `live stop` — argv shape, session name, one-argument prompt — with its
+#      two guards (no turns spawns nothing; a second stop is not_found and
+#      spawns nothing), the recall join proving a stored summary reaches the
+#      NEXT conversation's spawned prompt argv (and lands after the
+#      instruction block, never before), a write-then-immediate-read-back
+#      regression for a session older than the retained set, and the
+#      project-delete cascade.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -1296,5 +1309,257 @@ ok "--lan: the conversation can still be ended from a local client"
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true
 LAN_PID=
+
+# =====================================================================
+# 11. Session memory (mesa task 921): `mesa live summary` + the live-summary
+#     spawn on `live stop`
+# =====================================================================
+
+SUMMARY_MAX=$(grep -Eo 'pub const LIVE_SUMMARY_MAX: usize = [0-9]+' src/core/store.rs |
+  grep -Eo '[0-9]+$')
+[ -n "$SUMMARY_MAX" ] || fail "could not read LIVE_SUMMARY_MAX from src/core/store.rs"
+
+# ---- the CLI round-trip ----
+
+run 0 "$MESA" live start --no-agent
+SUM1=$(jqs .id)
+run 0 "$MESA" live say "Talked about the roadmap."
+run 0 "$MESA" live stop
+[ "$(jqs .id)" = "$SUM1" ] || fail "session memory setup: stop must echo $SUM1"
+
+run 0 "$MESA" live summary set "$SUM1" Discussed the roadmap and opened task 42.
+[ "$(jqs .session_id)" = "$SUM1" ] || fail "live summary set: session_id"
+[ "$(jqs .body)" = "Discussed the roadmap and opened task 42." ] ||
+  fail "live summary set: trailing words are joined into the body"
+[ "$(jqs .updated_at)" = "$(jqs .created_at)" ] ||
+  fail "live summary set: a fresh row's updated_at must equal its created_at"
+ok "live summary set: upserts a fresh row, trailing words joined into the body"
+
+run 0 "$MESA" live summary show "$SUM1"
+[ "$(jqs .session_id)" = "$SUM1" ] || fail "live summary show: session_id"
+[ "$(jqs .body)" = "Discussed the roadmap and opened task 42." ] || fail "live summary show: body"
+ok "live summary show: the stored record"
+
+run 0 "$MESA" live summary list
+[ "$(jqs type)" = "array" ] || fail "live summary list: bare array"
+[ "$(jqs '.[0].session_id')" = "$SUM1" ] ||
+  fail "live summary list: newest first, must include the row just set"
+ok "live summary list: a bare array, newest first"
+
+# ---- the --quiet contract ----
+
+run 0 "$MESA" live summary set --quiet "$SUM1" Second summary, replacing the first.
+printf '%s' "$STDOUT" >"$TMP/summary-quiet.json"
+[ "$(jqs 'has("body")')" = "false" ] || fail "live summary set --quiet: body must be dropped"
+[ "$(jqs .session_id)" = "$SUM1" ] || fail "live summary set --quiet: session_id must survive"
+run 0 "$MESA" live summary show "$SUM1"
+printf '%s' "$STDOUT" >"$TMP/summary-full.json"
+[ "$(jqs .body)" = "Second summary, replacing the first." ] ||
+  fail "live summary set --quiet: must still have written the full record"
+jq -e --slurpfile q "$TMP/summary-quiet.json" 'del(.body) == $q[0]' "$TMP/summary-full.json" >/dev/null ||
+  fail "live summary set --quiet: must be the full record minus \`body\` and nothing else"
+ok "live summary set --quiet: the full record minus \`body\`, every other key present and equal"
+
+run 0 "$MESA" live summary show "$SUM1" --quiet
+[ "$(jqs 'has("body")')" = "false" ] || fail "live summary show --quiet: body must be dropped"
+[ "$(jqs .session_id)" = "$SUM1" ] || fail "live summary show --quiet: session_id must survive"
+ok "live summary show --quiet: the same projection as set"
+
+run 2 "$MESA" live summary list --quiet
+[ -z "$STDOUT" ] || fail "live summary list --quiet: stdout must be empty on a usage error"
+[ "$(jqe .error.code)" = "usage" ] || fail "live summary list --quiet: error.code"
+ok "live summary list --quiet: unknown argument, exit 2, empty stdout"
+
+# `--quiet` typed AFTER the id/text is spoken into the body, never parsed as
+# the flag — the exact trap `live say` sets, since everything after the id
+# that is not a LEADING flag is swallowed as the summary text.
+run 0 "$MESA" live summary set "$SUM1" A note that mentions --quiet in passing.
+[ "$(jqs .body)" = "A note that mentions --quiet in passing." ] ||
+  fail "live summary set: --quiet typed after the text must land in the body, not be parsed as the flag"
+ok "live summary set: --quiet after the text is spoken into the body, exactly like \`live say\`"
+
+# ---- validation and errors ----
+
+run 1 "$MESA" live summary set "$SUM1" ""
+[ "$(jqe .error.code)" = "validation" ] || fail "live summary set with an empty body: error.code"
+run 1 "$MESA" live summary set "$SUM1" "   "
+[ "$(jqe .error.code)" = "validation" ] ||
+  fail "live summary set with a whitespace-only body: trimmed, so this is validation too"
+ok "live summary set: an empty or whitespace-only body is validation"
+
+LONG_SUMMARY=$(printf 'x%.0s' $(seq 1 $((SUMMARY_MAX + 1))))
+run 1 "$MESA" live summary set "$SUM1" "$LONG_SUMMARY"
+[ "$(jqe .error.code)" = "validation" ] || fail "an over-long summary body: error.code"
+grep -q "$SUMMARY_MAX" <<<"$STDERR" || fail "the summary bound must name itself in the message"
+run 0 "$MESA" live summary set "$SUM1" "$(printf 'x%.0s' $(seq 1 "$SUMMARY_MAX"))"
+[ "$(jqs '.body | length')" = "$SUMMARY_MAX" ] ||
+  fail "a body of exactly $SUMMARY_MAX chars must be accepted (inclusive bound)"
+ok "live summary body is capped at $SUMMARY_MAX chars: accepted at the bound, validation past it"
+
+run 1 "$MESA" live summary set 999999 "fine"
+[ "$(jqe .error.code)" = "not_found" ] || fail "live summary set on an unknown session: error.code"
+run 1 "$MESA" live summary show 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "live summary show on an unknown session: error.code"
+ok "live summary set/show on an unknown session: not_found"
+
+run 2 "$MESA" live summary set
+[ "$(jqe .error.code)" = "usage" ] || fail "live summary set with no id/text: error.code"
+ok "live summary set with no arguments: usage, exit 2"
+
+# ---- upsert: keeps created_at, moves updated_at ----
+
+run 0 "$MESA" live start --no-agent
+SUM2=$(jqs .id)
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live summary set "$SUM2" "first pass"
+FIRST_CREATED=$(jqs .created_at)
+FIRST_UPDATED=$(jqs .updated_at)
+sleep 1
+run 0 "$MESA" live summary set "$SUM2" "replaced pass"
+[ "$(jqs .body)" = "replaced pass" ] || fail "live summary set (second write): body must be replaced"
+[ "$(jqs .created_at)" = "$FIRST_CREATED" ] || fail "live summary set (second write): created_at must not move"
+[ "$(jqs .updated_at)" != "$FIRST_UPDATED" ] || fail "live summary set (second write): updated_at must move"
+ok "live summary set: a second write upserts — body replaced, created_at kept, updated_at moved"
+
+# ---- turns --session: reads an ended session's turns ----
+
+run 0 "$MESA" live start --no-agent
+SUM3=$(jqs .id)
+run 0 "$MESA" live say "one thing"
+run 0 "$MESA" live say "another thing"
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live turns --session "$SUM3"
+[ "$(jqs type)" = "array" ] || fail "live turns --session: bare array"
+[ "$(jqs length)" = "2" ] || fail "live turns --session: must read the ended session's own turns"
+run 1 "$MESA" live turns --session 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "live turns --session <unknown>: error.code"
+ok "live turns --session: reads an ended session's turns; an unknown session id is not_found"
+
+# ---- the spawn: `live stop` fires the live-summary template ----
+#
+# `--no-agent` throughout, so the only \`--bg\` invocation the stub can see
+# comes from the summariser, never from a live-agent spawn — isolating it
+# from section 4's spawn assertions.
+
+rm -f "$STUB_DIR/last-argc"
+run 0 "$MESA" live start --no-agent
+SUM4=$(jqs .id)
+run 0 "$MESA" live say "We renamed the project."
+run 0 "$MESA" live stop
+[ -e "$STUB_DIR/last-argc" ] ||
+  fail "live stop on a session with turns must spawn its summariser"
+EXPECTED_SUMMARY_FLAGS="--bg
+--agent
+swe
+--name
+mesa live $SUM4 summary
+--"
+[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_SUMMARY_FLAGS" ] ||
+  fail "live-summary spawn argv: expected
+$EXPECTED_SUMMARY_FLAGS
+got
+$(cat "$STUB_DIR/last-flags")"
+grep -q 'Your only job is to write down what it was about' "$STUB_DIR/last-prompt" ||
+  fail "live-summary spawn: the prompt argument must be core::live's summariser instructions"
+grep -q "summarising mesa live session $SUM4" "$STUB_DIR/last-prompt" ||
+  fail "live-summary spawn: the prompt must name the session it is summarising"
+ok "live stop: spawns the live-summary template — the argv shape, the session name, one prompt argument"
+
+# ---- the recall join: a stored summary reaches the NEXT conversation's
+#      spawned prompt (store -> prompt -> spawn_bg -> argv) ----
+#
+# `agent_prompt_appends_stored_summaries_as_recall` (Rust) pins the function;
+# the spawn assertions above pin that *a* prompt reaches the argv. Neither
+# pins the two joined up, which is the seam a refactor could break silently
+# with every unit test still green — so this is checked as a fact about the
+# argv actually sent, not about what a function returned.
+RECALL_TEXT="RECALL-MARKER: onboarded the new intern and closed task 77."
+run 0 "$MESA" live start --no-agent
+RECALL_SESSION=$(jqs .id)
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live summary set "$RECALL_SESSION" "$RECALL_TEXT"
+
+run 0 "$MESA" live start
+grep -q "$RECALL_TEXT" "$STUB_DIR/last-prompt" ||
+  fail "a stored summary must reach the very next live-agent spawn's prompt as recall"
+# Ordering matters: a summary is derived from dictated speech — untrusted
+# text — and untrusted text may not sit above the rules (the plan's posture).
+# An argv log is the only place this can be checked as a fact about what was
+# actually sent, rather than about what `prompt_with` returned in isolation.
+INSTR_POS=$(grep -bo 'You are the voice of mesa' "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+RECALL_POS=$(grep -bo "$RECALL_TEXT" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+[ -n "$INSTR_POS" ] || fail "recall join: could not find the instruction block in the spawned prompt"
+[ -n "$RECALL_POS" ] || fail "recall join: could not find the recall text in the spawned prompt"
+[ "$RECALL_POS" -gt "$INSTR_POS" ] ||
+  fail "recall must be appended AFTER the instruction block, never before — untrusted text may not outrank the rules"
+run 0 "$MESA" live stop >/dev/null
+ok "a stored summary reaches the next conversation's spawned prompt, appended after the instruction block"
+
+# ---- guard: a session with no turns spawns no summariser ----
+rm -f "$STUB_DIR/last-argc"
+run 0 "$MESA" live start --no-agent
+run 0 "$MESA" live stop
+[ ! -e "$STUB_DIR/last-argc" ] ||
+  fail "live stop on a session with NO turns must not spawn a summariser"
+ok "live stop on a session with no turns: no summariser is spawned"
+
+# ---- guard: a second stop of an already-ended session spawns nothing ----
+rm -f "$STUB_DIR/last-argc"
+run 1 "$MESA" live stop
+[ "$(jqe .error.code)" = "not_found" ] || fail "a second stop of an already-ended session: error.code"
+[ ! -e "$STUB_DIR/last-argc" ] ||
+  fail "a second stop of an already-ended session must not spawn another summariser"
+ok "a second stop of an already-ended session: not_found, and nothing is spawned"
+
+# ---- prune regression: a write is always readable back immediately, even
+#      for a session older than SUMMARY_KEEP already-summarised ones ----
+#
+# The prune after every write keeps only the newest SUMMARY_KEEP rows — by
+# WRITE order, not by session id (a session id is not the order summaries
+# arrive in: the oldest conversation can be the last one summarised). This
+# pins the regression that a write could delete the very row it had just
+# inserted; the exact keep-set arithmetic is covered by Rust unit tests.
+SUMMARY_KEEP=$(grep -Eo 'pub const LIVE_SUMMARY_KEEP: i64 = [0-9]+' src/core/store.rs |
+  grep -Eo '[0-9]+$')
+[ -n "$SUMMARY_KEEP" ] || fail "could not read LIVE_SUMMARY_KEEP from src/core/store.rs"
+
+run 0 "$MESA" live start --no-agent
+OLD_SESSION=$(jqs .id)
+run 0 "$MESA" live stop >/dev/null
+for i in $(seq 1 "$SUMMARY_KEEP"); do
+  run 0 "$MESA" live start --no-agent
+  NEWER_SESSION=$(jqs .id)
+  run 0 "$MESA" live stop >/dev/null
+  run 0 "$MESA" live summary set "$NEWER_SESSION" "filler summary $i"
+done
+run 0 "$MESA" live summary set "$OLD_SESSION" "an older conversation, summarised last"
+[ "$(jqs .body)" = "an older conversation, summarised last" ] ||
+  fail "a summary write must be readable back in its own response"
+run 0 "$MESA" live summary show "$OLD_SESSION"
+[ "$(jqs .body)" = "an older conversation, summarised last" ] ||
+  fail "a summary for a session older than $SUMMARY_KEEP already-summarised ones must still be readable back immediately after the write"
+ok "live summary set: a write is always readable back immediately, even for a session older than $SUMMARY_KEEP others"
+
+# ---- cascade: deleting a session's project must not destroy its summary ----
+#
+# `project_id` is ON DELETE SET NULL on `live_sessions` (not CASCADE, unlike
+# `live_summaries.session_id` on `live_sessions.id`), so deleting the project
+# must leave the session's turns and summary alone. There is no CLI command
+# that deletes a live session directly, so this is as far as the cascade can
+# be reached from the CLI.
+
+CASCADE_PROJ=$("$MESA" project create "live memory cascade" --no-git | jq -r .id)
+run 0 "$MESA" live start --no-agent --project "$CASCADE_PROJ"
+CASCADE_SESSION=$(jqs .id)
+run 0 "$MESA" live say "one more thing worth remembering"
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live summary set "$CASCADE_SESSION" "notes worth keeping"
+run 0 "$MESA" project delete "$CASCADE_PROJ"
+run 0 "$MESA" live summary show "$CASCADE_SESSION"
+[ "$(jqs .body)" = "notes worth keeping" ] ||
+  fail "deleting a session's project must not destroy its summary"
+run 0 "$MESA" live turns --session "$CASCADE_SESSION"
+[ "$(jqs length)" = "1" ] || fail "deleting a session's project must not destroy its turns either"
+ok "deleting a session's project: its summary and turns both survive (project_id is SET NULL, not CASCADE)"
 
 echo "all $CHECKS checks passed"

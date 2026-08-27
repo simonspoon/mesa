@@ -1,12 +1,13 @@
 //! User config: the command lines mesa uses when it starts a coding agent,
 //! and the per-model price table the CC Dashboard estimates cost from.
 //!
-//! mesa spawns an agent from exactly four places — the todo-watcher's
+//! mesa spawns an agent from exactly five places — the todo-watcher's
 //! dispatch, the inbox-watcher's triage, the Agents surface's "add agent"
-//! button, and the live conversation's agent. Each used to be a hardcoded
-//! `claude --bg …` argv, so swapping the binary, the persona, or the slash
-//! command meant a rebuild. Each is now a **command template** in
-//! `~/.mesa/config.json`:
+//! button, the live conversation's agent, and the short-lived agent that
+//! writes a live conversation's memory once it ends (mesa task 921). Each
+//! used to be a hardcoded `claude --bg …` argv, so swapping the binary, the
+//! persona, or the slash command meant a rebuild. Each is now a **command
+//! template** in `~/.mesa/config.json`:
 //!
 //! ```json
 //! {
@@ -14,7 +15,8 @@
 //!     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
 //!     "inbox-watcher":  "claude --bg --agent swe --name {name} -- \"/inbox-triage {id}\"",
 //!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
-//!     "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}"
+//!     "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}",
+//!     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}"
 //!   }
 //! }
 //! ```
@@ -124,11 +126,22 @@ pub const INBOX_WATCHER: &str = "inbox-watcher";
 pub const AGENT_SPAWN: &str = "agent-spawn";
 /// The live conversation's agent (`docs/live.md`).
 pub const LIVE_AGENT: &str = "live-agent";
+/// The short-lived agent that writes a live conversation's memory once it
+/// ends (mesa task 921, `docs/live.md`). Spawned from `live stop`, not from
+/// `live start` — it cannot be the live agent's own last act, since stopping
+/// a session stops that agent (`claude stop <agent_id>`).
+pub const LIVE_SUMMARY: &str = "live-summary";
 
 /// Every configurable command, in the order the docs and the Settings page
 /// list them. The single source of truth for "which keys mesa configures" —
 /// [`default_command`] answers the same question one key at a time.
-pub const ACTIONS: [&str; 4] = [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN, LIVE_AGENT];
+pub const ACTIONS: [&str; 5] = [
+    TODO_WATCHER,
+    INBOX_WATCHER,
+    AGENT_SPAWN,
+    LIVE_AGENT,
+    LIVE_SUMMARY,
+];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
 /// config file existed, spelled as a template. `{bin}`/`{agent}` carry the
@@ -153,6 +166,11 @@ pub const DEFAULT_AGENT_SPAWN: &str = "{bin} --bg --agent {agent} -- {prompt}";
 /// carries a prompt mesa supplies — `core::live::agent_prompt`, the loop the
 /// conversation runs — so the feature works with no user configuration.
 pub const DEFAULT_LIVE_AGENT: &str = "{bin} --bg --agent {agent} --name {name} -- {prompt}";
+/// Built-in default for [`LIVE_SUMMARY`] — identical in shape to
+/// [`DEFAULT_LIVE_AGENT`]: the summariser is also a mesa record (a session
+/// id and a name) carrying a prompt mesa supplies
+/// (`core::live::summary_prompt`), so it works with no user configuration.
+pub const DEFAULT_LIVE_SUMMARY: &str = "{bin} --bg --agent {agent} --name {name} -- {prompt}";
 
 /// The built-in template for `action`, or `None` if `action` isn't one of
 /// [`ACTIONS`]. Public so the docs check and the API can report the shipped
@@ -163,6 +181,7 @@ pub fn default_command(action: &str) -> Option<&'static str> {
         INBOX_WATCHER => Some(DEFAULT_INBOX_WATCHER),
         AGENT_SPAWN => Some(DEFAULT_AGENT_SPAWN),
         LIVE_AGENT => Some(DEFAULT_LIVE_AGENT),
+        LIVE_SUMMARY => Some(DEFAULT_LIVE_SUMMARY),
         _ => None,
     }
 }
@@ -429,7 +448,7 @@ const PLACEHOLDER_ENV: [(&str, &str); 5] = [
 pub fn offered_env_vars(action: &str) -> &'static [&'static str] {
     match action {
         AGENT_SPAWN => &["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"],
-        LIVE_AGENT => &[
+        LIVE_AGENT | LIVE_SUMMARY => &[
             "MESA_BIN",
             "MESA_AGENT",
             "MESA_ID",
@@ -574,7 +593,7 @@ impl Vars<'_> {
             "id" => (action != AGENT_SPAWN, self.id.map(|i| i.to_string())),
             "name" => (action != AGENT_SPAWN, self.name.map(str::to_string)),
             "prompt" => (
-                action == AGENT_SPAWN || action == LIVE_AGENT,
+                action == AGENT_SPAWN || action == LIVE_AGENT || action == LIVE_SUMMARY,
                 self.prompt.map(str::to_string),
             ),
             _ => (false, None),
@@ -597,8 +616,9 @@ impl Vars<'_> {
 pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
     match action {
         AGENT_SPAWN => &["{bin}", "{agent}", "{prompt}"],
-        // The union: a live session is a mesa record *and* carries a prompt.
-        LIVE_AGENT => &["{bin}", "{agent}", "{id}", "{name}", "{prompt}"],
+        // The union: a live session (and its summariser) is a mesa record
+        // *and* carries a prompt.
+        LIVE_AGENT | LIVE_SUMMARY => &["{bin}", "{agent}", "{id}", "{name}", "{prompt}"],
         _ => &["{bin}", "{agent}", "{id}", "{name}"],
     }
 }
@@ -1612,6 +1632,13 @@ mod tests {
         assert_eq!(settings[3].default, DEFAULT_LIVE_AGENT);
         assert_eq!(
             settings[3].placeholders,
+            ["{bin}", "{agent}", "{id}", "{name}", "{prompt}"]
+        );
+        // The summariser offers the same union, for the same reason.
+        assert_eq!(settings[4].action, LIVE_SUMMARY);
+        assert_eq!(settings[4].default, DEFAULT_LIVE_SUMMARY);
+        assert_eq!(
+            settings[4].placeholders,
             ["{bin}", "{agent}", "{id}", "{name}", "{prompt}"]
         );
     }
@@ -2791,7 +2818,7 @@ mod tests {
 
     #[test]
     fn every_default_names_a_known_action() {
-        for action in [TODO_WATCHER, INBOX_WATCHER, AGENT_SPAWN, LIVE_AGENT] {
+        for action in ACTIONS {
             assert!(default_command(action).is_some(), "{action}");
         }
         assert_eq!(default_command("task-execute"), None);

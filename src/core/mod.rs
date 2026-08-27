@@ -30,8 +30,8 @@ pub use types::{
     GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
     LibraryVersion, LiveAction, LiveContext, LiveContextKind, LiveRole, LiveSession, LiveState,
-    LiveStatus, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project, ProjectAgents,
-    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Script,
-    ScriptArg, ScriptArgKind, ScriptRun, Status, Task, TaskReceipt, TaskSummary, Waypoint,
-    task_name,
+    LiveStatus, LiveSummary, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task, TaskReceipt,
+    TaskSummary, Waypoint, task_name,
 };

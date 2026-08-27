@@ -1,6 +1,6 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly four places. Each one's command line
+mesa starts a coding agent from exactly five places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
 persona and the slash command can all change without rebuilding mesa:
 
@@ -10,6 +10,7 @@ persona and the slash command can all change without rebuilding mesa:
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"` |
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `{bin} --bg --agent {agent} -- {prompt}` |
 | `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `{bin} --bg --agent {agent} --name {name} -- {prompt}` |
+| `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `{bin} --bg --agent {agent} --name {name} -- {prompt}` |
 
 ```json
 {
@@ -17,7 +18,8 @@ persona and the slash command can all change without rebuilding mesa:
     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
     "agent-spawn":    "claude --bg -- {prompt}",
-    "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}"
+    "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}",
+    "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}"
   }
 }
 ```
@@ -34,6 +36,18 @@ with no user configuration, and a replacement template's job is to start
 editable, as of mesa task 919, through the **library** rather than this file —
 the `live-agent-prompt` built-in, forked like any other library row
 (`docs/library.md`) — so `{prompt}` is the forked text whenever one exists.
+
+`live-summary`'s default is identical in shape (mesa task 921): the
+summariser is also a mesa record — a session id and a name — carrying a
+prompt mesa supplies, `core::live::summary_prompt`. It cannot be the
+`live-agent` spawn's own last act, because ending a session **stops** that
+agent (`claude stop <agent_id>`), so a separate short-lived agent is spawned
+once the conversation has already ended, to read it back and write down what
+it was about. Like `live-agent`'s, that prompt is a library item when forked
+— `live-summary-prompt`, the sibling of `live-agent-prompt`
+(`docs/library.md`) — and a replacement template's job is the same as
+`live-agent`'s: start something that will read `{prompt}` and do what it
+says.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
 for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
@@ -87,11 +101,11 @@ what that spawn actually knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{bin}` | all four | `MESA_CLAUDE_BIN`, else `claude` |
-| `{agent}` | all four | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
-| `{id}` | watchers, `live-agent` | the task id / inbox item id / live session id |
-| `{name}` | watchers, `live-agent` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), or the live session's own name |
-| `{prompt}` | `agent-spawn`, `live-agent` | the POST body's `prompt` (`agent-spawn`; unavailable when omitted) / the live agent's instruction block, always present |
+| `{bin}` | all five | `MESA_CLAUDE_BIN`, else `claude` |
+| `{agent}` | all five | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
+| `{id}` | watchers, `live-agent`, `live-summary` | the task id / inbox item id / live session id |
+| `{name}` | watchers, `live-agent`, `live-summary` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), or the live session's own name |
+| `{prompt}` | `agent-spawn`, `live-agent`, `live-summary` | the POST body's `prompt` (`agent-spawn`; unavailable when omitted) / the live agent's or summariser's instruction block, always present |
 
 Two rules cover the edges:
 
@@ -146,11 +160,11 @@ variable, offered on exactly the commands its `{}` twin is:
 
 | Placeholder | Variable | Where |
 | --- | --- | --- |
-| `{bin}` | `MESA_BIN` | all four |
-| `{agent}` | `MESA_AGENT` | all four |
-| `{id}` | `MESA_ID` | watchers, `live-agent` |
-| `{name}` | `MESA_NAME` | watchers, `live-agent` |
-| `{prompt}` | `MESA_PROMPT` | `agent-spawn`, `live-agent` |
+| `{bin}` | `MESA_BIN` | all five |
+| `{agent}` | `MESA_AGENT` | all five |
+| `{id}` | `MESA_ID` | watchers, `live-agent`, `live-summary` |
+| `{name}` | `MESA_NAME` | watchers, `live-agent`, `live-summary` |
+| `{prompt}` | `MESA_PROMPT` | `agent-spawn`, `live-agent`, `live-summary` |
 
 Two rules mirror the argv ones:
 

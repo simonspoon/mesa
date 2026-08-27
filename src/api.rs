@@ -42,11 +42,11 @@ use crate::core::{
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
     InboxItem, InboxKind, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole,
-    LiveState, LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents,
-    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
-    ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary,
-    Waypoint, agents, attachments, config, files, git, hooks, library, live, receipt, scripts,
-    speech, version,
+    LiveState, LiveStatus, LiveWindow, MesaVersion, ModelRates, NextResult, Priority,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
+    ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
+    TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, library, live, receipt,
+    scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -2439,6 +2439,35 @@ async fn start_live(
     Ok((StatusCode::CREATED, Json(session)).into_response())
 }
 
+/// Resolves the working directory and session name a live conversation's
+/// agent runs under — shared by [`spawn_live_agent`] and, since mesa task 921,
+/// by `stop_live`'s summariser spawn, so the two can never name or place a
+/// session differently. The CLI's own `live_agent_dir` computes the same pair
+/// for the same reason: both spawn sites must not diverge.
+///
+/// The name is what a person reads in the Agents sidebar and the `/resume`
+/// picker, so a scoped conversation leads with its project, the idiom the
+/// todo-watcher's `"{project}: {task}"` set. The id is in both halves, so two
+/// conversations about one project stay distinguishable.
+fn live_agent_dir(
+    store: &Store,
+    project_id: Option<i64>,
+    session_id: i64,
+) -> Result<(String, String), ApiError> {
+    let (local_path, name) = match project_id {
+        Some(id) => {
+            let project = store.get_project(id)?;
+            (
+                project.local_path,
+                format!("{}: live {session_id}", project.name),
+            )
+        }
+        None => (None, format!("mesa live {session_id}")),
+    };
+    let dir = live_spawn_dir(local_path)?;
+    Ok((dir, name))
+}
+
 /// The spawn half of [`start_live`], split out so every failure between the
 /// session opening and the agent running has exactly one rollback path at the
 /// call site — a live session nothing is listening to would `conflict` every
@@ -2455,21 +2484,7 @@ async fn spawn_live_agent(
     session_id: i64,
     project_id: Option<i64>,
 ) -> Result<Option<String>, ApiError> {
-    // The name is what a person reads in the Agents sidebar and the `/resume`
-    // picker, so a scoped conversation leads with its project, the idiom the
-    // todo-watcher's `"{project}: {task}"` set. The id is in both halves, so
-    // two conversations about one project stay distinguishable.
-    let (local_path, name) = match project_id {
-        Some(id) => {
-            let project = state.store.lock().unwrap().get_project(id)?;
-            (
-                project.local_path,
-                format!("{}: live {session_id}", project.name),
-            )
-        }
-        None => (None, format!("mesa live {session_id}")),
-    };
-    let dir = live_spawn_dir(local_path)?;
+    let (dir, name) = live_agent_dir(&state.store.lock().unwrap(), project_id, session_id)?;
     let path = dir.clone();
     let prompt = live::agent_prompt(&state.store.lock().unwrap(), session_id);
     // Two-phase like every other spawn site in this file: the store lock is
@@ -2495,6 +2510,49 @@ async fn spawn_live_agent(
     Ok(job)
 }
 
+/// Spawns the short-lived agent that writes a just-ended session's memory
+/// (mesa task 921), reusing [`live_agent_dir`] so it lands in the same folder
+/// and under the same name as the conversation it is about, suffixed
+/// `" summary"`. **Best-effort**, like `stop_live`'s `claude stop` call right
+/// after it: the store write that ended the conversation is the truth, and a
+/// failure here is a log line, never this route's answer.
+async fn spawn_live_summary(state: &AppState, session_id: i64, project_id: Option<i64>) {
+    let dir_and_name = {
+        let store = state.store.lock().unwrap();
+        live_agent_dir(&store, project_id, session_id)
+    };
+    let (dir, name) = match dir_and_name {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "live session {session_id}: could not spawn its summariser: {}",
+                e.message
+            );
+            return;
+        }
+    };
+    let prompt = live::summary_prompt(&state.store.lock().unwrap(), session_id);
+    let result = tokio::task::spawn_blocking(move || {
+        agents::spawn_bg(
+            config::LIVE_SUMMARY,
+            &dir,
+            Some(session_id),
+            Some(&format!("{name} summary")),
+            Some(&prompt),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("live session {session_id}: could not spawn its summariser: {e}")
+        }
+        Err(e) => {
+            eprintln!("live session {session_id}: summariser spawn panicked: {e}")
+        }
+    }
+}
+
 /// Ends the conversation, answering with the ended session. Shares
 /// `require_agent_access` with `start_live`: hanging up on an agent mid-turn is
 /// the other half of the same capability, and the pair must not drift apart.
@@ -2518,13 +2576,37 @@ async fn stop_live(
     require_agent_access(&state, &addr, &headers)?;
     // The store lock is dropped before the blocking `claude stop` shell-out,
     // like every other agent call in this file.
-    let session = {
+    let (session, has_turns) = {
         let mut store = state.store.lock().unwrap();
-        let Some(session) = store.current_live_session()? else {
+        let Some(current) = store.current_live_session()? else {
             return Err(no_live_session());
         };
-        store.end_live_session(session.id)?
+        // Captured before `end_live_session` moves it to `Ended`: whether a
+        // summary is worth writing is a question about the conversation that
+        // just finished, not about the row after the write (mesa task 921).
+        let was_live = current.status == LiveStatus::Live;
+        let ended = store.end_live_session(current.id)?;
+        // Best-effort, matching the CLI's `live stop`: by this point the
+        // session is already ended, so a failure reading its turns must never
+        // turn into a failed stop — it can only ever mean "skip the
+        // summary", the same way a failing `claude stop` below is a log line
+        // rather than this route's answer.
+        let has_turns = was_live
+            && match store.list_live_turns(ended.id, None, 1) {
+                Ok(turns) => !turns.is_empty(),
+                Err(e) => {
+                    eprintln!(
+                        "live session {}: could not check for turns to summarize: {e}",
+                        ended.id
+                    );
+                    false
+                }
+            };
+        (ended, has_turns)
     };
+    if has_turns {
+        spawn_live_summary(&state, session.id, session.project_id).await;
+    }
     if let Some(agent_id) = session.agent_id.clone() {
         let id = session.id;
         match tokio::task::spawn_blocking(move || agents::stop(&agent_id)).await {

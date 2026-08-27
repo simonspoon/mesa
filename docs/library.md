@@ -104,18 +104,20 @@ That split is the whole point:
   `Store::create_library_item`/the fork route both check
   `Store::find_library_fork` first and answer `conflict` on a second attempt.
 
-The starter set is deliberately tiny — three rows:
+The starter set is deliberately tiny — four rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
 | `live-agent-prompt` | `prompt` | `user` | The live conversation's agent prompt — literally `core::live::AGENT_PROMPT`, moved here rather than duplicated |
+| `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops |
 
-`live-agent-prompt`'s body being the literal `AGENT_PROMPT` constant is what
-lets `docs/live.md`'s tests of "the loop is fully stated" keep passing
-unchanged — the built-in and the constant are the same text, never two copies
-that could drift.
+`live-agent-prompt`'s body being the literal `AGENT_PROMPT` constant (and
+`live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
+`docs/live.md`'s tests of "the loop is fully stated" keep passing unchanged —
+each built-in and its constant are the same text, never two copies that could
+drift.
 
 ## Where a row lives on disk
 
@@ -366,6 +368,20 @@ is plumbing rather than instruction.
 (`docs/config.md`); a `live.prompt` key left behind by an older mesa, or
 hand-edited into the file, is **silently ignored** — never an error, and never
 read from — because the struct simply has no field for it any more.
+
+### And where the summariser's went
+
+`live-summary-prompt` (mesa task 921) is `live-agent-prompt`'s sibling, cut
+from the same cloth: same kind (`prompt`), same scope (`user`), the same
+fork-replaces-the-built-in rule, and — being mesa-internal, like the prompt
+beside it — no on-disk path either (`relative_path` answers `None` for every
+`prompt` row, `src/core/library.rs:109`). `core::live::summary_prompt(store,
+session_id)` resolves it exactly as `agent_prompt` resolves its own: a fork
+of `live-summary-prompt` if one exists, else `core::live::SUMMARY_PROMPT`,
+falling back to the built-in on a store error for the same reason — a
+database hiccup must not be what stops the short-lived summariser from being
+spawned. It never existed as a config key in the first place, so there is
+nothing here for an old `config.json` to leave behind.
 
 ## Gate
 

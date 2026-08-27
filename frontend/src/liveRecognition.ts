@@ -361,6 +361,273 @@ export function isListenChord(e: {
   return e.key.toLowerCase() === 'l'
 }
 
+/**
+ * A rough phonetic fold, used to catch the browser mishearing a name mesa
+ * knows for an ordinary word that sounds like it (mesa task 922) — "khora" as
+ * "chorus", "helios" as "helius". `SpeechGrammarList`, the API's own way to
+ * hand a recognizer a vocabulary up front, is a documented no-op in Chrome, so
+ * this correction has to happen after the fact, on the text the engine already
+ * settled on.
+ *
+ * Plain soundex will not do: it keeps the first *letter* rather than the first
+ * *sound*, so "chorus" (C-) and "khora" (K-) are already different codes
+ * before either word is folded any further. Metaphone comes closer but maps
+ * `ch` to `x`, landing "chorus" and "khora" on different codes again. This
+ * fold instead normalises the *spelling* toward the sound first — `ch`, `kh`,
+ * `ck` and `qu` all become `k`, the same target `c` itself falls to except
+ * before `e`/`i`/`y` — and only then keeps one representative letter, so both
+ * words collapse onto the same key.
+ *
+ * The steps, in the order that makes that collapse happen:
+ * 1. Lowercase and strip everything that is not a-z — punctuation and
+ *    digits carry no sound.
+ * 2. Fold digraphs and single letters that spell one sound multiple ways,
+ *    left to right over the whole string. `gh` is dropped outright (a silent
+ *    letter pair in the words it appears in, "though"/"through"/"ghost"'s `h`
+ *    contribute nothing to how the name sounds); `x` becomes `ks` and `z`
+ *    becomes `s` because both are just voiced/voiceless spellings of sounds
+ *    already in the alphabet; `y` is left as a vowel rather than folded, so
+ *    the vowel-stripping step below treats it exactly like `a`/`e`/`i`/`o`/`u`.
+ *    This has to run before step 4, or `ch`/`kh`/`ck` would already have lost
+ *    the letter that makes them a digraph.
+ * 3. Drop one trailing `s` — the recognizer's stray plural/sibilant
+ *    ("helius" for "Helios") must not be what keeps two spellings apart.
+ * 4. Keep the first character verbatim (soundex's one idea worth keeping —
+ *    two words starting on genuinely different sounds should stay apart), then
+ *    drop every vowel *after* it. Vowels are the least reliably heard part of
+ *    a word and the part speakers vary most on, so keeping only the
+ *    consonant skeleton is what makes "khora" and "chorus" line up despite
+ *    neither vowel matching.
+ * 5. Collapse runs of the same character to one, the way soundex does for a
+ *    doubled consonant — "kh" and "k" folding to the same letter in step 2
+ *    can otherwise leave "kk" where a single word only ever had one sound.
+ *
+ * Worked examples this order is chosen to satisfy (both sides fold to `kr`,
+ * `hls`, `hlm` respectively — the exact letters are incidental, only the
+ * equalities below are load-bearing and are what the tests check):
+ * - `soundKey('chorus') === soundKey('khora')`
+ * - `soundKey('helius') === soundKey('helios')`
+ * - `soundKey('helium') !== soundKey('helios')`
+ */
+export function soundKey(word: string): string {
+  let s = word.toLowerCase().replace(/[^a-z]/g, '')
+  s = s
+    .replace(/gh/g, '')
+    .replace(/ph/g, 'f')
+    .replace(/ch/g, 'k')
+    .replace(/kh/g, 'k')
+    .replace(/ck/g, 'k')
+    .replace(/qu/g, 'k')
+    .replace(/q/g, 'k')
+    .replace(/wh/g, 'w')
+    .replace(/x/g, 'ks')
+    .replace(/z/g, 's')
+    .replace(/c(?=[eiy])/g, 's')
+    .replace(/c/g, 'k')
+  // Doubled letters collapse **before** the vowels come out, not after, and the
+  // order is the whole difference between a fold that works and one that eats
+  // the flagship case (mesa task 922). Collapsing afterwards would merge two
+  // consonants a vowel had kept apart: `kokoro` strips to `kkr` and then to
+  // `kr`, which is exactly `khora`'s key — so the ambiguity rule in
+  // `buildVocabulary` would cancel both, and the one mishearing this whole
+  // function exists to correct would stop being correctable. A vowel between
+  // two of the same consonant is a syllable, and soundex has always counted it.
+  s = s.replace(/(.)\1+/g, '$1')
+  s = s.replace(/s$/, '')
+  if (s.length > 1) {
+    s = s[0] + s.slice(1).replace(/[aeiouy]/g, '')
+  }
+  return s
+}
+
+/**
+ * The small set of ordinary English words this correction must never
+ * override (mesa task 922) — the guard `buildVocabulary` and
+ * `correctVocabulary` both check before ever consulting a sound key. A name
+ * that also happens to spell an everyday word (there are none in
+ * `MESA_VOCABULARY` today) is dropped from the vocabulary entirely rather
+ * than risk it, and an everyday word is never *rewritten* even where its
+ * sound key collides with a real name — "chorus" is deliberately the
+ * mishearing this feature corrects, but "course" or "call" must reach the
+ * transcript untouched regardless of what they sound like. This is
+ * necessarily incomplete (a rewrite is only worth doing where mesa is fairly
+ * sure), not an attempt at a full dictionary — the top few hundred function
+ * words and common nouns/verbs, weighted toward the ones that sound like
+ * mesa's own names, is what keeps ordinary speech safe without trying to
+ * enumerate the language.
+ */
+export const COMMON_ENGLISH: ReadonlySet<string> = new Set([
+  // top function words
+  'the', 'and', 'that', 'have', 'for', 'not', 'with', 'you', 'this', 'but',
+  'his', 'from', 'they', 'she', 'her', 'been', 'than', 'its', 'who', 'did',
+  'yes', 'get', 'has', 'him', 'how', 'man', 'new', 'now', 'old', 'see',
+  'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she',
+  'too', 'use', 'want', 'need', 'will', 'well', 'were', 'when', 'what',
+  'where', 'which', 'while', 'would', 'could', 'should', 'about', 'after',
+  'again', 'against', 'because', 'before', 'being', 'below', 'between',
+  'both', 'down', 'during', 'each', 'few', 'further', 'here', 'into',
+  'itself', 'just', 'more', 'most', 'once', 'only', 'other', 'over',
+  'own', 'same', 'some', 'such', 'then', 'there', 'these', 'those',
+  'through', 'under', 'until', 'very', 'your', 'yours', 'ours', 'theirs',
+  'them', 'their', 'have', 'having', 'does', 'doing', 'done', 'shall',
+  'must', 'can', 'cannot', 'like', 'make', 'made', 'take', 'took',
+  'come', 'came', 'go', 'goes', 'went', 'gone', 'look', 'looked',
+  'give', 'gave', 'find', 'found', 'know', 'knew', 'think', 'thought',
+  'good', 'great', 'little', 'long', 'right', 'still', 'never', 'always',
+  'today', 'tomorrow', 'yesterday', 'time', 'year', 'work', 'life',
+  'world', 'hand', 'part', 'place', 'case', 'week', 'point', 'fact',
+  'group', 'number', 'room', 'area', 'money', 'story', 'water', 'family',
+  'word', 'body', 'music', 'level', 'child', 'eye', 'day', 'thing',
+  'people', 'name', 'home', 'country', 'company', 'system', 'program',
+  'question', 'government', 'power', 'issue', 'side', 'kind', 'head',
+  'house', 'service', 'friend', 'father', 'mother', 'sister', 'brother',
+  // sound-alikes to the words we correct *toward* — the actual guard
+  'course', 'cores', 'chores', 'corps', 'care', 'call', 'called', 'calls',
+  'class', 'close', 'closed', 'coarse', 'chore', 'core',
+  'cause', 'cost', 'cold', 'code', 'cloud', 'crowd', 'clock', 'clerk',
+  'quote', 'quote', 'quiet', 'quick', 'quite', 'question',
+  'help', 'helper', 'health', 'held', 'hell', 'hello',
+  'lock', 'locked', 'lucky', 'local', 'logic',
+  'saw', 'sonnet', 'song', 'sound', 'south', 'shape', 'sharp',
+  'open', 'opens', 'opened', 'opening', 'opus', 'office', 'often',
+  'clip', 'client', 'clean',
+])
+
+/**
+ * The names mesa always knows regardless of what projects exist in this
+ * install (mesa task 922) — its own tools and the model family names it
+ * talks about.
+ *
+ * The list is deliberately **not** pre-filtered for what `buildVocabulary`
+ * will actually keep. `sonnet` and `opus` are ordinary English words as well
+ * as model names, so `COMMON_ENGLISH` drops them, and that is the right
+ * outcome rather than an oversight: nothing needs correcting *to* a word the
+ * recognizer already spells correctly, and a vocabulary that could rewrite
+ * "opus" would be a vocabulary that could rewrite it wrongly. Listing them
+ * here says what mesa's words are; the rules downstream say which of them are
+ * safe to correct toward, and keeping those two statements apart is what lets
+ * a rule change without this list being re-audited.
+ */
+export const MESA_VOCABULARY: readonly string[] = [
+  'khora',
+  'qorvex',
+  'helios',
+  'loki',
+  'kokoro',
+  'mesa',
+  'claude',
+  'sonnet',
+  'opus',
+  'haiku',
+  'clippy',
+  'sqlite',
+  'vitest',
+  'soundex',
+]
+
+/**
+ * The correction table built once per conversation (mesa task 922): a sound
+ * key to the one spelling it may be corrected to. A `ReadonlyMap` rather than
+ * a plain object so an unusual project name can never collide with a
+ * `Map`/`Object.prototype` method name the way a bare `{}` lookup can.
+ */
+export type Vocabulary = ReadonlyMap<string, string>
+
+/**
+ * Builds a `Vocabulary` from mesa's own names plus whatever this install's
+ * project names contribute (mesa task 922) — called once when a conversation
+ * opens, not on every result, since the set of things worth correcting *to*
+ * does not change mid-conversation.
+ *
+ * Every rule below exists to serve one governing principle: **a wrong
+ * "correction" is worse than the mishearing it replaced.** A missed rewrite
+ * is a name spelled the way the engine guessed it — mildly wrong, and no
+ * worse than today. A wrong rewrite silently replaces a word the person
+ * actually said with one they didn't, inside a transcript nobody proofreads
+ * before it is sent — so every rule here errs toward dropping a candidate
+ * rather than keeping a shaky one.
+ *
+ * - Each name is split on whitespace and punctuation into tokens, and each
+ *   token stands as its own candidate — a two-word project name should
+ *   correct either of its words on its own, not only the phrase whole.
+ * - A token under 4 characters is dropped: a short sound key is a common
+ *   prefix of half the language, so "correcting" toward it would rewrite far
+ *   more ordinary speech than it would ever fix.
+ * - A token whose *sound key* comes out under 2 characters is dropped for the
+ *   same reason, one step later — the fold can shrink a longer token down to
+ *   almost nothing (a name that is mostly vowels), and it is the key's length
+ *   that actually determines how much it collides with.
+ * - A token that is itself in `COMMON_ENGLISH` is dropped: a name that is
+ *   also an everyday word cannot be corrected *to* without corrupting the
+ *   ordinary speech that already spells it that way.
+ * - If two different surviving tokens land on the same sound key with
+ *   *different* canonical spellings, the key is dropped entirely rather than
+ *   arbitrarily keeping one — mesa has no way to know which of two real names
+ *   the person meant, and guessing wrong is the exact failure this feature
+ *   exists to avoid.
+ * - The key is computed from the lowercased token; the value kept is the
+ *   token's original spelling, so a proper-noun capitalisation in a project
+ *   name survives into the correction.
+ */
+export function buildVocabulary(names: Iterable<string>): Vocabulary {
+  const claims = new Map<string, string>()
+  const ambiguous = new Set<string>()
+  for (const name of names) {
+    for (const token of name.split(/[^A-Za-z]+/)) {
+      if (token.length < 4) continue
+      if (COMMON_ENGLISH.has(token.toLowerCase())) continue
+      const key = soundKey(token.toLowerCase())
+      if (key.length < 2) continue
+      const existing = claims.get(key)
+      if (existing === undefined) {
+        claims.set(key, token)
+      } else if (existing.toLowerCase() !== token.toLowerCase()) {
+        ambiguous.add(key)
+      }
+    }
+  }
+  for (const key of ambiguous) claims.delete(key)
+  return claims
+}
+
+/**
+ * Rewrites whole words in recognised text toward mesa's vocabulary (mesa task
+ * 922) — applied to both the final and interim text in `onresult`, since
+ * `heldFlush` can send the interim tail as part of a turn.
+ *
+ * Splits on word boundaries so every separator — spaces, punctuation, the
+ * sentence's own capitalisation — round-trips untouched wherever nothing
+ * matched; an empty vocabulary is therefore a no-op that returns its input
+ * unchanged rather than a pass over the string that happens to change
+ * nothing. For each word:
+ * - a word under 4 characters, or one whose lowercase form is in
+ *   `COMMON_ENGLISH`, is left alone without even computing a sound key —
+ *   the same two guards `buildVocabulary` applies when deciding what may be
+ *   corrected *to* apply here to what may be corrected *from*;
+ * - otherwise its sound key is looked up, and it is replaced **only** when
+ *   there is a hit whose spelling actually differs (a word already spelled
+ *   correctly is left as the engine wrote it, not re-typed identically);
+ * - the replacement is the vocabulary's stored spelling verbatim, not a
+ *   case-matched version of it — the entire point is the *real* spelling of
+ *   the name, so guessing at how to re-capitalise it would undo that.
+ *
+ * Task ids are deliberately not part of this: a digit string has no
+ * sound-alike spelling for a phonetic fold to work on, and turning a spoken
+ * number into a digit string is a different mechanism this module does not
+ * attempt.
+ */
+export function correctVocabulary(text: string, vocab: Vocabulary): string {
+  if (vocab.size === 0) return text
+  return text.replace(/[A-Za-z']+/g, (word) => {
+    if (word.length < 4) return word
+    const lower = word.toLowerCase()
+    if (COMMON_ENGLISH.has(lower)) return word
+    const hit = vocab.get(soundKey(lower))
+    if (hit === undefined || hit.toLowerCase() === lower) return word
+    return hit
+  })
+}
+
 /** How the chord is written wherever the page names it. One string for both
  * platforms rather than a detected one: it is read next to the control it
  * describes, and being told which half is yours is cheaper than mesa guessing

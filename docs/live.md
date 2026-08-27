@@ -1007,6 +1007,51 @@ conversation") working with no backend change.
     has) would otherwise re-record every sentence before it. `utteranceFrom`
     drops a settled result with no words in it (a cough, a door), which the
     engine produces routinely.
+  - **Both halves are corrected against mesa's own vocabulary before anything
+    else touches them** (`liveRecognition.ts`, mesa task 922). The browser's
+    recognizer has no idea what mesa's words are, and mishears them for
+    ordinary ones that sound similar — "khora" comes back as "chorus",
+    "helios" as "helius". `SpeechGrammarList`, the API's documented way to hand
+    a recognizer a vocabulary before it listens, is a no-op in Chrome, so this
+    has to run *after* the engine has already settled on the wrong word,
+    applied to the interim preview as well as the final: `heldFlush` can send
+    the interim tail as part of a turn, so a preview left mishearing "khora"
+    would be the very sentence a person just finished saying, unless it is
+    corrected before it is shown, not just before it is sent.
+
+    The correction is plain string matching, not a model call — no latency, no
+    cost, nothing leaves the page. `soundKey` folds a word toward a rough
+    phonetic key (spelling variants that spell one sound several ways — `ch`,
+    `kh`, `ck`, `qu` all fold to `k` — collapsed, doubled letters merged, a
+    trailing `s` dropped, and only then the first letter and the consonant
+    skeleton kept — that last order is load-bearing, since merging doubles
+    *after* the vowels come out welds together two consonants a vowel had kept
+    apart, which is enough to land `kokoro` on `khora`'s key and cancel both); plain soundex will not do here, since it keeps the first
+    *letter* rather than the first *sound* and so never lines up "chorus" with
+    "khora" in the first place. `buildVocabulary` turns a list of names —
+    mesa's own tools and model families, plus this install's project names —
+    into a key-to-spelling table, built once when a conversation opens rather
+    than on every result, since the set of things worth correcting *to* does
+    not change mid-conversation; a project list the page could not fetch just
+    leaves the built-in names in place rather than breaking anything.
+    `correctVocabulary` then rewrites whole words in recognised text using that
+    table, leaving punctuation, spacing and every word with no hit untouched.
+
+    Every rule in both functions serves one governing principle: **a wrong
+    "correction" is worse than the mishearing it replaced** — a missed rewrite
+    is a name spelled the way the engine guessed, no worse than today, but a
+    wrong one silently swaps in a word the person never said, inside a
+    transcript nobody proofreads before it is sent. That is why a short token,
+    or one that is itself ordinary English (`COMMON_ENGLISH`, a guard list
+    rather than a dictionary — "chorus" is deliberately absent from it, being
+    the mishearing this feature exists to correct, while "sonnet" and "opus"
+    are deliberately present and so drop out of the vocabulary entirely,
+    because nothing needs correcting *to* a word the recognizer already spells
+    right), is never a candidate; and why two different names landing on the
+    same sound key cancels the key rather than guessing which one was meant.
+    Task ids are deliberately outside this: a digit string has no sound-alike
+    spelling for a phonetic fold to work on, and turning a spoken number into
+    digits is a different mechanism this does not attempt.
   - **Listening is a recording, not a stream of utterances** (task 889), and a
     recording has **two** boundaries (task 917). Each settled sentence is
     joined onto a held recording (`heldWith`), shown above the capture box,
@@ -1381,8 +1426,10 @@ conversation") working with no backend change.
   second —
   which errors end listening, whether a keystroke is the listen chord and how
   the chord is written, a result event's final text, its preview
-  and its high-water mark, what a settled result is worth sending, and the
-  composer's hint) and
+  and its high-water mark, what a settled result is worth sending, the
+  composer's hint, and — mesa task 922 — the phonetic fold that keys mesa's
+  vocabulary, the vocabulary table built from it and the correction that
+  rewrites recognised text against it) and
   `frontend/src/liveDevices.ts` (which microphones there are, whether two
   readings of that list say the same thing, what to call one before its label
   is known, which one is actually chosen, and whether the chooser is offered at
@@ -1448,7 +1495,11 @@ CLAUDE.md requires: **data, never instructions.**
   knowing and not something mesa can answer for. Where there is no recognizer
   at all, the person's own system dictation types into the text field, exactly
   as it always did. The mesa audio path stays **one-directional, server to
-  browser**.
+  browser**. The one thing mesa does to that text before anything else sees it
+  is correct mishearings of its own vocabulary against a small local sound-key
+  table (mesa task 922, above) — plain string matching in the page, not a
+  second model call, so it changes nothing about whose recognizer this is or
+  where the audio goes.
   - A **fully local pipeline** — mic capture and VAD in the page, audio chunks
     to a mesa route, a local whisper — is the follow-up that would take the
     privacy question and the non-Chromium browsers off this list. It is not

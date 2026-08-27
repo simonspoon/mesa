@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import {
   getLive,
   getLiveConfig,
+  listProjects,
   liveSpeakUrl,
   markLiveTurnPlayed,
   reportLiveRoute,
@@ -32,12 +33,15 @@ import {
 } from '../liveDevices'
 import { headerIndicator, indicatorLabel } from '../liveIndicator'
 import {
+  buildVocabulary,
   captureHint,
+  correctVocabulary,
   isBlockingError,
   isListenChord,
   LISTEN_CHORD,
   heldFlush,
   heldWith,
+  MESA_VOCABULARY,
   readResults,
   recognitionCtor,
   recognizesSpeech,
@@ -45,6 +49,7 @@ import {
   shouldListen,
   utteranceFrom,
   type SpeechRecognitionLike,
+  type Vocabulary,
 } from '../liveRecognition'
 import {
   isLive,
@@ -229,6 +234,34 @@ export function LiveHub({
     }
   }, [live])
   const autoSendMs = autoSendIdleMs(liveConfig)
+
+  // The correction table for mishearings of mesa's own vocabulary (mesa task
+  // 922) — built once per conversation, keyed on the session id the same way
+  // `micOpenedFor` below is, rather than rebuilt on every recognised result:
+  // the set of names worth correcting *to* does not change mid-conversation.
+  // Held in a ref, not state, since it is read from inside `onresult`
+  // (a media-event handler set up once per recognizer, long after the render
+  // that built it) rather than rendered. Seeded with mesa's own names so a
+  // conversation is never briefly running with none; `listProjects` folds in
+  // whatever this install's projects are named. A failed fetch is a nicety
+  // lost, not a conversation broken — the ref just keeps the built-in set.
+  const vocabRef = useRef<Vocabulary>(buildVocabulary(MESA_VOCABULARY))
+  const vocabBuiltFor = useRef<number | null>(null)
+  useEffect(() => {
+    const id = session?.id ?? null
+    if (id === null || vocabBuiltFor.current === id) return
+    vocabBuiltFor.current = id
+    listProjects()
+      .then((projects) => {
+        vocabRef.current = buildVocabulary([
+          ...MESA_VOCABULARY,
+          ...projects.map((p) => p.name),
+        ])
+      })
+      .catch(() => {
+        vocabRef.current = buildVocabulary(MESA_VOCABULARY)
+      })
+  }, [session?.id])
 
   // The transcript, accumulated: each poll answers only with what is new, so
   // this component holds the conversation and the server holds the tail.
@@ -985,8 +1018,14 @@ export function LiveHub({
         markHeard()
         const heard = readResults(Math.max(event.resultIndex, settled), event.results)
         settled = heard.settledThrough
-        if (running) setInterimNow(heard.interim)
-        const text = utteranceFrom(heard.final)
+        // Corrected before either half is used anywhere else (mesa task 922):
+        // the interim matters too, since `heldFlush` can send it as the tail
+        // of a turn, and a preview showing the mishearing would be corrected
+        // out from under the person the moment they stopped talking.
+        const final = correctVocabulary(heard.final, vocabRef.current)
+        const interim = correctVocabulary(heard.interim, vocabRef.current)
+        if (running) setInterimNow(interim)
+        const text = utteranceFrom(final)
         if (text === null) return
         // Not guarded on `running`: `stop()` below delivers whatever was
         // pending as a final, and that is the sentence the person was still

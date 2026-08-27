@@ -1,16 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildVocabulary,
   captureHint,
+  COMMON_ENGLISH,
+  correctVocabulary,
   HELD_MAX,
   heldFlush,
   heldWith,
   isBlockingError,
   isListenChord,
+  MESA_VOCABULARY,
   readResults,
   recognitionCtor,
   recognizesSpeech,
   shouldFlushSilence,
   shouldListen,
+  soundKey,
   utteranceFrom,
   type RecognitionResult,
 } from './liveRecognition'
@@ -325,6 +330,140 @@ describe('heldFlush', () => {
     for (const text of heldFlush(held, 'and then')) {
       expect(text.length).toBeLessThanOrEqual(HELD_MAX)
     }
+  })
+})
+
+describe('soundKey', () => {
+  it('folds a mishearing onto the same key as the name it stands for', () => {
+    // "chorus" is exactly the kind of mishearing mesa task 922 exists to fix.
+    expect(soundKey('chorus')).toBe(soundKey('khora'))
+    expect(soundKey('helius')).toBe(soundKey('helios'))
+  })
+
+  it('keeps two names with genuinely different sounds apart', () => {
+    expect(soundKey('helium')).not.toBe(soundKey('helios'))
+  })
+
+  it('collapses doubled letters before stripping vowels, not after (mesa task 922 regression)', () => {
+    // Collapsing after the vowel strip would merge two consonants a vowel kept
+    // apart: "kokoro" would fold to "kkr" and then collapse to "kr" — exactly
+    // "khora"'s key — which would then cancel both entries as ambiguous in
+    // buildVocabulary and knock the flagship name "khora" out of the
+    // vocabulary entirely.
+    expect(soundKey('kokoro')).not.toBe(soundKey('khora'))
+  })
+})
+
+describe('buildVocabulary', () => {
+  it('builds a correction table from the given names', () => {
+    const vocab = buildVocabulary(['khora'])
+    expect(vocab.get(soundKey('khora'))).toBe('khora')
+  })
+
+  it('splits a multi-word name into independent candidate tokens', () => {
+    const vocab = buildVocabulary(['The Helios'])
+    expect(vocab.get(soundKey('helios'))).toBe('Helios')
+    expect(vocab.size).toBe(1) // "the" is under 4 characters and is dropped
+  })
+
+  it('drops a token shorter than 4 characters', () => {
+    const vocab = buildVocabulary(['abc', 'xyz'])
+    expect(vocab.size).toBe(0)
+  })
+
+  it('drops a token that is itself common English', () => {
+    const vocab = buildVocabulary(['course'])
+    expect(vocab.size).toBe(0)
+  })
+
+  it('drops a sound key two different names both claim, rather than picking one', () => {
+    // Two real, unrelated names that happen to fold to the same key: mesa
+    // cannot know which the person meant, so neither wins.
+    const a = 'khora'
+    const b = 'chorus' // stand-in for a second real name sharing the key
+    const vocab = buildVocabulary([a, b])
+    expect(vocab.has(soundKey(a))).toBe(false)
+  })
+
+  it('keeps one spelling when the same name is offered more than once', () => {
+    const vocab = buildVocabulary(['khora', 'khora'])
+    expect(vocab.get(soundKey('khora'))).toBe('khora')
+  })
+
+  it('keeps "khora" in the vocabulary built from the real MESA_VOCABULARY (end-to-end guard)', () => {
+    // This is the guard that actually matters: it fails if any future name,
+    // COMMON_ENGLISH entry or fold change knocks "khora" out again, the way
+    // the step-order bug above once did.
+    const vocab = buildVocabulary(MESA_VOCABULARY)
+    expect(vocab.get(soundKey('chorus'))).toBe('khora')
+  })
+
+  it('never rewrites a MESA_VOCABULARY name into a different name (round trip)', () => {
+    const vocab = buildVocabulary(MESA_VOCABULARY)
+    const survivors = new Set([...vocab.values()].map((v) => v.toLowerCase()))
+    for (const name of MESA_VOCABULARY) {
+      if (!survivors.has(name.toLowerCase())) continue
+      expect(correctVocabulary(name, vocab)).toBe(name)
+    }
+  })
+
+  it('drops from COMMON_ENGLISH exactly the words the doc comment names as intentional', () => {
+    // MESA_VOCABULARY's own doc comment names "sonnet" and "opus" as
+    // deliberately dropped because they are also ordinary English words. Any
+    // other name silently swallowed by the same guard is a regression, not a
+    // known trade-off.
+    const intersection = MESA_VOCABULARY.filter((name) => COMMON_ENGLISH.has(name.toLowerCase()))
+    expect(intersection.sort()).toEqual(['opus', 'sonnet'])
+  })
+})
+
+describe('correctVocabulary', () => {
+  it('rewrites a mishearing to the vocabulary spelling', () => {
+    const vocab = buildVocabulary(['khora'])
+    expect(correctVocabulary('can you open chorus', vocab)).toBe('can you open khora')
+  })
+
+  it('does not rewrite a near-miss that is not actually a hit', () => {
+    const vocab = buildVocabulary(['helios'])
+    expect(correctVocabulary('look at helium', vocab)).toBe('look at helium')
+  })
+
+  it('leaves a word shorter than 4 characters alone', () => {
+    const vocab = buildVocabulary(['khora'])
+    expect(correctVocabulary('go to it now', vocab)).toBe('go to it now')
+  })
+
+  it('passes a full sentence of plain English through unchanged, punctuation and all', () => {
+    const vocab = buildVocabulary(MESA_VOCABULARY)
+    const sentence = "Please close the task, and let's talk about the course next."
+    expect(correctVocabulary(sentence, vocab)).toBe(sentence)
+  })
+
+  it('leaves a word already spelled correctly alone', () => {
+    const vocab = buildVocabulary(['khora'])
+    expect(correctVocabulary('open khora please', vocab)).toBe('open khora please')
+  })
+
+  it('returns the input unchanged for an empty vocabulary', () => {
+    expect(correctVocabulary('open chorus please', buildVocabulary([]))).toBe(
+      'open chorus please',
+    )
+  })
+
+  it('corrects "chorus" to "khora" using the real built-in vocabulary (flagship case, end-to-end)', () => {
+    const vocab = buildVocabulary(MESA_VOCABULARY)
+    expect(correctVocabulary('can you open chorus', vocab)).toBe('can you open khora')
+  })
+
+  it('corrects "helius" to "helios" using the real built-in vocabulary', () => {
+    const vocab = buildVocabulary(MESA_VOCABULARY)
+    expect(correctVocabulary('can you open helius', vocab)).toBe('can you open helios')
+  })
+
+  it('passes a sentence with contractions and capitalisation through unchanged using the real vocabulary', () => {
+    const vocab = buildVocabulary(MESA_VOCABULARY)
+    const sentence = "Don't forget, she's opening the course tomorrow!"
+    expect(correctVocabulary(sentence, vocab)).toBe(sentence)
   })
 })
 

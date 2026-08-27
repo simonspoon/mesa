@@ -77,14 +77,20 @@ person is looking at — the page as `route` and what is open on it as `context`
 tells it to run **`mesa live look`** when the answer depends on what actually
 rendered rather than on which page is open (task 895) — the "this is
 speech, so write prose" rule (a bulleted reply gets read aloud as punctuation)
-and the untrusted-input posture below. `live::agent_prompt(id)`
+and the untrusted-input posture below. `live::agent_prompt(store, id)`
 appends the session id — the only per-call part.
 
-That block is the **default**, not the only possibility: `~/.mesa/config.json`'s
-`live.prompt` replaces it whenever the Settings page has one (mesa task 867,
-`docs/config.md`). Read on every start, so an edit lands on the next
-conversation with no restart; blank means the built-in, and the session line is
-the one thing mesa still appends either way. A rewritten prompt is how the
+That block is the **default**, not the only possibility: the library
+(`docs/library.md`, mesa task 919) can hold a **fork** of it — the
+`live-agent-prompt` built-in, forked into a db row the moment someone edits it
+— and a fork replaces the built-in whenever one exists. This used to be
+`~/.mesa/config.json`'s `live.prompt` (mesa task 867); that config key is gone,
+and the block lives only in the library now. Resolved fresh on every start
+(`store.find_library_fork("live-agent-prompt")`), so an edit lands on the next
+conversation with no restart; no fork means the built-in, and the session line
+is the one thing mesa still appends either way. A store error resolving the
+fork falls back to the built-in rather than failing the start — a database
+hiccup must not be what stops a conversation. A rewritten prompt is how the
 conversation changes character — but the loop `AGENT_PROMPT` describes is what
 makes the feature work, and a prompt that never mentions `mesa live listen`
 produces an agent that hears nothing.
@@ -239,7 +245,7 @@ outlives the project row it happened to be about.
 Three values, and they are all one idea: **what the person is looking at.**
 
 `navigate`'s target is one of the app's own hash routes — `#/`, `#/live`,
-`#/inbox`, `#/cc`, `#/scripts`, `#/settings`, `#/terminal`, `#/projects/<id>`
+`#/inbox`, `#/cc`, `#/scripts`, `#/library`, `#/settings`, `#/terminal`, `#/projects/<id>`
 and that project's `tasks/<id>`, `diagrams`, `git`, `files`, `terminal`,
 `dashboard` and `settings`. The list is in `AGENT_PROMPT` so the agent knows
 what it may say; the *rule* mesa enforces is only the `#/` shape, since the
@@ -1241,12 +1247,16 @@ The spawn is the fourth configurable command: **`live-agent`**, defaulting to
 `{bin} --bg --agent {agent} --name {name} -- {prompt}` — the union of the two
 existing shapes, since a live session is a mesa record (so it has an `{id}` and
 a `{name}`) *and* carries a prompt mesa supplies. That prompt is
-`live::agent_prompt`, so the feature works with **no user configuration** — and
-the prompt itself is the file's fifth section, `live.prompt`, which **replaces**
-the built-in block when it is set (an empty one is never stored; blank is the
-reset). That section holds one other key, `live.auto-send-ms` — the capture
-box's wait above, read by the page rather than by the spawn. Everything else
-about the template — argv vs script mode, tokenize-then-substitute, the
+`live::agent_prompt`, so the feature works with **no user configuration**. The
+prompt itself used to be the config file's fifth section, `live.prompt` (mesa
+task 867); as of mesa task 919 it lives in the library instead, as the
+`live-agent-prompt` built-in — forking it **replaces** the built-in block, the
+same rule the old config key followed. The file's `live` section holds one key
+now, `live.auto-send-ms` — the capture box's wait above, read by the page
+rather than by the spawn; see `docs/library.md` for the prompt and
+`docs/config.md` for the wait. A `live.prompt` key left behind in a hand-edited
+config file is silently ignored, never an error. Everything else about the
+`live-agent` template — argv vs script mode, tokenize-then-substitute, the
 `MESA_*` environment handoff, a `{placeholder}` refused inside
 a script — is inherited, not re-implemented. See `docs/config.md`.
 

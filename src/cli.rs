@@ -26,9 +26,10 @@ use serde_json::json;
 use crate::core::{
     Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
     Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
-    LiveAction, LiveRole, LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project,
-    ProjectPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
-    TaskPatch, agents, config, live, look,
+    LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveRole,
+    LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project, ProjectPatch, Result, Script,
+    ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, agents, config, library,
+    live, look,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -101,6 +102,10 @@ enum Command {
     /// Author and run user-written shell scripts with declared arguments
     #[command(subcommand)]
     Script(ScriptCmd),
+    /// Agent definitions, skills, hooks, commands, prompts and CLAUDE.md
+    /// files, synced against `.claude/`
+    #[command(subcommand)]
+    Library(LibraryCmd),
     /// Run a spoken conversation with mesa (the agent side of the Live page)
     #[command(subcommand)]
     Live(LiveCmd),
@@ -1019,6 +1024,176 @@ EXAMPLES
     },
 }
 
+/// Agent definitions, skills, hooks, commands, prompts and CLAUDE.md files,
+/// stored in mesa and (for every kind but `prompt`) synced against a file
+/// under `.claude/` (or a repo's root `CLAUDE.md`) — mesa task 919.
+///
+/// `core::library::BUILTINS` seeds a tiny starter set that `list`/`show`
+/// report even with no db row (`id: null`, `builtin: true`); editing one
+/// forks it into a real row that carries its `builtin_id`, and deleting that
+/// fork restores the built-in unshadowed.
+#[derive(Subcommand)]
+enum LibraryCmd {
+    /// Create a library item; prints the full created item (`--quiet`:
+    /// without `body`/`synced_body`)
+    #[command(after_help = "\
+EXAMPLES
+  mesa library create prompt my-note --body 'remember this'
+  mesa library create agent reviewer --body-file reviewer.md --scope project --project mesa")]
+    Create {
+        /// agent|skill|hook|command|prompt|claude-md
+        #[arg(value_name = "KIND", required_unless_present = "kind")]
+        kind_pos: Option<String>,
+        /// Kind (flag form of KIND)
+        #[arg(long = "kind", conflicts_with = "kind_pos")]
+        kind: Option<String>,
+        /// Unique name within its kind/scope; half of a filename
+        #[arg(value_name = "NAME", required_unless_present = "name")]
+        name_pos: Option<String>,
+        /// Name (flag form of NAME)
+        #[arg(long = "name", conflicts_with = "name_pos")]
+        name: Option<String>,
+        /// The file's contents
+        #[arg(
+            value_name = "BODY",
+            required_unless_present_any = ["body", "body_file"],
+        )]
+        body_pos: Option<String>,
+        /// The file's contents (flag form of BODY)
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "body_pos")]
+        body: Option<String>,
+        /// Read the body from a file (`-` = stdin); conflicts with BODY/--body
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["body", "body_pos"])]
+        body_file: Option<String>,
+        /// user|project (default: user)
+        #[arg(long, value_parser = parse_library_scope, default_value = "user")]
+        scope: LibraryScope,
+        /// Bind to this project, by id or name; required iff --scope project
+        #[arg(long)]
+        project: Option<String>,
+        /// Print the item without `body`/`synced_body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// List library items (db rows plus unshadowed built-ins) as a bare JSON
+    /// array, by kind then name
+    List {
+        /// Only items usable by this project (id or name); user-scope items
+        /// are always included
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Only items usable by this project (id or name); flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Only items of this kind
+        #[arg(long, value_parser = parse_library_kind)]
+        kind: Option<LibraryKind>,
+    },
+    /// Print one library item as a full JSON object (includes body)
+    ///
+    /// ITEM is a numeric id or a name; a built-in resolves by its name too
+    /// (which is also its built-in id in the starter set).
+    #[command(visible_alias = "get")]
+    Show {
+        item: String,
+        /// Print the item without `body`/`synced_body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Update a library item; at least one field flag is required
+    ///
+    /// `--name` and `--body` are replace-only: both are required and
+    /// non-empty. Updating an unshadowed built-in FORKS it — a new db row is
+    /// created carrying its `builtin_id`, rather than failing.
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Library item id or name
+        item: String,
+        /// New unique name
+        #[arg(long, group = "fields")]
+        name: Option<String>,
+        /// New body
+        #[arg(long, allow_hyphen_values = true, group = "fields")]
+        body: Option<String>,
+        /// Read the new body from a file (`-` = stdin); conflicts with --body
+        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "body")]
+        body_file: Option<String>,
+        /// Print the item without `body`/`synced_body` instead of in full
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Delete a library item (no confirmation); echoes the destroyed record
+    ///
+    /// Deleting the fork of a built-in restores it unshadowed. Deleting an
+    /// unshadowed built-in is a validation error — there is no row to destroy.
+    Delete {
+        /// Library item id or name
+        item: String,
+        /// Echo the destroyed item without `body`/`synced_body`
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// List a library item's history as a bare JSON array, newest first
+    ///
+    /// An unshadowed built-in has no history: an empty array.
+    Versions {
+        /// Library item id or name
+        item: String,
+    },
+    /// Compare mesa's library against the files on disk, and reconcile
+    #[command(subcommand)]
+    Sync(LibrarySyncCmd),
+}
+
+/// `mesa library sync status|apply` — mesa task 919's per-file reconciliation
+/// against `.claude/` (see `docs`'s sync decision table).
+#[derive(Subcommand)]
+enum LibrarySyncCmd {
+    /// Scan both sides and print one row per path as a bare JSON array
+    Status {
+        /// Only this project's project-scope items; user-scope items are
+        /// always included
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+    },
+    /// Apply per-path resolutions from a `sync status` scan; prints the
+    /// results as a JSON array
+    #[command(after_help = "\
+EXAMPLES
+  mesa library sync apply --resolve .claude/agents/reviewer.md=mesa
+  mesa library sync apply mesa --all-disk")]
+    Apply {
+        /// Only this project's project-scope items; user-scope items are
+        /// always included
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Resolve one path: PATH=mesa|disk|skip (repeatable)
+        #[arg(
+            long = "resolve",
+            value_name = "PATH=CHOICE",
+            value_parser = parse_library_resolution,
+            conflicts_with_all = ["all_mesa", "all_disk"],
+        )]
+        resolve: Vec<(String, String)>,
+        /// Resolve every non-in-sync row toward mesa
+        #[arg(long, conflicts_with_all = ["all_disk", "resolve"])]
+        all_mesa: bool,
+        /// Resolve every non-in-sync row toward disk
+        #[arg(long, conflicts_with_all = ["all_mesa", "resolve"])]
+        all_disk: bool,
+    },
+}
+
 /// The agent half of a live (spoken) conversation, mesa task 855.
 ///
 /// The person dictates into the web UI's Live page; those utterances become
@@ -1860,6 +2035,51 @@ fn parse_inbox_kind(s: &str) -> std::result::Result<InboxKind, String> {
     InboxKind::parse(s).ok_or_else(|| format!("'{s}' is not one of task-summary|change-request"))
 }
 
+fn parse_library_kind(s: &str) -> std::result::Result<LibraryKind, String> {
+    LibraryKind::parse(s)
+        .ok_or_else(|| format!("'{s}' is not one of agent|skill|hook|command|prompt|claude-md"))
+}
+
+fn parse_library_scope(s: &str) -> std::result::Result<LibraryScope, String> {
+    LibraryScope::parse(s).ok_or_else(|| format!("'{s}' is not one of user|project"))
+}
+
+/// Whether `--all-mesa` resolves a row of this status toward mesa: every
+/// status except `in-sync` (nothing to do) and `disk-new` (no mesa body
+/// exists to write — that row has no id in the library at all yet).
+fn library_sync_all_mesa_selects(status: LibrarySyncStatus) -> bool {
+    !matches!(
+        status,
+        LibrarySyncStatus::InSync | LibrarySyncStatus::DiskNew
+    )
+}
+
+/// Whether `--all-disk` resolves a row of this status toward disk: every
+/// status except `in-sync` and `mesa-new` (no disk body exists to pull —
+/// there is no file yet). `disk-deleted` stays in: the disk side winning
+/// legitimately means deleting the mesa row, which needs no disk body.
+fn library_sync_all_disk_selects(status: LibrarySyncStatus) -> bool {
+    !matches!(
+        status,
+        LibrarySyncStatus::InSync | LibrarySyncStatus::MesaNew
+    )
+}
+
+/// `--resolve PATH=CHOICE` for `library sync apply`: rejects a missing `=`,
+/// an empty path, and a choice that is not `mesa`/`disk`/`skip`.
+fn parse_library_resolution(s: &str) -> std::result::Result<(String, String), String> {
+    let (path, choice) = s
+        .split_once('=')
+        .ok_or_else(|| format!("'{s}' must be PATH=CHOICE"))?;
+    if path.is_empty() {
+        return Err(format!("'{s}': PATH must not be empty"));
+    }
+    if !matches!(choice, "mesa" | "disk" | "skip") {
+        return Err(format!("'{choice}' is not one of mesa|disk|skip"));
+    }
+    Ok((path.to_string(), choice.to_string()))
+}
+
 /// `mesa live sidebars <STATE>` names the state the person asked for, which
 /// reads as a sentence; the record stores the verb that gets there. The two
 /// sidebar actions are the whole vocabulary here — `navigate` is its own
@@ -2181,6 +2401,11 @@ const QUIET_DROP_INBOX_ITEM: &[&str] = &["body"];
 /// free-text fields. `args` stays — it is the bounded declaration the caller
 /// needs to build the next `script run`.
 const QUIET_DROP_SCRIPT: &[&str] = &["body", "description"];
+/// Keys dropped from a `LibraryItem` under `--quiet`: its own unbounded body,
+/// and the sync baseline — a second copy of a body, unbounded the same way.
+/// `name`/`kind`/`scope`/`path` all stay, which is what makes a compact row
+/// identifiable at all.
+const QUIET_DROP_LIBRARY: &[&str] = &["body", "synced_body"];
 /// A `FrameEdge` has no unbounded field: quiet output equals full output.
 /// The flag is still accepted on edge subcommands, for uniformity.
 const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
@@ -2289,6 +2514,12 @@ fn print_script(script: &Script, is_quiet: bool) {
     print_record(script, is_quiet, QUIET_DROP_SCRIPT);
 }
 
+/// Print one library item: the full record, or the record minus
+/// `body`/`synced_body`.
+fn print_library_item(item: &LibraryItem, is_quiet: bool) {
+    print_record(item, is_quiet, QUIET_DROP_LIBRARY);
+}
+
 /// Print one live session. Nothing on it is unbounded, so the quiet shape IS
 /// the full record; the flag is accepted for uniformity across the group.
 fn print_live_session(session: &LiveSession, is_quiet: bool) {
@@ -2377,6 +2608,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Diagram(cmd) => run_diagram(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
         Command::Script(cmd) => run_script_cmd(cmd),
+        Command::Library(cmd) => run_library_cmd(cmd),
         Command::Live(cmd) => run_live(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
@@ -3368,7 +3600,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                         &dir,
                         Some(session.id),
                         Some(&name),
-                        Some(&live::agent_prompt(session.id)),
+                        Some(&live::agent_prompt(&store, session.id)),
                     ),
                     Err(e) => Err(e.to_string()),
                 };
@@ -3484,6 +3716,43 @@ fn resolve_script(store: &Store, arg: &str) -> Result<Script> {
     match arg.parse::<i64>() {
         Ok(id) => store.get_script(id),
         Err(_) => store.find_script_by_name(arg),
+    }
+}
+
+/// Resolves a library item argument — a numeric id, or a name (which
+/// includes a built-in's name, the same string as its built-in id in the
+/// starter set). Name resolution scans [`library::effective_items`] with no
+/// project filter, so it only ever reaches user-scope items and built-ins
+/// (both of which `BUILTINS` is entirely made of) — a project-scope item
+/// must be addressed by id. Mirrors `Store::find_project_by_name`'s
+/// not-found hint and conflict-lists-candidates behaviour.
+fn resolve_library(store: &Store, arg: &str) -> Result<LibraryItem> {
+    if let Ok(id) = arg.parse::<i64>() {
+        return store.get_library_item(id);
+    }
+    let items = library::effective_items(store, None)?;
+    let matches: Vec<&LibraryItem> = items
+        .iter()
+        .filter(|i| i.name.eq_ignore_ascii_case(arg) || i.builtin_id.as_deref() == Some(arg))
+        .collect();
+    match matches.len() {
+        0 => Err(Error::NotFound(format!(
+            "no library item named {arg:?}; pass a library item id or an existing name \
+             (see `mesa library list`)"
+        ))),
+        1 => Ok(matches[0].clone()),
+        _ => Err(Error::Conflict(format!(
+            "{} library items are named {arg:?} ({}); use the id",
+            matches.len(),
+            matches
+                .iter()
+                .map(|i| match i.id {
+                    Some(id) => id.to_string(),
+                    None => format!("builtin:{}", i.builtin_id.as_deref().unwrap_or("?")),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))),
     }
 }
 
@@ -3610,6 +3879,166 @@ fn run_script_cmd(cmd: ScriptCmd) -> Result<()> {
             let run = crate::core::scripts::run(&script, &values, cwd.as_deref())
                 .map_err(Error::Validation)?;
             print_json(&run);
+        }
+    }
+    Ok(())
+}
+
+fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        LibraryCmd::Create {
+            kind_pos,
+            kind,
+            name_pos,
+            name,
+            body_pos,
+            body,
+            body_file,
+            scope,
+            project,
+            quiet,
+        } => {
+            // clap guarantees exactly one of each positional/flag pair, and
+            // exactly one of the three body forms.
+            let kind_str = kind.or(kind_pos).unwrap();
+            let kind = parse_library_kind(&kind_str).map_err(Error::Validation)?;
+            let name = name.or(name_pos).unwrap();
+            let mut stdin_used = false;
+            let body =
+                resolve_field(body.or(body_pos), body_file, &mut stdin_used)?.unwrap_or_default();
+            let project_id = match scope {
+                LibraryScope::User => {
+                    if project.is_some() {
+                        return Err(Error::Validation(
+                            "--project is only valid with --scope project".into(),
+                        ));
+                    }
+                    None
+                }
+                LibraryScope::Project => {
+                    let p = project.as_deref().ok_or_else(|| {
+                        Error::Validation("--scope project requires --project".into())
+                    })?;
+                    Some(resolve_project(&store, p)?)
+                }
+            };
+            print_library_item(
+                &store.create_library_item(kind, scope, project_id, &name, &body, None)?,
+                quiet,
+            );
+        }
+        LibraryCmd::List {
+            project_pos,
+            project,
+            kind,
+        } => {
+            let project = resolve_project_opt(&store, project.or(project_pos).as_deref())?;
+            let mut items = library::effective_items(&store, project)?;
+            if let Some(kind) = kind {
+                items.retain(|i| i.kind == kind);
+            }
+            print_json(&items);
+        }
+        LibraryCmd::Show { item, quiet } => {
+            print_library_item(&resolve_library(&store, &item)?, quiet)
+        }
+        LibraryCmd::Update {
+            item,
+            name,
+            body,
+            body_file,
+            quiet,
+        } => {
+            let mut stdin_used = false;
+            let body = resolve_field(body, body_file, &mut stdin_used)?;
+            let current = resolve_library(&store, &item)?;
+            let updated = match current.id {
+                Some(id) => {
+                    let patch = LibraryPatch {
+                        name,
+                        body,
+                        kind: None,
+                        scope: None,
+                        project_id: None,
+                    };
+                    store.update_library_item(id, patch)?
+                }
+                // An unshadowed built-in has no row to update: editing it
+                // forks it into one, carrying its built-in id.
+                None => {
+                    let builtin_id = current
+                        .builtin_id
+                        .clone()
+                        .expect("a built-in library item always carries its builtin_id");
+                    let name = name.unwrap_or_else(|| current.name.clone());
+                    let body = body.unwrap_or_else(|| current.body.clone());
+                    store.create_library_item(
+                        current.kind,
+                        current.scope,
+                        current.project_id,
+                        &name,
+                        &body,
+                        Some(&builtin_id),
+                    )?
+                }
+            };
+            print_library_item(&updated, quiet);
+        }
+        LibraryCmd::Delete { item, quiet } => {
+            let current = resolve_library(&store, &item)?;
+            let Some(id) = current.id else {
+                return Err(Error::Validation(format!(
+                    "{item:?} is an unshadowed built-in; there is nothing to delete"
+                )));
+            };
+            print_library_item(&store.delete_library_item(id)?, quiet);
+        }
+        LibraryCmd::Versions { item } => {
+            let current = resolve_library(&store, &item)?;
+            match current.id {
+                Some(id) => print_json(&store.list_library_versions(id)?),
+                // An unshadowed built-in has no row, and so no history.
+                None => print_json(&Vec::<crate::core::LibraryVersion>::new()),
+            }
+        }
+        LibraryCmd::Sync(sync_cmd) => run_library_sync_cmd(&mut store, sync_cmd)?,
+    }
+    Ok(())
+}
+
+fn run_library_sync_cmd(store: &mut Store, cmd: LibrarySyncCmd) -> Result<()> {
+    match cmd {
+        LibrarySyncCmd::Status {
+            project_pos,
+            project,
+        } => {
+            let project = resolve_project_opt(store, project.or(project_pos).as_deref())?;
+            print_json(&library::sync_status(store, project)?);
+        }
+        LibrarySyncCmd::Apply {
+            project_pos,
+            project,
+            resolve,
+            all_mesa,
+            all_disk,
+        } => {
+            let project = resolve_project_opt(store, project.or(project_pos).as_deref())?;
+            let resolutions = if all_mesa || all_disk {
+                let (choice, selects): (&str, fn(LibrarySyncStatus) -> bool) = if all_mesa {
+                    ("mesa", library_sync_all_mesa_selects)
+                } else {
+                    ("disk", library_sync_all_disk_selects)
+                };
+                library::sync_status(store, project)?
+                    .into_iter()
+                    .filter(|row| selects(row.status))
+                    .map(|row| (row.path, choice.to_string()))
+                    .collect()
+            } else {
+                resolve
+            };
+            print_json(&library::sync_apply(store, project, &resolutions)?);
         }
     }
     Ok(())
@@ -3803,6 +4232,24 @@ mod tests {
             }],
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
+        }
+    }
+
+    fn sample_library_item() -> LibraryItem {
+        LibraryItem {
+            id: Some(1),
+            name: "reviewer".into(),
+            kind: LibraryKind::Agent,
+            scope: LibraryScope::Project,
+            project_id: Some(2),
+            body: "# reviewer\n".into(),
+            builtin_id: Some("live-agent-prompt".into()),
+            builtin: false,
+            path: Some(".claude/agents/reviewer.md".into()),
+            synced_body: Some("# reviewer\n".into()),
+            synced_at: Some("2026-01-02 00:00:00".into()),
+            created_at: Some("2026-01-01 00:00:00".into()),
+            updated_at: Some("2026-01-02 00:00:00".into()),
         }
     }
 
@@ -4079,6 +4526,92 @@ mod tests {
         assert_eq!(
             sorted_owned(value_keys(&quiet(&sample_script(), QUIET_DROP_SCRIPT))),
             minus(&full, QUIET_DROP_SCRIPT),
+        );
+    }
+
+    #[test]
+    fn library_item_quiet_drops_body_and_synced_body() {
+        let full = keys(&sample_library_item());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "name",
+                "kind",
+                "scope",
+                "project_id",
+                "body",
+                "builtin_id",
+                "builtin",
+                "path",
+                "synced_body",
+                "synced_at",
+                "created_at",
+                "updated_at",
+            ]),
+            "LibraryItem gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_library_item(),
+                QUIET_DROP_LIBRARY
+            ))),
+            minus(&full, QUIET_DROP_LIBRARY),
+        );
+    }
+
+    /// Every `LibrarySyncStatus` variant, so a new one added later must be
+    /// placed into both lists below or this test itself fails to compile-check
+    /// completeness (each variant is listed exactly once as selected/not).
+    const ALL_LIBRARY_SYNC_STATUSES: &[crate::core::LibrarySyncStatus] = &[
+        crate::core::LibrarySyncStatus::InSync,
+        crate::core::LibrarySyncStatus::MesaNew,
+        crate::core::LibrarySyncStatus::DiskDeleted,
+        crate::core::LibrarySyncStatus::MesaChanged,
+        crate::core::LibrarySyncStatus::DiskChanged,
+        crate::core::LibrarySyncStatus::BothChanged,
+        crate::core::LibrarySyncStatus::DiskNew,
+    ];
+
+    #[test]
+    fn all_mesa_selects_every_status_but_in_sync_and_disk_new() {
+        use crate::core::LibrarySyncStatus::*;
+        let selected: Vec<_> = ALL_LIBRARY_SYNC_STATUSES
+            .iter()
+            .copied()
+            .filter(|s| library_sync_all_mesa_selects(*s))
+            .collect();
+        assert_eq!(
+            selected,
+            vec![MesaNew, DiskDeleted, MesaChanged, DiskChanged, BothChanged],
+            "a new LibrarySyncStatus needs a decision: does --all-mesa select it?",
+        );
+    }
+
+    #[test]
+    fn all_disk_selects_every_status_but_in_sync_and_mesa_new() {
+        use crate::core::LibrarySyncStatus::*;
+        let selected: Vec<_> = ALL_LIBRARY_SYNC_STATUSES
+            .iter()
+            .copied()
+            .filter(|s| library_sync_all_disk_selects(*s))
+            .collect();
+        assert_eq!(
+            selected,
+            vec![DiskDeleted, MesaChanged, DiskChanged, BothChanged, DiskNew],
+            "a new LibrarySyncStatus needs a decision: does --all-disk select it?",
+        );
+    }
+
+    #[test]
+    fn parse_library_resolution_rejects_bad_values() {
+        assert!(parse_library_resolution("path-with-no-equals").is_err());
+        assert!(parse_library_resolution("=mesa").is_err());
+        assert!(parse_library_resolution("a/b.md=bogus").is_err());
+        assert_eq!(
+            parse_library_resolution("a/b.md=mesa").unwrap(),
+            ("a/b.md".to_string(), "mesa".to_string()),
         );
     }
 

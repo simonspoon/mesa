@@ -42,6 +42,12 @@ function buildCommands(projects: Project[]): Command[] {
       search: 'scripts shell run',
       run: () => navigate('#/scripts'),
     },
+    {
+      id: 'library',
+      label: 'Library',
+      search: 'library agents skills hooks prompts claude',
+      run: () => navigate('#/library'),
+    },
   ]
   for (const p of projects) {
     const name = p.name.toLowerCase()

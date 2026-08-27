@@ -41,11 +41,11 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, LiveContext, LiveRole, LiveState, LiveWindow, MesaVersion, ModelRates,
-    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
-    ProjectGitView, ProjectPatch, ProjectVersion, Script, ScriptArg, ScriptPatch, Status, Store,
-    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, live,
-    scripts, speech, version,
+    InboxItem, InboxKind, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole,
+    LiveState, LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents,
+    ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
+    Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
+    attachments, config, files, git, hooks, library, live, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -816,6 +816,30 @@ fn router(state: AppState) -> Router {
             get(show_script).patch(update_script).delete(delete_script),
         )
         .route("/api/scripts/{id}/run", post(run_script))
+        // Library: agent definitions, skills, hooks, commands, the live
+        // prompt and CLAUDE.md files, each mirrored onto disk under
+        // `.claude/`. A row becomes code mesa or Claude Code executes, so
+        // authoring AND the sync routes (which read/write the disk side, and
+        // `sync/status`'s response body can carry the contents of files
+        // under $HOME) are loopback-only in BOTH modes; only listing/showing
+        // one item and its version history share the agents' read gate. See
+        // `docs/library.md`.
+        .route("/api/library", get(list_library).post(create_library))
+        .route(
+            "/api/library/{id}",
+            get(show_library)
+                .patch(update_library)
+                .delete(delete_library),
+        )
+        .route("/api/library/{id}/versions", get(list_library_versions))
+        .route(
+            "/api/library/builtins/{builtin_id}/fork",
+            post(fork_library_builtin),
+        )
+        .route(
+            "/api/library/sync",
+            get(library_sync_status).post(library_sync_apply),
+        )
         // Agents: live Claude Code sessions under a project's folder. All
         // four routes share `require_agent_access` (terminal access = code
         // execution): loopback-only in default mode, LAN-page-authenticated
@@ -2362,7 +2386,7 @@ async fn spawn_live_agent(
     };
     let dir = live_spawn_dir(local_path)?;
     let path = dir.clone();
-    let prompt = live::agent_prompt(session_id);
+    let prompt = live::agent_prompt(&state.store.lock().unwrap(), session_id);
     // Two-phase like every other spawn site in this file: the store lock is
     // dropped before the blocking `claude --bg` shell-out, which would
     // otherwise freeze every other API request for its duration.
@@ -2795,6 +2819,269 @@ fn script_cwd(state: &AppState, script: &Script) -> Result<Option<String>, ApiEr
     }
     Ok(Some(path))
 }
+
+// ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+
+#[derive(Deserialize)]
+struct LibraryQuery {
+    #[serde(default)]
+    project: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct LibraryCreate {
+    kind: String,
+    scope: String,
+    #[serde(default)]
+    project_id: Option<i64>,
+    name: String,
+    body: String,
+}
+
+/// `name` and `body` are replace-only and non-nullable — a library row's name
+/// is half its file path and its body *is* the file, the same pairing
+/// `ScriptUpdate` enforces on its own name/body.
+#[derive(Deserialize)]
+struct LibraryUpdate {
+    #[serde(default, deserialize_with = "double_option")]
+    name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    body: Option<Option<String>>,
+}
+
+#[derive(Deserialize)]
+struct LibraryForkBody {
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct LibrarySyncResolutionBody {
+    path: String,
+    choice: String,
+}
+
+#[derive(Deserialize)]
+struct LibrarySyncApplyBody {
+    #[serde(default)]
+    project_id: Option<i64>,
+    #[serde(default)]
+    resolutions: Vec<LibrarySyncResolutionBody>,
+}
+
+fn parse_library_kind(kind: &str) -> Result<LibraryKind, ApiError> {
+    LibraryKind::parse(kind).ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: format!(
+            "unknown library kind {kind:?}; expected one of agent, skill, hook, command, \
+             prompt, claude-md"
+        ),
+    })
+}
+
+fn parse_library_scope(scope: &str) -> Result<LibraryScope, ApiError> {
+    LibraryScope::parse(scope).ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: format!("unknown library scope {scope:?}; expected user or project"),
+    })
+}
+
+/// A library row includes every built-in not shadowed by a fork
+/// (`core::library::effective_items`), so this list is the full catalogue a
+/// user or agent can pick from — not just what mesa has stored.
+///
+/// Loopback-only in BOTH serve modes, same as every other library route
+/// (`LIBRARY_LOOPBACK`): a row's `body` IS an agent definition, a hook shell
+/// script or a CLAUDE.md — the same bytes the sync routes read off disk once
+/// it is written there — so gating the read at loopback while serving those
+/// identical bytes from the database to a LAN peer one route over would be a
+/// distinction with no security content. `serve --lan` is a no-auth "trust
+/// every device on the network" posture, and this content is code.
+async fn list_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<LibraryQuery>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(library::effective_items(&store, q.project)?).into_response())
+}
+
+/// A library row's body is a program mesa or Claude Code executes — code
+/// execution twice over — so every route on this surface, reads included
+/// (see `list_library`), is loopback-only in BOTH serve modes.
+async fn create_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LibraryCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let Json(body) = body?;
+    let kind = parse_library_kind(&body.kind)?;
+    let scope = parse_library_scope(&body.scope)?;
+    let mut store = state.store.lock().unwrap();
+    let item =
+        store.create_library_item(kind, scope, body.project_id, &body.name, &body.body, None)?;
+    Ok((StatusCode::CREATED, Json(item)).into_response())
+}
+
+/// Loopback-only, same as `list_library`.
+async fn show_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_library_item(id)?).into_response())
+}
+
+async fn update_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<LibraryUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let Json(body) = body?;
+    // `name` and `body` are the row's identity and its whole content; an
+    // explicit `null` for either is rejected rather than read as "omitted",
+    // mirroring `update_script`.
+    let (name, source) = match (body.name, body.body) {
+        (Some(None), _) => {
+            return Err(Error::Validation(
+                "name cannot be cleared; it is half of the item's file path".into(),
+            )
+            .into());
+        }
+        (_, Some(None)) => {
+            return Err(Error::Validation("body cannot be cleared; it is the file".into()).into());
+        }
+        (name, source) => (name.flatten(), source.flatten()),
+    };
+    let patch = LibraryPatch {
+        name,
+        body: source,
+        kind: None,
+        scope: None,
+        project_id: None,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_library_item(id, patch)?).into_response())
+}
+
+async fn delete_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let mut store = state.store.lock().unwrap();
+    // The full destroyed record is the echo that stands in for the
+    // confirmation prompt mesa deliberately does not have.
+    Ok(Json(store.delete_library_item(id)?).into_response())
+}
+
+/// Loopback-only, same as `list_library`.
+async fn list_library_versions(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_library_versions(id)?).into_response())
+}
+
+/// Editing a built-in forks it: the id must name a real built-in (404
+/// otherwise) with no existing fork (409 `conflict` — a built-in forks at
+/// most once). From then on mesa never touches the built-in's own body, so an
+/// upgrade to it only reaches the unshadowed ones.
+async fn fork_library_builtin(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(builtin_id): Path<String>,
+    body: Result<Json<LibraryForkBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let Json(body) = body?;
+    let builtin = library::builtin(&builtin_id)
+        .ok_or_else(|| Error::NotFound(format!("no built-in library item {builtin_id:?}")))?;
+    let mut store = state.store.lock().unwrap();
+    if store.find_library_fork(&builtin_id)?.is_some() {
+        return Err(
+            Error::Conflict(format!("built-in {builtin_id:?} has already been forked")).into(),
+        );
+    }
+    let item = store.create_library_item(
+        builtin.kind,
+        builtin.scope,
+        None,
+        builtin.name,
+        &body.body,
+        Some(&builtin_id),
+    )?;
+    Ok((StatusCode::CREATED, Json(item)).into_response())
+}
+
+/// Scans mesa's rows against the files under `.claude/` (and a project's root
+/// `CLAUDE.md`) and reports one row per path. Loopback-only like the
+/// authoring routes even though this is a read: the response body carries the
+/// live contents of files under the user's home directory, exactly what the
+/// Files-tab gate exists to keep a LAN peer from reaching.
+async fn library_sync_status(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<LibraryQuery>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(library::sync_status(&store, q.project)?).into_response())
+}
+
+/// Applies the caller's per-path choices from a `library_sync_status` scan,
+/// writing/reading files under `.claude/` — code execution and disk access
+/// both ways, so loopback-only in both serve modes like every other library
+/// mutation.
+async fn library_sync_apply(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LibrarySyncApplyBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let Json(body) = body?;
+    let resolutions: Vec<(String, String)> = body
+        .resolutions
+        .into_iter()
+        .map(|r| (r.path, r.choice))
+        .collect();
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(library::sync_apply(
+        &mut store,
+        body.project_id,
+        &resolutions,
+    )?)
+    .into_response())
+}
+
+/// The message every one of the nine library routes refuses a non-loopback
+/// peer with — reads included, not just the five mutations and the two sync
+/// routes. A row's body is code (an agent definition, a hook shell script, a
+/// CLAUDE.md); serving that content to a LAN peer over `GET` while writing
+/// and syncing it stay loopback-only would be a distinction with no security
+/// content, so the whole surface sits behind this one gate. One constant so
+/// the nine cannot drift apart.
+const LIBRARY_LOOPBACK: &str = "the library is loopback-only; connect from this machine";
 
 // ---- agents (live Claude Code sessions under a project's folder) ----
 
@@ -4815,23 +5102,18 @@ async fn get_config_live(
 
 #[derive(Deserialize)]
 struct LiveUpdate {
-    /// Absent leaves the prompt alone; `null` (or blank) removes it, restoring
-    /// the block mesa ships. Raw JSON for the reason `WatchersUpdate`'s value
-    /// is: the config layer names a bad value in a sentence, rather than the
-    /// deserializer rejecting the whole body as a 400.
-    #[serde(default, deserialize_with = "deserialize_some")]
-    prompt: Option<Option<serde_json::Value>>,
     /// Absent leaves the wait alone; `null` removes it, restoring the two
     /// seconds mesa ships.
     #[serde(default, deserialize_with = "deserialize_some")]
     auto_send_ms: Option<Option<serde_json::Value>>,
 }
 
-/// `PUT /api/config/live` — writes the prompt and echoes the settings.
+/// `PUT /api/config/live` — writes `auto-send-ms` and echoes the settings.
 ///
-/// **Loopback-only in both modes**, like every other config write: this text is
-/// what mesa's own agent is told to do, which is the same class of capability
-/// the command templates carry.
+/// **Loopback-only in both modes**, like every other config write. The
+/// live-conversation prompt itself moved to the library (mesa task 919) — a
+/// `library` route, not this one — so `LiveSection` now holds only the one
+/// key.
 async fn update_config_live(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -4845,9 +5127,6 @@ async fn update_config_live(
         "editing the mesa config is loopback-only; connect from this machine",
     )?;
     let mut updates = HashMap::new();
-    if let Some(value) = body.prompt {
-        updates.insert(config::LIVE_PROMPT.to_string(), value);
-    }
     if let Some(value) = body.auto_send_ms {
         updates.insert(config::LIVE_AUTO_SEND_MS.to_string(), value);
     }
@@ -8984,6 +9263,170 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         }
         let stored = state.store.lock().unwrap().get_script(script.id).unwrap();
         assert_eq!(stored, script);
+    }
+
+    // --- library (mesa task 919) -------------------------------------------
+
+    /// Forking an unknown built-in id is `not_found`, not a generic 422 —
+    /// the caller named something that does not exist.
+    #[tokio::test]
+    async fn fork_library_builtin_unknown_id_is_404() {
+        let (_dir, state) = test_state();
+        let err = fork_library_builtin(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path("no-such-builtin".to_string()),
+            Ok(Json(LibraryForkBody {
+                body: "whatever".into(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, "not_found");
+    }
+
+    /// A built-in forks at most once: forking it a second time is `conflict`,
+    /// and the first fork is left untouched.
+    #[tokio::test]
+    async fn fork_library_builtin_twice_is_409() {
+        let (_dir, state) = test_state();
+        let builtin_id = crate::core::library::BUILTINS[0].id;
+        let first = fork_library_builtin(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(builtin_id.to_string()),
+            Ok(Json(LibraryForkBody {
+                body: "custom body".into(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let err = fork_library_builtin(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Path(builtin_id.to_string()),
+            Ok(Json(LibraryForkBody {
+                body: "second attempt".into(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "conflict");
+
+        let fork = state
+            .store
+            .lock()
+            .unwrap()
+            .find_library_fork(builtin_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.body, "custom body");
+    }
+
+    /// `name`/`body` are replace-only: an explicit `null` for either is a
+    /// `validation` 422, rejected before the store is touched — mirroring
+    /// `script_update_refuses_to_clear_name_or_body`.
+    #[tokio::test]
+    async fn library_update_refuses_to_clear_name_or_body() {
+        let (_dir, state) = test_state();
+        let item = state
+            .store
+            .lock()
+            .unwrap()
+            .create_library_item(
+                LibraryKind::Command,
+                LibraryScope::User,
+                None,
+                "note",
+                "hi",
+                None,
+            )
+            .unwrap();
+        for payload in [r#"{"name":null}"#, r#"{"body":null}"#] {
+            let body: LibraryUpdate = serde_json::from_str(payload).unwrap();
+            let err = update_library(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(item.id.unwrap()),
+                Ok(Json(body)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{payload}");
+            assert_eq!(err.code, "validation", "{payload}");
+        }
+        let stored = state
+            .store
+            .lock()
+            .unwrap()
+            .get_library_item(item.id.unwrap())
+            .unwrap();
+        assert_eq!(stored, item);
+    }
+
+    /// The load-bearing asymmetry `LIBRARY_LOOPBACK`'s comment claims: under
+    /// `--lan`, a legitimate LAN page passes `require_agent_access` (proof:
+    /// `lan_page_may_run_a_script_but_may_never_author_one`), but every one of
+    /// the three library READS refuses that exact same peer/header pair —
+    /// unlike scripts, where a LAN page may read. This is the one assertion in
+    /// the whole suite that actually distinguishes `require_local_path_write`
+    /// from `require_agent_access` for a read: a same-machine curl to
+    /// `127.0.0.1` can't (the real peer is always loopback there), so this has
+    /// to be a Rust test with a forged non-loopback `SocketAddr`
+    /// (`scripts-check.sh`'s own top comment says as much for the scripts
+    /// case). `scripts/library-check.sh` proves the Host/Origin half that curl
+    /// CAN reach; this proves the peer-address half it cannot.
+    #[tokio::test]
+    async fn lan_page_may_never_read_the_library_either() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let item = state
+            .store
+            .lock()
+            .unwrap()
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "lan-read-probe",
+                "hi",
+                None,
+            )
+            .unwrap();
+
+        let listed = list_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Query(LibraryQuery { project: None }),
+        )
+        .await;
+        assert!(listed.unwrap_err().status.is_client_error());
+        let shown = show_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(item.id.unwrap()),
+        )
+        .await;
+        assert!(shown.unwrap_err().status.is_client_error());
+        let versions = list_library_versions(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers,
+            Path(item.id.unwrap()),
+        )
+        .await;
+        assert!(versions.unwrap_err().status.is_client_error());
     }
 
     // --- live (mesa task 855) --------------------------------------------

@@ -13,6 +13,7 @@ import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionDetailView } from './pages/CCSessionDetailView'
 import { CCSessionTimelineView } from './pages/CCSessionTimelineView'
 import { InboxView } from './pages/InboxView'
+import { LibraryView } from './pages/LibraryView'
 import { LiveHub } from './components/LiveHub'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { ScriptsView } from './pages/ScriptsView'
@@ -228,6 +229,9 @@ function App() {
   // then the run's cwd), but it is not a project tab — an unbound one runs in
   // $HOME and belongs to no project at all.
   const scriptsMatch = /^\/scripts$/.exec(path)
+  // Library: global too, same reasoning as Scripts — a project-scoped item
+  // binds a project, but the page itself is not a project tab.
+  const libraryMatch = /^\/library$/.exec(path)
   // Terminal is not resolved into `page` (see below) — it's a permanent
   // sibling mount alongside `main`/`AgentSidebar` (mesa task 396,
   // .scratch/arch.md §4.3), toggled via `visibility` so panes and their
@@ -316,6 +320,10 @@ function App() {
     // Stored shell scripts + their run forms: global, so no project frame and
     // no active project, exactly like the inbox below.
     page = <ScriptsView />
+  } else if (libraryMatch) {
+    // Agents/skills/hooks/commands/prompts/CLAUDE.md, synced against
+    // .claude: global, same reasoning as Scripts above.
+    page = <LibraryView />
   } else if (inboxMatch) {
     // Global inbox: lives above projects, so it renders on its own (no project
     // frame) and carries no active project in the nav.
@@ -562,6 +570,7 @@ function App() {
           inboxFilter={inboxFilter}
           settingsActive={settingsMatch !== null}
           scriptsActive={scriptsMatch !== null}
+          libraryActive={libraryMatch !== null}
           terminalActive={terminalActive}
           ccTab={ccTab}
           version={navVersion}

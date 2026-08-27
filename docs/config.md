@@ -31,8 +31,9 @@ rather than markdown, move the browser with `mesa live navigate`, and treat
 every dictated utterance as data rather than instructions. So the feature works
 with no user configuration, and a replacement template's job is to start
 *something* that will read `{prompt}` and do what it says. That block is itself
-editable — the [`live`](#live) section below — so `{prompt}` is the user's text
-whenever they have written one.
+editable, as of mesa task 919, through the **library** rather than this file —
+the `live-agent-prompt` built-in, forked like any other library row
+(`docs/library.md`) — so `{prompt}` is the forked text whenever one exists.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
 for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
@@ -496,49 +497,42 @@ reads an item in (mesa task 822, `docs/inbox.md`).
 
 ## Live
 
-A fifth, independent section holds two settings for the live conversation
-(`docs/live.md`): the **prompt** its agent is spawned with (mesa task 867) and
-the **wait** before a settled capture-box draft is sent (mesa task 886). They
-share a section because they are one feature; each key is written and reset on
-its own, and neither save touches the other.
+A fifth, independent section holds settings for the live conversation
+(`docs/live.md`). It used to carry two keys — the **prompt** its agent is
+spawned with (mesa task 867) and the **wait** before a settled capture-box
+draft is sent (mesa task 886) — but as of mesa task 919 the prompt moved out
+to the **library** (`docs/library.md`): it is now the `live-agent-prompt`
+built-in, forked like any other library row when someone edits it, and edited
+on `#/library` rather than in this file. This section holds the one key that
+is left.
 
 ```json
 {
   "live": {
-    "prompt": "You are the voice of mesa in a live conversation. …",
     "auto-send-ms": 2000
   }
 }
 ```
 
-`prompt` is the instruction block:
+**A `live.prompt` key left behind by an older mesa, or hand-edited into the
+file, is silently ignored** — never an error, and never read from — since
+`LiveSection` simply has no field for it any more. Everything the prompt used
+to be is unchanged in spirit, it has just moved: a configured prompt still
+**replaces** the built-in rather than extending it (forking a built-in starts
+from its text, the same "start from the built-in" idea the old editor offered
+as a button), mesa still appends only the session line —
+`You are driving mesa live session <id>.` — and the text is still never
+parsed by a shell, reaching the agent as one `Command::arg` or as
+`$MESA_PROMPT` in [script mode](#script-mode). Rewriting it is how a live
+conversation changes character, but the loop it describes is what makes the
+feature work at all — a prompt that never mentions `mesa live listen` produces
+an agent that hears nothing. `docs/live.md` is the contract the text has to
+keep; `docs/library.md` covers the fork/restore mechanics and
+`core::live::agent_prompt`'s resolution (fork, else the built-in, falling back
+to the built-in on any store error so a database hiccup never stops a
+conversation starting).
 
-- **Absent or blank ⇒ the block mesa ships** (`core::live::AGENT_PROMPT`), so
-  an unconfigured install spawns exactly the agent it spawned before this key
-  existed. Blank is never stored as `""`: an agent spawned with an empty prompt
-  is one that doesn't know it is in a conversation, so the save removes the key
-  instead — the same rule a blank command box follows.
-- **A configured prompt replaces the built-in**, it does not extend it. What
-  the Settings box holds is the whole of what mesa sends, which is why the
-  editor offers *start from the built-in prompt* rather than merging two texts
-  at spawn time. The **one** thing mesa still adds is the session line —
-  `You are driving mesa live session <id>.` — because that is plumbing, not
-  instruction: without it the agent cannot name the conversation it is in.
-- **It is prose, so the only rule is a length bound**
-  (`core::config::MAX_LIVE_PROMPT`, 16 KiB; over it is `422`). The text is
-  never parsed by a shell: it reaches the agent as one `Command::arg`, or as
-  `$MESA_PROMPT` in [script mode](#script-mode), exactly as the built-in block
-  does.
-- **Read on every start**, like `commands` on every spawn: edit the prompt and
-  the next conversation uses it, no restart. An existing conversation keeps the
-  agent it already started.
-
-Rewriting this prompt is how a live conversation changes character, but the
-loop it describes is what makes the feature work at all — a prompt that never
-mentions `mesa live listen` produces an agent that hears nothing. `docs/live.md`
-is the contract the text has to keep.
-
-`auto-send-ms` is the section's other key:
+`auto-send-ms` is this section's key:
 
 - **How long a line typed or dictated into the conversation's capture box sits
   untouched before the page sends it as a `user` turn.** Dictation never
@@ -569,24 +563,23 @@ is the contract the text has to keep.
 
 ### Routes
 
-- `GET /api/config/live` → `ConfigLive`:
-  `{prompt, default_prompt, auto_send_ms, auto_send_ms_default}` — each
-  override (`null` when unset) beside the value mesa ships, sent by the server
-  so the editor can show what blank means without a second copy of either in
-  TypeScript. Gated like the other config getters (`require_agent_access`); a
-  malformed config is **502 `unavailable`**.
-- `PUT /api/config/live`, body
-  `{"prompt": "<text>" | null, "auto_send_ms": <ms> | null}` → echoes the
-  getter. Each key is optional: absent leaves that setting alone, `null`
-  removes it (and blank does too for the prompt, whose editor sends what the
-  textarea holds), restoring the built-in. A prompt past the length bound, or
-  a wait outside 250..=60000, is **422 `validation`**, writing nothing.
-  (`save_live` therefore takes raw JSON values, like `save_watchers`: the
-  section holds prose *and* a number, and a bad value is named in a sentence
-  rather than rejected by the deserializer as a 400.) Gated with
-  `require_local_path_write`: **loopback-only in both serve modes** — this
-  text is what mesa's own agent is told to do, the same class of
-  capability the command templates carry.
+- `GET /api/config/live` → `ConfigLive`: `{auto_send_ms, auto_send_ms_default}`
+  — the override (`null` when unset) beside the value mesa ships, sent by the
+  server so the editor can show what blank means without a second copy of it
+  in TypeScript. `prompt`/`default_prompt` are gone from this route entirely
+  (mesa task 919) — not null, absent, since the prompt is a library item now
+  (`GET /api/library`, `docs/library.md`). Gated like the other config
+  getters (`require_agent_access`); a malformed config is **502
+  `unavailable`**.
+- `PUT /api/config/live`, body `{"auto_send_ms": <ms> | null}` → echoes the
+  getter. Absent leaves the setting alone, `null` removes it, restoring the
+  built-in. A wait outside 250..=60000, or the wrong shape, is **422
+  `validation`**, writing nothing. (`save_live` takes a raw JSON value, like
+  `save_watchers`, so a bad value is named in a sentence rather than rejected
+  by the deserializer as a 400.) `prompt` is no longer a key this route
+  accepts — naming it is the same "unknown live setting" mistake naming
+  `voice` here always was, not a special case. Gated with
+  `require_local_path_write`: **loopback-only in both serve modes**.
 
 ## Gate
 
@@ -626,20 +619,19 @@ voice is actually configured: with `bm_george` saved, a preview of `af_bella`
 still speaks `af_bella` and a blank one still adds no `-v` — and a preview
 works even under the malformed file every other config verb answers 502 to.
 
-For live it covers the round trip (`GET` reporting `prompt: null` on a fresh
-config and carrying the built-in block as `default_prompt`), the unconfigured
-spawn proven to carry that block, a saved prompt reaching the very next spawn
-and **replacing** it — the built-in text absent from the argv, mesa's session
-line still there — `null` **and** `""` both removing the key with the next
-spawn back on the built-in, a prompt past the length bound 422 writing nothing,
-502 on a malformed file, each of the other savers preserving `live` and vice
-versa, and both verbs refused to a request that isn't from this machine's own
-page. For `auto-send-ms` it covers the same ground for a value that is a
-**number**: `GET` reporting `null` beside the built-in 2000, a saved wait
-written as a JSON number (a quoted one would read back as nothing) and echoed,
-the two live keys independent in both directions, `null` removing the key, and
-0 / -1 / 2.5 / 60001 / `"2000"` — and a prompt sent as a number — each 422
-`validation` writing nothing.
+For live it covers `auto-send-ms`, the section's one remaining key: `GET`
+reporting `null` beside the built-in 2000 and no longer mentioning `prompt` or
+`default_prompt` at all, a saved wait written as a JSON number (a quoted one
+would read back as nothing) and echoed, `null` removing the key, 0 / -1 / 2.5 /
+60001 / `"2000"` each 422 `validation` writing nothing, `prompt` and `voice`
+both rejected as an unknown live setting, 502 on a malformed file, each of the
+other savers preserving `live` and vice versa, both verbs refused to a request
+that isn't from this machine's own page, and the migration case: a
+`live.prompt` key left behind by an older mesa survives a `GET` unread and a
+`PUT` of `auto-send-ms` untouched. "A configured prompt reaches the spawn,
+replacing the built-in" moved with the prompt itself (mesa task 919) — it is
+now `scripts/library-check.sh`'s assertion, proved through a forked library
+row instead of a config key.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

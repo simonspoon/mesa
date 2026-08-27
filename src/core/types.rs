@@ -280,16 +280,14 @@ pub struct ConfigSpeech {
 /// (`core::config`, `docs/config.md`, mesa task 867) — a fifth view of
 /// `~/.mesa/config.json`, with the same null-means-fallback rule as
 /// [`ConfigWatchers`].
+///
+/// This used to carry the instruction block a live agent is spawned with too
+/// (`prompt`/`default_prompt`), but that moved to the library as of mesa task
+/// 919 — it is now the `live-agent-prompt` library item, edited on
+/// `#/library` rather than here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct ConfigLive {
-    /// The instruction block a live agent is spawned with, or `null` when the
-    /// config says nothing — then `default_prompt` is what the agent gets.
-    pub prompt: Option<String>,
-    /// The prompt mesa ships (`core::live::AGENT_PROMPT`), so the editor can
-    /// show what blank means — and offer it as the starting point for an edit
-    /// — without a copy of it in TypeScript.
-    pub default_prompt: String,
     /// How long a settled dictation draft waits before the page sends it, in
     /// milliseconds, or `null` when the config says nothing — then
     /// `auto_send_ms_default` is the wait (mesa task 886).
@@ -1379,6 +1377,212 @@ pub struct ScriptRun {
     pub stderr: String,
     /// True when either stream hit the 64 KiB cap and was cut.
     pub truncated: bool,
+}
+
+// ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+//
+// mesa task 919: agents, skills, hooks, commands, the live-conversation
+// prompt, and CLAUDE.md files are first-class records — `library_items`, with
+// a `library_versions` history — synced file-by-file against the `.claude`
+// directory a user or a project checkout actually reads. A row's `kind`
+// decides where on disk it lives (`core::library::relative_path`); `prompt`
+// alone has no path, because the live-conversation prompt is mesa-internal,
+// not a file Claude Code reads.
+
+/// What a [`LibraryItem`] is. Six kinds, and the wire value is the exact word
+/// Claude Code (or mesa, for `prompt`) uses for the thing — `kebab-case`
+/// keeps `claude-md` readable rather than `claude_md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LibraryKind {
+    Agent,
+    Skill,
+    Hook,
+    Command,
+    Prompt,
+    ClaudeMd,
+}
+
+impl LibraryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LibraryKind::Agent => "agent",
+            LibraryKind::Skill => "skill",
+            LibraryKind::Hook => "hook",
+            LibraryKind::Command => "command",
+            LibraryKind::Prompt => "prompt",
+            LibraryKind::ClaudeMd => "claude-md",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LibraryKind> {
+        match s {
+            "agent" => Some(LibraryKind::Agent),
+            "skill" => Some(LibraryKind::Skill),
+            "hook" => Some(LibraryKind::Hook),
+            "command" => Some(LibraryKind::Command),
+            "prompt" => Some(LibraryKind::Prompt),
+            "claude-md" => Some(LibraryKind::ClaudeMd),
+            _ => None,
+        }
+    }
+}
+
+/// Where a [`LibraryItem`] lives: a personal, machine-wide row (the home
+/// dir), or one bound to a project (that project's `local_path`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LibraryScope {
+    User,
+    Project,
+}
+
+impl LibraryScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LibraryScope::User => "user",
+            LibraryScope::Project => "project",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LibraryScope> {
+        match s {
+            "user" => Some(LibraryScope::User),
+            "project" => Some(LibraryScope::Project),
+            _ => None,
+        }
+    }
+}
+
+/// One library record — an agent definition, a skill, a hook script, a slash
+/// command, the live-conversation prompt, or a CLAUDE.md, stored in mesa and
+/// (for every kind but `prompt`) synced against a file on disk.
+///
+/// `id` is `null` for an unshadowed built-in (`core::library::BUILTINS`) —
+/// there is no db row yet, `builtin` is `true`, and `builtin_id` names which
+/// built-in it is. Editing a built-in forks it: a db row appears carrying
+/// `builtin_id`, `builtin` becomes `false`, and `id` becomes real.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryItem {
+    #[ts(type = "number | null")]
+    pub id: Option<i64>,
+    /// `^[A-Za-z0-9][A-Za-z0-9._-]*$`, no `/`, no `..` — half of a filename.
+    pub name: String,
+    pub kind: LibraryKind,
+    pub scope: LibraryScope,
+    /// Required iff `scope` is `project`, and must be null iff `scope` is
+    /// `user` — the same pairing rule `TaskPatch`'s neighbours enforce.
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    /// The file's contents. May be empty.
+    pub body: String,
+    /// The built-in this row forked from, or null for a purely user-authored
+    /// row. Unique when set — a built-in forks at most once.
+    pub builtin_id: Option<String>,
+    /// Derived, never stored: true iff this row has no db id (an unshadowed
+    /// built-in reported in its place).
+    pub builtin: bool,
+    /// Derived from `kind`/`scope`/`name` via `core::library::relative_path`;
+    /// null for `prompt`, which has no file.
+    pub path: Option<String>,
+    /// The last body mesa and the file on disk agreed on — the sync
+    /// baseline. Null until the first sync.
+    pub synced_body: Option<String>,
+    pub synced_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One entry in a [`LibraryItem`]'s history. A row is appended only when the
+/// body actually changes, so this is a list of distinct contents, not a list
+/// of edits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryVersion {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub item_id: i64,
+    pub body: String,
+    /// Who wrote this body: `edit` (the item was saved in mesa) or
+    /// `sync-pull` (the disk side won a sync and was pulled in).
+    pub source: String,
+    pub created_at: String,
+}
+
+/// How a synced path's mesa body (M) compares to the file on disk (D) against
+/// the last-agreed baseline (B) — `core::library::classify`'s result, and the
+/// one decision table `mesa library sync status` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LibrarySyncStatus {
+    /// M == D. Not offered as a resolvable row.
+    InSync,
+    /// No file yet, never synced (B is null).
+    MesaNew,
+    /// No file, B == M — the disk side was deleted since the last sync.
+    DiskDeleted,
+    /// B == D, M != D — mesa changed since the last sync.
+    MesaChanged,
+    /// B == M, D != M — disk changed since the last sync.
+    DiskChanged,
+    /// Both sides moved since the last sync (or never synced and both sides
+    /// have content) — the one real conflict; the user picks a side.
+    BothChanged,
+    /// A file with no mesa row at all.
+    DiskNew,
+}
+
+impl LibrarySyncStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LibrarySyncStatus::InSync => "in-sync",
+            LibrarySyncStatus::MesaNew => "mesa-new",
+            LibrarySyncStatus::DiskDeleted => "disk-deleted",
+            LibrarySyncStatus::MesaChanged => "mesa-changed",
+            LibrarySyncStatus::DiskChanged => "disk-changed",
+            LibrarySyncStatus::BothChanged => "both-changed",
+            LibrarySyncStatus::DiskNew => "disk-new",
+        }
+    }
+}
+
+/// One row of a sync scan — one *path*, comparing the mesa side to the disk
+/// side. `item_id`/`builtin_id` are both null only for a `disk-new` row (a
+/// file with no mesa row at all).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibrarySyncRow {
+    #[ts(type = "number | null")]
+    pub item_id: Option<i64>,
+    pub builtin_id: Option<String>,
+    pub name: String,
+    pub kind: LibraryKind,
+    pub scope: LibraryScope,
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    pub path: String,
+    pub status: LibrarySyncStatus,
+    pub mesa_body: Option<String>,
+    pub disk_body: Option<String>,
+    pub baseline: Option<String>,
+}
+
+/// The outcome of applying one resolution from `POST /api/library/sync`.
+/// Apply is per-row, not all-or-nothing across the batch: a failing row is
+/// reported here and the rest still apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibrarySyncResult {
+    pub path: String,
+    /// `mesa | disk | skip`, echoing the resolution this result answers.
+    pub choice: String,
+    pub applied: bool,
+    pub error: Option<String>,
 }
 
 // ---- CC Dashboard (Claude Code telemetry) ----

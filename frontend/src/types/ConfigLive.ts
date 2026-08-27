@@ -5,19 +5,13 @@
  * (`core::config`, `docs/config.md`, mesa task 867) — a fifth view of
  * `~/.mesa/config.json`, with the same null-means-fallback rule as
  * [`ConfigWatchers`].
+ *
+ * This used to carry the instruction block a live agent is spawned with too
+ * (`prompt`/`default_prompt`), but that moved to the library as of mesa task
+ * 919 — it is now the `live-agent-prompt` library item, edited on
+ * `#/library` rather than here.
  */
 export type ConfigLive = { 
-/**
- * The instruction block a live agent is spawned with, or `null` when the
- * config says nothing — then `default_prompt` is what the agent gets.
- */
-prompt: string | null, 
-/**
- * The prompt mesa ships (`core::live::AGENT_PROMPT`), so the editor can
- * show what blank means — and offer it as the starting point for an edit
- * — without a copy of it in TypeScript.
- */
-default_prompt: string, 
 /**
  * How long a settled dictation draft waits before the page sends it, in
  * milliseconds, or `null` when the config says nothing — then

@@ -8930,3 +8930,240 @@ button:focus-visible,
     padding: 0.5rem;
   }
 }
+
+/* --- Library page (mesa task 919) --- */
+
+/* Same shape as Scripts: a global list above projects, `.card-list` rows,
+   `.panel-form` for the editor, grouped into one `<section>` per kind. */
+.library-group {
+  margin-top: 1rem;
+}
+
+.library-group-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.library-item-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.library-name {
+  font-family: var(--font-mono);
+  color: var(--cyan);
+}
+
+.library-meta {
+  font-size: 0.75rem;
+}
+
+.library-badge {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border-bright);
+  border-radius: 999px;
+  color: var(--amber);
+}
+
+.library-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+/* The editor opens inside the row it belongs to, exactly like `.script-form`
+   — a rule off the card above it keeps the form and the list item from
+   reading as one block. */
+.library-form {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.library-form h2 {
+  margin: 0;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.library-form-row {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+/* The body is a program or a document, never plain prose, so it gets the
+   shared syntax-highlighting editor and a border fencing it off from the
+   plain fields around it — the same treatment `.script-body-editor` gives a
+   script's body. */
+.library-body-editor .files-editor-stack {
+  height: 18rem;
+  border: 1px solid var(--border);
+  padding: 0.25rem;
+}
+
+.library-versions {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.library-version-row {
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+.library-version-body {
+  margin: 0.25rem 0 0;
+  max-height: 10rem;
+  overflow: auto;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+/* --- Library Sync modal --- */
+
+/* Reuses `.create-task-backdrop`/`.create-task-modal` like `ScriptRunModal`
+   — one wider variant, since the modal's job is showing two bodies side by
+   side. */
+.library-sync-modal {
+  width: min(48rem, 92vw);
+  max-height: 85vh;
+  overflow: auto;
+}
+
+.library-sync-project-picker {
+  display: block;
+  margin: 0.5rem 0;
+}
+
+.library-sync-list {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.library-sync-row {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem;
+}
+
+.library-sync-row-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.library-sync-path {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.library-sync-status {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border-bright);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.library-sync-status-both-changed {
+  color: var(--red);
+  border-color: rgba(255, 59, 92, 0.5);
+}
+
+.library-sync-status-disk-new {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
+.library-sync-status-mesa-changed,
+.library-sync-status-disk-changed,
+.library-sync-status-mesa-new,
+.library-sync-status-disk-deleted {
+  color: var(--cyan);
+}
+
+/* The two bodies, side by side — no diffing library, just the plain
+   before/after text `.library-sync-diff` was designed for. Stacks on a
+   narrow screen (`.library-sync-diff` is a flex row that wraps) rather than
+   forcing horizontal scroll. */
+.library-sync-diff {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+.library-sync-side {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.library-sync-side h4 {
+  margin: 0 0 0.25rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.library-sync-side pre {
+  margin: 0;
+  max-height: 12rem;
+  overflow: auto;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.library-sync-choice {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.library-sync-choice label {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: center;
+}
+
+.library-sync-results {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  font-size: 0.8rem;
+}

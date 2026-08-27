@@ -118,8 +118,6 @@ describe('shouldAutoSend', () => {
 
 describe('autoSendIdleMs', () => {
   const live = (auto_send_ms: number | null): ConfigLive => ({
-    prompt: null,
-    default_prompt: '',
     auto_send_ms,
     auto_send_ms_default: AUTO_SEND_IDLE_MS,
   })

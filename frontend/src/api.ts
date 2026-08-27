@@ -35,6 +35,12 @@ import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { InboxKind } from './types/InboxKind'
+import type { LibraryItem } from './types/LibraryItem'
+import type { LibraryKind } from './types/LibraryKind'
+import type { LibraryScope } from './types/LibraryScope'
+import type { LibrarySyncResult } from './types/LibrarySyncResult'
+import type { LibrarySyncRow } from './types/LibrarySyncRow'
+import type { LibraryVersion } from './types/LibraryVersion'
 import type { LiveContext } from './types/LiveContext'
 import type { LiveSession } from './types/LiveSession'
 import type { LiveState } from './types/LiveState'
@@ -1236,4 +1242,78 @@ export function runScript(
   values: Record<string, string>,
 ): Promise<ScriptRun> {
   return request(`/api/scripts/${id}/run`, jsonInit('POST', { values }))
+}
+
+// ---- Library (mesa task 919) ----
+
+export interface LibraryCreate {
+  kind: LibraryKind
+  scope: LibraryScope
+  project_id: number | null
+  name: string
+  body: string
+}
+
+export interface LibraryPatch {
+  name?: string
+  body?: string
+}
+
+/** Every library item — the db rows plus every built-in not shadowed by one
+ * (`id: null`, `builtin: true`). Unscoped when `project` is omitted. Like
+ * script authoring, every mutation below is loopback-only in *both* serve
+ * modes (docs/scripts.md's gate): a library row becomes an agent definition,
+ * a hook script or a CLAUDE.md on disk, so a LAN peer must never write one. */
+export function listLibrary(project?: number): Promise<LibraryItem[]> {
+  const qs = project !== undefined ? `?project=${project}` : ''
+  return request(`/api/library${qs}`)
+}
+
+export function getLibraryItem(id: number): Promise<LibraryItem> {
+  return request(`/api/library/${id}`)
+}
+
+export function createLibraryItem(body: LibraryCreate): Promise<LibraryItem> {
+  return request('/api/library', jsonInit('POST', body))
+}
+
+export function updateLibraryItem(id: number, body: LibraryPatch): Promise<LibraryItem> {
+  return request(`/api/library/${id}`, jsonInit('PATCH', body))
+}
+
+/** Returns the destroyed record — the recoverable delete echo. Deleting an
+ * unshadowed built-in (no db row to destroy) is `validation`. */
+export function deleteLibraryItem(id: number): Promise<LibraryItem> {
+  return request(`/api/library/${id}`, jsonDelete())
+}
+
+/** A stored item's history, most distinct body per entry (a save that leaves
+ * the body byte-identical writes no new version). */
+export function listLibraryVersions(id: number): Promise<LibraryVersion[]> {
+  return request(`/api/library/${id}/versions`)
+}
+
+/** Editing a built-in forks it: this creates the db row carrying
+ * `builtin_id`, rather than PATCHing something that does not exist yet. */
+export function forkLibraryItem(builtinId: string, body: string): Promise<LibraryItem> {
+  return request(`/api/library/builtins/${builtinId}/fork`, jsonInit('POST', { body }))
+}
+
+/** The sync scan: one row per path, comparing the stored body, the file on
+ * disk and the last-agreed baseline. Unscoped when `project` is omitted. */
+export function getLibrarySync(project?: number): Promise<LibrarySyncRow[]> {
+  const qs = project !== undefined ? `?project=${project}` : ''
+  return request(`/api/library/sync${qs}`)
+}
+
+/** Applies a batch of resolutions. Per-row, not all-or-nothing: a failing row
+ * is reported in its own result and the rest still apply. */
+export function applyLibrarySync(
+  projectId: number | null,
+  resolutions: { path: string; choice: 'mesa' | 'disk' | 'skip' }[],
+): Promise<LibrarySyncResult[]> {
+  return request(
+    '/api/library/sync',
+    jsonInit('POST', { project_id: projectId, resolutions }),
+  )
 }

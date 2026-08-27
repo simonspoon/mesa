@@ -45,7 +45,7 @@ If a job will take a while, say so first, do the work, then say what happened.
 3. To move the person's browser, run \
 `mesa live navigate '#/projects/3' --say \"Opening that project.\"`. The route \
 must be one of the app's hash routes: `#/`, `#/live`, `#/inbox`, `#/cc`, \
-`#/scripts`, `#/settings`, `#/terminal`, `#/projects/<id>`, \
+`#/scripts`, `#/library`, `#/settings`, `#/terminal`, `#/projects/<id>`, \
 `#/projects/<id>/tasks/<task id>`, `#/projects/<id>/diagrams`, \
 `#/projects/<id>/git`, `#/projects/<id>/files`, `#/projects/<id>/terminal`, \
 `#/projects/<id>/dashboard`, `#/projects/<id>/settings`. Navigate when the \
@@ -85,22 +85,26 @@ on with the conversation.";
 /// conversation it is driving. One function, so both spawn sites (the CLI's
 /// `live start` and the API's `POST /api/live`) hand the agent the same text.
 ///
-/// The block is `~/.mesa/config.json`'s `live.prompt` when the Settings page
-/// has one, and [`AGENT_PROMPT`] otherwise (mesa task 867) — read on every
-/// spawn, so an edit lands on the next conversation with no restart. A
-/// configured block **replaces** the built-in rather than extending it: what
-/// the box holds is what mesa sends. The session line is the one thing mesa
-/// still adds, because it is plumbing rather than instruction — without it the
-/// agent cannot name the conversation it is in.
+/// The block is the `live-agent-prompt` library item (mesa task 919) when it
+/// has been forked — `store.find_library_fork("live-agent-prompt")` — and
+/// [`AGENT_PROMPT`] otherwise, read on every spawn so an edit lands on the
+/// next conversation with no restart. A forked body **replaces** the built-in
+/// rather than extending it: what the library row holds is what mesa sends.
+/// The session line is the one thing mesa still adds, because it is plumbing
+/// rather than instruction — without it the agent cannot name the
+/// conversation it is in.
 ///
-/// A config file mesa cannot read falls back to [`AGENT_PROMPT`] rather than
-/// failing here: the very next call, `agents::spawn_bg`, reads the same file
-/// for the command template and reports that failure as `unavailable`, so the
-/// error surfaces once instead of twice.
-pub fn agent_prompt(session_id: i64) -> String {
-    let block = crate::core::config::live_prompt()
+/// A store error resolving the fork falls back to [`AGENT_PROMPT`] rather
+/// than failing here: a database hiccup must not stop a conversation from
+/// starting, and the very next call, `agents::spawn_bg`, reads the same
+/// config for the command template and reports *that* failure as
+/// `unavailable`, so an actual problem still surfaces once rather than twice.
+pub fn agent_prompt(store: &crate::core::Store, session_id: i64) -> String {
+    let block = store
+        .find_library_fork("live-agent-prompt")
         .ok()
         .flatten()
+        .map(|item| item.body)
         .unwrap_or_else(|| AGENT_PROMPT.to_string());
     prompt_with(&block, session_id)
 }
@@ -134,6 +138,39 @@ mod tests {
         assert!(prompt.starts_with("Talk like a pirate."), "{prompt}");
         assert!(!prompt.contains("mesa live listen"), "{prompt}");
         assert!(prompt.contains("session 12"), "{prompt}");
+    }
+
+    /// mesa task 919: the block now comes from the library. An unforked
+    /// `live-agent-prompt` still resolves to [`AGENT_PROMPT`]; forking it
+    /// (`Store::create_library_item` with `builtin_id:
+    /// "live-agent-prompt"`) makes `agent_prompt` send the forked body
+    /// instead — replacing the built-in, same as the old config-driven
+    /// prompt did — and the session line is still appended either way.
+    #[test]
+    fn agent_prompt_resolves_the_library_fork_and_falls_back_to_the_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::core::Store::open(&dir.path().join("test.db")).unwrap();
+
+        // No fork yet: the built-in.
+        let prompt = agent_prompt(&store, 5);
+        assert!(prompt.starts_with(AGENT_PROMPT));
+        assert!(prompt.contains("session 5"), "{prompt}");
+
+        // Forking replaces it.
+        store
+            .create_library_item(
+                crate::core::LibraryKind::Prompt,
+                crate::core::LibraryScope::User,
+                None,
+                "live-agent-prompt",
+                "Talk like a pirate.",
+                Some("live-agent-prompt"),
+            )
+            .unwrap();
+        let prompt = agent_prompt(&store, 6);
+        assert!(prompt.starts_with("Talk like a pirate."), "{prompt}");
+        assert!(!prompt.contains("mesa live listen"), "{prompt}");
+        assert!(prompt.contains("session 6"), "{prompt}");
     }
 
     /// Every rule the loop depends on is actually stated: pull, reply, the

@@ -706,53 +706,44 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused speech PUT must not touch the file"
 ok "both speech verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
-# ---- the live section: GET/PUT /api/config/live (mesa task 867) ----
+# ---- the live section: GET/PUT /api/config/live (mesa task 867, 886, 919) ----
 #
-# The fifth section, and the second whose value has to survive into another
-# program's argv: the prompt is what mesa hands the live conversation's agent.
-# So this covers the sibling-section rules once more, and then the thing that
-# makes the setting real — the saved text, and only the saved text, reaching
-# the spawn.
-
-start_live() { api POST /api/live '{"project_id": null}'; }
-stop_live() { api DELETE /api/live; }
+# The fifth section of the file. It used to hold two keys — the instruction
+# block a live agent is spawned with, and how long a settled dictation draft
+# waits before the page sends it — but the prompt moved out to the library as
+# of mesa task 919 (it is now the `live-agent-prompt` library item, resolved
+# by `core::live::agent_prompt`), leaving this section with the one key. The
+# "a configured prompt replaces the built-in at spawn" contract now belongs to
+# `library-check.sh`, proved through a library row instead of a config key.
+# What is left here is the sibling-section rules every other section keeps —
+# echo, round-trip, reset, bad-value rejection, cross-section independence and
+# the Host gate — plus the migration case: a `live.prompt` key left behind by
+# an older mesa in a hand-edited file must be silently ignored, never break a
+# read or a write.
 
 write_config <<EOF
 {"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}, "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}}, "watchers": {"todo-concurrency": 3}, "speech": {"voice": "bm_george"}}
 EOF
 api GET /api/config/live
 [ "$CODE" = "200" ] || fail "GET live: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.prompt' <<<"$STDOUT")" = "null" ] ||
-  fail "an unconfigured live prompt must report null, got $STDOUT"
-# The editor shows what blank means, so the built-in text is data on the route
-# rather than a second copy in TypeScript.
-jq -e '.default_prompt | test("mesa live listen")' <<<"$STDOUT" >/dev/null ||
-  fail "GET live: default_prompt must be the block mesa ships: $STDOUT"
-# The section's second key (mesa task 886) answers the same way: nothing
-# configured is null, and the built-in wait rides along so the editor can show
-# what blank means without a second copy of the number in TypeScript.
 [ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "null" ] ||
   fail "an unconfigured auto-send wait must report null, got $STDOUT"
 [ "$(jq -r '.auto_send_ms_default' <<<"$STDOUT")" = "2000" ] ||
   fail "GET live: auto_send_ms_default must be the built-in 2000: $STDOUT"
-ok "GET /api/config/live reports prompt and auto_send_ms null on a fresh config and carries the built-in block and the built-in 2000 ms wait as the defaults"
+# `prompt`/`default_prompt` are gone from the route entirely (mesa task 919) —
+# not null, absent.
+[ "$(jq -r 'has("prompt") or has("default_prompt")' <<<"$STDOUT")" = "false" ] ||
+  fail "GET live must no longer report prompt or default_prompt at all: $STDOUT"
+ok "GET /api/config/live reports auto_send_ms null on a fresh config, carries the built-in 2000 ms wait as the default, and no longer mentions a prompt at all"
 
-# Unconfigured: the agent is spawned with the block mesa ships — the pre-867
-# behaviour, unchanged.
-: > "$CLAUDE_LOG"
-start_live
-[ "$CODE" = "201" ] || fail "live start (unconfigured): expected 201, got $CODE: $STDOUT"
-grep -q "mesa live listen" "$CLAUDE_LOG" ||
-  fail "an unconfigured live prompt must spawn the built-in block: $(cat "$CLAUDE_LOG")"
-stop_live
-ok "with nothing configured, a live session spawns with the block mesa ships"
-
-api PUT /api/config/live '{"prompt": "Speak only in haiku."}'
+api PUT /api/config/live '{"auto_send_ms": 4500}'
 [ "$CODE" = "200" ] || fail "PUT live: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.prompt' <<<"$STDOUT")" = "Speak only in haiku." ] ||
-  fail "PUT must echo the stored prompt: $STDOUT"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
-  fail "PUT live did not write the prompt: $(cat "$CONFIG")"
+[ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "4500" ] ||
+  fail "PUT must echo the stored wait: $STDOUT"
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
+  fail "PUT live did not write the wait: $(cat "$CONFIG")"
+[ "$(jq -r '.live["auto-send-ms"] | type' < "$CONFIG")" = "number" ] ||
+  fail "the wait must be written as a JSON number, not a string: $(cat "$CONFIG")"
 [ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
   fail "a live write clobbered the commands section: $(cat "$CONFIG")"
 [ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
@@ -763,104 +754,24 @@ api PUT /api/config/live '{"prompt": "Speak only in haiku."}'
   fail "a live write clobbered the speech section: $(cat "$CONFIG")"
 [ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
   fail "a live write dropped a section it doesn't own: $(cat "$CONFIG")"
-ok "PUT /api/config/live sets the prompt, leaving commands, pricing, watchers, speech and an unknown section untouched"
+ok "PUT /api/config/live sets auto_send_ms as a JSON number, echoes it back, and leaves commands, pricing, watchers, speech and an unknown section untouched"
 
-# The whole point of the setting: the saved text is what the agent is spawned
-# with — read on the start, no restart — and it REPLACES the built-in block
-# rather than joining it. The one thing mesa still adds is the session line.
-: > "$CLAUDE_LOG"
-start_live
-[ "$CODE" = "201" ] || fail "live start (configured): expected 201, got $CODE: $STDOUT"
-SESSION=$(jq -r '.id' <<<"$STDOUT")
-grep -q "Speak only in haiku." "$CLAUDE_LOG" ||
-  fail "the saved prompt must reach the spawn: $(cat "$CLAUDE_LOG")"
-! grep -q "mesa live listen" "$CLAUDE_LOG" ||
-  fail "a configured prompt must REPLACE the built-in block, not extend it: $(cat "$CLAUDE_LOG")"
-grep -q "You are driving mesa live session $SESSION" "$CLAUDE_LOG" ||
-  fail "the session line must still be there: $(cat "$CLAUDE_LOG")"
-stop_live
-ok "a configured prompt is what the live agent is spawned with — replacing the built-in block, keeping only mesa's session line"
-
-# The other savers have to leave the prompt alone, exactly as it leaves them.
+# The other savers have to leave the wait alone, exactly as it leaves them —
+# the cross-section independence property every section gates, re-pointed at
+# the one key left in this section now that the prompt is gone.
 api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
 [ "$CODE" = "200" ] || fail "PUT commands after live: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
   fail "a commands write clobbered the live section: $(cat "$CONFIG")"
 api PUT /api/config/speech '{"voice": "af_bella"}'
 [ "$CODE" = "200" ] || fail "PUT speech after live: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
   fail "a speech write clobbered the live section: $(cat "$CONFIG")"
 api PUT /api/config/watchers '{"todo_concurrency": 2}'
 [ "$CODE" = "200" ] || fail "PUT watchers after live: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
   fail "a watchers write clobbered the live section: $(cat "$CONFIG")"
 ok "saving commands, speech or watchers preserves the live section, exactly as live preserves them"
-
-# Both spellings of "no prompt" remove the key: an empty prompt would spawn an
-# agent that does not know it is in a conversation, so it is never stored.
-for RESET in 'null' '""'; do
-  api PUT /api/config/live '{"prompt": "Speak only in haiku."}'
-  [ "$CODE" = "200" ] || fail "PUT live before reset $RESET: got $CODE: $STDOUT"
-  api PUT /api/config/live "{\"prompt\": $RESET}"
-  [ "$CODE" = "200" ] || fail "PUT live $RESET: expected 200, got $CODE: $STDOUT"
-  [ "$(jq -r '.prompt' <<<"$STDOUT")" = "null" ] ||
-    fail "PUT live $RESET must report no prompt, got $STDOUT"
-  [ "$(jq -r '.live | has("prompt")' < "$CONFIG")" = "false" ] ||
-    fail "PUT live $RESET must remove the key, never store it: $(cat "$CONFIG")"
-done
-# …and with the key gone the agent is spawned with the built-in block again.
-: > "$CLAUDE_LOG"
-start_live
-[ "$CODE" = "201" ] || fail "live start after reset: expected 201, got $CODE: $STDOUT"
-grep -q "mesa live listen" "$CLAUDE_LOG" ||
-  fail "a cleared prompt must spawn the built-in block again: $(cat "$CLAUDE_LOG")"
-stop_live
-ok "PUT prompt null and prompt \"\" both remove the key, and the next session spawns with the built-in block again"
-
-# ---- the wait before a settled dictation draft is sent (mesa task 886) ----
-#
-# The live section's second key, and the first whose value is a number rather
-# than prose. Three things to hold: it is stored as a JSON *number* (the reader
-# takes `u32`, so a quoted "4500" would silently disappear on the next read),
-# the two keys are independent in both directions, and a value of the wrong
-# shape or outside the bounds is named rather than coerced.
-
-api PUT /api/config/live '{"prompt": "Speak only in haiku."}'
-[ "$CODE" = "200" ] || fail "PUT live prompt before the auto-send checks: got $CODE: $STDOUT"
-
-api PUT /api/config/live '{"auto_send_ms": 4500}'
-[ "$CODE" = "200" ] || fail "PUT live auto_send_ms: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "4500" ] ||
-  fail "PUT must echo the stored wait: $STDOUT"
-[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
-  fail "PUT live did not write the wait: $(cat "$CONFIG")"
-[ "$(jq -r '.live["auto-send-ms"] | type' < "$CONFIG")" = "number" ] ||
-  fail "the wait must be written as a JSON number, not a string: $(cat "$CONFIG")"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in haiku." ] ||
-  fail "an auto-send write clobbered the prompt: $(cat "$CONFIG")"
-[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
-  fail "an auto-send write clobbered the commands section: $(cat "$CONFIG")"
-[ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
-  fail "an auto-send write clobbered the pricing section: $(cat "$CONFIG")"
-[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "2" ] ||
-  fail "an auto-send write clobbered the watchers section: $(cat "$CONFIG")"
-[ "$(jq -r '.speech.voice' < "$CONFIG")" = "af_bella" ] ||
-  fail "an auto-send write clobbered the speech section: $(cat "$CONFIG")"
-[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
-  fail "an auto-send write dropped a section it doesn't own: $(cat "$CONFIG")"
-ok "PUT /api/config/live sets auto_send_ms as a JSON number, echoes it back, and leaves the prompt, commands, pricing, watchers, speech and an unknown section untouched"
-
-# Independent in the other direction too: naming only the prompt leaves the
-# wait exactly where it was, so the Settings page can save one box at a time.
-api PUT /api/config/live '{"prompt": "Speak only in limericks."}'
-[ "$CODE" = "200" ] || fail "PUT live prompt after the wait: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "4500" ] ||
-  fail "a prompt-only PUT must still report the stored wait: $STDOUT"
-[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
-  fail "a prompt-only PUT clobbered the wait: $(cat "$CONFIG")"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in limericks." ] ||
-  fail "a prompt-only PUT did not write the prompt: $(cat "$CONFIG")"
-ok "the two live keys are independent: a PUT naming only one leaves the other alone, both directions"
 
 # null is the reset, as it is for a watcher limit: the key is removed rather
 # than stored as some spelling of "the default".
@@ -872,13 +783,11 @@ api PUT /api/config/live '{"auto_send_ms": null}'
   fail "the built-in wait must still ride along after a reset: $STDOUT"
 [ "$(jq -r '.live | has("auto-send-ms")' < "$CONFIG")" = "false" ] ||
   fail "PUT live auto_send_ms null must remove the key, never store it: $(cat "$CONFIG")"
-[ "$(jq -r '.live.prompt' < "$CONFIG")" = "Speak only in limericks." ] ||
-  fail "resetting the wait clobbered the prompt: $(cat "$CONFIG")"
 api GET /api/config/live
 [ "$CODE" = "200" ] || fail "GET live after reset: expected 200, got $CODE: $STDOUT"
 [ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "null" ] ||
   fail "GET live after reset must report null again, got $STDOUT"
-ok "PUT auto_send_ms null removes the key and the next GET reports null again, leaving the prompt alone"
+ok "PUT auto_send_ms null removes the key and the next GET reports null again"
 
 # Every rejected value is 422 validation and writes NOTHING — the whole save is
 # checked before the file is opened, so a bad wait cannot half-land.
@@ -893,46 +802,60 @@ for BAD in '0' '-1' '2.5' '60001' '"2000"'; do
 done
 ok "PUT /api/config/live rejects 0, -1, 2.5, 60001 and a quoted \"2000\" as 422 validation, writing nothing"
 
-# The shape rule runs the other way as well: the prompt is prose, and a number
-# is named rather than stringified into the file.
-api PUT /api/config/live '{"prompt": 7}'
-[ "$CODE" = "422" ] || fail "a numeric live prompt: expected 422, got $CODE: $STDOUT"
-[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
-  fail "a numeric live prompt: expected code validation, got $STDOUT"
+# `prompt` is no longer a field `LiveUpdate` declares (mesa task 919), and — as
+# with every config section — an undeclared JSON key is dropped by the
+# deserializer before it ever reaches `save_live`'s update map, never a 422.
+# That is deliberate, pre-existing behaviour shared by every section (a
+# `PUT {"nonsense": 1}` is 200 on speech and watchers too), not a special case
+# carved out for `prompt` — and it is the same posture as the file-side
+# migration rule below: a stale client that still sends `live.prompt` must be
+# ignored, not broken, and must not be able to resurrect a key mesa no longer
+# honours.
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config/live '{"prompt": "anything"}'
+[ "$CODE" = "200" ] || fail "PUT live with a stale prompt field: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r 'has("prompt")' <<<"$STDOUT")" = "false" ] ||
+  fail "the response must not echo a prompt field at all: $STDOUT"
 [ "$(cat "$CONFIG")" = "$BEFORE" ] ||
-  fail "a rejected prompt PUT must not touch the file: $(cat "$CONFIG")"
-ok "PUT /api/config/live rejects a prompt sent as a number as 422 validation, writing nothing"
+  fail "a stale prompt field must write nothing to the file: $(cat "$CONFIG")"
+[ "$(jq -r '.live | has("prompt")' < "$CONFIG" 2>/dev/null || echo false)" = "false" ] ||
+  fail "a stale prompt field must not resurrect .live.prompt in the file: $(cat "$CONFIG")"
+api PUT /api/config/live '{"auto_send_ms": 5500}'
+[ "$CODE" = "200" ] || fail "PUT live auto_send_ms after a stale prompt: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "5500" ] ||
+  fail "a real key must still save normally after an ignored stale one: $STDOUT"
+ok "a stale client still sending live.prompt is ignored, not an error, and cannot resurrect the key"
 
-# Back to no prompt, the state the checks below this point were written against.
-api PUT /api/config/live '{"prompt": null}'
-[ "$CODE" = "200" ] || fail "clearing the live prompt again: got $CODE: $STDOUT"
+# The migration case: a file written by an older mesa may still carry
+# `live.prompt`. Reading it must not error, and saving the section back must
+# leave that stray key exactly as it was — a save only ever touches the key
+# it names, and this key has no field left to touch it through.
+write_config <<EOF
+{"live": {"prompt": "an old built-in override", "auto-send-ms": 3500}}
+EOF
+api GET /api/config/live
+[ "$CODE" = "200" ] || fail "GET live with a leftover prompt key: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.auto_send_ms' <<<"$STDOUT")" = "3500" ] ||
+  fail "a leftover prompt key must not stop the wait from reading: $STDOUT"
+api PUT /api/config/live '{"auto_send_ms": 4000}'
+[ "$CODE" = "200" ] || fail "PUT live with a leftover prompt key: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.live.prompt' < "$CONFIG")" = "an old built-in override" ] ||
+  fail "a save must leave a leftover prompt key untouched: $(cat "$CONFIG")"
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4000" ] ||
+  fail "the wait must still be the one thing this save changes: $(cat "$CONFIG")"
+ok "a live.prompt key left behind by an older mesa is silently ignored on GET and left alone by a PUT, never an error"
 
 BEFORE=$(cat "$CONFIG")
-# The one rule a prompt has is a length bound — it is prose, not a command line.
-BIG=$(head -c 16385 /dev/zero | tr '\0' 'x')
-api PUT /api/config/live "$(jq -n --arg p "$BIG" '{prompt: $p}')"
-[ "$CODE" = "422" ] || fail "oversized live prompt: expected 422, got $CODE: $STDOUT"
-[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
-  fail "oversized live prompt: expected code validation, got $STDOUT"
-[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
-  fail "a rejected live PUT must not touch the file: $(cat "$CONFIG")"
-ok "PUT /api/config/live rejects a prompt past the length bound as 422 validation, writing nothing"
-
 CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
   "http://127.0.0.1:$PORT/api/config/live")
 [ "$CODE" = "403" ] || fail "GET live with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
 CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
   -H 'Content-Type: application/json' \
-  --data '{"prompt": "hi"}' \
+  --data '{"auto_send_ms": 4500}' \
   "http://127.0.0.1:$PORT/api/config/live")
 [ "$CODE" = "403" ] || fail "PUT live with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused live PUT must not touch the file"
 ok "both live verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
-
-# A live prompt is many lines, so the spawns above left a log the later
-# `wait_lines` counters would misread. They assert about the built-in argv, not
-# about this section, so the log starts clean again here.
-: > "$CLAUDE_LOG"
 
 printf '{ not json' > "$CONFIG"
 api GET /api/config
@@ -955,7 +878,7 @@ api PUT /api/config/speech '{"voice": "af_bella"}'
 [ "$CODE" = "502" ] || fail "malformed config speech PUT: expected 502, got $CODE: $STDOUT"
 api GET /api/config/live
 [ "$CODE" = "502" ] || fail "malformed config live GET: expected 502, got $CODE: $STDOUT"
-api PUT /api/config/live '{"prompt": "hi"}'
+api PUT /api/config/live '{"auto_send_ms": 4500}'
 [ "$CODE" = "502" ] || fail "malformed config live PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"

@@ -60,8 +60,6 @@ import {
   draftFrom as liveDraftFrom,
   isDirty as isLiveDirty,
   isSavable as isLiveSavable,
-  usesDefault,
-  valueError as livePromptError,
   MAX_AUTO_SEND_MS,
   MIN_AUTO_SEND_MS,
   waitError,
@@ -403,21 +401,20 @@ function WatchersSection() {
 }
 
 /**
- * Live: the instruction block the conversation's agent is spawned with (mesa
- * task 867), and how long a dictated line sits before the page sends it (mesa
- * task 886). Its own section, draft and save button, for the same reason
- * watchers and pricing have theirs — a separate endpoint, so one form's
- * rejection must not strand the other's edits.
+ * Live: how long a dictated line sits before the page sends it (mesa task
+ * 886). Its own section, draft and save button, for the same reason watchers
+ * and pricing have theirs — a separate endpoint, so one form's rejection must
+ * not strand the other's edits.
  *
- * Three things it must not soften:
- * - **Blank is the block mesa ships**, never "no instructions": a live agent
- *   with an empty prompt is an agent that does not know it is in a
- *   conversation, so clearing the box removes the key rather than storing "".
- * - **What is in the box is the whole of what mesa sends.** The "start from
- *   the built-in" button fills the box with the shipped text so an edit is a
- *   change to it, rather than an addition mesa would have to merge.
- * - **A blank wait is the two seconds mesa ships**, not "never send": the box
- *   is empty on an unconfigured install and clearing it removes the key.
+ * The instruction block the conversation's agent is spawned with used to
+ * live here too (mesa task 867), but moved to the library as of mesa task
+ * 919 — it is now the `live-agent-prompt` library item, edited on
+ * `#/library` like any other row, so this section only links there instead
+ * of holding a second editor for it.
+ *
+ * One thing it must not soften: **a blank wait is the two seconds mesa
+ * ships**, not "never send" — the box is empty on an unconfigured install
+ * and clearing it removes the key.
  */
 function LivePromptSection() {
   const { data: live, error, refetch } = useFetch(() => getLiveConfig(), 'live')
@@ -427,7 +424,7 @@ function LivePromptSection() {
   const [saving, setSaving] = useState(false)
 
   const seeded: LivePromptDraft =
-    draft ?? (live ? liveDraftFrom(live) : { prompt: '', auto_send_ms: '' })
+    draft ?? (live ? liveDraftFrom(live) : { auto_send_ms: '' })
 
   function edit(patch: Partial<LivePromptDraft>) {
     setDraft({ ...seeded, ...patch })
@@ -472,45 +469,18 @@ function LivePromptSection() {
 
   const dirty = isLiveDirty(live, seeded)
   const savable = isLiveSavable(seeded)
-  const fieldError = livePromptError(seeded.prompt)
   const waitFieldError = waitError(seeded.auto_send_ms)
-  const onDefault = usesDefault(seeded)
 
   return (
     <>
       <h2>Live conversation</h2>
       <section className="settings-command">
-        <label htmlFor="live-prompt">
-          <span className="settings-command-title">
-            Agent prompt
-          </span>
-          <code className="settings-command-key">live.prompt</code>
-        </label>
+        <span className="settings-command-title">Agent prompt</span>
         <p className="muted settings-command-blurb">
-          What the agent driving a spoken conversation is told to do. Blank = the
-          prompt mesa ships; anything here <strong>replaces</strong> it, so this
-          box is the whole of what the agent is sent. mesa adds one line naming
-          the session it is driving, and nothing else.
+          What the agent driving a spoken conversation is told to do now
+          lives in the library — see <a href="#/library">the library</a>,
+          under the <code>live-agent-prompt</code> item.
         </p>
-        <textarea
-          id="live-prompt"
-          className="settings-prompt-input"
-          rows={onDefault ? 6 : 18}
-          spellCheck={false}
-          value={seeded.prompt}
-          placeholder={live.default_prompt}
-          onChange={(e) => edit({ prompt: e.target.value })}
-        />
-        {fieldError && <p className="error">{fieldError}</p>}
-        {onDefault && (
-          <button
-            type="button"
-            className="settings-inline-button"
-            onClick={() => edit({ prompt: live.default_prompt })}
-          >
-            start from the built-in prompt
-          </button>
-        )}
       </section>
 
       <section className="settings-command">

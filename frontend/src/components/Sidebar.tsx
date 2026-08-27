@@ -220,6 +220,7 @@ export function Sidebar({
   inboxFilter,
   settingsActive,
   scriptsActive,
+  libraryActive,
   terminalActive,
   ccTab,
   version,
@@ -234,6 +235,7 @@ export function Sidebar({
   inboxFilter: InboxFilter | null
   settingsActive: boolean
   scriptsActive: boolean
+  libraryActive: boolean
   terminalActive: boolean
   ccTab: CcTab | null
   version: number
@@ -651,6 +653,11 @@ export function Sidebar({
             deliberately untouched. */}
         <a className={`nav-item${scriptsActive ? ' active' : ''}`} href="#/scripts">
           <span className="nav-item-label">Scripts</span>
+        </a>
+        {/* Same reasoning as Scripts above: Library is global, not a project
+            subtree. */}
+        <a className={`nav-item${libraryActive ? ' active' : ''}`} href="#/library">
+          <span className="nav-item-label">Library</span>
         </a>
         <button
           type="button"

@@ -7,9 +7,10 @@ use rusqlite::{Connection, OptionalExtension};
 use super::attachments;
 use super::types::{
     AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, EdgeMarker, EdgeStyle,
-    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LiveAction, LiveContext, LiveRole,
-    LiveSession, LiveStatus, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg,
-    ScriptArgKind, Status, Task, TaskEvent, Waypoint, task_name,
+    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LibraryItem, LibraryKind, LibraryScope,
+    LibraryVersion, LiveAction, LiveContext, LiveRole, LiveSession, LiveStatus, LiveTurn,
+    LiveWindow, Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Task, TaskEvent,
+    Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -580,6 +581,52 @@ const MIGRATIONS: &[&str] = &[
     // the JSON key are `window`. A row written before this column simply has
     // no browser to look at, which is what a CLI-driven session is anyway.
     "ALTER TABLE live_sessions ADD COLUMN window_box TEXT;",
+    // Task 919: the library — agents, skills, hooks, commands, the
+    // live-conversation prompt and CLAUDE.md files as first-class records,
+    // synced file-by-file against `.claude`. `project_id` is required iff
+    // `scope = 'project'` and NULL iff `scope = 'user'`, enforced in `Store`
+    // (not here) alongside every other rule. `ON DELETE CASCADE` matches a
+    // task's own project FK — deleting a project destroys its library rows
+    // along with everything else scoped to it, never leaves them orphaned.
+    // `builtin_id` is UNIQUE: a built-in (`core::library::BUILTINS`) forks
+    // into a db row at most once, and NULL for a purely user-authored row
+    // (SQLite's UNIQUE ignores NULLs, so any number of un-forked rows
+    // coexist). `library_versions` is the history — one row per *distinct*
+    // body a `library_items` row has held, appended only when a save
+    // actually changes the body (`Store::update_library_item` and
+    // `Store::pull_library_body`), never one row per PATCH.
+    "CREATE TABLE library_items (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        scope       TEXT NOT NULL,
+        project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        body        TEXT NOT NULL,
+        builtin_id  TEXT UNIQUE,
+        synced_body TEXT,
+        synced_at   TEXT,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+    -- `(kind, scope, project_id, name)` as a plain table-level UNIQUE would do
+    -- nothing for `scope = 'user'` rows: `project_id` is always NULL there,
+    -- and SQLite never treats two NULLs as equal in a UNIQUE constraint — so
+    -- it would silently never fire for the most common rows. `COALESCE`
+    -- folds NULL to a value (-1; never a real project id) before the index
+    -- compares it, so the constraint genuinely holds at the DB level for
+    -- every row, not just `Store::ensure_library_name_free`'s check-then-insert
+    -- (which still owns the friendly `conflict` message; this index is the
+    -- backstop under it, the same role `builtin_id UNIQUE` plays above).
+    CREATE UNIQUE INDEX library_items_identity
+        ON library_items (kind, scope, COALESCE(project_id, -1), name);
+    CREATE TABLE library_versions (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id    INTEGER NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+        body       TEXT NOT NULL,
+        source     TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_library_versions_item ON library_versions(item_id, id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -979,6 +1026,106 @@ fn encode_script_args(args: &[ScriptArg]) -> Result<String> {
         .map_err(|e| Error::Validation(format!("cannot encode script arguments: {e}")))
 }
 
+// ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+
+const LIBRARY_COLUMNS: &str = "id, name, kind, scope, project_id, body, builtin_id, synced_body, synced_at, \
+     created_at, updated_at";
+
+/// `builtin` is always `false` here — a row read out of the db is by
+/// definition a fork, never an unshadowed built-in (`core::library::BUILTINS`
+/// never has a row); the caller that assembles a `list` response is what
+/// mixes in the unshadowed built-ins with `builtin: true`. `path` is derived
+/// from `kind`/`scope`/`name` on every read via `core::library::relative_path`
+/// — never stored, so it can never disagree with where a sync actually looks.
+fn row_to_library_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
+    let kind: String = row.get(2)?;
+    let kind = LibraryKind::parse(&kind).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(2, "kind".into(), rusqlite::types::Type::Text)
+    })?;
+    let scope: String = row.get(3)?;
+    let scope = LibraryScope::parse(&scope).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(3, "scope".into(), rusqlite::types::Type::Text)
+    })?;
+    let name: String = row.get(1)?;
+    let path = crate::core::library::relative_path(kind, scope, &name)
+        .map(|p| p.to_string_lossy().into_owned());
+    Ok(LibraryItem {
+        id: row.get(0)?,
+        name,
+        kind,
+        scope,
+        project_id: row.get(4)?,
+        body: row.get(5)?,
+        builtin_id: row.get(6)?,
+        builtin: false,
+        path,
+        synced_body: row.get(7)?,
+        synced_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+/// Longest allowed [`LibraryItem::name`]. Generous relative to
+/// [`SCRIPT_ARG_NAME_MAX`] — a library name becomes a filename, not an
+/// env-var suffix, so the bound only needs to keep a path sane.
+const LIBRARY_NAME_MAX: usize = 100;
+
+/// Largest allowed [`LibraryItem::body`] — a library row is a whole file
+/// (an agent definition, a hook script, a CLAUDE.md), so the bound is much
+/// larger than a script's, but still bounded: nothing about this feature
+/// should be able to write an unbounded blob to disk on sync.
+const LIBRARY_BODY_MAX: usize = 1024 * 1024;
+
+/// A library name is half a filename (`core::library::relative_path` builds a
+/// path out of it directly), so this is the one traversal chokepoint on the
+/// write side: no `/`, no `\`, no `..`, and the charset that leaves outright.
+/// `files.rs::safe_path()`/`core::library::resolve` are the belt to this
+/// braces on the read side.
+fn validate_library_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Validation(
+            "library item name is required and may not be empty".into(),
+        ));
+    }
+    if trimmed.len() > LIBRARY_NAME_MAX {
+        return Err(Error::Validation(format!(
+            "library item name must be {LIBRARY_NAME_MAX} characters or fewer"
+        )));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(Error::Validation(
+            "library item name may not be \".\" or \"..\"".into(),
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err(Error::Validation(
+            "library item name may not contain \"/\", \"\\\", or \"..\" — it becomes half of a \
+             file path"
+                .into(),
+        ));
+    }
+    let mut chars = trimmed.chars();
+    let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric());
+    let tail_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !head_ok || !tail_ok {
+        return Err(Error::Validation(
+            "library item name must match ^[A-Za-z0-9][A-Za-z0-9._-]*$".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_library_body(body: &str) -> Result<String> {
+    if body.len() > LIBRARY_BODY_MAX {
+        return Err(Error::Validation(format!(
+            "library item body must be {LIBRARY_BODY_MAX} bytes or fewer"
+        )));
+    }
+    Ok(body.to_string())
+}
+
 const ATTACHMENT_COLUMNS: &str =
     "id, task_id, filename, content_type, size_bytes, author, created_at";
 
@@ -1327,6 +1474,27 @@ pub struct ScriptPatch {
     pub body: Option<String>,
     /// Replaces the full declared arg list.
     pub args: Option<Vec<ScriptArg>>,
+}
+
+/// Fields to change on a library item; `None` means leave unchanged (task
+/// 919). `scope`/`project_id` are replace-only pairs — see
+/// `Store::update_library_item` — because moving a row is really "does this
+/// project id exist and does the scope agree with it", the same question
+/// `create_library_item` asks.
+#[derive(Debug, Default, Clone)]
+pub struct LibraryPatch {
+    /// Replace-only and non-empty — the CLI/API resolve an item by id, but
+    /// the name is half of its file path.
+    pub name: Option<String>,
+    /// Replace-only and non-empty — the body *is* the file.
+    pub body: Option<String>,
+    pub kind: Option<LibraryKind>,
+    pub scope: Option<LibraryScope>,
+    /// `Some(None)` un-binds (only valid alongside `scope: Some(User)`);
+    /// `Some(Some(id))` binds to that project (only valid alongside
+    /// `scope: Some(Project)`). Present iff `scope` is also present — the two
+    /// are validated as one pair, mirroring `create_library_item`.
+    pub project_id: Option<Option<i64>>,
 }
 
 /// A new frame to add to a diagram. Coordinates and size are caller-supplied
@@ -4039,6 +4207,321 @@ impl Store {
         if let Some(other) = clash {
             return Err(Error::Conflict(format!(
                 "script {other} is already named {name:?}; script names are unique"
+            )));
+        }
+        Ok(())
+    }
+
+    // ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+
+    /// Rows visible from a given context: with `project` given, a project's
+    /// own `scope: project` rows plus every `scope: user` row (a project's
+    /// library page shows both what is personal and what is bound to it,
+    /// exactly as `mesa library sync` would need to check both bases); with
+    /// `project` absent, only `scope: user` rows — the user-level view that
+    /// is not standing in any particular project. Built-ins are not rows and
+    /// are not returned here; the caller layers `core::library::BUILTINS` in
+    /// for whichever built-in has no forking row.
+    pub fn list_library_items(&self, project: Option<i64>) -> Result<Vec<LibraryItem>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIBRARY_COLUMNS} FROM library_items \
+             WHERE scope = 'user' OR (scope = 'project' AND project_id = ?1) \
+             ORDER BY kind, name COLLATE NOCASE, id"
+        ))?;
+        let rows = stmt.query_map([project], row_to_library_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_library_item(&self, id: i64) -> Result<LibraryItem> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIBRARY_COLUMNS} FROM library_items WHERE id = ?1"),
+                [id],
+                row_to_library_item,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("library item {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Exact match on the whole uniqueness key — how a caller checks "is this
+    /// path already taken" before creating, and how `core::library::BUILTINS`
+    /// membership is layered in for `list`/`get` (a name match here is the
+    /// unshadowed-vs-forked distinction for a built-in).
+    pub fn find_library_item(
+        &self,
+        kind: LibraryKind,
+        scope: LibraryScope,
+        project_id: Option<i64>,
+        name: &str,
+    ) -> Result<Option<LibraryItem>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {LIBRARY_COLUMNS} FROM library_items \
+                     WHERE kind = ?1 AND scope = ?2 \
+                     AND ((project_id IS NULL AND ?3 IS NULL) OR project_id = ?3) \
+                     AND name = ?4"
+                ),
+                (kind.as_str(), scope.as_str(), project_id, name),
+                row_to_library_item,
+            )
+            .optional()
+            .map_err(Error::Db)
+    }
+
+    /// The row that forked a given built-in, if any.
+    pub fn find_library_fork(&self, builtin_id: &str) -> Result<Option<LibraryItem>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIBRARY_COLUMNS} FROM library_items WHERE builtin_id = ?1"),
+                [builtin_id],
+                row_to_library_item,
+            )
+            .optional()
+            .map_err(Error::Db)
+    }
+
+    /// Stores a new library item and its first version. `builtin_id`, when
+    /// given, is how an edit to a built-in *forks* it (`docs` — "editing a
+    /// built-in forks it"): the id must name a real built-in
+    /// (`core::library::builtin`) and must not already have a fork
+    /// (`conflict` — a built-in forks at most once).
+    pub fn create_library_item(
+        &mut self,
+        kind: LibraryKind,
+        scope: LibraryScope,
+        project_id: Option<i64>,
+        name: &str,
+        body: &str,
+        builtin_id: Option<&str>,
+    ) -> Result<LibraryItem> {
+        let name = validate_library_name(name)?;
+        let body = validate_library_body(body)?;
+        self.ensure_library_scope(scope, project_id)?;
+        self.ensure_library_name_free(kind, scope, project_id, &name, None)?;
+        if let Some(builtin_id) = builtin_id {
+            self.ensure_library_builtin(builtin_id)?;
+        }
+        self.conn.execute(
+            "INSERT INTO library_items \
+             (name, kind, scope, project_id, body, builtin_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+            (
+                &name,
+                kind.as_str(),
+                scope.as_str(),
+                project_id,
+                &body,
+                builtin_id,
+            ),
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.append_library_version(id, &body, "edit")?;
+        self.get_library_item(id)
+    }
+
+    /// Applies a patch. `name`/`body`/`kind`/`scope` are replace-only and
+    /// non-nullable, mirroring `ScriptPatch`: a library row's name and body
+    /// are its identity on disk, so there is no "clear" for either.
+    /// `project_id` is validated alongside whichever of `kind`/`scope` it
+    /// ends up paired with (the same question `create_library_item` asks),
+    /// even when the caller only changed one of the two. A version is
+    /// appended only when the resulting body actually differs from the
+    /// current one — a no-op update writes no history.
+    pub fn update_library_item(&mut self, id: i64, patch: LibraryPatch) -> Result<LibraryItem> {
+        let current = self.get_library_item(id)?;
+        let next_kind = patch.kind.unwrap_or(current.kind);
+        let next_scope = patch.scope.unwrap_or(current.scope);
+        let next_project_id = patch.project_id.unwrap_or(current.project_id);
+        let next_name = match &patch.name {
+            Some(name) => validate_library_name(name)?,
+            None => current.name.clone(),
+        };
+        let next_body = match &patch.body {
+            Some(body) => validate_library_body(body)?,
+            None => current.body.clone(),
+        };
+
+        let identity_changed = next_kind != current.kind
+            || next_scope != current.scope
+            || next_project_id != current.project_id
+            || next_name != current.name;
+        if identity_changed {
+            self.ensure_library_scope(next_scope, next_project_id)?;
+            self.ensure_library_name_free(
+                next_kind,
+                next_scope,
+                next_project_id,
+                &next_name,
+                Some(id),
+            )?;
+        }
+
+        self.conn.execute(
+            "UPDATE library_items SET name = ?1, kind = ?2, scope = ?3, project_id = ?4, \
+             body = ?5, updated_at = datetime('now') WHERE id = ?6",
+            (
+                &next_name,
+                next_kind.as_str(),
+                next_scope.as_str(),
+                next_project_id,
+                &next_body,
+                id,
+            ),
+        )?;
+        if next_body != current.body {
+            self.append_library_version(id, &next_body, "edit")?;
+        }
+        self.get_library_item(id)
+    }
+
+    /// Deletes a library item; returns the destroyed record (the recoverable
+    /// echo — `library_versions` cascades with it). Deleting the fork of a
+    /// built-in is how the built-in is restored unshadowed; deleting an
+    /// unshadowed built-in never reaches here — there is no row, and the
+    /// caller answers `validation` before calling.
+    pub fn delete_library_item(&mut self, id: i64) -> Result<LibraryItem> {
+        let item = self.get_library_item(id)?;
+        self.conn
+            .execute("DELETE FROM library_items WHERE id = ?1", [id])?;
+        Ok(item)
+    }
+
+    /// Newest first — the history reads top-down like everything else that
+    /// reports "what changed", the `TaskEvent` convention.
+    pub fn list_library_versions(&self, item_id: i64) -> Result<Vec<LibraryVersion>> {
+        self.get_library_item(item_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, item_id, body, source, created_at FROM library_versions \
+             WHERE item_id = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([item_id], |row| {
+            Ok(LibraryVersion {
+                id: row.get(0)?,
+                item_id: row.get(1)?,
+                body: row.get(2)?,
+                source: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Stamps the sync baseline without moving `updated_at` — the
+    /// `claimed_at` asymmetry held a second time: this call records that mesa
+    /// and the disk agree, it does not change what mesa itself holds, so it
+    /// must not read as an edit.
+    pub fn set_library_synced(&mut self, id: i64, synced_body: &str) -> Result<LibraryItem> {
+        self.get_library_item(id)?;
+        self.conn.execute(
+            "UPDATE library_items SET synced_body = ?1, synced_at = datetime('now') \
+             WHERE id = ?2",
+            (synced_body, id),
+        )?;
+        self.get_library_item(id)
+    }
+
+    /// Pulls the disk side of a sync into the body: appends a `sync-pull`
+    /// version (when the body actually changes), and — unlike
+    /// `set_library_synced` — moves `updated_at`, because this call *does*
+    /// change what mesa holds.
+    pub fn pull_library_body(&mut self, id: i64, body: &str) -> Result<LibraryItem> {
+        let current = self.get_library_item(id)?;
+        let body = validate_library_body(body)?;
+        self.conn.execute(
+            "UPDATE library_items SET body = ?1, synced_body = ?1, synced_at = datetime('now'), \
+             updated_at = datetime('now') WHERE id = ?2",
+            (&body, id),
+        )?;
+        if body != current.body {
+            self.append_library_version(id, &body, "sync-pull")?;
+        }
+        self.get_library_item(id)
+    }
+
+    fn append_library_version(&mut self, item_id: i64, body: &str, source: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO library_versions (item_id, body, source, created_at) \
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            (item_id, body, source),
+        )?;
+        Ok(())
+    }
+
+    /// `scope: user` requires no `project_id`; `scope: project` requires one
+    /// that exists. Both directions are `validation` — a supplied id under
+    /// `user` is just as wrong as a missing one under `project`.
+    fn ensure_library_scope(&self, scope: LibraryScope, project_id: Option<i64>) -> Result<()> {
+        match (scope, project_id) {
+            (LibraryScope::User, Some(_)) => Err(Error::Validation(
+                "a user-scoped library item may not carry a project_id".into(),
+            )),
+            (LibraryScope::User, None) => Ok(()),
+            (LibraryScope::Project, None) => Err(Error::Validation(
+                "a project-scoped library item requires a project_id".into(),
+            )),
+            (LibraryScope::Project, Some(project_id)) => {
+                let exists: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                    [project_id],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    return Err(Error::Validation(format!("project {project_id} not found")));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// `(kind, scope, project_id, name)` uniqueness — exact match, not
+    /// case-folded, matching the schema's `UNIQUE` index (a library name is a
+    /// filename, and filenames are case-sensitive on the filesystems this
+    /// syncs to).
+    fn ensure_library_name_free(
+        &self,
+        kind: LibraryKind,
+        scope: LibraryScope,
+        project_id: Option<i64>,
+        name: &str,
+        except: Option<i64>,
+    ) -> Result<()> {
+        let clash: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM library_items WHERE kind = ?1 AND scope = ?2 \
+                 AND ((project_id IS NULL AND ?3 IS NULL) OR project_id = ?3) \
+                 AND name = ?4 AND id IS NOT ?5 LIMIT 1",
+                (kind.as_str(), scope.as_str(), project_id, name, except),
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = clash {
+            return Err(Error::Conflict(format!(
+                "library item {other} already claims {} {} {name:?}",
+                scope.as_str(),
+                kind.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `builtin_id` must name a real built-in and must not already have a
+    /// fork — a built-in forks at most once.
+    fn ensure_library_builtin(&self, builtin_id: &str) -> Result<()> {
+        if crate::core::library::builtin(builtin_id).is_none() {
+            return Err(Error::Validation(format!(
+                "{builtin_id:?} is not a known built-in library item"
+            )));
+        }
+        if let Some(existing) = self.find_library_fork(builtin_id)? {
+            return Err(Error::Conflict(format!(
+                "built-in {builtin_id:?} is already forked as library item {}",
+                existing.id.expect("a fork always has an id")
             )));
         }
         Ok(())
@@ -9424,6 +9907,413 @@ mod tests {
             store.update_script(999, ScriptPatch::default()),
             Err(Error::NotFound(_))
         ));
+    }
+
+    // ---- library ----
+
+    #[test]
+    fn create_get_update_delete_library_item_round_trip() {
+        let (mut store, _dir) = temp_store();
+        let created = store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::User,
+                None,
+                "reviewer",
+                "you review code",
+                None,
+            )
+            .unwrap();
+        assert_eq!(created.name, "reviewer");
+        assert_eq!(created.kind, LibraryKind::Agent);
+        assert_eq!(created.scope, LibraryScope::User);
+        assert_eq!(created.body, "you review code");
+        assert!(!created.builtin);
+        assert_eq!(created.path.as_deref(), Some(".claude/agents/reviewer.md"));
+        assert!(created.synced_body.is_none());
+
+        let fetched = store.get_library_item(created.id.unwrap()).unwrap();
+        assert_eq!(fetched, created);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let updated = store
+            .update_library_item(
+                created.id.unwrap(),
+                LibraryPatch {
+                    body: Some("you review code carefully".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.body, "you review code carefully");
+        assert_ne!(updated.updated_at, created.updated_at.clone());
+
+        let deleted = store.delete_library_item(created.id.unwrap()).unwrap();
+        assert_eq!(deleted.id, created.id);
+        assert!(matches!(
+            store.get_library_item(created.id.unwrap()),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn library_name_rule_rejects_traversal_and_bad_shapes() {
+        let (mut store, _dir) = temp_store();
+        for bad in ["../evil", "a/b", "..", ".", "", "  ", "a\\b"] {
+            assert!(
+                matches!(
+                    store.create_library_item(
+                        LibraryKind::Agent,
+                        LibraryScope::User,
+                        None,
+                        bad,
+                        "body",
+                        None,
+                    ),
+                    Err(Error::Validation(_))
+                ),
+                "{bad:?} should have been rejected"
+            );
+        }
+        // A valid name is still accepted.
+        assert!(
+            store
+                .create_library_item(
+                    LibraryKind::Agent,
+                    LibraryScope::User,
+                    None,
+                    "a.valid-name_1",
+                    "body",
+                    None,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn library_scope_and_project_id_must_pair() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+
+        // user scope with a project_id is rejected.
+        assert!(matches!(
+            store.create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::User,
+                Some(p.id),
+                "x",
+                "body",
+                None,
+            ),
+            Err(Error::Validation(_))
+        ));
+        // project scope with no project_id is rejected.
+        assert!(matches!(
+            store.create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                None,
+                "x",
+                "body",
+                None,
+            ),
+            Err(Error::Validation(_))
+        ));
+        // project scope with an unknown project_id is rejected.
+        assert!(matches!(
+            store.create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(999),
+                "x",
+                "body",
+                None,
+            ),
+            Err(Error::Validation(_))
+        ));
+        // project scope with a real project_id is accepted.
+        let created = store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(p.id),
+                "x",
+                "body",
+                None,
+            )
+            .unwrap();
+        assert_eq!(created.project_id, Some(p.id));
+        assert_eq!(
+            created.path.as_deref(),
+            Some(".claude/agents/x.md"),
+            "a project-scoped agent uses the same relative path as user scope"
+        );
+    }
+
+    #[test]
+    fn library_uniqueness_is_a_conflict() {
+        let (mut store, _dir) = temp_store();
+        store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::User,
+                None,
+                "reviewer",
+                "body",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::User,
+                None,
+                "reviewer",
+                "different body",
+                None,
+            ),
+            Err(Error::Conflict(_))
+        ));
+        // A different kind or scope with the same name is not a clash.
+        assert!(
+            store
+                .create_library_item(
+                    LibraryKind::Skill,
+                    LibraryScope::User,
+                    None,
+                    "reviewer",
+                    "body",
+                    None,
+                )
+                .is_ok()
+        );
+    }
+
+    /// `ensure_library_name_free` is check-then-insert, so it alone cannot
+    /// guarantee uniqueness under a race; `library_items_identity` is the DB-
+    /// level backstop. This test bypasses `Store` entirely and inserts
+    /// directly through the connection — the only way to prove the index
+    /// itself, rather than the application check in front of it, is what
+    /// actually refuses the second row. The case that matters is two
+    /// `user`-scope rows (`project_id` always NULL there): a plain
+    /// `UNIQUE (kind, scope, project_id, name)` would never fire for them,
+    /// since SQLite treats two NULLs as distinct.
+    #[test]
+    fn library_identity_index_rejects_a_duplicate_at_the_db_level() {
+        let (store, _dir) = temp_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO library_items \
+                 (name, kind, scope, project_id, body, created_at, updated_at) \
+                 VALUES ('reviewer', 'agent', 'user', NULL, 'body', \
+                 datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        let err = store
+            .conn
+            .execute(
+                "INSERT INTO library_items \
+                 (name, kind, scope, project_id, body, created_at, updated_at) \
+                 VALUES ('reviewer', 'agent', 'user', NULL, 'different body', \
+                 datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation
+            ),
+            "expected a UNIQUE constraint violation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn version_history_only_grows_on_a_real_body_change() {
+        let (mut store, _dir) = temp_store();
+        let item = store
+            .create_library_item(
+                LibraryKind::Hook,
+                LibraryScope::User,
+                None,
+                "stop-notify",
+                "echo one",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_library_versions(item.id.unwrap()).unwrap().len(),
+            1
+        );
+
+        // A no-op update (unchanged body) appends nothing.
+        store
+            .update_library_item(
+                item.id.unwrap(),
+                LibraryPatch {
+                    name: Some("stop-notify".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_library_versions(item.id.unwrap()).unwrap().len(),
+            1
+        );
+
+        // A real body change appends a version, newest first.
+        store
+            .update_library_item(
+                item.id.unwrap(),
+                LibraryPatch {
+                    body: Some("echo two".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let versions = store.list_library_versions(item.id.unwrap()).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].body, "echo two");
+        assert_eq!(versions[0].source, "edit");
+        assert_eq!(versions[1].body, "echo one");
+    }
+
+    #[test]
+    fn set_library_synced_leaves_updated_at_alone() {
+        let (mut store, _dir) = temp_store();
+        let item = store
+            .create_library_item(
+                LibraryKind::Hook,
+                LibraryScope::User,
+                None,
+                "stop-notify",
+                "echo one",
+                None,
+            )
+            .unwrap();
+        // Force a distinct timestamp to compare against.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let synced = store
+            .set_library_synced(item.id.unwrap(), "echo one")
+            .unwrap();
+        assert_eq!(synced.synced_body.as_deref(), Some("echo one"));
+        assert!(synced.synced_at.is_some());
+        assert_eq!(
+            synced.updated_at, item.updated_at,
+            "a pure baseline stamp must not move updated_at"
+        );
+    }
+
+    #[test]
+    fn pull_library_body_appends_a_sync_pull_version_and_moves_updated_at() {
+        let (mut store, _dir) = temp_store();
+        let item = store
+            .create_library_item(
+                LibraryKind::Hook,
+                LibraryScope::User,
+                None,
+                "stop-notify",
+                "echo one",
+                None,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let pulled = store
+            .pull_library_body(item.id.unwrap(), "echo from disk")
+            .unwrap();
+        assert_eq!(pulled.body, "echo from disk");
+        assert_eq!(pulled.synced_body.as_deref(), Some("echo from disk"));
+        assert_ne!(pulled.updated_at, item.updated_at);
+
+        let versions = store.list_library_versions(item.id.unwrap()).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].body, "echo from disk");
+        assert_eq!(versions[0].source, "sync-pull");
+    }
+
+    #[test]
+    fn deleting_a_library_item_cascades_its_versions() {
+        let (mut store, _dir) = temp_store();
+        let item = store
+            .create_library_item(
+                LibraryKind::Hook,
+                LibraryScope::User,
+                None,
+                "stop-notify",
+                "echo one",
+                None,
+            )
+            .unwrap();
+        store
+            .update_library_item(
+                item.id.unwrap(),
+                LibraryPatch {
+                    body: Some("echo two".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_library_versions(item.id.unwrap()).unwrap().len(),
+            2
+        );
+        store.delete_library_item(item.id.unwrap()).unwrap();
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM library_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn forking_a_builtin_is_gated_on_a_real_unforked_id() {
+        let (mut store, _dir) = temp_store();
+        // An unknown builtin_id is rejected.
+        assert!(matches!(
+            store.create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "live-agent-prompt",
+                "custom prompt",
+                Some("no-such-builtin"),
+            ),
+            Err(Error::Validation(_))
+        ));
+        // A real builtin_id forks it.
+        let forked = store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "live-agent-prompt",
+                "custom prompt",
+                Some("live-agent-prompt"),
+            )
+            .unwrap();
+        assert_eq!(forked.builtin_id.as_deref(), Some("live-agent-prompt"));
+        // Forking the same builtin a second time is a conflict.
+        assert!(matches!(
+            store.create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "live-agent-prompt-2",
+                "another",
+                Some("live-agent-prompt"),
+            ),
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .find_library_fork("live-agent-prompt")
+                .unwrap()
+                .unwrap()
+                .id,
+            forked.id
+        );
     }
 
     // ---- cc telemetry ----

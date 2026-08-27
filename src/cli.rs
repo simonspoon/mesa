@@ -27,9 +27,9 @@ use crate::core::{
     Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
     Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveRole,
-    LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project, ProjectPatch, Result, Script,
-    ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, agents, config, library,
-    live, look,
+    LiveSession, LiveStatus, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
+    Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
+    TaskReceipt, agents, config, library, live, look, receipt,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -590,6 +590,66 @@ EXAMPLES
         ///
         /// The full echo is the recovery transcript that stands in for a
         /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Show, regenerate, annotate or delete a task's automatic work receipt
+    /// (task 920)
+    ///
+    /// A receipt is generated AUTOMATICALLY, once, the moment a claimed task
+    /// closes into `done` — see `core::receipt::update_task`, the chokepoint
+    /// both `task update` and the API's `PATCH /api/tasks/{id}` go through
+    /// instead of `Store::update_task` directly, so CLI and API can never
+    /// diverge on when a receipt is written. This subcommand never creates
+    /// the first receipt; it only reads or revises one that already exists.
+    ///
+    /// Unlike `task update`, there is no required `fields` ArgGroup here: a
+    /// bare `receipt <ID>` with none of `--regenerate`/`--note`/`--delete` is
+    /// a complete, legal show, not a no-op that needs rejecting the way a
+    /// field-less `update` does. `--quiet` still sits outside every group as
+    /// a pure modifier, the same as elsewhere — it just has nothing required
+    /// to sit outside of on this subcommand.
+    #[command(after_help = "\
+EXAMPLES
+  mesa task receipt 3                            # show it (not_found if none exists)
+  mesa task receipt 3 --regenerate               # recompute from the claim window
+  mesa task receipt 3 --note \"re-ran once, flaky test\"
+  mesa task receipt 3 --note \"\"                   # clear the note
+  mesa task receipt 3 --delete                   # echo the destroyed record
+  mesa task receipt 3 --quiet                    # drop commits/note")]
+    Receipt {
+        /// Task id
+        id: i64,
+        /// Recompute the receipt from the claim window instead of printing
+        /// the stored one
+        ///
+        /// Windows from the EXISTING receipt's `claimed_at`/`owner` when
+        /// there is one, falling back to the task's own live claim only when
+        /// there is no receipt yet. This order matters: the whole point of a
+        /// receipt is that it survives the claim closing, and closing is
+        /// exactly what clears `Task::owner`/`claimed_at`
+        /// (`Store::update_task`, the instant status leaves `in_progress`) —
+        /// so re-reading the task's own claim on an already-closed task would
+        /// find nothing, and `--regenerate` on the common case (a done task
+        /// that already has a receipt) would fail every time instead of just
+        /// the once.
+        #[arg(long, conflicts_with_all = ["note", "delete"])]
+        regenerate: bool,
+        /// Set (or, given "", clear) the human-written note; marks the
+        /// receipt `edited` so a hand-corrected record can never silently
+        /// pose as purely machine-generated (spec D6)
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            conflicts_with_all = ["regenerate", "delete"]
+        )]
+        note: Option<String>,
+        /// Delete the receipt, echoing the destroyed record (recovery
+        /// transcript, same convention as `task delete`)
+        #[arg(long, conflicts_with_all = ["regenerate", "note"])]
+        delete: bool,
+        /// Print the compact receipt (drops `commits`/`note`, its two
+        /// unbounded fields) instead of the full object
         #[arg(long)]
         quiet: bool,
     },
@@ -2418,6 +2478,13 @@ const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
 /// fields `Store` caps at 200 chars, a four-integer window box, and
 /// timestamps — so quiet output equals full output. The flag is accepted across the group for uniformity.
 const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
+/// Keys dropped from a `TaskReceipt` under `--quiet` (task 920): `commits`,
+/// a git log capped at `core::git::LOG_CAP` but still unbounded as far as a
+/// caller reading one JSON line is concerned, and `note`, the one field on a
+/// receipt that is free text by design. Everything else — ids, timestamps,
+/// the branch/repo path, the summed `stat`, and the session link — is
+/// already bounded.
+const QUIET_DROP_RECEIPT: &[&str] = &["commits", "note"];
 
 /// Quiet projection of one record: the serialized record minus `drop`ped keys.
 ///
@@ -2529,6 +2596,12 @@ fn print_live_session(session: &LiveSession, is_quiet: bool) {
 /// Print one live turn: the full record, or the record minus its spoken `text`.
 fn print_live_turn(turn: &LiveTurn, is_quiet: bool) {
     print_record(turn, is_quiet, QUIET_DROP_LIVE_TURN);
+}
+
+/// Print one task receipt: the full record, or the record minus
+/// `commits`/`note` (task 920).
+fn print_receipt(receipt: &TaskReceipt, is_quiet: bool) {
+    print_record(receipt, is_quiet, QUIET_DROP_RECEIPT);
 }
 
 /// Print a `{diagram, frames, edges}` view (`diagram show`/`delete`).
@@ -2929,9 +3002,41 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 sort_order: None,
                 append,
             };
-            print_task(&store.update_task(id, &patch)?, quiet);
+            // Chokepoint (spec D3): CLI and API must share the ONE place a
+            // status change can trigger receipt generation, so this calls
+            // `core::receipt::update_task` rather than `store.update_task`
+            // directly — mirroring `agents::spawn_bg` being the one chokepoint
+            // every agent spawn goes through instead of four separate
+            // `Command::new("claude")` call sites.
+            print_task(&receipt::update_task(&mut store, id, &patch)?, quiet);
         }
         TaskCmd::Delete { id, quiet } => print_tasks(&store.delete_task(id)?, quiet),
+        TaskCmd::Receipt {
+            id,
+            regenerate,
+            note,
+            delete,
+            quiet,
+        } => {
+            if delete {
+                print_receipt(&store.delete_task_receipt(id)?, quiet);
+            } else if let Some(note) = note {
+                let patch = ReceiptPatch {
+                    note: Some(clear_if_empty(note)),
+                };
+                print_receipt(&store.update_task_receipt(id, &patch)?, quiet);
+            } else if regenerate {
+                // Chokepoint (spec D3, mesa task 920 defect 2): CLI and API
+                // share the ONE place `--regenerate` recomputes a receipt,
+                // same shape as `receipt::update_task` above.
+                print_receipt(&receipt::regenerate(&mut store, id)?, quiet);
+            } else {
+                match store.get_task_receipt(id)? {
+                    Some(r) => print_receipt(&r, quiet),
+                    None => return Err(Error::NotFound(format!("no receipt for task {id}"))),
+                }
+            }
+        }
         TaskCmd::Claim {
             id,
             owner,
@@ -4060,7 +4165,7 @@ mod tests {
         AnchorSide, Diagram, DiagramType, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape,
         InboxItem, Project, TaskSummary, Waypoint,
     };
-    use crate::core::{LiveContext, LiveContextKind, LiveWindow};
+    use crate::core::{DiffStat, GitCommit, LiveContext, LiveContextKind, LiveWindow};
 
     /// Serialized top-level key set of any record, sorted.
     fn keys(value: &impl serde::Serialize) -> Vec<String> {
@@ -4290,6 +4395,34 @@ mod tests {
             created_at: "2026-01-01 00:00:00".into(),
             delivered_at: Some("2026-01-01 00:00:01".into()),
             played_at: Some("2026-01-01 00:00:02".into()),
+        }
+    }
+
+    fn sample_receipt() -> TaskReceipt {
+        TaskReceipt {
+            task_id: 1,
+            generated_at: "2026-01-02 03:04:05".into(),
+            owner: Some("session_abc".into()),
+            claimed_at: Some("2026-01-01 00:00:00".into()),
+            closed_at: "2026-01-02 03:04:00".into(),
+            branch: Some("trunk".into()),
+            repo_path: Some("/repo".into()),
+            commits: vec![GitCommit {
+                hash: "a".repeat(40),
+                short_hash: "aaaaaaa".into(),
+                author: "t".into(),
+                date: "2026-01-01T12:00:00Z".into(),
+                subject: "did the thing".into(),
+            }],
+            stat: DiffStat {
+                files_changed: 2,
+                insertions: 10,
+                deletions: 3,
+            },
+            session_id: None,
+            transcript_path: None,
+            edited: false,
+            note: Some("n".into()),
         }
     }
 
@@ -4703,6 +4836,47 @@ mod tests {
                 QUIET_DROP_LIVE_TURN
             ))),
             minus(&full, QUIET_DROP_LIVE_TURN),
+        );
+    }
+
+    #[test]
+    fn receipt_quiet_drops_commits_and_note() {
+        let full = keys(&sample_receipt());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "task_id",
+                // Moves on `--regenerate`; unrelated to `edited`. Bounded.
+                "generated_at",
+                // The claimant's raw string, verbatim even when it never
+                // resolves to a `cc_sessions` row (D5). Bounded.
+                "owner",
+                "claimed_at",
+                "closed_at",
+                "branch",
+                "repo_path",
+                // Unbounded: a git log capped at `core::git::LOG_CAP`, but
+                // still open-ended as far as a caller reading one JSON line
+                // is concerned. Dropped.
+                "commits",
+                // A summed {files_changed, insertions, deletions} triple —
+                // three bounded integers, not the log itself. Kept.
+                "stat",
+                "session_id",
+                "transcript_path",
+                // Set the moment a human writes a note; never by
+                // regeneration. Bounded (a bool).
+                "edited",
+                // The one field on a receipt that is free text by design.
+                // Dropped.
+                "note",
+            ]),
+            "TaskReceipt gained/lost a field: decide whether it belongs in \
+             the --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(&sample_receipt(), QUIET_DROP_RECEIPT))),
+            minus(&full, QUIET_DROP_RECEIPT),
         );
     }
 

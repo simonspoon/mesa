@@ -44,8 +44,9 @@ use crate::core::{
     InboxItem, InboxKind, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole,
     LiveState, LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents,
     ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion,
-    Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, config, files, git, hooks, library, live, scripts, speech, version,
+    ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary,
+    Waypoint, agents, attachments, config, files, git, hooks, library, live, receipt, scripts,
+    speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -715,6 +716,18 @@ fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/release", post(release_task))
         .route("/api/tasks/{id}/block", post(block_task))
         .route("/api/tasks/{id}/unblock", post(unblock_task))
+        // Task receipts (task 920) — NO per-route gate, matching the plain
+        // task CRUD routes above (see the handlers' own doc comment).
+        .route(
+            "/api/tasks/{id}/receipt",
+            get(show_receipt)
+                .patch(update_receipt)
+                .delete(delete_receipt),
+        )
+        .route(
+            "/api/tasks/{id}/receipt/regenerate",
+            post(regenerate_receipt),
+        )
         .route("/api/tasks/{id}/dependencies", get(list_dependencies))
         .route("/api/tasks/{id}/dependents", get(list_dependents))
         // Attachments: file uploads/downloads scoped to a task. Upload is
@@ -1454,12 +1467,84 @@ async fn update_task(
         append: false,
     };
     let mut store = state.store.lock().unwrap();
-    Ok(Json(store.update_task(id, &patch)?).into_response())
+    // Chokepoint (spec D3, task 920): goes through `core::receipt::update_task`
+    // rather than `store.update_task` directly, so this route and `mesa task
+    // update` can never diverge on when a work receipt gets generated — the
+    // same "one chokepoint, several call sites" shape `agents::spawn_bg` gives
+    // every agent spawn.
+    Ok(Json(receipt::update_task(&mut store, id, &patch)?).into_response())
 }
 
 async fn delete_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let mut store = state.store.lock().unwrap();
     Ok(Json(store.delete_task(id)?).into_response())
+}
+
+// ---- task receipts (task 920) ----
+//
+// A receipt is generated automatically, once, the moment a claimed task
+// closes into `done` (`receipt::update_task`, wired into `update_task`
+// above); these four routes never create the first one, only read or revise
+// one that already exists. Deliberately NO per-route gate here, matching
+// `show_task`/`update_task`/`delete_task` immediately above them exactly —
+// only the router-wide Host-allowlist + Content-Type middleware applies. A
+// receipt is task metadata hanging off the same row those three routes
+// already serve with no gate: it is not code execution (unlike
+// `execute_task`, which shares the agents' access gate below) and not a disk
+// read of its own (`local_path`/git are read once, at generation time, and
+// the result is frozen into the row) — inventing a stricter gate for reading
+// or annotating that frozen row than the task record it belongs to would be
+// a distinction with no security content, exactly the reasoning the library
+// surface's loopback gate documents for the opposite conclusion when the
+// bytes served ARE a live disk read.
+
+/// Fields a human may set directly on a receipt via `PATCH
+/// /api/tasks/{id}/receipt`. `note` is the only one — everything else on
+/// `TaskReceipt` is machine-generated and changes only by regeneration
+/// (`receipt::generate`), never by patch. Mirrors `mesa task receipt --note`.
+#[derive(Deserialize)]
+struct ReceiptUpdate {
+    /// `Some(None)` clears the note; `Some(Some(text))` sets it; an omitted
+    /// key changes nothing — same `double_option` convention as `TaskUpdate`'s
+    /// clearable fields. Either `Some` variant sets `edited = true` (spec D6).
+    #[serde(default, deserialize_with = "double_option")]
+    note: Option<Option<String>>,
+}
+
+async fn show_receipt(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    match store.get_task_receipt(id)? {
+        Some(r) => Ok(Json(r).into_response()),
+        None => Err(Error::NotFound(format!("no receipt for task {id}")).into()),
+    }
+}
+
+async fn update_receipt(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<ReceiptUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let patch = ReceiptPatch { note: body.note };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_task_receipt(id, &patch)?).into_response())
+}
+
+async fn delete_receipt(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.delete_task_receipt(id)?).into_response())
+}
+
+/// `POST /api/tasks/{id}/receipt/regenerate` — the API twin of `mesa task
+/// receipt --regenerate`, both now calling the shared `receipt::regenerate`
+/// chokepoint (spec D3, mesa task 920 defect 2) instead of hand-duplicating
+/// the validation/fallback/generate/put sequence.
+async fn regenerate_receipt(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(receipt::regenerate(&mut store, id)?).into_response())
 }
 
 /// Fires the task-execute hook for one task: the

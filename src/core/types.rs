@@ -456,6 +456,106 @@ pub struct GitCommitFile {
     pub orig_path: Option<String>,
 }
 
+/// Summed line/file counts over a set of commits (`core::git::diff_stat`,
+/// task 920). A bare triple rather than folding into `TaskReceipt` inline so
+/// it stays independently testable against `git.rs`'s `parse_numstat`, the
+/// same split `GitCommit`/`GitCommitFile` already keep from their owning
+/// records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct DiffStat {
+    /// Distinct paths touched across every summed commit, not a per-commit
+    /// sum (see `core::git::diff_stat`).
+    #[ts(type = "number")]
+    pub files_changed: u32,
+    #[ts(type = "number")]
+    pub insertions: u32,
+    #[ts(type = "number")]
+    pub deletions: u32,
+}
+
+/// A frozen record of what actually changed while a task was claimed and
+/// open (task 920, spec D1–D6). Generated once, at the moment a claimed task
+/// closes into `done`, and stored in its own table rather than as fields on
+/// `Task`:
+///
+/// - **Why frozen (D1):** `blocked` and `name` are derived-never-stored, but
+///   a receipt cannot follow that pattern — the claim window it describes is
+///   gone the instant it closes (`Store::update_task` nulls `owner`/
+///   `claimed_at` the moment status leaves `in_progress`) and the commits
+///   made during that window keep receding into git's ordinary history as
+///   more work lands on the branch. Recomputing "what changed while task N
+///   was open" after the fact is not possible even in principle once the
+///   claim is gone, so the only honest option is to capture it once, at
+///   close time, and keep that capture.
+/// - **Why a sibling record, not `Task` fields (D2):** `Task`/`TaskSummary`
+///   carry a long, heavily-specified `--quiet` key-parity contract
+///   (`cli.rs::compact()`); widening either to hold a commit list and a diff
+///   stat would force a decision across every existing projection for a
+///   field most reads never want. A receipt is fetched by its own
+///   subcommand/route instead. It sits beside `artifact`/`result` — which
+///   stay exactly as they are, hand-written and authoritative — and never
+///   overwrites either.
+/// - **Why the transcript link is best-effort (D5):** `owner` is whatever
+///   opaque string the claimant supplied; this repo's own execute-todo skill
+///   uses a `session_XXX` convention that is not a `cc_sessions` UUID and
+///   will never resolve. `owner`/`claimed_at` are therefore always stored
+///   verbatim, while `session_id`/`transcript_path` are filled in only when
+///   `owner` actually resolves against `Store::cc_session` — a null
+///   transcript is a legitimate, expected answer, never an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct TaskReceipt {
+    #[ts(type = "number")]
+    pub task_id: i64,
+    /// When this receipt was (re)generated (SQLite `datetime` text, UTC).
+    /// Moves on `--regenerate`; unrelated to `edited`, which tracks a human
+    /// hand touching the record afterward.
+    pub generated_at: String,
+    /// The claimant's `owner` string at close time, stored verbatim even
+    /// when it does not resolve to a `cc_sessions` row (see D5 above).
+    pub owner: Option<String>,
+    /// The claim's `claimed_at`, captured before `Store::update_task` clears
+    /// it on the same transition that produced this receipt — the start of
+    /// the window `commits`/`stat` were read from.
+    pub claimed_at: Option<String>,
+    /// When the task closed into `done` (SQLite `datetime` text, UTC) — the
+    /// end of the attribution window.
+    pub closed_at: String,
+    /// The repo branch at close time, so a reader can see which line of
+    /// history `commits` was read from. `None` when there was no readable
+    /// repo to check.
+    pub branch: Option<String>,
+    /// The project's `local_path` at generation time — where `commits`/
+    /// `stat` were read from. Recorded because `local_path` itself is not
+    /// frozen (task project may move or lose it later); the receipt keeps
+    /// its own copy of what it actually read.
+    pub repo_path: Option<String>,
+    /// Commits in `[claimed_at, closed_at]` on `branch`, newest first,
+    /// capped at `core::git::LOG_CAP` (`core::git::log_between`). Reuses
+    /// `GitCommit` rather than a second commit struct — same shape, same
+    /// meaning, no reason to duplicate it. Documented limitation (D4): two
+    /// claims on the same repo/branch/window would see the same commits;
+    /// this is the honest first cut, not a per-claim attribution guarantee.
+    pub commits: Vec<GitCommit>,
+    /// Summed diff stat over `commits` (`core::git::diff_stat`).
+    pub stat: DiffStat,
+    /// `cc_sessions.session_id` that `owner` resolved to, or `None` when it
+    /// didn't (see D5 above).
+    pub session_id: Option<String>,
+    /// The transcript file path for `session_id`'s main thread
+    /// (`Store::cc_node_file(session_id, "")`), or `None` when there is no
+    /// `session_id` or the file was never recorded/has since vanished.
+    pub transcript_path: Option<String>,
+    /// Set the moment a human writes to this receipt (a note, a manual
+    /// field edit) — never by regeneration itself, so a hand-corrected
+    /// receipt can never silently pose as purely machine-generated (D6).
+    pub edited: bool,
+    /// Free-text human addendum. The one field on a receipt that is meant to
+    /// be written by hand rather than regenerated.
+    pub note: Option<String>,
+}
+
 /// `GET /api/projects/{id}/git/log` response. Mirrors ProjectGitView's
 /// empty-state ladder, one level deeper: path null = no local_path; path
 /// set + commits null = folder gone / not a git repo; path set + commits

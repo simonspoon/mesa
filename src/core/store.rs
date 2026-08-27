@@ -6,11 +6,11 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
-    AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, EdgeMarker, EdgeStyle,
-    Frame, FrameEdge, FrameShape, InboxItem, InboxKind, LibraryItem, LibraryKind, LibraryScope,
-    LibraryVersion, LiveAction, LiveContext, LiveRole, LiveSession, LiveStatus, LiveTurn,
-    LiveWindow, Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Task, TaskEvent,
-    Waypoint, task_name,
+    AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat, EdgeMarker,
+    EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind, LibraryItem,
+    LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveContext, LiveRole, LiveSession,
+    LiveStatus, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg, ScriptArgKind, Status,
+    Task, TaskEvent, TaskReceipt, Waypoint, task_name,
 };
 
 #[derive(Debug)]
@@ -627,6 +627,40 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL
     );
     CREATE INDEX idx_library_versions_item ON library_versions(item_id, id);",
+    // Task 920: automatic work receipts. A frozen record of what changed
+    // while a task was claimed and open, written once at the moment a
+    // claimed task closes into `done` (see `core::receipt::update_task` and
+    // `TaskReceipt`'s doc comment for the full D1/D2/D5 reasoning). Keyed on
+    // `task_id` itself, not a surrogate id — a task has at most one receipt,
+    // and `INSERT OR REPLACE` on regeneration is exactly a keyed upsert.
+    // `ON DELETE CASCADE` because a receipt describing a deleted task is
+    // meaningless, the same posture library_versions takes on its item.
+    // `commits` is stored as JSON text (a `Vec<GitCommit>`, the same type
+    // the git-log routes already return) rather than a child table: nothing
+    // ever queries into one commit of a receipt, the whole list is read or
+    // written atomically, and every other JSON-blob column in this schema
+    // (`tasks.tags`, `live_sessions.context`/`window_box`) makes the same
+    // call for the same reason. `files_changed`/`insertions`/`deletions` are
+    // plain columns rather than folded into that JSON because a future
+    // "receipts with lots of insertions" report would want to filter/sort on
+    // them without deserializing every row.
+    "CREATE TABLE task_receipts (
+        task_id         INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        generated_at    TEXT NOT NULL,
+        owner           TEXT,
+        claimed_at      TEXT,
+        closed_at       TEXT NOT NULL,
+        branch          TEXT,
+        repo_path       TEXT,
+        commits         TEXT NOT NULL DEFAULT '[]',
+        files_changed   INTEGER NOT NULL DEFAULT 0,
+        insertions      INTEGER NOT NULL DEFAULT 0,
+        deletions       INTEGER NOT NULL DEFAULT 0,
+        session_id      TEXT,
+        transcript_path TEXT,
+        edited          INTEGER NOT NULL DEFAULT 0,
+        note            TEXT
+    );",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -688,6 +722,33 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
         from_status: from_status.map(|s| Status::parse(&s).expect("invalid status in db")),
         to_status: Status::parse(&to_status).expect("invalid status in db"),
         at: row.get(4)?,
+    })
+}
+
+/// Malformed stored `commits` JSON (a hand-edited db) reads back as an empty
+/// list rather than failing the whole receipt read — the same posture
+/// `row_to_task` takes on a NULL description: the row still has to render.
+fn row_to_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskReceipt> {
+    let commits_json: String = row.get(7)?;
+    let commits: Vec<GitCommit> = serde_json::from_str(&commits_json).unwrap_or_default();
+    Ok(TaskReceipt {
+        task_id: row.get(0)?,
+        generated_at: row.get(1)?,
+        owner: row.get(2)?,
+        claimed_at: row.get(3)?,
+        closed_at: row.get(4)?,
+        branch: row.get(5)?,
+        repo_path: row.get(6)?,
+        commits,
+        stat: DiffStat {
+            files_changed: row.get(8)?,
+            insertions: row.get(9)?,
+            deletions: row.get(10)?,
+        },
+        session_id: row.get(11)?,
+        transcript_path: row.get(12)?,
+        edited: row.get::<_, i64>(13)? != 0,
+        note: row.get(14)?,
     })
 }
 
@@ -1447,6 +1508,18 @@ fn append_text(existing: Option<&str>, added: &str) -> String {
         "" => added.to_string(),
         base => format!("{base}\n\n{added}"),
     }
+}
+
+/// Fields to change on a task receipt (task 920); `None` means leave
+/// unchanged. `note` is the one field a human writes directly — everything
+/// else on `TaskReceipt` is machine-generated and changes only by
+/// regeneration (`core::receipt::generate`), never by patch.
+#[derive(Debug, Default, Clone)]
+pub struct ReceiptPatch {
+    /// `Some(None)` clears the note; `Some(Some(text))` sets it. Either way,
+    /// applying this patch sets `edited = 1` (spec D6) — a hand-corrected
+    /// receipt must never silently pose as purely machine-generated.
+    pub note: Option<Option<String>>,
 }
 
 /// Fields to change on a diagram; `None` means leave unchanged. A
@@ -2743,6 +2816,114 @@ impl Store {
 
     fn check_parent(&self, parent_id: i64, project_id: i64) -> Result<()> {
         check_parent(&self.conn, parent_id, project_id)
+    }
+
+    // ---- task receipts (task 920) ----
+    //
+    // A task has at most one receipt, keyed on `task_id` itself (see the
+    // migration comment). Generation (`core::receipt::generate`, which shells
+    // out to git) deliberately does NOT live here — these methods are pure
+    // storage, the same "Store never shells out" boundary `agents::spawn_bg`
+    // draws around every other external process mesa runs.
+
+    /// The current time in the exact text form every other timestamp column
+    /// in this schema uses (`datetime('now')`, SQLite's own clock rather than
+    /// a second time source in Rust) — `core::receipt::generate` uses this
+    /// for a receipt's `generated_at` so it can never disagree in format with
+    /// `created_at`/`updated_at`/`claimed_at` on the very row it describes.
+    pub fn now(&self) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT datetime('now')", [], |r| r.get(0))?)
+    }
+
+    /// One task's receipt, or `None` when it has never closed with a claim
+    /// (no receipt was ever generated). `NotFound` only when the task itself
+    /// doesn't exist — a task with no receipt yet is a normal, quiet answer.
+    pub fn get_task_receipt(&self, task_id: i64) -> Result<Option<TaskReceipt>> {
+        self.get_task(task_id)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT task_id, generated_at, owner, claimed_at, closed_at, branch, \
+                 repo_path, commits, files_changed, insertions, deletions, session_id, \
+                 transcript_path, edited, note \
+                 FROM task_receipts WHERE task_id = ?1",
+                [task_id],
+                row_to_receipt,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Writes the whole receipt for `r.task_id`, replacing any existing one
+    /// (`INSERT OR REPLACE` — a keyed upsert, since a task has at most one
+    /// receipt). This is what `core::receipt::generate`'s caller writes with,
+    /// both for the first receipt a task ever gets and for an explicit
+    /// `--regenerate`. `NotFound` if the task doesn't exist — a receipt
+    /// orphaned from the start makes no sense, even though the DB-level FK
+    /// would only catch this at commit time.
+    pub fn put_task_receipt(&mut self, r: &TaskReceipt) -> Result<TaskReceipt> {
+        self.get_task(r.task_id)?;
+        let commits_json = serde_json::to_string(&r.commits).expect("commits serialize");
+        self.conn.execute(
+            "INSERT OR REPLACE INTO task_receipts \
+             (task_id, generated_at, owner, claimed_at, closed_at, branch, repo_path, \
+              commits, files_changed, insertions, deletions, session_id, transcript_path, \
+              edited, note) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            (
+                r.task_id,
+                &r.generated_at,
+                &r.owner,
+                &r.claimed_at,
+                &r.closed_at,
+                &r.branch,
+                &r.repo_path,
+                commits_json,
+                r.stat.files_changed,
+                r.stat.insertions,
+                r.stat.deletions,
+                &r.session_id,
+                &r.transcript_path,
+                r.edited as i64,
+                &r.note,
+            ),
+        )?;
+        self.get_task_receipt(r.task_id)
+            .map(|r| r.expect("just written"))
+    }
+
+    /// Applies a `ReceiptPatch` (currently just `note`) to an existing
+    /// receipt. Always sets `edited = 1` (spec D6) — the whole point of the
+    /// flag is that a human touched the record, and this is the one method
+    /// through which that ever happens. `NotFound` if the task has no
+    /// receipt to patch.
+    pub fn update_task_receipt(
+        &mut self,
+        task_id: i64,
+        patch: &ReceiptPatch,
+    ) -> Result<TaskReceipt> {
+        let mut r = self
+            .get_task_receipt(task_id)?
+            .ok_or_else(|| Error::NotFound(format!("task {task_id} has no receipt")))?;
+        if let Some(note) = &patch.note {
+            r.note = note.clone();
+        }
+        r.edited = true;
+        self.put_task_receipt(&r)
+    }
+
+    /// Deletes a task's receipt and echoes the destroyed record (mesa's
+    /// recovery-transcript safety floor, same as every other delete). `NotFound`
+    /// if the task has no receipt.
+    pub fn delete_task_receipt(&mut self, task_id: i64) -> Result<TaskReceipt> {
+        let r = self
+            .get_task_receipt(task_id)?
+            .ok_or_else(|| Error::NotFound(format!("task {task_id} has no receipt")))?;
+        self.conn
+            .execute("DELETE FROM task_receipts WHERE task_id = ?1", [task_id])?;
+        Ok(r)
     }
 
     // ---- dependencies ----
@@ -6445,6 +6626,156 @@ mod tests {
         ));
         // bystander survives and is no longer blocked (edge cascaded away)
         assert!(!store.get_task(bystander.id).unwrap().blocked);
+    }
+
+    /// A hand-built `TaskReceipt` for `task_id`, exercising every column —
+    /// these tests are about `Store`'s CRUD, not `core::receipt::generate`'s
+    /// git-shelling logic (which has its own tests in `receipt.rs`), so the
+    /// git-derived fields are just plausible-looking fixed values.
+    fn sample_receipt(task_id: i64) -> TaskReceipt {
+        TaskReceipt {
+            task_id,
+            generated_at: "2024-01-02 03:04:05".into(),
+            owner: Some("session_abc".into()),
+            claimed_at: Some("2024-01-01 00:00:00".into()),
+            closed_at: "2024-01-02 03:04:00".into(),
+            branch: Some("trunk".into()),
+            repo_path: Some("/repo".into()),
+            commits: vec![GitCommit {
+                hash: "a".repeat(40),
+                short_hash: "aaaaaaa".into(),
+                author: "t".into(),
+                date: "2024-01-01T12:00:00Z".into(),
+                subject: "did the thing".into(),
+            }],
+            stat: DiffStat {
+                files_changed: 2,
+                insertions: 10,
+                deletions: 3,
+            },
+            session_id: None,
+            transcript_path: None,
+            edited: false,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn get_task_receipt_is_not_found_for_a_missing_task() {
+        let (store, _dir) = temp_store();
+        assert!(matches!(
+            store.get_task_receipt(999),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn put_and_get_task_receipt_round_trip() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        assert_eq!(store.get_task_receipt(t.id).unwrap(), None);
+
+        let receipt = sample_receipt(t.id);
+        let written = store.put_task_receipt(&receipt).unwrap();
+        assert_eq!(written, receipt);
+        assert_eq!(store.get_task_receipt(t.id).unwrap(), Some(receipt));
+    }
+
+    #[test]
+    fn put_task_receipt_rejects_an_unknown_task() {
+        let (mut store, _dir) = temp_store();
+        assert!(matches!(
+            store.put_task_receipt(&sample_receipt(999)),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn put_task_receipt_replaces_an_existing_one() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        store.put_task_receipt(&sample_receipt(t.id)).unwrap();
+
+        let mut second = sample_receipt(t.id);
+        second.branch = Some("feature".into());
+        second.commits = Vec::new();
+        store.put_task_receipt(&second).unwrap();
+
+        let read = store.get_task_receipt(t.id).unwrap().unwrap();
+        assert_eq!(read.branch.as_deref(), Some("feature"));
+        assert!(read.commits.is_empty());
+    }
+
+    #[test]
+    fn update_task_receipt_sets_note_and_marks_edited() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        store.put_task_receipt(&sample_receipt(t.id)).unwrap();
+        assert!(!store.get_task_receipt(t.id).unwrap().unwrap().edited);
+
+        let patched = store
+            .update_task_receipt(
+                t.id,
+                &ReceiptPatch {
+                    note: Some(Some("looks right".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(patched.note.as_deref(), Some("looks right"));
+        assert!(patched.edited);
+
+        // `Some(None)` clears the note but still marks edited (D6).
+        let cleared = store
+            .update_task_receipt(t.id, &ReceiptPatch { note: Some(None) })
+            .unwrap();
+        assert_eq!(cleared.note, None);
+        assert!(cleared.edited);
+    }
+
+    #[test]
+    fn update_task_receipt_is_not_found_without_a_receipt() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        assert!(matches!(
+            store.update_task_receipt(t.id, &ReceiptPatch { note: None }),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_task_receipt_echoes_the_destroyed_record() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        let receipt = sample_receipt(t.id);
+        store.put_task_receipt(&receipt).unwrap();
+
+        let deleted = store.delete_task_receipt(t.id).unwrap();
+        assert_eq!(deleted, receipt);
+        assert_eq!(store.get_task_receipt(t.id).unwrap(), None);
+        assert!(matches!(
+            store.delete_task_receipt(t.id),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_a_task_cascades_its_receipt() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        store.put_task_receipt(&sample_receipt(t.id)).unwrap();
+
+        store.delete_task(t.id).unwrap();
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM task_receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     /// Like `temp_store`, but also points `MESA_ATTACHMENTS_DIR` at a tempdir

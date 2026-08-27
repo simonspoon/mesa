@@ -4,9 +4,12 @@
 //! store. Decorative data for the sidebar: any failure (no repo, no git,
 //! detached folder) is `None`, never an error surfaced to the client.
 
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
-use crate::core::types::{GitCommit, GitCommitFile, GitFile, GitRepoView, GitStatus, GitWorktree};
+use crate::core::types::{
+    DiffStat, GitCommit, GitCommitFile, GitFile, GitRepoView, GitStatus, GitWorktree,
+};
 
 /// Diff text is capped so one huge file can't balloon the JSON response
 /// (hooks' 64 KiB output cap precedent, scaled for diffs).
@@ -262,7 +265,7 @@ fn capped(bytes: &[u8]) -> String {
 /// yet" in practice, and either way an empty list is the correct quiet
 /// result (M9).
 pub fn commit_log_of(dir: &str) -> Vec<GitCommit> {
-    run_log(dir, None)
+    run_log(dir, None, &[])
 }
 
 /// Commits that touched ONE path, newest first — `commit_log_of` with a
@@ -281,17 +284,45 @@ pub fn commit_log_of(dir: &str) -> Vec<GitCommit> {
 /// diffable. An empty vec is a legitimate answer: a file that exists on
 /// disk but was never committed simply has no history.
 pub fn file_log_of(dir: &str, rel: &str) -> Vec<GitCommit> {
-    run_log(dir, Some(rel))
+    run_log(dir, Some(rel), &[])
 }
 
-/// Shared body of `commit_log_of`/`file_log_of`. `pathspec` is passed after
-/// `--` when present. Empty vec on ANY failure — not a repo, or a real repo
-/// with an unborn HEAD (no commits yet) are indistinguishable at this level
-/// on purpose; the caller has already established repo validity via
-/// `project_git_view`, so here "git log failed" only ever means "no commits
-/// yet" in practice, and either way an empty list is the correct quiet
-/// result (M9).
-fn run_log(dir: &str, pathspec: Option<&str>) -> Vec<GitCommit> {
+/// Commits made in `dir` between `since` and `until` (task 920, spec D4) —
+/// the log a receipt is built from: a task's claim window, not a browsing
+/// window, so unlike `commit_log_of`/`file_log_of` there is no pathspec, only
+/// a time range. `since`/`until` are `Store`'s own `datetime('now')` text
+/// ("YYYY-MM-DD HH:MM:SS"), which SQLite always writes in UTC; `git
+/// --since`/`--until` parse a bare timestamp in the LOCAL timezone, so each
+/// is given to git with a trailing " UTC" to pin the same interpretation git
+/// itself would give `claimed_at`/`closed_at` if it had written them. Get
+/// this wrong and every receipt is silently mis-windowed by the reader's UTC
+/// offset — not a crash, just quietly wrong commits, which is why the
+/// suffix is load-bearing rather than cosmetic. Same cap, same
+/// empty-vec-on-ANY-failure contract as `run_log` — an unreadable repo or an
+/// empty window are indistinguishable here, and either way "no commits" is
+/// the correct quiet result.
+pub fn log_between(dir: &str, since: &str, until: &str) -> Vec<GitCommit> {
+    run_log(
+        dir,
+        None,
+        &[
+            format!("--since={since} UTC"),
+            format!("--until={until} UTC"),
+        ],
+    )
+}
+
+/// Shared body of `commit_log_of`/`file_log_of`/`log_between`. `extra` holds
+/// additional `git log` flags (currently just `log_between`'s `--since`/
+/// `--until` pair) passed as separate `Command::arg`s — never string-built —
+/// so an untrusted value can never be read as a second flag; `pathspec` is
+/// passed after `--` when present. Empty vec on ANY failure — not a repo, or
+/// a real repo with an unborn HEAD (no commits yet) are indistinguishable at
+/// this level on purpose; the caller has already established repo validity
+/// via `project_git_view`, so here "git log failed" only ever means "no
+/// commits yet" in practice, and either way an empty list is the correct
+/// quiet result (M9).
+fn run_log(dir: &str, pathspec: Option<&str>, extra: &[String]) -> Vec<GitCommit> {
     let mut cmd = Command::new("git");
     cmd.args(["-C", dir]).args([
         "log",
@@ -300,6 +331,7 @@ fn run_log(dir: &str, pathspec: Option<&str>) -> Vec<GitCommit> {
         "--date=iso-strict",
         "--pretty=format:%H%x1f%h%x1f%an%x1f%aI%x1f%s",
     ]);
+    cmd.args(extra);
     if let Some(rel) = pathspec {
         cmd.arg("--").arg(rel);
     }
@@ -419,6 +451,89 @@ pub fn commit_file_diff_of(dir: &str, sha: &str, path: &str) -> Option<String> {
         return None;
     }
     run_diff(dir, &["show", "--no-color", sha, "--", path], &[0])
+}
+
+/// Summed diff stat over `shas` (task 920, spec D4/schema) — the numbers a
+/// receipt shows beside its commit list. One `git -C <dir> show --numstat
+/// --format= <sha>` per sha (`--format=` suppresses the commit header,
+/// leaving only numstat lines, same trick `commit_files_of` uses for
+/// `--name-status`); `insertions`/`deletions` are summed across every
+/// commit, but `files_changed` counts DISTINCT paths across the whole set,
+/// not one count per commit — the same file touched by two commits in the
+/// window is one changed file, not two. Each sha is checked with
+/// `is_valid_commit_id` BEFORE it reaches a `git` subprocess (M8, same
+/// defense-in-depth as `commit_files_of`/`commit_file_diff_of`); an invalid
+/// sha is skipped rather than aborting the whole sum, since `shas` here is
+/// always mesa's own `log_between` output and an invalid entry can only mean
+/// a caller bug, not an attack surface worth failing loudly over.
+///
+/// Documented limitation: `--format=` renders no diff at all for a merge
+/// commit (git's own default for `show` on a merge, same as
+/// `commit_files_of`'s note), so a merge inside the window silently
+/// contributes nothing to the stat. Accepted, not fixed: a combined diff
+/// against a synthetic merge base is not "what changed" in any single sense
+/// a receipt could summarize without editorializing.
+pub fn diff_stat(dir: &str, shas: &[String]) -> DiffStat {
+    let mut files: HashSet<String> = HashSet::new();
+    let mut insertions = 0u32;
+    let mut deletions = 0u32;
+    for sha in shas {
+        if !is_valid_commit_id(sha) {
+            continue;
+        }
+        let out = Command::new("git")
+            .args(["-C", dir])
+            .args(["show", "--numstat", "--format=", sha])
+            .stdin(Stdio::null())
+            .output();
+        let Ok(out) = out else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let (add, del, paths) = parse_numstat(&String::from_utf8_lossy(&out.stdout));
+        insertions += add;
+        deletions += del;
+        files.extend(paths);
+    }
+    DiffStat {
+        files_changed: files.len() as u32,
+        insertions,
+        deletions,
+    }
+}
+
+/// Kept pure like `parse_log`/`parse_commit_files`: parses `git show
+/// --numstat` lines, tab-separated `<added>\t<deleted>\t<path>`. A binary
+/// file reports `-`/`-` for its counts (git's own convention, no line count
+/// available) and is still returned as a changed path with 0 lines — a
+/// binary asset that changed must still show up in `files_changed`, it just
+/// can't contribute a line count. Returns `(insertions, deletions, paths)`
+/// rather than a `DiffStat` so the caller can fold `paths` into a set across
+/// several commits before counting distinct files.
+fn parse_numstat(text: &str) -> (u32, u32, Vec<String>) {
+    let mut insertions = 0u32;
+    let mut deletions = 0u32;
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let added = parts.next().unwrap_or("");
+        let deleted = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        // "-" marks a binary file (git's own convention) — no line count,
+        // parsed as 0 rather than propagating a sentinel through DiffStat.
+        insertions += added.parse::<u32>().unwrap_or(0);
+        deletions += deleted.parse::<u32>().unwrap_or(0);
+        paths.push(path.to_string());
+    }
+    (insertions, deletions, paths)
 }
 
 #[cfg(test)]
@@ -1004,5 +1119,211 @@ mod tests {
         assert!(!is_valid_commit_id(&"a".repeat(65))); // too long
         assert!(!is_valid_commit_id("abcdefg")); // non-hex char
         assert!(!is_valid_commit_id("-rf"));
+    }
+
+    // ---- task 920: log_between / diff_stat ----
+
+    #[test]
+    fn parse_numstat_sums_lines_and_counts_a_binary_file_as_zero_lines() {
+        let (ins, del, paths) = parse_numstat("3\t1\ta.txt\n0\t0\tb.txt\n-\t-\timg.png\n");
+        assert_eq!(ins, 3);
+        assert_eq!(del, 1);
+        assert_eq!(paths, vec!["a.txt", "b.txt", "img.png"]);
+    }
+
+    #[test]
+    fn parse_numstat_skips_blank_lines() {
+        let (ins, del, paths) = parse_numstat("\n1\t2\tx.txt\n\n");
+        assert_eq!(ins, 1);
+        assert_eq!(del, 2);
+        assert_eq!(paths, vec!["x.txt"]);
+    }
+
+    /// A repo with commits at controlled dates (`GIT_AUTHOR_DATE`/
+    /// `GIT_COMMITTER_DATE`) so `log_between`'s window can be tested exactly,
+    /// plus one binary file so `diff_stat`'s "-"/"-" handling has something
+    /// real to read rather than only `parse_numstat`'s synthetic input.
+    /// Returns `(dir, sha_2024, sha_2025)`.
+    fn dated_history_repo() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let commit_at = |date: &str, msg: &str| {
+            let ok = Command::new("git")
+                .args(["-C", path, "-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(["commit", "-m", msg])
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "commit at {date} failed");
+        };
+        let add_all = || {
+            Command::new("git")
+                .args(["-C", path, "add", "-A"])
+                .status()
+                .unwrap();
+        };
+        Command::new("git")
+            .args(["-C", path, "init", "-b", "trunk"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "line one\n").unwrap();
+        // A NUL byte is how git's own diff machinery decides a file is
+        // binary — no extension sniffing involved.
+        std::fs::write(dir.path().join("img.bin"), [0u8, 1, 2, 3]).unwrap();
+        add_all();
+        commit_at("2024-01-01T00:00:00", "in window");
+        let sha_2024 = String::from_utf8(
+            Command::new("git")
+                .args(["-C", path, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::write(dir.path().join("img.bin"), [0u8, 1, 2, 3, 4]).unwrap();
+        add_all();
+        commit_at("2025-01-01T00:00:00", "outside window");
+        let sha_2025 = String::from_utf8(
+            Command::new("git")
+                .args(["-C", path, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        (dir, sha_2024, sha_2025)
+    }
+
+    #[test]
+    fn log_between_windows_to_the_since_until_range() {
+        let (dir, sha_2024, _sha_2025) = dated_history_repo();
+        let path = dir.path().to_str().unwrap();
+        let log = log_between(path, "2023-12-31 00:00:00", "2024-06-01 00:00:00");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].hash, sha_2024);
+    }
+
+    #[test]
+    fn log_between_is_empty_when_the_window_misses_every_commit() {
+        let (dir, _sha_2024, _sha_2025) = dated_history_repo();
+        let path = dir.path().to_str().unwrap();
+        let log = log_between(path, "2020-01-01 00:00:00", "2020-06-01 00:00:00");
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn log_between_on_a_bad_path_is_empty_not_an_error() {
+        let log = log_between(
+            "/no/such/repo",
+            "2024-01-01 00:00:00",
+            "2024-06-01 00:00:00",
+        );
+        assert!(log.is_empty());
+    }
+
+    /// The `" UTC"` suffix `log_between` appends to its bounds is
+    /// load-bearing, and nothing else in this module can catch it: the
+    /// window tests above put their commits a YEAR apart, where a few hours
+    /// of timezone skew changes nothing. A real claim window is minutes
+    /// long, so if the suffix were dropped git would read mesa's UTC
+    /// timestamps as LOCAL time and silently return no commits — a receipt
+    /// that looks like "this task changed nothing" rather than like a bug.
+    ///
+    /// `TZ` is set for the duration because the bounds only become
+    /// ambiguous on a machine that is not already on UTC; without pinning
+    /// it, this test would pass vacuously on a UTC CI box, which is exactly
+    /// where the regression would then ship from. Same process-global env
+    /// caveat (and same remedy: set, assert, restore in one test) as
+    /// `empty_mesa_db_env_counts_as_unset` in `core::store`. Every other
+    /// git test here either passes explicit offsets or goes through
+    /// `log_between`'s own suffixing, so none of them reads `TZ`.
+    #[test]
+    fn log_between_reads_its_bounds_as_utc_not_local_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        Command::new("git")
+            .args(["-C", path, "init", "-b", "trunk"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        Command::new("git")
+            .args(["-C", path, "add", "-A"])
+            .status()
+            .unwrap();
+        // Noon UTC, stated with an explicit offset so the commit's instant
+        // does not itself depend on the ambient zone.
+        Command::new("git")
+            .args(["-C", path, "-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["commit", "-m", "noon utc"])
+            .env("GIT_AUTHOR_DATE", "2026-01-01T12:00:00+0000")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T12:00:00+0000")
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+
+        let prior = std::env::var("TZ").ok();
+        // UTC-5 in January: the half-hour window below straddles noon UTC,
+        // but read as New York local time it becomes 16:30-17:30 UTC and
+        // misses the commit entirely.
+        unsafe { std::env::set_var("TZ", "America/New_York") };
+        let log = log_between(path, "2026-01-01 11:30:00", "2026-01-01 12:30:00");
+        match prior {
+            Some(tz) => unsafe { std::env::set_var("TZ", tz) },
+            None => unsafe { std::env::remove_var("TZ") },
+        }
+
+        assert_eq!(
+            log.len(),
+            1,
+            "a UTC window around the commit must find it on a non-UTC box; \
+             an empty result means the \" UTC\" suffix was dropped and git \
+             read the bounds as local time",
+        );
+    }
+
+    #[test]
+    fn diff_stat_sums_across_commits_and_counts_distinct_files() {
+        let (dir, sha_2024, sha_2025) = dated_history_repo();
+        let path = dir.path().to_str().unwrap();
+        // Same file (img.bin) touched by both commits must count once, not
+        // twice — files_changed is distinct paths across the whole set.
+        let stat = diff_stat(path, &[sha_2024.clone(), sha_2025.clone()]);
+        assert_eq!(stat.files_changed, 2); // a.txt + img.bin
+        assert_eq!(stat.insertions, 1); // a.txt's one added line
+        assert_eq!(stat.deletions, 0);
+
+        let one = diff_stat(path, &[sha_2024]);
+        assert_eq!(one.files_changed, 2);
+        assert_eq!(one.insertions, 1);
+    }
+
+    #[test]
+    fn diff_stat_skips_an_invalid_sha_without_spawning_git() {
+        let (dir, sha_2024, _sha_2025) = dated_history_repo();
+        let path = dir.path().to_str().unwrap();
+        let stat = diff_stat(path, &["; rm -rf /".to_string(), sha_2024]);
+        // The bad entry contributes nothing; the valid one still counts.
+        assert_eq!(stat.files_changed, 2);
+    }
+
+    #[test]
+    fn diff_stat_of_no_commits_is_zero() {
+        let (dir, _sha_2024, _sha_2025) = dated_history_repo();
+        let path = dir.path().to_str().unwrap();
+        let stat = diff_stat(path, &[]);
+        assert_eq!(stat.files_changed, 0);
+        assert_eq!(stat.insertions, 0);
+        assert_eq!(stat.deletions, 0);
     }
 }

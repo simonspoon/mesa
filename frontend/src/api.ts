@@ -61,6 +61,7 @@ import type { ScriptArg } from './types/ScriptArg'
 import type { ScriptRun } from './types/ScriptRun'
 import type { Status } from './types/Status'
 import type { Task } from './types/Task'
+import type { TaskReceipt } from './types/TaskReceipt'
 import type { TaskSummary } from './types/TaskSummary'
 import type { Waypoint } from './types/Waypoint'
 
@@ -271,6 +272,46 @@ export function deleteTask(id: number): Promise<Task[]> {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+// ---- receipt (a task's frozen work record, task 920) ----
+
+/**
+ * A task's work receipt (spec D1–D6) — the frozen record of the commits made
+ * while it was claimed, plus a diff summary and best-effort transcript link.
+ * Most tasks have none: a task closed without ever being claimed, or whose
+ * project has no `local_path`, generates nothing, and that is the ordinary
+ * case, not a failure — a 404 here resolves to `null` rather than throwing.
+ * Every other error still throws (`ApiError`), same as any other route.
+ */
+export async function getTaskReceipt(id: number): Promise<TaskReceipt | null> {
+  try {
+    return await request(`/api/tasks/${id}/receipt`)
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null
+    throw e
+  }
+}
+
+/** Sets the receipt's human `note` (`null` clears it) — the one field meant
+ * to be hand-written. Marks the receipt `edited` (spec D6). */
+export function updateTaskReceipt(
+  id: number,
+  note: string | null,
+): Promise<TaskReceipt> {
+  return request(`/api/tasks/${id}/receipt`, jsonInit('PATCH', { note }))
+}
+
+/** Destroys the receipt. Returns the destroyed record. */
+export function deleteTaskReceipt(id: number): Promise<TaskReceipt> {
+  return request(`/api/tasks/${id}/receipt`, jsonDelete())
+}
+
+/** Recomputes the machine fields (commits, stat, branch, session) from the
+ * task's original claim window; preserves the human `note` and `edited`
+ * flag untouched (spec D6). */
+export function regenerateTaskReceipt(id: number): Promise<TaskReceipt> {
+  return request(`/api/tasks/${id}/receipt/regenerate`, jsonInit('POST', {}))
 }
 
 // ---- attachments (files attached to a task) ----

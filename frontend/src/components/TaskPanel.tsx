@@ -5,17 +5,24 @@ import {
   createTask,
   deleteAttachment,
   deleteTask,
+  deleteTaskReceipt,
   getTask,
+  getTaskReceipt,
   listAttachments,
   listDependencies,
   listTasks,
+  regenerateTaskReceipt,
   updateTask,
+  updateTaskReceipt,
 } from '../api'
+import { receiptIsEmpty, summarizeStat, transcriptLabel } from '../receiptView'
 import { parseTags } from '../tags'
 import { formatTimestamp, timeAgo } from '../time'
 import type { Attachment } from '../types/Attachment'
+import type { GitCommit } from '../types/GitCommit'
 import type { Priority } from '../types/Priority'
 import type { Status } from '../types/Status'
+import type { TaskReceipt } from '../types/TaskReceipt'
 import { useFetch } from '../useFetch'
 import { ConfirmDelete } from './ConfirmDelete'
 import { InlineEdit } from './InlineEdit'
@@ -167,6 +174,102 @@ function AttachmentRow({
   )
 }
 
+function ReceiptCommitRow({ commit }: { commit: GitCommit }) {
+  return (
+    <li>
+      <span className="badge git-status-badge">{commit.short_hash}</span>
+      <span className="git-file-path">{commit.subject}</span>
+      <div className="muted git-file-label">
+        {commit.author} · {commit.date}
+      </div>
+    </li>
+  )
+}
+
+/**
+ * A task's frozen work receipt (task 920, spec D1–D6) — commits made during
+ * the claim window, a diff summary, and a best-effort transcript link.
+ * Renders nothing when `receipt` is `null`: most tasks have none (never
+ * claimed, or the project has no `local_path`), and that is the ordinary
+ * case, so the section must not shout about its absence.
+ */
+function ReceiptSection({
+  taskId,
+  receipt,
+  onChanged,
+}: {
+  taskId: number
+  receipt: TaskReceipt | null
+  onChanged: () => void
+}) {
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  if (receipt === null) return null
+
+  function regenerate() {
+    setBusy(true)
+    setError(null)
+    regenerateTaskReceipt(taskId).then(
+      () => {
+        setBusy(false)
+        onChanged()
+      },
+      (e: unknown) => {
+        setBusy(false)
+        setError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  const label = transcriptLabel(receipt)
+
+  return (
+    <>
+      <h2>Receipt</h2>
+      <p className="muted">
+        {/* A hand-corrected receipt must never silently pose as
+            machine-generated (spec D6). */}
+        {receipt.edited && <span className="badge">edited</span>}{' '}
+        {receipt.branch !== null && <>branch {receipt.branch} · </>}
+        {summarizeStat(receipt.stat)}
+      </p>
+      {receiptIsEmpty(receipt) ? (
+        <p className="muted">No commits in the claim window.</p>
+      ) : (
+        <ul className="card-list">
+          {receipt.commits.map((c) => (
+            <ReceiptCommitRow key={c.hash} commit={c} />
+          ))}
+        </ul>
+      )}
+      {label !== null && <p className="muted">Transcript: {label}</p>}
+      <div className="description">
+        <InlineEdit
+          value={receipt.note ?? ''}
+          multiline
+          markdown
+          placeholder="no note — click to add"
+          onSave={(n) =>
+            updateTaskReceipt(taskId, n === '' ? null : n).then(onChanged)
+          }
+        />
+      </div>
+      <p className="task-controls">
+        <button type="button" onClick={regenerate} disabled={busy}>
+          regenerate
+        </button>
+        <ConfirmDelete
+          label="delete receipt"
+          message="Deletes this task's receipt."
+          onDelete={() => deleteTaskReceipt(taskId).then(onChanged)}
+        />
+        {error && <span className="error">{error}</span>}
+      </p>
+    </>
+  )
+}
+
 /**
  * Task detail body, mounted inside `TaskModal`'s centered overlay. Mutations
  * call `onChanged` so the project view's list/board refetches alongside this
@@ -184,14 +287,15 @@ export function TaskPanel({
   const [selectError, setSelectError] = useState<string | null>(null)
   const { data, error, refetch } = useFetch(async () => {
     const task = await getTask(taskId)
-    const [siblings, blockers, attachments] = await Promise.all([
+    const [siblings, blockers, attachments, receipt] = await Promise.all([
       listTasks({ project: task.project_id }),
       listDependencies(taskId),
       listAttachments(taskId),
+      getTaskReceipt(taskId),
     ])
     // One level of nesting only (spec Assumption 6).
     const subtasks = siblings.filter((t) => t.parent_id === taskId)
-    return { task, subtasks, blockers, attachments }
+    return { task, subtasks, blockers, attachments, receipt }
   }, `task-${taskId}`)
 
   const head = (
@@ -217,7 +321,7 @@ export function TaskPanel({
       </>
     )
 
-  const { task, subtasks, blockers, attachments } = data
+  const { task, subtasks, blockers, attachments, receipt } = data
 
   function changed() {
     refetch()
@@ -359,6 +463,8 @@ export function TaskPanel({
           }
         />
       </div>
+
+      <ReceiptSection taskId={taskId} receipt={receipt} onChanged={changed} />
 
       <p>
         <ConfirmDelete

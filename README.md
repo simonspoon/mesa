@@ -360,18 +360,23 @@ start locations in the global Agents sidebar.
   live work, so an umbrella task parks nothing — it narrows the tick to its own
   descendants. See `docs/todo-watcher.md`.
 - **Mesa live** (`mesa live`, the **Live** page in the web UI): a spoken
-  conversation with an agent. You dictate into a text field with your own
-  system dictation, a dedicated Claude Code session does the work with the
-  ordinary mesa CLI, and every reply is read back to you by `kokoro-rs` — the
-  same synthesis the Inbox's play button uses. The agent runs the loop itself
-  (`mesa live listen` → work → `mesa live say`, plus `mesa live navigate` to
-  move your browser), pulling turns out of the database rather than being
-  pushed at, because the CLI never talks to the server. One conversation at a
-  time. What the agent is told to do is the config file's `live.prompt`,
-  editable on the **Settings** page: blank is the block mesa ships, and
-  anything you write there replaces it. mesa ships **no speech-to-text**,
-  captures no microphone and accepts no audio body: the audio path is
-  one-directional, server to browser. See `docs/live.md`.
+  conversation with an agent. The microphone opens on its own once you join,
+  a dedicated Claude Code session does the work with the ordinary mesa CLI,
+  and every reply is read back to you by `kokoro-rs` — the same synthesis the
+  Inbox's play button uses. The agent runs the loop itself (`mesa live
+  listen` → work → `mesa live say`, plus `mesa live navigate` to move your
+  browser), pulling turns out of the database rather than being pushed at,
+  because the CLI never talks to the server. One conversation at a time. What
+  the agent is told to do is the config file's `live.prompt`, editable on the
+  **Settings** page: blank is the block mesa ships, and anything you write
+  there replaces it. Listening prefers `auris`, an optional external
+  speech-to-text binary — install it and mesa hears your own vocabulary and
+  real punctuation; without it, listening falls back to the browser's own
+  recognizer where one exists, and to your own system dictation typed into
+  the box where neither does. Either way the decode stays local: mesa runs
+  no speech-to-text of its own, and nothing you say is kept once it becomes
+  text. See `docs/live.md`, and `docs/listen.md` for the `auris` route's own
+  contract.
 - **Configurable spawn commands**: the four places mesa starts an agent — the
   todo-watcher's dispatch, the inbox-watcher's triage, the sidebar's *add
   agent*, and a live conversation — each read a command template from

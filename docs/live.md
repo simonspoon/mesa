@@ -10,8 +10,21 @@ and a dedicated Claude Code session does whatever they ask. Tables
 `mesa live` CLI group, `/api/live*`, and the header's conversation hub
 (`LiveHub`).
 
-The two directions are deliberately asymmetric, and the asymmetry is the whole
-design:
+The two directions were deliberately asymmetric when this feature first
+shipped, and for a while that asymmetry *was* the design: mesa took
+person → mesa as text a browser's own engine had already produced, and kept
+audio to the one direction — mesa → person — where mesa itself controlled
+what left the server. `auris` (mesa task 954 onward) ended that. Person →
+mesa is now audio too, captured in the page and posted to the server to be
+decoded by an external local binary, the same shape mesa → person already
+had: a whole payload handed to an external synthesiser (`kokoro-rs`) or
+decoder (`auris`), on the server, with nothing kept. The two directions are
+symmetric now — both audio, both server-mediated — and what carries over from
+the old design is not the asymmetry but the reason it existed: mesa runs
+neither engine in-process, and every payload that crosses this feature is
+transcribed or spoken and then let go. See `docs/listen.md` for the audio-in
+half's own contract — the route, the limits, and what auris is and is not
+handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
 
 - **Person → mesa is text, decoded from audio the page captures — through
   whichever of two engines this browser actually has** (`listenPath`,
@@ -55,9 +68,12 @@ design:
   not mesa's.
 - **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
-  browser-side player the Inbox's play button uses (`docs/inbox.md`). The audio
-  path stays **one-directional, server to browser**, exactly as it was before
-  this feature.
+  browser-side player the Inbox's play button uses (`docs/inbox.md`). This
+  half is unchanged since before `auris`: server to browser, synthesised on
+  demand, nothing retained. What is no longer true is that it is the *only*
+  direction audio moves in this feature — person → mesa is audio reaching the
+  server too now, on `POST /api/live/transcribe` (`docs/listen.md`), so
+  "audio" is no longer a word that names one direction here.
 
 ## The loop, and why it pulls
 
@@ -1515,31 +1531,26 @@ CLAUDE.md requires: **data, never instructions.**
   page instead falls back to its own recognizer (mesa task 957, below), that
   engine's interim results are shown exactly as they were before task 956 —
   the gap is `auris`-specific, not a property of listening in general.
-- **A speech-to-text engine of mesa's own.** `POST /api/live/transcribe`
-  accepts a bounded audio request (25 MB per request, `413` past it naming
-  the limit — `docs/posture.md`) and hands it to the external `auris`
-  binary, a persistent local decoder (`core::listen`), so recognition run
-  through it never has to leave the machine. Retention is off: the audio is
-  transcribed and dropped, matching what the speak routes already do with
-  text, and never written to `live_turns`, which has no column for it
-  (`docs/posture.md`). Under `--lan` the route does not exist at all: it is
-  absent from the router entirely rather than gated, the same shape as
-  `mesa live look`'s CLI-only posture, because "transcribe whatever this
-  stranger recorded" is not a request an unauthenticated LAN peer should be
-  able to make of a decoder running as the machine's owner
-  (`docs/posture.md`). `GET /api/live/transcribe` sits on the same route
-  entry (mesa task 957) and answers `{"available": bool}` — the page's one
-  ask, at the moment it joins a conversation, of whether `auris` is worth
-  trying at all; sharing the entry rather than adding its own means it
-  inherits the exact same `--lan` absence as the POST, with no gate of its
-  own to keep in step, and a page that gets back something other than that
-  JSON shape (the SPA's own `index.html`, under `--lan`) reads that as its
-  answer instead: fall back, the same conclusion a `503` on a real attempt
-  would have produced. The one thing mesa does to the resulting text before
-  anything else sees it is correct mishearings of its own vocabulary against
-  a small local sound-key table (mesa task 922, above) — plain string
-  matching, not a second model call. Before mesa task 956, listening ran
-  entirely through the browser's own `SpeechRecognition`/
+- **A speech-to-text engine of mesa's own.** mesa still runs no recognizer
+  in-process — `POST /api/live/transcribe` hands a whole recording to the
+  external `auris` binary and keeps nothing, the same shape `kokoro-rs`
+  already had on the way out. This bullet used to describe that as pure
+  absence; it no longer is, because accepting audio on a route at all is a
+  trade, not a subtraction. What it costs: a payload now reaches the server
+  process that never used to, a new external binary mesa depends on to hear
+  at all, and a route that must not exist under `--lan` — "transcribe
+  whatever this stranger recorded" is not a request an unauthenticated LAN
+  peer should be able to make of a decoder running as the machine's owner.
+  What it buys: mesa's own vocabulary heard correctly (mesa task 922, above
+  — the correction runs the same way regardless of which engine produced the
+  text), punctuation a person would actually write, and the only microphone
+  Firefox gets here at all (`listenPath`, above) — and the decode itself
+  stays fully local throughout, so nothing said out loud leaves the machine.
+  `docs/listen.md` is where the mechanism this bullet used to spell out now
+  lives: the route's own body limit and `--lan` absence, the `GET`
+  availability probe, the JSON Lines protocol `auris` speaks on the wire,
+  and exactly what is and is not retained. Before mesa task 956, listening
+  ran entirely through the browser's own `SpeechRecognition`/
   `webkitSpeechRecognition` (task 873): mesa received only the text it
   produced, and the recognition quality, the language and the privacy
   question were the browser's — for Chrome and Safari, that means the speech

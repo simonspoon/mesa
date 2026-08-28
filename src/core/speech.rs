@@ -1,6 +1,10 @@
 //! Speaking a piece of mesa text with the external `kokoro-rs` TTS binary.
 //! Synthesis is a subprocess, not storage, so it lives beside `scripts.rs` and
-//! `hooks.rs` and copies their shape.
+//! `hooks.rs` and copies their shape. This is the **output** half of mesa's
+//! speech; `core::listen` (mesa task 954) is its mirror, taking a browser's
+//! recording in and handing text back via the external `auris` binary — the
+//! audio path this module describes runs one way, but mesa's speech surface
+//! as a whole does not.
 //!
 //! The load-bearing property: **the text is never a shell string and never an
 //! argument**. It is written to the child's stdin (`kokoro-rs` reads stdin when

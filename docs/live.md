@@ -13,33 +13,46 @@ and a dedicated Claude Code session does whatever they ask. Tables
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
 
-- **Person → mesa is text, decoded from audio the page captures.** While a
-  session is live and this browser has joined it, the microphone opens on its
-  own (task 917 — before that, task 887 had it start muted until an explicit
-  press; a mute is still the person's own switch, and stays put for the rest
-  of that session), and the page runs it through an `AudioWorklet` and a
-  page-side voice-activity detector (`liveVad.ts`, mesa task 956) that decides
-  where one utterance ends — landing exactly where the browser's own speech
-  recognizer's *final result* used to, which is the whole point of the shape:
-  everything downstream of "here is a segment of speech" — `heldWith`,
-  `shouldFlushSilence`, `heldFlush`, both send boundaries, the mute switch,
-  the pause, the vocabulary correction — carries on unchanged. Each utterance
-  becomes a 16 kHz mono WAV (`liveAudio.ts`), posted to
-  `POST /api/live/transcribe`, and the text `auris` decodes it into is
-  **held** and posted as one `user` turn once the person goes quiet for a beat
-  (the same wait `live.auto-send-ms` already gives the typed box), or right
-  away if they press the listen switch (tasks 873, 889, 917, 956). The
-  conversation panel also has a plain `<textarea>`, which is the way in
-  whenever the microphone is not: it is muted, this browser cannot capture
-  audio at all, or the microphone was refused. There the person's *own*
-  system dictation (macOS Dictation, a phone keyboard's mic key, or their
-  fingers) types into it, exactly as before. mesa still ships no
-  speech-to-text engine of its own — `auris` is a separate external binary
-  this hands a recording to and retains nothing of, in either direction. As
-  of this task there is deliberately **no fallback to the browser's own
-  recognizer** when `auris` is missing or fails — a machine with no `auris`
-  installed hears nothing today, and closing that gap is mesa task 957. See
-  [What is deliberately absent](#what-is-deliberately-absent).
+- **Person → mesa is text, decoded from audio the page captures — through
+  whichever of two engines this browser actually has** (`listenPath`,
+  `liveRecognition.ts`, mesa task 957). While a session is live and this
+  browser has joined it, the microphone opens on its own (task 917 — before
+  that, task 887 had it start muted until an explicit press; a mute is still
+  the person's own switch, and stays put for the rest of that session).
+  Where `auris` answers and this browser can capture audio, the page runs the
+  stream through an `AudioWorklet` and a page-side voice-activity detector
+  (`liveVad.ts`, mesa task 956) that decides where one utterance ends —
+  landing exactly where a speech recognizer's *final result* would — turns
+  it into a 16 kHz mono WAV (`liveAudio.ts`), and posts it to
+  `POST /api/live/transcribe`, which hands it to `auris` and returns text.
+  auris wins whenever it can be reached, even on a browser that also has a
+  recognizer of its own: it hears mesa's own vocabulary correctly and
+  punctuates like a person, where a browser's own recognizer does neither —
+  mesa task 922's phonetic correction pass (below) was built against exactly
+  that recognizer's mishearings, and task 957 is the reason it was worth
+  keeping rather than deleting once `auris` landed: the fallback still runs
+  the same imperfect engine, on the same machines that never had `auris` to
+  begin with. Where `auris` cannot be reached but this browser
+  has its own recognizer (`SpeechRecognition`/`webkitSpeechRecognition`, task
+  873), listening falls back to that unchanged — the same engine, in the same
+  page, that ran before task 956 ever existed. **Firefox has no recognizer of
+  its own at all**, so `auris` is also the only way a Firefox user gets a
+  microphone here at all: `getUserMedia` is everywhere `SpeechRecognition` is
+  not, which makes that case a genuinely new capability rather than a better
+  one, and the second-best reason for the whole project after the vocabulary
+  fix. Either engine's text is **held** and posted as one `user` turn once
+  the person goes quiet for a beat (the same wait `live.auto-send-ms` already
+  gives the typed box), or right away if they press the listen switch (tasks
+  873, 889, 917, 956, 957). Only where neither engine is reachable does the
+  conversation panel's plain `<textarea>` become the way in: there the
+  person's *own* system dictation (macOS Dictation, a phone keyboard's mic
+  key, or their fingers) types into it, exactly as before — and it remains
+  the way in regardless of engine whenever the microphone itself is not:
+  muted, this browser cannot capture audio at all, or the microphone was
+  refused. mesa still ships no speech-to-text engine of its own — `auris` is
+  a separate external binary this hands a recording to and retains nothing
+  of, in either direction, and a browser's own recognizer is the browser's,
+  not mesa's.
 - **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
   browser-side player the Inbox's play button uses (`docs/inbox.md`). The audio
@@ -1011,16 +1024,21 @@ conversation") working with no backend change.
     `togglePause`. Unmuting calls the same `reclaim`, which declines, as it
     should: a recognized sentence reaches the conversation with the keyboard
     anywhere.
-  - **There is no interim preview any more** (mesa task 956) — one-shot
-    transcription has nothing to show until a segment is done, so the italic
-    "what I'm hearing" line under the capture box is gone. Two things replace
-    it, both load-bearing for how the surface *feels*: a level meter driven off
-    the same audio (a microphone with no visible response reads as broken), and
-    a "transcribing…" note while a posted segment is in flight. A streaming
-    partial transcript was the alternative and was rejected — it needs a
-    streaming decoder mesa does not have, and `auris` answers a whole request
-    at once. `utteranceFrom` still drops a transcript with no words in it (a
-    cough, a door, a segment `auris` heard as silence).
+  - **There is no interim preview through `auris`** (mesa task 956) —
+    one-shot transcription has nothing to show until a segment is done, so
+    the italic "what I'm hearing" line under the capture box is gone on that
+    path. Two things replace it, both load-bearing for how the surface
+    *feels*: a level meter driven off the same audio (a microphone with no
+    visible response reads as broken), and a "transcribing…" note while a
+    posted segment is in flight. A streaming partial transcript was the
+    alternative and was rejected — it needs a streaming decoder mesa does not
+    have, and `auris` answers a whole request at once. `utteranceFrom` still
+    drops a transcript with no words in it (a cough, a door, a segment
+    `auris` heard as silence). Where a page instead falls back to its own
+    recognizer (mesa task 957), the interim line is back exactly as it was
+    before task 956 — that engine settles results as it goes, so there is
+    something to show, and the level meter and "transcribing…" note are
+    `auris`-specific rather than a property of listening itself.
   - **The transcript is corrected against mesa's own vocabulary before
     anything else touches it** (`liveRecognition.ts`, mesa task 922), exactly
     as it was when the browser did the listening — the correction runs
@@ -1123,16 +1141,16 @@ conversation") working with no backend change.
       flushes what was already held, or the recording would sit on screen
       with no control left to send it.
   - **A failed transcription does not end listening.** Posting a segment's
-    WAV to `/api/live/transcribe` can fail — a slow network, a crashed
-    `auris` process, or (today) no `auris` installed at all, which the route
-    answers `503 unavailable` — and the next segment tries again on its own
-    rather than the page giving up on the microphone. What is lost is only
-    that one segment's words: on a machine with no `auris` installed this
-    means the conversation hears nothing today, and it says so in the status
-    line; closing that gap with a fallback to the browser's own recognizer is
-    mesa task 957, which is also why `liveRecognition.ts` still exports
-    `recognitionCtor`, `readResults`, `isBlockingError` and
-    `SpeechRecognitionLike` even though nothing calls them yet.
+    WAV to `/api/live/transcribe` can fail — a slow network or a crashed
+    `auris` process — and the route answers `503 unavailable`; the next
+    segment tries again on its own rather than the page giving up on the
+    microphone. What is lost is only that one segment's words. Which engine a
+    page uses at all is decided once per conversation, at the moment it joins
+    (`listenPath`, `GET /api/live/transcribe`, mesa task 957) — not re-decided
+    per segment — so a machine with no `auris` installed never routes here in
+    the first place: it hears through its own browser recognizer instead
+    where one exists, or through the typed box where none does, and the
+    status line names which.
   - **The capture stream opens and closes around each turn, not once for the
     whole conversation.** It is held for as long as the microphone is wanted,
     reused across VAD segments the way the old recognizer reused it across
@@ -1418,9 +1436,12 @@ conversation") working with no backend change.
   settled segment is worth sending (`heldWith`, `heldFlush`, `utteranceFrom`),
   the composer's hint, and — mesa task 922 — the phonetic fold that keys
   mesa's vocabulary, the vocabulary table built from it and the correction
-  that rewrites transcribed text against it; `recognitionCtor`, `readResults`,
-  `isBlockingError` and `SpeechRecognitionLike` still live here too, unused
-  by `LiveHub` since mesa task 956 but kept for mesa task 957's fallback) and
+  that rewrites transcribed text against it, and — mesa task 957 —
+  `listenPath`, which of the two engines a conversation actually uses;
+  `recognitionCtor`, `readResults`, `isBlockingError` and
+  `SpeechRecognitionLike` were unused by `LiveHub` from mesa task 956 until
+  957 wired them back in as the browser-recognizer fallback, and are in use
+  again) and
   `frontend/src/liveAudio.ts` (mesa task 956 — encoding a window of captured
   frames into the 16 kHz mono WAV `/api/live/transcribe` accepts: resampling,
   16-bit quantization, the RIFF header, chunked base64, whether this browser
@@ -1486,12 +1507,14 @@ CLAUDE.md requires: **data, never instructions.**
 
 ## What is deliberately absent
 
-- **Streaming or partial transcripts.** `auris` answers one whole segment at a
-  time — there is no interim guess to show while it thinks, unlike the
-  browser recognizer this replaced. A level meter and a "transcribing…" note
-  stand in for it instead (above); a streaming decoder that could offer a
-  running partial the way the recognizer's interim results did would close
-  this gap, but mesa has none and building one is out of scope here.
+- **Streaming or partial transcripts, through `auris`.** `auris` answers one
+  whole segment at a time — there is no interim guess to show while it
+  thinks. A level meter and a "transcribing…" note stand in for it instead
+  (above); a streaming decoder that could offer a running partial would close
+  this gap, but mesa has none and building one is out of scope here. Where a
+  page instead falls back to its own recognizer (mesa task 957, below), that
+  engine's interim results are shown exactly as they were before task 956 —
+  the gap is `auris`-specific, not a property of listening in general.
 - **A speech-to-text engine of mesa's own.** `POST /api/live/transcribe`
   accepts a bounded audio request (25 MB per request, `413` past it naming
   the limit — `docs/posture.md`) and hands it to the external `auris`
@@ -1504,25 +1527,28 @@ CLAUDE.md requires: **data, never instructions.**
   `mesa live look`'s CLI-only posture, because "transcribe whatever this
   stranger recorded" is not a request an unauthenticated LAN peer should be
   able to make of a decoder running as the machine's owner
-  (`docs/posture.md`). The one thing mesa does to the resulting text before
+  (`docs/posture.md`). `GET /api/live/transcribe` sits on the same route
+  entry (mesa task 957) and answers `{"available": bool}` — the page's one
+  ask, at the moment it joins a conversation, of whether `auris` is worth
+  trying at all; sharing the entry rather than adding its own means it
+  inherits the exact same `--lan` absence as the POST, with no gate of its
+  own to keep in step, and a page that gets back something other than that
+  JSON shape (the SPA's own `index.html`, under `--lan`) reads that as its
+  answer instead: fall back, the same conclusion a `503` on a real attempt
+  would have produced. The one thing mesa does to the resulting text before
   anything else sees it is correct mishearings of its own vocabulary against
   a small local sound-key table (mesa task 922, above) — plain string
-  matching, not a second model call.
-- **A fallback to the browser's own recognizer when `auris` is unavailable.**
-  Before mesa task 956, listening ran entirely through the browser's own
-  `SpeechRecognition`/`webkitSpeechRecognition` (task 873): mesa received
-  only the text it produced, and the recognition quality, the language and
-  the privacy question were the browser's — for Chrome and Safari, that means
-  the speech could be sent to *their* service, a thing worth knowing and not
-  something mesa could answer for, which is exactly the gap `auris` exists to
-  close. As of task 956 that path is gone from the page entirely, and nothing
-  stands in for it when `auris` is missing or fails: a machine with no
-  `auris` installed holds a live conversation it cannot hear, with the typed
-  box as the only way in, and the status line says so. This is a real
-  regression, closing it is mesa task 957, and `liveRecognition.ts` keeps
-  `recognitionCtor`, `readResults`, `isBlockingError` and
-  `SpeechRecognitionLike` exported and unused rather than deleted, against
-  that follow-up wiring them back in as the fallback.
+  matching, not a second model call. Before mesa task 956, listening ran
+  entirely through the browser's own `SpeechRecognition`/
+  `webkitSpeechRecognition` (task 873): mesa received only the text it
+  produced, and the recognition quality, the language and the privacy
+  question were the browser's — for Chrome and Safari, that means the speech
+  could be sent to *their* service, a thing worth knowing and not something
+  mesa could answer for, which is exactly the gap `auris` exists to close.
+  `auris` is therefore the preferred engine wherever it can be reached
+  (`listenPath`, above), but it is deliberately not the *only* one: mesa
+  task 957 kept the browser recognizer as the fallback for a machine with no
+  `auris` installed, rather than a machine with no engine at all.
 - **An HTTP route for `mesa live look`** (task 895). Capturing the person's
   screen is a CLI-only capability on purpose: `--lan` serves the API to the
   whole network with no auth, and no gate here makes "photograph the owner's

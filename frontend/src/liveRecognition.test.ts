@@ -9,6 +9,7 @@ import {
   heldWith,
   isBlockingError,
   isListenChord,
+  listenPath,
   MESA_VOCABULARY,
   readResults,
   recognitionCtor,
@@ -51,6 +52,41 @@ describe('recognitionCtor', () => {
 
   it('is null when the name is present but not constructible', () => {
     expect(recognitionCtor({ SpeechRecognition: 'yes' })).toBe(null)
+  })
+})
+
+describe('listenPath', () => {
+  it('picks auris when the server can transcribe and this browser can capture audio', () => {
+    expect(listenPath({ transcribes: true, captures: true, recognizes: false })).toBe('auris')
+  })
+
+  it('prefers auris even where the browser also has its own recognizer', () => {
+    // The ordering is the whole point of mesa task 957: auris hears mesa's
+    // own vocabulary correctly and punctuates like a person, where
+    // SpeechRecognition does neither.
+    expect(listenPath({ transcribes: true, captures: true, recognizes: true })).toBe('auris')
+  })
+
+  it('falls back to the browser recognizer where auris cannot be reached', () => {
+    expect(listenPath({ transcribes: false, captures: true, recognizes: true })).toBe('browser')
+    expect(listenPath({ transcribes: true, captures: false, recognizes: true })).toBe('browser')
+    expect(listenPath({ transcribes: false, captures: false, recognizes: true })).toBe('browser')
+  })
+
+  it('is none where neither way in is available', () => {
+    expect(listenPath({ transcribes: false, captures: false, recognizes: false })).toBe('none')
+    expect(listenPath({ transcribes: false, captures: true, recognizes: false })).toBe('none')
+    expect(listenPath({ transcribes: true, captures: false, recognizes: false })).toBe('none')
+  })
+
+  it('gives Firefox a microphone through auris even though it has no recognizer of its own', () => {
+    // Firefox has no SpeechRecognition at all — this is the genuinely new
+    // case the task exists for.
+    expect(listenPath({ transcribes: true, captures: true, recognizes: false })).toBe('auris')
+  })
+
+  it('leaves Firefox with no way in when auris cannot be reached either', () => {
+    expect(listenPath({ transcribes: false, captures: true, recognizes: false })).toBe('none')
   })
 })
 
@@ -495,15 +531,15 @@ describe('captureHint', () => {
   const base = {
     live: true,
     joined: true,
-    supported: true,
+    path: 'auris' as const,
     blocked: false,
     listening: false,
     paused: false,
     muted: false,
   }
 
-  it('says so where the browser cannot listen', () => {
-    expect(captureHint({ ...base, supported: false })).toMatch(/cannot listen/)
+  it('says so where neither way in is available', () => {
+    expect(captureHint({ ...base, path: 'none' })).toMatch(/Neither auris nor this browser/)
   })
 
   it('says so once the microphone was refused', () => {
@@ -516,6 +552,18 @@ describe('captureHint', () => {
 
   it('says it is listening while it is', () => {
     expect(captureHint({ ...base, listening: true })).toMatch(/Listening/)
+  })
+
+  it('names auris as the way in while listening through it', () => {
+    expect(captureHint({ ...base, listening: true, path: 'auris' })).toMatch(
+      /Listening through auris/,
+    )
+  })
+
+  it('names this browser as the way in while listening through its own recognizer', () => {
+    expect(captureHint({ ...base, listening: true, path: 'browser' })).toMatch(
+      /Listening through this browser/,
+    )
   })
 
   it('says the recording is sent on silence, with the switch as an early send', () => {
@@ -553,7 +601,7 @@ describe('captureHint', () => {
     // The box is disabled while paused, so each of the other three would be
     // inviting the person to type into a field that will not take it.
     expect(captureHint({ ...base, paused: true })).toMatch(/Resume/)
-    expect(captureHint({ ...base, paused: true, supported: false })).toMatch(/Resume/)
+    expect(captureHint({ ...base, paused: true, path: 'none' })).toMatch(/Resume/)
     expect(captureHint({ ...base, paused: true, blocked: true })).toMatch(/Resume/)
   })
 })

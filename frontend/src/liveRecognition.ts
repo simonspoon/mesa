@@ -57,9 +57,9 @@
  * has two boundaries, the person's own vocabulary gets corrected) never had
  * anything to do with *how* the words were heard. `recognitionCtor`,
  * `readResults`, `isBlockingError` and `SpeechRecognitionLike` are the part
- * that was `SpeechRecognition`-specific; they stay exported for mesa task
- * 957 (the fallback for a machine with no `auris`) but nothing calls them
- * today.
+ * that was `SpeechRecognition`-specific; as of mesa task 957 they are **in
+ * use again**, by the browser-recognizer path `listenPath` falls back to on
+ * a machine with no `auris`.
  */
 
 /** One reading of what was heard. The API offers alternatives; mesa takes the first. */
@@ -110,6 +110,52 @@ export function recognitionCtor(
   if (!scope) return null
   const ctor = scope.SpeechRecognition ?? scope.webkitSpeechRecognition
   return typeof ctor === 'function' ? (ctor as SpeechRecognitionCtor) : null
+}
+
+/**
+ * The two ways in a page can have (mesa task 957), plus none: `'auris'`
+ * (page-side capture posted to `POST /api/live/transcribe`, mesa task 956),
+ * `'browser'` (this module's original `SpeechRecognition` path, mesa task
+ * 873), or `'none'` (the typed box and the person's own system dictation).
+ */
+export type ListenPath = 'auris' | 'browser' | 'none'
+
+/**
+ * Which way in this page actually has, decided once per conversation and
+ * named to the person (`captureHint`) rather than left for them to guess
+ * from transcript quality.
+ *
+ * auris wins whenever it can be reached, **even where the browser also has
+ * its own recognizer** — the ordering is the whole point of mesa task 957:
+ * auris hears mesa's own vocabulary correctly (mesa task 922 exists only
+ * because the browser's engine does not) and punctuates like a person,
+ * where `SpeechRecognition` does neither. Firefox has no recognizer of its
+ * own at all, so auris is also the only way a Firefox user gets a
+ * microphone here — `getUserMedia` is everywhere `SpeechRecognition` is
+ * not, so `transcribes && captures && !recognizes` is a genuinely new
+ * capability, not just a better one.
+ *
+ * The browser's own recognizer is the fallback, and `'none'` is the last
+ * resort — the typed box and the person's own system dictation.
+ */
+export function listenPath(input: {
+  /**
+   * The server has an `auris` that answered — `GET /api/live/transcribe`.
+   * False whenever mesa could not ask: the route 404'd (what `serve --lan`
+   * looks like, the route being absent there rather than gated), the
+   * request failed, or `listen::models()` came back empty. An empty model
+   * list means **"mesa could not ask"**, never "auris says there are
+   * none" — the same rule `speech::voices()` has carried since it shipped.
+   */
+  transcribes: boolean
+  /** This browser can capture audio at all (`liveAudio.ts::capturesAudio`). */
+  captures: boolean
+  /** This browser has a recognizer of its own (`recognitionCtor(...) !== null`). */
+  recognizes: boolean
+}): ListenPath {
+  if (input.transcribes && input.captures) return 'auris'
+  if (input.recognizes) return 'browser'
+  return 'none'
 }
 
 /**
@@ -650,8 +696,9 @@ export const LISTEN_CHORD = '⌘/Ctrl+Shift+L'
  * What the composer says about listening — one line, always present, because
  * "is it hearing me" is the only question a hands-free surface has to answer
  * without being asked. The six states are the six honest ones: the person
- * paused it, this browser cannot listen, the microphone was refused, the
- * conversation has not started yet, the person muted it, or it is listening.
+ * paused it, neither way in is available, the microphone was refused, the
+ * conversation has not started yet, the person muted it, or it is listening
+ * (and, once listening, which of the two ways in — mesa task 957).
  *
  * The two states above muted are the two presses that have to come first — a
  * conversation to listen to, and this browser joined to it, since the switch
@@ -683,7 +730,8 @@ export function captureHint(input: {
   live: boolean
   /** This browser has had its press (the hub's `unlocked`). */
   joined: boolean
-  supported: boolean
+  /** Which way in this page actually has (mesa task 957, `listenPath`). */
+  path: ListenPath
   blocked: boolean
   listening: boolean
   paused: boolean
@@ -693,8 +741,8 @@ export function captureHint(input: {
   if (input.paused) {
     return 'Paused. Press Resume to talk to mesa again — the conversation is still running.'
   }
-  if (!input.supported) {
-    return 'This browser cannot listen for itself. Type here, or use your system dictation — a settled line is sent on its own.'
+  if (input.path === 'none') {
+    return 'Neither auris nor this browser can listen here. Type, or use your system dictation — a settled line is sent on its own.'
   }
   if (input.blocked) {
     return 'The microphone was refused, so mesa is not listening. Type here, or use your system dictation — a settled line is sent on its own.'
@@ -712,7 +760,11 @@ export function captureHint(input: {
     return `mesa is not listening. Press ${LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
   }
   if (input.listening) {
-    return 'Listening — everything you say is held here and sent to mesa once you go quiet, or right away if you press the switch. She stops listening while she is speaking. You can still type here.'
+    // Named (mesa task 957): the person can act on the difference — auris is
+    // an install away, the browser recognizer is not — so the ladder saying
+    // only "listening" would hide something worth knowing.
+    const via = input.path === 'auris' ? 'auris' : 'this browser'
+    return `Listening through ${via} — everything you say is held here and sent to mesa once you go quiet, or right away if you press the switch. She stops listening while she is speaking. You can still type here.`
   }
   // Joined, unmuted, and still not the way in — nothing left that is worth a
   // line of its own; the box is the way in and says so.

@@ -2888,6 +2888,51 @@ async fn transcribe_live(
     Ok(Json(LiveTranscript { text }).into_response())
 }
 
+/// `GET /api/live/transcribe` — whether a recognizer is the way in, for the
+/// live page to ask once per load before it decides whether to fall back to
+/// the browser's own `SpeechRecognition` (mesa task 957).
+///
+/// Answers `{"available": !listen::models().is_empty()}`. An empty list is
+/// [`listen::models`]'s "mesa could not ask" signal — the binary missing,
+/// failing, or answering with something that isn't a list of names — **never**
+/// "auris says it has no models installed"; there is no way to tell those
+/// apart from here, and the caller only needs to know whether decoding a
+/// recording has anywhere to go. `models()` is `OnceLock`-cached for the life
+/// of the process, exactly as `get_config_listen` already relies on, so this
+/// route adds no new probing mechanism — it just reads the same signal.
+///
+/// Registered on the **same** `.route("/api/live/transcribe", ...)` entry as
+/// [`transcribe_live`], inside `transcribe_router`, rather than its own line —
+/// that is what makes it inherit `transcribe_router`'s `--lan` absence
+/// exactly as the POST does — not a gate refusal. A GET to an unregistered
+/// path is exactly what the embedded SPA fallback DOES serve (200
+/// `index.html`, GET/HEAD only, per `transcribe_router`'s own doc comment),
+/// unlike the POST's plain 405, so the caller-visible signal is "this
+/// answered the app shell, not JSON with an `available` key" rather than a
+/// distinct status code. That absence *is* the answer for a LAN page: the
+/// capability does not exist to be checked there (see `transcribe_router`'s
+/// doc), so a LAN page must read "not a JSON answer" as "fall back to the
+/// browser's own recognizer" rather than getting `available: false` from a
+/// route that would have decoded its audio if only it asked politely.
+///
+/// Gated by `require_agent_access` alone — this is a read, not a mutation, so
+/// unlike `transcribe_live` it carries no `require_same_site_fetch`.
+async fn transcribe_available(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let available = tokio::task::spawn_blocking(|| !listen::models().is_empty())
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: format!("checking auris availability failed: {e}"),
+        })?;
+    Ok(Json(json!({ "available": available })).into_response())
+}
+
 /// Whether `POST /api/live/transcribe` exists at all, decided at router
 /// construction from `state.lan`.
 ///
@@ -2917,7 +2962,9 @@ fn transcribe_router(state: &AppState) -> Router<AppState> {
     }
     Router::new().route(
         "/api/live/transcribe",
-        post(transcribe_live).layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT)),
+        post(transcribe_live)
+            .get(transcribe_available)
+            .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT)),
     )
 }
 

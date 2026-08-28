@@ -41,6 +41,14 @@
 #      instead), and auris is never invoked; the Content-Type gate still
 #      fires first, in middleware, before routing decides the route doesn't
 #      exist.
+#   8. `GET /api/live/transcribe` (mesa task 957): a missing recognizer is
+#      200 `available: false`, never an error — an empty model list means
+#      "mesa could not ask", not "auris says no"; a recognizer that answers
+#      `--no-download --list-models` is `available: true`; the same
+#      `require_agent_access` gate as the POST (403 foreign Origin/Host, 200
+#      local) with no Content-Type check, since a GET carries no body;
+#   9. under `--lan`, the GET is **absent** too, on the same route entry as
+#      the POST — not merely refusing.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -92,6 +100,15 @@ cat > "$STUB_DIR/auris" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" > "$STUB_DIR/last-argv"
 cat > "$STUB_DIR/last-stdin"
+# \`listen::models()\` (\`GET /api/live/transcribe\`, mesa task 957) asks with
+# this exact argv and a closed stdin; answer with one bounded model name,
+# same shape auris itself uses. This branches ahead of the transcribe-only
+# fail/lines fixtures below so listing a model is unaffected by them.
+if [ "\$*" = "--no-download --list-models" ]; then
+  [ -e "$STUB_DIR/auris-fail" ] && exit 1
+  printf 'parakeet-tdt-0.6b-v2-int8\n'
+  exit 0
+fi
 [ -e "$STUB_DIR/auris-fail" ] && { echo "stub auris is down" >&2; exit 1; }
 [ -e "$STUB_DIR/auris-noisy" ] && { head -c 200000 /dev/zero | tr '\0' 'x' >&2; }
 if [ -e "$STUB_DIR/auris-lines" ]; then
@@ -159,6 +176,13 @@ api 503 POST "/api/live/transcribe" "$BODY_JSON"
   fail "transcribe with a missing auris binary: error.code must be unavailable"
 ok "POST /api/live/transcribe: a missing auris binary is 503 unavailable"
 
+raw GET "/api/live/transcribe"
+[ "$STATUS" = "200" ] ||
+  fail "GET /api/live/transcribe with a missing auris binary: expected 200, got $STATUS"
+[ "$(jqb .available)" = "false" ] ||
+  fail "GET /api/live/transcribe with a missing auris binary: available must be false, not an error — an empty model list means mesa could not ask"
+ok "GET /api/live/transcribe: a missing auris binary is 200 available:false, never an error"
+
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
@@ -188,6 +212,15 @@ cmp -s "$STUB_DIR/last-stdin" "$TMP/audio.raw" ||
 [ "$(cat "$STUB_DIR/last-argv")" = "-q --format json" ] ||
   fail "transcribe: argv must be exactly -q --format json (got $(cat "$STUB_DIR/last-argv"))"
 ok "POST /api/live/transcribe: 200 with the stub's transcript; audio reaches auris on stdin byte-identical, never as an argument; argv is -q --format json"
+
+# ---- 8a. GET /api/live/transcribe: available when the stub lists a model ----
+raw GET "/api/live/transcribe"
+[ "$STATUS" = "200" ] || fail "GET /api/live/transcribe: expected 200, got $STATUS"
+[ "$(jqb .available)" = "true" ] ||
+  fail "GET /api/live/transcribe: available must be true when the recognizer lists a model"
+[ "$(cat "$STUB_DIR/last-argv")" = "--no-download --list-models" ] ||
+  fail "GET /api/live/transcribe: must ask auris via --no-download --list-models (got $(cat "$STUB_DIR/last-argv"))"
+ok "GET /api/live/transcribe: 200 available:true when the recognizer lists a model, asked via --no-download --list-models"
 
 # ---- 3. last transcript line wins; an unrecognised type is ignored ----
 cat >"$STUB_DIR/auris-lines" <<'JSONL'
@@ -304,6 +337,18 @@ raw POST "/api/live/transcribe" -H "Host: evil.example" -H 'Content-Type: applic
   fail "transcribe from a local Origin must reach the handler"
 ok "transcribe: Content-Type gate (415 with no/form Content-Type) and agent gate (403 foreign Origin/Host, 200 local) — the same pair speak/start/stop carry"
 
+# ---- 8b. GET /api/live/transcribe: the agent gate, default mode ----
+#
+# A GET carries no body, so there is no Content-Type check to assert here —
+# just require_agent_access's Origin/Host halves.
+[ "$(origin_status GET "/api/live/transcribe" 'https://evil.example')" = "403" ] ||
+  fail "GET /api/live/transcribe with a foreign Origin must be 403 (the agent gate)"
+raw GET "/api/live/transcribe" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "GET /api/live/transcribe with a bogus Host: expected 403, got $STATUS"
+[ "$(origin_status GET "/api/live/transcribe" 'http://localhost:'"$PORT")" = "200" ] ||
+  fail "GET /api/live/transcribe from a local Origin must reach the handler"
+ok "GET /api/live/transcribe: the agent gate (403 foreign Origin/Host, 200 local) — same gate as the POST, no Content-Type check"
+
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
@@ -347,6 +392,22 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' -d 'audio_base64=form+post' "$LA
 [ "$STATUS" = "415" ] ||
   fail "--lan: the Content-Type gate must still fire on this path (it runs in middleware before routing), got $STATUS"
 ok "--lan: the Content-Type gate still rejects a form-encoded POST to the absent transcribe route — the middleware runs before routing decides the route does not exist"
+
+# ---- 9. --lan: GET /api/live/transcribe is absent too ----
+#
+# Same route entry as the POST (`transcribe_router`), so it inherits the same
+# absence rather than needing its own --lan handling. Unlike the POST, a GET
+# to an unknown path is exactly what the SPA fallback DOES serve (200
+# index.html, per `transcribe_router`'s own doc comment) — so the property to
+# assert here is not the status code but that no availability answer came
+# back: the response is the app shell, not JSON with an `available` key.
+STATUS=$(curl -s -o "$TMP/lan-get-body" -w '%{http_code}' "$LAN_BASE/api/live/transcribe")
+LAN_GET_BODY=$(cat "$TMP/lan-get-body")
+grep -q '"available"' <<<"$LAN_GET_BODY" &&
+  fail "--lan: an availability answer came back — the route must not exist here"
+grep -qi '<html' <<<"$LAN_GET_BODY" ||
+  fail "--lan: GET /api/live/transcribe must fall through to the SPA shell, not a JSON answer"
+ok "--lan: GET /api/live/transcribe never reaches the handler either — falls through to the SPA fallback like any other unknown GET path, absent exactly like the POST"
 
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true

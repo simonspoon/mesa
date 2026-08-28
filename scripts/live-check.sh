@@ -57,7 +57,20 @@
 #      NEXT conversation's spawned prompt argv (and lands after the
 #      instruction block, never before), a write-then-immediate-read-back
 #      regression for a session older than the retained set, and the
-#      project-delete cascade.
+#      project-delete cascade;
+#  12. POST /api/live/transcribe (mesa task 954), against a stub `auris`
+#      (MESA_AURIS_BIN): a real round-trip whose decoded audio reaches the
+#      stub on stdin byte-identical to what was sent (never as an argument),
+#      keeping the LAST `transcript` line among several and ignoring an
+#      unrecognised `type` (auris's own extension mechanism), `unavailable`
+#      for a nonzero exit, a run with no `transcript` line at all, and a
+#      missing binary; a body one byte over the 25 MiB cap answered 413
+#      validation naming the limit, still as JSON, distinct from 422 for
+#      invalid/empty/missing base64; both halves of the boundary in default
+#      mode (Content-Type, agent gate); and under `--lan` the route is
+#      **absent**, not gated — a well-formed request never reaches the
+#      handler, answered by the embedded static-file fallback's plain-text
+#      405 instead of the gate's JSON 403.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -186,6 +199,31 @@ esac
 EOF
 chmod +x "$STUB_DIR/loki"
 export MESA_LOKI_BIN="$STUB_DIR/loki"
+
+# ---- stub auris (POST /api/live/transcribe, mesa task 954) ----
+#
+# The mirror of the kokoro-rs stub, running in the other direction: it logs
+# its stdin (the decoded recording, which must reach it byte-identical and
+# never as an argument) and its argv, then answers auris's real JSON-Lines
+# `--format json` shape — a `segment` line, then a `transcript` line — on
+# stdout. `$STUB_DIR/auris-lines` lets a case override what it emits (to
+# prove mesa keeps the LAST `transcript` line and ignores anything else); an
+# `auris-fail` marker is the exit-1 "no transcript" failure mode, printing to
+# stderr and writing nothing to stdout.
+cat > "$STUB_DIR/auris" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$STUB_DIR/last-argv"
+cat > "$STUB_DIR/last-stdin"
+[ -e "$STUB_DIR/auris-fail" ] && { echo "stub auris is down" >&2; exit 1; }
+if [ -e "$STUB_DIR/auris-lines" ]; then
+  cat "$STUB_DIR/auris-lines"
+else
+  printf '{"type":"segment","index":0,"text":"hello"}\n'
+  printf '{"type":"transcript","text":"hello there"}\n'
+fi
+EOF
+chmod +x "$STUB_DIR/auris"
+export MESA_AURIS_BIN="$STUB_DIR/auris"
 
 # ---- fixtures ----
 #
@@ -1174,7 +1212,12 @@ raw GET "/api/live" -H "Host: localhost:1"
 ok "Host allowlist: a foreign Host is 403 on read and write; both allowlisted spellings pass"
 
 # ---- Content-Type gate (cross-site form posts), on every live write ----
-for p in "/api/live" "/api/live/utterance" "/api/live/route" "/api/live/turns/$SPOKEN/played"; do
+#
+# /api/live/transcribe rides in this same loop in default mode ONLY: under
+# --lan the route does not exist at all (section 12), so the loop's "must be
+# 415" expectation would not hold there.
+for p in "/api/live" "/api/live/utterance" "/api/live/route" "/api/live/turns/$SPOKEN/played" \
+         "/api/live/transcribe"; do
   raw POST "$p"
   [ "$STATUS" = "415" ] || fail "POST $p without Content-Type: expected 415, got $STATUS"
   [ "$(jqb .error.code)" = "validation" ] || fail "POST $p no Content-Type: error.code"
@@ -1185,7 +1228,7 @@ raw DELETE "/api/live" -d 'x=1'
 [ "$STATUS" = "415" ] || fail "DELETE /api/live without JSON Content-Type: expected 415, got $STATUS"
 raw GET "/api/live"
 [ "$STATUS" = "200" ] || fail "GET /api/live is exempt from the Content-Type gate"
-ok "Content-Type gate: every live mutation (POST ×4, DELETE) is 415 without JSON; GET is exempt"
+ok "Content-Type gate: every live mutation (POST ×5, DELETE) is 415 without JSON; GET is exempt"
 
 # ---- the agent gate on the three routes that carry it ----
 #
@@ -1561,5 +1604,196 @@ run 0 "$MESA" live summary show "$CASCADE_SESSION"
 run 0 "$MESA" live turns --session "$CASCADE_SESSION"
 [ "$(jqs length)" = "1" ] || fail "deleting a session's project must not destroy its turns either"
 ok "deleting a session's project: its summary and turns both survive (project_id is SET NULL, not CASCADE)"
+
+# =====================================================================
+# 12. POST /api/live/transcribe — recorded audio in, text out (mesa task 954)
+# =====================================================================
+#
+# Transcribing a recording is stateless — no live session is involved, see
+# `listen::transcribe`'s own doc comment — so this section needs nothing from
+# section 11's CLI-only work but a fresh server. `LIVE_AUDIO_MAX` is read out
+# of the source rather than hardcoded, the same way section 11 reads
+# LIVE_SUMMARY_MAX/KEEP.
+LIVE_AUDIO_MAX_EXPR=$(grep -Eo 'pub const LIVE_AUDIO_MAX: usize = [^;]+;' src/core/store.rs |
+  sed -E 's/.*= (.*);/\1/')
+[ -n "$LIVE_AUDIO_MAX_EXPR" ] || fail "could not read LIVE_AUDIO_MAX from src/core/store.rs"
+LIVE_AUDIO_MAX=$((LIVE_AUDIO_MAX_EXPR))
+
+PORT=17781
+BASE="http://127.0.0.1:$PORT"
+
+# ---- a missing binary, checked with its own short-lived server ----
+#
+# MESA_AURIS_BIN is read by the child process at spawn time, so it has to be
+# wrong BEFORE the server starts — changing the shell's export after a server
+# is already running would never reach it.
+MESA_AURIS_BIN="$STUB_DIR/no-such-auris" "$MESA" serve --port "$PORT" >"$TMP/serve-nobin.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$BASE/api/live" >/dev/null ||
+  fail "server (missing auris binary) did not start (log: $(cat "$TMP/serve-nobin.log"))"
+NOBIN_BODY=$(jq -n --arg a "$(printf 'AAAA' | base64)" '{audio_base64: $a}')
+api 503 POST "/api/live/transcribe" "$NOBIN_BODY"
+[ "$(jqb .error.code)" = "unavailable" ] ||
+  fail "transcribe with a missing auris binary: error.code must be unavailable"
+ok "POST /api/live/transcribe: a missing auris binary is 503 unavailable"
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
+
+# ---- the real server, stubbed auris in place ----
+"$MESA" serve --port "$PORT" >"$TMP/serve12.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$BASE/api/live" >/dev/null ||
+  fail "server did not start for section 12 (log: $(cat "$TMP/serve12.log"))"
+
+# ---- round-trip: a real recording, byte-identical on the stub's stdin ----
+head -c 4096 /dev/urandom >"$TMP/audio.raw"
+AUDIO_B64=$(base64 <"$TMP/audio.raw" | tr -d '\n')
+TRANSCRIBE_BODY=$(jq -n --arg a "$AUDIO_B64" '{audio_base64: $a}')
+api 200 POST "/api/live/transcribe" "$TRANSCRIBE_BODY"
+[ "$(jqb .text)" = "hello there" ] ||
+  fail "transcribe round-trip: expected the stub's transcript, got $(jqb .text)"
+cmp -s "$STUB_DIR/last-stdin" "$TMP/audio.raw" ||
+  fail "transcribe: the decoded audio must reach auris on stdin, byte-identical to what was sent"
+[ "$(cat "$STUB_DIR/last-argv")" = "-q --format json" ] ||
+  fail "transcribe: argv must be exactly -q --format json (got $(cat "$STUB_DIR/last-argv"))"
+ok "POST /api/live/transcribe: 200 with the stub's transcript; audio reaches auris on stdin byte-identical, never as an argument; argv is -q --format json"
+
+# ---- last transcript line wins; an unrecognised type is ignored ----
+cat >"$STUB_DIR/auris-lines" <<'JSONL'
+{"type":"segment","index":0,"text":"first pass"}
+{"type":"transcript","text":"draft one"}
+{"type":"something-new","text":"a field mesa does not know about"}
+{"type":"transcript","text":"final corrected text"}
+JSONL
+api 200 POST "/api/live/transcribe" "$TRANSCRIBE_BODY"
+[ "$(jqb .text)" = "final corrected text" ] ||
+  fail "transcribe: must keep the LAST transcript line, not the first (got $(jqb .text))"
+rm -f "$STUB_DIR/auris-lines"
+ok "transcribe: the last \`transcript\` line wins over an earlier one, and an unrecognised \`type\` is ignored rather than aborting the read — auris's own extension mechanism"
+
+# ---- unavailable: a nonzero exit, and a run with no transcript line ----
+touch "$STUB_DIR/auris-fail"
+api 503 POST "/api/live/transcribe" "$TRANSCRIBE_BODY"
+rm -f "$STUB_DIR/auris-fail"
+[ "$(jqb .error.code)" = "unavailable" ] || fail "transcribe: a failing auris must be 503 unavailable"
+
+cat >"$STUB_DIR/auris-lines" <<'JSONL'
+{"type":"segment","index":0,"text":"only a segment, nothing final"}
+{"type":"something-new"}
+JSONL
+api 503 POST "/api/live/transcribe" "$TRANSCRIBE_BODY"
+[ "$(jqb .error.code)" = "unavailable" ] ||
+  fail "transcribe: a run with no transcript line must be 503 unavailable, never a 200 with empty text"
+rm -f "$STUB_DIR/auris-lines"
+ok "transcribe: unavailable for a failing auris and for a run that never emits a transcript line — never a silent empty success"
+
+# ---- over-cap body: 413, JSON, naming the limit ----
+#
+# One byte past LIVE_AUDIO_MAX decoded — generated with head -c/base64 rather
+# than jq, and posted as a single request; slow to build, so there is exactly
+# one of these.
+OVER_RAW=$((LIVE_AUDIO_MAX + 1))
+head -c "$OVER_RAW" /dev/zero | base64 | tr -d '\n' >"$TMP/over.b64"
+{
+  printf '{"audio_base64":"'
+  cat "$TMP/over.b64"
+  printf '"}'
+} >"$TMP/over.json"
+STATUS=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Content-Type: application/json' \
+  --data-binary @"$TMP/over.json" "$BASE/api/live/transcribe")
+BODY=$(cat "$TMP/body")
+[ "$STATUS" = "413" ] || fail "transcribe over the $LIVE_AUDIO_MAX-byte cap: expected 413, got $STATUS"
+[ "$(jqb .error.code)" = "validation" ] || fail "transcribe over the cap: error.code"
+grep -q "$LIVE_AUDIO_MAX" <<<"$BODY" || fail "transcribe over the cap: the message must name the limit"
+jq -e . <<<"$BODY" >/dev/null ||
+  fail "transcribe over the cap: the 413 must still be JSON — the whole reason the DefaultBodyLimit layer was raised above the cap"
+ok "transcribe: a body one byte over the ${LIVE_AUDIO_MAX}-byte cap is 413 validation, still JSON, naming the limit"
+
+# ---- non-audio / malformed bodies: 422, never 413 ----
+api 422 POST "/api/live/transcribe" '{"audio_base64":"not valid base64!!!"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "transcribe with invalid base64: error.code"
+api 422 POST "/api/live/transcribe" '{"audio_base64":""}'
+[ "$(jqb .error.code)" = "validation" ] || fail "transcribe with an empty audio_base64: error.code"
+api 422 POST "/api/live/transcribe" '{}'
+[ "$(jqb .error.code)" = "validation" ] || fail "transcribe with no audio_base64 field at all: error.code"
+ok "transcribe: invalid base64, an empty recording, and a missing field are all 422 validation"
+
+# Valid base64 that is not actually a WAV: mesa never inspects the bytes
+# itself (`listen::transcribe` hands them to auris verbatim), so with the
+# stub this is indistinguishable from the round-trip above. With a real
+# auris this is exit-1 "no transcript" — the `unavailable` path just proven.
+NOT_WAV_B64=$(printf 'this is not a wav file' | base64 | tr -d '\n')
+api 200 POST "/api/live/transcribe" "$(jq -n --arg a "$NOT_WAV_B64" '{audio_base64: $a}')"
+[ "$(jqb .text)" = "hello there" ] ||
+  fail "transcribe with non-WAV (but valid) base64: mesa must still just hand it to auris"
+ok "transcribe: valid base64 that is not a WAV is not mesa's to reject — it reaches auris unexamined (a real auris would answer unavailable here)"
+
+# ---- both halves of the boundary, default mode ----
+raw POST "/api/live/transcribe"
+[ "$STATUS" = "415" ] || fail "transcribe without Content-Type: expected 415, got $STATUS"
+raw POST "/api/live/transcribe" -d 'audio_base64=form+post'
+[ "$STATUS" = "415" ] || fail "form-encoded transcribe: expected 415, got $STATUS"
+[ "$(origin_status POST "/api/live/transcribe" 'https://evil.example' "$TRANSCRIBE_BODY")" = "403" ] ||
+  fail "transcribe with a foreign Origin must be 403 (the agent gate)"
+raw POST "/api/live/transcribe" -H "Host: evil.example" -H 'Content-Type: application/json' \
+  -d "$TRANSCRIBE_BODY"
+[ "$STATUS" = "403" ] || fail "transcribe with a bogus Host: expected 403, got $STATUS"
+[ "$(origin_status POST "/api/live/transcribe" 'http://localhost:7770' "$TRANSCRIBE_BODY")" = "200" ] ||
+  fail "transcribe from a local Origin must reach the handler"
+ok "transcribe: Content-Type gate (415 with no/form Content-Type) and agent gate (403 foreign Origin/Host, 200 local) — the same pair speak/start/stop carry"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
+
+# ---- --lan: the route is ABSENT, not gated ----
+#
+# `transcribe_router` never registers this route under --lan, so a
+# well-formed request falls through to the embedded-static-file fallback
+# (`axum_embed::ServeEmbed`, GET/HEAD only), which answers a plain-text 405 —
+# nothing like the gate's `{"error":{"code":"validation",...}}` 403. That 405
+# is an artifact of the SPA fallback, not a status mesa chose, so this is
+# written against the property (the handler was never reached, and the stub
+# was never invoked) rather than against the number.
+LAN_PORT=17782
+LAN_BASE="http://127.0.0.1:$LAN_PORT"
+"$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan12.log" 2>&1 &
+LAN_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$LAN_BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$LAN_BASE/api/live" >/dev/null ||
+  fail "LAN server did not start for section 12 (log: $(cat "$TMP/lan12.log"))"
+
+rm -f "$STUB_DIR/last-argv"
+STATUS=$(curl -s -o "$TMP/lan-body" -w '%{http_code}' -H 'Content-Type: application/json' \
+  -d "$TRANSCRIBE_BODY" "$LAN_BASE/api/live/transcribe")
+LAN_BODY=$(cat "$TMP/lan-body")
+[ "$STATUS" != "200" ] || fail "--lan: /api/live/transcribe must not be reachable at all, got 200"
+grep -q '"text"' <<<"$LAN_BODY" && fail "--lan: a transcript came back — the route must not exist here"
+[ "$(jq -e . <<<"$LAN_BODY" 2>/dev/null | jq -r '.error.code // empty' 2>/dev/null)" != "validation" ] ||
+  fail "--lan: a validation error shape means the route was gated, not absent"
+[ ! -e "$STUB_DIR/last-argv" ] ||
+  fail "--lan: auris must never be invoked — the route is absent, not merely refused"
+ok "--lan: POST /api/live/transcribe never reaches the handler (not 200, no transcript, not the gate's JSON 403) and auris is never run"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -d 'audio_base64=form+post' "$LAN_BASE/api/live/transcribe")
+[ "$STATUS" = "415" ] ||
+  fail "--lan: the Content-Type gate must still fire on this path (it runs in middleware before routing), got $STATUS"
+ok "--lan: the Content-Type gate still rejects a form-encoded POST to the absent transcribe route — the middleware runs before routing decides the route does not exist"
+
+kill "$LAN_PID" 2>/dev/null || true
+wait "$LAN_PID" 2>/dev/null || true
+LAN_PID=
 
 echo "all $CHECKS checks passed"

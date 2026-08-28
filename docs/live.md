@@ -27,9 +27,12 @@ design:
   on offer at all — a browser without it (Firefox
   today), or a refused microphone. There the person's *own* system dictation
   (macOS Dictation, a phone keyboard's mic key, or their fingers) types into it,
-  exactly as before. Either way, **mesa ships no speech-to-text of its own,
-  never sees the audio, and accepts no audio request body** — the recognition
-  is the browser's and stays in the page. See
+  exactly as before. **Today mesa still ships no speech-to-text of its own and
+  the page still sends no audio request body** — the recognition is the
+  browser's and stays in the page — but mesa now also accepts one bounded
+  audio route, `POST /api/live/transcribe`, that hands a recording to the
+  external `auris` binary instead; the page does not call it yet (mesa task
+  956 wires the microphone to it). See
   [What is deliberately absent](#what-is-deliberately-absent).
 - **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
@@ -1169,9 +1172,10 @@ conversation") working with no backend change.
     machine-local like a pane width, and the default is remembered as
     **nothing at all**, not as an empty string, so a fresh browser and an
     explicitly-reset one read the same. None of it moves the audio boundary:
-    the chosen track never leaves the page, it is handed straight to the
-    browser's own recognizer, and mesa still ships no speech-to-text, still
-    sees no audio, and still accepts no audio body.
+    the chosen track never leaves the page through this module, it is handed
+    straight to the browser's own recognizer — this device chooser has
+    nothing to do with `auris` or `/api/live/transcribe` (above), and mesa
+    still ships no speech-to-text engine of its own, on either path.
   - **A refusal is terminal for the page** (`isBlockingError`): `not-allowed`
     and `service-not-allowed` set `blocked`, name themselves in the status
     line, and leave the typed box as the way in. Everything else the engine
@@ -1486,24 +1490,41 @@ CLAUDE.md requires: **data, never instructions.**
 
 ## What is deliberately absent
 
-- **Speech-to-text of mesa's own.** mesa does not ship or shell out to an STT
-  engine, no route accepts an audio body, and no audio ever reaches the server:
-  recognition is the **browser's**, running in the page, and mesa receives only
-  the text it produced (task 873). The recognition quality, the language and
-  the privacy question are therefore the browser's — which, for Chrome and
-  Safari, means the speech may be sent to *their* service, a thing worth
-  knowing and not something mesa can answer for. Where there is no recognizer
-  at all, the person's own system dictation types into the text field, exactly
-  as it always did. The mesa audio path stays **one-directional, server to
-  browser**. The one thing mesa does to that text before anything else sees it
-  is correct mishearings of its own vocabulary against a small local sound-key
-  table (mesa task 922, above) — plain string matching in the page, not a
-  second model call, so it changes nothing about whose recognizer this is or
-  where the audio goes.
-  - A **fully local pipeline** — mic capture and VAD in the page, audio chunks
-    to a mesa route, a local whisper — is the follow-up that would take the
-    privacy question and the non-Chromium browsers off this list. It is not
-    here yet, and it is the only reason a route would ever accept audio.
+- **Speech-to-text of mesa's own — the browser's, and now also auris's.**
+  `POST /api/live/transcribe` accepts a bounded audio request (25 MB per
+  request, `413` past it naming the limit — `docs/posture.md`) and hands it
+  to the external `auris` binary, a persistent local decoder
+  (`core::listen`), so recognition run through it never has to leave the
+  machine. Retention is off: the audio is transcribed and dropped, matching
+  what the speak routes already do with text, and never written to
+  `live_turns`, which has no column for it (`docs/posture.md`). This is mesa
+  task 954; the page does not call the route yet (wiring the microphone to
+  it is mesa task 956), so **today** the browser path below is still what
+  runs.
+
+  Recognition is otherwise the **browser's**, running in the page, and mesa
+  receives only the text it produced (task 873). The recognition quality,
+  the language and the privacy question are therefore the browser's on that
+  path — which, for Chrome and Safari, means the speech may be sent to
+  *their* service, a thing worth knowing and not something mesa can answer
+  for, and it is exactly this gap auris exists to close for whoever turns it
+  on. Where there is no recognizer at all, the person's own system dictation
+  types into the text field, exactly as it always did.
+
+  Under `--lan` the transcribe route does not exist: it is absent from the
+  router entirely rather than gated, the same shape as `mesa live look`'s
+  CLI-only posture, because "transcribe whatever this stranger recorded" is
+  not a request an unauthenticated LAN peer should be able to make of a
+  decoder running as the machine's owner (`docs/posture.md`). The one thing
+  mesa does to the resulting text before anything else sees it, on either
+  path, is correct mishearings of its own vocabulary against a small local
+  sound-key table (mesa task 922, above) — plain string matching, not a
+  second model call.
+  - **Page-side capture** — mic input streamed to `/api/live/transcribe`
+    instead of (or alongside) the browser's own recognizer — is the
+    follow-up that actually puts auris in the loop for a person talking to
+    mesa. It is mesa task 956, not this one: this task only gets the route
+    itself onto the server.
 - **An HTTP route for `mesa live look`** (task 895). Capturing the person's
   screen is a CLI-only capability on purpose: `--lan` serves the API to the
   whole network with no auth, and no gate here makes "photograph the owner's

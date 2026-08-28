@@ -41,12 +41,12 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole,
-    LiveState, LiveStatus, LiveWindow, MesaVersion, ModelRates, NextResult, Priority,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, library, live, receipt,
-    scripts, speech, version,
+    InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryKind, LibraryPatch, LibraryScope, LiveContext,
+    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates,
+    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch,
+    Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git,
+    hooks, library, listen, live, receipt, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -817,6 +817,11 @@ fn router(state: AppState) -> Router {
         // the inbox's play button — see `speak_inbox` for why that pair, and
         // why a GET.
         .route("/api/live/turns/{id}/speak", get(speak_live_turn))
+        // Transcribing one recording with `auris` (mesa task 954). Absent
+        // rather than gated under `--lan` — see `transcribe_router`'s own
+        // doc comment — so it is merged in conditionally instead of living
+        // in this `.route(...)` chain.
+        .merge(transcribe_router(&state))
         // Scripts: user-authored shell run from a generated form. A script
         // body is a program mesa executes, so authoring is the strictest gate
         // in the file (`require_local_path_write`, loopback-only in BOTH
@@ -2749,6 +2754,157 @@ async fn speak_live_turn(
         Body::from_stream(ReceiverStream::new(speech.chunks)),
     )
         .into_response())
+}
+
+/// Upper bound on the raw HTTP request body for the transcribe route. Same
+/// reasoning as [`ATTACHMENT_BODY_LIMIT`]: base64 costs 33% on the wire plus
+/// JSON framing overhead (~1 MiB headroom), or axum's own 2 MiB
+/// `DefaultBodyLimit` would reject an at-cap recording with a bare non-JSON
+/// 413 that names no limit — before mesa's own [`LIVE_AUDIO_MAX`] check ever
+/// runs, and past about 65 seconds of 16 kHz mono audio at that. This layer
+/// bounds the wire; the handler's own check is what produces the named,
+/// JSON-shaped error `docs/posture.md` requires.
+const TRANSCRIBE_BODY_LIMIT: usize = LIVE_AUDIO_MAX * 4 / 3 + 1024 * 1024;
+
+#[derive(Deserialize)]
+struct TranscribeBody {
+    /// The whole recording, base64-encoded. JSON body, not multipart or a raw
+    /// `audio/wav` request — see [`create_attachment`]'s doc comment for why:
+    /// it keeps this route inside the existing Content-Type gate with no
+    /// carve-out, and the gate's whole value is that it has no exceptions.
+    audio_base64: String,
+}
+
+/// Transcribes one recording with the external `auris` binary
+/// ([`listen::transcribe`]) and hands back the text. mesa's mirror of
+/// [`speak_inbox`]/[`speak_live_turn`] on the input side: audio in, text out,
+/// nothing kept either direction.
+///
+/// **Retention:** the decoded bytes live only in this function's local
+/// `bytes` buffer, are handed to the child's stdin inside
+/// `listen::transcribe`, and are never written to `live_turns`, to disk, or
+/// to a log — the speak routes' "nothing is stored and nothing is cached"
+/// read backwards (`docs/posture.md`, mesa task 954/930).
+///
+/// Invalid base64 or an empty recording is 422 `validation`. A decoded body
+/// over [`LIVE_AUDIO_MAX`] is **413**, not 422: 422 says "I read your input
+/// and it is invalid" — fitting a body mesa actually parsed and measured,
+/// the same shape `LIVE_TEXT_MAX`'s own check takes. 413 names a body too
+/// large to accept, refused at the boundary before it is read rather than
+/// after decoding starts and fails; claiming mesa inspected a recording it
+/// never let in the door would be the wrong signal (`docs/posture.md`).
+///
+/// Gated by the exact pair [`speak_inbox`]/[`speak_live_turn`] carry:
+/// `require_agent_access` because decoding a recording as the machine's
+/// owner is code-execution-adjacent the same way starting a synthesis is,
+/// plus `require_same_site_fetch`. Unlike the speak *GETs*, though, this is a
+/// fetch **POST**, which always carries an `Origin` — so `require_agent_access`
+/// already runs `require_local_origin`/`require_origin_matches_host` on this
+/// path, and `require_same_site_fetch` is the second, weaker half here rather
+/// than the load-bearing one. It stays anyway, both to match the pair every
+/// other doc/CLAUDE.md calls "exactly `speak_inbox`'s" and as defense in
+/// depth against whatever Origin-less client shape shows up later; it exists
+/// on the speak GETs specifically because an `<audio src>` carries no Origin
+/// for the first gate's Origin checks to judge, which is not this route's
+/// situation. See `transcribe_router` for why, under `--lan`, this route
+/// does not exist at all rather than being gated.
+///
+/// **Ordering, precisely stated:** the two gate calls below run before mesa
+/// decodes base64 or spawns `auris` — but `body: Result<Json<TranscribeBody>,
+/// JsonRejection>` is a handler *parameter*, and axum runs every extractor to
+/// completion before the handler body executes at all. So by the time either
+/// gate call runs, axum has already buffered the whole request body (up to
+/// [`TRANSCRIBE_BODY_LIMIT`], ~34 MiB) and parsed it as JSON. This is not new
+/// or route-specific: `update_project_files_content` and `run_script` both
+/// gate *after* a `Json<T>` parameter the same way. What is new here is only
+/// the magnitude — every other route on this pattern rides axum's ~2 MiB
+/// default, and this one raises the pre-gate buffer to ~34 MiB. That is a
+/// symmetric cost (a caller must transmit ~34 MB to make the server hold
+/// ~34 MB) and, under `--lan`, the route does not exist to be reached at all.
+async fn transcribe_live(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<TranscribeBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    require_same_site_fetch(&headers)?;
+    let Json(body) = body?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.audio_base64.as_bytes())
+        .map_err(|e| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: format!("invalid base64 audio: {e}"),
+        })?;
+    if bytes.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message: "audio must not be empty".to_string(),
+        });
+    }
+    if bytes.len() > LIVE_AUDIO_MAX {
+        return Err(ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "validation",
+            message: format!(
+                "audio must be at most {LIVE_AUDIO_MAX} bytes, got {}",
+                bytes.len()
+            ),
+        });
+    }
+    // Off the async executor for the same reason every other blocking read in
+    // this file is: `listen::transcribe` blocks on a subprocess. Same double
+    // `map_err` shape as `speak_live_turn`'s `speech::start` call — the outer
+    // one is the `JoinError` (the blocking task itself panicked), the inner
+    // one is `listen::transcribe`'s own `Result<_, String>`.
+    let text = tokio::task::spawn_blocking(move || listen::transcribe(&bytes))
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: format!("transcription failed: {e}"),
+        })?
+        .map_err(|e| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: e,
+        })?;
+    Ok(Json(LiveTranscript { text }).into_response())
+}
+
+/// Whether `POST /api/live/transcribe` exists at all, decided at router
+/// construction from `state.lan`.
+///
+/// `require_agent_access` **relaxes** under `--lan` — it swaps the strict
+/// loopback+Host+Origin check for the far looser `require_lan_page_access`,
+/// which any device already on the network passes by design. That is fine
+/// for task CRUD and for posting text a person already reviewed on their own
+/// screen; it is not fine for handing an unauthenticated LAN peer a way to
+/// make mesa's own machine decode whatever audio it recorded. The refusal
+/// has to be structural, not a stronger check — the same shape
+/// `mesa live look` takes and for the same reason (`core::look`,
+/// `docs/posture.md`): the capability does not exist to be checked. So this
+/// route is present only in default (loopback) mode; under `--lan` it is
+/// simply never registered, and a request for it falls through to the SPA
+/// fallback (`axum_embed::ServeEmbed`, `.fallback_service` in `router()`)
+/// like any other unknown path. Empirically — proven in
+/// `transcribe_route_is_absent_under_lan_not_gated` below — that fallback
+/// only serves GET/HEAD, so a properly-formed `POST` with a JSON
+/// Content-Type answers a bare **405 "Method not allowed"**, not the 200
+/// `index.html` a GET to an unknown path gets and not the gate's 403 JSON.
+/// Either way the property that actually matters holds: the request never
+/// reaches `transcribe_live`, so nothing is ever decoded on an unauthenticated
+/// LAN peer's behalf.
+fn transcribe_router(state: &AppState) -> Router<AppState> {
+    if state.lan {
+        return Router::new();
+    }
+    Router::new().route(
+        "/api/live/transcribe",
+        post(transcribe_live).layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT)),
+    )
 }
 
 // ---- scripts (user-authored shell) ----
@@ -9594,6 +9750,61 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         )
         .await;
         assert!(versions.unwrap_err().status.is_client_error());
+    }
+
+    /// The load-bearing claim `transcribe_router`'s doc comment makes: under
+    /// `--lan` the route is **absent**, not gated. Calling the handler
+    /// directly (as the library test above does) can only prove the handler
+    /// refuses — it says nothing about whether the route was ever reachable
+    /// — so this proves the router itself, wired to a real listener exactly
+    /// as `serve` wires it (`into_make_service_with_connect_info`), never
+    /// dispatches the path at all: an unmatched `/api/live/transcribe` falls
+    /// all the way through to the embedded-static-file fallback
+    /// (`axum_embed::ServeEmbed`), which answers a plain-text 405 (it only
+    /// serves GET/HEAD) — nothing like `require_agent_access`'s JSON 403
+    /// `{"error":{"code":"validation",...}}`. A route that existed but merely
+    /// refused `--lan` would answer with that JSON shape and a 403; this
+    /// route answers with neither.
+    #[tokio::test]
+    async fn transcribe_route_is_absent_under_lan_not_gated() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = "{}";
+        let req = format!(
+            "POST /api/live/transcribe HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            addr.port(),
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8_lossy(&resp);
+        let status_line = resp.lines().next().unwrap_or("");
+        // The observed shape (empirical, not assumed): a plain-text 405 from
+        // the static-file fallback, which only serves GET/HEAD. Assert that
+        // exactly, not just "not 403" — a route that existed but merely
+        // refused `--lan` would answer 403 with the gate's JSON body; a route
+        // that somehow reached the handler would answer 200 with a
+        // `LiveTranscript` JSON body. Neither happens here.
+        assert!(status_line.contains("405"), "{status_line}");
+        assert!(!resp.contains("\"code\":\"validation\""), "{resp}");
+        assert!(
+            !resp.contains("\"text\":"),
+            "the handler must never run: {resp}"
+        );
     }
 
     // --- live (mesa task 855) --------------------------------------------

@@ -6,6 +6,7 @@ pub mod files;
 pub mod git;
 pub mod hooks;
 pub mod library;
+pub mod listen;
 pub mod live;
 pub mod look;
 pub mod receipt;
@@ -17,8 +18,9 @@ pub mod usage;
 pub mod version;
 
 pub use store::{
-    DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch, ImportDoc, LibraryPatch,
-    NextResult, ProjectPatch, ReceiptPatch, Result, ScriptPatch, Store, TaskPatch, default_db_path,
+    DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch, ImportDoc, LIVE_AUDIO_MAX,
+    LibraryPatch, NextResult, ProjectPatch, ReceiptPatch, Result, ScriptPatch, Store, TaskPatch,
+    default_db_path,
 };
 pub use types::{
     AgentSession, AgentSpawned, AnchorSide, Attachment, CcAgentStat, CcDashboard, CcDayPoint,
@@ -30,8 +32,8 @@ pub use types::{
     GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
     LibraryVersion, LiveAction, LiveContext, LiveContextKind, LiveRole, LiveSession, LiveState,
-    LiveStatus, LiveSummary, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
-    ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task, TaskReceipt,
-    TaskSummary, Waypoint, task_name,
+    LiveStatus, LiveSummary, LiveTranscript, LiveTurn, LiveWindow, MesaVersion, ModelRates,
+    Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    ProjectGitView, ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task,
+    TaskReceipt, TaskSummary, Waypoint, task_name,
 };

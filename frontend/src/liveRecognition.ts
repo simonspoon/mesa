@@ -45,9 +45,13 @@
  *   hear her own reply out of the speakers and answer it — a conversation with
  *   itself. `speaking` is therefore a gate on listening, not a separate mute.
  *
- * The audio never leaves the page: recognition is the browser's, mesa still
- * ships no speech-to-text and no route accepts an audio body (`docs/live.md`,
- * *What is deliberately absent*).
+ * This module's own audio never leaves the page: what it captures goes
+ * straight to the browser's `SpeechRecognition`, and this file posts only the
+ * text that comes back. mesa does now accept one bounded audio route,
+ * `POST /api/live/transcribe`, that hands a recording to the external
+ * `auris` binary instead of the browser's recognizer — but nothing in this
+ * module calls it yet (mesa task 956 wires the microphone to it); see
+ * `docs/live.md`, *What is deliberately absent*.
  */
 
 /** One reading of what was heard. The API offers alternatives; mesa takes the first. */

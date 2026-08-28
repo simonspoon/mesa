@@ -92,8 +92,11 @@ import { useFetch } from '../useFetch'
  * in the conversation panel stays as the fallback — a browser with no recognizer, or a refused
  * microphone, is the surface as it was: system dictation types into the box,
  * mesa holds the keyboard for it, and a settled line goes on a timer. Either
- * way the audio stays in the page: mesa ships no STT and no route takes an
- * audio body. An agent spawned
+ * way the audio this component captures stays in the page — this hub does
+ * not itself post one. mesa does now accept one bounded audio route,
+ * `POST /api/live/transcribe`, that hands a recording to the external
+ * `auris` binary instead of the browser's recognizer (`docs/live.md`), but
+ * nothing here calls it yet. An agent spawned
  * by `Go live` pulls those over the CLI and answers with `mesa live say`,
  * which lands here as a `mesa` turn and is spoken through the same `kokoro-rs`
  * route and the same decoding machinery the inbox's play button uses. A turn

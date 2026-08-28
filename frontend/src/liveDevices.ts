@@ -28,9 +28,11 @@
  *   argument; anywhere else it would be a dropdown that either has one entry
  *   or changes nothing, and both of those lie about what mesa can do.
  *
- * The audio still never leaves the page: a chosen track is handed to the
- * browser's own recognizer, mesa ships no speech-to-text and no route accepts
- * an audio body (`docs/live.md`).
+ * The audio a chosen track carries still never leaves the page through this
+ * module: it is handed to the browser's own recognizer, same as ever. mesa
+ * does now accept one bounded audio route, `POST /api/live/transcribe`, that
+ * hands a recording to the external `auris` binary instead — but nothing
+ * here calls it yet (mesa task 956); see `docs/live.md`.
  */
 
 /** A `MediaDeviceInfo`, as much of one as the chooser reads. */

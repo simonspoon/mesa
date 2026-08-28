@@ -45,13 +45,21 @@
  *   hear her own reply out of the speakers and answer it — a conversation with
  *   itself. `speaking` is therefore a gate on listening, not a separate mute.
  *
- * This module's own audio never leaves the page: what it captures goes
- * straight to the browser's `SpeechRecognition`, and this file posts only the
- * text that comes back. mesa does now accept one bounded audio route,
- * `POST /api/live/transcribe`, that hands a recording to the external
- * `auris` binary instead of the browser's recognizer — but nothing in this
- * module calls it yet (mesa task 956 wires the microphone to it); see
- * `docs/live.md`, *What is deliberately absent*.
+ * As of mesa task 956, `LiveHub.tsx` no longer calls into this module for the
+ * microphone itself — page-side audio capture (`liveAudio.ts`, `liveVad.ts`)
+ * posts each finished utterance to `POST /api/live/transcribe`, which hands
+ * it to the external `auris` binary and returns text. That text is handed
+ * straight to the functions below, at exactly the point in the flow
+ * `onresult`'s final branch used to occupy — `heldWith`, `shouldFlushSilence`,
+ * `heldFlush`, `utteranceFrom`, `captureHint`, `correctVocabulary` and the
+ * rest of this module's exports are all still in use, unchanged, because the
+ * decisions they encode (only a settled utterance is recorded, a recording
+ * has two boundaries, the person's own vocabulary gets corrected) never had
+ * anything to do with *how* the words were heard. `recognitionCtor`,
+ * `readResults`, `isBlockingError` and `SpeechRecognitionLike` are the part
+ * that was `SpeechRecognition`-specific; they stay exported for mesa task
+ * 957 (the fallback for a machine with no `auris`) but nothing calls them
+ * today.
  */
 
 /** One reading of what was heard. The API offers alternatives; mesa takes the first. */

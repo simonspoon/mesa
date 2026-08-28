@@ -8830,6 +8830,30 @@ button:focus-visible,
   border-color: rgba(0, 229, 255, 0.5);
 }
 
+/* The level meter (mesa task 956): what replaced the interim preview once the
+   microphone stopped feeding a recognizer that could guess at words. A
+   microphone with no visible response looks broken, and a bar that moves with
+   the room is the cheap honest answer where a partial transcript would need a
+   streaming decoder mesa does not have. Sized to sit in the same row as the
+   switch and the chooser rather than as its own line. */
+.live-level {
+  flex: 1 1 3rem;
+  min-width: 3rem;
+  height: 0.3rem;
+  border-radius: 0.15rem;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.live-level-bar {
+  height: 100%;
+  background: var(--cyan);
+  /* A width transition rather than redrawing on every block: the meter
+     already throttles how often its own state changes, so this just smooths
+     the jump between those steps. */
+  transition: width 80ms linear;
+}
+
 .live-input {
   width: 100%;
   resize: vertical;
@@ -8850,9 +8874,11 @@ button:focus-visible,
   overflow-y: auto;
 }
 
-/* The tail of it the recognizer is still guessing at: a preview until it
-   settles. Italic and muted so it reads as provisional next to the sentences
-   before it, which are settled. */
+/* The provisional tail of the recording (mesa task 956): once the recognizer's
+   own live guess, now either an in-flight "transcribing…" note while a
+   segment is on its way back from `auris`, or the rare non-empty `interim`
+   this component still carries for `heldFlush`'s sake. Italic and muted so it
+   reads as provisional next to the sentences before it, which are settled. */
 .live-guessing {
   font-style: italic;
   color: var(--muted);

@@ -13,26 +13,32 @@ and a dedicated Claude Code session does whatever they ask. Tables
 The two directions are deliberately asymmetric, and the asymmetry is the whole
 design:
 
-- **Person → mesa is text, recognised in the browser.** While a session is live
-  and this browser has joined it, the microphone opens on its own (task 917 —
-  before that, task 887 had it start muted until an explicit press; a mute is
-  still the person's own switch, and stays put for the rest of that session),
-  the page opens the microphone through the browser's **own** speech
-  recognition (`SpeechRecognition` / `webkitSpeechRecognition`), **holds**
-  every *final* result, and posts the whole recording as one `user` turn once
-  the person goes quiet for a beat (the same wait `live.auto-send-ms` already
-  gives the typed box), or right away if they press the listen switch (tasks
-  873, 889, 917). The conversation panel also has a plain `<textarea>`, which is
-  the way in whenever the microphone is not: it is muted, or recognition is not
-  on offer at all — a browser without it (Firefox
-  today), or a refused microphone. There the person's *own* system dictation
-  (macOS Dictation, a phone keyboard's mic key, or their fingers) types into it,
-  exactly as before. **Today mesa still ships no speech-to-text of its own and
-  the page still sends no audio request body** — the recognition is the
-  browser's and stays in the page — but mesa now also accepts one bounded
-  audio route, `POST /api/live/transcribe`, that hands a recording to the
-  external `auris` binary instead; the page does not call it yet (mesa task
-  956 wires the microphone to it). See
+- **Person → mesa is text, decoded from audio the page captures.** While a
+  session is live and this browser has joined it, the microphone opens on its
+  own (task 917 — before that, task 887 had it start muted until an explicit
+  press; a mute is still the person's own switch, and stays put for the rest
+  of that session), and the page runs it through an `AudioWorklet` and a
+  page-side voice-activity detector (`liveVad.ts`, mesa task 956) that decides
+  where one utterance ends — landing exactly where the browser's own speech
+  recognizer's *final result* used to, which is the whole point of the shape:
+  everything downstream of "here is a segment of speech" — `heldWith`,
+  `shouldFlushSilence`, `heldFlush`, both send boundaries, the mute switch,
+  the pause, the vocabulary correction — carries on unchanged. Each utterance
+  becomes a 16 kHz mono WAV (`liveAudio.ts`), posted to
+  `POST /api/live/transcribe`, and the text `auris` decodes it into is
+  **held** and posted as one `user` turn once the person goes quiet for a beat
+  (the same wait `live.auto-send-ms` already gives the typed box), or right
+  away if they press the listen switch (tasks 873, 889, 917, 956). The
+  conversation panel also has a plain `<textarea>`, which is the way in
+  whenever the microphone is not: it is muted, this browser cannot capture
+  audio at all, or the microphone was refused. There the person's *own*
+  system dictation (macOS Dictation, a phone keyboard's mic key, or their
+  fingers) types into it, exactly as before. mesa still ships no
+  speech-to-text engine of its own — `auris` is a separate external binary
+  this hands a recording to and retains nothing of, in either direction. As
+  of this task there is deliberately **no fallback to the browser's own
+  recognizer** when `auris` is missing or fails — a machine with no `auris`
+  installed hears nothing today, and closing that gap is mesa task 957. See
   [What is deliberately absent](#what-is-deliberately-absent).
 - **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
@@ -861,9 +867,9 @@ conversation") working with no backend change.
     is bars that sit still, lower and dimmer than listening — the state it is
     most easily confused with.
   - **being heard** (green) — words are arriving, by either route in: an
-    interim result from the recognizer, or a draft sitting in the capture box.
-    One travelling wave, quieter than mesa's, because it reflects input rather
-    than performing.
+    audible frame the VAD is holding as part of an utterance, or a draft
+    sitting in the capture box. One travelling wave, quieter than mesa's,
+    because it reflects input rather than performing.
   - **the agent working** (violet) — she has taken what was said and has not
     gone back to waiting (task 894). Violet because violet is already what this
     app means by *an agent* (the sidebar pane header, task 819), so the colour
@@ -932,22 +938,25 @@ conversation") working with no backend change.
   inside keeps its focus, and the dictation flowing into it, while the panel
   is shut.
 - **While joined and unmuted, the browser listens** (`liveRecognition.ts`, the
-  tested module for all of this — task 873). Two questions, deliberately not
-  one:
+  tested module for the gating rules — task 873, and still where they live
+  after mesa task 956 moved *how* mesa hears into `liveAudio.ts`/`liveVad.ts`).
+  Two questions, deliberately not one:
   - `recognizesSpeech` — is the microphone the way in *at all*: the session is
     live, *this* browser has had its press (`unlocked` — the gesture that
-    unlocks audio is the one that may open a microphone), the browser has a
-    recognizer, the microphone was not refused, the person has not
-    **paused** (task 882 — a pause does not end on its own, so unlike a reply
-    it belongs to this question rather than to the one below), and they have
-    not **muted** it (task 887 — likewise something only they undo).
+    unlocks audio is the one that may open a microphone), this browser can
+    capture audio at all (`capturesAudio`), the microphone was not refused,
+    the person has not **paused** (task 882 — a pause does not end on its own,
+    so unlike a reply it belongs to this question rather than to the one
+    below), and they have not **muted** it (task 887 — likewise something only
+    they undo).
   - `shouldListen` — that, **and mesa is not speaking**. The microphone would
     otherwise hear her own reply out of the speakers and answer it, so speech
-    gates the engine's lifecycle from below rather than sitting beside the
-    person's own switch above it, and the microphone reopens when she stops.
+    gates the capture stream's lifecycle from below rather than sitting beside
+    the person's own switch above it, and the microphone reopens when she
+    stops.
 
   Everything *about the person's input method* reads the first — the capture
-  box's two rules, the composer's hint — and only the recognizer's own
+  box's two rules, the composer's hint — and only the capture stream's own
   lifecycle reads the second. Keying the former on the latter is the bug that
   looks like a shortcut: mesa speaks for most of the conversation's wall time,
   so a focus fight or an auto-send deadline that re-arms itself while she
@@ -967,8 +976,9 @@ conversation") working with no backend change.
     toggled by **⌘/Ctrl+Shift+L** (`isListenChord`,
     named once as `LISTEN_CHORD` wherever the page writes it) or by the
     `listen`/`listening` button in the panel's listen row — which is offered
-    on the same terms as Pause (live, this browser joined, a recognizer, the
-    microphone not refused), because a button reading "listening" before the
+    on the same terms as Pause (live, this browser joined, capable of
+    capturing audio, the microphone not refused), because a button reading
+    "listening" before the
     conversation has started claims something that is not happening, and a
     browser that cannot open a microphone at all has nothing for the switch to
     do (the hint below says which of the two it is). Like the close button, it
@@ -1001,26 +1011,26 @@ conversation") working with no backend change.
     `togglePause`. Unmuting calls the same `reclaim`, which declines, as it
     should: a recognized sentence reaches the conversation with the keyboard
     anywhere.
-  - **Only a final result is recorded.** An interim result is the engine
-    thinking out loud — shown as a preview under the capture box, in italics,
-    and never recorded. `readResults` splits one event into the two and answers
-    how far the list is now consumed (`settledThrough`); the hub floors the next
-    read at that mark rather than trusting the event's `resultIndex`, because
-    an engine that reports an index it already settled (Chromium on Android
-    has) would otherwise re-record every sentence before it. `utteranceFrom`
-    drops a settled result with no words in it (a cough, a door), which the
-    engine produces routinely.
-  - **Both halves are corrected against mesa's own vocabulary before anything
-    else touches them** (`liveRecognition.ts`, mesa task 922). The browser's
-    recognizer has no idea what mesa's words are, and mishears them for
-    ordinary ones that sound similar — "khora" comes back as "chorus",
-    "helios" as "helius". `SpeechGrammarList`, the API's documented way to hand
-    a recognizer a vocabulary before it listens, is a no-op in Chrome, so this
-    has to run *after* the engine has already settled on the wrong word,
-    applied to the interim preview as well as the final: `heldFlush` can send
-    the interim tail as part of a turn, so a preview left mishearing "khora"
-    would be the very sentence a person just finished saying, unless it is
-    corrected before it is shown, not just before it is sent.
+  - **There is no interim preview any more** (mesa task 956) — one-shot
+    transcription has nothing to show until a segment is done, so the italic
+    "what I'm hearing" line under the capture box is gone. Two things replace
+    it, both load-bearing for how the surface *feels*: a level meter driven off
+    the same audio (a microphone with no visible response reads as broken), and
+    a "transcribing…" note while a posted segment is in flight. A streaming
+    partial transcript was the alternative and was rejected — it needs a
+    streaming decoder mesa does not have, and `auris` answers a whole request
+    at once. `utteranceFrom` still drops a transcript with no words in it (a
+    cough, a door, a segment `auris` heard as silence).
+  - **The transcript is corrected against mesa's own vocabulary before
+    anything else touches it** (`liveRecognition.ts`, mesa task 922), exactly
+    as it was when the browser did the listening — the correction runs
+    against whatever produced the text, and now that is `auris`'s answer
+    rather than the recognizer's. `auris` has no idea what mesa's words are,
+    and mishears them for ordinary ones that sound similar — "khora" comes
+    back as "chorus", "helios" as "helius" — so this still runs *after*
+    transcription has already settled on the wrong word. With no interim
+    preview left to correct, there is only the one string per segment to
+    rewrite before it joins the recording.
 
     The correction is plain string matching, not a model call — no latency, no
     cost, nothing leaves the page. `soundKey` folds a word toward a rough
@@ -1042,151 +1052,127 @@ conversation") working with no backend change.
 
     Every rule in both functions serves one governing principle: **a wrong
     "correction" is worse than the mishearing it replaced** — a missed rewrite
-    is a name spelled the way the engine guessed, no worse than today, but a
+    is a name spelled the way `auris` guessed, no worse than today, but a
     wrong one silently swaps in a word the person never said, inside a
     transcript nobody proofreads before it is sent. That is why a short token,
     or one that is itself ordinary English (`COMMON_ENGLISH`, a guard list
     rather than a dictionary — "chorus" is deliberately absent from it, being
     the mishearing this feature exists to correct, while "sonnet" and "opus"
     are deliberately present and so drop out of the vocabulary entirely,
-    because nothing needs correcting *to* a word the recognizer already spells
+    because nothing needs correcting *to* a word `auris` already spells
     right), is never a candidate; and why two different names landing on the
     same sound key cancels the key rather than guessing which one was meant.
     Task ids are deliberately outside this: a digit string has no sound-alike
     spelling for a phonetic fold to work on, and turning a spoken number into
     digits is a different mechanism this does not attempt.
   - **Listening is a recording, not a stream of utterances** (task 889), and a
-    recording has **two** boundaries (task 917). Each settled sentence is
-    joined onto a held recording (`heldWith`), shown above the capture box,
-    and posted as **one** `user` turn (`heldFlush`) either once the person has
-    gone quiet for `live.auto-send-ms` — the same wait the typed box already
-    uses (`shouldFlushSilence`) — or right away if they press the listen
-    switch. A conversation is not one sentence at a time: the engine settles
-    wherever the speaker drew breath, so posting each final made the agent
-    answer a half-thought and then answer the rest of it, and the person had
-    to talk to the pauses the engine chose rather than to mesa; silence after
-    the whole thought is the pause that means something. The silence timer is
-    measured on `shouldListen`, not `recognizesSpeech`, and restarts on every
-    result including an interim one — while mesa is talking there is no pause
-    of the person's to read, and a mid-sentence pause they fill back in must
-    not be mistaken for the end of the thought. The switch remains an explicit
-    early send for whenever the wait would be too slow or too fast for what was
-    just said.
+    recording has **two** boundaries (task 917) — unchanged by mesa task 956.
+    Each transcribed segment is joined onto a held recording (`heldWith`),
+    shown above the capture box, and posted as **one** `user` turn
+    (`heldFlush`) either once the person has gone quiet for
+    `live.auto-send-ms` — the same wait the typed box already uses
+    (`shouldFlushSilence`) — or right away if they press the listen switch. A
+    conversation is not one sentence at a time: a VAD segment ends wherever
+    the speaker drew breath (`liveVad.ts`'s hangover), so posting each one as
+    its own turn made the agent answer a half-thought and then answer the
+    rest of it, and the person had to talk to the pauses the detector chose
+    rather than to mesa; silence after the whole thought is the pause that
+    means something. The silence timer is measured on `shouldListen`, not
+    `recognizesSpeech`, and is now driven by `markHeard` firing on **audible
+    audio frames** rather than on recognizer results — a truer answer to the
+    same question, since it no longer depends on a guess at words to know the
+    person is still talking. While mesa is talking there is no pause of the
+    person's to read, and a mid-sentence pause they fill back in must not be
+    mistaken for the end of the thought. The switch remains an explicit early
+    send for whenever the wait would be too slow or too fast for what was just
+    said.
 
     Three consequences follow, and each is a decision:
-    - **The flush includes the interim tail.** Everywhere else the preview is
-      never a turn; here it is, because the person finished speaking and *then*
-      reached for the switch, so the sentence the engine has not settled yet is
-      the last thing they said. The engine does deliver it as a final when it
-      stops — but on the browser's own schedule, after the switch has flipped
-      and the mute rule has already discarded it. The engine's best guess now
-      beats the settled version never.
+    - **The switch sends what is already transcribed, not what is still being
+      captured.** Segments transcribe **in order**, chained through a promise
+      (mirroring `post()`'s own chaining), so `flushRecording` posts
+      `recording` — the segments `auris` has already answered — and
+      `interim`, which mesa task 956 leaves permanently empty now that there
+      is no partial guess to hold: `heldFlush(recording, interim)` is
+      byte-identical to what it always did, it is simply never handed
+      anything in that second argument any more. A segment the VAD has not
+      yet ended when the switch is pressed is not specially cut and sent —
+      pressing the switch (like a mute, or mesa starting to speak) tears down
+      the capture stream, and whatever audio was mid-segment at that moment
+      is dropped rather than transcribed. This is a real, if usually small,
+      loss the browser-recognizer era did not have, where the engine's `stop()`
+      delivered the pending final before the microphone closed.
     - **The cap is the server's** (`LIVE_TEXT_MAX`, 8192). A recording that
-      would cross it is posted as it stands and the new sentence starts a fresh
-      one, so a nine-minute monologue arrives as several turns rather than
-      being refused. The split is on a sentence boundary — the engine's, not a
-      character count. The flush runs the interim tail through that **same**
-      rule (`heldFlush` is `heldWith` plus a trim), so a recording already at
-      the cap becomes two ordered turns rather than one the server rejects;
-      only a single settled sentence longer than the whole cap is cut, there
-      being no boundary inside it to split on.
-    - **A pause keeps the recording; ending discards it.** Pausing stops the
-      microphone, so nothing is added while it lasts, but nothing is lost
-      either and Resume carries on the same recording — there is no send
-      involved, so there is nothing to drop. The switch still sends while
-      paused: those words were said to this conversation, and the `paused`
-      guard belongs to a single cut-off final, not to a recording made before
-      the press. Ending the conversation clears it: it was said to a session
-      that no longer exists and nothing will ever send it.
-    - **A microphone that dies mid-recording still delivers.** A refusal
-      (`not-allowed`/`service-not-allowed`) sets `blocked`, which withdraws the
-      listen button — so the same handler flushes, or the recording would sit
-      on screen with no control left to send it. Another application taking the
-      device, or the permission being revoked from the omnibox, is the everyday
-      way this happens.
-  - **The last sentence before she speaks is not dropped.** Stopping the
-    engine *delivers* what was pending as a final, and that sentence was heard
-    before the audio started, so it is the person's and it joins the recording.
-    Three stops discard it instead, each for the same reason — it is not part
-    of any recording that will be sent. The conversation **ending** is one. A
-    **pause** is another (task 882) — the pending words are exactly what the
-    person was saying as they pressed a button meaning "hear nothing from me".
-    A **mute** is the third, and all but never a loss: the press already
-    flushed the recording with this very sentence's preview on the end of it,
-    so taking the late final too would say it twice. The one gap is a mute
-    landing between mesa starting to speak — which clears the preview on its
-    way past — and the stop that caused delivering the final; that sentence
-    goes, exactly as it did before task 889.
-  - **Recognition restarts itself.** Chrome ends it after about a minute and on
-    a long enough silence, and reports that as an ordinary end, not an error.
-    So `onend` asks `shouldListen` again and opens a new recognizer if the
-    answer is still yes — a re-answer, not a retry loop. A recognizer stopped
-    by the hub's own cleanup still fires its end; that echo is guarded, or
-    ending a conversation would reopen the microphone it just closed.
-  - **Which microphone is a browser-local choice, not a recognizer state**
-    (`liveDevices.ts`, mesa task 884). It sits in the panel's listen row beside
-    the listen button — task 887 moved it out of the header cluster and changed
-    nothing else about it, because which microphone and whether to use one at
-    all are two settings on the same thing, read at the moment the person is
-    deciding whether to talk or to type, and the header is where the press that
-    destroys the conversation lives. `SpeechRecognition.start()` grew an
-    optional `MediaStreamTrack` argument — passing one is how a specific device
-    is chosen, and passing none, which is what mesa always did, is still what
-    every browser that has ever supported speech recognition understands. So
-    the chooser is offered only where three things are all true: this browser
-    accepts the argument (proved, not probed — a `start(track)` that throws
-    `TypeError` is a browser answering "no", latched into `routes` and never
-    asked again for the life of the page), there is more than one
-    microphone to choose from, and mesa can enumerate them. Verified present in
-    Chrome 151, absent in Safari and Firefox. Choosing a device opens
-    `getUserMedia({audio:{deviceId:{exact:id}}})` and hands the resulting track
-    to `start()`; choosing "Default mic" passes nothing and opens no stream of
-    mesa's own — the untouched call, byte-for-byte what shipped before this
-    task. The stream is held for as long as the microphone is wanted: the
-    engine ending itself (the ~60s cap, a long silence) reuses it, and it is
-    re-acquired only once its track stops being `live`. It is deliberately
-    **not** held across mesa speaking — `shouldListen` goes false for the
-    length of every reply, so the device closes and reopens once a turn, which
-    is the promise "mesa stops listening while she speaks" made visible. An
-    indicator still lit through a reply would say the opposite, and that is
-    worth one `getUserMedia` per turn against a permission already granted.
-    Both the recognizer and the held stream close in the same cleanup —
-    including a stream that arrives *after* the conversation stopped, which
-    would otherwise leave a microphone open with nobody on the other end.
-    A device that is listed and still refuses to open — another application is
-    holding it, the everyday case — is **asked once**: the refusal is latched
-    against that device id, so it is not retried at every reply for the rest
-    of the conversation, and picking it again in the dropdown is what asks
-    again. The device *list* is re-read on mount, on
-    `devicechange`, and on every recognizer start, because a browser withholds
-    every device **label** until permission is granted and starting a
-    recognizer is what grants it — before that, entries read as `Microphone 1`,
-    `Microphone 2`. A remembered id that has since vanished (unplugged, or
-    storage cleared and ids rotated) falls back to the default rather than to
-    silence, and a `getUserMedia` failure — the device just went away, or
-    permission was refused — reports itself in the status line and falls back
-    the same way — as does a choice whose control has been withdrawn: unplug
-    the second microphone and the dropdown goes, and the survivor goes back to
-    the untouched call rather than staying routed through a `getUserMedia`
-    nobody can now undo. The choice lives in `localStorage` (`mesa.live.input`),
-    machine-local like a pane width, and the default is remembered as
-    **nothing at all**, not as an empty string, so a fresh browser and an
-    explicitly-reset one read the same. None of it moves the audio boundary:
-    the chosen track never leaves the page through this module, it is handed
-    straight to the browser's own recognizer — this device chooser has
-    nothing to do with `auris` or `/api/live/transcribe` (above), and mesa
-    still ships no speech-to-text engine of its own, on either path.
-  - **A refusal is terminal for the page** (`isBlockingError`): `not-allowed`
-    and `service-not-allowed` set `blocked`, name themselves in the status
-    line, and leave the typed box as the way in. Everything else the engine
-    reports — `no-speech`, `aborted`, `network`, `audio-capture` — arrives in
-    normal use and is followed by an end that `shouldListen` answers on its own
-    merits. Treating those as fatal would silence recognition on the first
-    quiet stretch; treating a refusal as transient would reopen the permission
-    prompt for ever. A `start()` that throws outright fires neither event, so
-    nothing would reopen it: it names itself in the status line instead of
-    going quiet, and the next change of the answer (mesa's next reply ending,
-    most likely) tries again.
+      would cross it is posted as it stands and the new sentence starts a
+      fresh one, so a nine-minute monologue arrives as several turns rather
+      than being refused. The split is on a sentence boundary — a
+      transcribed segment's, not a character count. Only a single segment
+      whose transcript is longer than the whole cap is cut, there being no
+      boundary inside it to split on.
+    - **A pause keeps the recording already held; ending discards it.**
+      Pausing tears down capture the same way muting does, so a segment mid
+      capture at that moment is dropped rather than transcribed — but nothing
+      already **held** is touched: there is no send involved in pausing, so
+      there is nothing to drop from `recording` itself, and Resume carries it
+      on. The switch still sends while paused, since those words were said to
+      this conversation and the recording belongs to the person, not to the
+      moment they stepped out. Ending the conversation clears it: it was said
+      to a session that no longer exists and nothing will ever send it.
+    - **A refused microphone still delivers.** `isMicRefusal` (`liveAudio.ts`)
+      sets `blocked`, which withdraws the listen button — so the same handler
+      flushes what was already held, or the recording would sit on screen
+      with no control left to send it.
+  - **A failed transcription does not end listening.** Posting a segment's
+    WAV to `/api/live/transcribe` can fail — a slow network, a crashed
+    `auris` process, or (today) no `auris` installed at all, which the route
+    answers `503 unavailable` — and the next segment tries again on its own
+    rather than the page giving up on the microphone. What is lost is only
+    that one segment's words: on a machine with no `auris` installed this
+    means the conversation hears nothing today, and it says so in the status
+    line; closing that gap with a fallback to the browser's own recognizer is
+    mesa task 957, which is also why `liveRecognition.ts` still exports
+    `recognitionCtor`, `readResults`, `isBlockingError` and
+    `SpeechRecognitionLike` even though nothing calls them yet.
+  - **The capture stream opens and closes around each turn, not once for the
+    whole conversation.** It is held for as long as the microphone is wanted,
+    reused across VAD segments the way the old recognizer reused it across
+    engine restarts — but it is deliberately **not** held across mesa
+    speaking: `shouldListen` goes false for the length of every reply, so the
+    stream closes and reopens once a turn, which is the promise "mesa stops
+    listening while she speaks" made visible. An indicator still lit through a
+    reply would say the opposite, and that is worth one `getUserMedia` per
+    turn against a permission already granted.
+  - **Which microphone is a browser-local choice, not a captured-stream
+    state** (`liveDevices.ts`, mesa task 884, reworked by mesa task 956). It
+    sits in the panel's listen row beside the listen button — task 887 moved
+    it out of the header cluster and changed nothing else about it, because
+    which microphone and whether to use one at all are two settings on the
+    same thing, read at the moment the person is deciding whether to talk or
+    to type, and the header is where the press that destroys the conversation
+    lives. The chooser's own logic (`chosenInput`, `sameInputs`,
+    `offersInputChoice`'s device-count half) is unchanged, but what the two
+    choices *mean* has shifted: capture always opens a stream now, so
+    "Default mic" no longer means "no stream of mesa's own" — it means
+    "whatever device the browser would pick" — and mesa needs its own
+    microphone permission on every path rather than only when a specific
+    device is chosen. The gate that used to decide whether the chooser was
+    offered at all — proving, not probing, that this browser's
+    `SpeechRecognition.start()` accepted a `MediaStreamTrack` argument,
+    latched into `routes` — is **gone**: `getUserMedia`'s `deviceId`
+    constraint is understood by every browser that has the API at all, so
+    there is nothing left to probe, and the chooser now turns purely on there
+    being more than one microphone to choose from. The device *list* is
+    re-read when the stream **opens** rather than when a recognizer starts,
+    for the reason it always was — a browser withholds every device
+    **label** until permission is granted, and opening the stream is now what
+    grants it, so that is when the numbered placeholders (`Microphone 1`,
+    `Microphone 2`) turn into real names. A device that is listed and still
+    refuses to open — another application is holding it, the everyday case —
+    is still **asked once**, latched against that device id, and a remembered
+    id that has since vanished still falls back to the default. The choice
+    still lives in `localStorage` (`mesa.live.input`), machine-local like a
+    pane width, and the default is still remembered as **nothing at all**,
+    not as an empty string.
   - **The composer always says which state it is in** (`captureHint`, over
     `recognizesSpeech`), in this order: the person paused it, this browser
     cannot listen, the microphone was refused, the conversation has not
@@ -1428,12 +1414,22 @@ conversation") working with no backend change.
   `frontend/src/liveRecognition.ts` (the two listening questions and why they
   are two — and why a pause and a mute belong to the first and a reply to the
   second —
-  which errors end listening, whether a keystroke is the listen chord and how
-  the chord is written, a result event's final text, its preview
-  and its high-water mark, what a settled result is worth sending, the
-  composer's hint, and — mesa task 922 — the phonetic fold that keys mesa's
-  vocabulary, the vocabulary table built from it and the correction that
-  rewrites recognised text against it) and
+  whether a keystroke is the listen chord and how the chord is written, what a
+  settled segment is worth sending (`heldWith`, `heldFlush`, `utteranceFrom`),
+  the composer's hint, and — mesa task 922 — the phonetic fold that keys
+  mesa's vocabulary, the vocabulary table built from it and the correction
+  that rewrites transcribed text against it; `recognitionCtor`, `readResults`,
+  `isBlockingError` and `SpeechRecognitionLike` still live here too, unused
+  by `LiveHub` since mesa task 956 but kept for mesa task 957's fallback) and
+  `frontend/src/liveAudio.ts` (mesa task 956 — encoding a window of captured
+  frames into the 16 kHz mono WAV `/api/live/transcribe` accepts: resampling,
+  16-bit quantization, the RIFF header, chunked base64, whether this browser
+  can capture audio at all, and whether a `getUserMedia` rejection is a
+  refusal or one of the ordinary failures capture recovers from) and
+  `frontend/src/liveVad.ts` (mesa task 956 — the voice-activity state machine:
+  onset/release hysteresis, the hangover that ends an utterance on a breath,
+  the minimum length that discards a cough or a door, and the maximum segment
+  that cuts a room that never falls quiet) and
   `frontend/src/liveDevices.ts` (which microphones there are, whether two
   readings of that list say the same thing, what to call one before its label
   is known, which one is actually chosen, and whether the chooser is offered at
@@ -1490,41 +1486,43 @@ CLAUDE.md requires: **data, never instructions.**
 
 ## What is deliberately absent
 
-- **Speech-to-text of mesa's own — the browser's, and now also auris's.**
-  `POST /api/live/transcribe` accepts a bounded audio request (25 MB per
-  request, `413` past it naming the limit — `docs/posture.md`) and hands it
-  to the external `auris` binary, a persistent local decoder
-  (`core::listen`), so recognition run through it never has to leave the
-  machine. Retention is off: the audio is transcribed and dropped, matching
-  what the speak routes already do with text, and never written to
-  `live_turns`, which has no column for it (`docs/posture.md`). This is mesa
-  task 954; the page does not call the route yet (wiring the microphone to
-  it is mesa task 956), so **today** the browser path below is still what
-  runs.
-
-  Recognition is otherwise the **browser's**, running in the page, and mesa
-  receives only the text it produced (task 873). The recognition quality,
-  the language and the privacy question are therefore the browser's on that
-  path — which, for Chrome and Safari, means the speech may be sent to
-  *their* service, a thing worth knowing and not something mesa can answer
-  for, and it is exactly this gap auris exists to close for whoever turns it
-  on. Where there is no recognizer at all, the person's own system dictation
-  types into the text field, exactly as it always did.
-
-  Under `--lan` the transcribe route does not exist: it is absent from the
-  router entirely rather than gated, the same shape as `mesa live look`'s
-  CLI-only posture, because "transcribe whatever this stranger recorded" is
-  not a request an unauthenticated LAN peer should be able to make of a
-  decoder running as the machine's owner (`docs/posture.md`). The one thing
-  mesa does to the resulting text before anything else sees it, on either
-  path, is correct mishearings of its own vocabulary against a small local
-  sound-key table (mesa task 922, above) — plain string matching, not a
-  second model call.
-  - **Page-side capture** — mic input streamed to `/api/live/transcribe`
-    instead of (or alongside) the browser's own recognizer — is the
-    follow-up that actually puts auris in the loop for a person talking to
-    mesa. It is mesa task 956, not this one: this task only gets the route
-    itself onto the server.
+- **Streaming or partial transcripts.** `auris` answers one whole segment at a
+  time — there is no interim guess to show while it thinks, unlike the
+  browser recognizer this replaced. A level meter and a "transcribing…" note
+  stand in for it instead (above); a streaming decoder that could offer a
+  running partial the way the recognizer's interim results did would close
+  this gap, but mesa has none and building one is out of scope here.
+- **A speech-to-text engine of mesa's own.** `POST /api/live/transcribe`
+  accepts a bounded audio request (25 MB per request, `413` past it naming
+  the limit — `docs/posture.md`) and hands it to the external `auris`
+  binary, a persistent local decoder (`core::listen`), so recognition run
+  through it never has to leave the machine. Retention is off: the audio is
+  transcribed and dropped, matching what the speak routes already do with
+  text, and never written to `live_turns`, which has no column for it
+  (`docs/posture.md`). Under `--lan` the route does not exist at all: it is
+  absent from the router entirely rather than gated, the same shape as
+  `mesa live look`'s CLI-only posture, because "transcribe whatever this
+  stranger recorded" is not a request an unauthenticated LAN peer should be
+  able to make of a decoder running as the machine's owner
+  (`docs/posture.md`). The one thing mesa does to the resulting text before
+  anything else sees it is correct mishearings of its own vocabulary against
+  a small local sound-key table (mesa task 922, above) — plain string
+  matching, not a second model call.
+- **A fallback to the browser's own recognizer when `auris` is unavailable.**
+  Before mesa task 956, listening ran entirely through the browser's own
+  `SpeechRecognition`/`webkitSpeechRecognition` (task 873): mesa received
+  only the text it produced, and the recognition quality, the language and
+  the privacy question were the browser's — for Chrome and Safari, that means
+  the speech could be sent to *their* service, a thing worth knowing and not
+  something mesa could answer for, which is exactly the gap `auris` exists to
+  close. As of task 956 that path is gone from the page entirely, and nothing
+  stands in for it when `auris` is missing or fails: a machine with no
+  `auris` installed holds a live conversation it cannot hear, with the typed
+  box as the only way in, and the status line says so. This is a real
+  regression, closing it is mesa task 957, and `liveRecognition.ts` keeps
+  `recognitionCtor`, `readResults`, `isBlockingError` and
+  `SpeechRecognitionLike` exported and unused rather than deleted, against
+  that follow-up wiring them back in as the fallback.
 - **An HTTP route for `mesa live look`** (task 895). Capturing the person's
   screen is a CLI-only capability on purpose: `--lan` serves the API to the
   whole network with no auth, and no gate here makes "photograph the owner's

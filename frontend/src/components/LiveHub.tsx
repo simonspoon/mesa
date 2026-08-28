@@ -10,7 +10,19 @@ import {
   sendLiveUtterance,
   startLive,
   stopLive,
+  transcribeAudio,
 } from '../api'
+import {
+  capturesAudio,
+  dropBefore,
+  frameRms,
+  isMicRefusal,
+  PCM_WORKLET_SOURCE,
+  TARGET_SAMPLE_RATE,
+  toBase64,
+  wavFromFrames,
+  type CapturedFrame,
+} from '../liveAudio'
 import {
   autoSendIdleMs,
   isEditableTarget,
@@ -36,19 +48,15 @@ import {
   buildVocabulary,
   captureHint,
   correctVocabulary,
-  isBlockingError,
   isListenChord,
   LISTEN_CHORD,
   heldFlush,
   heldWith,
   MESA_VOCABULARY,
-  readResults,
-  recognitionCtor,
   recognizesSpeech,
   shouldFlushSilence,
   shouldListen,
   utteranceFrom,
-  type SpeechRecognitionLike,
   type Vocabulary,
 } from '../liveRecognition'
 import {
@@ -68,6 +76,7 @@ import {
   turnGroups,
   turnLabel,
 } from '../liveTurns'
+import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadStep } from '../liveVad'
 import { sameBox, windowBox } from '../liveWindow'
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
@@ -82,22 +91,26 @@ import { useFetch } from '../useFetch'
  * here now, not on a routed page.
  *
  * The person just talks: joining a live conversation opens the microphone on
- * its own (task 917) through the browser's own speech recognition
- * (`liveRecognition.ts`, task 873), which **holds** every settled result and
- * sends the whole recording as one `user` turn once the person goes quiet —
- * the wait `live.auto-send-ms` names — with the listen switch (`isListenChord`
- * or the panel's button, task 887) as an explicit early send; the same press
- * is also what mutes the microphone and keeps it muted for the rest of that
- * session. The capture box
- * in the conversation panel stays as the fallback — a browser with no recognizer, or a refused
- * microphone, is the surface as it was: system dictation types into the box,
- * mesa holds the keyboard for it, and a settled line goes on a timer. Either
- * way the audio this component captures stays in the page — this hub does
- * not itself post one. mesa does now accept one bounded audio route,
- * `POST /api/live/transcribe`, that hands a recording to the external
- * `auris` binary instead of the browser's recognizer (`docs/live.md`), but
- * nothing here calls it yet. An agent spawned
- * by `Go live` pulls those over the CLI and answers with `mesa live say`,
+ * its own (task 917) through page-side audio capture (`liveAudio.ts`,
+ * `liveVad.ts`, task 956) — an `AudioWorkletProcessor` hands this component
+ * raw blocks, a voice-activity state machine decides where one utterance ends
+ * and the next begins, matching the breath the browser's `SpeechRecognition`
+ * used to settle a final result on, and each finished segment is posted as a
+ * WAV to `POST /api/live/transcribe`, which hands it to the external `auris`
+ * binary and answers with text. That text enters the **existing** held-
+ * recording path (`liveRecognition.ts`, task 873) completely unchanged: it
+ * **holds** every settled utterance and sends the whole recording as one
+ * `user` turn once the person goes quiet — the wait `live.auto-send-ms`
+ * names — with the listen switch (`isListenChord` or the panel's button, task
+ * 887) as an explicit early send; the same press is also what mutes the
+ * microphone and keeps it muted for the rest of that session. The capture box
+ * in the conversation panel stays as the fallback — a browser with no way to
+ * capture audio, or a refused microphone, is the surface as it was: system
+ * dictation types into the box, mesa holds the keyboard for it, and a settled
+ * line goes on a timer. Either way this is now the **only** place audio
+ * leaves the page: each segment travels once, as one bounded WAV, to that one
+ * route, decoded locally by `auris` and never retained (`docs/live.md`). An
+ * agent spawned by `Go live` pulls those over the CLI and answers with `mesa live say`,
  * which lands here as a `mesa` turn and is spoken through the same `kokoro-rs`
  * route and the same decoding machinery the inbox's play button uses. A turn
  * may also carry `navigate`, which is how the conversation moves the browser.
@@ -357,21 +370,23 @@ export function LiveHub({
   // Terminal for this page: retrying would reopen the permission prompt for
   // ever, and the typed box is exactly the surface to fall back to.
   const [blocked, setBlocked] = useState(false)
-  // Whether this browser has a recognizer at all. Asked once: it cannot change
-  // under a loaded page, and every other decision reads the answer.
+  // Whether this browser can be the way in at all. Asked once: it cannot
+  // change under a loaded page, and every other decision reads the answer.
+  // The question this has always answered is "is the microphone the way in on
+  // this browser" — `recognizesSpeech`, `captureHint` and `offersInputChoice`
+  // all still read it for exactly that. Only the capability behind the answer
+  // has changed (mesa task 956): it used to be whether `SpeechRecognition`
+  // existed, and is now whether `getUserMedia`, `AudioContext` and
+  // `AudioWorkletNode` all do (`capturesAudio`) — what page-side capture
+  // actually needs.
   const [supported] = useState(
-    () => recognitionCtor(window as unknown as Record<string, unknown>) !== null,
+    () => capturesAudio(window as unknown as Record<string, unknown>),
   )
   // Which microphone to listen through (mesa task 884, `liveDevices.ts`), and
   // what there is to choose from. The list is the browser's, re-read whenever
   // it changes; the choice is this machine's, remembered across visits.
   const [inputs, setInputs] = useState<AudioInput[]>([])
   const [storedInput, setStoredInput] = useState(readInputChoice)
-  // Whether this browser takes a track on `start()`. Assumed until it is
-  // disproved by the one call that can disprove it — there is no probe for the
-  // argument that does not involve opening a recognizer, and opening one is
-  // exactly what asks a person for their microphone.
-  const [routes, setRoutes] = useState(true)
   // A device that is here, is chosen, and will not open — another application
   // holding the input is the everyday case, and unlike an unplugged one it
   // never leaves `inputs`, so nothing else would stop mesa asking it again on
@@ -379,6 +394,17 @@ export function LiveHub({
   // than for the page: picking a different one is a fresh question, and so is
   // picking this one again after quitting whatever was holding it.
   const [refusedInput, setRefusedInput] = useState<string | null>(null)
+  // The current input level, 0..1, for the meter beside the listen switch —
+  // what replaced `interimResults` as the sign the microphone is doing
+  // anything at all. A microphone with no visible response looks broken, and
+  // a level is the cheap honest answer where a partial transcript would need
+  // a streaming decoder mesa does not have (mesa task 956).
+  const [level, setLevel] = useState(0)
+  // How many segments are in flight to the transcribe route right now —
+  // almost always 0 or 1, since segments are posted in order, but never
+  // assumed to be: it is a count, not a flag, so a slow request does not read
+  // as "stopped hearing" for the length of it.
+  const [hearing, setHearing] = useState(0)
 
   // Which session the held transcript belongs to. A new conversation is a new
   // transcript — going live again is a fresh session with its own turns, and
@@ -777,7 +803,16 @@ export function LiveHub({
   // unplug the second microphone and the dropdown goes, but without this the
   // survivor would still be opened through `getUserMedia` for ever rather than
   // falling back to the untouched call.
-  const choosesInput = offersInputChoice({ supported, routes, inputs })
+  //
+  // `routes` is always `true` now (mesa task 956): that field used to answer
+  // whether this browser accepted a `MediaStreamTrack` argument to
+  // `SpeechRecognition.start()`, discovered only by trying it, because there
+  // was no way to ask in advance. Capture opens a stream through
+  // `getUserMedia` directly, and a `deviceId` constraint on that call is
+  // understood by every browser that has `getUserMedia` at all — there is no
+  // second argument to probe any more, so the question `offersInputChoice`
+  // actually has left to answer is only whether there is more than one input.
+  const choosesInput = offersInputChoice({ supported, routes: true, inputs })
   // The device to listen through: the remembered one while it is still here
   // and still opens, and the browser's own default otherwise.
   const chosen =
@@ -926,135 +961,59 @@ export function LiveHub({
     return () => window.removeEventListener('keydown', onKey)
   }, [toggleListening])
 
+  // Capture opens a stream and a worklet rather than a recognizer (mesa task
+  // 956), but keeps the run-guard shape the recognizer effect always had —
+  // `running`, flipped false by the cleanup — for exactly the same reason:
+  // work still in flight when the conversation stops wanting the microphone
+  // (mesa speaking, the person muting, the conversation ending) must not
+  // write state into a component that has moved on, or open a device nothing
+  // will ever listen to.
   useEffect(() => {
     if (!wantsMic) return
-    const Recognizer = recognitionCtor(window as unknown as Record<string, unknown>)
-    if (Recognizer === null) return
-    // This effect's own run. A recognizer stopped by the cleanup below still
-    // fires its `end`, and that echo must not restart the microphone the
-    // cleanup just closed.
     let running = true
-    let current: SpeechRecognitionLike | null = null
-    // The chosen microphone's stream, held for as long as this effect run is:
-    // the engine ends and reopens by itself (the ~60s cap, a long silence),
-    // and reacquiring the device on each of those would blink the browser's
-    // recording indicator through a quiet stretch nothing changed in.
-    //
-    // It is deliberately NOT held across mesa speaking. `wantsMic` goes false
-    // for the length of every reply, so this run ends and the device closes —
-    // which is the promise `shouldListen` makes made visible: while mesa
-    // talks, the microphone is shut, and an indicator still lit would say the
-    // opposite. The cost is one `getUserMedia` per turn on the chosen-device
-    // path, against a permission already granted.
-    //
-    // Null while the default is chosen — that path opens no device of mesa's
-    // own at all.
     let stream: MediaStream | null = null
+    let ctx: AudioContext | null = null
+    let node: AudioWorkletNode | null = null
+    let source: MediaStreamAudioSourceNode | null = null
+    let blobUrl: string | null = null
+    // The rolling buffer of recent audio: bounded by `dropBefore` below to the
+    // current utterance's pre-roll, since a page listening for an hour must
+    // not hold an hour of it.
+    let frames: CapturedFrame[] = []
+    let vad = initialVad()
+    // The level meter is throttled here rather than in `setLevel` itself: a
+    // 128-sample block at 16 kHz is on the order of 125 blocks a second, and
+    // re-rendering the hub that often for a bar nobody can watch move that
+    // fast would cost far more than the meter is worth. A block only updates
+    // the state once its level has moved by more than 0.03 or ~100ms have
+    // passed since the last write.
+    let lastLevelAt = 0
+    let lastLevelValue = 0
+    // Segments are transcribed **in order**: two overlapping posts could land
+    // the halves of one thought the wrong way round, the same reasoning
+    // `post()` already carries in this file for a split recording. Every
+    // segment's `send` is chained onto this rather than fired directly.
+    let queue = Promise.resolve()
 
     /**
-     * The track to listen through, or `undefined` for the untouched call.
-     * Re-acquired when the held one is no longer live: a track can be stopped
-     * from outside the page (unplugged, or claimed by another application) and
-     * `start()` refuses one that is not live.
+     * One finished utterance, windowed out of the rolling buffer, downsampled
+     * and posted to `POST /api/live/transcribe`. What comes back is handed to
+     * the **existing** held-recording path exactly as the old `onresult`
+     * final branch did — same order, same guards — because everything
+     * downstream (`heldWith`, `shouldFlushSilence`, `heldFlush`) is built
+     * assuming a final arrives this way.
      */
-    const microphone = async (): Promise<MediaStreamTrack | undefined> => {
-      if (chosen === DEFAULT_INPUT) return undefined
-      const media = navigator.mediaDevices
-      if (!media?.getUserMedia) return undefined
-      const held = stream?.getAudioTracks().find((t) => t.readyState === 'live')
-      if (held) return held
-      stream?.getTracks().forEach((t) => t.stop())
-      stream = await media.getUserMedia({ audio: { deviceId: { exact: chosen } } })
-      return stream.getAudioTracks()[0]
-    }
-
-    /**
-     * Start one engine, on the given track or on the browser's default.
-     *
-     * A `TypeError` from a track is this browser saying it has no such
-     * argument (Safari, and Chromium before 135). That is not a failure to
-     * report — nothing was opened and nothing was lost — it is the answer to a
-     * question mesa could not ask any other way: stop offering the chooser and
-     * listen exactly as mesa always did.
-     */
-    const startWith = (engine: SpeechRecognitionLike, track?: MediaStreamTrack) => {
+    const send = async (wav: Uint8Array) => {
+      setHearing((n) => n + 1)
       try {
-        // Two calls rather than one with an optional argument: Chrome's
-        // `start(undefined)` is a `TypeError`, not an omitted argument, so
-        // forwarding a `track` that happens to be undefined would break the
-        // default path — the one path that has to keep working everywhere.
-        if (track === undefined) engine.start()
-        else engine.start(track)
-      } catch (err: unknown) {
-        if (track !== undefined) {
-          // A `TypeError` is this browser saying it has no such argument; a
-          // track that ended between the liveness check and this call is the
-          // other way here. Either way the engine did not start and the
-          // default still would, so fall back to it rather than leaving the
-          // conversation deaf until something else moves.
-          if (err instanceof TypeError) setRoutes(false)
-          else setRefusedInput(chosen)
-          startWith(engine)
-          return
-        }
-        // A refused start fires no `start` and no `end`, so nothing here will
-        // reopen it — say so rather than going quiet, and let the next change
-        // of the answer (mesa's next reply ending, most likely) try again.
-        if (running) setActionError(err instanceof Error ? err.message : String(err))
-      }
-    }
-
-    const open = () => {
-      const engine = new Recognizer()
-      current = engine
-      // How far this engine's own results list has been consumed. Per engine:
-      // a restart is a new list, starting again at zero.
-      let settled = 0
-      // Continuous so a pause is a sentence rather than the end of listening,
-      // interim so the person can see they are being heard.
-      engine.continuous = true
-      engine.interimResults = true
-      engine.onresult = (event) => {
-        // Every result restarts the silence wait, interim or settled alike —
-        // a pause the person fills back in mid-sentence must not be read as
-        // them having finished (mesa task 917).
-        markHeard()
-        const heard = readResults(Math.max(event.resultIndex, settled), event.results)
-        settled = heard.settledThrough
-        // Corrected before either half is used anywhere else (mesa task 922):
-        // the interim matters too, since `heldFlush` can send it as the tail
-        // of a turn, and a preview showing the mishearing would be corrected
-        // out from under the person the moment they stopped talking.
-        const final = correctVocabulary(heard.final, vocabRef.current)
-        const interim = correctVocabulary(heard.interim, vocabRef.current)
-        if (running) setInterimNow(interim)
-        const text = utteranceFrom(final)
+        const { text: raw } = await transcribeAudio(toBase64(wav))
+        if (!running) return
+        const text = utteranceFrom(correctVocabulary(raw, vocabRef.current))
         if (text === null) return
-        // Not guarded on `running`: `stop()` below delivers whatever was
-        // pending as a final, and that is the sentence the person was still
-        // finishing as mesa began to speak — heard before the audio started,
-        // so it is theirs, not an echo, and it belongs in the recording. Three
-        // stops *do* drop it, and for the same reason: it is not part of any
-        // recording that will be sent. The conversation ending is one. A
-        // **pause** is the other (task 882) — the person pressed a button that
-        // means "hear nothing from me", and the pending sentence is exactly
-        // what they were saying when they pressed it. `setPausedNow(true)`
-        // runs before this effect's cleanup calls `stop()`, so the ref is
-        // already true by the time that final arrives. A **mute** is the third,
-        // and all but never a loss: the press already flushed the recording
-        // with this very sentence's preview on the end of it (`heldFlush`), so
-        // taking the late final too would say it twice. The exception is a
-        // mute landing in the gap between mesa starting to speak — which
-        // clears the preview on its way past — and the stop that gap caused
-        // delivering the final. That sentence goes; it is the same sentence the
-        // pre-889 page dropped on a mute, and closing it would mean holding a
-        // preview mesa is already talking over.
-        if (running) {
-          // The preview is cleared here rather than waiting for the next
-          // event: the words it showed have just been recorded, and leaving
-          // them under the box would read as a second sentence still coming.
-          setInterimNow('')
-        }
+        // The preview is cleared here rather than waiting for the next
+        // segment: the words it showed have just been recorded, and leaving
+        // them under the box would read as a second sentence still coming.
+        setInterimNow('')
         if (armed.current.live && !pausedRef.current && !mutedRef.current) {
           // Held, not posted (task 889): the recording is one turn, and the
           // person's own switch is what ends it. `flush` is only the cap.
@@ -1062,55 +1021,133 @@ export function LiveHub({
           setRecordingNow(grown.held)
           if (grown.flush !== null) void postRef.current(grown.flush)
         }
-      }
-      engine.onerror = (event) => {
+      } catch (err: unknown) {
         if (!running) return
-        if (!isBlockingError(event.error)) return
-        // Not an error the conversation recovers from: say so once, in the
-        // status line, and leave the typed box as the way in.
-        setBlocked(true)
-        setActionError(`the microphone is unavailable (${event.error})`)
-        // And send what it did hear (task 889). A refusal withdraws the listen
-        // button — `blocked` is one of its four conditions — so the recording
-        // would otherwise sit on screen with no control left to deliver it.
-        // The microphone dying mid-sentence is the everyday case: another
-        // application takes the device, or the permission is revoked from the
-        // omnibox.
-        flushRef.current()
+        // A missing `auris` answers 503 `unavailable`, and any other failure
+        // looks the same from here — this page cannot tell "not installed"
+        // from "crashed on this clip", and to the person both mean the same
+        // thing: say so, and try the next utterance rather than ending
+        // listening outright. A machine with no `auris` therefore hears
+        // nothing today and the status line says exactly that; the real
+        // fallback — reopening the typed box on its own — is mesa task 957.
+        setActionError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setHearing((n) => n - 1)
       }
-      engine.onend = () => {
+    }
+
+    const onFrame = (samples: Float32Array) => {
+      const at = Date.now()
+      frames.push({ at, samples })
+      const rms = frameRms(samples)
+      if (Math.abs(rms - lastLevelValue) > 0.03 || at - lastLevelAt > 100) {
+        lastLevelValue = rms
+        lastLevelAt = at
+        setLevel(rms)
+      }
+      const step = vadStep(vad, { rms, at })
+      vad = step.state
+      // The silence clock now comes from audible audio rather than a
+      // recognizer result: `markHeard` used to fire on every result, interim
+      // included, precisely so a mid-sentence pause the person fills back in
+      // was not read as them having finished. Audible sound is a *truer*
+      // answer to the same question than a guess at words was, and
+      // `shouldFlushSilence` above is unchanged.
+      if (step.loud) markHeard()
+      // Windowed **synchronously**, and before the buffer is bounded below.
+      // `send` runs a microtask later at the earliest, and the VAD resets on
+      // the very frame that ends an utterance — so by the time a deferred
+      // window ran, `dropBefore` would already have let go of every frame the
+      // sentence was made of, and the recording posted to auris would be the
+      // trailing pre-roll instead of what the person said. Encoding here is
+      // the one place the frames the segment names are all still in hand.
+      if (step.ended !== null && ctx !== null) {
+        const wav = wavFromFrames(
+          frames,
+          step.ended.startedAt - PRE_ROLL_MS,
+          step.ended.endedAt,
+          ctx.sampleRate,
+        )
+        // A header-only WAV is a window with nothing in it — nothing anybody
+        // said, so nothing worth waking a decoder for.
+        if (wav.length > 44) queue = queue.then(() => send(wav))
+      }
+      frames = dropBefore(frames, (vad.startedAt ?? at) - PRE_ROLL_MS)
+    }
+
+    /** Opens the stream, the context and the worklet, in that order — each
+     *  awaited step bails if the conversation stopped wanting the microphone
+     *  while it was opening, closing whatever this call already has. */
+    const open = async (constraint: MediaTrackConstraints | boolean) => {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: constraint })
+      if (!running) {
+        stream.getTracks().forEach((t) => t.stop())
+        stream = null
+        return
+      }
+      try {
+        ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE })
+      } catch {
+        // A browser that refuses the rate still works: `wavFromFrames` is
+        // handed `ctx.sampleRate` and downsamples in the page instead.
+        ctx = new AudioContext()
+      }
+      // The press that joined the conversation is the gesture that permits
+      // this — the same one `act()` already spends on the player and the
+      // clock.
+      await ctx.resume()
+      if (!running) {
+        void ctx.close()
+        ctx = null
+        stream.getTracks().forEach((t) => t.stop())
+        stream = null
+        return
+      }
+      blobUrl = URL.createObjectURL(new Blob([PCM_WORKLET_SOURCE], { type: 'text/javascript' }))
+      await ctx.audioWorklet.addModule(blobUrl)
+      if (!running) return
+      node = new AudioWorkletNode(ctx, 'mesa-pcm')
+      source = ctx.createMediaStreamSource(stream)
+      // Deliberately not connected onward to `ctx.destination` — that would
+      // play the person's own microphone back at them.
+      source.connect(node)
+      node.port.onmessage = (e) => onFrame(e.data as Float32Array)
+      // Real names for the devices: a browser redacts every device *label*
+      // until microphone permission has been granted, and opening the stream
+      // above is what grants it — this is the capture-era version of what
+      // `engine.onstart` used to trigger this from.
+      listInputs()
+    }
+
+    void (async () => {
+      try {
+        // `DEFAULT_INPUT` no longer means "no stream of mesa's own" the way it
+        // did under `SpeechRecognition.start()` — capture always opens a
+        // stream now. What the default choice means is "whatever device the
+        // browser would pick": mesa needs its own microphone permission on
+        // every path, not only the chosen-device one.
+        await open(chosen === DEFAULT_INPUT ? true : { deviceId: { exact: chosen } })
+      } catch (err: unknown) {
         if (!running) return
-        setInterimNow('')
-        // The browser ends recognition by itself — after about a minute, and
-        // on a long enough silence — and reports it as an ordinary end. So the
-        // question is asked again rather than retried: as long as the
-        // conversation still wants the microphone, open a new one.
-        if (wants.current) open()
-      }
-      // Real names for the devices: permission is granted by the time an
-      // engine starts, so this is when the numbered placeholders resolve.
-      engine.onstart = listInputs
-      microphone()
-        .then((track) => {
-          if (running) {
-            startWith(engine, track)
-            return
-          }
-          // The conversation stopped while the device was still opening. The
-          // cleanup below already ran, at a moment when there was no stream to
-          // close, so closing it is this branch's job — a track nothing will
-          // ever listen to leaves the browser's recording indicator lit with
-          // nobody on the other end of it.
-          stream?.getTracks().forEach((t) => t.stop())
-          stream = null
-        })
-        .catch((err: unknown) => {
-          if (!running) return
-          // The named device is gone, or the permission behind it was refused.
-          // Listen through the default rather than not at all — a conversation
-          // that hears nothing is worse than one that hears the wrong
-          // microphone — and say which it is, because the chooser above will
-          // still be showing the device that is not being used.
+        const name = err instanceof DOMException ? err.name : ''
+        if (isMicRefusal(name)) {
+          // Not an error the conversation recovers from: say so once, in the
+          // status line, and leave the typed box as the way in.
+          setBlocked(true)
+          setActionError(`the microphone is unavailable (${name})`)
+          // And send what it did hear (task 889). A refusal withdraws the
+          // listen button — `blocked` is one of its four conditions — so the
+          // recording would otherwise sit on screen with no control left to
+          // deliver it.
+          flushRef.current()
+          return
+        }
+        if (chosen !== DEFAULT_INPUT) {
+          // The named device is gone, or the permission behind it was
+          // refused. Listen through the default rather than not at all — a
+          // conversation that hears nothing is worse than one that hears the
+          // wrong microphone — and say which it is, because the chooser above
+          // will still be showing the device that is not being used.
           setActionError(
             `that microphone is unavailable (${
               err instanceof Error ? err.message : String(err)
@@ -1121,19 +1158,32 @@ export function LiveHub({
           // another application has it — would otherwise be asked again at
           // every reply, for ever, with the same failure and the same line.
           setRefusedInput(chosen)
-          startWith(engine)
-        })
-    }
-    open()
+          try {
+            await open(true)
+          } catch (err2: unknown) {
+            if (running) setActionError(err2 instanceof Error ? err2.message : String(err2))
+          }
+          return
+        }
+        setActionError(err instanceof Error ? err.message : String(err))
+      }
+    })()
 
     return () => {
       running = false
-      // The preview goes; the recording does not. This cleanup runs every time
-      // mesa starts speaking, and a recording that emptied itself for the
-      // length of each of her replies would keep almost nothing (task 889).
       setInterimNow('')
-      current?.stop()
+      // The meter goes quiet with the microphone. It is driven from frames
+      // that have stopped arriving, so without this it would freeze at
+      // whatever the last block happened to read — a bar still showing sound
+      // through mesa's whole reply, which is the opposite of what shutting
+      // the microphone while she speaks is meant to show.
+      setLevel(0)
+      node?.port.close?.()
+      node?.disconnect()
+      source?.disconnect()
+      void ctx?.close()
       stream?.getTracks().forEach((t) => t.stop())
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
     }
   }, [wantsMic, chosen, listInputs, markHeard, setInterimNow, setRecordingNow])
 
@@ -1463,6 +1513,14 @@ export function LiveHub({
     postRef.current = post
   })
 
+  // Whether the person is audibly talking right now, or a segment they just
+  // finished is still on its way back from `auris` — the audio-era
+  // replacement for the interim guess the bars used to key on (mesa task
+  // 956). Without it the very first utterance of a conversation would show
+  // "listening" while the person is still mid-sentence: there is no partial
+  // transcript any more to say otherwise until the segment comes back.
+  const voiced = level >= DEFAULT_VAD.onsetRms || hearing > 0
+
   // What the header band says about the conversation (`liveIndicator.ts`):
   // mesa speaking, the person being heard, the agent at work, or the
   // microphone simply open.
@@ -1474,8 +1532,11 @@ export function LiveHub({
     // The recording counts as being heard (task 889): between two settled
     // sentences the guess is empty for a beat, and bars that drop back to
     // "listening" there would say mesa had taken what was said and moved on
-    // — when in fact it is still held, waiting for the switch.
-    interim: interim !== '' ? interim : recording,
+    // — when in fact it is still held, waiting for the switch. `voiced` folds
+    // in the same idea one level lower: `liveIndicator.ts` only ever checks
+    // whether this string is empty, never what it says, so `'hearing'` is a
+    // placeholder in exactly the sense `recording`/`interim` themselves were.
+    interim: voiced ? 'hearing' : interim !== '' ? interim : recording,
     draft,
     paused,
     // The agent's own half of the band (mesa task 894), and the only part of
@@ -1714,6 +1775,23 @@ export function LiveHub({
                       ))}
                     </select>
                   )}
+                  {/* The level meter (mesa task 956): what replaced the
+                      interim preview as the sign the microphone is doing
+                      anything at all. A partial transcript would say more,
+                      but it would need a streaming decoder mesa does not
+                      have — a level is the cheap honest answer, and shown
+                      only while the microphone is actually the way in, the
+                      same terms the switch itself is offered on. `aria-hidden`
+                      because it is decoration for the eye; the hint below is
+                      what actually reports state to a screen reader. */}
+                  {recognizes && (
+                    <div className="live-level" aria-hidden="true">
+                      <div
+                        className="live-level-bar"
+                        style={{ width: `${Math.min(1, Math.sqrt(level) * 3) * 100}%` }}
+                      />
+                    </div>
+                  )}
                 </div>
                 <textarea
                   ref={capture}
@@ -1779,19 +1857,26 @@ export function LiveHub({
                     thing to the person — what mesa will be told when they stop
                     listening — and shown at all because a microphone recording
                     out of sight is the thing this must never be. */}
-                {(recording !== '' || interim !== '') && (
+                {(recording !== '' || interim !== '' || hearing > 0) && (
                   <div className="live-interim">
                     {recording}
-                    {recording !== '' && interim !== '' ? ' ' : ''}
-                    {/* The live region is the *guess*, not the recording it is
-                        joined onto: announcing the whole thing again on every
-                        interim update would read the last two minutes back to
-                        a screen reader once a second. Each sentence is
-                        announced while it is still being guessed at, which is
-                        when it is news. */}
+                    {recording !== '' && (interim !== '' || hearing > 0) ? ' ' : ''}
+                    {/* The live region used to be the recognizer's own guess;
+                        there is no partial transcript to show any more (mesa
+                        task 956), so while a segment is on its way back from
+                        `auris` this is the in-flight note instead — still
+                        announced once, while it is still news, for the same
+                        reason the guess was: a recording sitting on screen
+                        with no visible sign anything is happening reads as
+                        broken. */}
                     {interim !== '' && (
                       <span className="live-guessing" aria-live="polite">
                         {interim}
+                      </span>
+                    )}
+                    {interim === '' && hearing > 0 && (
+                      <span className="live-guessing" aria-live="polite">
+                        transcribing…
                       </span>
                     )}
                   </div>

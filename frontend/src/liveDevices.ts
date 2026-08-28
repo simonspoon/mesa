@@ -28,11 +28,13 @@
  *   argument; anywhere else it would be a dropdown that either has one entry
  *   or changes nothing, and both of those lie about what mesa can do.
  *
- * The audio a chosen track carries still never leaves the page through this
- * module: it is handed to the browser's own recognizer, same as ever. mesa
- * does now accept one bounded audio route, `POST /api/live/transcribe`, that
- * hands a recording to the external `auris` binary instead — but nothing
- * here calls it yet (mesa task 956); see `docs/live.md`.
+ * As of mesa task 956, the device this module names is opened through
+ * `getUserMedia` directly rather than handed to the browser's own recognizer
+ * — the audio still never leaves the page *through this module*; it goes to
+ * `LiveHub.tsx`'s capture effect, which is what posts a finished utterance to
+ * `POST /api/live/transcribe` (`liveAudio.ts`). This module's own question is
+ * unchanged either way: which device to open, not what becomes of what it
+ * hears.
  */
 
 /** A `MediaDeviceInfo`, as much of one as the chooser reads. */

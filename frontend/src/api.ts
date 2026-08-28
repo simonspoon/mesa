@@ -45,6 +45,7 @@ import type { LibraryVersion } from './types/LibraryVersion'
 import type { LiveContext } from './types/LiveContext'
 import type { LiveSession } from './types/LiveSession'
 import type { LiveState } from './types/LiveState'
+import type { LiveTranscript } from './types/LiveTranscript'
 import type { LiveTurn } from './types/LiveTurn'
 import type { LiveWindow } from './types/LiveWindow'
 import type { MesaVersion } from './types/MesaVersion'
@@ -948,6 +949,19 @@ export function stopLive(): Promise<LiveSession> {
  */
 export function sendLiveUtterance(text: string): Promise<LiveTurn> {
   return request('/api/live/utterance', jsonInit('POST', { text }))
+}
+
+/**
+ * The input-direction mirror of the speak routes (mesa task 956): audio in,
+ * text out, nothing retained on either side. `POST /api/live/transcribe`
+ * hands the recording to the external `auris` binary and answers with
+ * whatever it read back (`src/core/listen.rs`). The body carries the WAV as
+ * base64 inside JSON rather than a raw `audio/wav` POST, so the route stays
+ * inside the ordinary Content-Type gate with no carve-out for a second body
+ * shape (`src/api.rs::TranscribeBody`).
+ */
+export function transcribeAudio(audioBase64: string): Promise<LiveTranscript> {
+  return request('/api/live/transcribe', jsonInit('POST', { audio_base64: audioBase64 }))
 }
 
 /**

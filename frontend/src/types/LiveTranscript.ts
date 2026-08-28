@@ -4,6 +4,6 @@
  * The answer to `POST /api/live/transcribe` (mesa task 954): whatever
  * `listen::transcribe` read back from `auris` for one posted recording.
  * Nothing else rides along — the audio itself is never stored, so there is
- * no id, no session, nothing to look up again (`docs/posture.md`).
+ * no id, no session, nothing to look up again (`docs/listen.md`).
  */
 export type LiveTranscript = { text: string, };

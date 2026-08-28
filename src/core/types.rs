@@ -2951,7 +2951,7 @@ pub struct LiveTurn {
 /// The answer to `POST /api/live/transcribe` (mesa task 954): whatever
 /// `listen::transcribe` read back from `auris` for one posted recording.
 /// Nothing else rides along — the audio itself is never stored, so there is
-/// no id, no session, nothing to look up again (`docs/posture.md`).
+/// no id, no session, nothing to look up again (`docs/listen.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct LiveTranscript {

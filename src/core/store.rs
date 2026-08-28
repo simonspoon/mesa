@@ -885,7 +885,7 @@ const LIVE_WINDOW_EXTENT_MAX: i32 = 20000;
 const LIVE_TEXT_MAX: usize = 8192;
 
 /// Largest audio recording `POST /api/live/transcribe` accepts, in bytes
-/// (`docs/posture.md`, mesa task 954). This is a cap on **one recording**, not
+/// (`docs/listen.md`, mesa task 954). This is a cap on **one recording**, not
 /// a corpus: 16 kHz 16-bit mono PCM runs about 32 KB/s, so a ten-minute
 /// utterance is roughly 19 MB, and `docs/streaming.md`'s VAD segmentation is
 /// why a single request only ever has to carry one utterance rather than a

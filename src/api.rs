@@ -2770,7 +2770,7 @@ async fn speak_live_turn(
 /// 413 that names no limit — before mesa's own [`LIVE_AUDIO_MAX`] check ever
 /// runs, and past about 65 seconds of 16 kHz mono audio at that. This layer
 /// bounds the wire; the handler's own check is what produces the named,
-/// JSON-shaped error `docs/posture.md` requires.
+/// JSON-shaped error `docs/listen.md` requires.
 const TRANSCRIBE_BODY_LIMIT: usize = LIVE_AUDIO_MAX * 4 / 3 + 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -2791,7 +2791,7 @@ struct TranscribeBody {
 /// `bytes` buffer, are handed to the child's stdin inside
 /// `listen::transcribe`, and are never written to `live_turns`, to disk, or
 /// to a log — the speak routes' "nothing is stored and nothing is cached"
-/// read backwards (`docs/posture.md`, mesa task 954/930).
+/// read backwards (`docs/listen.md`, mesa task 954/930).
 ///
 /// Invalid base64 or an empty recording is 422 `validation`. A decoded body
 /// over [`LIVE_AUDIO_MAX`] is **413**, not 422: 422 says "I read your input
@@ -2799,7 +2799,7 @@ struct TranscribeBody {
 /// the same shape `LIVE_TEXT_MAX`'s own check takes. 413 names a body too
 /// large to accept, refused at the boundary before it is read rather than
 /// after decoding starts and fails; claiming mesa inspected a recording it
-/// never let in the door would be the wrong signal (`docs/posture.md`).
+/// never let in the door would be the wrong signal (`docs/listen.md`).
 ///
 /// Gated by the exact pair [`speak_inbox`]/[`speak_live_turn`] carry:
 /// `require_agent_access` because decoding a recording as the machine's
@@ -2944,7 +2944,7 @@ async fn transcribe_available(
 /// make mesa's own machine decode whatever audio it recorded. The refusal
 /// has to be structural, not a stronger check — the same shape
 /// `mesa live look` takes and for the same reason (`core::look`,
-/// `docs/posture.md`): the capability does not exist to be checked. So this
+/// `docs/listen.md`): the capability does not exist to be checked. So this
 /// route is present only in default (loopback) mode; under `--lan` it is
 /// simply never registered, and a request for it falls through to the SPA
 /// fallback (`axum_embed::ServeEmbed`, `.fallback_service` in `router()`)

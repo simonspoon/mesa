@@ -13,7 +13,7 @@
 //! there is nothing earlier to hand back and nothing to gain from a channel.
 //! [`transcribe`] collects the whole answer and returns it.
 //!
-//! **Nothing here is retained** (`docs/posture.md`, mesa task 930): the audio
+//! **Nothing here is retained** (`docs/listen.md`, mesa task 930): the audio
 //! is transcribed and dropped. It is never written to `live_turns` (which has
 //! no column for it), never written to disk, and never logged — the speak
 //! routes' "nothing is stored and nothing is cached" read backwards, with the

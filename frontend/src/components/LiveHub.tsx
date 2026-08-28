@@ -83,7 +83,7 @@ import {
   turnGroups,
   turnLabel,
 } from '../liveTurns'
-import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadStep } from '../liveVad'
+import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadCut, vadStep } from '../liveVad'
 import { sameBox, windowBox } from '../liveWindow'
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
@@ -1093,12 +1093,30 @@ export function LiveHub({
      * final branch did — same order, same guards — because everything
      * downstream (`heldWith`, `shouldFlushSilence`, `heldFlush`) is built
      * assuming a final arrives this way.
+     *
+     * `outlives` (mesa task 961) is for the one segment that is windowed in
+     * this effect's own *cleanup* rather than from `onFrame` — the sentence
+     * the person was still finishing when mesa began to speak, cut by
+     * `vadCut` because `wantsMic` going false tears this whole effect down
+     * before the VAD would ever have reported it `ended` on its own. That
+     * send necessarily starts after `running` has already gone false, so the
+     * two `!running` early-outs below are skipped for it — the same
+     * "not guarded on `running`" carve-out the browser-recognizer path takes
+     * in its `onresult`, and for the same reason: this text was heard before
+     * mesa's audio started, so it is the person's, not an echo, and belongs
+     * in the recording. The delivery-time predicate two lines down
+     * (`armed.current.live && !pausedRef.current && !mutedRef.current`) is
+     * still what decides whether it actually lands — unchanged, and doing
+     * all the discriminating: a pause, a mute or the listen switch, or the
+     * conversation having ended by the time this resolves, all fail it, so
+     * only "mesa started speaking and nothing else happened" reaches the
+     * recording.
      */
-    const send = async (wav: Uint8Array) => {
+    const send = async (wav: Uint8Array, outlives = false) => {
       setHearing((n) => n + 1)
       try {
         const { text: raw } = await transcribeAudio(toBase64(wav))
-        if (!running) return
+        if (!running && !outlives) return
         const text = utteranceFrom(correctVocabulary(raw, vocabRef.current))
         if (text === null) return
         // The preview is cleared here rather than waiting for the next
@@ -1113,7 +1131,7 @@ export function LiveHub({
           if (grown.flush !== null) void postRef.current(grown.flush)
         }
       } catch (err: unknown) {
-        if (!running) return
+        if (!running && !outlives) return
         // This effect only runs at all once the mount probe found auris
         // available (`path === 'auris'`), so a failure here is auris crashing
         // on this one clip, not the missing-binary case `listenPath` already
@@ -1272,6 +1290,32 @@ export function LiveHub({
       node?.port.close?.()
       node?.disconnect()
       source?.disconnect()
+      // mesa task 961: `wantsMic` can go false with an utterance still open —
+      // most often because mesa started speaking, which shuts the microphone
+      // for the length of her reply. `vadStep` never gets to report that
+      // utterance `ended`, because nothing feeds it another frame once this
+      // cleanup runs, so `vadCut` reads the same "worth transcribing" verdict
+      // off whatever state the VAD was actually left in. This has to happen
+      // here, before `ctx?.close()`/the stream teardown just below: windowing
+      // needs `ctx.sampleRate` to downsample by and `frames` to draw from, and
+      // both are gone the moment those run. The send is chained onto `queue`
+      // like every other segment, never fired directly — so it can't overtake
+      // a segment already in flight — and marked `outlives` so the two
+      // `!running` guards inside `send` don't discard it now that `running`
+      // is already false; see `send`'s comment for why the delivery-time
+      // predicate alone is still enough to keep the other four teardown
+      // reasons (pause, mute, the listen switch, ending) from also sending
+      // whatever they cut off. `vad = initialVad()` after windowing, mirroring
+      // the reset `vadStep` performs on an ordinary `ended`, is what stops
+      // this same audio being windowed twice — this cleanup runs exactly
+      // once per effect run, but leaving `vad` as it was would say otherwise
+      // to anything reading it afterwards.
+      const cut = vadCut(vad)
+      if (cut !== null && ctx !== null) {
+        const wav = wavFromFrames(frames, cut.startedAt - PRE_ROLL_MS, cut.endedAt, ctx.sampleRate)
+        if (wav.length > 44) queue = queue.then(() => send(wav, true))
+      }
+      vad = initialVad()
       void ctx?.close()
       stream?.getTracks().forEach((t) => t.stop())
       if (blobUrl) URL.revokeObjectURL(blobUrl)

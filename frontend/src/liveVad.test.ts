@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_VAD, initialVad, vadStep, type VadConfig, type VadState } from './liveVad'
+import { DEFAULT_VAD, initialVad, vadCut, vadStep, type VadConfig, type VadState } from './liveVad'
 
 const config: VadConfig = DEFAULT_VAD
 
@@ -81,5 +81,29 @@ describe('vadStep', () => {
     const frozenSilent = { ...silent }
     vadStep(silent, { rms: 0, at: 100 }, config)
     expect(silent).toEqual(frozenSilent)
+  })
+})
+
+describe('vadCut', () => {
+  it('is null with no utterance in progress', () => {
+    expect(vadCut(initialVad(), config)).toBeNull()
+  })
+
+  it('is null for an utterance shorter than minSpeechMs', () => {
+    const state: VadState = { startedAt: 0, lastLoudAt: config.minSpeechMs - 1 }
+    expect(vadCut(state, config)).toBeNull()
+  })
+
+  it('cuts an in-progress utterance at lastLoudAt, not now', () => {
+    const state: VadState = { startedAt: 0, lastLoudAt: config.minSpeechMs + 50 }
+    expect(vadCut(state, config)).toEqual({ startedAt: 0, endedAt: config.minSpeechMs + 50 })
+  })
+
+  it('honours a custom config', () => {
+    const custom: VadConfig = { ...config, minSpeechMs: 1000 }
+    const tooShort: VadState = { startedAt: 0, lastLoudAt: 999 }
+    expect(vadCut(tooShort, custom)).toBeNull()
+    const longEnough: VadState = { startedAt: 0, lastLoudAt: 1000 }
+    expect(vadCut(longEnough, custom)).toEqual({ startedAt: 0, endedAt: 1000 })
   })
 })

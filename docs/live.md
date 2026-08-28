@@ -1131,11 +1131,17 @@ conversation") working with no backend change.
       byte-identical to what it always did, it is simply never handed
       anything in that second argument any more. A segment the VAD has not
       yet ended when the switch is pressed is not specially cut and sent —
-      pressing the switch (like a mute, or mesa starting to speak) tears down
-      the capture stream, and whatever audio was mid-segment at that moment
-      is dropped rather than transcribed. This is a real, if usually small,
-      loss the browser-recognizer era did not have, where the engine's `stop()`
-      delivered the pending final before the microphone closed.
+      pressing the switch (like a mute) tears down the capture stream, and
+      whatever audio was mid-segment at that moment is dropped rather than
+      transcribed. Mesa starting to speak is the one teardown this does *not*
+      apply to (mesa task 961, `vadCut` in `liveVad.ts`): the effect's cleanup
+      windows and posts whatever utterance was still in progress before the
+      microphone closes, the same way the browser-recognizer engine's
+      `stop()` used to deliver a pending final — that sentence was heard
+      before mesa's own audio started, so it is the person's, not an echo.
+      The delivery-time guard (`armed.current.live && !paused && !muted`) is
+      what still drops it if a pause, a mute or the end of the conversation
+      also happened to land in that gap.
     - **The cap is the server's** (`LIVE_TEXT_MAX`, 8192). A recording that
       would cross it is posted as it stands and the new sentence starts a
       fresh one, so a nine-minute monologue arrives as several turns rather

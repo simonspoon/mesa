@@ -122,3 +122,37 @@ export function vadStep(
   // enough to call it over.
   return { state, loud, ended: null }
 }
+
+/**
+ * The utterance in progress right now, if there is one worth transcribing —
+ * for a caller whose capture is being torn down *out from under* the VAD
+ * rather than ending it on the VAD's own terms (mesa task 961).
+ *
+ * Four of the five reasons `shouldListen` goes false (pause, mute, the
+ * listen switch, ending the conversation) are the person's own act, and the
+ * sentence they cut off by it is rightly dropped. The fifth — mesa starting
+ * to speak — is not: the person may still have been mid-sentence when her
+ * audio began, and that sentence was heard before it, so it belongs in the
+ * recording. `vadStep` never gets to report it as `ended`, because nothing
+ * fed it another frame; `vadCut` answers the same "is this worth sending"
+ * question `vadStep`'s hangover branch already does, from whatever state the
+ * VAD was actually left in.
+ *
+ * Same too-short rule as the hangover branch: no utterance in progress, or
+ * one shorter than `minSpeechMs`, is null. Otherwise `endedAt` is
+ * `lastLoudAt`, not "now" — for the same reason `vadStep`'s doc comment
+ * gives: the quiet is how we know speech ended, not part of what was said,
+ * and cutting at "now" would drag in silence the person never spoke into.
+ */
+export function vadCut(
+  state: VadState,
+  config: VadConfig = DEFAULT_VAD,
+): { startedAt: number; endedAt: number } | null {
+  if (state.startedAt === null) {
+    return null
+  }
+  if (state.lastLoudAt - state.startedAt < config.minSpeechMs) {
+    return null
+  }
+  return { startedAt: state.startedAt, endedAt: state.lastLoudAt }
+}

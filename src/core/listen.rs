@@ -19,11 +19,13 @@
 //! routes' "nothing is stored and nothing is cached" read backwards, with the
 //! arrow of what goes in and what comes out reversed.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
+
+use crate::core::speech::{drain_capped, list_names};
 
 /// The speech-to-text binary to run. `MESA_AURIS_BIN` overrides it — the same
 /// test seam as `speech::kokoro_bin`/`agents::claude_bin`, and how the
@@ -60,25 +62,18 @@ const MAX_MODELS: usize = 50;
 /// (`auris/README.md` "`--no-download`", which names this function by name).
 /// `--no-download` is passed anyway, matching `speech::voices()`, so listing
 /// names can never become a fetch even if a future auris version changes
-/// that.
+/// that. Both of the child's pipes are bounded (`list_names` →
+/// `speech::spawn_and_drain`), so a `--list-models` that answers with
+/// megabytes of noise costs one capped buffer, never an unbounded one.
 pub fn models() -> &'static [String] {
     static MODELS: OnceLock<Vec<String>> = OnceLock::new();
     MODELS.get_or_init(|| {
-        let out = Command::new(auris_bin())
-            .args(["--no-download", "--list-models"])
-            .stdin(Stdio::null())
-            .output();
-        let Ok(out) = out else { return Vec::new() };
-        if !out.status.success() {
-            return Vec::new();
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| is_model_name(line))
-            .take(MAX_MODELS)
-            .map(str::to_string)
-            .collect()
+        list_names(
+            &auris_bin(),
+            &["--no-download", "--list-models"],
+            is_model_name,
+            MAX_MODELS,
+        )
     })
 }
 
@@ -127,6 +122,89 @@ enum Kind {
     Transcript,
     #[serde(other)]
     Other,
+}
+
+/// The longest single stdout line mesa will hold from auris's JSON Lines
+/// output before giving up on it. A byte cap on the *whole* stream would risk
+/// discarding a legitimate final `transcript` line arriving after a long run
+/// of `segment` lines — the opposite of `speech::STDERR_CAP`, which is fine to
+/// truncate because it is only ever quoted back in an error. Bounding the
+/// *line* length instead keeps memory bounded while still reading every line
+/// auris writes, in order, to find the last `transcript`.
+const LINE_CAP: usize = 1024 * 1024;
+
+/// Reads `reader` line by line, keeping the text of the **last** `{"type":
+/// "transcript", ...}` line seen — auris's contract (`auris/README.md`
+/// "`--format json`") is that `transcript` is always the last line on a run
+/// that produced one, so the last match is the answer even though `segment`
+/// lines may run ahead of it in volume this function must not buffer as a
+/// whole. A line longer than [`LINE_CAP`] cannot be a real JSON Lines record
+/// from auris, so it is drained and discarded whole rather than parsed as a
+/// truncated (and therefore invalid) fragment. Returns the read error, if
+/// any, alongside whatever was found before it — mirroring `read_to_string`'s
+/// contract of "partial data, then an error" as closely as a line reader can.
+fn last_transcript<R: Read>(reader: R) -> (Option<String>, Option<std::io::Error>) {
+    let mut reader = BufReader::new(reader);
+    let mut transcript = None;
+    loop {
+        let mut line = Vec::new();
+        let read = (&mut reader)
+            .take(LINE_CAP as u64)
+            .read_until(b'\n', &mut line);
+        let n = match read {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return (transcript, Some(e)),
+        };
+        // Hitting the cap with no trailing newline is ambiguous on its own:
+        // it is either a line still going (over-long, discard it) or a line
+        // that happens to be exactly LINE_CAP bytes with the stream ending
+        // right there (complete — nothing to discard). `drain_overlong`
+        // resolves it by trying to read more.
+        if n as u64 == LINE_CAP as u64 && line.last() != Some(&b'\n') {
+            match drain_overlong(&mut reader) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => return (transcript, Some(e)),
+            }
+        }
+        let text = String::from_utf8_lossy(&line);
+        let Ok(parsed) = serde_json::from_str::<Line>(text.trim_end()) else {
+            continue;
+        };
+        if parsed.kind == Kind::Transcript {
+            transcript = Some(parsed.text);
+        }
+    }
+    (transcript, None)
+}
+
+/// Called only when a line has just hit [`LINE_CAP`] with no trailing
+/// newline — drains whatever comes after it, in further `LINE_CAP`-bounded
+/// reads, until a newline or EOF. `Ok(false)` means the very next read hit
+/// EOF immediately: nothing followed, so the line the caller just read was
+/// not truncated at all — it was exactly `LINE_CAP` bytes and the stream
+/// simply ended there — and must be parsed normally rather than discarded.
+/// `Ok(true)` means at least one more byte followed: the line genuinely
+/// continues past the cap, so the caller's line (and everything drained here)
+/// is discarded whole rather than parsed as a truncated fragment.
+fn drain_overlong<R: BufRead>(reader: &mut R) -> std::io::Result<bool> {
+    let mut discarded = false;
+    loop {
+        let mut sink = Vec::new();
+        let n = (&mut *reader)
+            .take(LINE_CAP as u64)
+            .read_until(b'\n', &mut sink)?;
+        if n == 0 {
+            return Ok(discarded);
+        }
+        discarded = true;
+        if (n as u64) < LINE_CAP as u64 || sink.last() == Some(&b'\n') {
+            return Ok(true);
+        }
+        // Still no newline after another full LINE_CAP-bounded read: the
+        // line keeps going, so keep draining.
+    }
 }
 
 /// Transcribes `audio` (a whole WAV recording) by shelling out to `auris`.
@@ -192,29 +270,14 @@ pub fn transcribe(audio: &[u8]) -> Result<String, String> {
         // it cannot decode an offline utterance until it sees the end.
     });
 
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let complaints = std::thread::spawn(move || {
-        let mut said = String::new();
-        let _ = stderr.read_to_string(&mut said);
-        said
-    });
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let complaints = std::thread::spawn(move || drain_capped(stderr));
 
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut out = String::new();
-    let read_err = stdout.read_to_string(&mut out).err();
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let (transcript, read_err) = last_transcript(stdout);
 
     let _ = writer.join();
     let status = child.wait();
-
-    let mut transcript: Option<String> = None;
-    for line in out.lines() {
-        let Ok(parsed) = serde_json::from_str::<Line>(line) else {
-            continue;
-        };
-        if parsed.kind == Kind::Transcript {
-            transcript = Some(parsed.text);
-        }
-    }
 
     if let Some(text) = transcript {
         return Ok(text);
@@ -252,6 +315,29 @@ mod tests {
     /// the other — `unwrap_or_else` recovers the guard instead of unwrapping
     /// into a second panic.
     static ENV: Mutex<()> = Mutex::new(());
+
+    /// A line that is exactly `LINE_CAP` bytes, has no trailing newline, and
+    /// is genuinely the whole of the data (the stream ends right there) must
+    /// still be parsed — not discarded as over-long. Regression for the case
+    /// `drain_overlong` exists to resolve: hitting the cap with no newline is
+    /// ambiguous until a further read proves whether anything follows.
+    #[test]
+    fn a_transcript_line_landing_exactly_on_line_cap_at_eof_is_kept() {
+        let prefix = br#"{"type":"transcript","text":""#;
+        let suffix = br#""}"#;
+        let pad_len = LINE_CAP - prefix.len() - suffix.len();
+        let mut line = Vec::with_capacity(LINE_CAP);
+        line.extend_from_slice(prefix);
+        line.extend(std::iter::repeat_n(b'x', pad_len));
+        line.extend_from_slice(suffix);
+        assert_eq!(line.len(), LINE_CAP);
+        // No trailing newline: the stream ends exactly at LINE_CAP bytes.
+
+        let (transcript, err) = last_transcript(std::io::Cursor::new(line.clone()));
+        assert!(err.is_none());
+        let expected = "x".repeat(pad_len);
+        assert_eq!(transcript, Some(expected));
+    }
 
     #[test]
     fn reports_a_missing_binary_as_an_error() {
@@ -296,6 +382,34 @@ mod tests {
         assert_eq!(result, Ok("ok".to_string()));
     }
 
+    /// A `--list-models` stub flooding stdout with far more than
+    /// `speech::STDERR_CAP` of noise must still return promptly with a
+    /// bounded result. Mirrors
+    /// `speech::tests::list_names_stays_bounded_against_a_flooding_stub` —
+    /// exercises `list_names` directly rather than `models()`, whose
+    /// `OnceLock` caches for the life of the process and would leak a stub
+    /// answer into every other test that reads real models.
+    #[test]
+    fn list_names_stays_bounded_against_a_flooding_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("auris-flood-list-models.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             head -c 8388608 /dev/zero | tr '\\0' 'x'\n",
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let names = list_names(
+            stub.to_str().expect("utf8 path"),
+            &["--no-download", "--list-models"],
+            is_model_name,
+            MAX_MODELS,
+        );
+        assert!(names.is_empty(), "flooded noise is not a model name");
+    }
+
     /// The shape rule is what keeps a stored model name from ever being read
     /// as an option, and what filters a `--list-models` answer that isn't a
     /// list. Mirrors `speech::tests::voice_names_are_bounded_identifiers`.
@@ -305,5 +419,66 @@ mod tests {
         for bad in ["", "-o", &"a".repeat(65), "a b", "a/b", "a;rm -rf /"] {
             assert!(!is_model_name(bad), "{bad:?} is not a model name");
         }
+    }
+
+    fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, script).expect("write stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    /// A stub that says far more than `speech::STDERR_CAP` on stderr and
+    /// fails: the error must still terminate and stay bounded, proving stderr
+    /// is capped rather than collected whole.
+    #[test]
+    fn a_noisy_failing_binary_produces_a_bounded_error() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_stub(
+            dir.path(),
+            "auris-noisy-stderr.sh",
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             head -c 8388608 /dev/zero | tr '\\0' 'x' >&2\n\
+             exit 1\n",
+        );
+
+        unsafe { std::env::set_var("MESA_AURIS_BIN", &stub) };
+        let err = transcribe(b"not real audio").expect_err("failing binary, no transcript");
+        unsafe { std::env::remove_var("MESA_AURIS_BIN") };
+
+        assert!(
+            err.len() < crate::core::speech::STDERR_CAP + 4096,
+            "error message was not bounded: {} bytes",
+            err.len()
+        );
+    }
+
+    /// A stub whose stdout carries far more than `LINE_CAP` of `segment`
+    /// lines before its final `transcript` line: the last line must still
+    /// win, proving the reader stays bounded without losing the answer.
+    #[test]
+    fn the_last_transcript_line_wins_over_a_flood_of_segments() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_stub(
+            dir.path(),
+            "auris-flood-segments.sh",
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             i=0\n\
+             while [ $i -lt 20000 ]; do\n\
+             printf '{\"type\":\"segment\",\"text\":\"filler\"}\\n'\n\
+             i=$((i + 1))\n\
+             done\n\
+             printf '{\"type\":\"transcript\",\"text\":\"the real answer\"}\\n'\n",
+        );
+
+        unsafe { std::env::set_var("MESA_AURIS_BIN", &stub) };
+        let result = transcribe(b"not real audio");
+        unsafe { std::env::remove_var("MESA_AURIS_BIN") };
+
+        assert_eq!(result, Ok("the real answer".to_string()));
     }
 }

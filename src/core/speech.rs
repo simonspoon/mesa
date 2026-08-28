@@ -41,6 +41,95 @@ use tokio::sync::mpsc;
 /// audio reaches the browser; `kokoro-rs` writes in 4 KiB pieces.
 const CHUNK: usize = 16 * 1024;
 
+/// Cap on a drained stderr stream, shared with `listen.rs` — its `auris`
+/// mirror. Only ever quoted back in an error message, so it takes the
+/// `scripts::OUTPUT_CAP` size rather than anything larger.
+pub(crate) const STDERR_CAP: usize = 64 * 1024;
+
+/// Reads `reader` to EOF, keeping at most [`STDERR_CAP`] bytes. Bytes past the
+/// cap are still read and discarded — never a reason to stop reading. A
+/// child's stderr is drained on its own thread precisely so a chatty binary
+/// can't block the writer forever on a full pipe; stopping short of EOF here
+/// would reopen that same deadlock, just with a smaller backlog. Lossy UTF-8,
+/// with the `scripts::capped` truncation marker appended when anything was
+/// dropped.
+pub(crate) fn drain_capped<R: Read>(mut reader: R) -> String {
+    let mut kept = Vec::new();
+    let mut total: usize = 0;
+    let mut buf = [0u8; CHUNK];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        total += n;
+        if kept.len() < STDERR_CAP {
+            let room = STDERR_CAP - kept.len();
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+    }
+    let cut = total > kept.len();
+    // Cut at whatever byte the cap lands on — not, unlike `scripts::capped`,
+    // snapped back to a char boundary. That is fine here: this only ever
+    // feeds an error message, `String::from_utf8_lossy` turns a severed
+    // multi-byte character into a single replacement character rather than
+    // failing, and a cosmetic glyph at the very end of a diagnostic string is
+    // not worth the extra bookkeeping.
+    let mut s = String::from_utf8_lossy(&kept).into_owned();
+    if cut {
+        s.push_str("\n[truncated]");
+    }
+    s
+}
+
+/// Runs `cmd` with its stdio wired for a short, name-list-sized answer:
+/// stdin closed, stdout and stderr both piped and both drained through
+/// [`drain_capped`] for the child's whole life (stderr on its own thread, so
+/// a chatty binary can't block on a full pipe the way `voices`/`models`'
+/// callers already guard against for `start`). `None` on a spawn failure or a
+/// nonzero exit; `Some` carries stdout, capped to [`STDERR_CAP`] bytes — a
+/// bound on the *buffer* this reads into, not on how many names the answer
+/// may claim to have (`MAX_VOICES`/`MAX_MODELS` filters the parsed list
+/// afterwards, same as before this existed).
+pub(crate) fn spawn_and_drain(mut cmd: Command) -> Option<String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let complaints = std::thread::spawn(move || drain_capped(stderr));
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let out = drain_capped(stdout);
+    let _ = complaints.join();
+    let status = child.wait().ok()?;
+    status.success().then_some(out)
+}
+
+/// Runs `bin args…` through [`spawn_and_drain`] and filters its stdout lines
+/// into a bounded list of names — the shared body of `speech::voices` and
+/// `listen::models`, which differ only in the binary, the argv, the name
+/// shape and the cap. A spawn failure or nonzero exit is an empty list, same
+/// as before this existed: "mesa could not ask", never "there are none".
+pub(crate) fn list_names(
+    bin: &str,
+    args: &[&str],
+    is_name: fn(&str) -> bool,
+    max: usize,
+) -> Vec<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    let Some(out) = spawn_and_drain(cmd) else {
+        return Vec::new();
+    };
+    out.lines()
+        .map(str::trim)
+        .filter(|line| is_name(line))
+        .take(max)
+        .map(str::to_string)
+        .collect()
+}
+
 /// How many chunks may sit in the channel before the reader thread blocks.
 /// Small on purpose: the backlog is memory, and a client that stopped
 /// listening should stall the pipe rather than buffer a whole render.
@@ -51,6 +140,15 @@ const BACKLOG: usize = 8;
 /// 64 KiB is emitting something this module does not understand, and every byte
 /// spent looking is a byte held back from the browser.
 const HEADER_CAP: usize = 64 * 1024;
+
+/// Ceiling on the no-WAV-header fallback below, which reads the whole of a
+/// synthesiser's stdout when nothing recognisable as a `data` chunk turned up
+/// within `HEADER_CAP`. That path can still carry a legitimate render — a
+/// `data` chunk sitting past `HEADER_CAP` behind an oversized `LIST`/`fact`
+/// chunk — so this is not a truncation point the way `STDERR_CAP` is: crossing
+/// it is a failure of the whole call, never a shorter WAV handed back as if it
+/// were complete.
+const STDOUT_CAP: usize = 64 * 1024 * 1024;
 
 /// The `data` length declared in a streamed WAV, whose real length is not
 /// knowable when the header goes out. See [`fix_wav_sizes`]. Chosen so that the
@@ -84,28 +182,21 @@ const MAX_VOICES: usize = 500;
 ///
 /// Cached for the life of the process: the call costs ~1s, the answer changes
 /// only when the binary does, and it is read on every Settings page load.
+/// `--no-download`: listing names must never become a model fetch. This runs
+/// inside a `OnceLock`, so a call that blocks blocks every later caller for
+/// the life of the process — there is no cheap timeout here, so the fix is
+/// not to start anything that can hang. Both of the child's pipes are bounded
+/// (`list_names` → `spawn_and_drain`), so a `--list-voices` that answers with
+/// megabytes of noise costs one capped buffer, never an unbounded one.
 pub fn voices() -> &'static [String] {
     static VOICES: OnceLock<Vec<String>> = OnceLock::new();
     VOICES.get_or_init(|| {
-        let out = Command::new(kokoro_bin())
-            // `--no-download`: listing names must never become a model fetch.
-            // This runs inside a `OnceLock`, so a call that blocks blocks every
-            // later caller for the life of the process — there is no cheap
-            // timeout here, so the fix is not to start anything that can hang.
-            .args(["--no-download", "--list-voices"])
-            .stdin(Stdio::null())
-            .output();
-        let Ok(out) = out else { return Vec::new() };
-        if !out.status.success() {
-            return Vec::new();
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| is_voice_name(line))
-            .take(MAX_VOICES)
-            .map(str::to_string)
-            .collect()
+        list_names(
+            &kokoro_bin(),
+            &["--no-download", "--list-voices"],
+            is_voice_name,
+            MAX_VOICES,
+        )
     })
 }
 
@@ -184,12 +275,8 @@ pub fn start(text: &str, voice: Option<&str>) -> Result<Speech, String> {
     // Drain stderr for the child's whole life, not just when we want to quote
     // it: a binary that says more than a pipe buffer's worth would otherwise
     // block there and never write the stdout byte this function is waiting for.
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let complaints = std::thread::spawn(move || {
-        let mut said = String::new();
-        let _ = stderr.read_to_string(&mut said);
-        said
-    });
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let complaints = std::thread::spawn(move || drain_capped(stderr));
     let mut stdout = child.stdout.take().expect("stdout was piped");
 
     // Read exactly far enough to patch the header, and no further: every byte
@@ -219,8 +306,33 @@ pub fn start(text: &str, voice: Option<&str>) -> Result<Speech, String> {
     // whether it was audio at all. Streaming is an optimisation for the case we
     // understand, never a reason to pass an error message off as `audio/wav`.
     if !matches!(scan_header(&head), HeaderScan::Ready(_)) {
-        let _ = stdout.read_to_end(&mut head);
-        let spoke = child.wait().map(|s| s.success()).unwrap_or(false);
+        // Unlike the stderr drain, this path can legitimately carry real
+        // audio — a `data` chunk that simply sat past `HEADER_CAP` behind an
+        // oversized `LIST`/`fact` chunk — so `STDOUT_CAP` is a ceiling on a
+        // runaway binary, not a truncation point: crossing it is an error,
+        // never a shorter WAV. Still drained to EOF before `wait()`, exactly
+        // like every other pipe here.
+        let mut total = head.len();
+        let mut buf = [0u8; CHUNK];
+        loop {
+            let n = match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            total += n;
+            if head.len() < STDOUT_CAP {
+                let room = STDOUT_CAP - head.len();
+                head.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+        let status = child.wait();
+        if total > head.len() {
+            return Err(format!(
+                "{bin} produced more than {STDOUT_CAP} bytes of unrecognised output"
+            ));
+        }
+        let spoke = status.map(|s| s.success()).unwrap_or(false);
         if !spoke || head.is_empty() {
             return Err(failure(&bin, complaints));
         }
@@ -366,7 +478,15 @@ fn fix_wav_sizes(bytes: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// `MESA_KOKORO_BIN` is a process-global env var and cargo runs tests in
+    /// parallel, so every test that sets it must not race another — mirrors
+    /// `listen::tests::ENV`.
+    static ENV: Mutex<()> = Mutex::new(());
 
     /// A streaming header exactly as `kokoro-rs -o -` writes it, plus `n`
     /// bytes of audio.
@@ -493,11 +613,99 @@ mod tests {
 
     #[test]
     fn start_reports_a_failing_binary() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // A binary that cannot exist: the spawn error path, no stub needed.
         unsafe { std::env::set_var("MESA_KOKORO_BIN", "mesa-no-such-tts-binary") };
         let err = start("hello", None).err().expect("no binary, no speech");
         unsafe { std::env::remove_var("MESA_KOKORO_BIN") };
         assert!(err.contains("mesa-no-such-tts-binary"), "{err}");
+    }
+
+    fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, script).expect("write stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    /// A stub that says far more than `STDERR_CAP` on stderr and produces no
+    /// audio: `start` must still return `Err`, with the failure message
+    /// bounded rather than carrying the whole complaint.
+    #[test]
+    fn a_noisy_failing_binary_produces_a_bounded_error() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_stub(
+            dir.path(),
+            "kokoro-noisy-stderr.sh",
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             head -c 8388608 /dev/zero | tr '\\0' 'x' >&2\n\
+             exit 1\n",
+        );
+
+        unsafe { std::env::set_var("MESA_KOKORO_BIN", &stub) };
+        let err = start("hello", None)
+            .err()
+            .expect("failing binary, no speech");
+        unsafe { std::env::remove_var("MESA_KOKORO_BIN") };
+
+        assert!(
+            err.len() < STDERR_CAP + 4096,
+            "error message was not bounded: {} bytes",
+            err.len()
+        );
+    }
+
+    /// A stub that writes far more than `STDOUT_CAP` of non-WAV bytes on
+    /// stdout: the no-header fallback must refuse to collect it all rather
+    /// than balloon memory, and `start` must still terminate with an `Err`.
+    #[test]
+    fn an_oversized_non_wav_stdout_is_rejected_rather_than_collected() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_stub(
+            dir.path(),
+            "kokoro-oversized-stdout.sh",
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             head -c 71303168 /dev/zero | tr '\\0' 'x'\n\
+             exit 1\n",
+        );
+
+        unsafe { std::env::set_var("MESA_KOKORO_BIN", &stub) };
+        let err = start("hello", None)
+            .err()
+            .expect("oversized non-WAV stdout, no speech");
+        unsafe { std::env::remove_var("MESA_KOKORO_BIN") };
+
+        assert!(err.contains("more than"), "{err}");
+    }
+
+    /// A `--list-voices` stub flooding stdout with far more than `STDERR_CAP`
+    /// of noise (never a real voices answer — no newlines, so `is_voice_name`
+    /// rejects the one giant "line" `list_names` sees) must still return
+    /// promptly with a bounded result rather than growing without bound.
+    /// Exercises `list_names` directly rather than `voices()`, whose
+    /// `OnceLock` caches for the life of the process and would leak a stub
+    /// answer into every other test that reads real voices.
+    #[test]
+    fn list_names_stays_bounded_against_a_flooding_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_stub(
+            dir.path(),
+            "kokoro-flood-list-voices.sh",
+            "#!/bin/sh\n\
+             head -c 8388608 /dev/zero | tr '\\0' 'x'\n",
+        );
+
+        let names = list_names(
+            stub.to_str().expect("utf8 path"),
+            &["--no-download", "--list-voices"],
+            is_voice_name,
+            MAX_VOICES,
+        );
+        assert!(names.is_empty(), "flooded noise is not a voice name");
     }
 
     /// The shape rule is what keeps a stored voice from ever being read as an

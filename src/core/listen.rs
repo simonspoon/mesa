@@ -244,14 +244,26 @@ fn drain_overlong<R: BufRead>(reader: &mut R) -> std::io::Result<bool> {
 /// unreadable body is auris's own exit-1 "no transcript" path, not a
 /// distinct case this function has to detect itself.
 ///
+/// `model`, when `Some`, is passed as `-m <name>` — the model the config's
+/// `listen` section names (`config::listen_model`, mesa task 955), read by
+/// the caller on every request the same way `speech_voice()` is read on
+/// every press. `None` (nothing configured, or a hand-edited value the shape
+/// rule rejects) produces byte-for-byte the argv this function always ran:
+/// `-q --format json` and nothing else, so `auris` picks its own default
+/// model.
+///
 /// Blocking: call it from `spawn_blocking`, not an async worker.
-pub fn transcribe(audio: &[u8]) -> Result<String, String> {
-    // Per-request vocabulary (hotword biasing / correction) is mesa task 955;
+pub fn transcribe(audio: &[u8], model: Option<&str>) -> Result<String, String> {
+    // Per-request vocabulary (hotword biasing / correction) is a later task;
     // `--vocabulary-file` is documented but not yet implemented by auris, so
     // this call passes nothing for it.
     let bin = auris_bin();
-    let mut child = Command::new(&bin)
-        .args(["-q", "--format", "json"])
+    let mut command = Command::new(&bin);
+    command.args(["-q", "--format", "json"]);
+    if let Some(model) = model {
+        command.args(["-m", model]);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -345,7 +357,7 @@ mod tests {
         // A binary that cannot exist: the spawn error path, no stub needed —
         // mirrors `speech::tests::start_reports_a_failing_binary`.
         unsafe { std::env::set_var("MESA_AURIS_BIN", "mesa-no-such-auris-binary") };
-        let err = transcribe(b"not real audio").expect_err("no binary, no transcript");
+        let err = transcribe(b"not real audio", None).expect_err("no binary, no transcript");
         unsafe { std::env::remove_var("MESA_AURIS_BIN") };
         assert!(err.contains("mesa-no-such-auris-binary"), "{err}");
     }
@@ -376,7 +388,7 @@ mod tests {
 
         unsafe { std::env::set_var("MESA_AURIS_BIN", &stub) };
         let payload = vec![0u8; 1024 * 1024];
-        let result = transcribe(&payload);
+        let result = transcribe(&payload, None);
         unsafe { std::env::remove_var("MESA_AURIS_BIN") };
 
         assert_eq!(result, Ok("ok".to_string()));
@@ -445,7 +457,7 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MESA_AURIS_BIN", &stub) };
-        let err = transcribe(b"not real audio").expect_err("failing binary, no transcript");
+        let err = transcribe(b"not real audio", None).expect_err("failing binary, no transcript");
         unsafe { std::env::remove_var("MESA_AURIS_BIN") };
 
         assert!(
@@ -476,9 +488,38 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MESA_AURIS_BIN", &stub) };
-        let result = transcribe(b"not real audio");
+        let result = transcribe(b"not real audio", None);
         unsafe { std::env::remove_var("MESA_AURIS_BIN") };
 
         assert_eq!(result, Ok("the real answer".to_string()));
+    }
+
+    /// `model: None` must produce byte-identical argv to before task 955 —
+    /// exactly `-q --format json`, no `-m` at all
+    /// (`scripts/auris-check.sh` asserts this too). `model: Some(name)` adds
+    /// `-m <name>` as two more `Command::arg`s, never spliced into anything a
+    /// shell parses.
+    #[test]
+    fn a_model_is_passed_as_m_and_none_adds_nothing() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_stub(
+            dir.path(),
+            "auris-echo-argv.sh",
+            "#!/bin/sh\n\
+             cat > /dev/null\n\
+             printf '{\"type\":\"transcript\",\"text\":\"%s\"}\\n' \"$*\"\n",
+        );
+
+        unsafe { std::env::set_var("MESA_AURIS_BIN", &stub) };
+        let without = transcribe(b"not real audio", None);
+        let with = transcribe(b"not real audio", Some("parakeet-tdt-0.6b-v2-int8"));
+        unsafe { std::env::remove_var("MESA_AURIS_BIN") };
+
+        assert_eq!(without, Ok("-q --format json".to_string()));
+        assert_eq!(
+            with,
+            Ok("-q --format json -m parakeet-tdt-0.6b-v2-int8".to_string())
+        );
     }
 }

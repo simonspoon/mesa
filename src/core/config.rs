@@ -106,6 +106,21 @@
 //! [`crate::core::live::agent_prompt`]. A `live.prompt` key left behind in a
 //! hand-edited file is silently ignored: `LiveSection` simply has no field
 //! for it any more. See `docs/live.md`.
+//!
+//! ## Listen
+//!
+//! A sixth, independent section names the model `live transcribe` runs the
+//! external `auris` speech-to-text binary with (mesa task 955) — the input-side
+//! mirror of Speech, above:
+//!
+//! ```json
+//! { "listen": { "model": "parakeet-tdt-0.6b-v2-int8" } }
+//! ```
+//!
+//! One key, [`MODEL`], read on every request. Absent or blank is **not** a
+//! default mesa names: it means no `-m` is passed at all, so `auris` picks its
+//! own default model and an unconfigured install runs the argv it ran before
+//! this setting existed. See [`listen_model`] and `docs/live.md`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -113,9 +128,10 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
+use crate::core::listen;
 use crate::core::speech;
 use crate::core::types::{
-    ConfigCommand, ConfigLive, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
+    ConfigCommand, ConfigListen, ConfigLive, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
 };
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
@@ -1367,6 +1383,189 @@ pub fn validate_voice(voice: &str, offered: &[String]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Listen (mesa task 955)
+// ---------------------------------------------------------------------------
+
+/// The config key holding the model `live transcribe` runs the external
+/// `auris` speech-to-text binary with.
+pub const MODEL: &str = "model";
+
+/// Every key the `listen` section understands, for the unknown-key error.
+const LISTEN_KEYS: &[&str] = &[MODEL];
+
+/// The `listen` map, deserialized on its own for the reason every other
+/// section is — the [`SpeechSection`] mirror, on the input side.
+#[derive(Debug, Default, Deserialize)]
+struct ListenConfig {
+    #[serde(default)]
+    listen: ListenSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListenSection {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn read_listen(path: &Path) -> Result<ListenSection, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ListenSection::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: ListenConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.listen)
+}
+
+/// The configured model, or `None` for "the recognizer's own default".
+///
+/// Read **on every request**, like [`speech_voice`] is read on every press,
+/// so a change reaches the next transcription with no restart. Absent, blank
+/// and a value the shape rule rejects all mean `None`: a hand-edited
+/// nonsense model falls back to the default rather than reaching the
+/// binary's argv. A file that exists but can't be read or parsed is `Err`,
+/// never a silent fall back.
+pub fn listen_model() -> Result<Option<String>, String> {
+    listen_model_in(&config_file())
+}
+
+fn listen_model_in(path: &Path) -> Result<Option<String>, String> {
+    Ok(read_listen(path)?
+        .model
+        .map(|v| v.trim().to_string())
+        .filter(|v| listen::is_model_name(v)))
+}
+
+/// The listen settings for the Settings page (`GET /api/config/listen`): the
+/// configured model (`null` when the file says nothing) plus the models the
+/// installed recognizer offers, so the editor can be a list rather than a
+/// magic string. An empty `models` is "mesa could not ask the binary" — the
+/// editor still has to accept a typed name then.
+pub fn listen() -> Result<ConfigListen, String> {
+    listen_in(&config_file())
+}
+
+fn listen_in(path: &Path) -> Result<ConfigListen, String> {
+    Ok(ConfigListen {
+        // The **raw** stored value, not the filtered one [`listen_model_in`]
+        // hands the recognizer: a hand-edited nonsense model must reach the
+        // editor that can fix it, exactly as [`speech_in`] does for a voice.
+        model: read_listen(path)?
+            .model
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        models: listen::models().to_vec(),
+    })
+}
+
+/// Writes the `listen` entries named in `updates` into the config file.
+///
+/// - `None` **removes** the key, restoring the recognizer's own default —
+///   the same meaning blank has for a command and `null` for a watcher
+///   limit.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_speech`] and the other savers: one read-modify-write
+///   over the whole document, so every section (and any mesa doesn't know)
+///   survives every other's edits.
+pub fn save_listen(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    save_listen_in(&config_file(), updates, listen::models())
+}
+
+/// `offered` is the list membership is checked against — a parameter rather
+/// than a [`listen::models`] call, so a test names the list it is asserting
+/// about instead of inheriting whatever recognizer the machine has
+/// installed.
+fn save_listen_in(
+    path: &Path,
+    updates: &HashMap<String, Option<String>>,
+    offered: &[String],
+) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        // Nothing named, nothing to do — and no empty `"listen": {}` written
+        // into a file the user never configured.
+        return Ok(());
+    }
+    let mut keys: Vec<&String> = updates.keys().collect();
+    keys.sort();
+    for key in &keys {
+        if !LISTEN_KEYS.contains(&key.as_str()) {
+            return Err(SaveError::Validation(format!(
+                "unknown listen setting {key:?}; mesa configures {}",
+                LISTEN_KEYS.join(", ")
+            )));
+        }
+        // Blank is the reset, not a value to check — same rule as a command box.
+        if let Some(value) = updates[*key].as_deref().map(str::trim)
+            && !value.is_empty()
+        {
+            validate_model(value, offered).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("listen")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"listen\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for key in keys {
+        match updates[key].as_deref().map(str::trim) {
+            // Blank is the same reset as `null`, exactly as it is for a command
+            // template — the editor clears a box, it does not send a sentinel.
+            None | Some("") => {
+                section.remove(key);
+            }
+            Some(value) => {
+                section.insert(key.clone(), serde_json::Value::String(value.to_string()));
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// A model has to be a name the recognizer could accept: a bounded
+/// identifier ([`listen::is_model_name`] — so it can never be read as an
+/// option), and, when mesa managed to ask the binary what it `offers`, one
+/// of those.
+///
+/// The membership half is skipped when `offered` is empty, which is what a
+/// missing or uncooperative binary looks like: mesa cannot prove the name is
+/// wrong there, and refusing a value it merely can't check would be the
+/// worse answer (the same call [`validate_voice`] makes).
+pub fn validate_model(model: &str, offered: &[String]) -> Result<(), String> {
+    if !listen::is_model_name(model) {
+        return Err(format!(
+            "the model {model:?} is not a model name: up to 64 letters, digits, \
+             underscores, dashes and dots, starting with a letter or digit"
+        ));
+    }
+    if !offered.is_empty() && !offered.iter().any(|m| m == model) {
+        return Err(format!(
+            "unknown model {model:?}; {} offers {}",
+            listen::auris_bin(),
+            offered.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Live (mesa task 867)
 // ---------------------------------------------------------------------------
 
@@ -2425,6 +2624,7 @@ mod tests {
                  "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}},
                  "watchers": {"todo-concurrency": 4},
                  "speech": {"voice": "bm_george"},
+                 "listen": {"model": "parakeet-tdt-0.6b-v2-int8"},
                  "future": {"x": 1}
                }"#,
         );
@@ -2437,6 +2637,10 @@ mod tests {
             );
             assert_eq!(root["pricing"]["claude-opus"]["output"], 2.0, "{label}");
             assert_eq!(root["speech"][VOICE], "bm_george", "{label}");
+            assert_eq!(
+                root["listen"][MODEL], "parakeet-tdt-0.6b-v2-int8",
+                "{label}"
+            );
             assert_eq!(root["future"]["x"], 1, "{label}");
             root
         };
@@ -2471,6 +2675,16 @@ mod tests {
         let root = survives("live");
         assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
         assert_eq!(root["live"][LIVE_AUTO_SEND_MS], 3000);
+        // And the listen saver is the sixth (mesa task 955).
+        save_listen_in(
+            &path,
+            &model_update(&[(MODEL, Some("parakeet-tdt-0.6b-v2-int8"))]),
+            &offered_models(),
+        )
+        .unwrap();
+        let root = survives("listen");
+        assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
+        assert_eq!(root["listen"][MODEL], "parakeet-tdt-0.6b-v2-int8");
     }
 
     #[test]
@@ -2652,6 +2866,157 @@ mod tests {
         assert!(speech_in(&path).is_err());
         let err =
             save_speech_in(&path, &voice(&[(VOICE, Some("af_heart"))]), &offered()).unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    fn model_update(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    /// The models a save is checked against. A fixture, never
+    /// `listen::models()`: what a real recognizer on this machine happens to
+    /// offer is not something a config unit test may depend on.
+    fn offered_models() -> Vec<String> {
+        vec!["parakeet-tdt-0.6b-v2-int8".to_string()]
+    }
+
+    #[test]
+    fn listen_round_trips_a_model_and_resets_to_the_binary_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // No file at all: no model, so no `-m` — the pre-955 argv.
+        assert_eq!(listen_model_in(&path).unwrap(), None);
+
+        save_listen_in(
+            &path,
+            &model_update(&[(MODEL, Some("  parakeet-tdt-0.6b-v2-int8  "))]),
+            &offered_models(),
+        )
+        .unwrap();
+        // Stored trimmed, and visible to the read path immediately.
+        assert_eq!(
+            listen_model_in(&path).unwrap().as_deref(),
+            Some("parakeet-tdt-0.6b-v2-int8")
+        );
+        let view = listen_in(&path).unwrap();
+        assert_eq!(view.model.as_deref(), Some("parakeet-tdt-0.6b-v2-int8"));
+
+        // `null` and blank both remove the key — the reset, expressed by
+        // absence rather than by a stored empty string.
+        for reset in [None, Some("")] {
+            save_listen_in(
+                &path,
+                &model_update(&[(MODEL, Some("parakeet-tdt-0.6b-v2-int8"))]),
+                &offered_models(),
+            )
+            .unwrap();
+            save_listen_in(&path, &model_update(&[(MODEL, reset)]), &offered_models()).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(written["listen"].get(MODEL).is_none(), "{reset:?}");
+            assert_eq!(listen_model_in(&path).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn save_listen_rejects_a_name_that_is_not_a_model_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"listen": {"model": "parakeet-tdt-0.6b-v2-int8"}}"#;
+        let path = write_config(dir.path(), before);
+        // A name that could be read as an option, or carry a shell metacharacter
+        // into an argv — refused in the editor, not at the next request.
+        for bad in ["-o", "a b", "a; rm -rf /", &"a".repeat(65)] {
+            let err = save_listen_in(
+                &path,
+                &model_update(&[(MODEL, Some(bad))]),
+                &offered_models(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, SaveError::Validation(m) if m.contains("model")),
+                "{bad:?}: {err:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{bad:?}");
+        }
+        // An unknown key in the section is a validation error too.
+        let err = save_listen_in(
+            &path,
+            &model_update(&[("language", Some("en"))]),
+            &offered_models(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unknown listen setting")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // Nothing named writes nothing — no empty `"listen": {}` appears.
+        let path = dir.path().join("untouched.json");
+        save_listen_in(&path, &HashMap::new(), &offered_models()).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// The membership half of the check: a well-shaped name the binary never
+    /// offered is refused — but only when mesa actually has a list. An empty
+    /// list is "mesa could not ask", where refusing a name it merely can't
+    /// check would be the worse answer.
+    #[test]
+    fn save_listen_refuses_an_unoffered_model_only_when_it_has_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let err = save_listen_in(
+            &path,
+            &model_update(&[(MODEL, Some("zz-nobody"))]),
+            &offered_models(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("zz-nobody")),
+            "{err:?}"
+        );
+        assert!(!path.exists(), "a rejected save writes nothing");
+        // No list: the same name is stored, because nothing here can disprove it.
+        save_listen_in(&path, &model_update(&[(MODEL, Some("zz-nobody"))]), &[]).unwrap();
+        assert_eq!(
+            listen_model_in(&path).unwrap().as_deref(),
+            Some("zz-nobody")
+        );
+    }
+
+    /// A model hand-edited into something the argv must never carry falls back
+    /// to the binary's default on the transcribe path, while the editor still
+    /// sees the raw value — the same split the watcher clamp draws.
+    #[test]
+    fn a_hand_edited_model_that_is_not_a_name_is_ignored_but_still_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"listen": {"model": "--output /tmp/x"}}"#);
+        assert_eq!(listen_model_in(&path).unwrap(), None);
+        assert_eq!(
+            listen_in(&path).unwrap().model.as_deref(),
+            Some("--output /tmp/x")
+        );
+    }
+
+    #[test]
+    fn listen_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        let err = listen_model_in(&path).unwrap_err();
+        assert!(err.contains("malformed mesa config"), "{err}");
+        assert!(listen_in(&path).is_err());
+        let err = save_listen_in(
+            &path,
+            &model_update(&[(MODEL, Some("parakeet-tdt-0.6b-v2-int8"))]),
+            &offered_models(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
             "{err:?}"

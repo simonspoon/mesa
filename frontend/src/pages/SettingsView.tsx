@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
   getConfig,
+  getListen,
   getLiveConfig,
   getPricing,
   getSpeech,
@@ -10,6 +11,7 @@ import {
   restartServer,
   speechPreviewUrl,
   updateConfig,
+  updateListen,
   updateLiveConfig,
   updatePricing,
   updateSpeech,
@@ -55,6 +57,16 @@ import {
   valueError as voiceError,
   type SpeechDraft,
 } from '../speechDraft'
+import {
+  canPick as canPickModel,
+  changedListen,
+  draftFrom as listenDraftFrom,
+  isDirty as isListenDirty,
+  isSavable as isListenSavable,
+  options as modelOptions,
+  valueError as modelError,
+  type ListenDraft,
+} from '../listenDraft'
 import {
   changedLive,
   draftFrom as liveDraftFrom,
@@ -284,6 +296,7 @@ export function SettingsView() {
       <WatchersSection />
       <LivePromptSection />
       <SpeechSection />
+      <ListenSection />
       <PricingSection />
     </div>
   )
@@ -740,6 +753,150 @@ function SpeechSection() {
           onClick={save}
         >
           {saving ? 'saving…' : 'save speech'}
+        </button>
+        {dirty && savable && !saving && (
+          <span className="muted">unsaved changes</span>
+        )}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {saveError && <p className="error">{saveError}</p>}
+    </>
+  )
+}
+
+/**
+ * Listen: the model `live transcribe` runs the external `auris` speech-to-text
+ * binary with (mesa task 955). Its own section, draft and save button, for
+ * the same reason speech has one — a separate endpoint, so one form's
+ * rejection must not strand the other's edits.
+ *
+ * The input-side mirror of `SpeechSection`, minus a test button: `auris` has
+ * nothing like speaking a sample.
+ *
+ * Two things it must not soften:
+ * - **Blank is the binary's own default**, not silence: mesa passes no `-m`
+ *   at all then, which is exactly what it did before this setting existed.
+ * - **The list is what the installed binary reports**, not a list mesa
+ *   ships. When mesa could not ask it (no `auris` on PATH) there is no list
+ *   to pick from, so the box becomes a plain one rather than an empty
+ *   dropdown that would look like "no models exist".
+ */
+function ListenSection() {
+  const { data: listen, error, refetch } = useFetch(() => getListen(), 'listen')
+  const [draft, setDraft] = useState<ListenDraft | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const seeded: ListenDraft =
+    draft ?? (listen ? listenDraftFrom(listen) : { model: '' })
+
+  function edit(value: string) {
+    setDraft({ model: value })
+    setSaved(false)
+  }
+
+  function save() {
+    if (!listen) return
+    setSaving(true)
+    setSaveError(null)
+    updateListen(changedListen(listen, seeded)).then(
+      (fresh) => {
+        // Re-seed from what the server read back, so the box shows what landed.
+        setDraft(listenDraftFrom(fresh))
+        setSaving(false)
+        setSaved(true)
+        refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Listen</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!listen) {
+    return (
+      <>
+        <h2>Listen</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isListenDirty(listen, seeded)
+  const savable = isListenSavable(seeded)
+  const fieldError = modelError(seeded.model)
+
+  return (
+    <>
+      <h2>Listen</h2>
+      <section className="settings-command">
+        <label htmlFor="listen-model">
+          <span className="settings-command-title">
+            Live transcription model
+          </span>
+          <code className="settings-command-key">model</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          The model <code>auris</code> decodes a live-conversation recording
+          with. Blank = the model auris picks itself; a change applies on the
+          next transcription, with no restart.
+        </p>
+        <div className="settings-voice-row">
+          {canPickModel(listen) ? (
+            <select
+              id="listen-model"
+              className="settings-voice-input"
+              value={seeded.model}
+              onChange={(e) => edit(e.target.value)}
+            >
+              {/* Not a count: `options()` may carry a configured model the
+                  binary no longer lists, so any number here would be wrong in
+                  exactly the case that matters. */}
+              <option value="">default (the binary's own)</option>
+              {modelOptions(listen).map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              id="listen-model"
+              type="text"
+              className="settings-voice-input"
+              spellCheck={false}
+              value={seeded.model}
+              placeholder="parakeet-tdt-0.6b-v2-int8"
+              onChange={(e) => edit(e.target.value)}
+            />
+          )}
+        </div>
+        {!canPickModel(listen) && (
+          <p className="muted settings-command-blurb">
+            mesa could not ask <code>auris</code> which models it has — type a
+            name, or run <code>auris --list-models</code> to see them.
+          </p>
+        )}
+        {fieldError && <p className="error">{fieldError}</p>}
+      </section>
+
+      <div className="settings-actions">
+        <button
+          type="button"
+          disabled={!dirty || !savable || saving}
+          onClick={save}
+        >
+          {saving ? 'saving…' : 'save listen'}
         </button>
         {dirty && savable && !saving && (
           <span className="muted">unsaved changes</span>

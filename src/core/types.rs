@@ -276,6 +276,24 @@ pub struct ConfigSpeech {
     pub voices: Vec<String>,
 }
 
+/// The listen settings as the Settings page sees them (`core::config`,
+/// `docs/config.md`, mesa task 955) — the input-side mirror of
+/// [`ConfigSpeech`]: the model the external `auris` speech-to-text binary is
+/// run with, plus the models the installed binary offers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigListen {
+    /// The configured model `live transcribe` runs `auris` with, or `null`
+    /// when the config says nothing — then no `-m` is passed at all and
+    /// `auris` picks its own default.
+    pub model: Option<String>,
+    /// Every model the installed `auris` reports (`--list-models`), so the
+    /// editor can offer a list. **Empty means mesa could not ask** — a missing
+    /// or uncooperative binary — never "there are no models", so an empty
+    /// list is a reason to accept a typed name, not to refuse one.
+    pub models: Vec<String>,
+}
+
 /// The live-conversation settings as the Settings page sees them
 /// (`core::config`, `docs/config.md`, mesa task 867) — a fifth view of
 /// `~/.mesa/config.json`, with the same null-means-fallback rule as

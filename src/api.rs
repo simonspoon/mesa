@@ -1038,6 +1038,13 @@ fn router(state: AppState) -> Router {
             "/api/config/live",
             get(get_config_live).put(update_config_live),
         )
+        // The same file's `listen` section — the model `live transcribe` runs
+        // the external `auris` binary with (mesa task 955). A sixth route for
+        // the same reason as the other four.
+        .route(
+            "/api/config/listen",
+            get(get_config_listen).put(update_config_listen),
+        )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -2855,22 +2862,29 @@ async fn transcribe_live(
         });
     }
     // Off the async executor for the same reason every other blocking read in
-    // this file is: `listen::transcribe` blocks on a subprocess. Same double
-    // `map_err` shape as `speak_live_turn`'s `speech::start` call — the outer
-    // one is the `JoinError` (the blocking task itself panicked), the inner
-    // one is `listen::transcribe`'s own `Result<_, String>`.
-    let text = tokio::task::spawn_blocking(move || listen::transcribe(&bytes))
-        .await
-        .map_err(|e| ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "unavailable",
-            message: format!("transcription failed: {e}"),
-        })?
-        .map_err(|e| ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "unavailable",
-            message: e,
-        })?;
+    // this file is: `listen::transcribe` blocks on a subprocess. Read the
+    // configured model on the same blocking call, on every request — the
+    // `speech_voice()` rule `speak_live_turn` already applies — so a config
+    // read that fails maps to the same `unavailable` shape a bad file gives
+    // the speak path, rather than a distinct error. Same double `map_err`
+    // shape as `speak_live_turn`'s `speech::start` call — the outer one is
+    // the `JoinError` (the blocking task itself panicked), the inner one is
+    // this closure's own `Result<_, String>`.
+    let text = tokio::task::spawn_blocking(move || {
+        let model = config::listen_model()?;
+        listen::transcribe(&bytes, model.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "unavailable",
+        message: format!("transcription failed: {e}"),
+    })?
+    .map_err(|e| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "unavailable",
+        message: e,
+    })?;
     Ok(Json(LiveTranscript { text }).into_response())
 }
 
@@ -5468,6 +5482,83 @@ async fn update_config_live(
             },
         })?;
     get_config_live(State(state), ConnectInfo(addr), headers).await
+}
+
+/// `GET /api/config/listen` — the model `live transcribe` runs the external
+/// `auris` binary with, plus the models the installed binary offers
+/// (`docs/config.md`, mesa task 955). The input-side mirror of
+/// `get_config_speech`.
+///
+/// Gated like `get_config_speech` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`. A **missing recognizer is
+/// not** an error here: it makes `models` empty, because this route is about
+/// the config file, and refusing to show the setting when the binary is absent
+/// would hide the one control that survives installing it.
+async fn get_config_listen(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    // On the first call of the process this asks the recognizer for its model
+    // list — a subprocess, so it goes off the async workers like every other
+    // shell-out in this file. Later calls are the cached list plus a file read.
+    match blocking(config::listen).await? {
+        Ok(listen) => Ok(Json(listen).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListenUpdate {
+    /// Absent leaves the model alone; `null` (or blank) removes it, restoring
+    /// the recognizer's own default.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    model: Option<Option<String>>,
+}
+
+/// `PUT /api/config/listen` — writes the model and echoes the settings.
+///
+/// **Loopback-only in both modes**, like every other config write: it is the
+/// same file mesa's own argv comes out of, and the section a write lands in is
+/// not the distinction that matters.
+async fn update_config_listen(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ListenUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    let mut updates = HashMap::new();
+    if let Some(value) = body.model {
+        updates.insert(config::MODEL.to_string(), value);
+    }
+    // Validating a model consults the same (possibly uncached) model list the
+    // getter does, so the save is a blocking call too.
+    blocking(move || config::save_listen(&updates))
+        .await?
+        .map_err(|e| match e {
+            config::SaveError::Validation(message) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message,
+            },
+            config::SaveError::Unavailable(message) => ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "unavailable",
+                message,
+            },
+        })?;
+    get_config_listen(State(state), ConnectInfo(addr), headers).await
 }
 
 #[derive(Deserialize)]

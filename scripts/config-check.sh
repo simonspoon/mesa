@@ -2,7 +2,11 @@
 # Config gate: proves the three spawn commands in ~/.mesa/config.json actually
 # replace the built-in `claude --bg …` argv — for the todo-watcher, the
 # inbox-watcher and the Agents surface's spawn route — and that a missing or
-# broken config behaves the way docs/config.md says.
+# broken config behaves the way docs/config.md says. It also covers the
+# pricing, watchers, speech, live and listen sections that share the same
+# file — the last of these (mesa task 955) names the model `live transcribe`
+# runs the external `auris` binary with, the input-side mirror of `speech`'s
+# `kokoro-rs` voice.
 #
 # The config file is read at its REAL default location, so HOME is pointed at
 # a throwaway dir (MESA_CONFIG_FILE, the unit tests' seam, would sidestep the
@@ -100,6 +104,30 @@ printf '\x01\x02\x03\x04\x05\x06\x07\x08'
 EOF
 chmod +x "$STUB_DIR/mytool" "$STUB_DIR/mytool-receipt" "$STUB_DIR/claude" "$STUB_DIR/kokoro-rs"
 export MESA_KOKORO_BIN="$STUB_DIR/kokoro-rs"
+
+# The recognizer behind the `listen` section (mesa task 955), the input-side
+# mirror of kokoro-rs above. `--list-models` (matched anywhere in argv, like
+# `--list-voices` above — mesa passes `--no-download` beside it) answers with
+# a bounded list plus a line that is not a name, which must be filtered out;
+# the one real name includes a DOT ("parakeet-tdt-0.6b-v2-int8", auris's own
+# model), the specific regression this task's notes call out since
+# `is_voice_name`'s rule would have filtered it. Every other invocation logs
+# its argv (does the saved model reach `-m`?), drains stdin and emits a valid
+# `--format json` transcript line so `POST /api/live/transcribe` answers 200.
+AURIS_ARGV="$TMP/auris.argv"
+cat > "$STUB_DIR/auris" <<EOF
+#!/usr/bin/env bash
+case " \$* " in *" --list-models "*) LISTING=1;; *) LISTING=0;; esac
+if [ "\$LISTING" = "1" ]; then
+  printf 'parakeet-tdt-0.6b-v2-int8\nnot a model name!\n'
+  exit 0
+fi
+printf '%s\n' "\$*" > "$AURIS_ARGV"
+cat > /dev/null
+printf '{"type":"transcript","text":"heard it"}\n'
+EOF
+chmod +x "$STUB_DIR/auris"
+export MESA_AURIS_BIN="$STUB_DIR/auris"
 
 # ---- fixtures ----
 
@@ -857,6 +885,155 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused live PUT must not touch the file"
 ok "both live verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
+# ---- the listen section: GET/PUT /api/config/listen (mesa task 955) ----
+#
+# The sixth section of the same file, and the input-side mirror of speech:
+# the model `live transcribe` runs the external `auris` binary with. Same
+# sibling-section rules as every other section, plus the thing only speech
+# has an analogue of — the saved value reaching another program's argv (this
+# time auris's rather than kokoro-rs's), and NOT showing up at all when
+# nothing is saved.
+
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}, "pricing": {"claude-opus": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}}, "watchers": {"todo-concurrency": 3}, "speech": {"voice": "bm_george"}, "live": {"auto-send-ms": 4500}}
+EOF
+api GET /api/config/listen
+[ "$CODE" = "200" ] || fail "GET listen: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.model' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured model must report null, got $STDOUT"
+# mesa ships no model list of its own: the choices are whatever the installed
+# binary answers --list-models with, minus the lines that aren't names — and
+# the one name with a DOT ("parakeet-tdt-0.6b-v2-int8", auris's real model)
+# must survive the filter (is_model_name allows `.` where is_voice_name does
+# not — the specific regression mesa task 955's notes call out).
+[ "$(jq -r '.models | join(",")' <<<"$STDOUT")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "GET listen: models must be the binary's --list-models output, names only: $STDOUT"
+ok "GET /api/config/listen reports model: null on a fresh config and offers exactly the model names the installed recognizer lists, dots included"
+
+api PUT /api/config/listen '{"model": "parakeet-tdt-0.6b-v2-int8"}'
+[ "$CODE" = "200" ] || fail "PUT listen: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.model' <<<"$STDOUT")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "PUT must echo the stored model: $STDOUT"
+[ "$(jq -r '.listen.model' < "$CONFIG")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "PUT listen did not write the model: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "a listen write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq '.pricing["claude-opus"].output == 2' < "$CONFIG")" = "true" ] ||
+  fail "a listen write clobbered the pricing section: $(cat "$CONFIG")"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "a listen write clobbered the watchers section: $(cat "$CONFIG")"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "bm_george" ] ||
+  fail "a listen write clobbered the speech section: $(cat "$CONFIG")"
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "4500" ] ||
+  fail "a listen write clobbered the live section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "a listen write dropped a section it doesn't own: $(cat "$CONFIG")"
+ok "PUT /api/config/listen sets the model, leaving commands, pricing, watchers, speech, live and an unknown section untouched"
+
+# The whole point of the setting: the saved name reaches the recognizer, as
+# `-m <model>`, read fresh on the request with no restart — and with nothing
+# saved the argv is byte-for-byte the one mesa ran before this setting
+# existed, no `-m` at all.
+rm -f "$AURIS_ARGV"
+api POST /api/live/transcribe '{"audio_base64": "AAAA"}'
+[ "$CODE" = "200" ] || fail "transcribe with a configured model: expected 200, got $CODE: $STDOUT"
+[ "$(cat "$AURIS_ARGV")" = "-q --format json -m parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "the saved model must reach auris's argv, got $(cat "$AURIS_ARGV")"
+ok "the saved model reaches auris as \`-m <model>\`, read on the request (no restart)"
+
+api PUT /api/config/listen '{"model": null}'
+[ "$CODE" = "200" ] || fail "PUT listen null (for the argv check): expected 200, got $CODE: $STDOUT"
+rm -f "$AURIS_ARGV"
+api POST /api/live/transcribe '{"audio_base64": "AAAA"}'
+[ "$CODE" = "200" ] || fail "transcribe with no model: expected 200, got $CODE: $STDOUT"
+[ "$(cat "$AURIS_ARGV")" = "-q --format json" ] ||
+  fail "with no model configured argv must be exactly -q --format json (no -m), got $(cat "$AURIS_ARGV")"
+ok "with no model configured, /api/live/transcribe runs auris with exactly -q --format json — no -m at all, byte-identical to the pre-955 argv"
+
+# The other five savers have to leave the model alone, exactly as it leaves
+# them alone.
+api PUT /api/config/listen '{"model": "parakeet-tdt-0.6b-v2-int8"}'
+[ "$CODE" = "200" ] || fail "PUT listen (restoring before cross-section checks): expected 200, got $CODE: $STDOUT"
+api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
+[ "$CODE" = "200" ] || fail "PUT commands after listen: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.listen.model' < "$CONFIG")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "a commands write clobbered the listen section: $(cat "$CONFIG")"
+api PUT /api/config/speech '{"voice": "af_bella"}'
+[ "$CODE" = "200" ] || fail "PUT speech after listen: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.listen.model' < "$CONFIG")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "a speech write clobbered the listen section: $(cat "$CONFIG")"
+api PUT /api/config/watchers '{"todo_concurrency": 2}'
+[ "$CODE" = "200" ] || fail "PUT watchers after listen: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.listen.model' < "$CONFIG")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "a watchers write clobbered the listen section: $(cat "$CONFIG")"
+api PUT /api/config/live '{"auto_send_ms": 2500}'
+[ "$CODE" = "200" ] || fail "PUT live after listen: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.listen.model' < "$CONFIG")" = "parakeet-tdt-0.6b-v2-int8" ] ||
+  fail "a live write clobbered the listen section: $(cat "$CONFIG")"
+ok "saving commands, speech, watchers or live preserves the listen section, exactly as listen preserves them"
+
+# Both spellings of "no model" remove the key.
+for RESET in 'null' '""'; do
+  api PUT /api/config/listen '{"model": "parakeet-tdt-0.6b-v2-int8"}'
+  [ "$CODE" = "200" ] || fail "PUT listen before reset $RESET: got $CODE: $STDOUT"
+  api PUT /api/config/listen "{\"model\": $RESET}"
+  [ "$CODE" = "200" ] || fail "PUT listen $RESET: expected 200, got $CODE: $STDOUT"
+  [ "$(jq -r '.model' <<<"$STDOUT")" = "null" ] ||
+    fail "PUT listen $RESET must report no model, got $STDOUT"
+  [ "$(jq -r '.listen | has("model")' < "$CONFIG")" = "false" ] ||
+    fail "PUT listen $RESET must remove the key, never store it: $(cat "$CONFIG")"
+done
+ok "PUT model null and model \"\" both remove the key (absence, never an empty string in the file)"
+
+BEFORE=$(cat "$CONFIG")
+# A model is a bounded identifier, so a value that could be read as an
+# option, split into two arguments, carry a path separator, or overrun the
+# length bound is refused at save time — the store-what-you-would-refuse-to-run
+# rule every other bounded identifier in this file already keeps.
+for BAD in '-o' '.leadingdot' 'a b' 'a/b' "$(head -c 65 </dev/zero | tr '\0' 'a')"; do
+  api PUT /api/config/listen "$(jq -n --arg v "$BAD" '{model: $v}')"
+  [ "$CODE" = "422" ] || fail "model $BAD: expected 422, got $CODE: $STDOUT"
+  [ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+    fail "model $BAD: expected code validation, got $STDOUT"
+done
+# A well-shaped name the installed binary never offered is refused too, by the
+# same list the editor is built from.
+api PUT /api/config/listen '{"model": "zz-nobody"}'
+[ "$CODE" = "422" ] || fail "unknown model: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "unknown model: expected code validation, got $STDOUT"
+grep -q "zz-nobody" <<<"$STDOUT" || fail "the message must name the model: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected listen PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT /api/config/listen rejects a model that isn't a bounded identifier and one the binary doesn't offer as 422 validation, writing nothing"
+
+# `model` is the only field `ListenUpdate` declares — like `SpeechUpdate`, and
+# unlike `commands`'s `HashMap<String, String>`, so an unrecognised JSON key
+# never reaches `save_listen`'s own unknown-key check at all: it is dropped by
+# the deserializer first, exactly the "stale prompt field" case already
+# proven for `live`, and exercised directly (not through this route) by
+# `save_listen_rejects_a_name_that_is_not_a_model_without_writing` in
+# src/core/config.rs.
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config/listen '{"language": "en"}'
+[ "$CODE" = "200" ] || fail "PUT listen with an unrecognised field: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r 'has("language")' <<<"$STDOUT")" = "false" ] ||
+  fail "the response must not echo an unrecognised field: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "an unrecognised field must write nothing: $(cat "$CONFIG")"
+ok "PUT /api/config/listen ignores a field it does not declare (e.g. language) rather than erroring — the same posture live already takes toward a stale prompt field"
+
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/listen")
+[ "$CODE" = "403" ] || fail "GET listen with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
+  -H 'Content-Type: application/json' \
+  --data '{"model": "parakeet-tdt-0.6b-v2-int8"}' \
+  "http://127.0.0.1:$PORT/api/config/listen")
+[ "$CODE" = "403" ] || fail "PUT listen with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused listen PUT must not touch the file"
+ok "both listen verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"
@@ -880,9 +1057,13 @@ api GET /api/config/live
 [ "$CODE" = "502" ] || fail "malformed config live GET: expected 502, got $CODE: $STDOUT"
 api PUT /api/config/live '{"auto_send_ms": 4500}'
 [ "$CODE" = "502" ] || fail "malformed config live PUT: expected 502, got $CODE: $STDOUT"
+api GET /api/config/listen
+[ "$CODE" = "502" ] || fail "malformed config listen GET: expected 502, got $CODE: $STDOUT"
+api PUT /api/config/listen '{"model": "parakeet-tdt-0.6b-v2-int8"}'
+[ "$CODE" = "502" ] || fail "malformed config listen PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
-ok "a malformed config is 502 unavailable on all ten config verbs, and a PUT never overwrites a file it could not read"
+ok "a malformed config is 502 unavailable on all twelve config verbs, and a PUT never overwrites a file it could not read"
 
 # The preview is the one speech surface a malformed file cannot break, because
 # it reads no config at all — which is what makes it usable on the page whose

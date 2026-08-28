@@ -595,6 +595,68 @@ conversation starting).
   `voice` here always was, not a special case. Gated with
   `require_local_path_write`: **loopback-only in both serve modes**.
 
+## Listen
+
+A sixth, independent section names the **model** `live transcribe` runs the
+external `auris` speech-to-text binary with (mesa task 955) — the input-side
+mirror of Speech, above.
+
+```json
+{
+  "listen": {
+    "model": "parakeet-tdt-0.6b-v2-int8"
+  }
+}
+```
+
+- **Absent or blank ⇒ no `-m` at all.** mesa names no default model of its
+  own: with nothing configured the argv is byte-for-byte the one it ran
+  before this key existed, and which model that means is `auris`'s business.
+  There is deliberately **no `language` key** — `auris` has no `--language`
+  flag, so one would drive no argv — and vocabulary is **not** a config key
+  either: it is derived per request, not stored here.
+- **The list of models comes from the binary**, not from mesa:
+  `auris --no-download --list-models`, filtered to bounded identifiers and
+  cached for the life of the process (`core::listen::models`). An **empty
+  list means mesa could not ask** — no binary, or an answer that wasn't a
+  list of names — never "there are no models", so the editor falls back to a
+  plain text box and the save-time membership check is skipped. The cache is
+  per process, so installing `auris` (or a model that adds one) while `mesa
+  serve` is already running needs a **Restart server** before the picker sees
+  it. `--list-models` runs with `--no-download`: listing names must never
+  turn into a model fetch.
+- **A model is a bounded identifier** (`core::listen::is_model_name`: up to
+  64 ASCII letters/digits/`_`/`-`/`.`, starting with a letter or digit — the
+  one deliberate difference from a voice's shape rule, since `auris`'s only
+  model today, `parakeet-tdt-0.6b-v2-int8`, contains a `.`) — passed as two
+  `Command::arg`s after `-m`, so a value can never be read as an option or
+  reach a shell. The save path refuses anything else (`422`), and the *read*
+  path drops it: a hand-edited `"--output /tmp/x"` transcribes with the
+  default model rather than reaching the argv. A config file that cannot be
+  *read* is not a fallback at all — `live transcribe` answers **503
+  `unavailable`**, the same answer the editor gets, rather than guessing at a
+  setting it couldn't read. The Settings page still shows the raw stored
+  value, the same split the watcher clamp draws.
+- **Read on every request**, like `commands` on every spawn: change the model
+  and the next transcription uses it, no restart. A malformed config file is
+  `unavailable` on the transcribe route too (503) rather than a guessed
+  default.
+
+### Routes
+
+- `GET /api/config/listen` → `ConfigListen`: `{model, models}`, `model` being
+  the override (`null` when unset) and `models` what the installed binary
+  offers (`[]` when mesa couldn't ask — **not** an error, since the setting
+  must stay visible on a machine where `auris` isn't installed yet). Gated
+  like the other config getters (`require_agent_access`); a malformed config
+  is **502 `unavailable`**.
+- `PUT /api/config/listen`, body `{"model": "<name>" | null}` → echoes the
+  getter. `null` **and** blank both remove the key, restoring the binary's own
+  model. A name that isn't a model — or, when mesa has a list, isn't on it —
+  is **422 `validation`**, writing nothing. Gated with
+  `require_local_path_write`: **loopback-only in both serve modes**, the same
+  posture as every other config write.
+
 ## Gate
 
 `scripts/config-check.sh` — all three commands driven by a configured template

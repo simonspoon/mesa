@@ -55,6 +55,15 @@ trap 'rm -rf "$TMP";
       [ -n "${LAN_PID:-}" ] && kill "$LAN_PID" 2>/dev/null; true' EXIT
 export MESA_DB="$TMP/mesa.db"
 
+# Config is read at its REAL default location under $HOME (mesa task 955 gave
+# it a `listen.model`), so a developer with a model saved in their own
+# ~/.mesa/config.json would otherwise make the argv-equals-"-q --format json"
+# assertions below fail spuriously. Point HOME at a throwaway dir under $TMP —
+# `pwd -P` for the same reason config-check.sh resolves it that way: macOS's
+# /tmp is a symlink, and a stub's logged cwd/paths must match what mesa
+# resolves.
+export HOME=$(mkdir -p "$TMP/home" && cd "$TMP/home" && pwd -P)
+
 CHECKS=0
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { CHECKS=$((CHECKS + 1)); echo "ok: $*"; }

@@ -16,6 +16,7 @@ import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
 import type { ConfigPrice } from './types/ConfigPrice'
 import type { ConfigSpeech } from './types/ConfigSpeech'
+import type { ConfigListen } from './types/ConfigListen'
 import type { ConfigLive } from './types/ConfigLive'
 import type { ConfigWatchers } from './types/ConfigWatchers'
 import type { Diagram } from './types/Diagram'
@@ -1192,6 +1193,30 @@ export function updateSpeech(
   speech: Record<string, string | null>,
 ): Promise<ConfigSpeech> {
   return request('/api/config/speech', jsonInit('PUT', speech))
+}
+
+/**
+ * The listen settings in `~/.mesa/config.json`: the model `live transcribe`
+ * runs the external `auris` speech-to-text binary with (mesa task 955), plus
+ * every model the installed `auris` reports. `model: null` means the config
+ * says nothing, so `auris` picks its own default; an empty `models` means
+ * mesa could not ask the binary, not that there are none. 502 `unavailable`
+ * means the config file itself is unreadable, exactly as for `getConfig`.
+ */
+export function getListen(): Promise<ConfigListen> {
+  return request('/api/config/listen')
+}
+
+/**
+ * Writes listen settings and echoes them as re-read from disk. Only the keys
+ * passed are touched; `null` removes one, restoring `auris`'s own default.
+ * 422 `validation` is a name that isn't a model (or isn't one this binary
+ * offers), and nothing is written in that case.
+ */
+export function updateListen(
+  listen: Record<string, string | null>,
+): Promise<ConfigListen> {
+  return request('/api/config/listen', jsonInit('PUT', listen))
 }
 
 /**

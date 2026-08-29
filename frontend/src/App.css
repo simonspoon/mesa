@@ -8508,174 +8508,65 @@ button:focus-visible,
   display: block;
 }
 
-/* The conversation indicator (mesa task 874): five bars in the middle of the
-   header band, in one state at a time — mesa speaking, the person being heard,
-   the agent at work on what was said (task 894), a paused page, or the
-   microphone simply open. With the panel closed this is the only sign of
-   either side talking, so which state it is has to read at a glance: colour
-   carries who (cyan is mesa, green is the person, violet is the agent working,
-   muted is nobody yet) and the motion carries how much is happening. Absolute
-   against the header, so it takes no room from the flex row. */
-.live-talk {
+/* The conversation indicator (mesa task 874, redrawn as an aperture by mesa
+   task 973): one small canvas in the middle of the header band, in one state
+   at a time — mesa speaking, the person being heard, the agent at work on
+   what was said (task 894), a paused page, or the microphone simply open.
+   With the panel closed this is the only sign of either side talking, so
+   which state it is has to read at a glance: colour carries who (cyan is
+   mesa, green is the person, violet is the agent working, muted is nobody
+   yet) and the drawing itself — rings, an orbit, a breathing dot, a single
+   still arc — carries how much is happening and in which direction
+   (`liveBand.ts` has the full reasoning for each shape). Absolute against
+   the header, so it takes no room from the flex row, and the canvas paints
+   itself; nothing here animates. */
+.live-band {
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
-  display: flex;
-  align-items: center;
-  gap: 3px;
+  width: 18px;
   height: 18px;
   pointer-events: none;
 }
 
-.live-talk span {
-  width: 3px;
-  height: 100%;
-  /* Coloured off the container so each state sets one property, not five. */
-  background: currentColor;
-  border-radius: 2px;
-  transform-origin: center;
-}
-
-/* mesa speaking: the loudest of the three, and deliberately not one wave —
-   every bar runs its own keyframes at its own duration, so the five never fall
-   back into the lockstep ripple a single shared animation gives. Durations are
-   mutually awkward (0.53s … 0.71s) so the pattern takes minutes to repeat,
-   which is what reads as a voice rather than as a loading spinner. */
-.live-talk-speaking {
+/* mesa speaking: cyan with a glow, the loudest of the five and the only one
+   that gets one — the same drop-shadow the old bars carried, so the change
+   from bars to an aperture did not also quietly turn the glow off. */
+.live-band-speaking {
   color: var(--cyan);
   filter: drop-shadow(0 0 4px var(--cyan-dim));
 }
 
-.live-talk-speaking span:nth-child(1) { animation: live-talk-short 0.61s ease-in-out infinite; }
-.live-talk-speaking span:nth-child(2) { animation: live-talk-mid 0.53s ease-in-out infinite 0.08s; }
-.live-talk-speaking span:nth-child(3) { animation: live-talk-tall 0.67s ease-in-out infinite 0.04s; }
-.live-talk-speaking span:nth-child(4) { animation: live-talk-mid 0.59s ease-in-out infinite 0.19s; }
-.live-talk-speaking span:nth-child(5) { animation: live-talk-short 0.71s ease-in-out infinite 0.11s; }
-
-/* The person being heard: the same shape in the other colour, as one wave
-   travelling left to right — a reflection of what the microphone is taking in,
-   answered rather than performed, so it stays quieter than mesa's own. */
-.live-talk-hearing {
+/* The person being heard: the same drawing as speaking, mirrored (the rings
+   travel inward instead of out — `drawAperture`'s own doc comment explains
+   the mirroring), in green rather than cyan. */
+.live-band-hearing {
   color: var(--green);
-}
-
-.live-talk-hearing span {
-  animation: live-talk-heard 0.9s ease-in-out infinite;
-}
-
-.live-talk-hearing span:nth-child(1) { animation-delay: 0s; }
-.live-talk-hearing span:nth-child(2) { animation-delay: 0.1s; }
-.live-talk-hearing span:nth-child(3) { animation-delay: 0.2s; }
-.live-talk-hearing span:nth-child(4) { animation-delay: 0.3s; }
-.live-talk-hearing span:nth-child(5) { animation-delay: 0.4s; }
-
-/* The microphone open and the room quiet: low, slow and muted — present enough
-   to say the page is listening, dim enough that nobody reads it as speech. */
-.live-talk-listening {
-  color: var(--muted);
-}
-
-.live-talk-listening span {
-  transform: scaleY(0.22);
-  animation: live-talk-idle 2.4s ease-in-out infinite;
-}
-
-.live-talk-listening span:nth-child(2) { animation-delay: 0.2s; }
-.live-talk-listening span:nth-child(3) { animation-delay: 0.4s; }
-.live-talk-listening span:nth-child(4) { animation-delay: 0.6s; }
-.live-talk-listening span:nth-child(5) { animation-delay: 0.8s; }
-
-/* Paused: the one state that does not move at all. Everything else in this
-   band is something happening — she is talking, the room is being taken in,
-   the microphone is open — and paused is the absence of all three, so the
-   honest drawing of it is bars that sit still. Lower and dimmer than
-   listening, which is the state it is most easily confused with, and the only
-   one it has to be told apart from at a glance. */
-.live-talk-paused {
-  color: var(--muted);
-  opacity: 0.5;
-}
-
-.live-talk-paused span {
-  transform: scaleY(0.15);
-  animation: none;
 }
 
 /* The agent at work (mesa task 894): violet, because violet is what this app
    already means by "an agent" (the sidebar pane header, task 819) — so the
-   colour alone separates her doing something from her saying something (cyan)
-   and from the person being taken in (green). It is the one state neither side
-   is talking in, and it can be lit for minutes on a page somebody is reading,
-   so the motion is the quietest thing here that still moves: one wave, low
-   amplitude, slow, and no glow. Livelier than the open microphone below it,
-   plainly less than either voice above it — the ranking the whole band is
-   read by. */
-.live-talk-working {
+   colour alone separates her doing something from her saying something
+   (cyan) and from the person being taken in (green). */
+.live-band-working {
   color: var(--violet);
 }
 
-.live-talk-working span {
-  transform: scaleY(0.28);
-  animation: live-talk-work 1.8s ease-in-out infinite;
+/* The microphone open and the room quiet: low, slow and muted — present
+   enough to say the page is listening, dim enough that nobody reads it as
+   speech. */
+.live-band-listening {
+  color: var(--muted);
 }
 
-.live-talk-working span:nth-child(2) { animation-delay: 0.16s; }
-.live-talk-working span:nth-child(3) { animation-delay: 0.32s; }
-.live-talk-working span:nth-child(4) { animation-delay: 0.48s; }
-.live-talk-working span:nth-child(5) { animation-delay: 0.64s; }
-
-@keyframes live-talk-tall {
-  0%, 100% { transform: scaleY(0.2); }
-  45% { transform: scaleY(1); }
-  70% { transform: scaleY(0.5); }
-}
-
-@keyframes live-talk-mid {
-  0%, 100% { transform: scaleY(0.45); }
-  30% { transform: scaleY(0.22); }
-  60% { transform: scaleY(0.9); }
-}
-
-@keyframes live-talk-short {
-  0%, 100% { transform: scaleY(0.3); }
-  50% { transform: scaleY(0.72); }
-}
-
-@keyframes live-talk-heard {
-  0%, 100% { transform: scaleY(0.25); opacity: 0.7; }
-  50% { transform: scaleY(0.8); opacity: 1; }
-}
-
-@keyframes live-talk-work {
-  0%, 100% { transform: scaleY(0.28); opacity: 0.55; }
-  50% { transform: scaleY(0.62); opacity: 0.95; }
-}
-
-@keyframes live-talk-idle {
-  0%, 100% { transform: scaleY(0.22); opacity: 0.45; }
-  50% { transform: scaleY(0.34); opacity: 0.85; }
-}
-
-/* Motion-sensitive readers keep the signal, not the dance — the same rule as
-   `.live-dot`'s pulse. Colour still says which of the three it is, and the
-   heights keep the ranking the motion carried: mesa loudest, the person heard
-   below her, the open microphone lowest of all. */
-@media (prefers-reduced-motion: reduce) {
-  .live-talk span {
-    animation: none;
-    opacity: 1;
-  }
-  .live-talk-speaking span { transform: scaleY(0.7); }
-  .live-talk-hearing span { transform: scaleY(0.5); }
-  /* Between the two, which is where it sits in the band's order: work is
-     quieter than either voice and louder than an idle microphone. */
-  .live-talk-working span { transform: scaleY(0.38); }
-  .live-talk-listening span { transform: scaleY(0.25); }
-  /* Lowest of the four, which is the ranking it already has: paused is the
-     one state that was still to begin with, so this block changes nothing
-     about it and says so rather than leaving it to inherit by accident. */
-  .live-talk-paused span { transform: scaleY(0.15); }
+/* Paused: muted like listening, which is the state it is most easily
+   confused with, but dimmed further and — the real distinction —
+   `drawAperture` draws it as an open arc rather than a closed ring, so the
+   two are told apart by shape, not only by how bright they are. */
+.live-band-paused {
+  color: var(--muted);
+  opacity: 0.5;
 }
 
 /* Where the hub portals its panel: a flex child of `.shell-body` that is not

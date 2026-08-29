@@ -883,32 +883,62 @@ conversation") working with no backend change.
   and a routed page would be torn down by the very navigation it just
   performed — cutting its own sentence off mid-word and stopping the route
   reports below.
-- **A five-bar indicator sits centered in the header band, in one of five
-  states** (`liveIndicator.ts`, tasks 874, 882 and 894) — the only sign of the
-  conversation while the panel is closed, so it answers for *both* sides of it
-  rather than only for mesa:
-  - **mesa speaking** (cyan) — the loudest of the four, and deliberately not
-    one wave: each bar runs its own keyframes at its own awkward duration, so
-    the five never fall into the shared ripple that reads as a spinner.
-  - **paused** (amber, and the only one that does not move) — the person
-    stepped out (task 882). Everything else in the band is something
-    happening; paused is the absence of all three, so the honest drawing of it
-    is bars that sit still, lower and dimmer than listening — the state it is
-    most easily confused with.
-  - **being heard** (green) — words are arriving, by either route in: an
-    audible frame the VAD is holding as part of an utterance, or a draft
-    sitting in the capture box. One travelling wave, quieter than mesa's,
-    because it reflects input rather than performing.
+- **An 18×18 canvas sits centered in the header band, in one of five
+  states** (`liveIndicator.ts` for the ranking, `liveBand.ts`'s `drawAperture`
+  for the drawing, `components/LiveBand.tsx` for the one rAF loop that paints
+  it, tasks 874, 882, 894 and 973) — the only sign of the conversation while
+  the panel is closed, so it answers for *both* sides of it rather than only
+  for mesa. The drawing is a single **aperture** — a ring, or a few, around a
+  lit centre — rather than the five bars of a level meter it replaced (task
+  973): three of the five states are not about how loud anything is (paused
+  and listening are about *whether* something is happening at all), and one
+  shape family turns out to draw all five without switching metaphors partway
+  through:
+  - **mesa speaking** (cyan) — rings travelling outward from a glowing core,
+    faster and brighter the louder the (simulated) voice. Outward motion reads
+    as mesa's voice going out. The amplitude driving it is not tapped from
+    real playback — mesa's audio runs through two different code paths (a
+    plain `<audio>` element and, on browsers whose media stack refuses a
+    range-less stream, a Web Audio decode-and-schedule fallback), and wiring a
+    real `AnalyserNode` to both to get one true signal was out of scope for
+    this drawing — so speaking instead animates a *simulated* envelope
+    (`simEnvelope`, ported unchanged from the design mockup): a slow
+    phrase-shaped rise and fall with two faster, mutually awkward syllable
+    oscillations riding on top, tuned to read as a voice rather than a
+    metronome.
+  - **paused** (muted, at half opacity, and the only one that does not move)
+    — the person stepped out (task 882). It is also the only state that draws
+    no full circle: a single open arc, so the shape itself — not merely its
+    stillness — says paused, since a dimmed ring reads too easily as
+    "listening, but dimmer," the state it would otherwise be confused with.
+  - **being heard** (green) — the same rings as speaking, run in reverse:
+    travelling *inward*, toward the core, because it is the other side of the
+    same conversation drawn with the same renderer, and the mirrored direction
+    is unmistakably the other one at a glance where colour alone would not be.
+    Unlike speaking, this amplitude is real: the smoothed microphone level
+    `LiveHub` already computes for the listen meter is passed to the band and
+    smoothed again per frame with a fast-attack, slow-release curve
+    (`smoothLevel`, 0.55 rising / 0.14 falling — jump up the instant sound
+    arrives, fall back gradually so it doesn't flicker to zero between
+    syllables), so the core and the rings genuinely swell with how loud the
+    room actually is. This is the one part of the redraw that changed what the
+    band *knows*, not just how it looks: the old bars ran a fixed animation no
+    matter how loud the person was.
   - **the agent working** (violet) — she has taken what was said and has not
     gone back to waiting (task 894). Violet because violet is already what this
     app means by *an agent* (the sidebar pane header, task 819), so the colour
-    alone separates her doing something from her saying something. One wave,
-    low, slow and unglowing: it is the one state neither side is talking in,
-    and it can be lit for minutes on a page somebody is reading.
-  - **listening** (muted) — the microphone is open and the room is quiet. Shown
-    only where recognition really is the way in (`recognizesSpeech`); a browser
-    that types into the fallback box gets no resting indicator, since a
-    permanent glyph meaning "a text box exists" is noise.
+    alone separates her doing something from her saying something. The drawing
+    is a dot orbiting a dim, static ring with a fading trail behind it — motion
+    with no amplitude in it at all, because nothing about the agent thinking is
+    loud or quiet, only ongoing, and it can be lit for minutes on a page
+    somebody is reading.
+  - **listening** (muted) — the microphone is open and the room is quiet: a
+    small dim core inside a slow, low-alpha breathing halo — present enough to
+    say the microphone is open, faint enough that nobody mistakes it for
+    speech. Shown only where recognition really is the way in
+    (`recognizesSpeech`); a browser that types into the fallback box gets no
+    resting indicator, since a permanent glyph meaning "a text box exists" is
+    noise.
 
   The order is the decision: **speaking outranks everything** (while she talks
   the microphone is shut, so a band claiming to hear the person would be
@@ -919,8 +949,11 @@ conversation") working with no backend change.
   are the stronger news, and the agent carries on working either way), and
   **working outranks listening** (listening is the resting state, and work is
   not rest). Whitespace is not speech. All five freeze under
-  `prefers-reduced-motion` — the same rule as `.live-dot`'s pulse — to steady
-  bars whose heights keep the ranking the motion carried.
+  `prefers-reduced-motion` to a single representative still frame that keeps
+  the ranking — no longer a CSS media block (a canvas has nothing for a media
+  query to hook), but a branch inside `drawAperture` itself, driven by a flag
+  the component maintains by subscribing to the query live, since a setting
+  flipped mid-session used to take effect with no reload and still should.
 
   Working is the one state shown to a browser that types into the fallback box
   as well: unlike listening it is not "a text box exists" — someone is doing

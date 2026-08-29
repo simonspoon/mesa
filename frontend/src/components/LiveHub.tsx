@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { LiveBand } from './LiveBand'
 import {
   getLive,
   getLiveConfig,
@@ -44,7 +45,7 @@ import {
   writeInputChoice,
   type AudioInput,
 } from '../liveDevices'
-import { headerIndicator, indicatorLabel } from '../liveIndicator'
+import { headerIndicator } from '../liveIndicator'
 import {
   buildVocabulary,
   captureHint,
@@ -1928,16 +1929,12 @@ export function LiveHub({
           the positioning context) — with the panel closed it is the only sign
           of either side talking, or of the agent working on what was said.
           One element in one state at a time, so the band never shows two
-          things at once (`liveIndicator.ts`). */}
-      {indicator !== null && (
-        <div
-          className={`live-talk live-talk-${indicator}`}
-          aria-label={indicatorLabel(indicator)}
-          role="status"
-        >
-          <span /><span /><span /><span /><span />
-        </div>
-      )}
+          things at once (`liveIndicator.ts`). Drawn as an aperture rather than
+          bars (mesa task 973, `liveBand.ts`); `level` is already throttled at
+          its source (0.03/100ms, see the capture effect above) and the
+          band's own per-frame smoothing (`smoothLevel`) is what turns that
+          into something that reads as continuous. */}
+      {indicator !== null && <LiveBand state={indicator} level={level} />}
 
       {controls.panel && (
         <button

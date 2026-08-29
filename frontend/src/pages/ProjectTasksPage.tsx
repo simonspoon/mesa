@@ -447,63 +447,65 @@ export function ProjectTasksPage({
         />
       )}
       <div className={fills ? 'project-page project-page-fills' : 'project-page'}>
-        <h1>
-          {project ? (
-            <InlineEdit
-              value={project.name}
-              onSave={(name) =>
-                updateProject(projectId, { name }).then(() => {
-                  refetchProject()
-                  onProjectsChanged()
-                })
-              }
-            />
-          ) : (
-            `Project ${projectId}`
+        <div className="project-heading">
+          <h1>
+            {project ? (
+              <InlineEdit
+                value={project.name}
+                onSave={(name) =>
+                  updateProject(projectId, { name }).then(() => {
+                    refetchProject()
+                    onProjectsChanged()
+                  })
+                }
+              />
+            ) : (
+              `Project ${projectId}`
+            )}
+            {/* The version of the app this project's folder holds (task 684),
+                derived from its manifest on every read. Best-effort: absent
+                whenever there is no folder or no readable version, so the
+                header is unchanged for a project that isn't an app. The `v`
+                prefix is added only when the manifest didn't already write
+                one. */}
+            {appVersion?.version && (
+              <span
+                className="badge project-version-badge"
+                title={`from ${appVersion.source}`}
+              >
+                {appVersion.version.startsWith('v')
+                  ? appVersion.version
+                  : `v${appVersion.version}`}
+              </span>
+            )}
+            {/* An archived project's page is otherwise identical to a live
+                one's — every read here is project-scoped, so the flag changes
+                nothing about it (task 509). Says so plainly, next to the name,
+                and reuses the existing task badge styling. */}
+            {project?.archived && (
+              <span
+                className="badge project-archived-badge"
+                title="Hidden from the sidebar's main list and from unscoped task/diagram views. Restore from the Settings tab."
+              >
+                archived
+              </span>
+            )}
+          </h1>
+          {project && (
+            <p className="muted">
+              <InlineEdit
+                value={project.description ?? ''}
+                multiline
+                placeholder="no description — click to add"
+                onSave={(d) =>
+                  updateProject(projectId, {
+                    description: d === '' ? null : d,
+                  }).then(refetchProject)
+                }
+              />
+            </p>
           )}
-          {/* The version of the app this project's folder holds (task 684),
-              derived from its manifest on every read. Best-effort: absent
-              whenever there is no folder or no readable version, so the
-              header is unchanged for a project that isn't an app. The `v`
-              prefix is added only when the manifest didn't already write
-              one. */}
-          {appVersion?.version && (
-            <span
-              className="badge project-version-badge"
-              title={`from ${appVersion.source}`}
-            >
-              {appVersion.version.startsWith('v')
-                ? appVersion.version
-                : `v${appVersion.version}`}
-            </span>
-          )}
-          {/* An archived project's page is otherwise identical to a live
-              one's — every read here is project-scoped, so the flag changes
-              nothing about it (task 509). Says so plainly, next to the name,
-              and reuses the existing task badge styling. */}
-          {project?.archived && (
-            <span
-              className="badge project-archived-badge"
-              title="Hidden from the sidebar's main list and from unscoped task/diagram views. Restore from the Settings tab."
-            >
-              archived
-            </span>
-          )}
-        </h1>
-        {project && (
-          <p className="muted">
-            <InlineEdit
-              value={project.description ?? ''}
-              multiline
-              placeholder="no description — click to add"
-              onSave={(d) =>
-                updateProject(projectId, {
-                  description: d === '' ? null : d,
-                }).then(refetchProject)
-              }
-            />
-          </p>
-        )}
+        </div>
         <div className="tabs">
           {/* Custom is first, ahead of Dashboard (mesa task 843), and exists
               only while this project has a remembered pane layout — it is the

@@ -1057,6 +1057,31 @@ main {
   border-color: var(--border);
 }
 
+/* Project view header (mesa task 962): name and description share one row
+   when there's room, wrapping the description onto its own full-width line
+   when there isn't — no JS breakpoint, just flex-wrap doing the work. The
+   `h1`'s own margin is left alone (`align-items: baseline` aligns the two
+   children regardless, and the h1's margin box is what sizes the row), so
+   the rhythm above `.tabs` is unchanged and still scales at the phone
+   tier's `h1 { font-size: 1.2rem }`; when the description wraps to its own
+   line it gets the same gap under the name that the h1's bottom margin
+   already gives it today. */
+.project-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.75rem;
+}
+
+.project-heading p {
+  margin: 0;
+  /* Grow to fill the row beside the name, but yield to a full-width wrap
+     (and never let a long word push the row wider than the page) once
+     there isn't 18rem left for it. */
+  flex: 1 1 18rem;
+  min-width: 0;
+}
+
 /* Archived marker beside a project's name (task 509): the shared chip, nudged
    off the title and onto its optical middle, in the amber this palette already
    uses for an attention state rather than a failure. Two-class selector like
@@ -8954,6 +8979,15 @@ button:focus-visible,
 
   .live-transcript {
     padding: 0.5rem;
+  }
+
+  /* Below the phone tier the name and description always stack, whatever
+     room the flex basis thinks it has: a ~300px column beside a short name
+     is not the shared line this was for (mesa task 962). `display: block`
+     hands the gap back to the h1's own bottom margin, so this is exactly
+     the pre-962 stacked header. */
+  .project-heading {
+    display: block;
   }
 }
 

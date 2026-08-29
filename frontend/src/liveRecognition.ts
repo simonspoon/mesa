@@ -18,10 +18,10 @@
  *   and a recording has **two** boundaries, not one (mesa task 917). Each
  *   settled sentence is *held* rather than sent, and the whole recording
  *   becomes **one** `user` turn — ordinarily on **silence**: the wait
- *   `live.auto-send-ms` already names for the typed box
- *   (`liveCapture.ts::autoSendIdleMs`), read again here so the two surfaces
- *   answer "has the person stopped" with one number rather than two that
- *   drift. A conversation is not one sentence at a time: the engine settles
+ *   `live.auto-send-ms` names. `liveCapture.ts::autoSendIdleMs` still owns
+ *   the number and the clamp; mesa task 977 took the typed box off it, so
+ *   this is now that setting's one reader rather than one of two. A
+ *   conversation is not one sentence at a time: the engine settles
  *   wherever the speaker drew breath, so posting each final made the agent
  *   answer a half-thought and then answer the rest of it, and the person had
  *   to talk to the pauses the engine chose rather than to mesa — silence
@@ -741,10 +741,10 @@ export function captureHint(input: {
     return 'Paused. Press Resume to talk to mesa again — the conversation is still running.'
   }
   if (input.path === 'none') {
-    return 'Neither auris nor this browser can listen here. Type, or use your system dictation — a settled line is sent on its own.'
+    return 'Neither auris nor this browser can listen here. Type here, or use your system dictation.'
   }
   if (input.blocked) {
-    return 'The microphone was refused, so mesa is not listening. Type here, or use your system dictation — a settled line is sent on its own.'
+    return 'The microphone was refused, so mesa is not listening. Type here, or use your system dictation.'
   }
   if (!input.live) {
     return 'Go live and mesa listens through this browser. You can also type here, or use your system dictation.'
@@ -767,5 +767,5 @@ export function captureHint(input: {
   }
   // Joined, unmuted, and still not the way in — nothing left that is worth a
   // line of its own; the box is the way in and says so.
-  return 'Type here, or use your system dictation — a settled line is sent on its own.'
+  return 'Type here, or use your system dictation.'
 }

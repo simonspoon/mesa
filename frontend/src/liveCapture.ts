@@ -12,34 +12,38 @@ import type { ConfigLive } from './types/ConfigLive'
  * person deliberately clicking into a form must win, a page's autofocus firing
  * after mesa navigated must not.
  *
- * The other half is when a dictated line is *sent*. Dictation never presses
- * Enter, so waiting for one means the conversation stalls until the person
- * touches the keyboard — the opposite of hands-free. mesa decides instead: a
- * draft nobody has edited for a beat is a finished thought.
+ * The typed box itself is sent by Enter alone (mesa task 977): a timer that
+ * posts what the person is still typing sends half-thoughts, and the box is
+ * the fallback surface a person is deliberately typing into — not dictating
+ * through — so the deliberate keystroke is the boundary, exactly as it is
+ * anywhere else text is typed.
  *
- * Both halves stand down entirely while the browser is doing the listening
- * itself (`listening`, from `liveRecognition.ts` — mesa task 873). The fight
- * was only ever about *where the words land*, and a recognized sentence lands
- * in the conversation no matter what holds the keyboard; so with the
- * microphone open the box stops grabbing focus and stops sending on a timer,
- * and it is a plain fallback the person may type in. This module keeps both
- * rules because recognition is not everywhere: an unsupported browser, or a
- * refused microphone, is exactly the old surface, unchanged.
+ * The focus fight stands down entirely while the browser is doing the
+ * listening itself (`listening`, from `liveRecognition.ts` — mesa task 873).
+ * The fight was only ever about *where the words land*, and a recognized
+ * sentence lands in the conversation no matter what holds the keyboard; so
+ * with the microphone open the box stops grabbing focus, and it is a plain
+ * fallback the person may type in. This module keeps the rule because
+ * recognition is not everywhere: an unsupported browser, or a refused
+ * microphone, is exactly the old surface, unchanged.
  *
- * The one number this module owns — `autoSendIdleMs` — is read by both
- * surfaces (mesa task 917): the typed draft's own idle deadline, and the
- * recording's silence boundary in `liveRecognition.ts`. One wait answering
- * "has the person stopped" for whichever half is live, rather than two
- * settings that could drift apart and disagree about how long a pause means.
+ * The one number this module still owns — `autoSendIdleMs` — is read by
+ * `liveRecognition.ts` alone now: the silence boundary that flushes a
+ * *transcribed* recording once the person stops talking for a beat. It moved
+ * here rather than staying inline there because it is one wait answering "has
+ * the person stopped" and was, until task 977, also the typed draft's own
+ * idle deadline — kept in one place so the two surfaces could not drift apart
+ * and disagree about how long a pause means.
  */
 
 /** How long after a pointer/key gesture a focus loss still counts as deliberate. */
 export const GESTURE_WINDOW_MS = 500
 
 /**
- * How long a non-empty draft must sit untouched before it is sent, with nothing
- * configured — `core::config::DEFAULT_LIVE_AUTO_SEND_MS`, and the wait mesa had
- * before the setting existed. It is also the answer while the config has not
+ * How long a transcribed recording must sit in silence before it is sent, with
+ * nothing configured — `core::config::DEFAULT_LIVE_AUTO_SEND_MS`, and the wait
+ * mesa had before the setting existed (back when it also governed the typed
+ * box, before mesa task 977). It is also the answer while the config has not
  * been read yet (or could not be), because a conversation must not stall
  * waiting on a settings file.
  */
@@ -124,27 +128,4 @@ export function shouldReclaimFocus(input: {
   if (!input.live || !input.unlocked) return false
   if (input.standingDown) return input.cause !== 'focus-lost-no-gesture'
   return true
-}
-
-/**
- * Whether an untouched draft is ready to send: non-blank, idle past the
- * threshold, not mid-IME-composition — sending half-converted text would
- * ship a word the person never said — and not while the browser is
- * `listening`, where the engine's own final results are what get sent and a
- * timer firing on top of them would post the same sentence twice.
- *
- * The threshold is passed in rather than read from the constant: how long a
- * pause means "finished" is the person's own cadence, so it is a setting
- * (`live.auto-send-ms`, mesa task 886) and this predicate must answer for
- * whatever they chose.
- */
-export function shouldAutoSend(
-  draft: string,
-  idleMs: number,
-  composing: boolean,
-  listening: boolean,
-  idleThresholdMs: number,
-): boolean {
-  if (listening) return false
-  return !composing && draft.trim() !== '' && idleMs >= idleThresholdMs
 }

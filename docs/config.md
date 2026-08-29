@@ -514,11 +514,12 @@ reads an item in (mesa task 822, `docs/inbox.md`).
 A fifth, independent section holds settings for the live conversation
 (`docs/live.md`). It used to carry two keys — the **prompt** its agent is
 spawned with (mesa task 867) and the **wait** before a settled capture-box
-draft is sent (mesa task 886) — but as of mesa task 919 the prompt moved out
-to the **library** (`docs/library.md`): it is now the `live-agent-prompt`
-built-in, forked like any other library row when someone edits it, and edited
-on `#/library` rather than in this file. This section holds the one key that
-is left.
+draft is sent (mesa task 886, until mesa task 977 narrowed it to the
+microphone's held recording alone — a typed line is now sent by Enter) — but
+as of mesa task 919 the prompt moved out to the **library**
+(`docs/library.md`): it is now the `live-agent-prompt` built-in, forked like
+any other library row when someone edits it, and edited on `#/library` rather
+than in this file. This section holds the one key that is left.
 
 ```json
 {
@@ -548,11 +549,12 @@ conversation starting).
 
 `auto-send-ms` is this section's key:
 
-- **How long a line typed or dictated into the conversation's capture box sits
-  untouched before the page sends it as a `user` turn.** Dictation never
-  presses Enter, so that pause is what ends a sentence; how long a pause means
-  "finished" is the person's own cadence, which is why it is a setting rather
-  than a constant.
+- **How long the person may fall silent before the page sends the microphone's
+  held recording as a `user` turn** (mesa task 977 narrowed this key to the
+  recording alone — a typed line is sent by Enter, since the capture box is a
+  deliberate keystroke away). Dictation never presses Enter, so that pause is
+  what ends a spoken sentence; how long a pause means "finished" is the
+  person's own cadence, which is why it is a setting rather than a constant.
 - **Absent or `null` ⇒ `core::config::DEFAULT_LIVE_AUTO_SEND_MS` (2000)**, the
   value hardcoded in `liveCapture.ts` before the key existed, so an
   unconfigured install waits exactly as long as it always did.
@@ -571,9 +573,11 @@ conversation starting).
   app — so an edit lands on the next conversation with no restart. If the read
   fails, the built-in wait applies: a settings file must never be what stalls
   a conversation.
-- **It governs the capture box only.** While the browser is listening through
-  `SpeechRecognition` the recognizer's own final results are what get sent and
-  the timer never fires (`shouldAutoSend` answers false while `listening`).
+- **It governs the microphone's held recording only** (mesa task 977 — a typed
+  line is sent by Enter, since the capture box is a deliberate keystroke
+  away). While the browser is listening, the recording flushes on
+  whichever comes first: this silence boundary (`shouldFlushSilence`) or the
+  listen switch.
 
 ### Routes
 

@@ -54,8 +54,8 @@ handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
   not, which makes that case a genuinely new capability rather than a better
   one, and the second-best reason for the whole project after the vocabulary
   fix. Either engine's text is **held** and posted as one `user` turn once
-  the person goes quiet for a beat (the same wait `live.auto-send-ms` already
-  gives the typed box), or right away if they press the listen switch (tasks
+  the person goes quiet for a beat (the wait `live.auto-send-ms` names), or
+  right away if they press the listen switch (tasks
   873, 889, 917, 956, 957). Only where neither engine is reachable does the
   conversation panel's plain `<textarea>` become the way in: there the
   person's *own* system dictation (macOS Dictation, a phone keyboard's mic
@@ -1018,11 +1018,13 @@ conversation") working with no backend change.
     stops.
 
   Everything *about the person's input method* reads the first — the capture
-  box's two rules, the composer's hint — and only the capture stream's own
+  box's focus rule, the composer's hint — and only the capture stream's own
   lifecycle reads the second. Keying the former on the latter is the bug that
   looks like a shortcut: mesa speaks for most of the conversation's wall time,
-  so a focus fight or an auto-send deadline that re-arms itself while she
-  talks is decided by playback timing rather than by any rule.
+  so a focus fight that re-arms itself while she talks is decided by playback
+  timing rather than by any rule — the recording's own silence clock avoids
+  exactly this by being measured on `shouldListen` rather than
+  `recognizesSpeech`.
   - **Listening is the person's own switch, and joining opens it** (tasks 887,
     917). `muted` is an input to `recognizesSpeech` for the same reason
     `paused` is: a muted page is one where the microphone is not the way in,
@@ -1137,8 +1139,17 @@ conversation") working with no backend change.
     Each transcribed segment is joined onto a held recording (`heldWith`),
     shown above the capture box, and posted as **one** `user` turn
     (`heldFlush`) either once the person has gone quiet for
-    `live.auto-send-ms` — the same wait the typed box already uses
-    (`shouldFlushSilence`) — or right away if they press the listen switch. A
+    `live.auto-send-ms` — the recording's own silence boundary
+    (`shouldFlushSilence`) — or right away if they press the listen switch.
+    That wait is **configurable** (mesa task
+    886): `live.auto-send-ms` in `~/.mesa/config.json`, edited on the
+    **Settings** page in the *Live conversation* section — 250..=60000 ms,
+    absent/blank meaning the 2000 ms mesa ships (`AUTO_SEND_IDLE_MS`), because
+    how long a pause means "finished" is the person's own cadence. `LiveHub`
+    reads the section once per conversation it joins, so an edit lands on the
+    next conversation with no restart, and a read that fails is the built-in
+    wait rather than a stall; `autoSendIdleMs` clamps what the file says,
+    since the editor is not the only way into it. A
     conversation is not one sentence at a time: a VAD segment ends wherever
     the speaker drew breath (`liveVad.ts`'s hangover), so posting each one as
     its own turn made the agent answer a half-thought and then answer the
@@ -1293,34 +1304,22 @@ conversation") working with no backend change.
   precede a navigate cannot make its autofocus read as deliberate.
   Nothing grabs the keyboard before the press: an un-joined browser has no
   business stealing focus.
-- **A settled line is sent on mesa's clock** (`shouldAutoSend`) — while the
-  browser is not listening for itself, where the microphone's recording is
-  what gets sent and a timer firing on top of it would post the same words
-  twice, from two surfaces. Otherwise: dictation
-  never presses Enter, so a non-blank draft untouched for the auto-send wait
-  is sent as the utterance — hands-free end to end. That wait is
-  **configurable** (mesa task 886): `live.auto-send-ms` in
-  `~/.mesa/config.json`, edited on the **Settings** page in the same *Live
-  conversation* section as the agent prompt — 250..=60000 ms, absent/blank
-  meaning the 2000 ms mesa ships (`AUTO_SEND_IDLE_MS`), because how long a
-  pause means "finished" is the person's own cadence. `LiveHub` reads the
-  section once per conversation it joins, so an edit lands on the next
-  conversation with no restart, and a read that fails is the built-in wait
-  rather than a stall; `autoSendIdleMs` clamps what the file says, since the
-  editor is not the only way into it. It governs this box only — with the
-  microphone open the recording is what gets sent, on the person's own switch,
-  and the timer never fires. Enter still sends at
-  once, Shift+Enter still opens a line, and the IME guard holds it while
-  composing (an IME commit re-arms the timer, since committing changes no
-  draft text). The firing timer reads the draft, the measured idle time and
-  the IME state through refs, never its own render's closure — which is what
-  makes a deadline racing an explicit Enter post nothing instead of the same
-  utterance twice. A line the server **refused** is put back in the box but
-  marked, and is not auto-retried until edited — Enter is the deliberate way
-  to try the same text again. A failed press (`Go live` on a machine with no
-  `claude`, most likely) **opens the panel**, because the error is the status
-  line's to report and a failed start leaves no session for the header to
-  hint with.
+- **The typed box is sent by Enter alone** (mesa task 977). It used to be
+  sent on mesa's clock after `live.auto-send-ms` of idle, on the reasoning
+  that dictation never presses Enter — but the box is the surface a person
+  reaches for when they are *typing*, and a timer that fires mid-sentence
+  posts a half-thought. `live.auto-send-ms` survives as the *listening*
+  surface's silence boundary (see the recording bullet above), and the box's
+  own boundary is the keystroke: Enter sends, Shift+Enter opens a line, and
+  the IME guard holds an Enter that is only committing a candidate (it
+  arrives with `isComposing` set and would ship half-converted text).
+  Sending reads the draft through a ref (`draftRef`), the same value
+  `updateDraft` writes alongside the render state, so `send` and `post`
+  always act on what is actually in the box. A line the server **refused**
+  is put back in the box unmarked — Enter is simply how it is retried.
+  A failed press (`Go live` on a machine with no `claude`, most likely)
+  **opens the panel**, because the error is the status line's to report and a
+  failed start leaves no session for the header to hint with.
 - **The controls are a three-state toggle, not one button.** Nothing live:
   **Go live** (`POST /api/live`). Live in a browser that has had a press:
   **End** (`DELETE /api/live`). Live in a browser that has **not** had one:
@@ -1482,8 +1481,8 @@ conversation") working with no backend change.
   control and where it is *not* offered, the panel toggle's `panel` flag,
   and the status line, where paused ranks under the two not-live states and
   above everything the running conversation would otherwise say) and
-  `frontend/src/liveCapture.ts` (the focus referee and the auto-send rule, and
-  when both stand aside) and
+  `frontend/src/liveCapture.ts` (the focus referee, when it stands aside, and
+  the shared idle wait) and
   `frontend/src/liveRecognition.ts` (the two listening questions and why they
   are two — and why a pause and a mute belong to the first and a reply to the
   second —
@@ -1534,8 +1533,8 @@ prompt itself used to be the config file's fifth section, `live.prompt` (mesa
 task 867); as of mesa task 919 it lives in the library instead, as the
 `live-agent-prompt` built-in — forking it **replaces** the built-in block, the
 same rule the old config key followed. The file's `live` section holds one key
-now, `live.auto-send-ms` — the capture box's wait above, read by the page
-rather than by the spawn; see `docs/library.md` for the prompt and
+now, `live.auto-send-ms` — the recording's silence boundary above, read by the
+page rather than by the spawn; see `docs/library.md` for the prompt and
 `docs/config.md` for the wait. A `live.prompt` key left behind in a hand-edited
 config file is silently ignored, never an error. Everything else about the
 `live-agent` template — argv vs script mode, tokenize-then-substitute, the

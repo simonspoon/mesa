@@ -6,7 +6,6 @@ import {
   MAX_AUTO_SEND_IDLE_MS,
   MIN_AUTO_SEND_IDLE_MS,
   isEditableTarget,
-  shouldAutoSend,
   shouldReclaimFocus,
   userTookFocus,
 } from './liveCapture'
@@ -80,39 +79,6 @@ describe('shouldReclaimFocus', () => {
     expect(shouldReclaimFocus({ ...down, cause: 'navigated' })).toBe(true)
     expect(shouldReclaimFocus({ ...down, cause: 'hub-press' })).toBe(true)
     expect(shouldReclaimFocus({ ...down, cause: 'focus-lost-no-gesture' })).toBe(false)
-  })
-})
-
-describe('shouldAutoSend', () => {
-  const D = AUTO_SEND_IDLE_MS
-
-  it('sends a settled non-empty draft', () => {
-    expect(shouldAutoSend('make a task', D, false, false, D)).toBe(true)
-  })
-
-  it('waits while the draft is still moving', () => {
-    expect(shouldAutoSend('make a task', D - 1, false, false, D)).toBe(false)
-  })
-
-  it('never sends blank or whitespace-only text', () => {
-    expect(shouldAutoSend('', D, false, false, D)).toBe(false)
-    expect(shouldAutoSend('   \n', D, false, false, D)).toBe(false)
-  })
-
-  it('never sends mid-IME-composition', () => {
-    expect(shouldAutoSend('make a task', D, true, false, D)).toBe(false)
-  })
-
-  it('never sends on a timer while the browser is listening for itself', () => {
-    expect(shouldAutoSend('make a task', D, false, true, D)).toBe(false)
-  })
-
-  it('measures the idle draft against the configured wait, not the built-in one', () => {
-    // A person who set a longer wait is still mid-sentence at two seconds…
-    expect(shouldAutoSend('make a task', D, false, false, 6000)).toBe(false)
-    expect(shouldAutoSend('make a task', 6000, false, false, 6000)).toBe(true)
-    // …and one who set a shorter wait has finished before them.
-    expect(shouldAutoSend('make a task', 500, false, false, 500)).toBe(true)
   })
 })
 

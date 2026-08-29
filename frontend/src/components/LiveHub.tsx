@@ -28,7 +28,6 @@ import {
 import {
   autoSendIdleMs,
   isEditableTarget,
-  shouldAutoSend,
   shouldReclaimFocus,
   userTookFocus,
   type ReclaimCause,
@@ -120,9 +119,9 @@ import { useFetch } from '../useFetch'
  * microphone and keeps it muted for the rest of that session. The capture box
  * in the conversation panel stays as the fallback — a browser with no way to
  * capture audio, or a refused microphone, is the surface as it was: system
- * dictation types into the box, mesa holds the keyboard for it, and a settled
- * line goes on a timer. Either way this is now the **only** place audio
- * leaves the page: each segment travels once, as one bounded WAV, to that one
+ * dictation types into the box, mesa holds the keyboard for it, and a line is
+ * sent by Enter alone (mesa task 977). Either way this is now the **only**
+ * place audio leaves the page: each segment travels once, as one bounded WAV, to that one
  * route, decoded locally by `auris` and never retained (`docs/live.md`). An
  * agent spawned by `Go live` pulls those over the CLI and answers with `mesa live say`,
  * which lands here as a `mesa` turn and is spoken through the same `kokoro-rs`
@@ -161,11 +160,11 @@ import { useFetch } from '../useFetch'
  *   (`liveCapture.ts`): a `navigate` turn is mesa's doing, and the words after
  *   it are still meant for mesa, not for whatever field the opened page
  *   focused. A deliberate click into another field wins the fight and stands
- *   capture down; mesa's next action re-arms it. Dictation never presses
- *   Enter, so a draft that sits untouched for a beat is sent on mesa's own
- *   clock. With the microphone open none of that applies — a recognized
- *   sentence reaches the conversation with the keyboard anywhere — so both
- *   rules stand down and the box is a plain fallback.
+ *   capture down; mesa's next action re-arms it. The typed box itself is sent
+ *   by Enter alone (mesa task 977) — only a *transcribed* recording is sent
+ *   on mesa's own clock. With the microphone open the focus fight does not
+ *   apply — a recognized sentence reaches the conversation with the keyboard
+ *   anywhere — so that rule stands down and the box is a plain fallback.
  *
  * The two page verbs — `navigate` and the sidebar pair (task 859) — are both
  * performed here, in transcript order, when the run *reaches* the turn: the
@@ -242,10 +241,12 @@ export function LiveHub({
   const live = isLive(session)
 
   // The live section of `~/.mesa/config.json`, for the one value this page
-  // reads out of it: how long a settled draft waits before it is sent (mesa
-  // task 886). Asked once per conversation joined rather than on mount — the
-  // hub is mounted for the life of the app, so reading it at start is what
-  // makes an edit in Settings land on the next conversation without a reload.
+  // reads out of it: how long the person may fall silent before a
+  // transcribed recording is sent (mesa task 886; the typed box itself sends
+  // on Enter alone as of mesa task 977). Asked once per conversation joined
+  // rather than on mount — the hub is mounted for the life of the app, so
+  // reading it at start is what makes an edit in Settings land on the next
+  // conversation without a reload.
   // `null` until it answers, and left `null` if it never does: the built-in
   // wait applies then (`autoSendIdleMs`), because a settings file must never
   // be what stalls a conversation.
@@ -678,8 +679,6 @@ export function LiveHub({
   // Whether the person deliberately took focus elsewhere. A ref: it is read
   // and written from focus events and never rendered.
   const standingDown = useRef(false)
-  // Mid-IME-composition, for the auto-send guard.
-  const composing = useRef(false)
   // The steady question — is the person talking to mesa through the microphone
   // — which is what the capture box's two rules and the composer's hint read.
   // Deliberately not `wantsMic` below: that one goes false for the length of
@@ -789,54 +788,15 @@ export function LiveHub({
     if (live && unlocked) reclaim('went-live', { live, unlocked })
   }, [live, unlocked, reclaim])
 
-  // A settled draft is sent on mesa's clock (dictation never presses Enter).
-  // Everything the firing timer reads comes through refs, not the closure:
-  // `draftRef` so a deadline racing an Enter send replays nothing (the send
-  // already emptied it), `editedAt` so the idle threshold is measured rather
-  // than assumed, and `refused` so a line the server rejected is not retried
-  // every two seconds for ever — it waits to be edited (or sent by hand).
-  const sendRef = useRef<() => void>(() => {})
-  // The same, for the recognizer: its handlers are set once per start and post
-  // sentences long after the render that installed them.
+  // The recognizer's handlers are set once per start and post sentences long
+  // after the render that installed them, so they read through a ref rather
+  // than a closure over a stale `post`.
   const postRef = useRef<(text: string) => Promise<void>>(() => Promise.resolve())
   const draftRef = useRef('')
-  const editedAt = useRef(0)
-  const refused = useRef<string | null>(null)
-  // Bumped when an IME composition commits: that commit changes no draft text
-  // (the characters were already displayed), so without it nothing would ever
-  // re-arm a timer the composition suppressed.
-  const [composeTick, setComposeTick] = useState(0)
-  useEffect(() => {
-    // Paused, the box is disabled and nothing in it is an utterance the person
-    // is still making — a deadline that fired here would send a line dictated
-    // before they stepped out.
-    if (!live || paused || draft.trim() === '') return
-    const timer = window.setTimeout(() => {
-      const text = draftRef.current
-      if (text.trim() === refused.current) return
-      if (
-        shouldAutoSend(
-          text,
-          Date.now() - editedAt.current,
-          composing.current,
-          listeningRef.current,
-          autoSendMs,
-        )
-      ) {
-        sendRef.current()
-      }
-    }, autoSendMs)
-    return () => window.clearTimeout(timer)
-    // `recognizes` is a dependency, not just a read inside the timer: a draft
-    // left in the box when recognition stops being the way in (the microphone
-    // refused, the browser's answer changing) must get its deadline back
-    // rather than sit there for ever because the decision was sampled once.
-  }, [draft, live, paused, composeTick, recognizes, autoSendMs])
 
-  /** The one write path for the draft: state for the render, refs for the timer. */
+  /** The one write path for the draft: state for the render, a ref for `send`. */
   const updateDraft = useCallback((value: string) => {
     draftRef.current = value
-    editedAt.current = Date.now()
     setDraft(value)
   }, [])
 
@@ -960,10 +920,9 @@ export function LiveHub({
   }, [flushRecording])
 
   // The recording's other boundary (mesa task 917): silence, not just the
-  // switch. Shaped like the auto-send deadline below — a timeout re-armed on
-  // every dependency change, reading the live answer through refs rather than
-  // the closure, because the person may have gone silent well before this
-  // effect's own render.
+  // switch. A timeout re-armed on every dependency change, reading the live
+  // answer through refs rather than the closure, because the person may have
+  // gone silent well before this effect's own render.
   useEffect(() => {
     if (!wantsMic || (recording.trim() === '' && interim.trim() === '')) return
     const timer = window.setTimeout(() => {
@@ -1843,9 +1802,9 @@ export function LiveHub({
   }
 
   function send() {
-    // Read through the ref, not the render's draft: an auto-send deadline
-    // racing an explicit Enter finds the box already emptied and posts
-    // nothing, instead of the same utterance twice.
+    // `draftRef` is the draft's authoritative value — `updateDraft` writes it
+    // alongside the render state — so it is what `post` and this function's
+    // own clearing below both read.
     const text = draftRef.current.trim()
     if (text === '' || !live) return
     updateDraft('')
@@ -1861,7 +1820,6 @@ export function LiveHub({
   function post(text: string) {
     return sendLiveUtterance(text).then(
       () => {
-        refused.current = null
         refetch()
       },
       (err: unknown) => {
@@ -1870,15 +1828,12 @@ export function LiveHub({
         setOpen(true)
         // The line was never recorded, so it belongs back in the box rather
         // than lost — re-dictating it is the one thing a person cannot redo.
-        // Marked refused so the auto-send timer does not retry it unedited;
-        // Enter remains the deliberate way to try the same text again.
-        refused.current = text
+        // It goes back in unmarked: Enter is simply how it is retried.
         if (draftRef.current === '') updateDraft(text)
       },
     )
   }
   useEffect(() => {
-    sendRef.current = send
     postRef.current = post
   })
 
@@ -2183,16 +2138,6 @@ export function LiveHub({
                   }
                   aria-label="say something to mesa"
                   onChange={(e) => updateDraft(e.target.value)}
-                  onCompositionStart={() => {
-                    composing.current = true
-                  }}
-                  onCompositionEnd={() => {
-                    composing.current = false
-                    // Committing changes no text (it was already displayed), so
-                    // this tick is the only thing that re-arms a timer the open
-                    // composition suppressed.
-                    setComposeTick((t) => t + 1)
-                  }}
                   onBlur={(e) => {
                     // The arbiter: focus lost to somewhere a person types, on the
                     // heels of a gesture, is them deliberately going elsewhere —
@@ -2263,7 +2208,7 @@ export function LiveHub({
                     paused,
                     muted,
                   })}{' '}
-                  {!paused && 'Enter sends at once.'}
+                  {!paused && 'Enter sends.'}
                 </div>
               </form>
             </div>

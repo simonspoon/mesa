@@ -504,12 +504,12 @@ function LivePromptSection() {
           <code className="settings-command-key">live.auto-send-ms</code>
         </label>
         <p className="muted settings-command-blurb">
-          How long a line typed or dictated into the conversation box sits
-          untouched before mesa takes it as a finished thought and sends it —
-          dictation never presses Enter, so this pause is what ends a sentence.
-          Blank = {live.auto_send_ms_default} ms (the default). It does not
-          apply while the browser is listening through the microphone: there,
-          the recognizer decides where a sentence ends.
+          How long the person may fall silent, while mesa is listening,
+          before the transcribed recording so far is sent as one turn —
+          dictation never presses Enter, so this pause is what ends a spoken
+          thought. Blank = {live.auto_send_ms_default} ms (the default). It
+          does not apply to text typed into the conversation box, which is
+          sent by Enter alone (mesa task 977).
         </p>
         <input
           id="live-auto-send"

@@ -130,7 +130,7 @@ describe('recognizesSpeech', () => {
   it('does not blink while mesa speaks — the capture rules key on this', () => {
     // The engine stops for the length of a reply (`shouldListen`), but the way
     // the person is talking to mesa has not changed, so neither may the focus
-    // fight nor the auto-send deadline.
+    // fight.
     const whileSpeaking = { ...open, speaking: true }
     expect(recognizesSpeech(whileSpeaking)).toBe(true)
     expect(shouldListen(whileSpeaking)).toBe(false)

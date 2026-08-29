@@ -248,6 +248,60 @@ time: recording that mesa and the disk agree is not an edit to what mesa
 holds. `Store::pull_library_body` (the `disk` choice's write) does move
 `updated_at`, because it *does* change the body.
 
+## Import / export
+
+A library can travel between mesa instances as one downloadable **bundle** —
+a JSON document holding the library's *contents*, not its identity. Three new
+ts-rs types carry it: `LibraryBundleItem` (`name`, `kind`, `scope`, an
+optional `project` **name** — present iff `scope` is `project` — `body`, and
+an optional `builtin_id`), `LibraryBundle` (`version`, `exported_at`, and a
+`Vec<LibraryBundleItem>`), and `LibraryImportResult` (the per-item outcome of
+an import, the same posture as `LibrarySyncResult`).
+
+**Export carries db rows only — never an unshadowed built-in.** A built-in is
+code (`core::library::BUILTINS`), identical on the receiving instance by
+construction, so exporting it would be noise that imports as a pointless
+fork. A *forked* built-in is exported, and carries its `builtin_id` so it
+lands as a fork on the far side too — the fork/restore rule holds across
+instances, not just within one. Scope of an export follows `list`'s own
+visibility rule: no project scopes to `user`-only rows, a project scopes to
+that project's rows plus every `user`-scope row.
+
+**What never travels, and why:** `id`, `created_at`, `updated_at`, `path` and
+version history are all machine-local or derived — an id and timestamps mean
+nothing on another instance, `path` is recomputed from `(kind, scope, name)`
+on arrival, and history is a list of *past* contents, while a bundle carries
+only current ones. Above all, `synced_body`/`synced_at` never travel: the
+sync baseline is a fact about *this machine's* disk, and shipping it to
+another machine would assert an agreement that machine's disk never actually
+reached. A `project`-scope item travels by the project's **name**, resolved
+against `Store::find_project_by_name` on import — ids are machine-local, and
+an unknown name fails that one item rather than the whole batch.
+
+**Import is per-item, exactly like `sync_apply`, with one whole-bundle
+exception.** An unknown `version` refuses the entire bundle up front
+(`validation`) — the one all-or-nothing check, because there is no format to
+interpret an item against. Past that, each item resolves independently
+against any existing row at its `(kind, scope, project, name)`: none existing
+creates it; one existing is a **conflict**, decided by `on_conflict` (`skip`
+by default, `replace` as the opt-in) — `skip` leaves the existing row
+untouched, `replace` overwrites its body only, never its name and never the
+sync baseline. The default is `skip` because import is something a person
+runs deliberately, often to *pull in* items from elsewhere, and a body they
+already have replaced out from under them with no warning is the more
+dangerous default; `replace` exists for the deliberate re-import case, and
+is opt-in per call. Any other `Store` failure for one item (the name rule,
+the body cap) fails only that item; the rest of the batch still applies.
+
+**Import never touches disk.** It writes rows the same way `create`/`update`
+do, and nothing more — no file is written, no baseline is stamped. A freshly
+imported row therefore has a null `synced_body`, so the very next `sync
+status` reports it honestly: `mesa-new` if nothing sits at its path yet, or
+`both-changed` if a file already does. That is correct, not a gap — mesa and
+this machine's disk have never actually agreed on that row's contents, and
+the sync model must not pretend otherwise just because the row arrived from
+somewhere else.
+
 ## Gate posture
 
 | Route | Success | Gate |
@@ -261,21 +315,24 @@ holds. `Store::pull_library_body` (the `disk` choice's write) does move
 | `POST /api/library/builtins/{builtin_id}/fork` | 201 | `require_local_path_write` |
 | `GET /api/library/sync` (`?project=<id>`) | 200, bare array | `require_local_path_write` |
 | `POST /api/library/sync` | 200, results array | `require_local_path_write` |
+| `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_local_path_write` |
+| `POST /api/library/import` | 200, results array | `require_local_path_write` |
 
-**All nine routes are `require_local_path_write` — loopback-only in both
+**All eleven routes are `require_local_path_write` — loopback-only in both
 serve modes, reads included.** This is not a read/write split: unlike
 scripts (`docs/scripts.md`'s "the read/write asymmetry is the point", where a
 LAN peer may *trigger* a stored script but never *author* one), the library
 has no read that is safe to open to a LAN peer, because a row's `body` **is**
 an agent definition, a hook shell script or a CLAUDE.md — the same bytes the
 sync routes read straight off disk, only after they have been stored in the
-database. Gating the disk read at loopback while serving those identical
-bytes to a LAN peer from `GET /api/library/{id}` one route over would be a
-distinction with no security content. `serve --lan` is a no-auth "trust every
-device on the network" posture, so the whole surface — CRUD reads, mutations,
-and both sync routes — sits behind the one gate, one constant
-(`LIBRARY_LOOPBACK`) so the nine cannot drift apart. Nothing useful is lost by
-it: an agent runs on this machine and reaches mesa over loopback, which the
+database (a bundle is just every one of those bytes at once). Gating the
+disk read at loopback while serving those identical bytes to a LAN peer from
+`GET /api/library/{id}` one route over would be a distinction with no
+security content. `serve --lan` is a no-auth "trust every device on the
+network" posture, so the whole surface — CRUD reads, mutations, both sync
+routes and both bundle routes — sits behind the one gate, one constant
+(`LIBRARY_LOOPBACK`) so the eleven cannot drift apart. Nothing useful is lost
+by it: an agent runs on this machine and reaches mesa over loopback, which the
 gate still allows.
 
 **How the loopback boundary is actually proved.** A same-machine `curl` to
@@ -286,7 +343,7 @@ before the per-route gate is ever reached, and under `--lan` a
 loopback-connected `curl` makes `require_local_path_write` reduce to exactly
 what `require_agent_access` checks. So `scripts/library-check.sh` proves only
 the *portable* half of the boundary — a DNS-name `Host` (rebinding) and a
-foreign `Origin` (cross-site) refused, in both modes, on all nine routes.
+foreign `Origin` (cross-site) refused, in both modes, on all eleven routes.
 The genuinely remote-peer case — would a LAN device actually get turned away
 — can only be proved with a forged non-loopback `SocketAddr`, which a shell
 script driving a real `curl` cannot produce. That is a Rust unit test,
@@ -329,13 +386,24 @@ or a name — a built-in resolves by name too, since its name and its
   `--resolve PATH=mesa|disk|skip` flags or one of `--all-mesa`/`--all-disk`
   (resolve every non-`in-sync` row toward one side at once) — the three are
   mutually exclusive — and prints the resulting `LibrarySyncResult[]`.
+- `export [PROJECT] [--project P] [--output PATH]` prints the `LibraryBundle`
+  JSON to stdout by default; `--output PATH` writes it there instead (refusing
+  to clobber an existing path, mirroring `backup`) and prints
+  `{"path": "...", "items": <n>}`. `PROJECT`/`--project` is the same
+  positional-or-flag pair `list` takes.
+- `import <PATH> [--on-conflict skip|replace]` reads a bundle from `PATH` (or
+  `-` for stdin, the `--body-file` convention) and prints the resulting
+  `LibraryImportResult[]` as a bare array; a malformed or unparseable bundle
+  is `validation`, exit 1. `--on-conflict` defaults to `skip`.
 
 `--quiet` follows the house rule (`CLAUDE.md`): accepted on `create`,
 `update`, `delete` and `show`/`get`, dropping `body` and `synced_body`
 (`QUIET_DROP_LIBRARY`) while keeping `name`, `kind`, `scope` and the derived
-`path`; **not defined at all** on `list`, `versions` or either `sync`
-subcommand, so passing it there is clap's unknown-argument error, exit 2. On
-`update` it sits outside the required field `ArgGroup`, so `--quiet` alone,
+`path`; **not defined at all** on `list`, `versions`, either `sync`
+subcommand, or `export`/`import`, so passing it there is clap's
+unknown-argument error, exit 2 — those commands answer with a bundle or a
+results array, not a record, so there is nothing for `--quiet` to project.
+On `update` it sits outside the required field `ArgGroup`, so `--quiet` alone,
 with no field flag, is still the usage error rather than a legal no-op call.
 
 ## Where the live prompt went
@@ -385,7 +453,8 @@ nothing here for an old `config.json` to leave behind.
 
 ## Gate
 
-`scripts/library-check.sh` (79 checks) covers, over both the CLI and the API:
+`scripts/library-check.sh` (95 checks) covers, over both the CLI and the
+API:
 
 - **CRUD**: create (positional and flag forms, `--body-file`, the name-rule
   rejections — `../evil`, `a/b`, `..`, `.`, empty — as 422/`validation`,
@@ -416,11 +485,11 @@ nothing here for an old `config.json` to leave behind.
   row's `mesa` re-creates the file and its `disk` deletes the row; a
   `both-changed` row shows both bodies, and `skip` leaves both sides and the
   status untouched on the next scan).
-- **The API DTOs and status codes** for all nine routes, a malformed JSON
+- **The API DTOs and status codes** for all eleven routes, a malformed JSON
   body as 422 (never a 500), and every mutating route (create, update,
-  delete, fork, sync apply) refusing a request with no JSON `Content-Type` as
-  415.
-- **The loopback gate, on all nine routes, reads included**, in both
+  delete, fork, sync apply, import) refusing a request with no JSON
+  `Content-Type` as 415.
+- **The loopback gate, on all eleven routes, reads included**, in both
   `default` and `--lan` serve modes: a foreign `Host` refused by the global
   guard in default mode; under `--lan`, a DNS-name `Host` (rebinding) and a
   foreign `Origin` (cross-site) refused while a genuinely local
@@ -429,6 +498,21 @@ nothing here for an old `config.json` to leave behind.
   Content-Type gate still fires under `--lan` too. This is the *portable*
   half of the boundary a shell script can prove — see [Gate posture](#gate-posture)
   above for why the peer-address half needs a Rust test instead.
+- **Import/export round trip**: exporting a library holding a user row and a
+  forked built-in produces a bundle containing both, containing no unshadowed
+  built-in, and with no item carrying an `id`, a `synced_*` key, or
+  `created_at`; importing that bundle into a second, empty `MESA_DB`
+  reproduces the rows with byte-identical bodies, the fork still carrying its
+  `builtin_id`, and the built-in it shadows no longer offered unshadowed.
+  Re-importing the same bundle with the default `on_conflict` reports every
+  item `skipped` with bodies untouched; re-importing with `--on-conflict
+  replace` after editing the source reports `replaced` with the new body
+  present. A project-scoped item whose project does not exist on the
+  receiving instance is `failed` on its own, with the rest of the batch still
+  applied. A bundle carrying an unknown `version` is refused whole
+  (`validation`, exit 1, nothing written). `--quiet` on `export` and on
+  `import` is the unknown-argument error, exit 2. `--output` to a path that
+  already exists refuses rather than overwriting.
 - **The live-conversation prompt now coming from the library**: with nothing
   forked, `mesa live start` spawns the stub `claude` with the built-in
   `live-agent-prompt` block (`mesa live listen` present) plus the session

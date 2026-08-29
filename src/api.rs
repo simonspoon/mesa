@@ -41,12 +41,13 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
     FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryKind, LibraryPatch, LibraryScope, LiveContext,
-    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates,
-    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
-    ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch,
-    Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, config, files, git,
-    hooks, library, listen, live, receipt, scripts, speech, version,
+    InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryBundle, LibraryImportResult, LibraryKind,
+    LibraryPatch, LibraryScope, LiveContext, LiveRole, LiveState, LiveStatus, LiveTranscript,
+    LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
+    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
+    Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
+    attachments, config, files, git, hooks, library, listen, live, receipt, scripts, speech,
+    version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -840,9 +841,13 @@ fn router(state: AppState) -> Router {
         // authoring AND the sync routes (which read/write the disk side, and
         // `sync/status`'s response body can carry the contents of files
         // under $HOME) are loopback-only in BOTH modes; only listing/showing
-        // one item and its version history share the agents' read gate. See
-        // `docs/library.md`.
+        // one item and its version history share the agents' read gate.
+        // Export/import (mesa task 963) carry a whole library's worth of that
+        // same content in one payload, so both sit behind the same
+        // loopback-only gate too. See `docs/library.md`.
         .route("/api/library", get(list_library).post(create_library))
+        .route("/api/library/export", get(export_library))
+        .route("/api/library/import", post(import_library))
         .route(
             "/api/library/{id}",
             get(show_library)
@@ -3458,13 +3463,58 @@ async fn library_sync_apply(
     .into_response())
 }
 
-/// The message every one of the nine library routes refuses a non-loopback
-/// peer with — reads included, not just the five mutations and the two sync
+/// Snapshots a library into a portable `LibraryBundle` (`core::library::export`,
+/// mesa task 963) — every db row, minus the unshadowed built-ins that are code
+/// rather than rows. Loopback-only like every other library route: a bundle
+/// is strictly more sensitive than any single row it carries.
+async fn export_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<LibraryQuery>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(library::export(&store, q.project)?).into_response())
+}
+
+#[derive(Deserialize)]
+struct LibraryImportBody {
+    bundle: LibraryBundle,
+    #[serde(default = "default_on_conflict")]
+    on_conflict: String,
+}
+
+fn default_on_conflict() -> String {
+    "skip".to_string()
+}
+
+/// Applies a `LibraryBundle` (`core::library::import`, mesa task 963) —
+/// per-item, never all-or-nothing except for an unrecognised bundle
+/// `version`, which `library::import` refuses whole. Loopback-only like every
+/// other library mutation: importing a bundle writes exactly the rows
+/// authoring one row at a time would.
+async fn import_library(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LibraryImportBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let results: Vec<LibraryImportResult> =
+        library::import(&mut store, &body.bundle, &body.on_conflict)?;
+    Ok(Json(results).into_response())
+}
+
+/// The message every one of the eleven library routes refuses a non-loopback
+/// peer with — reads included, not just the mutations and the sync/import
 /// routes. A row's body is code (an agent definition, a hook shell script, a
 /// CLAUDE.md); serving that content to a LAN peer over `GET` while writing
 /// and syncing it stay loopback-only would be a distinction with no security
 /// content, so the whole surface sits behind this one gate. One constant so
-/// the nine cannot drift apart.
+/// the eleven cannot drift apart.
 const LIBRARY_LOOPBACK: &str = "the library is loopback-only; connect from this machine";
 
 // ---- agents (live Claude Code sessions under a project's folder) ----
@@ -9791,6 +9841,98 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         assert_eq!(fork.body, "custom body");
     }
 
+    /// `export`/`import` round-trip a `user`-scope row through a bundle, and
+    /// re-importing with the default `skip` policy leaves it untouched.
+    #[tokio::test]
+    async fn export_then_import_round_trips_a_row() {
+        let (_dir, state) = test_state();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "roundtrip",
+                "hello",
+                None,
+            )
+            .unwrap();
+
+        let exported = export_library(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Query(LibraryQuery { project: None }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        let bundle: LibraryBundle = serde_json::from_slice(
+            &axum::body::to_bytes(exported.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let (_dir2, target) = test_state();
+        let results = import_library(
+            State(target.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Ok(Json(LibraryImportBody {
+                bundle,
+                on_conflict: "skip".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        let results: Vec<LibraryImportResult> = serde_json::from_slice(
+            &axum::body::to_bytes(results.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "created");
+
+        let imported = target
+            .store
+            .lock()
+            .unwrap()
+            .find_library_item(LibraryKind::Prompt, LibraryScope::User, None, "roundtrip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.body, "hello");
+    }
+
+    /// The API's own validation surface: an `on_conflict` outside
+    /// `skip`/`replace` is `validation`, 422, before any item is touched
+    /// (`core::library::import`'s whole-call check).
+    #[tokio::test]
+    async fn import_unknown_on_conflict_is_422() {
+        let (_dir, state) = test_state();
+        let bundle = LibraryBundle {
+            version: 1,
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            items: vec![],
+        };
+        let err = import_library(
+            State(state.clone()),
+            ConnectInfo(loopback()),
+            loopback_agent_headers(),
+            Ok(Json(LibraryImportBody {
+                bundle,
+                on_conflict: "overwrite".to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "validation");
+    }
+
     /// `name`/`body` are replace-only: an explicit `null` for either is a
     /// `validation` 422, rejected before the store is touched — mirroring
     /// `script_update_refuses_to_clear_name_or_body`.
@@ -9883,11 +10025,48 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let versions = list_library_versions(
             State(state.clone()),
             ConnectInfo(lan_peer()),
-            headers,
+            headers.clone(),
             Path(item.id.unwrap()),
         )
         .await;
         assert!(versions.unwrap_err().status.is_client_error());
+
+        // Export is the read that would leak the most — a whole library in
+        // one payload — so it gets the same forged-peer proof as the three
+        // single-item reads above.
+        let exported = export_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers,
+            Query(LibraryQuery { project: None }),
+        )
+        .await;
+        assert!(exported.unwrap_err().status.is_client_error());
+    }
+
+    /// Import's mirror of the test above: a LAN peer may never write a
+    /// bundle into the library either, even one that carries nothing.
+    #[tokio::test]
+    async fn lan_page_may_never_import_the_library_either() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let bundle = LibraryBundle {
+            version: 1,
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            items: vec![],
+        };
+        let imported = import_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers,
+            Ok(Json(LibraryImportBody {
+                bundle,
+                on_conflict: "skip".to_string(),
+            })),
+        )
+        .await;
+        assert!(imported.unwrap_err().status.is_client_error());
     }
 
     /// The load-bearing claim `transcribe_router`'s doc comment makes: under

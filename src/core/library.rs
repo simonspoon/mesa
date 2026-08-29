@@ -1,5 +1,5 @@
 //! The library's built-ins, disk layout and sync decision table (mesa task
-//! 919).
+//! 919), plus the portable import/export bundle (mesa task 963).
 //!
 //! A library row is an agent definition, a skill, a hook script, a slash
 //! command, the live-conversation prompt, or a CLAUDE.md — stored in
@@ -10,15 +10,18 @@
 //! the traversal chokepoint that keeps a resolved path under its scope base
 //! (`resolve`, the `files.rs::safe_path()` line held a second time), the sync
 //! decision table (`classify`), and the disk-side scan a sync compares
-//! against (`scan_disk`).
+//! against (`scan_disk`) — and, alongside those, [`export`]/[`import`], which
+//! turn a library's contents into a portable [`crate::core::types::LibraryBundle`]
+//! and back, for moving them to another mesa instance.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::core::store::{Error, Result as StoreResult, Store};
+use crate::core::store::{Error, LibraryPatch, Result as StoreResult, Store};
 use crate::core::types::{
-    LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
+    LibraryBundle, LibraryBundleItem, LibraryImportResult, LibraryItem, LibraryKind, LibraryScope,
+    LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
 };
 
 /// One built-in library entry — code, not a db row. `core::library::BUILTINS`
@@ -678,6 +681,180 @@ fn apply_disk(store: &mut Store, row: &LibrarySyncRow) -> StoreResult<()> {
             store.pull_library_body(id, body)?;
             Ok(())
         }
+    }
+}
+
+/// `LibraryBundle::version` this build understands. A bundle carrying any
+/// other value is refused whole by [`import`] before anything is written —
+/// the one all-or-nothing check the format makes.
+pub const BUNDLE_VERSION: u32 = 1;
+
+/// Snapshots a library's contents into a portable [`LibraryBundle`]
+/// (`Store::list_library_items` — db rows only). An unshadowed built-in is
+/// never included: it is code, not a row, and identical on the receiving
+/// instance by construction, so exporting it would be noise that imports as
+/// a pointless fork. A *forked* built-in IS included, carrying its
+/// `builtin_id` so it lands as a fork on the far side too. Scope follows the
+/// same visibility rule `list` uses: no project -> `user`-scope rows only;
+/// with a project -> that project's rows plus every `user`-scope row.
+pub fn export(store: &Store, project: Option<i64>) -> StoreResult<LibraryBundle> {
+    let rows = store.list_library_items(project)?;
+    // Every `project`-scope row `list_library_items` returns is bound to
+    // exactly this one project (its own WHERE clause guarantees it), so its
+    // name is resolved once rather than per row.
+    let project_name = match project {
+        Some(id) => Some(store.get_project(id)?.name),
+        None => None,
+    };
+    let items = rows
+        .into_iter()
+        .map(|item| LibraryBundleItem {
+            name: item.name,
+            kind: item.kind,
+            scope: item.scope,
+            project: match item.scope {
+                LibraryScope::Project => project_name.clone(),
+                LibraryScope::User => None,
+            },
+            body: item.body,
+            builtin_id: item.builtin_id,
+        })
+        .collect();
+    Ok(LibraryBundle {
+        version: BUNDLE_VERSION,
+        exported_at: store.now()?,
+        items,
+    })
+}
+
+/// Applies a [`LibraryBundle`] against this instance. `on_conflict` is
+/// `"skip"` (leave an existing row untouched) or `"replace"` (update its
+/// body); any other value is a caller mistake, not a per-item outcome, so it
+/// fails the whole call (`Error::Validation`). A bundle whose `version` this
+/// mesa does not know is likewise refused whole, before a single item is
+/// touched. Every other failure is per item: a bad project name or a
+/// `Store` rejection (the name rule, the body cap, ...) fails only that
+/// item and the rest of the batch still applies — the same posture
+/// `sync_apply` already takes toward its own batch.
+pub fn import(
+    store: &mut Store,
+    bundle: &LibraryBundle,
+    on_conflict: &str,
+) -> StoreResult<Vec<LibraryImportResult>> {
+    if on_conflict != "skip" && on_conflict != "replace" {
+        return Err(Error::Validation(format!(
+            "{on_conflict:?} is not a valid on_conflict value; use \"skip\" or \"replace\""
+        )));
+    }
+    if bundle.version != BUNDLE_VERSION {
+        return Err(Error::Validation(format!(
+            "bundle version {} is not supported; this mesa understands version {BUNDLE_VERSION}",
+            bundle.version
+        )));
+    }
+
+    Ok(bundle
+        .items
+        .iter()
+        .map(|item| import_one(store, item, on_conflict))
+        .collect())
+}
+
+/// Imports one bundle item, never propagating an error — every outcome,
+/// including a failure, is reported in the returned [`LibraryImportResult`]
+/// so the caller's batch loop stays a plain `map`.
+fn import_one(
+    store: &mut Store,
+    item: &LibraryBundleItem,
+    on_conflict: &str,
+) -> LibraryImportResult {
+    let fail = |error: String| LibraryImportResult {
+        name: item.name.clone(),
+        kind: item.kind,
+        scope: item.scope,
+        status: "failed".to_string(),
+        item_id: None,
+        error: Some(error),
+    };
+
+    let project_id = match (item.scope, &item.project) {
+        (LibraryScope::User, Some(_)) => {
+            return fail("a user-scoped item may not carry a project name".to_string());
+        }
+        (LibraryScope::Project, None) => {
+            return fail("a project-scoped item must carry a project name".to_string());
+        }
+        (LibraryScope::User, None) => None,
+        (LibraryScope::Project, Some(name)) => match store.find_project_by_name(name) {
+            Ok(project) => Some(project.id),
+            Err(e) => return fail(e.to_string()),
+        },
+    };
+
+    let existing = match store.find_library_item(item.kind, item.scope, project_id, &item.name) {
+        Ok(existing) => existing,
+        Err(e) => return fail(e.to_string()),
+    };
+
+    let existing = match existing {
+        Some(existing) => Some(existing),
+        // No row claims this exact (kind, scope, project, name) — but if the
+        // item's builtin_id already has a fork somewhere, creating a second
+        // row for the same builtin_id would be `conflict`. Resolve against
+        // that existing fork instead, per the spec's conflict case.
+        None => match &item.builtin_id {
+            Some(builtin_id) => match store.find_library_fork(builtin_id) {
+                Ok(fork) => fork,
+                Err(e) => return fail(e.to_string()),
+            },
+            None => None,
+        },
+    };
+
+    match existing {
+        None => match store.create_library_item(
+            item.kind,
+            item.scope,
+            project_id,
+            &item.name,
+            &item.body,
+            item.builtin_id.as_deref(),
+        ) {
+            Ok(created) => LibraryImportResult {
+                name: item.name.clone(),
+                kind: item.kind,
+                scope: item.scope,
+                status: "created".to_string(),
+                item_id: created.id,
+                error: None,
+            },
+            Err(e) => fail(e.to_string()),
+        },
+        Some(existing) if on_conflict == "skip" => LibraryImportResult {
+            name: item.name.clone(),
+            kind: item.kind,
+            scope: item.scope,
+            status: "skipped".to_string(),
+            item_id: existing.id,
+            error: None,
+        },
+        Some(existing) => match store.update_library_item(
+            existing.id.expect("a matched row always has an id"),
+            LibraryPatch {
+                body: Some(item.body.clone()),
+                ..Default::default()
+            },
+        ) {
+            Ok(updated) => LibraryImportResult {
+                name: item.name.clone(),
+                kind: item.kind,
+                scope: item.scope,
+                status: "replaced".to_string(),
+                item_id: updated.id,
+                error: None,
+            },
+            Err(e) => fail(e.to_string()),
+        },
     }
 }
 
@@ -1645,5 +1822,246 @@ mod tests {
             }
             assert!(rows.iter().all(|r| r.kind != LibraryKind::Prompt));
         });
+    }
+
+    // ---- export / import (mesa task 963) ----
+
+    #[test]
+    fn export_omits_unshadowed_builtins_but_includes_a_forked_one() {
+        let (mut store, _dir) = temp_store();
+        store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "live-agent-prompt",
+                "a custom prompt",
+                Some("live-agent-prompt"),
+            )
+            .unwrap();
+
+        let bundle = export(&store, None).unwrap();
+        assert_eq!(bundle.version, BUNDLE_VERSION);
+
+        let forked = bundle
+            .items
+            .iter()
+            .find(|i| i.name == "live-agent-prompt")
+            .expect("a forked built-in must be exported");
+        assert_eq!(forked.builtin_id.as_deref(), Some("live-agent-prompt"));
+        assert_eq!(forked.body, "a custom prompt");
+
+        // live-summary-prompt was never forked, so it must not appear at all.
+        assert!(
+            bundle.items.iter().all(|i| i.name != "live-summary-prompt"),
+            "an unshadowed built-in must never be exported: {:?}",
+            bundle.items
+        );
+    }
+
+    #[test]
+    fn export_omits_the_sync_baseline() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(pid),
+                "reviewer",
+                "mesa body",
+                None,
+            )
+            .unwrap();
+        // Diverge the baseline from the mesa body to prove it never leaks in
+        // — the bundle item type itself carries no synced_body/synced_at
+        // field, so this asserts the exported *content* too.
+        store
+            .set_library_synced(item.id.unwrap(), "a stale baseline body")
+            .unwrap();
+
+        let bundle = export(&store, Some(pid)).unwrap();
+        let exported = bundle.items.iter().find(|i| i.name == "reviewer").unwrap();
+        assert_eq!(exported.body, "mesa body");
+    }
+
+    #[test]
+    fn export_names_the_project_for_a_project_scoped_item() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(pid),
+                "reviewer",
+                "reviewer body",
+                None,
+            )
+            .unwrap();
+        store
+            .create_library_item(
+                LibraryKind::Hook,
+                LibraryScope::User,
+                None,
+                "my-hook",
+                "hook body",
+                None,
+            )
+            .unwrap();
+
+        let bundle = export(&store, Some(pid)).unwrap();
+
+        let project_item = bundle.items.iter().find(|i| i.name == "reviewer").unwrap();
+        assert_eq!(project_item.scope, LibraryScope::Project);
+        assert_eq!(project_item.project.as_deref(), Some("proj"));
+
+        let user_item = bundle.items.iter().find(|i| i.name == "my-hook").unwrap();
+        assert_eq!(user_item.scope, LibraryScope::User);
+        assert_eq!(user_item.project, None);
+    }
+
+    fn bundle_of(items: Vec<LibraryBundleItem>) -> LibraryBundle {
+        LibraryBundle {
+            version: BUNDLE_VERSION,
+            exported_at: "2026-01-01T00:00:00".to_string(),
+            items,
+        }
+    }
+
+    #[test]
+    fn import_creates_then_skips_then_replaces() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![LibraryBundleItem {
+            name: "my-hook".to_string(),
+            kind: LibraryKind::Hook,
+            scope: LibraryScope::User,
+            project: None,
+            body: "original body".to_string(),
+            builtin_id: None,
+        }]);
+
+        let results = import(&mut store, &bundle, "skip").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "created");
+        let id = results[0].item_id.expect("a created row has an id");
+        assert_eq!(store.get_library_item(id).unwrap().body, "original body");
+
+        // A second import with the default policy leaves it entirely untouched.
+        let results = import(&mut store, &bundle, "skip").unwrap();
+        assert_eq!(results[0].status, "skipped");
+        assert_eq!(results[0].item_id, Some(id));
+        assert_eq!(store.get_library_item(id).unwrap().body, "original body");
+
+        // Re-import with `replace` after the source changed updates the body.
+        let mut changed = bundle;
+        changed.items[0].body = "new body".to_string();
+        let results = import(&mut store, &changed, "replace").unwrap();
+        assert_eq!(results[0].status, "replaced");
+        assert_eq!(results[0].item_id, Some(id));
+        assert_eq!(store.get_library_item(id).unwrap().body, "new body");
+    }
+
+    #[test]
+    fn import_fails_only_the_item_with_an_unknown_project() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![
+            LibraryBundleItem {
+                name: "reviewer".to_string(),
+                kind: LibraryKind::Agent,
+                scope: LibraryScope::Project,
+                project: Some("no-such-project".to_string()),
+                body: "reviewer body".to_string(),
+                builtin_id: None,
+            },
+            LibraryBundleItem {
+                name: "my-hook".to_string(),
+                kind: LibraryKind::Hook,
+                scope: LibraryScope::User,
+                project: None,
+                body: "hook body".to_string(),
+                builtin_id: None,
+            },
+        ]);
+
+        let results = import(&mut store, &bundle, "skip").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].status, "failed");
+        assert!(results[0].error.is_some());
+        assert_eq!(results[1].status, "created");
+    }
+
+    #[test]
+    fn import_refuses_an_unknown_bundle_version_whole() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![LibraryBundleItem {
+            name: "my-hook".to_string(),
+            kind: LibraryKind::Hook,
+            scope: LibraryScope::User,
+            project: None,
+            body: "hook body".to_string(),
+            builtin_id: None,
+        }]);
+        let mut unknown_version = bundle;
+        unknown_version.version = 99;
+
+        let err = import(&mut store, &unknown_version, "skip").unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(
+            store
+                .list_library_items(None)
+                .unwrap()
+                .iter()
+                .all(|i| i.name != "my-hook"),
+            "nothing must be written when the whole bundle is refused"
+        );
+    }
+
+    #[test]
+    fn import_rejects_an_unknown_on_conflict_value_for_the_whole_call() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![LibraryBundleItem {
+            name: "my-hook".to_string(),
+            kind: LibraryKind::Hook,
+            scope: LibraryScope::User,
+            project: None,
+            body: "hook body".to_string(),
+            builtin_id: None,
+        }]);
+
+        let err = import(&mut store, &bundle, "merge").unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(store.list_library_items(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_fails_only_the_item_with_a_bad_name() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![
+            LibraryBundleItem {
+                name: "../evil".to_string(),
+                kind: LibraryKind::Hook,
+                scope: LibraryScope::User,
+                project: None,
+                body: "evil body".to_string(),
+                builtin_id: None,
+            },
+            LibraryBundleItem {
+                name: "my-hook".to_string(),
+                kind: LibraryKind::Hook,
+                scope: LibraryScope::User,
+                project: None,
+                body: "hook body".to_string(),
+                builtin_id: None,
+            },
+        ]);
+
+        let results = import(&mut store, &bundle, "skip").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].status, "failed");
+        assert!(results[0].error.is_some());
+        assert_eq!(results[1].status, "created");
     }
 }

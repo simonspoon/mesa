@@ -1703,6 +1703,67 @@ pub struct LibrarySyncResult {
     pub error: Option<String>,
 }
 
+// ---- library import/export (mesa task 963) ----
+//
+// A bundle is a downloadable snapshot of a library's *contents*, portable to
+// another mesa instance — `core::library::export`/`import`. It deliberately
+// carries none of a row's machine-local facts: no `id`, `created_at` or
+// `updated_at` (identity/bookkeeping on this database), no `synced_body` or
+// `synced_at` (a fact about *this machine's* disk that must never travel),
+// no `path` (derived), and no version history (a bundle is contents, not a
+// past). An unshadowed built-in is never included — it is code, not a row,
+// and identical on the receiving instance by construction — while a
+// *forked* built-in travels, carrying its `builtin_id` so it lands as a
+// fork on the far side too.
+
+/// One library row as it travels between mesa instances.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryBundleItem {
+    pub name: String,
+    pub kind: LibraryKind,
+    pub scope: LibraryScope,
+    /// The project's NAME, not its id — ids are machine-local. Present iff
+    /// `scope` is `project`, resolved back to an id on import via
+    /// `Store::find_project_by_name`.
+    pub project: Option<String>,
+    pub body: String,
+    /// The built-in this row forked from, so a fork imports as a fork.
+    pub builtin_id: Option<String>,
+}
+
+/// A downloadable bundle of a library's contents (`core::library::export`),
+/// portable to another mesa instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryBundle {
+    /// Format version; `1` today. A bundle whose version this mesa does not
+    /// know is refused whole, not partly applied (`core::library::import`).
+    pub version: u32,
+    pub exported_at: String,
+    pub items: Vec<LibraryBundleItem>,
+}
+
+/// The outcome of importing one bundle item. Import is per-item, not
+/// all-or-nothing — a failing item is reported here and the rest still
+/// apply. (Deliberately the same posture as `LibrarySyncResult`.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryImportResult {
+    pub name: String,
+    pub kind: LibraryKind,
+    pub scope: LibraryScope,
+    /// `created | replaced | skipped | failed`.
+    pub status: String,
+    /// The db id of the row this item resolved to — the one created,
+    /// replaced, or left untouched by a `skip`, which is how a caller
+    /// identifies the row that won a conflict it did not overwrite. Null
+    /// only for `failed`, where no row was reached at all.
+    #[ts(type = "number | null")]
+    pub item_id: Option<i64>,
+    pub error: Option<String>,
+}
+
 // ---- CC Dashboard (Claude Code telemetry) ----
 //
 // Read-only analytics derived from Claude Code's own session transcripts

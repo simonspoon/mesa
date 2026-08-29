@@ -36,6 +36,8 @@ import type { GitCommitFile } from './types/GitCommitFile'
 import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { InboxKind } from './types/InboxKind'
+import type { LibraryBundle } from './types/LibraryBundle'
+import type { LibraryImportResult } from './types/LibraryImportResult'
 import type { LibraryItem } from './types/LibraryItem'
 import type { LibraryKind } from './types/LibraryKind'
 import type { LibraryScope } from './types/LibraryScope'
@@ -1424,4 +1426,20 @@ export function applyLibrarySync(
     '/api/library/sync',
     jsonInit('POST', { project_id: projectId, resolutions }),
   )
+}
+
+/** The whole library as a portable bundle (mesa task 963) — db rows only, no
+ * unshadowed built-in. Always unscoped: the Library page has no
+ * project-scope concept (`listLibrary()` above is called the same way). */
+export function exportLibrary(): Promise<LibraryBundle> {
+  return request('/api/library/export')
+}
+
+/** Imports a bundle. Per-item, not all-or-nothing — a failing item is
+ * reported in its own result and the rest still apply. */
+export function importLibrary(
+  bundle: LibraryBundle,
+  onConflict: 'skip' | 'replace',
+): Promise<LibraryImportResult[]> {
+  return request('/api/library/import', jsonInit('POST', { bundle, on_conflict: onConflict }))
 }

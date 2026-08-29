@@ -1,10 +1,12 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   applyLibrarySync,
   createLibraryItem,
   deleteLibraryItem,
+  exportLibrary,
   forkLibraryItem,
   getLibrarySync,
+  importLibrary,
   listLibrary,
   listLibraryVersions,
   listProjects,
@@ -12,6 +14,7 @@ import {
 } from '../api'
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
+import { bundleFilename, parseBundle, summarizeImport } from '../libraryBundle'
 import {
   LIBRARY_KINDS,
   LIBRARY_SCOPES,
@@ -416,6 +419,60 @@ export function LibraryView() {
   const [showingVersions, setShowingVersions] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
 
+  // Export/import (mesa task 963). The page itself is unscoped (there is no
+  // page-level project picker — `listLibrary()` above already reads only
+  // user-scope rows plus built-ins), so export follows suit and never sends
+  // `?project=`.
+  const [onConflict, setOnConflict] = useState<'skip' | 'replace'>('skip')
+  const [importing, setImporting] = useState(false)
+  const [bundleError, setBundleError] = useState<string | null>(null)
+  const [importSummary, setImportSummary] = useState<string | null>(null)
+  const importInputRef = useRef<HTMLInputElement>(null)
+
+  function handleExport() {
+    setBundleError(null)
+    exportLibrary().then(
+      (bundle) => {
+        const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = bundleFilename(new Date())
+        a.click()
+        URL.revokeObjectURL(url)
+      },
+      (err: unknown) => setBundleError(err instanceof Error ? err.message : String(err)),
+    )
+  }
+
+  function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0] ?? null
+    e.target.value = ''
+    if (file === null) return
+    setBundleError(null)
+    setImportSummary(null)
+    setImporting(true)
+    file.text().then((text) => {
+      const parsed = parseBundle(text)
+      if ('error' in parsed) {
+        setImporting(false)
+        setBundleError(parsed.error)
+        return
+      }
+      importLibrary(parsed.bundle, onConflict).then(
+        (results) => {
+          setImporting(false)
+          setImportSummary(summarizeImport(results))
+          refetch()
+        },
+        (err: unknown) => {
+          setImporting(false)
+          setBundleError(err instanceof Error ? err.message : String(err))
+        },
+      )
+    })
+  }
+
   const grouped = LIBRARY_KINDS.map((kind) => ({
     kind,
     items: (items ?? []).filter((i) => i.kind === kind),
@@ -438,7 +495,34 @@ export function LibraryView() {
         <button type="button" onClick={() => setSyncing(true)}>
           sync
         </button>
+        <button type="button" onClick={handleExport}>
+          export
+        </button>
+        <select
+          value={onConflict}
+          onChange={(e) => setOnConflict(e.target.value as 'skip' | 'replace')}
+        >
+          <option value="skip">on conflict: skip</option>
+          <option value="replace">on conflict: replace</option>
+        </select>
+        <button
+          type="button"
+          disabled={importing}
+          onClick={() => importInputRef.current?.click()}
+        >
+          {importing ? 'importing…' : 'import'}
+        </button>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json"
+          hidden
+          onChange={handleImportFile}
+        />
       </div>
+
+      {bundleError !== null && <p className="error">{bundleError}</p>}
+      {importSummary !== null && <p className="muted">{importSummary}</p>}
 
       {editing === 'new' && (
         <LibraryForm

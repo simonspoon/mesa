@@ -42,7 +42,18 @@
 #      off `config.json`'s `live.prompt`): with nothing forked, `live start`
 #      spawns the agent with the built-in block; with `live-agent-prompt`
 #      forked to a different body, that body REPLACES the built-in while the
-#      session line is still appended.
+#      session line is still appended;
+#  10. import/export (mesa task 963): a CLI round trip (a user row plus a
+#      forked built-in export, with no unshadowed built-in and none of
+#      id/synced_*/created_at/updated_at/path on an item), importing that
+#      bundle into a second, empty db (bodies byte-identical, the fork still
+#      carrying its builtin_id, a project-scoped item whose project doesn't
+#      exist there failing alone while the rest of the batch still applies),
+#      re-import (skip leaves bodies untouched, replace overwrites), an
+#      unknown bundle version refusing the whole import with nothing written,
+#      `--output` refusing to clobber an existing path, `--quiet` rejected on
+#      both commands, and the two new routes added to the loopback-gate
+#      sweeps (now eleven routes) in both serve modes.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -649,19 +660,44 @@ NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
 [ "$NO_CT" = "415" ] || fail "POST fork without Content-Type: expected 415, got $NO_CT"
 NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/library/sync")
 [ "$NO_CT" = "415" ] || fail "POST /api/library/sync without Content-Type: expected 415, got $NO_CT"
-ok "every mutating /api/library route (incl. fork and sync apply) without a JSON Content-Type is 415"
+NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -d '{"bundle":{"version":1,"exported_at":"x","items":[]}}' "http://127.0.0.1:$PORT/api/library/import")
+[ "$NO_CT" = "415" ] || fail "POST /api/library/import without Content-Type: expected 415, got $NO_CT"
+ok "every mutating /api/library route (incl. fork, sync apply and import) without a JSON Content-Type is 415"
+
+# ---- export / import (mesa task 963) ----
+
+api 200 GET /api/library/export
+[ "$(jqb .version)" = "1" ] || fail "API export: version"
+[ "$(jqb type)" = "object" ] || fail "API export: object"
+[ "$(jqb '.items | type')" = "array" ] || fail "API export: items array"
+ok "GET /api/library/export: 200 + LibraryBundle {version, exported_at, items[]}"
+
+api 422 POST /api/library/import '{not json'
+ok "POST /api/library/import with unparseable JSON: 422 (JsonRejection, never a 500)"
+
+api 422 POST /api/library/import \
+  '{"bundle":{"version":1,"exported_at":"x","items":[]},"on_conflict":"bogus"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "API import unknown on_conflict: error.code"
+ok "POST /api/library/import with an unknown on_conflict value: 422 validation"
+
+api 200 POST /api/library/import '{"bundle":{"version":1,"exported_at":"x","items":[]}}'
+[ "$(jqb type)" = "array" ] || fail "API import: bare array"
+[ "$(jqb length)" = "0" ] || fail "API import of an empty bundle: expected an empty results array"
+ok "POST /api/library/import: 200 + LibraryImportResult[] (on_conflict omitted -> defaults to skip)"
 
 # ================= 8. gates: default mode =================
-# All NINE library routes are loopback-only in BOTH serve modes — including
-# the three reads (list/show/versions), not just the five mutations and the
-# two sync routes: a row's body IS an agent definition, a hook shell script or
-# a CLAUDE.md, the same bytes the sync routes read off disk once it is
-# written there, so serving that content to a LAN peer over GET while writing
-# and syncing it stay loopback-only would be a distinction with no security
-# content. Every curl below originates on this machine, so the server always
-# sees a LOOPBACK peer — what these assertions pin is the Host/Origin half of
-# the same gate (the peer-address half is pinned by the Rust unit tests in
-# api.rs).
+# All ELEVEN library routes are loopback-only in BOTH serve modes — including
+# the three reads (list/show/versions), not just the five mutations, the two
+# sync routes and the two bundle routes (export/import, mesa task 963): a
+# row's body IS an agent definition, a hook shell script or a CLAUDE.md, the
+# same bytes the sync routes read off disk once it is written there (and a
+# bundle is just every one of those bytes at once), so serving that content
+# to a LAN peer over GET while writing and syncing it stay loopback-only
+# would be a distinction with no security content. Every curl below
+# originates on this machine, so the server always sees a LOOPBACK peer —
+# what these assertions pin is the Host/Origin half of the same gate (the
+# peer-address half is pinned by the Rust unit tests in api.rs).
 
 raw() { # raw <method> <path> [extra curl args...]
   local method=$1 path=$2; shift 2
@@ -680,7 +716,9 @@ raw GET "/api/library/$AN" -H "Host: evil.example"
 [ "$STATUS" = "403" ] || fail "default: GET /api/library/{id} with a foreign Host must be 403"
 raw GET "/api/library/$AN/versions" -H "Host: evil.example"
 [ "$STATUS" = "403" ] || fail "default: GET /api/library/{id}/versions with a foreign Host must be 403"
-ok "default mode: show and versions carry the same gate as list"
+raw GET /api/library/export -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "default: GET /api/library/export with a foreign Host must be 403"
+ok "default mode: show, versions and export carry the same gate as list"
 
 api 201 POST /api/library '{"kind":"prompt","scope":"user","name":"gate-fixture","body":"x"}'
 GATE_ID=$(jqb .id)
@@ -701,6 +739,9 @@ raw GET /api/library/sync -H "Host: evil.example"
 raw POST /api/library/sync -H "Host: evil.example" -H 'Content-Type: application/json' \
   -d '{"resolutions":[]}'
 [ "$STATUS" = "403" ] || fail "default: POST /api/library/sync with a foreign Host must be 403"
+raw POST /api/library/import -H "Host: evil.example" -H 'Content-Type: application/json' \
+  -d '{"bundle":{"version":1,"exported_at":"x","items":[]}}'
+[ "$STATUS" = "403" ] || fail "default: import with a foreign Host must be 403"
 api 200 GET "/api/library/$GATE_ID"
 [ "$(jqb .body)" = "x" ] || fail "default: a refused authoring request must write nothing"
 ok "default mode: every mutating route AND both sync routes reject a foreign Host, writing nothing"
@@ -710,9 +751,10 @@ wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
 
 # ================= gates: --lan mode =================
-# `--lan` skips the GLOBAL Host allowlist, but every one of the NINE library
-# routes — the three reads (list/show/versions) as much as the five
-# mutations and the two sync routes — sits behind `require_local_path_write`,
+# `--lan` skips the GLOBAL Host allowlist, but every one of the ELEVEN
+# library routes — the three reads (list/show/versions) as much as the five
+# mutations, the two sync routes and the two bundle routes (export/import) —
+# sits behind `require_local_path_write`,
 # which layers its own rebinding/cross-site defense
 # (`require_lan_page_access`) on top of an actual-loopback-peer check. Every
 # curl here originates on this machine, so the real TCP peer is ALWAYS
@@ -769,16 +811,22 @@ ok "--lan: GET /api/library accepts a local/IP-literal Host with a matching Orig
   fail "--lan: GET /api/library/{id} must accept an IP-literal Host, same as list"
 [ "$(lan_req GET "/api/library/$GATE_ID/versions" "192.0.2.7:$LAN_PORT")" = "200" ] ||
   fail "--lan: GET /api/library/{id}/versions must accept an IP-literal Host, same as list"
-ok "--lan: show and versions accept a valid local request too"
+[ "$(lan_req GET /api/library/export "192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: GET /api/library/export must accept an IP-literal Host, same as list"
+ok "--lan: show, versions and export accept a valid local request too"
 
 LVS=$(lan_req POST /api/library "127.0.0.1:$LAN_PORT" '' '{"kind":"prompt","scope":"user","name":"lan-loopback-check","body":"x"}')
 [ "$LVS" = "201" ] ||
   fail "--lan: authoring from this machine's own local Host must still work (the flag never locks the owner out)"
-ok "--lan: authoring from a loopback peer with a local Host still works (the flag never locks the owner out)"
+LIS=$(lan_req POST /api/library/import "127.0.0.1:$LAN_PORT" '' '{"bundle":{"version":1,"exported_at":"x","items":[]}}')
+[ "$LIS" = "200" ] ||
+  fail "--lan: importing from this machine's own local Host must still work (the flag never locks the owner out)"
+ok "--lan: authoring (incl. import) from a loopback peer with a local Host still works (the flag never locks the owner out)"
 
-# All NINE routes: a DNS-name Host (rebinding) and a foreign Origin
-# (cross-site) are each refused — reads exactly as strictly as mutations and
-# both sync routes, since every one of them shares LIBRARY_LOOPBACK.
+# All ELEVEN routes: a DNS-name Host (rebinding) and a foreign Origin
+# (cross-site) are each refused — reads exactly as strictly as mutations, the
+# two sync routes and the two bundle routes, since every one of them shares
+# LIBRARY_LOOPBACK.
 for CASE in \
   "GET|/api/library|" \
   "GET|/api/library/$GATE_ID|" \
@@ -789,6 +837,8 @@ for CASE in \
   "POST|/api/library/builtins/starter-claude-md/fork|{\"body\":\"x\"}" \
   "GET|/api/library/sync|" \
   "POST|/api/library/sync|{\"resolutions\":[]}" \
+  "GET|/api/library/export|" \
+  "POST|/api/library/import|{\"bundle\":{\"version\":1,\"exported_at\":\"x\",\"items\":[]}}" \
 ; do
   IFS='|' read -r METHOD PATH_ BODY_ <<<"$CASE"
   S=$(lan_req "$METHOD" "$PATH_" "evil.example:$LAN_PORT" '' "$BODY_")
@@ -798,7 +848,7 @@ for CASE in \
   [ "$S" = "403" ] ||
     fail "--lan: $METHOD $PATH_ from a foreign Origin must be 403, got $S"
 done
-ok "--lan: all nine library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
+ok "--lan: all eleven library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
 
 api2() { # api2 <expected-status> <method> <path> [json-body] — against LAN_PORT, local Host
   local expected=$1 method=$2 path=$3 body=${4:-}
@@ -823,6 +873,10 @@ LAN_NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Host: 127.0.0.1:$
   "http://127.0.0.1:$LAN_PORT/api/library/sync")
 [ "$LAN_NO_CT" = "415" ] ||
   fail "--lan: POST /api/library/sync with no Content-Type must still be 415, got $LAN_NO_CT"
+LAN_NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Host: 127.0.0.1:$LAN_PORT" \
+  -d '{"bundle":{"version":1,"exported_at":"x","items":[]}}' "http://127.0.0.1:$LAN_PORT/api/library/import")
+[ "$LAN_NO_CT" = "415" ] ||
+  fail "--lan: POST /api/library/import with no Content-Type must still be 415, got $LAN_NO_CT"
 ok "--lan: the Content-Type gate still fires on /api/library (the two halves never drift apart)"
 
 kill "$LAN_PID" 2>/dev/null || true
@@ -867,6 +921,157 @@ grep -q "You are driving mesa live session $S2\." "$STUB_DIR/last-prompt" ||
   fail "the session line must still be appended after a forked prompt: $(cat "$STUB_DIR/last-prompt")"
 run 0 "$MESA" live stop
 ok "with live-agent-prompt forked to a different body, that body REPLACES the built-in (mesa never appends to it) while the session line is still appended"
+
+echo "== library-check: section 9 (live prompt) passed ($CHECKS checks so far) =="
+
+# ================= 10. import / export (mesa task 963) =================
+# `starter-claude-md` is already forked (section 7, over the API) with body
+# "custom claude.md" — reused here as the "a forked built-in" fixture rather
+# than forking a second one.
+
+run 0 "$MESA" library create prompt export-user-note 'exported body'
+ok "fixture: a fresh user-scope row for the export/import round trip"
+
+# ---- CLI export: shape of one bundle ----
+
+run 0 "$MESA" library export
+[ "$(jqs .version)" = "1" ] || fail "CLI export: version"
+[ "$(jqs .exported_at)" != "null" ] || fail "CLI export: exported_at"
+[ "$(jqs '.items | type')" = "array" ] || fail "CLI export: items array"
+
+NOTE_ITEM=$(jqs '.items[] | select(.name=="export-user-note")')
+[ -n "$NOTE_ITEM" ] || fail "CLI export: export-user-note must be present"
+[ "$(jq -r '.kind' <<<"$NOTE_ITEM")" = "prompt" ] || fail "CLI export item: kind"
+[ "$(jq -r '.scope' <<<"$NOTE_ITEM")" = "user" ] || fail "CLI export item: scope"
+[ "$(jq -r '.project' <<<"$NOTE_ITEM")" = "null" ] || fail "CLI export item: project null for a user-scope row"
+[ "$(jq -r '.body' <<<"$NOTE_ITEM")" = "exported body" ] || fail "CLI export item: body"
+[ "$(jq -r '.builtin_id' <<<"$NOTE_ITEM")" = "null" ] || fail "CLI export item: builtin_id null for a plain row"
+for KEY in id synced_body synced_at created_at updated_at path; do
+  [ "$(jq --arg k "$KEY" 'has($k)' <<<"$NOTE_ITEM")" = "false" ] ||
+    fail "CLI export item: must carry no '$KEY' key, got $NOTE_ITEM"
+done
+ok "CLI library export: bundle {version, exported_at, items[]}, an item carries no id/synced_*/created_at/updated_at/path"
+
+FORK_ITEM=$(jqs '.items[] | select(.name=="starter-claude-md")')
+[ -n "$FORK_ITEM" ] || fail "CLI export: the forked built-in starter-claude-md must be present"
+[ "$(jq -r '.builtin_id' <<<"$FORK_ITEM")" = "starter-claude-md" ] ||
+  fail "CLI export: a forked built-in must carry its builtin_id"
+[ "$(jq -r '.body' <<<"$FORK_ITEM")" = "custom claude.md" ] || fail "CLI export: forked body"
+ok "CLI library export: a forked built-in travels, carrying its builtin_id"
+
+[ "$(jqs '[.items[] | select(.name=="live-summary-prompt")] | length')" = "0" ] ||
+  fail "CLI export: an UNshadowed built-in (live-summary-prompt) must never be exported"
+ok "CLI library export: no unshadowed built-in appears in the bundle"
+
+# ---- --output: writes a file, refuses to clobber an existing one ----
+
+run 0 "$MESA" library export --output "$TMP/bundle-out.json"
+[ "$(jqs .path)" = "$TMP/bundle-out.json" ] || fail "CLI export --output: prints {path, items}"
+[ "$(jqs '.items | type')" = "number" ] || fail "CLI export --output: items must be a number"
+[ -f "$TMP/bundle-out.json" ] || fail "CLI export --output: file must be written"
+[ "$(jq -r .version < "$TMP/bundle-out.json")" = "1" ] || fail "CLI export --output: file holds a real bundle"
+BEFORE=$(cat "$TMP/bundle-out.json")
+
+run 1 "$MESA" library export --output "$TMP/bundle-out.json"
+[ "$(jqe .error.code)" = "conflict" ] || fail "CLI export --output existing path: error.code"
+[ "$(cat "$TMP/bundle-out.json")" = "$BEFORE" ] || fail "CLI export --output existing path: file must be untouched"
+ok "CLI library export --output: writes {path, items}, and refuses to clobber an existing path leaving it untouched"
+
+# ---- --quiet is not defined on export/import: exit 2 usage ----
+
+run 2 "$MESA" library export --quiet
+[ "$(jqe .error.code)" = "usage" ] || fail "--quiet on export: code=usage"
+run 2 "$MESA" library import /no/such/file --quiet
+[ "$(jqe .error.code)" = "usage" ] || fail "--quiet on import: code=usage"
+ok "--quiet on library export/import: rejected as an unknown argument, exit 2 usage"
+
+# ---- CLI import round trip, into a second, empty db ----
+
+run 0 "$MESA" library export --output "$TMP/roundtrip.json"
+MESA_DB_2="$TMP/mesa2.db"
+
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library import "$TMP/roundtrip.json"
+RESULTS=$STDOUT
+NOTE_RESULT=$(jq '.[] | select(.name=="export-user-note")' <<<"$RESULTS")
+[ "$(jq -r .status <<<"$NOTE_RESULT")" = "created" ] || fail "import round trip: export-user-note must be created"
+[ "$(jq -r .item_id <<<"$NOTE_RESULT")" != "null" ] || fail "import round trip: created item must carry an item_id"
+
+FORK_RESULT=$(jq '.[] | select(.name=="starter-claude-md")' <<<"$RESULTS")
+[ "$(jq -r .status <<<"$FORK_RESULT")" = "created" ] || fail "import round trip: starter-claude-md must be created"
+
+# `library export` with no project scopes to user-scope rows only (the same
+# rule `list` follows), so the project-scoped `reviewer` row from section 1
+# never appears in the bundle above. Export it explicitly, scoped to its
+# project, into a fresh third db that has no such project at all.
+run 0 "$MESA" library export "Library project" --output "$TMP/project-scoped.json"
+[ "$(jq -r '.items[] | select(.name=="reviewer") | .project' "$TMP/project-scoped.json")" \
+  = "Library project" ] || fail "CLI export PROJECT: reviewer must travel with its project's NAME"
+MESA_DB_3="$TMP/mesa3.db"
+run 0 env MESA_DB="$MESA_DB_3" "$MESA" library import "$TMP/project-scoped.json"
+RESULTS=$STDOUT
+REVIEWER_RESULT=$(jq '.[] | select(.name=="reviewer")' <<<"$RESULTS")
+[ "$(jq -r .status <<<"$REVIEWER_RESULT")" = "failed" ] ||
+  fail "import round trip: reviewer (project-scoped to a project absent on the far side) must fail alone"
+[ "$(jq -r .item_id <<<"$REVIEWER_RESULT")" = "null" ] || fail "import round trip: a failed item carries no item_id"
+[ "$(jq -r .error <<<"$REVIEWER_RESULT")" != "null" ] || fail "import round trip: a failed item carries an error"
+NOTE_RESULT=$(jq '.[] | select(.name=="export-user-note")' <<<"$RESULTS")
+[ "$(jq -r .status <<<"$NOTE_RESULT")" = "created" ] ||
+  fail "import round trip: the rest of the batch must still apply alongside the one failure"
+ok "import: a project-scoped item whose project doesn't exist on the far side fails alone; the rest of the batch still applies"
+
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library show export-user-note
+[ "$(jqs .body)" = "exported body" ] || fail "import round trip: body must be byte-identical"
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library show starter-claude-md
+[ "$(jqs .body)" = "custom claude.md" ] || fail "import round trip: forked body must be byte-identical"
+[ "$(jqs .builtin_id)" = "starter-claude-md" ] || fail "import round trip: the fork must still carry its builtin_id"
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library list
+[ "$(jqs 'map(select(.builtin_id=="starter-claude-md" and .id==null)) | length')" = "0" ] ||
+  fail "import round trip: the built-in it shadows must no longer be offered unshadowed"
+ok "import into a second, empty db reproduces the rows: bodies byte-identical, the fork carrying its builtin_id, the shadowed built-in no longer unshadowed"
+
+# ---- re-import: default (skip) leaves bodies untouched; replace overwrites ----
+
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library import "$TMP/roundtrip.json"
+NOTE_RESULT=$(jqs '.[] | select(.name=="export-user-note")')
+[ "$(jq -r .status <<<"$NOTE_RESULT")" = "skipped" ] || fail "re-import (default): export-user-note must be skipped"
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library show export-user-note
+[ "$(jqs .body)" = "exported body" ] || fail "re-import (default): body must be untouched"
+ok "re-import with the default policy: skipped, bodies untouched"
+
+run 0 "$MESA" library update export-user-note --body 'exported body v2'
+run 0 "$MESA" library export --output "$TMP/roundtrip2.json"
+
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library import "$TMP/roundtrip2.json"
+NOTE_RESULT=$(jqs '.[] | select(.name=="export-user-note")')
+[ "$(jq -r .status <<<"$NOTE_RESULT")" = "skipped" ] ||
+  fail "re-import (default) after editing the source: must still skip"
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library show export-user-note
+[ "$(jqs .body)" = "exported body" ] || fail "re-import (default) after editing the source: body must be untouched"
+
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library import "$TMP/roundtrip2.json" --on-conflict replace
+NOTE_RESULT=$(jqs '.[] | select(.name=="export-user-note")')
+[ "$(jq -r .status <<<"$NOTE_RESULT")" = "replaced" ] || fail "re-import --on-conflict replace: must replace"
+run 0 env MESA_DB="$MESA_DB_2" "$MESA" library show export-user-note
+[ "$(jqs .body)" = "exported body v2" ] || fail "re-import --on-conflict replace: new body must be present"
+ok "re-import with --on-conflict replace after editing the source: replaced, the new body present"
+
+# ---- unknown bundle version: validation, exit 1, nothing written ----
+
+jq '.version = 999' "$TMP/roundtrip.json" > "$TMP/badversion.json"
+MESA_DB_4="$TMP/mesa4.db"
+run 1 env MESA_DB="$MESA_DB_4" "$MESA" library import "$TMP/badversion.json"
+[ "$(jqe .error.code)" = "validation" ] || fail "import unknown version: error.code"
+run 0 env MESA_DB="$MESA_DB_4" "$MESA" library list
+[ "$(jqs '[.[] | select(.id != null)] | length')" = "0" ] ||
+  fail "import unknown version: nothing must be written, got $STDOUT"
+ok "import of a bundle with an unknown version: exit 1 validation, nothing written"
+
+echo 'not a bundle' > "$TMP/malformed.json"
+run 1 "$MESA" library import "$TMP/malformed.json"
+[ "$(jqe .error.code)" = "validation" ] || fail "import unparseable bundle: error.code"
+ok "import of an unparseable bundle: exit 1 validation"
+
+echo "== library-check: section 10 (import/export) passed ($CHECKS checks so far) =="
 
 echo
 echo "library-check: $CHECKS checks passed"

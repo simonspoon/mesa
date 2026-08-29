@@ -26,10 +26,10 @@ use serde_json::json;
 use crate::core::{
     Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
     Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
-    LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveRole,
-    LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch,
-    ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
-    TaskPatch, TaskReceipt, agents, config, library, live, look, receipt,
+    LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus,
+    LiveAction, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority,
+    Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch,
+    Status, Store, Task, TaskPatch, TaskReceipt, agents, config, library, live, look, receipt,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1207,6 +1207,44 @@ EXAMPLES
     /// Compare mesa's library against the files on disk, and reconcile
     #[command(subcommand)]
     Sync(LibrarySyncCmd),
+    /// Snapshot the library into a portable bundle (db rows only; no `--quiet`)
+    ///
+    /// Unshadowed built-ins never travel — they are code, identical on the
+    /// receiving instance by construction. A forked built-in DOES travel,
+    /// carrying its `builtin_id` so it lands as a fork on the far side too.
+    #[command(after_help = "\
+EXAMPLES
+  mesa library export > my-library.json
+  mesa library export mesa --output mesa-library.json")]
+    Export {
+        /// Only this project's project-scope rows; user-scope rows are always
+        /// included
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Write the bundle here instead of stdout; refuses an existing path
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+    },
+    /// Apply a bundle from `export`; prints the per-item results (no `--quiet`)
+    ///
+    /// Each item resolves independently against any existing row at its
+    /// (kind, scope, project, name) — a failure never aborts the batch. An
+    /// unrecognised bundle `version` refuses the whole call before anything
+    /// is written.
+    #[command(after_help = "\
+EXAMPLES
+  mesa library import my-library.json
+  mesa library import - --on-conflict replace < my-library.json")]
+    Import {
+        /// Bundle file to read (`-` = stdin)
+        path: String,
+        /// skip|replace an existing row at the same (kind, scope, project, name)
+        #[arg(long, default_value = "skip")]
+        on_conflict: String,
+    },
 }
 
 /// `mesa library sync status|apply` — mesa task 919's per-file reconciliation
@@ -4267,6 +4305,33 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
             }
         }
         LibraryCmd::Sync(sync_cmd) => run_library_sync_cmd(&mut store, sync_cmd)?,
+        LibraryCmd::Export {
+            project_pos,
+            project,
+            output,
+        } => {
+            let project = resolve_project_opt(&store, project.or(project_pos).as_deref())?;
+            let bundle = library::export(&store, project)?;
+            match output {
+                None => print_json(&bundle),
+                Some(path) => {
+                    if std::path::Path::new(&path).exists() {
+                        return Err(Error::Conflict(format!("{path} already exists")));
+                    }
+                    let json = serde_json::to_string(&bundle).expect("json serialize");
+                    std::fs::write(&path, json)?;
+                    print_json(&json!({"path": path, "items": bundle.items.len()}));
+                }
+            }
+        }
+        LibraryCmd::Import { path, on_conflict } => {
+            let mut stdin_used = false;
+            let text = resolve_field(None, Some(path), &mut stdin_used)?.unwrap_or_default();
+            let bundle: LibraryBundle = serde_json::from_str(&text)
+                .map_err(|e| Error::Validation(format!("not a valid library bundle: {e}")))?;
+            let results = library::import(&mut store, &bundle, &on_conflict)?;
+            print_json(&results);
+        }
     }
     Ok(())
 }

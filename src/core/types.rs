@@ -1497,6 +1497,114 @@ pub struct ScriptRun {
     pub truncated: bool,
 }
 
+// ---- artifacts (agent-written pages, mesa task 974) --------------------
+//
+// NOTE: unrelated to `Task::artifact` (a bounded pointer string — a commit
+// SHA, PR URL, or path — a task carries as its work receipt). This
+// `Artifact` is a first-class record: a whole small document (an HTML
+// mockup, an SVG diagram, a markdown page) an agent writes and a person
+// reads back on the project's Artifacts tab. The two share a name and
+// nothing else.
+
+/// The allowlisted `content_type` values a stored [`Artifact`] body may
+/// declare — exactly three, mirroring `files::image_mime`'s posture: a fixed
+/// list, not a free string, because `content_type` decides how the render
+/// route answers and how the web UI frames the result (an `<iframe
+/// sandbox>` for the first two, `components/Markdown.tsx` for the third). A
+/// fourth value is a change to both of those, never a free addition here.
+pub const ARTIFACT_CONTENT_TYPES: &[&str] = &["text/html", "image/svg+xml", "text/markdown"];
+
+/// The `content_type` an artifact gets when a caller names none. Lives in
+/// `core`, not the CLI or the API, so the two surfaces can never disagree
+/// about it (CLAUDE.md: "CLI and API share `core` and never diverge") —
+/// `Store::create_artifact` is what applies it, and both `mesa artifact
+/// create --content-type` and a `POST` body that omits `content_type` reach
+/// that one chokepoint.
+pub const DEFAULT_ARTIFACT_CONTENT_TYPE: &str = "text/html";
+
+/// Whether `content_type` is one of [`ARTIFACT_CONTENT_TYPES`]. The one
+/// chokepoint `Store::create_artifact`/`update_artifact` call — never
+/// re-checked ad hoc elsewhere.
+pub fn is_valid_artifact_content_type(content_type: &str) -> bool {
+    ARTIFACT_CONTENT_TYPES.contains(&content_type)
+}
+
+/// An agent-written page bound to a project: a small text document — HTML
+/// mockup, SVG diagram, or markdown page — rendered on the project's
+/// Artifacts tab. The body lives in the db (unlike an [`Attachment`], which
+/// is an arbitrary binary on disk): an artifact is closer in kind to a task
+/// `description` or a diagram frame `body`, both already stored this way,
+/// and keeping it there means one `mesa backup` story rather than a second
+/// on-disk tree for `Store` to reconcile. `ARTIFACT_BODY_MAX` (`Store`) is
+/// the hard cap that keeps this from becoming the attachment case by the
+/// back door.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct Artifact {
+    #[ts(type = "number")]
+    pub id: i64,
+    /// The project this artifact belongs to; immutable after creation (the
+    /// id is in the artifact's own URL). `ON DELETE CASCADE` — an artifact is
+    /// a page *about* a project and has nowhere to live without one.
+    #[ts(type = "number")]
+    pub project_id: i64,
+    /// The task that prompted this page, if any. `ON DELETE SET NULL` —
+    /// deleting the task that prompted a page must not destroy the page.
+    #[ts(type = "number | null")]
+    pub task_id: Option<i64>,
+    /// Unique (case-insensitively) within the project; the CLI resolves an
+    /// artifact by id only (unlike a script or project), but the name is
+    /// still the selector a person reads.
+    pub name: String,
+    /// One of [`ARTIFACT_CONTENT_TYPES`].
+    pub content_type: String,
+    /// The document itself, stored verbatim. Required, non-empty, capped at
+    /// `ARTIFACT_BODY_MAX` (`Store`) — unlike the live surface's
+    /// `LIVE_TEXT_MAX`, which does not apply here: an artifact is read, never
+    /// spoken.
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The API's `GET /api/projects/{id}/artifacts` list projection — every
+/// [`Artifact`] field except `body` — the twin of the CLI's `QUIET_DROP_ARTIFACT`
+/// compact shape (`src/cli.rs`); the two must stay in step, so a new bounded
+/// field on `Artifact` belongs in both. Dropped for the same reason
+/// [`TaskSummary`] drops `description`: `body` is a document capped at 2 MiB
+/// (`Store::ARTIFACT_BODY_MAX`), and the primary caller of `list` is an agent
+/// asking what pages exist in a project, not fetching every page's markup —
+/// a project with many artifacts would otherwise return tens of megabytes
+/// into a browser's memory for a question that only needed names and ids.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ArtifactSummary {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub project_id: i64,
+    #[ts(type = "number | null")]
+    pub task_id: Option<i64>,
+    pub name: String,
+    pub content_type: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<&Artifact> for ArtifactSummary {
+    fn from(a: &Artifact) -> ArtifactSummary {
+        ArtifactSummary {
+            id: a.id,
+            project_id: a.project_id,
+            task_id: a.task_id,
+            name: a.name.clone(),
+            content_type: a.content_type.clone(),
+            created_at: a.created_at.clone(),
+            updated_at: a.updated_at.clone(),
+        }
+    }
+}
+
 // ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
 //
 // mesa task 919: agents, skills, hooks, commands, the live-conversation
@@ -2832,7 +2940,7 @@ impl LiveAction {
 /// Which *page* the person is on when the live session reports its context.
 ///
 /// The vocabulary is deliberately not open: it is the app's own page
-/// inventory, and nothing else. Seven of these are `ProjectTab` values from
+/// inventory, and nothing else. Eight of these are `ProjectTab` values from
 /// `frontend/src/lastView.ts` — the tabs a project page has — and the other
 /// two are the global pages that have something in focus (the inbox and the
 /// scripts page). A page mesa does not have is therefore not expressible,
@@ -2856,6 +2964,7 @@ impl LiveAction {
 #[serde(rename_all = "kebab-case")]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum LiveContextKind {
+    Artifacts,
     Board,
     Dashboard,
     Diagrams,

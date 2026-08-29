@@ -4,7 +4,7 @@
  * Which *page* the person is on when the live session reports its context.
  *
  * The vocabulary is deliberately not open: it is the app's own page
- * inventory, and nothing else. Seven of these are `ProjectTab` values from
+ * inventory, and nothing else. Eight of these are `ProjectTab` values from
  * `frontend/src/lastView.ts` — the tabs a project page has — and the other
  * two are the global pages that have something in focus (the inbox and the
  * scripts page). A page mesa does not have is therefore not expressible,
@@ -25,4 +25,4 @@
  * The kind is the *page*; [`LiveContext`]'s other three fields are what is in
  * focus on it.
  */
-export type LiveContextKind = "board" | "dashboard" | "diagrams" | "files" | "git" | "inbox" | "scripts" | "settings" | "terminal";
+export type LiveContextKind = "artifacts" | "board" | "dashboard" | "diagrams" | "files" | "git" | "inbox" | "scripts" | "settings" | "terminal";

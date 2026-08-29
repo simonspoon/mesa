@@ -5,6 +5,8 @@
 import type { AgentSession } from './types/AgentSession'
 import type { AgentSpawned } from './types/AgentSpawned'
 import type { AnchorSide } from './types/AnchorSide'
+import type { Artifact } from './types/Artifact'
+import type { ArtifactSummary } from './types/ArtifactSummary'
 import type { Attachment } from './types/Attachment'
 import type { CcDashboard } from './types/CcDashboard'
 import type { CcLive } from './types/CcLive'
@@ -1352,6 +1354,71 @@ export function runScript(
   values: Record<string, string>,
 ): Promise<ScriptRun> {
   return request(`/api/scripts/${id}/run`, jsonInit('POST', { values }))
+}
+
+// ---- Artifacts (mesa task 974) ----
+//
+// `Artifact` here is an unrelated record type from `Task.artifact` — the
+// existing bounded pointer string (a SHA/PR URL/path) a task carries at
+// close-out (docs/artifacts.md). All six routes below sit behind the plain
+// `guard` middleware only, unconditionally, in both serve modes — the
+// sandbox on the render route is the whole defense, so its behaviour must
+// not depend on which mode `serve` is running in (docs/artifacts.md).
+
+/** The create body. `project_id` is fixed at creation and never sent again —
+ * see `artifactDraft.ts`'s module note. */
+export interface ArtifactCreate {
+  project_id: number
+  task_id: number | null
+  name: string
+  content_type: string
+  body: string
+}
+
+/** The patch body. There is no `project_id` here: it is immutable after
+ * creation. */
+export interface ArtifactPatch {
+  task_id?: number | null
+  name?: string
+  content_type?: string
+  body?: string
+}
+
+/** Every artifact in one project, without its `body` — the `TaskSummary`
+ * posture: a project's artifact bodies are capped at 2 MiB each, so a list
+ * of them would otherwise push tens of megabytes into the browser for
+ * nothing the list view reads. Fetch the full record with `getArtifact` for
+ * whichever one is actually selected. Ordered by name, server-side. */
+export function listArtifacts(projectId: number): Promise<ArtifactSummary[]> {
+  return request(`/api/projects/${projectId}/artifacts`)
+}
+
+export function createArtifact(
+  projectId: number,
+  body: ArtifactCreate,
+): Promise<Artifact> {
+  return request(`/api/projects/${projectId}/artifacts`, jsonInit('POST', body))
+}
+
+export function getArtifact(id: number): Promise<Artifact> {
+  return request(`/api/artifacts/${id}`)
+}
+
+export function updateArtifact(id: number, body: ArtifactPatch): Promise<Artifact> {
+  return request(`/api/artifacts/${id}`, jsonInit('PATCH', body))
+}
+
+/** Returns the destroyed record — the recoverable delete echo. */
+export function deleteArtifact(id: number): Promise<Artifact> {
+  return request(`/api/artifacts/${id}`, jsonDelete())
+}
+
+/** The URL an artifact's rendered body lives at (spec §4): a raw response
+ * carrying its own Content-Type/CSP, framed with
+ * `sandbox="allow-scripts"` and no `allow-same-origin` — never fetched with
+ * `request()`, since it is not JSON. */
+export function artifactRenderUrl(projectId: number, artifactId: number): string {
+  return `/api/projects/${projectId}/artifacts/${artifactId}/render`
 }
 
 // ---- Library (mesa task 919) ----

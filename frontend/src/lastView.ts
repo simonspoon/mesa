@@ -26,6 +26,7 @@ export type ProjectTab =
   | 'diagrams'
   | 'git'
   | 'files'
+  | 'artifacts'
   | 'terminal'
   | 'settings'
 
@@ -37,6 +38,7 @@ const TAB_SEGMENTS = [
   'diagrams',
   'git',
   'files',
+  'artifacts',
   'terminal',
   'settings',
 ] as const

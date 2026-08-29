@@ -663,6 +663,18 @@ make this unsafe; they ship together or not at all. (`style-src
 so an `.svg` opened in the editor is still ordinary text with syntax colour —
 raw is about how it is *rendered*, not about reclassifying it.
 
+**This is also why raw never grows a `text/html` entry, and why a different
+route (`docs/artifacts.md`) is allowed to serve exactly that content type.**
+Raw serves arbitrary **repo files** — bytes a browser would treat as an
+ordinary same-origin document the moment it saw `text/html`, with mesa's own
+origin and cookies reachable from inside them, and there is no CSP that makes
+that safe for content this unbounded and this uncontrolled. The artifacts
+render route serves a **record mesa itself created and validated**, capped
+and content-type-checked at write time, stamped with a CSP
+(`sandbox allow-scripts`, no `allow-same-origin`) that strips the document's
+origin before anything in it can run. Same content type, opposite trust
+model — see `docs/artifacts.md` for the full reasoning.
+
 **Markdown image resolution is client-side and refuses more than it
 resolves.** `frontend/src/markdownAssets.ts`'s `resolveMarkdownImageSrc(fileDir,
 src)` answers the repo-relative path to load, or `null` for "render no image".

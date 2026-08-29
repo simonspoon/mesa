@@ -38,6 +38,7 @@ export const PANE_TABS: readonly PaneTab[] = [
   'diagrams',
   'git',
   'files',
+  'artifacts',
   'terminal',
   'settings',
 ]
@@ -69,6 +70,7 @@ const LABELS: Record<PaneTab, string> = {
   diagrams: 'Diagrams',
   git: 'Git',
   files: 'Files',
+  artifacts: 'Artifacts',
   terminal: 'Terminal',
   settings: 'Settings',
 }

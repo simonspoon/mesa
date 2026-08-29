@@ -9,8 +9,8 @@
 //!   projection — the record minus its unbounded free-text fields, the same
 //!   bounded shape `task list` already emits. Accepted on every mutation and
 //!   `show`/`get` in `project`, `task`, `diagram` (+ `frame`, `edge`),
-//!   `inbox`, `script` and `live`; composites keep their key structure and
-//!   compact their members.
+//!   `inbox`, `script`, `artifact` and `live`; composites keep their key
+//!   structure and compact their members.
 //!   Default output is unchanged. On a `delete` it waives the full echo, which
 //!   is mesa's recovery transcript.
 //! - Errors are `{"error": {"code", "message"}}` on stderr; clap usage errors
@@ -24,12 +24,13 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
-    Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc, InboxItem, InboxKind,
-    LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus,
-    LiveAction, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority,
-    Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch,
-    Status, Store, Task, TaskPatch, TaskReceipt, agents, config, library, live, look, receipt,
+    Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew,
+    EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
+    InboxItem, InboxKind, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope,
+    LibrarySyncStatus, LiveAction, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn,
+    NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg,
+    ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt, agents, config,
+    library, live, look, receipt,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -44,7 +45,7 @@ OUTPUT
   instead — the record minus its unbounded free-text fields; for a task that
   is exactly the bounded shape `task list` already emits. Accepted on every
   mutation and `show`/`get` in `project`, `task`, `diagram` (+ `frame`,
-  `edge`), `inbox`, `script` and `live`; composite payloads keep their key structure and
+  `edge`), `inbox`, `script`, `artifact` and `live`; composite payloads keep their key structure and
   compact their members. It changes stdout only — never exit codes, stderr or
   stored data — and default output is byte-identical to before the flag
   existed. On a `delete` it waives the full echo, which is mesa's recovery
@@ -102,6 +103,10 @@ enum Command {
     /// Author and run user-written shell scripts with declared arguments
     #[command(subcommand)]
     Script(ScriptCmd),
+    /// Create, list, inspect, update, and delete project artifacts (agent-
+    /// written HTML/SVG/markdown pages)
+    #[command(subcommand)]
+    Artifact(ArtifactCmd),
     /// Agent definitions, skills, hooks, commands, prompts and CLAUDE.md
     /// files, synced against `.claude/`
     #[command(subcommand)]
@@ -1081,6 +1086,121 @@ EXAMPLES
         /// Supply one declared argument: NAME=VALUE (repeatable)
         #[arg(long = "set", value_name = "NAME=VALUE", allow_hyphen_values = true)]
         set: Vec<String>,
+    },
+}
+
+/// Agent-written pages bound to a project (mesa task 974) — an HTML mockup,
+/// an SVG diagram, or a markdown document, rendered on the project's
+/// Artifacts tab. Unrelated to a task's own `artifact` field (a bounded
+/// pointer string — a commit SHA, PR URL, or path — a task carries as its
+/// work receipt); this is a first-class record of its own.
+#[derive(Subcommand)]
+enum ArtifactCmd {
+    /// Create an artifact; prints the full created artifact (`--quiet`:
+    /// without `body`)
+    ///
+    /// The body is stored verbatim — HTML, SVG or markdown source, never
+    /// interpreted by mesa itself. Give it with --body or from a file
+    /// (`-` = stdin), so a multi-line document can arrive from a heredoc.
+    #[command(after_help = "\
+EXAMPLES
+  mesa artifact create 1 mockup --body '<h1>hi</h1>'
+  mesa artifact create mesa dashboard --body-file - < dashboard.html
+  mesa artifact create 1 notes --content-type text/markdown --body '# Notes'")]
+    Create {
+        /// Project the artifact belongs to, by id or name (immutable after creation)
+        #[arg(value_name = "PROJECT", required_unless_present = "project")]
+        project_pos: Option<String>,
+        /// Unique (within the project) artifact name
+        #[arg(value_name = "NAME", required_unless_present = "name")]
+        name_pos: Option<String>,
+        /// Project, by id or name (flag form of PROJECT)
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+        /// Artifact name (flag form of NAME)
+        #[arg(long, conflicts_with = "name_pos")]
+        name: Option<String>,
+        /// The document itself
+        #[arg(long, allow_hyphen_values = true, required_unless_present_any = ["body_file"])]
+        body: Option<String>,
+        /// Read the body from a file (`-` = stdin); conflicts with --body
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<String>,
+        /// text/html | image/svg+xml | text/markdown (default: text/html)
+        ///
+        /// No clap-level default: the default lives in `core` (`Store`'s
+        /// `DEFAULT_ARTIFACT_CONTENT_TYPE`), the one place the CLI and the
+        /// API can't disagree about it.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Bind to the task that prompted this page, by id
+        #[arg(long)]
+        task: Option<i64>,
+        /// Print the artifact without `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// List a project's artifacts as a bare JSON array (no body)
+    List {
+        /// Only artifacts in this project (id or name); omit for every artifact
+        #[arg(value_name = "PROJECT")]
+        project_pos: Option<String>,
+        /// Only artifacts in this project (id or name); flag form of [PROJECT]
+        #[arg(long, conflicts_with = "project_pos")]
+        project: Option<String>,
+    },
+    /// Print one artifact as a full JSON object (includes body)
+    #[command(visible_alias = "get")]
+    Show {
+        /// Artifact id
+        id: i64,
+        /// Print the artifact without `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Update an artifact; at least one field flag is required
+    ///
+    /// `--name`/`--body` are replace-only: both are required and non-empty,
+    /// so an empty value is a validation error, not an erasure. `--task ""`
+    /// un-binds the task. There is no `--project`: an artifact's project is
+    /// immutable after creation.
+    #[command(group(ArgGroup::new("fields").required(true).multiple(true)))]
+    Update {
+        /// Artifact id
+        id: i64,
+        /// New unique (within the project) name
+        #[arg(long, group = "fields")]
+        name: Option<String>,
+        /// New document body
+        #[arg(long, allow_hyphen_values = true, group = "fields")]
+        body: Option<String>,
+        /// Read the new body from a file (`-` = stdin); conflicts with --body
+        #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "body")]
+        body_file: Option<String>,
+        /// New content type: text/html | image/svg+xml | text/markdown
+        #[arg(long, group = "fields")]
+        content_type: Option<String>,
+        /// Bind to this task, by id; pass "" to un-bind
+        #[arg(long, group = "fields")]
+        task: Option<String>,
+        /// Print the artifact without `body` instead of in full
+        ///
+        /// Deliberately outside the `fields` group: it is a modifier, so
+        /// `--quiet` alone is still clap's "no field given" usage error
+        /// (exit 2) rather than a legal call that silently does nothing.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Delete an artifact (no confirmation); echoes the destroyed record
+    Delete {
+        /// Artifact id
+        id: i64,
+        /// Echo the destroyed artifact without `body`
+        ///
+        /// The full echo is the recovery transcript that stands in for a
+        /// confirmation prompt; `--quiet` waives it for this call.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -2565,6 +2685,10 @@ const QUIET_DROP_INBOX_ITEM: &[&str] = &["body"];
 /// free-text fields. `args` stays — it is the bounded declaration the caller
 /// needs to build the next `script run`.
 const QUIET_DROP_SCRIPT: &[&str] = &["body", "description"];
+/// Keys dropped from an `Artifact` under `--quiet` (mesa task 974): its own
+/// unbounded body. `name`/`content_type`/`task_id` all stay, which is what
+/// makes a compact row identifiable at all.
+const QUIET_DROP_ARTIFACT: &[&str] = &["body"];
 /// Keys dropped from a `LibraryItem` under `--quiet`: its own unbounded body,
 /// and the sync baseline — a second copy of a body, unbounded the same way.
 /// `name`/`kind`/`scope`/`path` all stay, which is what makes a compact row
@@ -2688,6 +2812,11 @@ fn print_script(script: &Script, is_quiet: bool) {
     print_record(script, is_quiet, QUIET_DROP_SCRIPT);
 }
 
+/// Print one artifact: the full record, or the record minus `body`.
+fn print_artifact(artifact: &Artifact, is_quiet: bool) {
+    print_record(artifact, is_quiet, QUIET_DROP_ARTIFACT);
+}
+
 /// Print one library item: the full record, or the record minus
 /// `body`/`synced_body`.
 fn print_library_item(item: &LibraryItem, is_quiet: bool) {
@@ -2793,6 +2922,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Diagram(cmd) => run_diagram(cmd),
         Command::Inbox(cmd) => run_inbox(cmd),
         Command::Script(cmd) => run_script_cmd(cmd),
+        Command::Artifact(cmd) => run_artifact_cmd(cmd),
         Command::Library(cmd) => run_library_cmd(cmd),
         Command::Live(cmd) => run_live(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
@@ -4186,6 +4316,87 @@ fn run_script_cmd(cmd: ScriptCmd) -> Result<()> {
     Ok(())
 }
 
+/// Parses an `--task` id, validated only as a well-formed integer — an
+/// unknown id is `Store`'s `validation` error, the same "field of the record
+/// being written" posture every other unknown-id field takes.
+fn parse_task_id(s: &str) -> Result<i64> {
+    s.parse::<i64>()
+        .map_err(|_| Error::Validation(format!("--task must be a task id, got {s:?}")))
+}
+
+fn run_artifact_cmd(cmd: ArtifactCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        ArtifactCmd::Create {
+            project_pos,
+            name_pos,
+            project,
+            name,
+            body,
+            body_file,
+            content_type,
+            task,
+            quiet,
+        } => {
+            // clap guarantees exactly one of each positional/flag pair, and
+            // exactly one of the two body forms.
+            let project = resolve_project(&store, &project.or(project_pos).unwrap())?;
+            let name = name.or(name_pos).unwrap();
+            let mut stdin_used = false;
+            let body = resolve_field(body, body_file, &mut stdin_used)?.unwrap_or_default();
+            print_artifact(
+                &store.create_artifact(project, task, &name, content_type.as_deref(), &body)?,
+                quiet,
+            );
+        }
+        ArtifactCmd::List {
+            project_pos,
+            project,
+        } => {
+            let project = resolve_project_opt(&store, project.or(project_pos).as_deref())?;
+            // Unlike `script list`/`library list`, this is compact by default
+            // and takes no `--quiet` — an artifact's `body` is a document
+            // capped at 2 MiB, and the primary use of `list` is an agent
+            // asking what pages exist, not fetching every page's markup
+            // (the same reasoning `task list` already applies to `description`).
+            print_json(&quiet_all(
+                &store.list_artifacts(project)?,
+                QUIET_DROP_ARTIFACT,
+            ));
+        }
+        ArtifactCmd::Show { id, quiet } => print_artifact(&store.get_artifact(id)?, quiet),
+        ArtifactCmd::Update {
+            id,
+            name,
+            body,
+            body_file,
+            content_type,
+            task,
+            quiet,
+        } => {
+            let mut stdin_used = false;
+            let body = resolve_field(body, body_file, &mut stdin_used)?;
+            // `--task ""` un-binds; any other value is a task id.
+            let task_id = match task.as_deref() {
+                None => None,
+                Some("") => Some(None),
+                Some(t) => Some(Some(parse_task_id(t)?)),
+            };
+            let patch = ArtifactPatch {
+                task_id,
+                name,
+                content_type,
+                body,
+            };
+            print_artifact(&store.update_artifact(id, patch)?, quiet);
+        }
+        ArtifactCmd::Delete { id, quiet } => {
+            print_artifact(&store.delete_artifact(id)?, quiet);
+        }
+    }
+    Ok(())
+}
+
 fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
@@ -4386,8 +4597,8 @@ mod tests {
 
     use super::*;
     use crate::core::{
-        AnchorSide, Diagram, DiagramType, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape,
-        InboxItem, Project, TaskSummary, Waypoint,
+        AnchorSide, ArtifactSummary, Diagram, DiagramType, EdgeMarker, EdgeStyle, Frame, FrameEdge,
+        FrameShape, InboxItem, Project, TaskSummary, Waypoint,
     };
     use crate::core::{DiffStat, GitCommit, LiveContext, LiveContextKind, LiveWindow};
 
@@ -4559,6 +4770,19 @@ mod tests {
                 default: None,
                 choices: None,
             }],
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-02 00:00:00".into(),
+        }
+    }
+
+    fn sample_artifact() -> Artifact {
+        Artifact {
+            id: 1,
+            project_id: 2,
+            task_id: Some(3),
+            name: "mockup".into(),
+            content_type: "text/html".into(),
+            body: "<h1>hi</h1>".into(),
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-02 00:00:00".into(),
         }
@@ -4883,6 +5107,45 @@ mod tests {
         assert_eq!(
             sorted_owned(value_keys(&quiet(&sample_script(), QUIET_DROP_SCRIPT))),
             minus(&full, QUIET_DROP_SCRIPT),
+        );
+    }
+
+    #[test]
+    fn artifact_quiet_drops_body() {
+        let full = keys(&sample_artifact());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "project_id",
+                "task_id",
+                "name",
+                "content_type",
+                "body",
+                "created_at",
+                "updated_at",
+            ]),
+            "Artifact gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(&sample_artifact(), QUIET_DROP_ARTIFACT))),
+            minus(&full, QUIET_DROP_ARTIFACT),
+        );
+    }
+
+    /// `ArtifactSummary` (the API's `list` projection) is a hand-written
+    /// struct mirroring `Artifact` minus `body`, the same shape
+    /// `QUIET_DROP_ARTIFACT` gives the CLI's `artifact list`; assert the two
+    /// key sets match so a new field on `Artifact` can't silently vanish from
+    /// one surface's list while staying on the other's (mirrors
+    /// `compact_matches_task_summary_keys`).
+    #[test]
+    fn artifact_summary_matches_artifact_quiet_keys() {
+        let artifact = sample_artifact();
+        assert_eq!(
+            sorted_owned(keys(&ArtifactSummary::from(&artifact))),
+            sorted_owned(value_keys(&quiet(&artifact, QUIET_DROP_ARTIFACT))),
         );
     }
 

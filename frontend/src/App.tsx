@@ -270,6 +270,7 @@ function App() {
   const diagramListMatch = /^\/projects\/(\d+)\/diagrams$/.exec(path)
   const gitMatch = /^\/projects\/(\d+)\/git$/.exec(path)
   const filesMatch = /^\/projects\/(\d+)\/files$/.exec(path)
+  const artifactsMatch = /^\/projects\/(\d+)\/artifacts$/.exec(path)
   // Distinct from `terminalMatch` above: this one is a project tab rendered
   // inside `main`'s project frame (like Files/Git), not the permanently
   // mounted global page.
@@ -298,19 +299,21 @@ function App() {
         ? Number(gitMatch[1])
         : filesMatch
           ? Number(filesMatch[1])
-          : projectTerminalMatch
-            ? Number(projectTerminalMatch[1])
-            : dashboardMatch
-              ? Number(dashboardMatch[1])
-              : projectSettingsMatch
-                ? Number(projectSettingsMatch[1])
-                : projectCustomMatch
-                  ? Number(projectCustomMatch[1])
-                  : createTaskMatch
-                    ? Number(createTaskMatch[1])
-                    : projectMatch
-                      ? Number(projectMatch[1])
-                      : null
+          : artifactsMatch
+            ? Number(artifactsMatch[1])
+            : projectTerminalMatch
+              ? Number(projectTerminalMatch[1])
+              : dashboardMatch
+                ? Number(dashboardMatch[1])
+                : projectSettingsMatch
+                  ? Number(projectSettingsMatch[1])
+                  : projectCustomMatch
+                    ? Number(projectCustomMatch[1])
+                    : createTaskMatch
+                      ? Number(createTaskMatch[1])
+                      : projectMatch
+                        ? Number(projectMatch[1])
+                        : null
 
   let page
   if (settingsMatch) {
@@ -348,6 +351,7 @@ function App() {
         diagramId={Number(diagramMatch[2])}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings={false}
@@ -366,6 +370,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings={false}
@@ -384,6 +389,7 @@ function App() {
         diagramId={null}
         git
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings={false}
@@ -402,6 +408,27 @@ function App() {
         diagramId={null}
         git={false}
         files
+        artifacts={false}
+        terminal={false}
+        dashboard={false}
+        settings={false}
+        custom={false}
+        createTask={false}
+        onProjectsChanged={() => setNavVersion((v) => v + 1)}
+      />
+    )
+  } else if (artifactsMatch) {
+    // Agent-written pages for the project, in place inside the project page
+    // frame (mesa task 974).
+    page = (
+      <ProjectTasksPage
+        projectId={Number(artifactsMatch[1])}
+        taskId={null}
+        diagrams={false}
+        diagramId={null}
+        git={false}
+        files={false}
+        artifacts
         terminal={false}
         dashboard={false}
         settings={false}
@@ -425,6 +452,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal
         dashboard={false}
         settings={false}
@@ -443,6 +471,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard
         settings={false}
@@ -462,6 +491,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings
@@ -481,6 +511,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings={false}
@@ -500,6 +531,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings={false}
@@ -517,6 +549,7 @@ function App() {
         diagramId={null}
         git={false}
         files={false}
+        artifacts={false}
         terminal={false}
         dashboard={false}
         settings={false}

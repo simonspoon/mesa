@@ -38,16 +38,16 @@ use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{
-    AgentSession, AgentSpawned, AnchorSide, CcDashboard, CcUsage, DiagramPatch, DiagramType,
-    EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch,
-    FrameShape, GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree,
-    InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryBundle, LibraryImportResult, LibraryKind,
-    LibraryPatch, LibraryScope, LiveContext, LiveRole, LiveState, LiveStatus, LiveTranscript,
-    LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
-    Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, config, files, git, hooks, library, listen, live, receipt, scripts, speech,
-    version,
+    AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactPatch, ArtifactSummary, CcDashboard,
+    CcUsage, DiagramPatch, DiagramType, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error,
+    FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
+    GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryBundle,
+    LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole, LiveState,
+    LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates, NextResult, Priority,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
+    ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
+    TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, library, listen, live,
+    receipt, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -876,6 +876,30 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/library/sync",
             get(library_sync_status).post(library_sync_apply),
+        )
+        // Artifacts: small agent-written pages (HTML mockup, SVG diagram, or
+        // markdown) bound to a project (mesa task 974). All six routes below
+        // sit behind the standard `guard` and nothing more — not
+        // `require_agent_access`, not `require_local_path_write` — including
+        // the render route, which is the one that actually serves an
+        // artifact's body back as markup. See `render_project_artifact`'s
+        // doc comment and `docs/artifacts.md` for why that is deliberate and
+        // identical in both serve modes: the sandboxing CSP on the render
+        // response is the whole defense, so its behaviour must not depend on
+        // which mode is running.
+        .route(
+            "/api/projects/{id}/artifacts",
+            get(list_project_artifacts).post(create_artifact),
+        )
+        .route(
+            "/api/artifacts/{id}",
+            get(show_artifact)
+                .patch(update_artifact)
+                .delete(delete_artifact),
+        )
+        .route(
+            "/api/projects/{id}/artifacts/{aid}/render",
+            get(render_project_artifact),
         )
         // Agents: live Claude Code sessions under a project's folder. All
         // four routes share `require_agent_access` (terminal access = code
@@ -3502,6 +3526,204 @@ async fn import_library(
 /// content, so the whole surface sits behind this one gate. One constant so
 /// the eleven cannot drift apart.
 const LIBRARY_LOOPBACK: &str = "the library is loopback-only; connect from this machine";
+
+// ---- artifacts (agent-written pages, mesa task 974) ----
+//
+// Not to be confused with `Task::artifact` — the existing bounded pointer
+// string (a SHA / PR URL / path) a task carries at close-out. That field and
+// this record type share a name and nothing else.
+//
+// All six routes below sit behind the standard `guard` middleware and
+// nothing more: no `require_agent_access`, no `require_local_path_write`, no
+// per-route check of any kind, identically in default and `--lan` mode. See
+// `docs/artifacts.md` and `render_project_artifact`'s doc comment for why.
+
+#[derive(Deserialize)]
+struct ArtifactCreate {
+    /// The body may also carry a `project_id` (the web client sends the one
+    /// it's already viewing), but it is never read: the path `{id}` is
+    /// authoritative for which project an artifact is created under, so
+    /// there is deliberately no field here for it to disagree with.
+    #[serde(default)]
+    task_id: Option<i64>,
+    name: String,
+    /// Absent/`null` is not the same as an explicit content type: omitting
+    /// the key here reaches `Store::create_artifact`'s own `None` branch,
+    /// which applies `DEFAULT_ARTIFACT_CONTENT_TYPE` — the API never applies
+    /// that default itself, so it can never drift from what `mesa artifact
+    /// create` does with no `--content-type` flag.
+    #[serde(default)]
+    content_type: Option<String>,
+    body: String,
+}
+
+/// `task_id` alone is a `double_option`-style three-state field (matching
+/// [`ArtifactPatch::task_id`]): absent leaves the binding alone, `null`
+/// un-binds, a value re-binds. `name`, `content_type` and `body` are plain
+/// `Option<String>` instead, on purpose — an explicit `null` for any of them
+/// fails to deserialize into a `String` and comes back 422 via
+/// `impl From<JsonRejection> for ApiError`, rather than being read as
+/// "erase this". `name` and `body` are a selector and the document itself;
+/// clearing either is nonsensical, and `Store::update_artifact` re-enforces
+/// non-emptiness on both regardless.
+#[derive(Deserialize)]
+struct ArtifactUpdate {
+    #[serde(default, deserialize_with = "double_option")]
+    task_id: Option<Option<i64>>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// The list is a **projection**, not the full record — the twin of
+/// `mesa artifact list`'s compact shape (`QUIET_DROP_ARTIFACT` in
+/// `src/cli.rs`), and the two must not drift: a new bounded field on
+/// [`Artifact`] belongs on both `ArtifactSummary` and `QUIET_DROP_ARTIFACT`.
+/// `body` is a document capped at `Store::ARTIFACT_BODY_MAX` (2 MiB); the
+/// primary caller here is asking what pages exist in a project, not fetching
+/// every page's markup, so returning bodies would put tens of megabytes into
+/// a browser for a question that only needed names and ids (mirrors why
+/// `list_tasks` maps through `TaskSummary` instead of returning `Task`).
+async fn list_project_artifacts(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    let artifacts: Vec<ArtifactSummary> = store
+        .list_artifacts(Some(id))?
+        .iter()
+        .map(ArtifactSummary::from)
+        .collect();
+    Ok(Json(artifacts).into_response())
+}
+
+async fn create_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<ArtifactCreate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let artifact: Artifact = store.create_artifact(
+        id,
+        body.task_id,
+        &body.name,
+        body.content_type.as_deref(),
+        &body.body,
+    )?;
+    Ok((StatusCode::CREATED, Json(artifact)).into_response())
+}
+
+async fn show_artifact(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_artifact(id)?).into_response())
+}
+
+async fn update_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<ArtifactUpdate>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let patch = ArtifactPatch {
+        task_id: body.task_id,
+        name: body.name,
+        content_type: body.content_type,
+        body: body.body,
+    };
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(store.update_artifact(id, patch)?).into_response())
+}
+
+async fn delete_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let mut store = state.store.lock().unwrap();
+    // The full destroyed record is the recoverable echo, exactly as every
+    // other destructive delete in this file stands in for the confirmation
+    // prompt mesa deliberately does not have.
+    Ok(Json(store.delete_artifact(id)?).into_response())
+}
+
+/// Serves one artifact's stored body, framed for direct rendering by a
+/// browser (an `<iframe>` for `text/html`/`image/svg+xml`, or a bare fetch
+/// for `text/markdown` even though the web UI actually renders that kind
+/// through `components/Markdown.tsx` instead — see `docs/artifacts.md`).
+///
+/// This route is the **one deliberate exception** to the rule stated on
+/// [`raw_project_file`]'s own doc comment: "no route may ever return
+/// `text/html`". That rule holds because `/files/raw` serves arbitrary
+/// **repo files** — bytes a browser would treat as an ordinary same-origin
+/// document the instant they came back labelled `text/html`. This route
+/// serves a **record mesa itself created and validated** (`docs/artifacts.md`),
+/// and the exception is the Content-Security-Policy below, not the content
+/// type: the policy is what keeps a rendered artifact from ever behaving like
+/// an ordinary same-origin mesa page.
+///
+/// The load-bearing directive is `sandbox allow-scripts` with **no**
+/// `allow-same-origin`. `sandbox` alone forces the response into an opaque
+/// origin — distinct from mesa's own — for both the framed case (an
+/// `<iframe sandbox="allow-scripts">`, which the web UI also sets as a
+/// second, independent layer) and a direct top-level navigation to this URL.
+/// An opaque origin cannot read mesa's cookies or `localStorage` and cannot
+/// make a same-origin `fetch`/XHR/WebSocket call back into any other mesa
+/// route — the terminal and agents routes included — no matter what script an
+/// artifact's own HTML carries. Granting `allow-scripts` without
+/// `allow-same-origin` is precisely what lets that inline script still run
+/// (an agent-written mockup is one self-contained file, and disabling script
+/// entirely would break it) while denying it the one thing that would make it
+/// dangerous. `default-src 'none'` with no `connect-src` closes the gap a
+/// sandboxed-but-scriptable document would otherwise still have: it cannot
+/// reach mesa's API, and it cannot exfiltrate to a third party either.
+/// `form-action 'none'` and `base-uri 'none'` close the two navigation-shaped
+/// exfiltration paths CSP's `sandbox` alone does not.
+///
+/// Gate: plain `guard`, nothing more, identically in both serve modes — see
+/// the route-table comment above and `docs/artifacts.md`. The sandbox is the
+/// whole defense, so it must not vary with which mode mesa is running in.
+///
+/// A `{aid}` that exists but does not belong to `{id}` answers 404, the same
+/// as an `{aid}` that does not exist at all — not 403, which would confirm to
+/// a caller guessing ids that the artifact is real but simply misfiled.
+async fn render_project_artifact(
+    State(state): State<AppState>,
+    Path((id, aid)): Path<(i64, i64)>,
+) -> ApiResult<Response> {
+    let artifact: Artifact = {
+        let store = state.store.lock().unwrap();
+        store.get_artifact(aid)?
+    };
+    if artifact.project_id != id {
+        return Err(Error::NotFound(format!("artifact {aid} not found")).into());
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                format!("{}; charset=utf-8", artifact.content_type),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                disposition("inline", &artifact.name),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+                 img-src data:; font-src data:; media-src data:; form-action 'none'; \
+                 base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+                    .to_string(),
+            ),
+        ],
+        artifact.body.into_bytes(),
+    )
+        .into_response())
+}
 
 // ---- agents (live Claude Code sessions under a project's folder) ----
 
@@ -10440,5 +10662,233 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             )
             .is_ok()
         );
+    }
+
+    // --- Artifacts (mesa task 974) ------------------------------------------
+
+    fn artifact_create_body(name: &str) -> Result<Json<ArtifactCreate>, JsonRejection> {
+        Ok(Json(ArtifactCreate {
+            task_id: None,
+            name: name.to_string(),
+            content_type: None,
+            body: "<h1>hi</h1>".to_string(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn artifact_crud_happy_path_create_is_201_and_defaults_content_type() {
+        let (_dir, state) = test_state();
+        let project_id = new_project(&state, None);
+
+        let resp = create_artifact(
+            State(state.clone()),
+            Path(project_id),
+            artifact_create_body("mockup"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = json_body(resp).await;
+        assert_eq!(created["name"], "mockup");
+        assert_eq!(created["project_id"], project_id);
+        assert_eq!(created["task_id"], serde_json::Value::Null);
+        assert_eq!(created["content_type"], "text/html");
+        let id = created["id"].as_i64().unwrap();
+
+        let listed = list_project_artifacts(State(state.clone()), Path(project_id))
+            .await
+            .unwrap();
+        let listed = json_body(listed).await;
+        let rows = listed.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        // The list is a projection: everything but `body` survives, and
+        // `body` itself must never appear — a project with many artifacts
+        // must not push megabytes of markup into a list response.
+        assert_eq!(rows[0]["id"], id);
+        assert_eq!(rows[0]["name"], "mockup");
+        assert_eq!(rows[0]["content_type"], "text/html");
+        assert!(rows[0].get("body").is_none(), "{rows:?}");
+
+        let shown = show_artifact(State(state.clone()), Path(id)).await.unwrap();
+        assert_eq!(json_body(shown).await["id"], id);
+
+        let updated = update_artifact(
+            State(state.clone()),
+            Path(id),
+            Ok(Json(ArtifactUpdate {
+                task_id: None,
+                name: Some("renamed".to_string()),
+                content_type: None,
+                body: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let updated = json_body(updated).await;
+        assert_eq!(updated["name"], "renamed");
+        // Untouched fields survive a partial patch.
+        assert_eq!(updated["content_type"], "text/html");
+
+        let deleted = delete_artifact(State(state.clone()), Path(id))
+            .await
+            .unwrap();
+        assert_eq!(json_body(deleted).await["id"], id);
+        let err = show_artifact(State(state), Path(id)).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn artifact_create_duplicate_name_in_project_is_conflict() {
+        let (_dir, state) = test_state();
+        let project_id = new_project(&state, None);
+        create_artifact(
+            State(state.clone()),
+            Path(project_id),
+            artifact_create_body("dup"),
+        )
+        .await
+        .unwrap();
+        let err = create_artifact(State(state), Path(project_id), artifact_create_body("DUP"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "conflict");
+    }
+
+    #[tokio::test]
+    async fn artifact_create_bad_content_type_is_validation() {
+        let (_dir, state) = test_state();
+        let project_id = new_project(&state, None);
+        let err = create_artifact(
+            State(state),
+            Path(project_id),
+            Ok(Json(ArtifactCreate {
+                task_id: None,
+                name: "bad".to_string(),
+                content_type: Some("application/json".to_string()),
+                body: "x".to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "validation");
+    }
+
+    /// A body that fails to deserialize at all — the shape `impl From<
+    /// JsonRejection> for ApiError` maps to 422 `validation` for every
+    /// handler in this file that takes `Result<Json<T>, JsonRejection>`. This
+    /// is a property of that one shared `impl`, not of the artifact handlers,
+    /// so it is exercised the same way `live_route_rejects_a_page_mesa_does_
+    /// not_have` exercises a closed enum above: at the deserialization layer,
+    /// which is what the extractor actually runs before a handler ever sees
+    /// the body — a missing required field, and syntactically invalid JSON.
+    #[test]
+    fn artifact_create_malformed_body_fails_to_deserialize() {
+        assert!(serde_json::from_str::<ArtifactCreate>("{not json").is_err());
+        // `name` and `body` are required; omitting either is malformed.
+        assert!(serde_json::from_str::<ArtifactCreate>(r#"{"body":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ArtifactCreate>(r#"{"name":"x"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn artifact_render_mismatched_project_is_not_found() {
+        let (_dir, state) = test_state();
+        let project_a = new_project(&state, None);
+        let project_b = new_project(&state, None);
+        let resp = create_artifact(
+            State(state.clone()),
+            Path(project_a),
+            artifact_create_body("page"),
+        )
+        .await
+        .unwrap();
+        let id = json_body(resp).await["id"].as_i64().unwrap();
+
+        let err = render_project_artifact(State(state.clone()), Path((project_b, id)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, "not_found");
+
+        // An id that doesn't exist at all gets the identical answer.
+        let err = render_project_artifact(State(state), Path((project_a, id + 999)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artifact_render_sets_the_exact_hardening_header_set() {
+        let (_dir, state) = test_state();
+        let project_id = new_project(&state, None);
+        let resp = create_artifact(
+            State(state.clone()),
+            Path(project_id),
+            artifact_create_body("shot"),
+        )
+        .await
+        .unwrap();
+        let id = json_body(resp).await["id"].as_i64().unwrap();
+
+        let resp = render_project_artifact(State(state), Path((project_id, id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&resp, header::CONTENT_TYPE),
+            "text/html; charset=utf-8"
+        );
+        let disp = header_str(&resp, header::CONTENT_DISPOSITION);
+        assert!(disp.starts_with("inline; "), "{disp}");
+        assert!(disp.contains("filename=\"shot\""), "{disp}");
+        assert_eq!(header_str(&resp, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        assert_eq!(
+            header_str(&resp, header::CONTENT_SECURITY_POLICY),
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             img-src data:; font-src data:; media-src data:; form-action 'none'; \
+             base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+        );
+        assert_eq!(body_bytes(resp).await, b"<h1>hi</h1>");
+    }
+
+    /// The render route's header set (and its very existence) must not
+    /// depend on serve mode — the sandbox is the whole defense, so it is the
+    /// one thing in this file that must not vary with `state.lan`.
+    #[tokio::test]
+    async fn artifact_render_headers_are_identical_under_lan_mode() {
+        let (_dir, state) = test_state();
+        let project_id = new_project(&state, None);
+        let resp = create_artifact(
+            State(state.clone()),
+            Path(project_id),
+            artifact_create_body("both-modes"),
+        )
+        .await
+        .unwrap();
+        let id = json_body(resp).await["id"].as_i64().unwrap();
+
+        let mut lan_state = state.clone();
+        lan_state.lan = true;
+
+        let default_resp = render_project_artifact(State(state), Path((project_id, id)))
+            .await
+            .unwrap();
+        let lan_resp = render_project_artifact(State(lan_state), Path((project_id, id)))
+            .await
+            .unwrap();
+
+        for h in [
+            header::CONTENT_TYPE,
+            header::CONTENT_DISPOSITION,
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::CONTENT_SECURITY_POLICY,
+        ] {
+            assert_eq!(
+                header_str(&default_resp, h.clone()),
+                header_str(&lan_resp, h),
+            );
+        }
     }
 }

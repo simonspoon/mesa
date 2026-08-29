@@ -6,11 +6,12 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::types::{
-    AnchorSide, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat, EdgeMarker,
-    EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind, LibraryItem,
-    LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveContext, LiveRole, LiveSession,
-    LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg,
-    ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint, task_name,
+    AnchorSide, Artifact, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat,
+    EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind,
+    LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveContext, LiveRole,
+    LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script,
+    ScriptArg, ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint,
+    is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -684,6 +685,36 @@ const MIGRATIONS: &[&str] = &[
         created_at  TEXT NOT NULL,
         updated_at  TEXT NOT NULL
     );",
+    // Task 974: artifacts — agent-written pages (HTML mockups, SVG diagrams,
+    // markdown docs) bound to a project, rendered on its Artifacts tab.
+    // Unrelated to `tasks.artifact` (a bounded pointer string a task carries
+    // as its work receipt) — see the doc comment on `types::Artifact`.
+    //
+    // `project_id` is `ON DELETE CASCADE`, the opposite of `scripts` and
+    // `inbox`'s `SET NULL`: a script or an inbox item is content that
+    // outlives the project it happened to run in or arrive from, so
+    // un-binding it on delete is right. An artifact is a page *about* a
+    // project, addressed at `/api/projects/{id}/artifacts/…`, and has
+    // nowhere to live without one — so `project_id` is NOT NULL and the row
+    // goes with its project. `task_id` is the optional binding, `SET NULL`:
+    // deleting the task that prompted a page must not destroy the page.
+    //
+    // `body` lives in this table, not on disk — an artifact is a small,
+    // agent-written text document, the same species as a task `description`
+    // or a diagram frame `body`, both already stored this way. Bounded by
+    // `Store::ARTIFACT_BODY_MAX` so this can never become the attachment
+    // case (arbitrary binaries on disk) by the back door.
+    "CREATE TABLE artifacts (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        task_id      INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+        name         TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        body         TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    );
+    CREATE INDEX idx_artifacts_project ON artifacts(project_id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1139,6 +1170,71 @@ fn validate_script_args(args: &[ScriptArg]) -> Result<()> {
 fn encode_script_args(args: &[ScriptArg]) -> Result<String> {
     serde_json::to_string(args)
         .map_err(|e| Error::Validation(format!("cannot encode script arguments: {e}")))
+}
+
+const ARTIFACT_COLUMNS: &str =
+    "id, project_id, task_id, name, content_type, body, created_at, updated_at";
+
+fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+    Ok(Artifact {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        task_id: row.get(2)?,
+        name: row.get(3)?,
+        content_type: row.get(4)?,
+        body: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+/// Longest allowed [`Artifact::name`]: required, unique within its project.
+const ARTIFACT_NAME_MAX: usize = 200;
+
+/// Largest allowed [`Artifact::body`], in bytes (mesa task 974): an artifact
+/// is a small, agent-written text document, not the attachment case (an
+/// arbitrary binary on disk, capped at 25 MiB). 2 MiB is generous for a
+/// hand-written page while still a hard back-stop.
+const ARTIFACT_BODY_MAX: usize = 2 * 1024 * 1024;
+
+fn validate_artifact_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Validation(
+            "artifact name is required and may not be empty".into(),
+        ));
+    }
+    if trimmed.chars().count() > ARTIFACT_NAME_MAX {
+        return Err(Error::Validation(format!(
+            "artifact name must be {ARTIFACT_NAME_MAX} characters or fewer"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_artifact_content_type(content_type: &str) -> Result<String> {
+    if !is_valid_artifact_content_type(content_type) {
+        return Err(Error::Validation(format!(
+            "artifact content_type must be one of {ARTIFACT_CONTENT_TYPES:?}",
+            ARTIFACT_CONTENT_TYPES = super::types::ARTIFACT_CONTENT_TYPES
+        )));
+    }
+    Ok(content_type.to_string())
+}
+
+fn validate_artifact_body(body: &str) -> Result<String> {
+    if body.trim().is_empty() {
+        return Err(Error::Validation(
+            "artifact body is required and may not be empty".into(),
+        ));
+    }
+    if body.len() > ARTIFACT_BODY_MAX {
+        return Err(Error::Validation(format!(
+            "artifact body must be at most {ARTIFACT_BODY_MAX} bytes"
+        )));
+    }
+    // Stored verbatim — trimming only judges emptiness, never what gets saved.
+    Ok(body.to_string())
 }
 
 // ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
@@ -1601,6 +1697,22 @@ pub struct ScriptPatch {
     pub body: Option<String>,
     /// Replaces the full declared arg list.
     pub args: Option<Vec<ScriptArg>>,
+}
+
+/// Fields to change on an artifact; `None` means leave unchanged (mesa task
+/// 974). There is deliberately no `project_id` field — an artifact's project
+/// is immutable after creation, the same rule a task's is under, because the
+/// id is in the artifact's own URL.
+#[derive(Debug, Default, Clone)]
+pub struct ArtifactPatch {
+    /// `Some(None)` un-binds the artifact from its task; `Some(Some(id))`
+    /// binds it. An unknown id is a `validation` error.
+    pub task_id: Option<Option<i64>>,
+    /// Replace-only and non-empty — the name is the selector a person reads.
+    pub name: Option<String>,
+    pub content_type: Option<String>,
+    /// Replace-only and non-empty — the body *is* the artifact.
+    pub body: Option<String>,
 }
 
 /// Fields to change on a library item; `None` means leave unchanged (task
@@ -4529,6 +4641,171 @@ impl Store {
         if let Some(other) = clash {
             return Err(Error::Conflict(format!(
                 "script {other} is already named {name:?}; script names are unique"
+            )));
+        }
+        Ok(())
+    }
+
+    // ---- artifacts (agent-written pages, mesa task 974) ----
+
+    /// Stores a new artifact. `name` is required, non-empty, ≤200 chars and
+    /// unique **within the project** (case-insensitively — mirrors
+    /// `ensure_script_name_free`, scoped to `project_id` since an artifact's
+    /// name is not a global selector the way a script's is). `content_type`
+    /// must be one of [`super::types::ARTIFACT_CONTENT_TYPES`], defaulting to
+    /// [`super::types::DEFAULT_ARTIFACT_CONTENT_TYPE`] when `None` — this is
+    /// the one chokepoint that default lives behind, so the CLI and the API
+    /// can never disagree about it. `body` is required, non-empty and capped
+    /// at [`ARTIFACT_BODY_MAX`] bytes. An unknown `project_id`/`task_id` is a
+    /// `validation` error (it arrives as a field of the record being
+    /// written), mirroring `create_inbox_item`.
+    pub fn create_artifact(
+        &mut self,
+        project_id: i64,
+        task_id: Option<i64>,
+        name: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> Result<Artifact> {
+        let name = validate_artifact_name(name)?;
+        let content_type = validate_artifact_content_type(
+            content_type.unwrap_or(super::types::DEFAULT_ARTIFACT_CONTENT_TYPE),
+        )?;
+        let body = validate_artifact_body(body)?;
+        self.ensure_artifact_project(project_id)?;
+        self.ensure_artifact_task(task_id)?;
+        self.ensure_artifact_name_free(project_id, &name, None)?;
+        self.conn.execute(
+            "INSERT INTO artifacts \
+             (project_id, task_id, name, content_type, body, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))",
+            (project_id, task_id, &name, &content_type, &body),
+        )?;
+        self.get_artifact(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_artifact(&self, id: i64) -> Result<Artifact> {
+        self.conn
+            .query_row(
+                &format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE id = ?1"),
+                [id],
+                row_to_artifact,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("artifact {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Lists artifacts by name (case-insensitively), `id` breaking ties. With
+    /// `project` given, only that project's artifacts; otherwise every
+    /// artifact.
+    pub fn list_artifacts(&self, project: Option<i64>) -> Result<Vec<Artifact>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE (?1 IS NULL OR project_id = ?1) ORDER BY name COLLATE NOCASE, id"
+        ))?;
+        let rows = stmt.query_map([project], row_to_artifact)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Applies a patch. Every rule `create_artifact` enforces is re-enforced
+    /// here — an update is the other way a bad record could get in. There is
+    /// no `project_id` field on [`ArtifactPatch`]: an artifact's project is
+    /// immutable after creation.
+    pub fn update_artifact(&mut self, id: i64, patch: ArtifactPatch) -> Result<Artifact> {
+        let current = self.get_artifact(id)?;
+        let mut next = current.clone();
+        if let Some(task_id) = patch.task_id {
+            self.ensure_artifact_task(task_id)?;
+            next.task_id = task_id;
+        }
+        if let Some(name) = &patch.name {
+            next.name = validate_artifact_name(name)?;
+            self.ensure_artifact_name_free(current.project_id, &next.name, Some(id))?;
+        }
+        if let Some(content_type) = &patch.content_type {
+            next.content_type = validate_artifact_content_type(content_type)?;
+        }
+        if let Some(body) = &patch.body {
+            next.body = validate_artifact_body(body)?;
+        }
+        self.conn.execute(
+            "UPDATE artifacts SET task_id = ?1, name = ?2, content_type = ?3, body = ?4, \
+             updated_at = datetime('now') WHERE id = ?5",
+            (next.task_id, &next.name, &next.content_type, &next.body, id),
+        )?;
+        self.get_artifact(id)
+    }
+
+    /// Deletes an artifact; returns the destroyed record (the recoverable
+    /// echo — there is no history table for artifacts, and deletes carry no
+    /// prompt).
+    pub fn delete_artifact(&mut self, id: i64) -> Result<Artifact> {
+        let artifact = self.get_artifact(id)?;
+        self.conn
+            .execute("DELETE FROM artifacts WHERE id = ?1", [id])?;
+        Ok(artifact)
+    }
+
+    /// An artifact's project must exist; unknown is `validation`, not
+    /// `not_found`, because it arrives as a field of the record being
+    /// written (mirrors `ensure_script_project`, but required rather than
+    /// optional — an artifact's `project_id` is NOT NULL).
+    fn ensure_artifact_project(&self, project_id: i64) -> Result<()> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(format!("project {project_id} not found")));
+        }
+        Ok(())
+    }
+
+    /// An artifact's task binding is optional; when given, the task must
+    /// exist (mirrors `create_inbox_item`'s unknown-task check).
+    fn ensure_artifact_task(&self, task_id: Option<i64>) -> Result<()> {
+        let Some(task_id) = task_id else {
+            return Ok(());
+        };
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(format!("task {task_id} not found")));
+        }
+        Ok(())
+    }
+
+    /// Name uniqueness, case-insensitive, scoped to the project — an
+    /// artifact's name is a selector only within its own project. `except` is
+    /// the row being updated, so re-saving an artifact under its own name is
+    /// a no-op rather than a conflict with itself.
+    fn ensure_artifact_name_free(
+        &self,
+        project_id: i64,
+        name: &str,
+        except: Option<i64>,
+    ) -> Result<()> {
+        let clash: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM artifacts \
+                 WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE AND id IS NOT ?3 LIMIT 1",
+                (project_id, name, except),
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = clash {
+            return Err(Error::Conflict(format!(
+                "artifact {other} in project {project_id} is already named {name:?}; \
+                 artifact names are unique within a project"
             )));
         }
         Ok(())
@@ -10098,15 +10375,29 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            50,
-            "a fresh db should report user_version 50"
+            51,
+            "a fresh db should report user_version 51"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
+    }
+
+    /// Pins the artifacts migration (mesa task 974) at index 50, the position
+    /// this task appended it at — the same "never edit a shipped migration"
+    /// guard [`the_live_summaries_table_arrives_at_migration_49`] gives its
+    /// own migration.
+    #[test]
+    fn the_artifacts_table_arrives_at_migration_50() {
+        const ARTIFACTS: usize = 50;
+        assert!(
+            MIGRATIONS[ARTIFACTS].contains("CREATE TABLE artifacts"),
+            "migration {ARTIFACTS} is no longer the artifacts migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
     }
 
     /// Upserting keeps `created_at` and moves `updated_at` — the receipts
@@ -11615,5 +11906,321 @@ mod tests {
         let cursors = store.cc_cursors().unwrap();
         assert_eq!(cursors.len(), 1);
         assert_eq!(cursors["/t/a.jsonl"], c2);
+    }
+
+    // ---- artifacts (mesa task 974) -----------------------------------
+
+    #[test]
+    fn create_artifact_round_trips_and_defaults_updated_at_to_created_at() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let a = store
+            .create_artifact(p.id, None, "mockup", Some("text/html"), "<h1>hi</h1>")
+            .unwrap();
+        assert_eq!(a.project_id, p.id);
+        assert_eq!(a.task_id, None);
+        assert_eq!(a.name, "mockup");
+        assert_eq!(a.content_type, "text/html");
+        assert_eq!(a.body, "<h1>hi</h1>");
+        assert_eq!(store.get_artifact(a.id).unwrap(), a);
+    }
+
+    #[test]
+    fn create_artifact_defaults_content_type_when_none_is_given() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let a = store
+            .create_artifact(p.id, None, "mockup", None, "<h1>hi</h1>")
+            .unwrap();
+        assert_eq!(
+            a.content_type,
+            super::super::types::DEFAULT_ARTIFACT_CONTENT_TYPE
+        );
+    }
+
+    #[test]
+    fn create_artifact_rejects_empty_name_and_body() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        assert!(matches!(
+            store.create_artifact(p.id, None, "  ", Some("text/html"), "body"),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.create_artifact(p.id, None, "name", Some("text/html"), ""),
+            Err(Error::Validation(_))
+        ));
+        // Whitespace-only is empty too — mirrors `validate_script_body`.
+        assert!(matches!(
+            store.create_artifact(p.id, None, "name", Some("text/html"), "   \n"),
+            Err(Error::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn create_artifact_rejects_content_type_outside_the_allowlist() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        assert!(matches!(
+            store.create_artifact(p.id, None, "name", Some("text/plain"), "body"),
+            Err(Error::Validation(_))
+        ));
+        // Every allowlisted value is accepted.
+        for (i, ct) in super::super::types::ARTIFACT_CONTENT_TYPES
+            .iter()
+            .enumerate()
+        {
+            store
+                .create_artifact(p.id, None, &format!("name-{i}"), Some(ct), "body")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn create_artifact_rejects_body_over_the_cap() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let too_big = "a".repeat(ARTIFACT_BODY_MAX + 1);
+        assert!(matches!(
+            store.create_artifact(p.id, None, "name", Some("text/html"), &too_big),
+            Err(Error::Validation(_))
+        ));
+        // Exactly at the cap is fine.
+        let at_cap = "a".repeat(ARTIFACT_BODY_MAX);
+        store
+            .create_artifact(p.id, None, "name", Some("text/html"), &at_cap)
+            .unwrap();
+    }
+
+    #[test]
+    fn create_artifact_unknown_project_or_task_is_validation() {
+        let (mut store, _dir) = temp_store();
+        assert!(matches!(
+            store.create_artifact(9999, None, "name", Some("text/html"), "body"),
+            Err(Error::Validation(_))
+        ));
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        assert!(matches!(
+            store.create_artifact(p.id, Some(9999), "name", Some("text/html"), "body"),
+            Err(Error::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn create_artifact_name_is_unique_per_project_case_insensitively() {
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
+        store
+            .create_artifact(p1.id, None, "Mockup", Some("text/html"), "body")
+            .unwrap();
+        assert!(matches!(
+            store.create_artifact(p1.id, None, "mockup", Some("text/html"), "other"),
+            Err(Error::Conflict(_))
+        ));
+        // Same name in a different project is fine — the scope is per-project.
+        store
+            .create_artifact(p2.id, None, "mockup", Some("text/html"), "body")
+            .unwrap();
+    }
+
+    #[test]
+    fn list_artifacts_orders_by_name_and_scopes_to_a_project() {
+        let (mut store, _dir) = temp_store();
+        let p1 = store.create_project("p1", None, None, None, None).unwrap();
+        let p2 = store.create_project("p2", None, None, None, None).unwrap();
+        store
+            .create_artifact(p1.id, None, "zeta", Some("text/html"), "b")
+            .unwrap();
+        store
+            .create_artifact(p1.id, None, "alpha", Some("text/html"), "b")
+            .unwrap();
+        store
+            .create_artifact(p2.id, None, "middle", Some("text/html"), "b")
+            .unwrap();
+
+        let scoped = store.list_artifacts(Some(p1.id)).unwrap();
+        assert_eq!(
+            scoped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+
+        let all = store.list_artifacts(None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn update_artifact_patches_only_what_it_names_and_reenforces_rules() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let t = add_task(&mut store, p.id, "task one");
+        let a = store
+            .create_artifact(p.id, None, "name", Some("text/html"), "<p>hi</p>")
+            .unwrap();
+
+        // Bind the task; other fields untouched.
+        let patched = store
+            .update_artifact(
+                a.id,
+                ArtifactPatch {
+                    task_id: Some(Some(t.id)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(patched.task_id, Some(t.id));
+        assert_eq!(patched.name, "name");
+        assert_eq!(patched.body, "<p>hi</p>");
+
+        // Un-bind the task.
+        let patched = store
+            .update_artifact(
+                a.id,
+                ArtifactPatch {
+                    task_id: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(patched.task_id, None);
+
+        // Empty name/body are validation errors, not erasures.
+        assert!(matches!(
+            store.update_artifact(
+                a.id,
+                ArtifactPatch {
+                    name: Some("".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.update_artifact(
+                a.id,
+                ArtifactPatch {
+                    body: Some("".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+        // Bad content_type re-enforced on update too.
+        assert!(matches!(
+            store.update_artifact(
+                a.id,
+                ArtifactPatch {
+                    content_type: Some("text/plain".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+        // Unknown task re-enforced on update.
+        assert!(matches!(
+            store.update_artifact(
+                a.id,
+                ArtifactPatch {
+                    task_id: Some(Some(9999)),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn update_artifact_name_conflict_is_scoped_to_the_project_and_ignores_self() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let a1 = store
+            .create_artifact(p.id, None, "one", Some("text/html"), "b")
+            .unwrap();
+        let a2 = store
+            .create_artifact(p.id, None, "two", Some("text/html"), "b")
+            .unwrap();
+        // Renaming a1 to its own name is a no-op, not a self-conflict.
+        store
+            .update_artifact(
+                a1.id,
+                ArtifactPatch {
+                    name: Some("one".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Renaming a1 to a2's name is a real conflict.
+        assert!(matches!(
+            store.update_artifact(
+                a1.id,
+                ArtifactPatch {
+                    name: Some("two".into()),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Conflict(_))
+        ));
+        let _ = a2;
+    }
+
+    #[test]
+    fn delete_artifact_echoes_the_destroyed_record() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let a = store
+            .create_artifact(p.id, None, "name", Some("text/html"), "body")
+            .unwrap();
+        let destroyed = store.delete_artifact(a.id).unwrap();
+        assert_eq!(destroyed, a);
+        assert!(matches!(store.get_artifact(a.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn deleting_a_project_cascades_its_artifacts() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let a = store
+            .create_artifact(p.id, None, "name", Some("text/html"), "body")
+            .unwrap();
+        store.delete_project(p.id).unwrap();
+        assert!(matches!(store.get_artifact(a.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn deleting_a_task_sets_its_artifacts_task_id_to_null() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("proj", None, None, None, None)
+            .unwrap();
+        let t = add_task(&mut store, p.id, "task one");
+        let a = store
+            .create_artifact(p.id, Some(t.id), "name", Some("text/html"), "body")
+            .unwrap();
+        store.delete_task(t.id).unwrap();
+        let after = store.get_artifact(a.id).unwrap();
+        assert_eq!(
+            after.task_id, None,
+            "deleting the task must un-bind, not destroy, the page"
+        );
     }
 }

@@ -28,6 +28,7 @@ import { TaskModal } from '../components/TaskModal'
 import { KanbanBoard } from '../KanbanBoard'
 import { shouldIgnoreShortcut } from '../keyboardScope'
 import { useFetch } from '../useFetch'
+import { ArtifactsView } from './ArtifactsView'
 import { CCDashboardView } from './CCDashboardView'
 import { DiagramBoardView } from './DiagramBoardView'
 import { DiagramListView } from './DiagramListView'
@@ -83,6 +84,7 @@ export function ProjectTasksPage({
   diagramId,
   git,
   files,
+  artifacts,
   terminal,
   dashboard,
   settings,
@@ -102,6 +104,11 @@ export function ProjectTasksPage({
   // Files is another URL-driven view: the project's file tree (rooted at
   // local_path) with a content viewer for the selected file.
   files: boolean
+  // Artifacts is another URL-driven view: the project's agent-written pages
+  // (mesa task 974) — a list on the left, the selected one rendered on the
+  // right, sandboxed. Unrelated to a task's own `artifact` field (a bounded
+  // pointer string set at close-out).
+  artifacts: boolean
   // Terminal is another URL-driven view: the global Terminal page's pane
   // tree of live shells, rooted at the project's local_path instead of
   // $HOME (mesa task 524).
@@ -191,7 +198,14 @@ export function ProjectTasksPage({
   // once because both the 'a' shortcut and the agents poll below are scoped
   // to it.
   const onBoard =
-    !diagrams && !git && !files && !terminal && !dashboard && !settings && !onCustom
+    !diagrams &&
+    !git &&
+    !files &&
+    !artifacts &&
+    !terminal &&
+    !dashboard &&
+    !settings &&
+    !onCustom
 
   // Which single view fills the main area when Custom is not the open tab —
   // and therefore which pane a tab dropped on it splits against.
@@ -203,11 +217,13 @@ export function ProjectTasksPage({
         ? 'git'
         : files
           ? 'files'
-          : terminal
-            ? 'terminal'
-            : diagrams
-              ? 'diagrams'
-              : 'board'
+          : artifacts
+            ? 'artifacts'
+            : terminal
+              ? 'terminal'
+              : diagrams
+                ? 'diagrams'
+                : 'board'
 
   const {
     data: project,
@@ -327,6 +343,8 @@ export function ProjectTasksPage({
         return <GitView projectId={projectId} />
       case 'files':
         return <FilesView projectId={projectId} />
+      case 'artifacts':
+        return <ArtifactsView projectId={projectId} />
       case 'terminal':
         return !project ? (
           <p className="muted">Loading…</p>

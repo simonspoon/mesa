@@ -4734,6 +4734,117 @@ body.files-tree-resizing {
   text-align: center;
 }
 
+/* ---- Artifacts tab: artifact list (left) + rendered preview (right)
+   (mesa task 974) — same viewport-bound two-pane shape as .git-layout. ---- */
+
+.artifacts-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: stretch;
+  height: var(--tab-viewport-height);
+  min-height: var(--tab-viewport-min);
+}
+
+.artifacts-list-pane {
+  flex: none;
+  width: 19rem;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.artifacts-list li {
+  cursor: pointer;
+}
+
+.artifacts-list li.selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan-dim);
+}
+
+.artifacts-item-name {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-h);
+}
+
+.artifacts-item-meta {
+  font-size: 0.75rem;
+  margin-top: 0.2rem;
+}
+
+.artifacts-detail-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 0.5rem 0.75rem;
+}
+
+.artifacts-detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0 0 0.5rem;
+}
+
+.artifacts-detail-name {
+  font-size: 1rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.artifacts-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
+}
+
+/* The rendered artifact fills whatever the detail pane has left — an <iframe>
+   with no intrinsic size otherwise collapses to a couple of lines. */
+.artifacts-preview {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* `sandbox="allow-scripts"` with NO `allow-same-origin` (App.tsx's
+   ArtifactPreview) is the load-bearing attribute — do not add
+   `allow-same-origin` here or there. This border is cosmetic only; the
+   frame's own opaque origin plus the render route's CSP is the actual
+   boundary (.scratch/artifacts-spec.md §4/§5). */
+.artifact-preview-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #fff;
+}
+
+.artifact-markdown-preview {
+  flex: 1;
+  overflow: auto;
+}
+
+.artifact-form-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.artifact-body-editor {
+  flex: 1;
+  min-height: 20rem;
+  display: flex;
+}
+
+.artifact-body-editor > * {
+  flex: 1;
+}
+
 /* Files tab: tree panel + content viewer, same viewport-bound two-pane shape
    as .git-layout. */
 .files-truncated-note {
@@ -6355,6 +6466,24 @@ body.files-tree-resizing {
   }
 
   .git-diff-pane {
+    height: var(--tab-viewport-height);
+    min-height: var(--tab-viewport-min);
+  }
+
+  /* Artifacts tab: list flows above, preview pane keeps a viewport-bound box
+     below (same treatment as .git-layout). */
+  .artifacts-layout {
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+
+  .artifacts-list-pane {
+    width: auto;
+    overflow-y: visible;
+  }
+
+  .artifacts-detail-pane {
     height: var(--tab-viewport-height);
     min-height: var(--tab-viewport-min);
   }

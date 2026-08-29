@@ -141,11 +141,10 @@ export type ListenPath = 'auris' | 'browser' | 'none'
 export function listenPath(input: {
   /**
    * The server has an `auris` that answered — `GET /api/live/transcribe`.
-   * False whenever mesa could not ask: the route 404'd (what `serve --lan`
-   * looks like, the route being absent there rather than gated), the
-   * request failed, or `listen::models()` came back empty. An empty model
-   * list means **"mesa could not ask"**, never "auris says there are
-   * none" — the same rule `speech::voices()` has carried since it shipped.
+   * False whenever mesa could not ask: the request failed, or
+   * `listen::models()` came back empty. An empty model list means
+   * **"mesa could not ask"**, never "auris says there are none" — the same
+   * rule `speech::voices()` has carried since it shipped.
    */
   transcribes: boolean
   /** This browser can capture audio at all (`liveAudio.ts::capturesAudio`). */

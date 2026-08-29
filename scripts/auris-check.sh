@@ -35,20 +35,22 @@
 #      no/form Content-Type) and the agent gate (403 on a foreign Origin or
 #      Host, 200 from a local one) `require_agent_access` shares with
 #      speak/start/stop;
-#   7. under `--lan`, the route is **absent**, not gated: a well-formed
-#      request never reaches the handler (no 200, no transcript, not even the
-#      gate's JSON 403 — the embedded static-file fallback's plain 405
-#      instead), and auris is never invoked; the Content-Type gate still
-#      fires first, in middleware, before routing decides the route doesn't
-#      exist.
+#   7. under `--lan`, the route is **present and gated** (mesa task 972): a
+#      well-formed request from a loopback peer reaches the handler and
+#      auris is actually invoked — `require_agent_access` relaxes to
+#      `require_lan_page_access` under `--lan` exactly as the agent/terminal
+#      routes do, since a LAN peer already has a shell there and decoding a
+#      recording is strictly less; the Content-Type gate still fires first,
+#      in both modes.
 #   8. `GET /api/live/transcribe` (mesa task 957): a missing recognizer is
 #      200 `available: false`, never an error — an empty model list means
 #      "mesa could not ask", not "auris says no"; a recognizer that answers
 #      `--no-download --list-models` is `available: true`; the same
 #      `require_agent_access` gate as the POST (403 foreign Origin/Host, 200
 #      local) with no Content-Type check, since a GET carries no body;
-#   9. under `--lan`, the GET is **absent** too, on the same route entry as
-#      the POST — not merely refusing.
+#   9. under `--lan`, the GET answers the same `{"available": bool}` JSON as
+#      default mode — not the SPA shell — on the same relaxed gate as the
+#      POST.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -354,20 +356,23 @@ wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
 
 # =====================================================================
-# 7. --lan: the route is ABSENT, not gated
+# 7. --lan: the route is PRESENT and GATED (mesa task 972)
 # =====================================================================
 #
-# `transcribe_router` never registers this route under --lan, so a
-# well-formed request falls through to the embedded-static-file fallback
-# (`axum_embed::ServeEmbed`, GET/HEAD only), which answers a plain-text 405 —
-# nothing like the gate's `{"error":{"code":"validation",...}}` 403. That 405
-# is an artifact of the SPA fallback, not a status mesa chose, so this is
-# written against the property (the handler was never reached, and the stub
-# was never invoked) rather than against the number.
+# `--lan` already hands any device on the network a shell (the Agents and
+# Terminal routes) and full task CRUD with no auth, so a structural refusal
+# on this one route bought nothing but broke `mesa live` from a phone. The
+# route is registered in both serve modes now, behind the same
+# `require_agent_access` pair every other agent route carries — which itself
+# relaxes to the looser `require_lan_page_access` under `--lan`. A loopback
+# request (the only kind this script can make) satisfies that relaxed check,
+# so the assertions here are the mirror of section 6: the handler is
+# actually reached, auris is actually invoked, and the Content-Type gate
+# still fires first, in both modes.
 
 LAN_PORT=17780
 LAN_BASE="http://127.0.0.1:$LAN_PORT"
-"$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan.log" 2>&1 &
+MESA_AURIS_BIN="$STUB_DIR/auris" "$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan.log" 2>&1 &
 LAN_PID=$!
 for _ in $(seq 1 50); do
   curl -sf "$LAN_BASE/api/projects" >/dev/null 2>&1 && break
@@ -380,34 +385,31 @@ rm -f "$STUB_DIR/last-argv"
 STATUS=$(curl -s -o "$TMP/lan-body" -w '%{http_code}' -H 'Content-Type: application/json' \
   -d "$TRANSCRIBE_BODY" "$LAN_BASE/api/live/transcribe")
 LAN_BODY=$(cat "$TMP/lan-body")
-[ "$STATUS" != "200" ] || fail "--lan: /api/live/transcribe must not be reachable at all, got 200"
-grep -q '"text"' <<<"$LAN_BODY" && fail "--lan: a transcript came back — the route must not exist here"
-[ "$(jq -e . <<<"$LAN_BODY" 2>/dev/null | jq -r '.error.code // empty' 2>/dev/null)" != "validation" ] ||
-  fail "--lan: a validation error shape means the route was gated, not absent"
-[ ! -e "$STUB_DIR/last-argv" ] ||
-  fail "--lan: auris must never be invoked — the route is absent, not merely refused"
-ok "--lan: POST /api/live/transcribe never reaches the handler (not 200, no transcript, not the gate's JSON 403) and auris is never run"
+[ "$STATUS" = "200" ] ||
+  fail "--lan: a well-formed transcribe request from a loopback peer must reach the handler, got $STATUS ($LAN_BODY)"
+[ "$(jq -r .text <<<"$LAN_BODY")" = "hello there" ] ||
+  fail "--lan: expected the stub's transcript, got $(jq -r .text <<<"$LAN_BODY")"
+[ -e "$STUB_DIR/last-argv" ] ||
+  fail "--lan: auris must actually be invoked — the whole point of task 972 is a LAN peer gets real transcription, not a refusal"
+ok "--lan: POST /api/live/transcribe is reachable and gated like any other agent route — a loopback peer gets 200 with the stub's transcript, and auris is actually invoked"
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' -d 'audio_base64=form+post' "$LAN_BASE/api/live/transcribe")
 [ "$STATUS" = "415" ] ||
-  fail "--lan: the Content-Type gate must still fire on this path (it runs in middleware before routing), got $STATUS"
-ok "--lan: the Content-Type gate still rejects a form-encoded POST to the absent transcribe route — the middleware runs before routing decides the route does not exist"
+  fail "--lan: the Content-Type gate must still fire on a form-encoded POST, got $STATUS"
+ok "--lan: the Content-Type gate still rejects a form-encoded POST — that half of the boundary holds in both serve modes"
 
-# ---- 9. --lan: GET /api/live/transcribe is absent too ----
+# ---- 9. --lan: GET /api/live/transcribe answers the same JSON as default mode ----
 #
-# Same route entry as the POST (`transcribe_router`), so it inherits the same
-# absence rather than needing its own --lan handling. Unlike the POST, a GET
-# to an unknown path is exactly what the SPA fallback DOES serve (200
-# index.html, per `transcribe_router`'s own doc comment) — so the property to
-# assert here is not the status code but that no availability answer came
-# back: the response is the app shell, not JSON with an `available` key.
+# Same route entry as the POST, registered unconditionally now, so it
+# inherits the same gate rather than needing its own --lan handling: a
+# loopback peer gets the real `{"available": bool}` answer, not the SPA
+# shell an unknown GET path would otherwise fall through to.
 STATUS=$(curl -s -o "$TMP/lan-get-body" -w '%{http_code}' "$LAN_BASE/api/live/transcribe")
 LAN_GET_BODY=$(cat "$TMP/lan-get-body")
-grep -q '"available"' <<<"$LAN_GET_BODY" &&
-  fail "--lan: an availability answer came back — the route must not exist here"
-grep -qi '<html' <<<"$LAN_GET_BODY" ||
-  fail "--lan: GET /api/live/transcribe must fall through to the SPA shell, not a JSON answer"
-ok "--lan: GET /api/live/transcribe never reaches the handler either — falls through to the SPA fallback like any other unknown GET path, absent exactly like the POST"
+[ "$STATUS" = "200" ] || fail "--lan: GET /api/live/transcribe expected 200, got $STATUS"
+[ "$(jq -r .available <<<"$LAN_GET_BODY")" = "true" ] ||
+  fail "--lan: GET /api/live/transcribe must answer available:true (the stub lists a model), got $LAN_GET_BODY"
+ok "--lan: GET /api/live/transcribe answers the real {\"available\": bool} JSON, not the SPA shell — same gate as the POST"
 
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true

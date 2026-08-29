@@ -818,11 +818,25 @@ fn router(state: AppState) -> Router {
         // the inbox's play button — see `speak_inbox` for why that pair, and
         // why a GET.
         .route("/api/live/turns/{id}/speak", get(speak_live_turn))
-        // Transcribing one recording with `auris` (mesa task 954). Absent
-        // rather than gated under `--lan` — see `transcribe_router`'s own
-        // doc comment — so it is merged in conditionally instead of living
-        // in this `.route(...)` chain.
-        .merge(transcribe_router(&state))
+        // Transcribing one recording with `auris` (mesa task 954, revisited
+        // task 972). Registered in **both** serve modes now: gated by the
+        // same `require_agent_access` + `require_same_site_fetch` pair
+        // `transcribe_live`'s doc comment describes, which already relaxes
+        // to `require_lan_page_access` under `--lan` exactly as the agent
+        // and terminal routes do. `--lan` already hands a LAN peer a shell
+        // (the Agents/Terminal routes), so decoding a recording is strictly
+        // less than what that peer can already do — a structural refusal
+        // here bought nothing but broke `mesa live` from a phone, which
+        // fell back to the browser's Chrome-only recognizer, the exact gap
+        // `auris` exists to close. Body limit raised above `LIVE_AUDIO_MAX`
+        // for the same reason as everywhere else on this route: base64
+        // costs 33% on the wire.
+        .route(
+            "/api/live/transcribe",
+            post(transcribe_live)
+                .get(transcribe_available)
+                .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT)),
+        )
         // Scripts: user-authored shell run from a generated form. A script
         // body is a program mesa executes, so authoring is the strictest gate
         // in the file (`require_local_path_write`, loopback-only in BOTH
@@ -2818,8 +2832,16 @@ struct TranscribeBody {
 /// depth against whatever Origin-less client shape shows up later; it exists
 /// on the speak GETs specifically because an `<audio src>` carries no Origin
 /// for the first gate's Origin checks to judge, which is not this route's
-/// situation. See `transcribe_router` for why, under `--lan`, this route
-/// does not exist at all rather than being gated.
+/// situation. Under `--lan` this same `require_agent_access` call relaxes to
+/// `require_lan_page_access`, letting any device already on the network
+/// reach this handler — deliberately (mesa task 972): `--lan` already grants
+/// a LAN peer the Agents and Terminal routes, i.e. arbitrary code execution
+/// on this machine, so a peer that could already run a shell could already
+/// decode whatever audio it wanted. Refusing this one route structurally
+/// (as `mesa live look` still does, for the different capability of
+/// screenshotting the owner's physical screen) protected nothing and broke
+/// `mesa live` from a phone, which fell back to the browser's Chrome-only
+/// `SpeechRecognition` — the exact gap `auris` exists to close.
 ///
 /// **Ordering, precisely stated:** the two gate calls below run before mesa
 /// decodes base64 or spawns `auris` — but `body: Result<Json<TranscribeBody>,
@@ -2832,7 +2854,10 @@ struct TranscribeBody {
 /// the magnitude — every other route on this pattern rides axum's ~2 MiB
 /// default, and this one raises the pre-gate buffer to ~34 MiB. That is a
 /// symmetric cost (a caller must transmit ~34 MB to make the server hold
-/// ~34 MB) and, under `--lan`, the route does not exist to be reached at all.
+/// ~34 MB), and it now applies under `--lan` too, where the peer set is
+/// wider — an honest cost to state, not a new one: it matches what every
+/// other agent-gated route on this file already accepts from that same
+/// wider peer set.
 async fn transcribe_live(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -2907,18 +2932,14 @@ async fn transcribe_live(
 /// route adds no new probing mechanism — it just reads the same signal.
 ///
 /// Registered on the **same** `.route("/api/live/transcribe", ...)` entry as
-/// [`transcribe_live`], inside `transcribe_router`, rather than its own line —
-/// that is what makes it inherit `transcribe_router`'s `--lan` absence
-/// exactly as the POST does — not a gate refusal. A GET to an unregistered
-/// path is exactly what the embedded SPA fallback DOES serve (200
-/// `index.html`, GET/HEAD only, per `transcribe_router`'s own doc comment),
-/// unlike the POST's plain 405, so the caller-visible signal is "this
-/// answered the app shell, not JSON with an `available` key" rather than a
-/// distinct status code. That absence *is* the answer for a LAN page: the
-/// capability does not exist to be checked there (see `transcribe_router`'s
-/// doc), so a LAN page must read "not a JSON answer" as "fall back to the
-/// browser's own recognizer" rather than getting `available: false` from a
-/// route that would have decoded its audio if only it asked politely.
+/// [`transcribe_live`] rather than its own line, so the two verbs share one
+/// gate and one body-limit layer. Present in both serve modes (mesa task
+/// 972): under `--lan`, `require_agent_access` relaxes to
+/// `require_lan_page_access` exactly as it does for the POST, so a LAN page
+/// gets a real `available` answer instead of being forced to infer the
+/// capability's absence from a non-JSON response — see `transcribe_live`'s
+/// doc comment for why `--lan` reaching this route at all is the intended
+/// posture rather than a gap.
 ///
 /// Gated by `require_agent_access` alone — this is a read, not a mutation, so
 /// unlike `transcribe_live` it carries no `require_same_site_fetch`.
@@ -2936,41 +2957,6 @@ async fn transcribe_available(
             message: format!("checking auris availability failed: {e}"),
         })?;
     Ok(Json(json!({ "available": available })).into_response())
-}
-
-/// Whether `POST /api/live/transcribe` exists at all, decided at router
-/// construction from `state.lan`.
-///
-/// `require_agent_access` **relaxes** under `--lan` — it swaps the strict
-/// loopback+Host+Origin check for the far looser `require_lan_page_access`,
-/// which any device already on the network passes by design. That is fine
-/// for task CRUD and for posting text a person already reviewed on their own
-/// screen; it is not fine for handing an unauthenticated LAN peer a way to
-/// make mesa's own machine decode whatever audio it recorded. The refusal
-/// has to be structural, not a stronger check — the same shape
-/// `mesa live look` takes and for the same reason (`core::look`,
-/// `docs/listen.md`): the capability does not exist to be checked. So this
-/// route is present only in default (loopback) mode; under `--lan` it is
-/// simply never registered, and a request for it falls through to the SPA
-/// fallback (`axum_embed::ServeEmbed`, `.fallback_service` in `router()`)
-/// like any other unknown path. Empirically — proven in
-/// `transcribe_route_is_absent_under_lan_not_gated` below — that fallback
-/// only serves GET/HEAD, so a properly-formed `POST` with a JSON
-/// Content-Type answers a bare **405 "Method not allowed"**, not the 200
-/// `index.html` a GET to an unknown path gets and not the gate's 403 JSON.
-/// Either way the property that actually matters holds: the request never
-/// reaches `transcribe_live`, so nothing is ever decoded on an unauthenticated
-/// LAN peer's behalf.
-fn transcribe_router(state: &AppState) -> Router<AppState> {
-    if state.lan {
-        return Router::new();
-    }
-    Router::new().route(
-        "/api/live/transcribe",
-        post(transcribe_live)
-            .get(transcribe_available)
-            .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT)),
-    )
 }
 
 // ---- scripts (user-authored shell) ----
@@ -10069,21 +10055,27 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         assert!(imported.unwrap_err().status.is_client_error());
     }
 
-    /// The load-bearing claim `transcribe_router`'s doc comment makes: under
-    /// `--lan` the route is **absent**, not gated. Calling the handler
-    /// directly (as the library test above does) can only prove the handler
-    /// refuses — it says nothing about whether the route was ever reachable
-    /// — so this proves the router itself, wired to a real listener exactly
-    /// as `serve` wires it (`into_make_service_with_connect_info`), never
-    /// dispatches the path at all: an unmatched `/api/live/transcribe` falls
-    /// all the way through to the embedded-static-file fallback
-    /// (`axum_embed::ServeEmbed`), which answers a plain-text 405 (it only
-    /// serves GET/HEAD) — nothing like `require_agent_access`'s JSON 403
-    /// `{"error":{"code":"validation",...}}`. A route that existed but merely
-    /// refused `--lan` would answer with that JSON shape and a 403; this
-    /// route answers with neither.
+    /// mesa task 972's reversal: under `--lan` the transcribe route is now
+    /// **present and gated**, not absent. Calling the handler directly (as
+    /// the library tests above do) can only prove the handler's own gate
+    /// check — it says nothing about whether the route was ever wired into
+    /// the router — so this proves the router itself, wired to a real
+    /// listener exactly as `serve` wires it
+    /// (`into_make_service_with_connect_info`), actually dispatches the
+    /// path under `--lan`: a loopback peer passes `require_lan_page_access`
+    /// (its Host is `127.0.0.1:<port>`, and a raw TCP request carries no
+    /// Origin/Sec-Fetch-Site header for either gate to reject), reaches
+    /// `transcribe_live`, and fails there on the merits — an empty JSON body
+    /// has no `audio_base64` field, so `Json<TranscribeBody>` extraction
+    /// rejects it as **422** with mesa's own `{"error":{"code":"validation",
+    /// ...}}` shape. That is the opposite of the old fallback signature
+    /// (a plain-text 405 from the embedded-static-file fallback, GET/HEAD
+    /// only) and proves the route is reachable rather than routed around:
+    /// the whole point of task 972 is that `--lan` already hands this peer a
+    /// shell via the Agents/Terminal routes, so gating this route the same
+    /// way those are gated is the correct posture, not a hole.
     #[tokio::test]
-    async fn transcribe_route_is_absent_under_lan_not_gated() {
+    async fn transcribe_route_is_present_and_gated_under_lan() {
         let (_dir, mut state) = test_state();
         state.lan = true;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10099,9 +10091,12 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let body = "{}";
+        // `test_state()` sets `port: 0` (it never binds a real listener of its
+        // own), so the Host header must claim port 0 — the ephemeral port
+        // this test actually bound to (`addr.port()`) is irrelevant to
+        // `require_lan_agent_host`, which checks Host against `state.port`.
         let req = format!(
-            "POST /api/live/transcribe HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            addr.port(),
+            "POST /api/live/transcribe HTTP/1.1\r\nHost: 127.0.0.1:0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -10110,18 +10105,49 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         stream.read_to_end(&mut resp).await.unwrap();
         let resp = String::from_utf8_lossy(&resp);
         let status_line = resp.lines().next().unwrap_or("");
-        // The observed shape (empirical, not assumed): a plain-text 405 from
-        // the static-file fallback, which only serves GET/HEAD. Assert that
-        // exactly, not just "not 403" — a route that existed but merely
-        // refused `--lan` would answer 403 with the gate's JSON body; a route
-        // that somehow reached the handler would answer 200 with a
-        // `LiveTranscript` JSON body. Neither happens here.
-        assert!(status_line.contains("405"), "{status_line}");
-        assert!(!resp.contains("\"code\":\"validation\""), "{resp}");
-        assert!(
-            !resp.contains("\"text\":"),
-            "the handler must never run: {resp}"
-        );
+        // Observed (empirical, not assumed): the handler ran and rejected the
+        // body on the merits, 422 with mesa's JSON error shape — not the
+        // fallback's plain-text 405, and not the gate's own 403.
+        assert!(status_line.contains("422"), "{status_line}");
+        assert!(resp.contains("\"code\":\"validation\""), "{resp}");
+    }
+
+    /// The test above connects from `127.0.0.1`, which is a **loopback**
+    /// peer — and `require_origin_matches_host` special-cases exactly that
+    /// case (`if addr.ip().is_loopback() && require_local_origin(headers)
+    /// .is_ok() { return Ok(()) }`), so a same-machine `curl` never proves
+    /// the branch a real LAN phone actually takes. Proving that branch needs
+    /// a **non-loopback** `ConnectInfo`, which only a forged `SocketAddr`
+    /// passed straight to the handler can supply — the same reasoning
+    /// `lan_page_may_never_read_the_library_either` already relies on for
+    /// the library routes' identical "a same-machine curl cannot prove the
+    /// peer-address half" gap. `transcribe_available` is the cheap half to
+    /// call this way (no `auris` binary needed — an empty `models()` just
+    /// makes `available` false, which this test does not assert either way).
+    ///
+    /// Two assertions, the pairing that must not drift apart: a forged LAN
+    /// peer sending exactly what a phone's browser sends (an IP-literal Host
+    /// on our port, a matching Origin) gets a real answer, and the same peer
+    /// with a mismatched Origin is still refused.
+    #[tokio::test]
+    async fn transcribe_available_reaches_a_real_lan_phone_but_not_a_foreign_origin() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        state.port = 7770;
+        let peer = lan_peer();
+
+        let phone_headers = hdrs(Some("192.168.1.50:7770"), Some("http://192.168.1.50:7770"));
+        let resp = transcribe_available(State(state.clone()), ConnectInfo(peer), phone_headers)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert!(body.get("available").is_some(), "{body}");
+
+        let forged_origin_headers = hdrs(Some("192.168.1.50:7770"), Some("https://evil.example"));
+        let rejected =
+            transcribe_available(State(state), ConnectInfo(peer), forged_origin_headers).await;
+        assert!(rejected.unwrap_err().status.is_client_error());
     }
 
     // --- live (mesa task 855) --------------------------------------------

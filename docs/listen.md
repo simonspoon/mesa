@@ -48,37 +48,34 @@ in a `OnceLock` for the life of the process, the same cache
 `GET /api/config/listen` reads (`docs/config.md`), so this route adds no new
 probing mechanism.
 
-The GET is registered on the **same** route entry as the POST below, inside
-`transcribe_router`, rather than a line of its own — that is what makes it
-inherit the POST's `--lan` absence exactly, with no gate of its own to keep
-in step. A GET to an unregistered path is exactly what the embedded SPA
-fallback serves instead (200 `index.html`, GET/HEAD only), so a LAN page's
-caller-visible signal is "this answered the app shell, not JSON with an
-`available` key" rather than a distinct status code — and that absence *is*
-the answer: fall back to the browser's own recognizer, the same conclusion a
-`503` on a real transcribe attempt would have produced. Gated by
-`require_agent_access` alone (a read, not a mutation, so no
-`require_same_site_fetch`).
+The GET is registered on the **same** route entry as the POST below — both
+folded into the main route chain in `router()`, with no route-specific
+helper of their own — so a LAN page reading this probe gets the same real
+`{"available": ...}` answer a default-mode page gets, not the SPA fallback's
+`index.html` standing in for "not JSON." Gated by `require_agent_access`
+alone (a read, not a mutation, so no `require_same_site_fetch`).
 
-## The route: present only in default mode
+## The route: gated, not absent, under `--lan`
 
-`POST /api/live/transcribe` exists at all only when `state.lan` is false,
-decided once at router construction (`transcribe_router`, `src/api.rs`).
-`require_agent_access` **relaxes** under `--lan` — it swaps the strict
+`POST /api/live/transcribe` is registered in **both** serve modes, behind
+the same `require_agent_access` gate every other agent route carries —
+which **relaxes** rather than refuses under `--lan`, swapping the strict
 loopback+Host+Origin check for `require_lan_page_access`, which any device
-already on the network passes by design. That is fine for posting text a
-person already reviewed on their own screen; it is not fine for handing an
-unauthenticated LAN peer a way to make mesa's own machine decode whatever
-audio it recorded. The refusal is therefore **structural, not a stronger
-check** — the same shape `mesa live look` takes (`core::look`, `docs/live.md`
-"Seeing the screen") and for the same reason: the capability does not exist
-to be checked. Under `--lan` the route is simply never registered, and a
-request for it falls through to the SPA fallback like any other unknown
-path — which only serves GET/HEAD, so a properly-formed POST answers a bare
-**405 "Method not allowed"**, not the 200 `index.html` a GET gets and not
-the gate's 403 JSON. Either way the property that matters holds: the
-request never reaches the handler, so nothing is ever decoded on an
-unauthenticated LAN peer's behalf.
+already on the network passes by design. This route used to refuse
+structurally instead, on the reasoning that posting text a person already
+reviewed on their own screen is one thing and handing an unauthenticated LAN
+peer a way to make mesa's own machine decode whatever audio it recorded is
+another. That reasoning did not survive contact with what `--lan` already
+is: the flag hands every device on the network full read/write on all data
+plus the Agents and Terminal tabs — arbitrary code execution on this
+machine — against which decoding a posted recording is strictly less
+power, not more. Refusing it structurally bought no real safety and cost a
+real feature: a phone on the network never saw `auris` was reachable, so the
+Live page silently fell back to the browser's own `SpeechRecognition` —
+Chrome-only, no vocabulary correction — the whole reason `auris` exists.
+`mesa live look` keeps its structural refusal unchanged: screenshotting the
+machine's owner's physical screen is a genuinely different capability, not
+merely a stronger one, and nothing about that argument applies here.
 
 ## The request: bounded audio, not text
 
@@ -109,8 +106,10 @@ before the handler body executes at all — so by the time either gate runs,
 the whole request body is already buffered (up to `TRANSCRIBE_BODY_LIMIT`)
 and parsed as JSON. That is not new or route-specific (`update_project_files_content`
 and `run_script` gate after a `Json<T>` parameter the same way); what is new
-here is only the magnitude, and under `--lan` the route does not exist to be
-reached at all regardless.
+here is only the magnitude, and it now applies under `--lan` too, in exactly
+the same shape: a caller must transmit ~34 MB to make the server hold ~34 MB
+before either gate gets a chance to refuse it, which is the same cost every
+other agent-gated route with a request body already accepts.
 
 ## What `auris` receives and returns
 
@@ -185,8 +184,9 @@ stderr floods a pipe buffer; the "nonzero exit or no transcript line means
 no transcript" rule; the body-size contract (413 naming the limit, 422 on
 bad/empty/missing base64, an unreadable-but-valid-base64 body reaching
 `auris` unexamined); the security boundary in default mode (415 on a bad
-Content-Type, 403/200 on the agent gate); the route's structural absence
-under `--lan` for both the POST and the GET (a well-formed request never
-reaches the handler, not even the gate's 403); and the `GET`'s own
+Content-Type, 403/200 on the agent gate); the route's presence and gating
+under `--lan` for both the POST and the GET (a LAN POST reaches the stub
+`auris` and comes back 200 with a transcript, the GET answers 200 with an
+`available` key, and the Content-Type gate still fires); and the `GET`'s own
 `available: true`/`false` split against a stub that does or doesn't answer
 `--list-models`.

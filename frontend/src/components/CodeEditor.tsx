@@ -352,11 +352,23 @@ export function CodeEditor({
   // A layout effect, so the correction is applied before the browser paints the
   // frame the layer first appears in, and keyed on the two conditions that
   // mount a layer rather than on the values behind them.
+  //
+  // `deferred` is the third key, for the other way a layer ends up holding a
+  // scroll the textarea does not have (task 1005). The colours lag by design,
+  // so a character typed at the right-hand edge of a long line scrolls the
+  // textarea onto text the highlight layer does not carry yet — and the
+  // mirrored `scrollLeft` is then CLAMPED to that narrower layer's
+  // `scrollWidth`, one character short, with nothing to fire again once the
+  // deferred pass finally widens it. It costs a character per keystroke and
+  // never recovers, so the glyphs drift right of the caret producing them:
+  // "the cursor is in one place and the typing lands in another". This is the
+  // commit where the layer is at last as wide as the scroll it was handed, and
+  // re-mirroring here is the same five assignments the scroll handler makes.
   const hasFindLayer = matches.length > 0
   useLayoutEffect(() => {
     const area = areaRef.current
     if (area !== null) mirrorScroll(area)
-  }, [hasFindLayer, wrap])
+  }, [hasFindLayer, wrap, deferred])
 
   // Rebuilt every render rather than memoised on `[]`: the methods close over
   // `onCaret`, and a handle frozen at mount would keep reporting the caret to

@@ -188,6 +188,13 @@ function LibraryForm({
           value={draft.body}
           language={bodyLanguage(draft.kind)}
           autoFocus={false}
+          // Every body on this surface is prose in markdown — an agent
+          // definition, a skill, a CLAUDE.md — written in paragraph-long
+          // lines, so scrolling sideways to read one is the wrong default
+          // here even though it is the right one for a script. Fixed rather
+          // than a toggle: the Files tab offers the choice because it browses
+          // arbitrary repos, and this box only ever holds the one shape.
+          wrap
           onChange={(body) => setDraft({ ...draft, body })}
         />
       </div>

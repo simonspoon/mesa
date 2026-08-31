@@ -306,55 +306,89 @@ somewhere else.
 
 | Route | Success | Gate |
 | --- | --- | --- |
-| `GET /api/library` (`?project=<id>`) | 200, bare array (`effective_items`) | `require_local_path_write` |
-| `POST /api/library` | 201 | `require_local_path_write` |
-| `GET /api/library/{id}` | 200 | `require_local_path_write` |
-| `PATCH /api/library/{id}` | 200 | `require_local_path_write` |
-| `DELETE /api/library/{id}` | 200, destroyed record | `require_local_path_write` |
-| `GET /api/library/{id}/versions` | 200, bare array | `require_local_path_write` |
-| `POST /api/library/builtins/{builtin_id}/fork` | 201 | `require_local_path_write` |
-| `GET /api/library/sync` (`?project=<id>`) | 200, bare array | `require_local_path_write` |
-| `POST /api/library/sync` | 200, results array | `require_local_path_write` |
-| `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_local_path_write` |
-| `POST /api/library/import` | 200, results array | `require_local_path_write` |
+| `GET /api/library` (`?project=<id>`) | 200, bare array (`effective_items`) | `require_agent_access` |
+| `POST /api/library` | 201 | `require_agent_access` |
+| `GET /api/library/{id}` | 200 | `require_agent_access` |
+| `PATCH /api/library/{id}` | 200 | `require_agent_access` |
+| `DELETE /api/library/{id}` | 200, destroyed record | `require_agent_access` |
+| `GET /api/library/{id}/versions` | 200, bare array | `require_agent_access` |
+| `POST /api/library/builtins/{builtin_id}/fork` | 201 | `require_agent_access` |
+| `GET /api/library/sync` (`?project=<id>`) | 200, bare array | `require_agent_access` |
+| `POST /api/library/sync` | 200, results array | `require_agent_access` |
+| `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_agent_access` |
+| `POST /api/library/import` | 200, results array | `require_agent_access` |
 
-**All eleven routes are `require_local_path_write` — loopback-only in both
-serve modes, reads included.** This is not a read/write split: unlike
-scripts (`docs/scripts.md`'s "the read/write asymmetry is the point", where a
-LAN peer may *trigger* a stored script but never *author* one), the library
-has no read that is safe to open to a LAN peer, because a row's `body` **is**
-an agent definition, a hook shell script or a CLAUDE.md — the same bytes the
-sync routes read straight off disk, only after they have been stored in the
-database (a bundle is just every one of those bytes at once). Gating the
-disk read at loopback while serving those identical bytes to a LAN peer from
-`GET /api/library/{id}` one route over would be a distinction with no
-security content. `serve --lan` is a no-auth "trust every device on the
-network" posture, so the whole surface — CRUD reads, mutations, both sync
-routes and both bundle routes — sits behind the one gate, one constant
-(`LIBRARY_LOOPBACK`) so the eleven cannot drift apart. Nothing useful is lost
-by it: an agent runs on this machine and reaches mesa over loopback, which the
-gate still allows.
+**All eleven routes are `require_agent_access`** (mesa task 1004) — the same
+gate the agents, terminal and scripts-run routes carry. This is not a
+read/write split: unlike scripts (`docs/scripts.md`'s "the read/write
+asymmetry is the point", where a LAN peer may *trigger* a stored script but
+never *author* one), every route on this surface is treated alike, because a
+row's `body` **is** an agent definition, a hook shell script or a CLAUDE.md —
+the same bytes the sync routes read straight off disk, only after they have
+been stored in the database (a bundle is just every one of those bytes at
+once). There is no coherent line to draw between reading such a row and
+writing one.
 
-**How the loopback boundary is actually proved.** A same-machine `curl` to
-`127.0.0.1` cannot distinguish `require_agent_access` from
-`require_local_path_write` for a *read*, in either serve mode: in default
-mode the global `guard` middleware refuses a foreign `Host` for every route
-before the per-route gate is ever reached, and under `--lan` a
-loopback-connected `curl` makes `require_local_path_write` reduce to exactly
-what `require_agent_access` checks. So `scripts/library-check.sh` proves only
-the *portable* half of the boundary — a DNS-name `Host` (rebinding) and a
-foreign `Origin` (cross-site) refused, in both modes, on all eleven routes.
-The genuinely remote-peer case — would a LAN device actually get turned away
-— can only be proved with a forged non-loopback `SocketAddr`, which a shell
-script driving a real `curl` cannot produce. That is a Rust unit test,
-`lan_page_may_never_read_the_library_either` in `src/api.rs`, mirroring the
-existing `lan_page_may_run_a_script_but_may_never_author_one`: it calls
-`list_library`/`show_library`/`list_library_versions` directly with
-`ConnectInfo` set to a LAN address and asserts all three refuse it — the one
-assertion in the whole suite that actually distinguishes
-`require_local_path_write` from `require_agent_access` for a read. Do not
-"strengthen" the shell gate into asserting this instead; against a loopback
-`curl` it cannot fail, so it would prove nothing.
+What that gate means, per mode:
+
+- **Default (`mesa serve`)** — a **loopback TCP peer** (`require_loopback`),
+  **plus** a local `Host` (`require_local_host`) **plus** a local `Origin`
+  (`require_local_origin`). That is *strictly stronger* than the
+  loopback-only `require_local_path_write` this surface used to carry, which
+  checked the peer alone and leaned on the router-wide `guard` for the Host.
+  Nothing about the ordinary single-machine install loosened; a cross-site
+  page's `Origin` is now refused by the route itself.
+- **`--lan` (`mesa serve --lan`)** — the peer check *relaxes*: a browser on
+  the network reaches the library, so the Library page actually works from
+  the phone or tablet `--lan` exists to serve. Both confused-deputy defenses
+  stay shut — `require_lan_agent_host` (the `Host` must be `localhost` or an
+  IP literal on our port, so a DNS-rebinding page is refused) and
+  `require_origin_matches_host` (a browser `Origin` must equal that vetted
+  `Host`). The Content-Type gate on mutations is unchanged in both modes.
+  Neither defense is authentication, and neither is claimed to be: they stop
+  a *browser* being used as a confused deputy, and nothing more. A
+  non-browser client on the network — a `curl` sending an IP-literal `Host`
+  on our port and no `Origin` at all (every `Origin` check in `api.rs`
+  returns `Ok` on a missing header) — is served, exactly as it already is by
+  `/api/terminal` and `POST /api/scripts/{id}/run`. That *is* the `--lan`
+  posture rather than a gap in it, which is the whole of the reasoning below.
+
+The reasoning for the relax: `--lan` is already an explicit, no-auth "trust
+every device on this network" posture, and under it that network is handed a
+terminal (`/api/agents`), a shell (`/api/terminal`) and script execution
+(`POST /api/scripts/{id}/run`). Refusing that same network the library rows
+while granting it the shell was a distinction with no security content — the
+peer that can run anything gains nothing by being denied the catalogue, and
+loses the entire page. This is the posture `POST /api/live/transcribe` took
+for the same reason (`docs/live.md`, `docs/listen.md`): `require_agent_access`
+relaxes rather than refuses. What stays loopback-only in both modes is the
+narrower set where the capability really is different in kind — the scripts'
+*authoring* routes (a LAN peer must never choose the program) and
+`GET`/`POST /api/fs/dirs`.
+
+**How the boundary is actually proved.** A same-machine `curl` to `127.0.0.1`
+cannot exercise the peer-address half of any of this, in either serve mode:
+in default mode the global `guard` middleware refuses a foreign `Host` for
+every route before the per-route gate is ever reached, and under `--lan` a
+loopback-connected `curl` makes the relaxed and strict gates identical. So
+`scripts/library-check.sh` proves only the *portable* half — a DNS-name
+`Host` (rebinding) and a foreign `Origin` (cross-site) refused under `--lan`,
+a foreign `Host` and a foreign `Origin` refused in default mode, on all
+eleven routes. The genuinely remote-peer case — does a LAN device now get
+*in*, and does a rebound one still get turned away — can only be proved with
+a forged non-loopback `SocketAddr`, which a shell script driving a real
+`curl` cannot produce. That is a Rust unit test,
+`lan_page_may_read_and_author_the_library_but_not_from_a_rebound_page` in
+`src/api.rs` (with
+`lan_page_may_import_the_library_but_not_from_a_rebound_page` for the bundle
+half), mirroring `lan_page_may_run_a_script_but_may_never_author_one`: it
+calls `list_library`/`show_library`/`list_library_versions`/`export_library`
+and `create_library` directly with `ConnectInfo` set to a LAN address and
+asserts they now succeed, that the same peer behind a DNS-name `Host` or a
+foreign `Origin` is still refused, and that in default mode that peer reaches
+neither a read nor a write. Do not "strengthen" the shell gate into asserting
+this instead; against a loopback `curl` it cannot fail, so it would prove
+nothing.
 
 ## The CLI
 
@@ -489,13 +523,14 @@ API:
   body as 422 (never a 500), and every mutating route (create, update,
   delete, fork, sync apply, import) refusing a request with no JSON
   `Content-Type` as 415.
-- **The loopback gate, on all eleven routes, reads included**, in both
-  `default` and `--lan` serve modes: a foreign `Host` refused by the global
-  guard in default mode; under `--lan`, a DNS-name `Host` (rebinding) and a
-  foreign `Origin` (cross-site) refused while a genuinely local
-  Host+Origin — including a loopback peer authoring, not just reading — still
-  succeeds; every refused request leaves the row untouched; and the
-  Content-Type gate still fires under `--lan` too. This is the *portable*
+- **The `require_agent_access` gate, on all eleven routes, reads included**,
+  in both `default` and `--lan` serve modes: in default mode a foreign `Host`
+  and a foreign `Origin` are each refused (a request with no `Origin` at all —
+  curl, or a same-origin browser GET — is fine); under `--lan`, a DNS-name
+  `Host` (rebinding) and a foreign `Origin` (cross-site) refused while a
+  genuinely local Host+Origin — including a loopback peer authoring, not just
+  reading — still succeeds; every refused request leaves the row untouched;
+  and the Content-Type gate still fires under `--lan` too. This is the *portable*
   half of the boundary a shell script can prove — see [Gate posture](#gate-posture)
   above for why the peer-address half needs a Rust test instead.
 - **Import/export round trip**: exporting a library holding a user row and a

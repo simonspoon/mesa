@@ -1437,10 +1437,12 @@ export interface LibraryPatch {
 }
 
 /** Every library item — the db rows plus every built-in not shadowed by one
- * (`id: null`, `builtin: true`). Unscoped when `project` is omitted. Like
- * script authoring, every mutation below is loopback-only in *both* serve
- * modes (docs/scripts.md's gate): a library row becomes an agent definition,
- * a hook script or a CLAUDE.md on disk, so a LAN peer must never write one. */
+ * (`id: null`, `builtin: true`). Unscoped when `project` is omitted. Every
+ * call below — reads as much as mutations — sits behind the server's
+ * `require_agent_access` gate (mesa task 1004, docs/library.md): strictly
+ * loopback in default mode, and under `--lan` served to a page this server
+ * handed out, so the Library page works from a phone exactly as the Terminal
+ * and Agents pages already do. */
 export function listLibrary(project?: number): Promise<LibraryItem[]> {
   const qs = project !== undefined ? `?project=${project}` : ''
   return request(`/api/library${qs}`)

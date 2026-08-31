@@ -851,14 +851,17 @@ fn router(state: AppState) -> Router {
         .route("/api/scripts/{id}/run", post(run_script))
         // Library: agent definitions, skills, hooks, commands, the live
         // prompt and CLAUDE.md files, each mirrored onto disk under
-        // `.claude/`. A row becomes code mesa or Claude Code executes, so
-        // authoring AND the sync routes (which read/write the disk side, and
-        // `sync/status`'s response body can carry the contents of files
-        // under $HOME) are loopback-only in BOTH modes; only listing/showing
-        // one item and its version history share the agents' read gate.
-        // Export/import (mesa task 963) carry a whole library's worth of that
-        // same content in one payload, so both sit behind the same
-        // loopback-only gate too. See `docs/library.md`.
+        // `.claude/`. A row becomes code mesa or Claude Code executes, so all
+        // eleven routes — reads, authoring, the sync pair that touches the
+        // disk side, and the export/import bundle pair — share ONE gate,
+        // `require_agent_access`, the agents'/terminal's/scripts' gate
+        // (mesa task 1004, replacing the loopback-only `LIBRARY_LOOPBACK`
+        // that used to sit here). Default mode is strictly stronger than
+        // before (loopback peer + local Host + local Origin); `--lan` relaxes
+        // to a page this server served, with the rebinding and cross-site
+        // defenses intact — the same posture `/api/live/transcribe` takes,
+        // and the only one under which the Library page works from the phone
+        // `--lan` exists to serve. See `docs/library.md`.
         .route("/api/library", get(list_library).post(create_library))
         .route("/api/library/export", get(export_library))
         .route("/api/library/import", post(import_library))
@@ -1549,9 +1552,9 @@ async fn delete_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiR
 // read of its own (`local_path`/git are read once, at generation time, and
 // the result is frozen into the row) — inventing a stricter gate for reading
 // or annotating that frozen row than the task record it belongs to would be
-// a distinction with no security content, exactly the reasoning the library
-// surface's loopback gate documents for the opposite conclusion when the
-// bytes served ARE a live disk read.
+// a distinction with no security content, exactly the reasoning the scripts'
+// authoring routes and `/api/fs/dirs` document for the opposite conclusion
+// when the bytes involved ARE a program to run or a live disk read.
 
 /// Fields a human may set directly on a receipt via `PATCH
 /// /api/tasks/{id}/receipt`. `note` is the only one — everything else on
@@ -3290,34 +3293,43 @@ fn parse_library_scope(scope: &str) -> Result<LibraryScope, ApiError> {
 /// (`core::library::effective_items`), so this list is the full catalogue a
 /// user or agent can pick from — not just what mesa has stored.
 ///
-/// Loopback-only in BOTH serve modes, same as every other library route
-/// (`LIBRARY_LOOPBACK`): a row's `body` IS an agent definition, a hook shell
-/// script or a CLAUDE.md — the same bytes the sync routes read off disk once
-/// it is written there — so gating the read at loopback while serving those
-/// identical bytes from the database to a LAN peer one route over would be a
-/// distinction with no security content. `serve --lan` is a no-auth "trust
-/// every device on the network" posture, and this content is code.
+/// Gated by [`require_agent_access`] — the agents'/terminal's/scripts' gate,
+/// on this route and on the ten beside it (mesa task 1004). In default mode
+/// that is strictly stronger than the loopback-only check this surface used
+/// to carry: a loopback peer AND a local Host AND a local Origin, so nothing
+/// is loosened for the ordinary single-machine install. Under `--lan` it
+/// *relaxes* rather than refuses — a page this server handed a LAN browser
+/// gets in — while both confused-deputy holes stay shut
+/// (`require_lan_agent_host` for DNS rebinding, `require_origin_matches_host`
+/// for a cross-site fetch). A row's `body` IS an agent definition, a hook
+/// shell script or a CLAUDE.md, so the surface is genuinely code — but
+/// `--lan` is already the opt-in "trust every device on this network" posture
+/// that hands that same network a terminal (`/api/agents`), a shell
+/// (`/api/terminal`) and script execution, and refusing it the library rows
+/// while granting it the shell was a distinction with no security content.
+/// The phone that could already run anything can now also read and edit the
+/// catalogue, which is the whole point of serving the Library page at all.
 async fn list_library(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<LibraryQuery>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let store = state.store.lock().unwrap();
     Ok(Json(library::effective_items(&store, q.project)?).into_response())
 }
 
 /// A library row's body is a program mesa or Claude Code executes — code
-/// execution twice over — so every route on this surface, reads included
-/// (see `list_library`), is loopback-only in BOTH serve modes.
+/// execution twice over — so every route on this surface, reads included,
+/// shares the agents' code-execution gate (see `list_library`).
 async fn create_library(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<LibraryCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     let kind = parse_library_kind(&body.kind)?;
     let scope = parse_library_scope(&body.scope)?;
@@ -3327,14 +3339,14 @@ async fn create_library(
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
 
-/// Loopback-only, same as `list_library`.
+/// Same [`require_agent_access`] gate as `list_library`.
 async fn show_library(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let store = state.store.lock().unwrap();
     Ok(Json(store.get_library_item(id)?).into_response())
 }
@@ -3346,7 +3358,7 @@ async fn update_library(
     Path(id): Path<i64>,
     body: Result<Json<LibraryUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     // `name` and `body` are the row's identity and its whole content; an
     // explicit `null` for either is rejected rather than read as "omitted",
@@ -3380,21 +3392,21 @@ async fn delete_library(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut store = state.store.lock().unwrap();
     // The full destroyed record is the echo that stands in for the
     // confirmation prompt mesa deliberately does not have.
     Ok(Json(store.delete_library_item(id)?).into_response())
 }
 
-/// Loopback-only, same as `list_library`.
+/// Same [`require_agent_access`] gate as `list_library`.
 async fn list_library_versions(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let store = state.store.lock().unwrap();
     Ok(Json(store.list_library_versions(id)?).into_response())
 }
@@ -3410,7 +3422,7 @@ async fn fork_library_builtin(
     Path(builtin_id): Path<String>,
     body: Result<Json<LibraryForkBody>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     let builtin = library::builtin(&builtin_id)
         .ok_or_else(|| Error::NotFound(format!("no built-in library item {builtin_id:?}")))?;
@@ -3432,32 +3444,34 @@ async fn fork_library_builtin(
 }
 
 /// Scans mesa's rows against the files under `.claude/` (and a project's root
-/// `CLAUDE.md`) and reports one row per path. Loopback-only like the
-/// authoring routes even though this is a read: the response body carries the
-/// live contents of files under the user's home directory, exactly what the
-/// Files-tab gate exists to keep a LAN peer from reaching.
+/// `CLAUDE.md`) and reports one row per path. Gated like the authoring routes
+/// even though this is a read: the response body carries the live contents of
+/// files under the user's home directory — but that is the same class of
+/// content the row bodies beside it already carry, and it therefore takes the
+/// same [`require_agent_access`] gate as the rest of the surface rather than a
+/// stricter one of its own (see `list_library`).
 async fn library_sync_status(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<LibraryQuery>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let store = state.store.lock().unwrap();
     Ok(Json(library::sync_status(&store, q.project)?).into_response())
 }
 
 /// Applies the caller's per-path choices from a `library_sync_status` scan,
 /// writing/reading files under `.claude/` — code execution and disk access
-/// both ways, so loopback-only in both serve modes like every other library
-/// mutation.
+/// both ways, behind the same [`require_agent_access`] gate as every other
+/// library route (see `list_library`).
 async fn library_sync_apply(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<LibrarySyncApplyBody>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     let resolutions: Vec<(String, String)> = body
         .resolutions
@@ -3475,15 +3489,16 @@ async fn library_sync_apply(
 
 /// Snapshots a library into a portable `LibraryBundle` (`core::library::export`,
 /// mesa task 963) — every db row, minus the unshadowed built-ins that are code
-/// rather than rows. Loopback-only like every other library route: a bundle
-/// is strictly more sensitive than any single row it carries.
+/// rather than rows. Same [`require_agent_access`] gate as every other
+/// library route: a bundle is the rows this surface already serves, gathered
+/// into one payload, so a gate of its own would be arbitrary.
 async fn export_library(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<LibraryQuery>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let store = state.store.lock().unwrap();
     Ok(Json(library::export(&store, q.project)?).into_response())
 }
@@ -3501,31 +3516,22 @@ fn default_on_conflict() -> String {
 
 /// Applies a `LibraryBundle` (`core::library::import`, mesa task 963) —
 /// per-item, never all-or-nothing except for an unrecognised bundle
-/// `version`, which `library::import` refuses whole. Loopback-only like every
-/// other library mutation: importing a bundle writes exactly the rows
-/// authoring one row at a time would.
+/// `version`, which `library::import` refuses whole. Same
+/// [`require_agent_access`] gate as every other library mutation: importing a
+/// bundle writes exactly the rows authoring one row at a time would.
 async fn import_library(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<LibraryImportBody>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, LIBRARY_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
     let results: Vec<LibraryImportResult> =
         library::import(&mut store, &body.bundle, &body.on_conflict)?;
     Ok(Json(results).into_response())
 }
-
-/// The message every one of the eleven library routes refuses a non-loopback
-/// peer with — reads included, not just the mutations and the sync/import
-/// routes. A row's body is code (an agent definition, a hook shell script, a
-/// CLAUDE.md); serving that content to a LAN peer over `GET` while writing
-/// and syncing it stay loopback-only would be a distinction with no security
-/// content, so the whole surface sits behind this one gate. One constant so
-/// the eleven cannot drift apart.
-const LIBRARY_LOOPBACK: &str = "the library is loopback-only; connect from this machine";
 
 // ---- artifacts (agent-written pages, mesa task 974) ----
 //
@@ -10183,20 +10189,44 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         assert_eq!(stored, item);
     }
 
-    /// The load-bearing asymmetry `LIBRARY_LOOPBACK`'s comment claims: under
-    /// `--lan`, a legitimate LAN page passes `require_agent_access` (proof:
-    /// `lan_page_may_run_a_script_but_may_never_author_one`), but every one of
-    /// the three library READS refuses that exact same peer/header pair —
-    /// unlike scripts, where a LAN page may read. This is the one assertion in
-    /// the whole suite that actually distinguishes `require_local_path_write`
-    /// from `require_agent_access` for a read: a same-machine curl to
-    /// `127.0.0.1` can't (the real peer is always loopback there), so this has
-    /// to be a Rust test with a forged non-loopback `SocketAddr`
-    /// (`scripts-check.sh`'s own top comment says as much for the scripts
-    /// case). `scripts/library-check.sh` proves the Host/Origin half that curl
-    /// CAN reach; this proves the peer-address half it cannot.
+    /// mesa task 1004's reversal: the eleven library routes moved off the
+    /// loopback-only `require_local_path_write` onto `require_agent_access`,
+    /// the gate the agents, terminal and scripts routes already use — so
+    /// under `--lan` a real LAN page may now both READ and AUTHOR the
+    /// library, exactly as it may already run a script
+    /// (`lan_page_may_run_a_script_but_may_never_author_one`) or open a
+    /// terminal. `--lan` is the opt-in "trust every device on this network"
+    /// posture that hands that network a shell; refusing it the catalogue
+    /// while granting it the shell was a distinction with no security
+    /// content.
+    ///
+    /// This has to be a Rust test rather than a curl in
+    /// `scripts/library-check.sh`: every curl from this machine arrives with
+    /// a LOOPBACK peer, so a shell script can only ever exercise the
+    /// Host/Origin half of the gate — the peer-address half needs a forged
+    /// non-loopback `SocketAddr` handed straight to the handler (the same
+    /// reasoning `scripts-check.sh`'s own top comment gives for scripts).
+    ///
+    /// Three assertions, the pairing that must not drift apart: a legitimate
+    /// LAN page (IP-literal Host on our port, matching Origin) gets through
+    /// on TEN of the eleven routes — the four reads, create, update, delete,
+    /// fork and both sync routes (import is the eleventh, and gets its own
+    /// test below because a bundle body makes this one unreadable); the same
+    /// LAN peer with a DNS-name Host (rebinding) or a foreign Origin
+    /// (cross-site) is still refused on every one of them; and in DEFAULT
+    /// mode that same non-loopback peer is refused on a read and on a write,
+    /// so nothing about the single-machine posture loosened.
+    ///
+    /// Every route is named here rather than a representative few, because a
+    /// route left out has NO regression pressure at all: reverting it to
+    /// `require_local_path_write` leaves both `cargo test` and
+    /// `scripts/library-check.sh` green, the shell script structurally
+    /// (its curl is always a loopback peer, which makes the two gates
+    /// identical under `--lan`) and the Rust suite only by omission. That is
+    /// exactly how the five routes this test originally skipped —
+    /// update/delete/fork and the sync pair — were found.
     #[tokio::test]
-    async fn lan_page_may_never_read_the_library_either() {
+    async fn lan_page_may_read_and_author_the_library_but_not_from_a_rebound_page() {
         let (_dir, mut state) = test_state();
         state.lan = true;
         let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
@@ -10214,67 +10244,335 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             )
             .unwrap();
 
-        let listed = list_library(
+        // The four reads: list, show, version history and the whole-library
+        // bundle — the last being the read that carries the most at once, so
+        // it gets the same forged-peer proof as the three single-item ones.
+        list_library(
             State(state.clone()),
             ConnectInfo(lan_peer()),
             headers.clone(),
             Query(LibraryQuery { project: None }),
         )
-        .await;
-        assert!(listed.unwrap_err().status.is_client_error());
-        let shown = show_library(
+        .await
+        .unwrap();
+        show_library(
             State(state.clone()),
             ConnectInfo(lan_peer()),
             headers.clone(),
             Path(item.id.unwrap()),
         )
-        .await;
-        assert!(shown.unwrap_err().status.is_client_error());
-        let versions = list_library_versions(
+        .await
+        .unwrap();
+        list_library_versions(
             State(state.clone()),
             ConnectInfo(lan_peer()),
             headers.clone(),
             Path(item.id.unwrap()),
         )
-        .await;
-        assert!(versions.unwrap_err().status.is_client_error());
+        .await
+        .unwrap();
+        export_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Query(LibraryQuery { project: None }),
+        )
+        .await
+        .unwrap();
 
-        // Export is the read that would leak the most — a whole library in
-        // one payload — so it gets the same forged-peer proof as the three
-        // single-item reads above.
-        let exported = export_library(
+        // …and authoring, the half that used to be unreachable from any
+        // machine but this one.
+        let created = create_library(
             State(state.clone()),
             ConnectInfo(lan_peer()),
-            headers,
+            headers.clone(),
+            Ok(Json(LibraryCreate {
+                kind: "prompt".to_string(),
+                scope: "user".to_string(),
+                project_id: None,
+                name: "lan-authored".to_string(),
+                body: "written from a phone".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let authored_id = json_body(created).await["id"].as_i64().unwrap();
+
+        // …and the four that used to have no forged-peer coverage at all.
+        update_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(item.id.unwrap()),
+            Ok(Json(LibraryUpdate {
+                name: None,
+                body: Some(Some("edited from a phone".to_string())),
+            })),
+        )
+        .await
+        .unwrap();
+        let forked = fork_library_builtin(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(crate::core::library::BUILTINS[0].id.to_string()),
+            Ok(Json(LibraryForkBody {
+                body: "forked from a phone".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forked.status(), StatusCode::CREATED);
+        delete_library(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(authored_id),
+        )
+        .await
+        .unwrap();
+
+        // The sync pair is the half that touches the disk under `.claude/`,
+        // so it is the half a missing gate would cost the most — but the
+        // subject here is the gate, not the sync semantics, so the scan runs
+        // unscoped and the apply carries an empty resolution list: no path is
+        // resolved and nothing is written, while the call still has to get
+        // past `require_agent_access` to return at all. (`sync_status` on a
+        // fresh store cannot fail on the merits — every disk miss is an
+        // `Option`, never an error — so an `unwrap` here can only be the gate
+        // refusing.)
+        library_sync_status(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
             Query(LibraryQuery { project: None }),
         )
-        .await;
-        assert!(exported.unwrap_err().status.is_client_error());
+        .await
+        .unwrap();
+        let applied = library_sync_apply(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Ok(Json(LibrarySyncApplyBody {
+                project_id: None,
+                resolutions: vec![],
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.status(), StatusCode::OK);
+
+        // Both confused-deputy defenses still fire on that same LAN peer, on
+        // every one of the ten: a DNS-name Host is a rebound page, a foreign
+        // Origin is a cross-site fetch. Each route is called once per hostile
+        // header set, and every refusal must be a 403 from the gate rather
+        // than any other client error the handler might produce on the merits.
+        let refused = |r: ApiResult<Response>, what: &str| {
+            let err = r.err().unwrap_or_else(|| panic!("{what} must be refused"));
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{what}: {}", err.message);
+        };
+        let rebound = hdrs(Some("evil.example:0"), None);
+        let cross_site = hdrs(Some("192.168.1.50:0"), Some("https://evil.example"));
+        for (label, h) in [("rebound Host", rebound), ("foreign Origin", cross_site)] {
+            refused(
+                list_library(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Query(LibraryQuery { project: None }),
+                )
+                .await,
+                &format!("list ({label})"),
+            );
+            refused(
+                show_library(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Path(item.id.unwrap()),
+                )
+                .await,
+                &format!("show ({label})"),
+            );
+            refused(
+                list_library_versions(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Path(item.id.unwrap()),
+                )
+                .await,
+                &format!("versions ({label})"),
+            );
+            refused(
+                export_library(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Query(LibraryQuery { project: None }),
+                )
+                .await,
+                &format!("export ({label})"),
+            );
+            refused(
+                create_library(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Ok(Json(LibraryCreate {
+                        kind: "prompt".to_string(),
+                        scope: "user".to_string(),
+                        project_id: None,
+                        name: format!("hostile-{label}"),
+                        body: "x".to_string(),
+                    })),
+                )
+                .await,
+                &format!("create ({label})"),
+            );
+            refused(
+                update_library(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Path(item.id.unwrap()),
+                    Ok(Json(LibraryUpdate {
+                        name: None,
+                        body: Some(Some("hostile".to_string())),
+                    })),
+                )
+                .await,
+                &format!("update ({label})"),
+            );
+            refused(
+                delete_library(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Path(item.id.unwrap()),
+                )
+                .await,
+                &format!("delete ({label})"),
+            );
+            refused(
+                fork_library_builtin(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Path(crate::core::library::BUILTINS[1].id.to_string()),
+                    Ok(Json(LibraryForkBody {
+                        body: "hostile".to_string(),
+                    })),
+                )
+                .await,
+                &format!("fork ({label})"),
+            );
+            refused(
+                library_sync_status(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Query(LibraryQuery { project: None }),
+                )
+                .await,
+                &format!("sync status ({label})"),
+            );
+            refused(
+                library_sync_apply(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Ok(Json(LibrarySyncApplyBody {
+                        project_id: None,
+                        resolutions: vec![],
+                    })),
+                )
+                .await,
+                &format!("sync apply ({label})"),
+            );
+        }
+
+        // Nothing hostile got through: the row still carries the body the
+        // legitimate LAN page wrote, not any of the probes above.
+        let survivor = state
+            .store
+            .lock()
+            .unwrap()
+            .get_library_item(item.id.unwrap())
+            .unwrap();
+        assert_eq!(survivor.body, "edited from a phone");
+
+        // Default mode is untouched by all of this: the same non-loopback
+        // peer never reaches the library at all, read or write.
+        state.lan = false;
+        assert!(
+            list_library(
+                State(state.clone()),
+                ConnectInfo(lan_peer()),
+                loopback_agent_headers(),
+                Query(LibraryQuery { project: None }),
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        assert!(
+            create_library(
+                State(state),
+                ConnectInfo(lan_peer()),
+                loopback_agent_headers(),
+                Ok(Json(LibraryCreate {
+                    kind: "prompt".to_string(),
+                    scope: "user".to_string(),
+                    project_id: None,
+                    name: "default-mode-probe".to_string(),
+                    body: "x".to_string(),
+                })),
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
     }
 
-    /// Import's mirror of the test above: a LAN peer may never write a
-    /// bundle into the library either, even one that carries nothing.
+    /// Import's mirror of the test above: a legitimate LAN page may write a
+    /// bundle into the library too (mesa task 1004), and the same peer behind
+    /// a rebound Host still may not.
     #[tokio::test]
-    async fn lan_page_may_never_import_the_library_either() {
+    async fn lan_page_may_import_the_library_but_not_from_a_rebound_page() {
         let (_dir, mut state) = test_state();
         state.lan = true;
-        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        let bundle = LibraryBundle {
+        let bundle = || LibraryBundle {
             version: 1,
             exported_at: "2026-01-01T00:00:00Z".to_string(),
             items: vec![],
         };
-        let imported = import_library(
+        import_library(
             State(state.clone()),
             ConnectInfo(lan_peer()),
-            headers,
+            hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0")),
             Ok(Json(LibraryImportBody {
-                bundle,
+                bundle: bundle(),
+                on_conflict: "skip".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+
+        let refused = import_library(
+            State(state),
+            ConnectInfo(lan_peer()),
+            hdrs(Some("evil.example:0"), None),
+            Ok(Json(LibraryImportBody {
+                bundle: bundle(),
                 on_conflict: "skip".to_string(),
             })),
         )
         .await;
-        assert!(imported.unwrap_err().status.is_client_error());
+        assert!(refused.unwrap_err().status.is_client_error());
     }
 
     /// mesa task 972's reversal: under `--lan` the transcribe route is now
@@ -10341,9 +10639,9 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
     /// the branch a real LAN phone actually takes. Proving that branch needs
     /// a **non-loopback** `ConnectInfo`, which only a forged `SocketAddr`
     /// passed straight to the handler can supply — the same reasoning
-    /// `lan_page_may_never_read_the_library_either` already relies on for
-    /// the library routes' identical "a same-machine curl cannot prove the
-    /// peer-address half" gap. `transcribe_available` is the cheap half to
+    /// `lan_page_may_read_and_author_the_library_but_not_from_a_rebound_page`
+    /// already relies on for the library routes' identical "a same-machine
+    /// curl cannot prove the peer-address half" gap. `transcribe_available` is the cheap half to
     /// call this way (no `auris` binary needed — an empty `models()` just
     /// makes `available` false, which this test does not assert either way).
     ///

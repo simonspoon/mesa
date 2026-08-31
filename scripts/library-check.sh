@@ -34,10 +34,14 @@
 #      sides untouched — asserting actual file bytes, not just the JSON;
 #   7. a CRUD round-trip over the API, the malformed-JSON/Content-Type cases,
 #      and the fork route's 404/409;
-#   8. the security boundary in default mode AND `--lan`: the three read
-#      routes (list/show/versions) on `require_agent_access`, and all six
-#      mutating/sync routes loopback-only in BOTH modes, plus the
-#      Content-Type gate firing on every mutation in both modes;
+#   8. the security boundary in default mode AND `--lan`: all eleven routes —
+#      reads, authoring, both sync routes and both bundle routes — share
+#      `require_agent_access` (mesa task 1004, replacing the old
+#      loopback-only gate), so in default mode a foreign Host AND a foreign
+#      Origin are each refused, while under `--lan` a DNS-name Host
+#      (rebinding) and a foreign Origin (cross-site) are refused but a
+#      genuine LAN page is served; plus the Content-Type gate firing on every
+#      mutation in both modes;
 #   9. the live prompt now comes from the library (mesa task 919's migration
 #      off `config.json`'s `live.prompt`): with nothing forked, `live start`
 #      spawns the agent with the built-in block; with `live-agent-prompt`
@@ -52,8 +56,8 @@
 #      re-import (skip leaves bodies untouched, replace overwrites), an
 #      unknown bundle version refusing the whole import with nothing written,
 #      `--output` refusing to clobber an existing path, `--quiet` rejected on
-#      both commands, and the two new routes added to the loopback-gate
-#      sweeps (now eleven routes) in both serve modes.
+#      both commands, and the two new routes added to the gate sweeps (now
+#      eleven routes) in both serve modes.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -687,17 +691,18 @@ api 200 POST /api/library/import '{"bundle":{"version":1,"exported_at":"x","item
 ok "POST /api/library/import: 200 + LibraryImportResult[] (on_conflict omitted -> defaults to skip)"
 
 # ================= 8. gates: default mode =================
-# All ELEVEN library routes are loopback-only in BOTH serve modes — including
-# the three reads (list/show/versions), not just the five mutations, the two
-# sync routes and the two bundle routes (export/import, mesa task 963): a
-# row's body IS an agent definition, a hook shell script or a CLAUDE.md, the
-# same bytes the sync routes read off disk once it is written there (and a
-# bundle is just every one of those bytes at once), so serving that content
-# to a LAN peer over GET while writing and syncing it stay loopback-only
-# would be a distinction with no security content. Every curl below
-# originates on this machine, so the server always sees a LOOPBACK peer —
-# what these assertions pin is the Host/Origin half of the same gate (the
-# peer-address half is pinned by the Rust unit tests in api.rs).
+# All ELEVEN library routes share ONE gate — `require_agent_access`, the
+# agents'/terminal's/scripts'-run gate (mesa task 1004, replacing the old
+# loopback-only `LIBRARY_LOOPBACK`) — reads (list/show/versions/export) as
+# much as the five mutations, the two sync routes and import: a row's body IS
+# an agent definition, a hook shell script or a CLAUDE.md, so there is no
+# coherent line between reading one and writing one. In DEFAULT mode that
+# gate is a loopback peer + a local Host + a local Origin, strictly stronger
+# than the loopback-only check it replaced. Every curl below originates on
+# this machine, so the server always sees a LOOPBACK peer — what these
+# assertions pin is the Host/Origin half of the gate (the peer-address half,
+# and the fact that `--lan` now lets a real LAN page IN, are pinned by the
+# Rust unit tests in api.rs).
 
 raw() { # raw <method> <path> [extra curl args...]
   local method=$1 path=$2; shift 2
@@ -719,6 +724,20 @@ raw GET "/api/library/$AN/versions" -H "Host: evil.example"
 raw GET /api/library/export -H "Host: evil.example"
 [ "$STATUS" = "403" ] || fail "default: GET /api/library/export with a foreign Host must be 403"
 ok "default mode: show, versions and export carry the same gate as list"
+
+# The Origin half of `require_agent_access` (mesa task 1004): in default mode
+# the route itself now runs `require_local_origin`, which the loopback-only
+# gate it replaced never did. A cross-site page's Origin is refused; a request
+# with no Origin at all — curl, or the embedded UI's own same-origin GET — is
+# fine, which is what every other assertion in this file relies on.
+raw GET /api/library -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example'
+[ "$STATUS" = "403" ] || fail "default: GET /api/library with a foreign Origin must be 403, got $STATUS"
+raw GET /api/library -H "Host: 127.0.0.1:$PORT" -H "Origin: http://127.0.0.1:$PORT"
+[ "$STATUS" = "200" ] || fail "default: GET /api/library with a local Origin must be 200, got $STATUS"
+raw POST /api/library -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example' \
+  -H 'Content-Type: application/json' -d '{"kind":"prompt","scope":"user","name":"origin-probe","body":"x"}'
+[ "$STATUS" = "403" ] || fail "default: authoring POST with a foreign Origin must be 403, got $STATUS"
+ok "default mode: a foreign Origin is refused on a read and on a write; a local/absent one is not"
 
 api 201 POST /api/library '{"kind":"prompt","scope":"user","name":"gate-fixture","body":"x"}'
 GATE_ID=$(jqb .id)
@@ -751,20 +770,21 @@ wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
 
 # ================= gates: --lan mode =================
-# `--lan` skips the GLOBAL Host allowlist, but every one of the ELEVEN
-# library routes — the three reads (list/show/versions) as much as the five
-# mutations, the two sync routes and the two bundle routes (export/import) —
-# sits behind `require_local_path_write`,
-# which layers its own rebinding/cross-site defense
-# (`require_lan_page_access`) on top of an actual-loopback-peer check. Every
-# curl here originates on this machine, so the real TCP peer is ALWAYS
-# loopback and that half can only be forged in the Rust unit tests (see
-# api.rs); what curl CAN prove, and what this section proves for all nine
-# routes exactly as scripts-check.sh proves it for scripts' authoring routes,
-# is: a DNS-name Host is refused (rebinding), a foreign Origin is refused
-# (cross-site), and a genuinely local request (IP-literal or localhost Host
-# on our port, no foreign Origin) still succeeds — the flag never locks the
-# machine's own owner out.
+# `--lan` skips the GLOBAL Host allowlist, and under it `require_agent_access`
+# RELAXES rather than refuses (mesa task 1004): the peer no longer has to be
+# loopback, so a phone on the network can use the Library page at all — the
+# same posture /api/live/transcribe takes, and the one --lan already takes for
+# the terminal and for running a script. What it does NOT relax is either
+# confused-deputy defense (`require_lan_page_access`): a DNS-name Host is a
+# rebound page and a foreign Origin is a cross-site fetch, and both are still
+# refused, on all ELEVEN routes alike. Every curl here originates on this
+# machine, so the real TCP peer is ALWAYS loopback — the "a genuine LAN peer
+# now gets in" half can only be forged in the Rust unit tests (see api.rs).
+# What curl CAN prove, and what this section proves for all eleven routes
+# exactly as scripts-check.sh proves it for scripts' authoring routes, is: a
+# DNS-name Host is refused, a foreign Origin is refused, and a genuinely local
+# request (IP-literal or localhost Host on our port, no foreign Origin) still
+# succeeds — the flag never locks the machine's own owner out.
 
 LAN_PORT=17799
 "$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan.log" 2>&1 &
@@ -826,7 +846,7 @@ ok "--lan: authoring (incl. import) from a loopback peer with a local Host still
 # All ELEVEN routes: a DNS-name Host (rebinding) and a foreign Origin
 # (cross-site) are each refused — reads exactly as strictly as mutations, the
 # two sync routes and the two bundle routes, since every one of them shares
-# LIBRARY_LOOPBACK.
+# `require_agent_access`.
 for CASE in \
   "GET|/api/library|" \
   "GET|/api/library/$GATE_ID|" \

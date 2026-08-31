@@ -211,10 +211,12 @@ reasoning rather than just the rule:
   it.
 
 **The obvious objection, and why it doesn't apply here.** `scripts` and
-`library` both gate reads loopback-only in *both* serve modes — library goes
-further and gates all eleven of its routes that way, reads included, on the
-reasoning that "a row's `body` IS the agent definition, hook script or
-CLAUDE.md." An artifact is also a `body` column served over a route. Why is
+`library` both put a per-route gate on their *reads* — scripts on the agents'
+code-execution gate (with authoring loopback-only in *both* serve modes), and
+library on that same `require_agent_access` for all eleven of its routes,
+reads included (mesa task 1004), on the reasoning that "a row's `body` IS the
+agent definition, hook script or CLAUDE.md." An artifact is also a `body`
+column served over a route, and it carries no per-route gate at all. Why is
 this one different?
 
 Because the two bodies sit in different **capability classes**, and it is

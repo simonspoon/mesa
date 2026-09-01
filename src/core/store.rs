@@ -4153,39 +4153,68 @@ impl Store {
     /// [`validate_live_context`] and [`validate_live_window`] — a hash route
     /// and two small fixed structs, not free text.
     ///
-    /// The report is a **complete statement** of where the person is, not a
-    /// patch: one poster in the page sends all three together on every move,
-    /// so `context: None` writes SQL `NULL` and clears whatever was selected
-    /// before. A page that has opened nothing must be able to say so, and it
-    /// says so by reporting no context. The window box is the same statement
-    /// about the browser itself (mesa task 895), which is why it is written
-    /// here rather than through a route of its own: it moves when the person
-    /// moves the window, and the page already posts on every move.
+    /// The **route** is required and always written: every client that reports
+    /// at all knows which page it is on, so there is no third state to tell
+    /// apart there.
     ///
-    /// Every value is validated before **any** is written, so a refused
-    /// context leaves the stored report exactly as it was rather than
-    /// half-applying it.
+    /// The context and the window box are each a **three-way** statement
+    /// rather than a two-way one (mesa task 1016), which is what the two-level
+    /// `Option` in each signature says: `None` is *silence* and leaves the
+    /// stored value exactly as it is, `Some(None)` is an explicit denial and
+    /// writes SQL `NULL`, and `Some(Some(v))` validates and stores `v`.
+    ///
+    /// This used to be a "complete statement, not a patch" — one poster in the
+    /// page sent all three together on every move, so an absent context or
+    /// window cleared whatever was stored. That rule assumed one client. A
+    /// live session is one *conversation*, and these are three statements
+    /// about it that different clients can make with different authority: a
+    /// desktop browser knows its window box and its focused file, while a
+    /// phone knows neither and never will. Under the old rule the phone's
+    /// report — which can only ever carry a route — erased both, and nothing
+    /// put them back for the life of the session. Omitting a key now means
+    /// silence rather than a denial, and a page that has opened nothing still
+    /// says so, by sending the key as `null`. (mesa's own web client is
+    /// unaffected either way: it already sends all three keys explicitly.)
+    ///
+    /// Every value is validated before **any** is written, and the write is a
+    /// single statement, so a refused context leaves the stored report exactly
+    /// as it was rather than half-applying it, and no interleaved report can
+    /// land between reading a kept value and writing it back.
     pub fn set_live_route(
         &mut self,
         id: i64,
         route: &str,
-        context: Option<&LiveContext>,
-        window: Option<&LiveWindow>,
+        context: Option<Option<&LiveContext>>,
+        window: Option<Option<&LiveWindow>>,
     ) -> Result<LiveSession> {
         let route = validate_live_route(route)?;
-        let context = context.map(validate_live_context).transpose()?;
-        let window = window.map(validate_live_window).transpose()?;
         let context = context
-            .as_ref()
-            .map(|c| serde_json::to_string(c).expect("json serialize"));
+            .map(|c| c.map(validate_live_context).transpose())
+            .transpose()?;
         let window = window
-            .as_ref()
-            .map(|w| serde_json::to_string(w).expect("json serialize"));
+            .map(|w| w.map(validate_live_window).transpose())
+            .transpose()?;
+        // Flattened for SQL: a "present" flag the statement branches on, plus
+        // the JSON to store when it is set. `None` collapses to (false, NULL),
+        // and the `CASE` below never looks at the NULL in that case.
+        let context_given = context.is_some();
+        let context = context
+            .flatten()
+            .map(|c| serde_json::to_string(&c).expect("a validated context always serializes"));
+        let window_given = window.is_some();
+        let window = window
+            .flatten()
+            .map(|w| serde_json::to_string(&w).expect("a validated window always serializes"));
         self.get_live_session(id)?;
         self.conn.execute(
-            "UPDATE live_sessions SET route = ?2, context = ?3, window_box = ?4, \
+            // One statement, so "keep what is there" is decided inside the
+            // write rather than across a read and a write another reporter
+            // could slip between.
+            "UPDATE live_sessions SET route = ?2, \
+             context = CASE WHEN ?3 THEN ?4 ELSE context END, \
+             window_box = CASE WHEN ?5 THEN ?6 ELSE window_box END, \
              updated_at = datetime('now') WHERE id = ?1",
-            (id, &route, &context, &window),
+            (id, &route, context_given, &context, window_given, &window),
         )?;
         self.get_live_session(id)
     }
@@ -9716,12 +9745,12 @@ mod tests {
             .set_live_route(
                 session.id,
                 "#/projects/3/files",
-                Some(&LiveContext {
+                Some(Some(&LiveContext {
                     kind: LiveContextKind::Files,
                     id: Some("  src/core/store.rs  ".into()),
                     label: Some("store.rs".into()),
                     detail: Some("line 42".into()),
-                }),
+                })),
                 None,
             )
             .unwrap();
@@ -9742,12 +9771,12 @@ mod tests {
             .set_live_route(
                 session.id,
                 "#/projects/3/files",
-                Some(&LiveContext {
+                Some(Some(&LiveContext {
                     kind: LiveContextKind::Files,
                     id: Some("".into()),
                     label: Some("   ".into()),
                     detail: None,
-                }),
+                })),
                 None,
             )
             .unwrap();
@@ -9755,16 +9784,17 @@ mod tests {
         assert_eq!(ctx.kind, LiveContextKind::Files);
         assert_eq!((ctx.id, ctx.label, ctx.detail), (None, None, None));
 
-        // The report is a complete statement, not a patch: no context clears.
+        // An explicit `null` is how a page says nothing is selected, and it
+        // clears the stored context (mesa task 1016).
         let cleared = store
-            .set_live_route(session.id, "#/inbox", None, None)
+            .set_live_route(session.id, "#/inbox", Some(None), None)
             .unwrap();
         assert_eq!(cleared.context, None);
     }
 
     /// The window box the page reports beside the route (mesa task 895): it
-    /// round-trips out of the column, and a report without one clears it, the
-    /// same complete-statement rule the context follows.
+    /// round-trips out of the column, and an explicit `null` clears it — the
+    /// same three-way key the context follows (mesa task 1016).
     #[test]
     fn set_live_route_records_where_the_browser_window_is() {
         let (mut store, _dir) = temp_store();
@@ -9776,7 +9806,7 @@ mod tests {
             height: 1000,
         };
         let reported = store
-            .set_live_route(session.id, "#/live", None, Some(&box_))
+            .set_live_route(session.id, "#/live", None, Some(Some(&box_)))
             .unwrap();
         assert_eq!(reported.window, Some(box_));
         assert_eq!(
@@ -9784,7 +9814,67 @@ mod tests {
             Some(box_)
         );
         let cleared = store
-            .set_live_route(session.id, "#/live", None, None)
+            .set_live_route(session.id, "#/live", None, Some(None))
+            .unwrap();
+        assert_eq!(cleared.window, None);
+    }
+
+    /// Two clients, one conversation (mesa task 1016). A desktop browser
+    /// reports all three parts; a phone can only ever report a route, and
+    /// under the old complete-statement rule its report erased the desktop's
+    /// context and window box for the rest of the session — which is what
+    /// `mesa live look` needed and could never get back. An omitted key is
+    /// silence now, so the last client that actually *knew* something still
+    /// holds the answer, while the route is whoever reported most recently.
+    /// An explicit `null` is still a denial and still clears.
+    #[test]
+    fn a_report_that_omits_a_key_leaves_that_key_alone() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let ctx = LiveContext {
+            kind: LiveContextKind::Files,
+            id: Some("src/core/store.rs".into()),
+            label: Some("store.rs".into()),
+            detail: None,
+        };
+        let box_ = LiveWindow {
+            x: 118,
+            y: 64,
+            width: 1512,
+            height: 982,
+        };
+        // The desktop: route, context and window box together.
+        store
+            .set_live_route(
+                session.id,
+                "#/projects/3/files",
+                Some(Some(&ctx)),
+                Some(Some(&box_)),
+            )
+            .unwrap();
+
+        // The phone: a route and nothing it has any authority to say.
+        let after = store
+            .set_live_route(session.id, "#/inbox", None, None)
+            .unwrap();
+        assert_eq!(after.route.as_deref(), Some("#/inbox"));
+        assert_eq!(after.context, Some(ctx.clone()));
+        assert_eq!(after.window, Some(box_));
+        // …and out of the column, not just out of the call's return value.
+        let read = store.get_live_session(session.id).unwrap();
+        assert_eq!(read.context, Some(ctx));
+        assert_eq!(read.window, Some(box_));
+
+        // An explicit null is the other half of the three-way key: the page
+        // saying nothing is selected, which still clears.
+        let cleared = store
+            .set_live_route(session.id, "#/inbox", Some(None), None)
+            .unwrap();
+        assert_eq!(cleared.context, None);
+        // …and clearing one says nothing about the other.
+        assert_eq!(cleared.window, Some(box_));
+        let cleared = store
+            .set_live_route(session.id, "#/inbox", None, Some(None))
             .unwrap();
         assert_eq!(cleared.window, None);
     }
@@ -9804,7 +9894,7 @@ mod tests {
             height: 600,
         };
         store
-            .set_live_route(session.id, "#/live", None, Some(&good))
+            .set_live_route(session.id, "#/live", None, Some(Some(&good)))
             .unwrap();
         for bad in [
             LiveWindow {
@@ -9833,7 +9923,7 @@ mod tests {
             },
         ] {
             let err = store
-                .set_live_route(session.id, "#/inbox", None, Some(&bad))
+                .set_live_route(session.id, "#/inbox", None, Some(Some(&bad)))
                 .unwrap_err();
             assert!(matches!(err, Error::Validation(_)), "{bad:?}: {err:?}");
         }
@@ -9856,7 +9946,7 @@ mod tests {
             detail: None,
         };
         store
-            .set_live_route(session.id, "#/projects/3/diagrams", Some(&good), None)
+            .set_live_route(session.id, "#/projects/3/diagrams", Some(Some(&good)), None)
             .unwrap();
 
         let long = "x".repeat(LIVE_CONTEXT_FIELD_MAX + 1);
@@ -9884,7 +9974,7 @@ mod tests {
             ),
         ] {
             let err = store
-                .set_live_route(session.id, "#/inbox", Some(&bad), None)
+                .set_live_route(session.id, "#/inbox", Some(Some(&bad)), None)
                 .unwrap_err();
             match err {
                 Error::Validation(m) => assert!(m.contains(field), "{field}: {m}"),

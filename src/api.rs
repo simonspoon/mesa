@@ -2370,20 +2370,24 @@ struct LiveRouteBody {
     /// reporting no route is not a thing the page has to say.
     route: String,
     /// What is *on* that page — the file, the diagram, the task, the commit
-    /// (mesa task 888). Optional, and absent means "nothing selected": a page
-    /// with an empty editor reports its route and no more. Its `kind` is a
-    /// closed enum, so a page mesa does not have is rejected by serde before
-    /// this handler runs at all.
-    #[serde(default)]
-    context: Option<LiveContext>,
-    /// Where the browser window itself is on the screen (mesa task 895).
-    /// Optional, and absent means "no browser is reporting one" — a session
-    /// driven from the CLI never has one, which is exactly what
-    /// `mesa live look` refuses to guess at. Only the page that is joined to
-    /// the conversation ever posts here, which is what makes the box the
-    /// identity of the *person's* window and not some other browser's.
-    #[serde(default)]
-    window: Option<LiveWindow>,
+    /// (mesa task 888). A `double_option`, exactly as `TaskUpdate`'s clearable
+    /// fields are, because the three states are genuinely different (mesa task
+    /// 1016): an **omitted** key leaves the stored context alone ("I have
+    /// nothing to say about this"), an explicit **`null`** clears it ("nothing
+    /// is selected"), and a value replaces it. A phone, which has no notion of
+    /// a focused file and never will, can only ever report a route — under the
+    /// old rule its report erased the desktop's context for the life of the
+    /// session. Its `kind` is a closed enum, so a page mesa does not have is
+    /// rejected by serde before this handler runs at all.
+    #[serde(default, deserialize_with = "double_option")]
+    context: Option<Option<LiveContext>>,
+    /// Where the browser window itself is on the screen (mesa task 895). The
+    /// same three-way key as `context` above and for the same reason: a client
+    /// with no window box to offer says nothing rather than denying the one a
+    /// desktop browser reported, since `mesa live look` has nothing else to go
+    /// on. An explicit `null` is still how a page says the box is gone.
+    #[serde(default, deserialize_with = "double_option")]
+    window: Option<Option<LiveWindow>>,
 }
 
 /// Every live write except `start` acts on **the** current session, so there is
@@ -2712,8 +2716,18 @@ async fn live_utterance(
 /// gated like task CRUD, and bounded by `Store` (a `#/` route and four fields
 /// of ≤ 200 chars) rather than by anything here.
 ///
-/// Route and context arrive together because they are one statement: the
-/// context is not a patch, and omitting it clears whatever was selected.
+/// Route, context and window box arrive together because they are one
+/// statement about one moment — a report cannot have them disagree about which
+/// page a focus is on, or name a box some other report's page was never in.
+///
+/// That is a claim about *this* client's report, not about every other
+/// client's, which is why the context and window keys are three-way as of mesa
+/// task 1016: omitted leaves the stored value alone, an explicit `null` clears
+/// it, a value replaces it. The rule they used to follow — absent means
+/// cleared — assumed a single poster, and a phone, which can only ever report
+/// a route, erased the desktop's focused file and window box for the life of
+/// the session. The handler itself only carries that distinction through;
+/// `Store::set_live_route` is where it is spelled out and applied.
 async fn live_route(
     State(state): State<AppState>,
     body: Result<Json<LiveRouteBody>, JsonRejection>,
@@ -2726,8 +2740,8 @@ async fn live_route(
     Ok(Json(store.set_live_route(
         session.id,
         &body.route,
-        body.context.as_ref(),
-        body.window.as_ref(),
+        body.context.as_ref().map(Option::as_ref),
+        body.window.as_ref().map(Option::as_ref),
     )?)
     .into_response())
 }
@@ -10869,9 +10883,10 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
 
     use crate::core::LiveContextKind;
 
-    /// The page reports route and context in one body, and the context is
-    /// optional: a page with nothing open sends the route alone, and that
-    /// clears whatever was selected (mesa task 888).
+    /// The page reports route and context in one body (mesa task 888), and
+    /// the context key is three-way (mesa task 1016): a page with nothing to
+    /// say about it omits it and the stored one stands, while a page with
+    /// nothing open sends an explicit `null` and clears it.
     #[tokio::test]
     async fn live_route_records_the_context_the_page_reports_with_it() {
         let (_dir, state) = test_state();
@@ -10885,20 +10900,21 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             State(state.clone()),
             Ok(Json(LiveRouteBody {
                 route: "#/projects/1/files".into(),
-                context: Some(LiveContext {
+                context: Some(Some(LiveContext {
                     kind: LiveContextKind::Files,
                     id: Some("src/api.rs".into()),
                     label: Some("api.rs".into()),
                     detail: None,
-                }),
+                })),
                 // The browser reports where it is on the screen in the same
-                // body (mesa task 895) — one statement, one poster.
-                window: Some(LiveWindow {
+                // body (mesa task 895), which is what keeps the box and the
+                // page it is showing from ever disagreeing.
+                window: Some(Some(LiveWindow {
                     x: 22,
                     y: 22,
                     width: 1600,
                     height: 1000,
-                }),
+                })),
             })),
         )
         .await
@@ -10915,6 +10931,9 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         assert_eq!(ctx.label.as_deref(), Some("api.rs"));
         assert_eq!(session.window.unwrap().width, 1600);
 
+        // A report that omits both keys says nothing about either, so what the
+        // page reported above is still standing (mesa task 1016) — this is the
+        // phone's report, and the phone has no window box to offer.
         live_route(
             State(state.clone()),
             Ok(Json(LiveRouteBody {
@@ -10932,10 +10951,30 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .current_live_session()
             .unwrap()
             .unwrap();
+        assert_eq!(session.route.as_deref(), Some("#/inbox"));
+        assert_eq!(session.context.unwrap().kind, LiveContextKind::Files);
+        assert_eq!(session.window.unwrap().width, 1600);
+
+        // An explicit `null` is the page saying nothing is selected and no
+        // window is being reported, and that still clears both.
+        live_route(
+            State(state.clone()),
+            Ok(Json(LiveRouteBody {
+                route: "#/inbox".into(),
+                context: Some(None),
+                window: Some(None),
+            })),
+        )
+        .await
+        .unwrap();
+        let session = state
+            .store
+            .lock()
+            .unwrap()
+            .current_live_session()
+            .unwrap()
+            .unwrap();
         assert_eq!(session.context, None);
-        // The window box is the same complete statement: a report without one
-        // is a page saying it no longer knows, not a patch that leaves the old
-        // box standing.
         assert_eq!(session.window, None);
     }
 
@@ -10954,6 +10993,17 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         );
         // The whole context is optional, and so is every field but `kind`.
         assert!(serde_json::from_str::<LiveRouteBody>(r##"{"route":"#/inbox"}"##).is_ok());
+        // …and serde is where the three-way key is actually decided: omitted
+        // is `None` (silence), `null` is `Some(None)` (a denial). The handler
+        // only passes that distinction along (mesa task 1016).
+        let omitted = serde_json::from_str::<LiveRouteBody>(r##"{"route":"#/inbox"}"##).unwrap();
+        assert!(omitted.context.is_none() && omitted.window.is_none());
+        let nulled = serde_json::from_str::<LiveRouteBody>(
+            r##"{"route":"#/inbox","context":null,"window":null}"##,
+        )
+        .unwrap();
+        assert_eq!(nulled.context, Some(None));
+        assert_eq!(nulled.window, Some(None));
         assert!(
             serde_json::from_str::<LiveRouteBody>(
                 r##"{"route":"#/inbox","context":{"kind":"inbox"}}"##

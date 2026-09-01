@@ -242,7 +242,9 @@ turns (schema enforces none of it, per CLAUDE.md):
   does not have is refused before the handler ever runs. Both halves are
   validated **before either is written**, so a refused context leaves the
   stored route *and* the stored context exactly as they were rather than
-  half-applying the report.
+  half-applying the report. Whether a report touches the context at all is the
+  three-way key rule below: omitted leaves it, `null` clears it, a value
+  replaces it (mesa task 1016).
 - **The context is a fixed vocabulary rather than a free-form blob**, and that
   is the decision the whole shape turns on. The agent has to be able to *say
   something useful* about what is on screen without parsing anything — "you
@@ -538,10 +540,16 @@ right one:
   is "no shot", never "someone else's screen".
 - **The window mesa photographs is the window that reported the page the agent
   was told about.** The box rides in the *existing* route report as a third
-  member beside `route` and `context`, under the one-complete-statement rule
-  those two already live by, so all three are written by one poster in one
-  request and cannot disagree. And several mesa **tabs** share one window box,
-  so two tabs of the same browser are not two answers.
+  member beside `route` and `context`, so a browser that reports at all reports
+  all three in one request and they cannot disagree. And several mesa **tabs**
+  share one window box, so two tabs of the same browser are not two answers.
+
+  Since mesa task 1016 a client may report a route and *omit* the box rather
+  than deny it, which is how a phone joining the conversation stopped erasing
+  the desktop's window for the rest of the session. The guarantee above is
+  unchanged where it matters: the stored box is still the last one a browser
+  actually reported, alongside the route and context that browser reported with
+  it.
 
 That is also why there is no separate write path for it. A window box is not a
 different kind of news from a route; it moves for the same reason a route
@@ -750,7 +758,7 @@ takes exactly one value.
 | `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
 | `DELETE /api/live` | the ended session | `require_agent_access` |
 | `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
-| `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded | standard write |
+| `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded — an omitted `context`/`window` leaves the stored one alone, an explicit `null` clears it | standard write |
 | `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
 | `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
 
@@ -772,15 +780,44 @@ fixes it. One poll carries at most 500 turns — the ceiling `Store` clamps to
 anyway — so a conversation longer than that is read in cursor-sized pages,
 which is what `?after=` is for.
 
-`POST /api/live/route`'s `context` and `window` are optional and **omitting
-either clears the stored one** — the report is a complete statement of where
-the person is, not a
-patch, because one poster in the page sends every part of it together on every
-move.
-A page that has opened nothing must be able to say so, and this is how it says
-it; the same goes for a caller that is not a browser and has no window to
-report, which is exactly the session `mesa live look` refuses to guess at. An
-unknown `kind` is a **422 `validation`**, refused by serde before the
+`POST /api/live/route`'s `route` is required and always written. Its `context`
+and `window` are **three-way keys** (mesa task 1016), the same
+`double_option` shape `PATCH /api/tasks/{id}`'s clearable fields use:
+
+| the key is… | what it means | what is stored |
+| --- | --- | --- |
+| **omitted** | "I have nothing to say about this" | the stored value is left exactly as it is |
+| present and **`null`** | "nothing is selected" / "no window is being reported" | cleared |
+| present with a **value** | this is what is open / where the window is | validated and stored |
+
+This was, until task 1016, a **complete statement** rather than a patch —
+absent meant cleared, because one poster in the page sent every part of it
+together on every move. That rule assumed one client. A live session is one
+*conversation*, and route, context and window are three statements about it
+that different clients can now make with **different authority**: a desktop
+browser knows its window box and its focused file, a phone knows neither and
+never will. Under the old rule the phone's report, which can only ever carry a
+route, erased both — and nothing put them back for the life of the session, so
+`mesa live look` lost the box it needs the moment the person glanced at their
+phone. Omission is silence now, not a denial. A page that has opened nothing
+still says so, and says it the way it always meant to: by sending `null`.
+
+mesa's own web client is unaffected by the change, because it already sends all
+three keys explicitly — `frontend/src/api.ts::reportLiveRoute` takes a
+`LiveContext | null` and a `LiveWindow | null`, and `JSON.stringify` keeps an
+explicit `null` — so it still clears exactly what it means to clear.
+
+**Per-client attribution was considered and rejected.** The alternative to
+"last writer wins per key" is remembering *which* client said each thing and
+letting `mesa live look` prefer the one that can see a window. But there is one
+person in a live conversation — that is the whole premise of the surface, and
+the reason at most one session may be `live` — so "who is where" is not a
+question this design has to ask. Paying for the answer would mean a client
+identity the CLI would have to mint, stored per report, plus a new tie-break
+rule inside `mesa live look` for two clients claiming different boxes: new
+state and a new failure mode, to disambiguate something that does not happen.
+
+An unknown `kind` is a **422 `validation`**, refused by serde before the
 handler runs (`JsonRejection` maps to mesa's validation body), which is the
 same code an over-long field gets from `Store` — an unknown page is a client
 bug either way. The gate is unchanged: an ordinary write.
@@ -1410,11 +1447,13 @@ conversation") working with no backend change.
   something moved.
 
   Route, context and window box go in **one body because they are one
-  statement**, and
-  omitting the context is how a page with nothing open says so — a report is
-  not a patch. Sending them separately would mean two writes that can disagree
-  about which page a focus is on, or a box that names a window some other
-  report's page was never in.
+  statement** about one moment: sending them separately would mean two writes
+  that can disagree about which page a focus is on, or a box that names a
+  window some other report's page was never in. That is about this client's
+  report being coherent with itself; it is *not* a claim that the report
+  replaces every other client's (mesa task 1016). The hub always sends all
+  three keys — an explicit `null` where it has nothing open or no box — so a
+  page with nothing open still clears what was selected, exactly as before.
 
   The report is **debounced** (one shared trailing 300 ms timer,
   `REPORT_DEBOUNCE_MS`), which the route alone never needed. Context changes far
@@ -1652,7 +1691,10 @@ The route write is checked with its **context** riding in the same body (task
 888): both halves recorded, `mesa live status` reading back over its own
 `Store` exactly what the page reported over HTTP (the two surfaces share
 `core`, so they must not disagree about what the person is looking at),
-omitting or nulling the context clearing it, blank fields folding to `null`
+a `null` context clearing it while an omitted one leaves the stored one
+standing (task 1016, checked with the two-client scenario it exists for: a
+desktop reports all three parts, a phone reports a route alone, and the window
+box `mesa live look` needs survives), blank fields folding to `null`
 rather than `""`, the 200-char field bound inclusive on both sides, an unknown
 `kind` as 422 `validation`, a refused report leaving the stored route *and*
 context untouched — and every one of the ten `kind` values accepted in a loop,

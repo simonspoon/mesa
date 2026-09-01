@@ -22,8 +22,9 @@
 #   5. the API twin over a live `serve` — the `{session:null,turns:[]}` empty
 #      state, start/stop, the 409, the utterance write, the route write and the
 #      context riding with it (both halves recorded, the CLI reading back the
-#      same context, omitted/null clearing it, the closed `kind` vocabulary and
-#      the 200-char field bound), the `?after=` cursor and the idempotent
+#      same context, the three-way context key — omitted keeps, null clears, a
+#      value replaces (task 1016) — the closed `kind` vocabulary and the
+#      200-char field bound), the `?after=` cursor and the idempotent
 #      played stamp;
 #   6. the loop the two surfaces make together: an utterance posted over HTTP is
 #      handed to `mesa live listen` exactly once, never twice, a quiet wait
@@ -35,8 +36,11 @@
 #      `validation` for a pure-navigate turn and `unavailable` for a failing
 #      synthesiser;
 #   8. `mesa live look` (task 895) against a stub loki — the window box riding
-#      in the route report and read back by `mesa live status`, an impossible
-#      box refused, and which window the box picks: the person's rather than
+#      in the route report and read back by `mesa live status`, its own
+#      three-way key and the two-client scenario that made it one (a desktop
+#      reports route+context+box, a phone reports a route alone, and the box
+#      survives for `look` to match — task 1016), an impossible box refused,
+#      and which window the box picks: the person's rather than
 #      the headless `mesa` beside it, `unavailable` when nothing is at the box
 #      (or no browser reported one), `conflict` when two windows are;
 #   9. the security boundary in default mode — the Host allowlist, the
@@ -724,9 +728,8 @@ ok "POST /api/live/route: records a hash route, refuses anything else (422)"
 # ---- context: what is open on that page (task 888) ----
 #
 # The route says which page; the context says what is in focus on it. They
-# arrive in ONE body because they are one statement — and because omitting the
-# context is how a page with nothing open says so, which every bare-route
-# assertion above already depends on.
+# arrive in ONE body because they are one statement about one moment: a page
+# that reports both cannot have them disagree about which page a focus is on.
 CTX=$(jq -n '{route:"#/projects/7/files",
               context:{kind:"files", id:"src/core/store.rs",
                        label:"store.rs", detail:"line 42"}}')
@@ -751,14 +754,30 @@ run 0 "$MESA" live status
 [ "$(jqs .context.detail)" = "line 42" ] || fail "live status: the CLI must see the detail"
 ok "mesa live status: the CLI reads back the context the page reported over HTTP"
 
-# The report is a complete statement, not a patch: no context clears.
+# The context key is THREE-way, and the three are genuinely different things
+# to say (mesa task 1016). Omitting it is silence — "I have nothing to say
+# about what is open" — and leaves the stored context exactly as it is, which
+# is the only report a client with no notion of a focused file can ever make.
+# The route itself is required, so it is always written either way.
 api 200 POST "/api/live/route" '{"route":"#/inbox"}'
-[ "$(jqb .context)" = "null" ] || fail "omitting context must clear it, not leave the old one"
+[ "$(jqb .context.kind)" = "files" ] ||
+  fail "omitting the context must leave the stored one standing, not clear it"
+[ "$(jqb .context.id)" = "src/core/store.rs" ] ||
+  fail "omitting the context must leave every field of it standing"
+[ "$(jqb .route)" = "#/inbox" ] || fail "…while the route is always written"
+
+# An explicit null is the other half: the page stating that nothing is
+# selected. That is what mesa's own page sends when its editor is empty, and
+# it still clears.
+api 200 POST "/api/live/route" '{"route":"#/inbox","context":null}'
+[ "$(jqb .context)" = "null" ] || fail "an explicit null context must clear what was selected"
+
+# …and a value replaces whatever was there.
 api 200 POST "/api/live/route" "$CTX"
 [ "$(jqb .context.kind)" = "files" ] || fail "re-reporting the context must record it again"
 api 200 POST "/api/live/route" '{"route":"#/inbox","context":null}'
-[ "$(jqb .context)" = "null" ] || fail "an explicit null context must clear it too"
-ok "the context is a statement, not a patch: omitted or null clears what was selected"
+[ "$(jqb .context)" = "null" ] || fail "an explicit null context must clear it again"
+ok "the context key is three-way: omitted keeps, null clears, a value replaces"
 
 # "Nothing selected" is genuinely absent, never "". A page whose editor is
 # empty reports its kind and no more, and the agent must not have to treat an
@@ -1079,10 +1098,16 @@ run 0 "$MESA" live status
 [ "$(jqs .window.height)" = "982" ] || fail "live status: the CLI must see the reported height"
 ok "POST /api/live/route: the window box rides with the route and reaches \`mesa live status\`"
 
-# A statement, not a patch — exactly as the context is.
+# The same three-way key as the context — and the box is the reason it had to
+# become one, since `mesa live look` has nothing else to go on and no second
+# client will ever put a box back once one is lost.
 api 200 POST "/api/live/route" '{"route":"#/inbox"}'
-[ "$(jqb .window)" = "null" ] || fail "omitting the window must clear it, not leave the old box"
-ok "the window box is a statement too: a report without one clears it"
+[ "$(jqb .window.x)" = "118" ] ||
+  fail "omitting the window must leave the stored box standing, not clear it"
+[ "$(jqb .window.width)" = "1512" ] || fail "omitting the window must leave every field of it"
+api 200 POST "/api/live/route" '{"route":"#/inbox","window":null}'
+[ "$(jqb .window)" = "null" ] || fail "an explicit null window must clear the stored box"
+ok "the window box is three-way too: omitted keeps the box, null clears it"
 
 # An origin may be negative: a display to the LEFT of the primary one is where
 # a great many people keep their browser.
@@ -1108,6 +1133,31 @@ api 200 GET "/api/live"
 [ "$(jqb .session.window.width)" = "1512" ] ||
   fail "a refused window box must leave the recorded box alone"
 ok "an impossible window box is 422 validation and writes nothing (route AND box untouched)"
+
+# ---- two clients, one conversation (mesa task 1016) ----
+#
+# The scenario the three-way key exists for. A desktop browser reports all
+# three parts; the person then picks up their phone, whose page reports a route
+# and nothing else — it has no focused file and no window box, and never will.
+# Under the old complete-statement rule that report erased both for the rest of
+# the session, so `mesa live look` could never find the window again. Now the
+# last client that actually KNEW something still holds the answer, while the
+# route is whoever reported most recently.
+api 200 POST "/api/live/route" \
+  "{\"route\":\"#/projects/7/files\",\"context\":{\"kind\":\"files\",\"id\":\"src/api.rs\",\"label\":\"api.rs\"},\"window\":$LOOKBOX}"
+api 200 POST "/api/live/route" '{"route":"#/inbox"}'
+[ "$(jqb .route)" = "#/inbox" ] || fail "two clients: the phone's route must be the recorded one"
+[ "$(jqb .context.label)" = "api.rs" ] ||
+  fail "two clients: the desktop's context must survive a phone that never had one"
+[ "$(jqb .window.width)" = "1512" ] ||
+  fail "two clients: the desktop's window box must survive a phone that has none"
+
+# …and the agent reads the surviving box over its own Store, which is what
+# `mesa live look` matches a real window against below.
+run 0 "$MESA" live status
+[ "$(jqs .window.x)" = "118" ] || fail "two clients: the CLI must still see the desktop's box"
+[ "$(jqs .window.height)" = "982" ] || fail "two clients: the CLI must still see its height"
+ok "two clients on one session: a route-only report keeps the context and box it cannot speak for"
 
 if [ "$(uname -s)" != "Darwin" ]; then
   # loki drives macOS's own window server, and mesa says so before it goes

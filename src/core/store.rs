@@ -735,6 +735,11 @@ const BLOCKED_EXPR: &str = "EXISTS(SELECT 1 FROM dependencies d JOIN tasks b ON 
 /// for the same reason as [`BLOCKED_EXPR`].
 const PRIORITY_RANK: &str = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END";
 
+/// Threshold for the `next_task` stale-claim diagnostic. Fixed, not
+/// configurable: nobody types a flag at a diagnostic, and a tunable would
+/// be a third source of truth for one concept.
+const STALE_CLAIM_MINUTES: u32 = 60;
+
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let id: i64 = row.get(0)?;
     // The column is still SQL-nullable (dropping `title` in migration 28 did
@@ -1831,6 +1836,12 @@ pub enum NextResult {
         blocked: i64,
         in_progress: i64,
         todo: i64,
+        /// How many of those `in_progress` tasks carry a claim at least
+        /// [`STALE_CLAIM_MINUTES`] old — the wedge diagnostic. It rides here
+        /// because the todo-watcher calls `next_task` itself, so the signal
+        /// lands on the watcher's own path with no watcher code and no dedup
+        /// state of its own.
+        stale_claims: i64,
     },
 }
 
@@ -2883,7 +2894,9 @@ impl Store {
     /// the `project` filter if given. Order: priority (high>medium>low) then
     /// ascending id; the first is returned. If none is actionable, returns the
     /// status counts (scoped to the same filter) so the caller can tell "all
-    /// done" from "stuck/blocked" from "work in flight".
+    /// done" from "stuck/blocked" from "work in flight" — plus `stale_claims`,
+    /// how many of those `in_progress` tasks are held by a claim nobody has
+    /// renewed for [`STALE_CLAIM_MINUTES`] minutes.
     pub fn next_task(&self, project: Option<i64>) -> Result<NextResult> {
         let blocked_expr = BLOCKED_EXPR;
         let priority_rank = PRIORITY_RANK;
@@ -2921,6 +2934,14 @@ impl Store {
             blocked: count(&format!("t.status = 'todo' AND {blocked_expr}"))?,
             in_progress: count("t.status = 'in_progress'")?,
             todo: count(&format!("t.status = 'todo' AND NOT {blocked_expr}"))?,
+            // The wedge diagnostic: an `in_progress` task nobody has re-asserted
+            // a hold on for {STALE_CLAIM_MINUTES} minutes. Same scope as the
+            // three counts above, and SQLite's own clock so it can never
+            // disagree with what stamped `claimed_at`.
+            stale_claims: count(&format!(
+                "t.status = 'in_progress' AND t.claimed_at IS NOT NULL \
+                 AND t.claimed_at <= datetime('now', '-{STALE_CLAIM_MINUTES} minutes')"
+            ))?,
         })
     }
 
@@ -3001,6 +3022,20 @@ impl Store {
         Ok(self
             .conn
             .query_row("SELECT datetime('now')", [], |r| r.get(0))?)
+    }
+
+    /// The timestamp `minutes` ago, in that same text form — the cutoff a
+    /// claim must be at or before to count as stale. SQLite's clock again,
+    /// deliberately: it is the one that stamped `claimed_at`, and every mesa
+    /// timestamp is fixed-width UTC text, so `claimed_at <= cutoff` is an
+    /// ordinary string comparison. mesa still stores no staleness and expires
+    /// nothing — this only derives an age on read.
+    pub fn claim_cutoff(&self, minutes: u32) -> Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT datetime('now', ?1)",
+            [format!("-{minutes} minutes")],
+            |r| r.get(0),
+        )?)
     }
 
     /// One task's receipt, or `None` when it has never closed with a claim
@@ -6742,6 +6777,99 @@ mod tests {
         assert_eq!(store.get_task(t.id).unwrap().status, Status::Todo);
     }
 
+    /// Ages a claim in place. Test setup, not a second write path: nothing in
+    /// `Store` moves `claimed_at` backwards, which is exactly the asymmetry
+    /// under test.
+    fn age_claim(store: &Store, id: i64, minutes: u32) {
+        store
+            .conn
+            .execute(
+                &format!("UPDATE tasks SET claimed_at = datetime('now', '-{minutes} minutes') WHERE id = ?1"),
+                [id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_claim_cutoff_separates_an_old_hold_from_a_fresh_one() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let old = add_task(&mut store, p.id, "abandoned");
+        let fresh = add_task(&mut store, p.id, "live");
+        let unclaimed = add_task(&mut store, p.id, "nobody's");
+        store.claim_task(old.id, "sess-old", false).unwrap();
+        store.claim_task(fresh.id, "sess-new", false).unwrap();
+        age_claim(&store, old.id, 90);
+
+        let cutoff = store.claim_cutoff(30).unwrap();
+        let stale = |id: i64| {
+            store
+                .get_task(id)
+                .unwrap()
+                .claimed_at
+                .is_some_and(|at| at <= cutoff)
+        };
+        assert!(stale(old.id), "a 90-minute-old claim is past a 30m cutoff");
+        assert!(!stale(fresh.id), "a claim taken now is not stale");
+        assert!(!stale(unclaimed.id), "an unclaimed task is never stale");
+
+        // 0 minutes is legal and means "every claimed task".
+        let now = store.claim_cutoff(0).unwrap();
+        assert!(
+            store
+                .get_task(fresh.id)
+                .unwrap()
+                .claimed_at
+                .is_some_and(|at| at <= now)
+        );
+        assert!(store.get_task(unclaimed.id).unwrap().claimed_at.is_none());
+    }
+
+    #[test]
+    fn next_task_counts_stale_claims_when_none_actionable() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let old = add_task(&mut store, p.id, "abandoned");
+        let fresh = add_task(&mut store, p.id, "live");
+        let bare = add_task(&mut store, p.id, "flipped by hand");
+        store.claim_task(old.id, "sess-old", false).unwrap();
+        store.claim_task(fresh.id, "sess-new", false).unwrap();
+        // `bare` goes in_progress with no claim at all — not a live hold, and
+        // not a stale one either.
+        store
+            .update_task(
+                bare.id,
+                &TaskPatch {
+                    status: Some(Status::InProgress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        age_claim(&store, old.id, STALE_CLAIM_MINUTES + 1);
+
+        match store.next_task(Some(p.id)).unwrap() {
+            NextResult::Task(t) => panic!("nothing is actionable, got {}", t.id),
+            NextResult::None {
+                blocked,
+                in_progress,
+                todo,
+                stale_claims,
+            } => {
+                assert_eq!(blocked, 0);
+                assert_eq!(in_progress, 3);
+                assert_eq!(todo, 0);
+                assert_eq!(stale_claims, 1, "only the aged claim counts");
+            }
+        }
+
+        // Releasing it is a separate explicit act — and the diagnostic clears.
+        store.release_task(old.id).unwrap();
+        match store.next_task(Some(p.id)).unwrap() {
+            NextResult::Task(_) => panic!("still nothing actionable"),
+            NextResult::None { stale_claims, .. } => assert_eq!(stale_claims, 0),
+        }
+    }
+
     #[test]
     fn update_task_sets_and_clears_result() {
         let (mut store, _dir) = temp_store();
@@ -7840,10 +7968,12 @@ mod tests {
                 blocked,
                 in_progress,
                 todo,
+                stale_claims,
             } => {
                 assert_eq!(blocked, 1); // b
                 assert_eq!(in_progress, 1); // a
                 assert_eq!(todo, 0); // no unblocked todo
+                assert_eq!(stale_claims, 0); // a is in_progress but unclaimed
             }
         }
     }
@@ -7872,10 +8002,12 @@ mod tests {
                 blocked,
                 in_progress,
                 todo,
+                stale_claims,
             } => {
                 assert_eq!(blocked, 0);
                 assert_eq!(in_progress, 0);
                 assert_eq!(todo, 0);
+                assert_eq!(stale_claims, 0);
             }
         }
 
@@ -8027,10 +8159,12 @@ mod tests {
                 blocked,
                 in_progress,
                 todo,
+                stale_claims,
             } => {
                 assert_eq!(blocked, 0, "p2's blocked task must not be counted");
                 assert_eq!(in_progress, 1, "only p1's in_progress task counts");
                 assert_eq!(todo, 0, "p2's actionable todo task must not be counted");
+                assert_eq!(stale_claims, 0, "p1's in_progress task is unclaimed");
             }
         }
 

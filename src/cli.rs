@@ -424,7 +424,8 @@ EXAMPLES
   mesa task list 1 --status todo --unblocked       # scoped to a project (id or name)
   mesa task list --project 1 --status todo --unblocked
   mesa task list --tag writing
-  mesa task list --parent 42                       # child stories of task 42")]
+  mesa task list --parent 42                       # child stories of task 42
+  mesa task list --status in_progress --stale-claim-minutes 60   # abandoned holds")]
     List {
         /// Only tasks in this project (id or name)
         #[arg(value_name = "PROJECT")]
@@ -444,15 +445,21 @@ EXAMPLES
         /// Only tasks that are not blocked
         #[arg(long)]
         unblocked: bool,
+        /// Only tasks whose claim is at least this many minutes old
+        #[arg(long, value_name = "MINUTES")]
+        stale_claim_minutes: Option<u32>,
     },
     /// Print the next actionable task (todo + unblocked) as a full JSON object
     ///
     /// Selection is deterministic: among actionable tasks (optionally scoped to
     /// --project), order by priority (high>medium>low) then ascending id, and
     /// print the first as a full task object. When none is actionable, prints a
-    /// status object `{"next": null, "blocked": N, "in_progress": M, "todo": T}`
-    /// (counts scoped to the same filter) so the caller can tell "all done"
-    /// (all zero) from "work in flight" (in_progress>0) from "stuck" (blocked>0).
+    /// status object `{"next": null, "blocked": N, "in_progress": M, "todo": T,
+    /// "stale_claims": S}` (counts scoped to the same filter) so the caller can
+    /// tell "all done" (all zero) from "work in flight" (in_progress>0) from
+    /// "stuck" (blocked>0) — and, when the work in flight has in fact been
+    /// abandoned, from "wedged" (stale_claims>0: an `in_progress` task whose
+    /// claim nobody has renewed for an hour).
     /// Exit code is 0 whether or not a task is returned.
     #[command(after_help = "\
 EXAMPLES
@@ -3134,9 +3141,16 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             tag,
             parent,
             unblocked,
+            stale_claim_minutes,
         } => {
             let project = project.or(project_pos);
             let project = resolve_project_opt(&store, project.as_deref())?;
+            // One cutoff for the whole call, not one per row: the clock must
+            // not move underneath the filter.
+            let claim_cutoff = match stale_claim_minutes {
+                Some(minutes) => Some(store.claim_cutoff(minutes)?),
+                None => None,
+            };
             let tasks: Vec<_> = store
                 .list_tasks(project)?
                 .iter()
@@ -3144,6 +3158,11 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                 .filter(|t| tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
                 .filter(|t| parent.is_none_or(|p| t.parent_id == Some(p)))
                 .filter(|t| !unblocked || !t.blocked)
+                .filter(|t| {
+                    claim_cutoff
+                        .as_ref()
+                        .is_none_or(|cutoff| t.claimed_at.as_ref().is_some_and(|at| at <= cutoff))
+                })
                 .map(compact)
                 .collect();
             print_json(&tasks);
@@ -3159,11 +3178,13 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
                     blocked,
                     in_progress,
                     todo,
+                    stale_claims,
                 } => print_json(&json!({
                     "next": null,
                     "blocked": blocked,
                     "in_progress": in_progress,
                     "todo": todo,
+                    "stale_claims": stale_claims,
                 })),
             }
         }

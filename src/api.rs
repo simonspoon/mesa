@@ -1441,6 +1441,10 @@ struct TaskQuery {
     parent: Option<i64>,
     #[serde(default)]
     unblocked: bool,
+    /// Only tasks whose claim is at least this many minutes old, matching the
+    /// CLI's `--stale-claim-minutes`.
+    #[serde(default)]
+    stale_claim_minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1454,6 +1458,11 @@ async fn list_tasks(
     Query(q): Query<TaskQuery>,
 ) -> ApiResult<Response> {
     let store = state.store.lock().unwrap();
+    // One cutoff for the whole call, not one per row.
+    let claim_cutoff = match q.stale_claim_minutes {
+        Some(minutes) => Some(store.claim_cutoff(minutes)?),
+        None => None,
+    };
     let tasks: Vec<TaskSummary> = store
         .list_tasks(q.project)?
         .iter()
@@ -1461,6 +1470,11 @@ async fn list_tasks(
         .filter(|t| q.tag.as_ref().is_none_or(|g| t.tags.iter().any(|x| x == g)))
         .filter(|t| q.parent.is_none_or(|p| t.parent_id == Some(p)))
         .filter(|t| !q.unblocked || !t.blocked)
+        .filter(|t| {
+            claim_cutoff
+                .as_ref()
+                .is_none_or(|cutoff| t.claimed_at.as_ref().is_some_and(|at| at <= cutoff))
+        })
         .map(TaskSummary::from)
         .collect();
     Ok(Json(tasks).into_response())

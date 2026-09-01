@@ -7,6 +7,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+command -v sqlite3 >/dev/null || { echo "sqlite3 is required" >&2; exit 1; }
 
 cargo build --quiet
 MESA=target/debug/mesa
@@ -243,6 +244,77 @@ run 0 "$MESA" task update "$T2" --status done
 [ "$(jqs .owner)" = "null" ] || fail "done: claim must be dropped"
 [ "$(jqs .claimed_at)" = "null" ] || fail "done: claimed_at must be dropped"
 ok "leaving in_progress drops the claim"
+
+# ---- stale claims (task 1017): a read-side filter, never a release ----
+# Self-contained: its own project, dropped at the end, so the delete/backup
+# assertions below (which assume only P and P2 exist) stay valid.
+run 0 "$MESA" project create "Stale" --no-git
+PS=$(jqs .id)
+run 0 "$MESA" task create "$PS" "abandoned run"
+TS_OLD=$(jqs .id)
+run 0 "$MESA" task create "$PS" "live run"
+TS_NEW=$(jqs .id)
+# Shelved, so nothing in this project is ever actionable and `task next`
+# answers with the counts.
+run 0 "$MESA" task create "$PS" "never claimed" --status backlog
+TS_FREE=$(jqs .id)
+run 0 "$MESA" task claim "$TS_OLD" --owner sess-gone
+run 0 "$MESA" task claim "$TS_NEW" --owner sess-live
+
+# `claimed_at` only ever moves forward through mesa, so the age is faked in
+# the db directly — test setup, not a supported write path.
+sqlite3 "$MESA_DB" \
+  "UPDATE tasks SET claimed_at = datetime('now', '-90 minutes') WHERE id = $TS_OLD;"
+
+run 0 "$MESA" task list "$PS" --stale-claim-minutes 30
+[ "$(jqs "any(.[]; .id == $TS_OLD)")" = "true" ] ||
+  fail "--stale-claim-minutes: a 90-minute-old claim must be listed"
+[ "$(jqs "any(.[]; .id == $TS_NEW)")" = "false" ] ||
+  fail "--stale-claim-minutes: a claim taken now must not be listed"
+[ "$(jqs "any(.[]; .id == $TS_FREE)")" = "false" ] ||
+  fail "--stale-claim-minutes: an unclaimed task must never be listed"
+[ "$(jqs 'all(.[]; .claimed_at != null)')" = "true" ] ||
+  fail "--stale-claim-minutes: every listed task must carry a claim"
+ok "task list --stale-claim-minutes: the aged claim only"
+
+# 0 is legal and means "every claimed task" — no validation on it.
+run 0 "$MESA" task list "$PS" --stale-claim-minutes 0
+[ "$(jqs length)" = "2" ] || fail "--stale-claim-minutes 0: both claimed tasks"
+[ "$(jqs "any(.[]; .id == $TS_FREE)")" = "false" ] ||
+  fail "--stale-claim-minutes 0: an unclaimed task is still never listed"
+ok "task list --stale-claim-minutes 0: every claimed task, unclaimed still excluded"
+
+# ANDs with the existing filters rather than replacing them.
+run 0 "$MESA" task list "$PS" --status backlog --stale-claim-minutes 0
+[ "$(jqs length)" = "0" ] || fail "--stale-claim-minutes: must AND with --status"
+ok "task list --stale-claim-minutes: ANDs with --status"
+
+# The flag changes stdout only when it is passed: with the stale claim sitting
+# right there, an unflagged `task list` is unchanged and still shows all three.
+BEFORE=$("$MESA" task list "$PS")
+[ "$BEFORE" = "$("$MESA" task list "$PS")" ] || fail "task list: default output is not stable"
+[ "$(jq length <<<"$BEFORE")" = "3" ] || fail "task list with no flag: must list every task"
+[ "$BEFORE" != "$("$MESA" task list "$PS" --stale-claim-minutes 30)" ] ||
+  fail "task list: the flag must actually narrow the result"
+ok "task list with no flag: unchanged; the flag narrows only when passed"
+
+# `task next` reports the wedge on the todo-watcher's own path.
+run 0 "$MESA" task next "$PS"
+[ "$(jqs .next)" = "null" ] || fail "task next: nothing should be actionable here"
+[ "$(jqs .in_progress)" = "2" ] || fail "task next: in_progress count"
+[ "$(jqs .stale_claims)" = "1" ] || fail "task next: stale_claims must count the aged claim"
+ok "task next: stale_claims counts the abandoned hold"
+
+# A read never releases: releasing stays an explicit, separate act.
+run 0 "$MESA" task show "$TS_OLD"
+[ "$(jqs .owner)" = "sess-gone" ] || fail "stale filter: a read must not release the claim"
+run 0 "$MESA" task release "$TS_OLD"
+[ "$(jqs .owner)" = "null" ] || fail "release: clears the stale claim"
+run 0 "$MESA" task next "$PS"
+[ "$(jqs .stale_claims)" = "0" ] || fail "task next: releasing clears stale_claims"
+ok "stale claims: a read never releases; task release does"
+
+run 0 "$MESA" project delete "$PS"
 
 # restore T2 to the state this section found it in (in_progress, unclaimed),
 # so the assertions further down are unaffected by this block

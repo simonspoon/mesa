@@ -13,7 +13,8 @@
 #   3. the claim routes added by task 563 — POST /api/tasks/{id}/claim and
 #      /release: 200 shapes, renewal, the 409 on a rival owner, --force, the
 #      status-leaves-in_progress clear, and the `claimed_at` asymmetry that
-#      makes the pair useful (it must NOT move on an ordinary field write);
+#      makes the pair useful (it must NOT move on an ordinary field write),
+#      plus the read-side `?stale_claim_minutes=N` filter added by task 1017;
 #   4. archived-project scoping over HTTP (unscoped hides, scoped does not);
 #   5. the project `sort_order` round-trip added by task 666 — the field the
 #      sidebar's drag-reorder writes, and the list order it drives, plus the
@@ -42,6 +43,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+command -v sqlite3 >/dev/null || { echo "sqlite3 is required" >&2; exit 1; }
 
 cargo build --quiet
 MESA=target/debug/mesa
@@ -464,6 +466,56 @@ ok "POST .../release on an unknown task: 404 not_found"
 api 200 POST "/api/tasks/$T1/claim" '{"owner":"session-ccc"}'
 [ "$(jqb .owner)" = "session-ccc" ] || fail "claim over a null owner: owner"
 ok "POST .../claim on an in_progress task with a null owner: 200 without force"
+
+# ---- stale claims (task 1017): ?stale_claim_minutes, a read-side filter ----
+#
+# T1 is claimed as of a moment ago; TSTALE gets a claim aged in the db
+# directly (nothing in mesa moves `claimed_at` backwards — that asymmetry is
+# the whole feature), and TFREE is never claimed at all. The task is deleted
+# again at the end so the sections below see the fixtures they expect.
+api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"description\":\"Abandoned run\"}"
+TSTALE=$(jqb .id)
+api 201 POST "/api/tasks" "{\"project_id\":$PROJ,\"description\":\"Never claimed\"}"
+TFREE=$(jqb .id)
+api 200 POST "/api/tasks/$TSTALE/claim" '{"owner":"session-gone"}'
+sqlite3 "$MESA_DB" \
+  "UPDATE tasks SET claimed_at = datetime('now', '-90 minutes') WHERE id = $TSTALE;"
+
+api 200 GET "/api/tasks?project=$PROJ&stale_claim_minutes=30"
+[ "$(jqb "any(.[]; .id == $TSTALE)")" = "true" ] ||
+  fail "stale_claim_minutes: a 90-minute-old claim must be listed"
+[ "$(jqb "any(.[]; .id == $T1)")" = "false" ] ||
+  fail "stale_claim_minutes: a claim taken moments ago must not be listed"
+[ "$(jqb "any(.[]; .id == $TFREE)")" = "false" ] ||
+  fail "stale_claim_minutes: an unclaimed task must never be listed"
+[ "$(jqb 'map(.claimed_at != null) | all')" = "true" ] ||
+  fail "stale_claim_minutes: every listed task must carry a claim"
+ok "GET /api/tasks?stale_claim_minutes=30: the aged claim only"
+
+# 0 is legal and means "every claimed task" — no validation on it.
+api 200 GET "/api/tasks?project=$PROJ&stale_claim_minutes=0"
+[ "$(jqb "any(.[]; .id == $TSTALE)")" = "true" ] &&
+  [ "$(jqb "any(.[]; .id == $T1)")" = "true" ] ||
+  fail "stale_claim_minutes=0: every claimed task"
+[ "$(jqb "any(.[]; .id == $TFREE)")" = "false" ] ||
+  fail "stale_claim_minutes=0: an unclaimed task is still never listed"
+ok "GET /api/tasks?stale_claim_minutes=0: every claimed task, unclaimed still excluded"
+
+# ANDs with the existing filters, and the unfiltered read is unchanged.
+api 200 GET "/api/tasks?project=$PROJ&status=todo&stale_claim_minutes=0"
+[ "$(jqb length)" = "0" ] || fail "stale_claim_minutes: must AND with status"
+api 200 GET "/api/tasks?project=$PROJ"
+[ "$(jqb "any(.[]; .id == $TFREE)")" = "true" ] ||
+  fail "the param is opt-in: an unflagged read must still list everything"
+ok "GET /api/tasks?stale_claim_minutes: ANDs with status, absent means unfiltered"
+
+# A read never releases — that stays the explicit act.
+api 200 GET "/api/tasks/$TSTALE"
+[ "$(jqb .owner)" = "session-gone" ] || fail "stale filter: a read must not release the claim"
+ok "GET /api/tasks?stale_claim_minutes: a read never releases the claim"
+
+api 200 DELETE "/api/tasks/$TSTALE"
+api 200 DELETE "/api/tasks/$TFREE"
 
 # Leaving in_progress clears the claim, so no done/cancelled row stays owned.
 api 200 PATCH "/api/tasks/$T1" '{"status":"done"}'

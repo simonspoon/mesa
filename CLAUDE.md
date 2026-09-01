@@ -225,6 +225,14 @@ The code is the source of truth. These are the invariants you must not break:
 - A task may carry a **claim** (`owner` + `claimed_at`) — `docs/claims.md`. The
   load-bearing asymmetry: `updated_at` moves on any write, `claimed_at` moves
   **only** on claim/renew. Never restamp `claimed_at` from an ordinary update.
+  That asymmetry is what lets mesa *derive* an age on read (task 1017) without
+  storing one: `task list --stale-claim-minutes N` / `GET
+  /api/tasks?stale_claim_minutes=N` keeps only tasks whose claim is at least
+  that old (unclaimed never matches, cutoff computed once per call off SQLite's
+  own clock, absent = byte-identical output), and `task next`'s
+  no-actionable-task payload carries a `stale_claims` count against a fixed
+  60-minute const — the wedge signal on the todo-watcher's own path. mesa still
+  enforces no TTL and releases nothing: a read never releases.
 - A project may bind a **`root_commit`** — the repo's root commit hash, the
   stable identity of "this source code" across clones/worktrees/moves. Binds to
   **at most one project** (DB-unique; a second bind is `conflict`).

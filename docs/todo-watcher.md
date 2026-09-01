@@ -133,7 +133,12 @@ because someone ran `mesa serve`.
 - Residual risks, both inherent to the two signals above:
   - Task status is a **status**, not a liveness check: if a dispatched agent
     crashes before finishing, its task stays `in_progress` and that project
-    goes quiet until someone edits the row.
+    goes quiet until someone edits the row — though the tick's own
+    `next_task` call now *reports* it: its no-actionable-task payload carries
+    a `stale_claims` count of `in_progress` tasks nobody has renewed a claim
+    on for an hour, and `mesa task list --stale-claim-minutes N` names them
+    (`docs/claims.md`). Nothing is released automatically; the row still
+    needs an explicit `mesa task release`.
   - A genuinely long-running background shell (a `sleep`, a watch loop, a
     server an agent left running under its session) parks that project's slot
     until the process exits. That is intended — there really is work in

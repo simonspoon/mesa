@@ -316,6 +316,41 @@ pub struct ConfigLive {
     pub auto_send_ms_default: u32,
 }
 
+/// The cost-guard settings as the Settings page sees them (`core::config`,
+/// `docs/cost-guard.md`, mesa task 1018) — a sixth view of
+/// `~/.mesa/config.json`, with the same null-means-fallback rule as
+/// [`ConfigWatchers`]: an absent value is the built-in threshold, and writing
+/// `null` back is how the user restores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigGuard {
+    /// Dollars of estimated spend in the guard window at which a live session
+    /// is reported, or `null` when the config says nothing.
+    pub cost_usd: Option<f64>,
+    /// The built-in dollar ceiling mesa ships.
+    pub cost_usd_default: f64,
+    /// Tokens in the guard window at which a live session is reported, or
+    /// `null` when the config says nothing.
+    #[ts(type = "number | null")]
+    pub total_tokens: Option<i64>,
+    /// The built-in token ceiling mesa ships.
+    #[ts(type = "number")]
+    pub total_tokens_default: i64,
+    /// The share of a session's tokens that must be cache reads for the
+    /// spin-loop rule to fire (0.5..=1.0), or `null` for the built-in.
+    pub cache_read_share: Option<f64>,
+    /// The built-in cache-read share mesa ships.
+    pub cache_read_share_default: f64,
+    /// The token floor under which the spin-loop rule never fires — what stops
+    /// a tiny session at 100% cache-read from being called a runaway — or
+    /// `null` for the built-in.
+    #[ts(type = "number | null")]
+    pub cache_read_min_tokens: Option<i64>,
+    /// The built-in spin-loop token floor mesa ships.
+    #[ts(type = "number")]
+    pub cache_read_min_tokens_default: i64,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

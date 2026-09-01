@@ -2492,6 +2492,31 @@ impl Store {
             })
     }
 
+    /// The task claimed by `owner`, if any — most recently claimed first.
+    ///
+    /// The cost guard's first way of attributing a runaway Claude Code session
+    /// to a task: an agent that claimed its work with its own session id has
+    /// already told mesa which task it is running, and `docs/receipts.md`
+    /// links `cc_sessions` off `owner` for exactly this reason. A miss is
+    /// `Ok(None)`, not an error — most owners are people, and most sessions
+    /// claimed nothing.
+    ///
+    /// `claimed_at` is the right sort key rather than `updated_at` because it
+    /// moves **only** on claim/renew (`docs/claims.md`), so it dates the claim
+    /// itself; ordinary edits to a task must not reorder these.
+    pub fn find_task_by_owner(&self, owner: &str) -> Result<Option<Task>> {
+        let owner = owner.trim();
+        if owner.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks t WHERE t.owner = ?1 \
+             ORDER BY t.claimed_at DESC, t.id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map([owner], row_to_task)?;
+        rows.next().transpose().map_err(Error::Db)
+    }
+
     /// A not-found message with a lead: the id-nearest existing task, so a
     /// typo'd id self-corrects instead of dead-ending.
     fn task_not_found_message(&self, id: i64) -> String {
@@ -5840,6 +5865,34 @@ mod tests {
                 None,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn find_task_by_owner_answers_the_newest_claim_and_none_for_a_stranger() {
+        let (mut store, _dir) = temp_store();
+        let project = store
+            .create_project("alpha", None, None, None, None)
+            .unwrap()
+            .id;
+        let first = add_task(&mut store, project, "first").id;
+        let second = add_task(&mut store, project, "second").id;
+
+        assert!(store.find_task_by_owner("session-1").unwrap().is_none());
+        store.claim_task(first, "session-1", false).unwrap();
+        assert_eq!(
+            store.find_task_by_owner("session-1").unwrap().map(|t| t.id),
+            Some(first)
+        );
+        // A second claim by the same owner: the later `claimed_at` wins, which
+        // is what makes this the *current* work of a long-lived session.
+        store.claim_task(second, "session-1", false).unwrap();
+        assert_eq!(
+            store.find_task_by_owner("session-1").unwrap().map(|t| t.id),
+            Some(second)
+        );
+        // Another session, and an empty owner, are misses rather than errors.
+        assert!(store.find_task_by_owner("session-2").unwrap().is_none());
+        assert!(store.find_task_by_owner("  ").unwrap().is_none());
     }
 
     #[test]

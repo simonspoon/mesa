@@ -165,6 +165,17 @@ enum Command {
         /// UI's Restart Server action.
         #[arg(long, default_value_t = false)]
         watch_inbox: bool,
+        /// Periodically check the Claude Code sessions running right now and
+        /// file an inbox alert for any that crosses a cost-guard threshold —
+        /// dollars, tokens, or the cache-read share that marks a spin loop
+        /// (thresholds in ~/.mesa/config.json's `guard` section;
+        /// `mesa cc guard` shows the same verdict on demand). mesa reports;
+        /// it never stops a session. Off by default: it reads Claude Code's
+        /// transcripts and writes inbox items with no user request behind it.
+        /// Independent of --watch-todo and --watch-inbox. Preserved across the
+        /// web UI's Restart Server action.
+        #[arg(long, default_value_t = false)]
+        watch_cost: bool,
     },
     /// Snapshot the database to a file (safe while the server runs)
     ///
@@ -1928,6 +1939,24 @@ EXAMPLES
         #[arg(long, default_value_t = crate::core::cc::DEFAULT_LIVE_MINUTES)]
         minutes: i64,
     },
+    /// Print the live sessions currently over a cost-guard threshold
+    ///
+    /// The read-only half of the cost guard (`docs/cost-guard.md`): the same
+    /// thresholds `serve --watch-cost` files inbox alerts against, evaluated
+    /// once against `cc live` and printed. A session mesa cannot attribute to
+    /// a task reports `task_id: null` — it is filed nowhere, so this is where
+    /// it stays visible. Reads transcripts and the mesa db; writes nothing.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc guard                 # the last 60 minutes
+  mesa cc guard --minutes 240   # a wider look back")]
+    Guard {
+        /// Recency window in minutes. A value outside 1..=1440 is CLAMPED into
+        /// that range, not rejected — the `cc live` rule, so `--minutes 0`
+        /// succeeds with a 1-minute window.
+        #[arg(long, default_value_t = crate::core::guard::DEFAULT_GUARD_WINDOW_MINUTES)]
+        minutes: i64,
+    },
     /// Print live subscription usage (plan limits + reset times) as one JSON object
     ///
     /// Fetches Anthropic's `/usage` data using the local Claude Code OAuth token
@@ -2939,7 +2968,8 @@ fn execute(command: Command) -> Result<()> {
             lan,
             watch_todo,
             watch_inbox,
-        } => crate::api::serve(port, lan, watch_todo, watch_inbox),
+            watch_cost,
+        } => crate::api::serve(port, lan, watch_todo, watch_inbox, watch_cost),
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;
@@ -3749,6 +3779,22 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
             print_json(&crate::core::cc::reset_and_sync(&mut store)?)
         }
         CcCmd::Live { minutes } => print_json(&crate::core::cc::live(minutes)),
+        CcCmd::Guard { minutes } => {
+            // No `cc sync`: the guard is about sessions running *now*, which
+            // is a live transcript read (`cc live`), not a db aggregate. The
+            // store is opened only to resolve each breaching session to a
+            // task — a read, and the CLI's own `Store`, never the server's.
+            let store = Store::open_default()?;
+            let live = crate::core::cc::live(minutes);
+            let thresholds = match crate::core::config::guard_thresholds() {
+                Ok(t) => t,
+                Err(message) => {
+                    print_error("unavailable", &message);
+                    std::process::exit(1);
+                }
+            };
+            print_json(&crate::core::guard::report(&store, &live, &thresholds)?)
+        }
         CcCmd::Usage => match crate::core::usage::fetch() {
             Ok(usage) => print_json(&usage),
             Err(message) => {

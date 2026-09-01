@@ -39,15 +39,15 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactPatch, ArtifactSummary, CcDashboard,
-    CcUsage, DiagramPatch, DiagramType, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error,
-    FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
+    CcLiveSession, CcUsage, DiagramPatch, DiagramType, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
+    Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryBundle,
     LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole, LiveState,
     LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates, NextResult, Priority,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
     ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskSummary, Waypoint, agents, attachments, config, files, git, hooks, library, listen, live,
-    receipt, scripts, speech, version,
+    TaskSummary, Waypoint, agents, attachments, config, files, git, guard, hooks, library, listen,
+    live, receipt, scripts, speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -172,6 +172,18 @@ struct AppState {
     /// direction (a duplicate triage of an item is cheap; a permanently
     /// skipped item is not) — see `docs/inbox-watcher.md`.
     inbox_dispatched: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// `(session_id, threshold)` pairs the cost-guard (`watch_cost`) has
+    /// already filed an inbox alert for — or has decided it cannot file one
+    /// for. The guard's fire-once set, and a **pair** rather than a session id
+    /// because a runaway usually trips several rules and each is a separate
+    /// finding: cost tells a person to look, spin tells them what they will
+    /// find. Claimed before the write and released again if that write fails,
+    /// exactly as `inbox_dispatched` is. Pruned each tick to the sessions
+    /// still inside the live window, so it cannot grow unboundedly. Not
+    /// persisted, for `inbox_dispatched`'s reason: a restart re-alerting on a
+    /// session that is *still* burning money is the recoverable direction —
+    /// see `docs/cost-guard.md`.
+    cost_alerted: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
 }
 
 /// How often the todo-watcher (`watch_todo`) checks every project for
@@ -200,6 +212,21 @@ fn watch_inbox_tick() -> Duration {
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_INBOX_TICK)
+}
+
+/// How often the cost-guard (`watch_cost`) re-reads the live sessions. Same
+/// fixed-cadence rationale as [`WATCH_TODO_TICK`]; `MESA_WATCH_COST_TICK_MS`
+/// is the matching test seam. A minute is well inside the guard's own
+/// hour-wide window, so nothing can start and finish between two ticks
+/// without the window still holding its spend.
+const WATCH_COST_TICK: Duration = Duration::from_secs(60);
+
+fn watch_cost_tick() -> Duration {
+    std::env::var("MESA_WATCH_COST_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_COST_TICK)
 }
 
 /// How much of an inbox body goes into an auto-dispatched session's name,
@@ -321,6 +348,126 @@ fn inbox_watcher_tick(state: &AppState) {
         }
     }
 }
+
+/// One cost-guard pass: read the live Claude Code sessions, evaluate the
+/// configured thresholds against each, and file **one inbox item per session
+/// per tripped threshold** (`docs/cost-guard.md`, mesa task 1018).
+///
+/// mesa reports; it never stops a session. The whole feature exists because
+/// the numbers that would have caught a $1,413 spin loop were already in
+/// `mesa cc` the entire time and nothing was watching them.
+///
+/// Two-phase like [`inbox_watcher_tick`] and `todo_watcher_tick`: reading the
+/// transcripts and evaluating the rules is the slow part and happens with no
+/// store lock held; the lock is taken only for the task resolution and the
+/// inbox writes. Thresholds are read from `~/.mesa/config.json` **fresh every
+/// tick**, the `todo_concurrency` rule, so a limit changed in Settings takes
+/// effect without restarting `mesa serve`; a config mesa cannot parse skips
+/// the tick rather than guarding against guessed numbers.
+///
+/// A session mesa cannot attribute to a task files **nothing** — the inbox's
+/// rule is that an item names the task it came from, and the guard does not
+/// get to invent one. It warns on stderr and still claims the fire-once pair,
+/// so an unattributable runaway does not reprint that warning every minute;
+/// `mesa cc guard` is where it stays visible.
+fn cost_watcher_tick(state: &AppState) {
+    let thresholds = match config::guard_thresholds() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cost-guard: {e}");
+            return;
+        }
+    };
+    let live = crate::core::cc::live(crate::core::guard::DEFAULT_GUARD_WINDOW_MINUTES);
+
+    // Phase one, lock-free: which session tripped what, and which of those
+    // pairs this process has not already answered for.
+    let mut pending: Vec<(&CcLiveSession, Vec<guard::GuardBreach>)> = Vec::new();
+    {
+        let mut alerted = match state.cost_alerted.lock() {
+            Ok(a) => a,
+            Err(e) => e.into_inner(),
+        };
+        let present: std::collections::HashSet<&str> = live
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        alerted.retain(|(session_id, _)| present.contains(session_id.as_str()));
+        for session in &live.sessions {
+            let fresh: Vec<guard::GuardBreach> = guard::breaches(session, &thresholds)
+                .into_iter()
+                .filter(|b| alerted.insert((session.session_id.clone(), b.threshold.to_string())))
+                .collect();
+            if !fresh.is_empty() {
+                pending.push((session, fresh));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    for (session, fresh) in pending {
+        let body = guard::alert_body(
+            session,
+            &fresh,
+            live.window_minutes,
+            guard::running_minutes(session),
+        );
+        let filed = {
+            let mut store = match state.store.lock() {
+                Ok(s) => s,
+                Err(e) => e.into_inner(),
+            };
+            match guard::resolve_task(&store, session) {
+                Ok(Some(task_id)) => store
+                    .create_inbox_item(
+                        Some(COST_GUARD_AUTHOR),
+                        &body,
+                        InboxKind::TaskSummary,
+                        task_id,
+                    )
+                    .map(|_| true)
+                    .map_err(|e| e.to_string()),
+                Ok(None) => {
+                    eprintln!(
+                        "cost-guard: session {} tripped {} but names no mesa task \
+                         (no claim, no project at its cwd); see `mesa cc guard`",
+                        session.session_id,
+                        fresh
+                            .iter()
+                            .map(|b| b.threshold)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    // Deliberately NOT a failure: there is nothing to retry.
+                    // The pair stays claimed so this line is printed once, not
+                    // once a minute for as long as the session runs.
+                    Ok(true)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        if let Err(e) = filed {
+            eprintln!(
+                "cost-guard: filing an alert for session {} failed: {e}",
+                session.session_id
+            );
+            let mut alerted = match state.cost_alerted.lock() {
+                Ok(a) => a,
+                Err(e) => e.into_inner(),
+            };
+            for b in &fresh {
+                alerted.remove(&(session.session_id.clone(), b.threshold.to_string()));
+            }
+        }
+    }
+}
+
+/// The `author` every cost-guard inbox item carries, so the alerts are one
+/// identifiable stream in a list of hand-written and agent-written items.
+const COST_GUARD_AUTHOR: &str = "cost-guard";
 
 /// Walks `task` down to the actionable task the todo watcher should really
 /// dispatch: the top-ranked actionable descendant of `task`, recursively, or
@@ -601,7 +748,13 @@ fn todo_watcher_tick(state: &AppState) {
 /// all off by default, all propagated across the web UI's Restart Server
 /// action. They are independent flags over independent queues — none implies
 /// another.
-pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate::core::Result<()> {
+pub fn serve(
+    port: u16,
+    lan: bool,
+    watch_todo: bool,
+    watch_inbox: bool,
+    watch_cost: bool,
+) -> crate::core::Result<()> {
     let store = Store::open_default()?;
     let restart_requested = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -626,6 +779,7 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate
         restart_requested: restart_requested.clone(),
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
         inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -651,6 +805,17 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate
                     ticker.tick().await;
                     let state = watch_state.clone();
                     let _ = tokio::task::spawn_blocking(move || inbox_watcher_tick(&state)).await;
+                }
+            });
+        }
+        if watch_cost {
+            let watch_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(watch_cost_tick());
+                loop {
+                    ticker.tick().await;
+                    let state = watch_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || cost_watcher_tick(&state)).await;
                 }
             });
         }
@@ -685,6 +850,9 @@ pub fn serve(port: u16, lan: bool, watch_todo: bool, watch_inbox: bool) -> crate
         }
         if watch_inbox {
             args.push("--watch-inbox".to_string());
+        }
+        if watch_cost {
+            args.push("--watch-cost".to_string());
         }
         std::process::Command::new(exe).args(args).spawn()?;
         std::process::exit(0);
@@ -1090,6 +1258,13 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/config/listen",
             get(get_config_listen).put(update_config_listen),
+        )
+        // The same file's `guard` section — the cost-guard's thresholds
+        // (mesa task 1018). A seventh route for the same reason as the other
+        // five.
+        .route(
+            "/api/config/guard",
+            get(get_config_guard).put(update_config_guard),
         )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
@@ -5661,6 +5836,90 @@ async fn update_config_watchers(
     get_config_watchers(State(state), ConnectInfo(addr), headers).await
 }
 
+/// `GET /api/config/guard` — the cost-guard's four thresholds, each with the
+/// built-in behind it (`docs/cost-guard.md`, mesa task 1018).
+///
+/// Gated like `get_config_watchers` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`, so the editor never renders
+/// a blank box over a file it couldn't read.
+async fn get_config_guard(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::guard() {
+        Ok(guard) => Ok(Json(guard).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct GuardUpdate {
+    /// Absent leaves the key alone; `null` removes it (restoring the built-in
+    /// threshold). Values stay raw JSON so a bad number is the config layer's
+    /// named 422 rather than a deserializer rejection — as `WatchersUpdate`'s
+    /// are.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    cost_usd: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    total_tokens: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    cache_read_share: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    cache_read_min_tokens: Option<Option<serde_json::Value>>,
+}
+
+/// `PUT /api/config/guard` — writes the guard thresholds and echoes them.
+///
+/// **Loopback-only in both modes**, like every other config write: it is the
+/// same file mesa's own argv comes out of, and the section a write lands in is
+/// not the distinction that matters.
+async fn update_config_guard(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<GuardUpdate>,
+) -> ApiResult<Response> {
+    require_local_path_write(
+        &state,
+        &addr,
+        &headers,
+        "editing the mesa config is loopback-only; connect from this machine",
+    )?;
+    let mut updates = HashMap::new();
+    for (key, value) in [
+        (config::GUARD_COST_USD, body.cost_usd),
+        (config::GUARD_TOTAL_TOKENS, body.total_tokens),
+        (config::GUARD_CACHE_READ_SHARE, body.cache_read_share),
+        (
+            config::GUARD_CACHE_READ_MIN_TOKENS,
+            body.cache_read_min_tokens,
+        ),
+    ] {
+        if let Some(value) = value {
+            updates.insert(key.to_string(), value);
+        }
+    }
+    config::save_guard(&updates).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_guard(State(state), ConnectInfo(addr), headers).await
+}
+
 /// `GET /api/config/speech` — the voice the inbox's play button speaks in, plus
 /// the voices the installed synthesiser offers so the editor can be a list
 /// (`docs/config.md`, mesa task 822).
@@ -6967,6 +7226,7 @@ mod tests {
             restart_requested: Arc::new(AtomicBool::new(false)),
             shutdown_tx: Arc::new(Mutex::new(None)),
             inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
         (dir, state)
     }

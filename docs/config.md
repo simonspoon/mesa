@@ -429,8 +429,8 @@ the todo-watcher's per-project concurrency limit (mesa task 777,
   file, and which file a LAN peer may rewrite is not a per-section question.
 
 The sections are siblings over one document: saving `watchers` preserves
-`commands`, `pricing`, `speech` and any section mesa doesn't know about, and
-vice versa.
+`commands`, `pricing`, `speech`, `guard` and any section mesa doesn't know
+about, and vice versa.
 
 ## Speech
 
@@ -661,6 +661,64 @@ mirror of Speech, above.
   `require_local_path_write`: **loopback-only in both serve modes**, the same
   posture as every other config write.
 
+## Guard
+
+A seventh, independent section holds the **cost-guard** thresholds — the
+numbers `serve --watch-cost` and `mesa cc guard` compare a running Claude Code
+session against (mesa task 1018, `docs/cost-guard.md`).
+
+```json
+{
+  "guard": {
+    "cost-usd": 25.0,
+    "total-tokens": 100000000,
+    "cache-read-share": 0.98,
+    "cache-read-min-tokens": 20000000
+  }
+}
+```
+
+- `cost-usd` — estimated dollars inside the guard's hour-wide window at which
+  a session is reported. **Absent or `null` ⇒ the built-in 25.** The editor
+  requires a number greater than 0 and at most 100000; the upper bound is a
+  sanity cap against a typo that would silently switch the rule off, not a
+  policy.
+- `total-tokens` — tokens in the same window at which a session is reported
+  regardless of cost, since a cheap model can burn enormous volume for very
+  little money. **Absent or `null` ⇒ 100000000.** A whole number ≥ 1.
+- `cache-read-share` — the share of a session's tokens that must be cache
+  **reads** for the spin-loop rule to fire. **Absent or `null` ⇒ 0.98.**
+  Between 0.5 and 1: below half, "mostly cache reads" stops describing a loop
+  and starts describing a healthy long session.
+- `cache-read-min-tokens` — the token floor the spin-loop rule needs before it
+  fires at all. **Absent or `null` ⇒ 20000000.** A whole number ≥ 1. A session
+  three messages long is trivially 100% cache-read and perfectly healthy; this
+  is what separates it from an agent re-reading its context forever.
+- **Read at the top of every tick, not cached** — the `watchers` rule: edit
+  the file (or Settings) and the very next tick uses it, no restart. A config
+  file that cannot be *parsed* skips the tick and logs, rather than guarding
+  against guessed numbers.
+- A hand-edited value of the right type but outside its bound (found in the
+  file, not written through `PUT`) falls back to the built-in **for that key
+  alone** on read, the same clamp posture `todo-concurrency` takes — a stray
+  `0` must not switch the guard off silently. Only the write path is strict,
+  and the Settings page still shows the raw stored value.
+
+### Routes
+
+- `GET /api/config/guard` → `ConfigGuard`: each of the four keys **verbatim**
+  (`null` when unset) beside its built-in (`cost_usd_default`,
+  `total_tokens_default`, `cache_read_share_default`,
+  `cache_read_min_tokens_default`). Gated like the other config getters
+  (`require_agent_access`); a malformed config is **502 `unavailable`**.
+- `PUT /api/config/guard`, body `{"cost_usd": <n> | null, "total_tokens": …,
+  "cache_read_share": …, "cache_read_min_tokens": …}` → echoes the getter.
+  Absent leaves a key alone; `null` removes it, restoring the built-in. Any
+  out-of-range or wrong-typed value is **422 `validation`**, writing nothing —
+  the whole update is checked before the file is touched. Gated with
+  `require_local_path_write`: **loopback-only in both serve modes**, the same
+  posture as every other config write.
+
 ## Gate
 
 `scripts/config-check.sh` — all three commands driven by a configured template
@@ -712,6 +770,14 @@ that isn't from this machine's own page, and the migration case: a
 replacing the built-in" moved with the prompt itself (mesa task 919) — it is
 now `scripts/library-check.sh`'s assertion, proved through a forked library
 row instead of a config key.
+
+For guard the coverage lives in its own gate, `scripts/cost-guard-check.sh`
+(`docs/cost-guard.md`), since the thresholds are only meaningful against a live
+session: `GET` reporting all-null values beside the four built-ins, a saved
+threshold governing the very next verdict with no restart, `null` restoring the
+built-in, every out-of-range and wrong-typed value 422 writing nothing, an
+unknown body key ignored, and **all six** other sections surviving the guard
+section's save.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

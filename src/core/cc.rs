@@ -3308,7 +3308,7 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
 /// Parse `2026-06-15T01:44:23.655Z` (and any RFC-3339-ish prefix) to Unix
 /// seconds, UTC. Fractional seconds and the timezone suffix are ignored — every
 /// transcript timestamp is `Z`.
-fn parse_ts(s: &str) -> Option<i64> {
+pub(crate) fn parse_ts(s: &str) -> Option<i64> {
     if s.len() < 19 {
         return None;
     }

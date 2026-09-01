@@ -128,10 +128,12 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
+use crate::core::guard::GuardThresholds;
 use crate::core::listen;
 use crate::core::speech;
 use crate::core::types::{
-    ConfigCommand, ConfigListen, ConfigLive, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
+    ConfigCommand, ConfigGuard, ConfigListen, ConfigLive, ConfigPrice, ConfigSpeech,
+    ConfigWatchers, ModelRates,
 };
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
@@ -1744,6 +1746,271 @@ fn validate_live(key: &str, value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Guard (mesa task 1018)
+// ---------------------------------------------------------------------------
+
+/// The config key holding the dollar ceiling one live session may reach in the
+/// guard window before it is reported.
+pub const GUARD_COST_USD: &str = "cost-usd";
+/// The config key holding the token ceiling for the same window.
+pub const GUARD_TOTAL_TOKENS: &str = "total-tokens";
+/// The config key holding the cache-read share the spin-loop rule fires at.
+pub const GUARD_CACHE_READ_SHARE: &str = "cache-read-share";
+/// The config key holding the token floor the spin-loop rule needs before it
+/// will fire at all.
+pub const GUARD_CACHE_READ_MIN_TOKENS: &str = "cache-read-min-tokens";
+
+/// Every key the `guard` section understands, for the unknown-key error.
+const GUARD_KEYS: &[&str] = &[
+    GUARD_CACHE_READ_MIN_TOKENS,
+    GUARD_CACHE_READ_SHARE,
+    GUARD_COST_USD,
+    GUARD_TOTAL_TOKENS,
+];
+
+/// Dollars of *estimated* spend inside the guard window at which a session is
+/// worth a person's attention. Deliberately an hour's worth of expensive work
+/// rather than a day's: the guard reports, it does not stop anything, so the
+/// cost of a false alarm is one inbox item.
+pub const DEFAULT_GUARD_COST_USD: f64 = 25.0;
+
+/// The largest ceiling the editor will write — a **sanity bound, not a
+/// policy**. Past it the guard would never fire and the section would be
+/// silently off, which is worse than not configuring it.
+pub const MAX_GUARD_COST_USD: f64 = 100_000.0;
+
+/// Tokens inside the guard window at which a session is reported regardless of
+/// what they cost. The cost rule can be defeated by a cheap model; volume
+/// cannot.
+pub const DEFAULT_GUARD_TOTAL_TOKENS: i64 = 100_000_000;
+
+/// The share of a session's tokens that must be cache **reads** for the
+/// spin-loop rule to fire. The motivating incident sat at 99.8%: an agent
+/// re-reading the same context forever, producing almost no output.
+pub const DEFAULT_GUARD_CACHE_READ_SHARE: f64 = 0.98;
+
+/// The narrowest share the editor will write. Below half, "mostly cache reads"
+/// stops describing a loop and starts describing a healthy long session.
+pub const MIN_GUARD_CACHE_READ_SHARE: f64 = 0.5;
+
+/// The token floor the spin-loop rule needs before it fires. A session three
+/// messages long is 100% cache-read and perfectly healthy; the floor is what
+/// separates "reading its context" from "reading its context forever".
+pub const DEFAULT_GUARD_CACHE_READ_MIN_TOKENS: i64 = 20_000_000;
+
+/// The `guard` map, deserialized on its own for the reason every other section
+/// is: independent features share one file, and a broken value in any of them
+/// must not take the others down.
+#[derive(Debug, Default, Deserialize)]
+struct GuardConfig {
+    #[serde(default)]
+    guard: GuardSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GuardSection {
+    #[serde(default, rename = "cost-usd")]
+    cost_usd: Option<f64>,
+    #[serde(default, rename = "total-tokens")]
+    total_tokens: Option<i64>,
+    #[serde(default, rename = "cache-read-share")]
+    cache_read_share: Option<f64>,
+    #[serde(default, rename = "cache-read-min-tokens")]
+    cache_read_min_tokens: Option<i64>,
+}
+
+fn read_guard(path: &Path) -> Result<GuardSection, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GuardSection::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: GuardConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.guard)
+}
+
+/// The thresholds the cost-guard watcher evaluates against, read **on every
+/// tick** — the [`todo_concurrency`] rule, and for the same reason: a limit
+/// raised in Settings must take effect without restarting `mesa serve`.
+///
+/// A file that exists but can't be read or parsed is `Err`, never a silent
+/// fall back — the caller (`cost_watcher_tick`) skips the tick rather than
+/// guard against guessed numbers. A value of the right *type* but outside its
+/// sanity bound falls back to the built-in for that key alone, the same
+/// don't-stop-working posture [`todo_concurrency`]'s clamp takes: a
+/// hand-edited `0` must not turn the guard off silently, and the editor still
+/// refuses to *write* such a value.
+pub fn guard_thresholds() -> Result<GuardThresholds, String> {
+    guard_thresholds_in(&config_file())
+}
+
+fn guard_thresholds_in(path: &Path) -> Result<GuardThresholds, String> {
+    let section = read_guard(path)?;
+    Ok(GuardThresholds {
+        cost_usd: section
+            .cost_usd
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= MAX_GUARD_COST_USD)
+            .unwrap_or(DEFAULT_GUARD_COST_USD),
+        total_tokens: section
+            .total_tokens
+            .filter(|v| *v >= 1)
+            .unwrap_or(DEFAULT_GUARD_TOTAL_TOKENS),
+        cache_read_share: section
+            .cache_read_share
+            .filter(|v| v.is_finite() && *v >= MIN_GUARD_CACHE_READ_SHARE && *v <= 1.0)
+            .unwrap_or(DEFAULT_GUARD_CACHE_READ_SHARE),
+        cache_read_min_tokens: section
+            .cache_read_min_tokens
+            .filter(|v| *v >= 1)
+            .unwrap_or(DEFAULT_GUARD_CACHE_READ_MIN_TOKENS),
+    })
+}
+
+/// The guard settings for the Settings page (`GET /api/config/guard`): each
+/// configured value **verbatim** (`null` when the file says nothing) beside
+/// the built-in behind it — the `{value, default}` idiom [`ConfigWatchers`]
+/// uses. Verbatim matters: a hand-edited out-of-range number is shown as it
+/// was written, so the editor reflects the file rather than the number the
+/// watcher fell back to.
+pub fn guard() -> Result<ConfigGuard, String> {
+    guard_in(&config_file())
+}
+
+fn guard_in(path: &Path) -> Result<ConfigGuard, String> {
+    let section = read_guard(path)?;
+    Ok(ConfigGuard {
+        cost_usd: section.cost_usd,
+        cost_usd_default: DEFAULT_GUARD_COST_USD,
+        total_tokens: section.total_tokens,
+        total_tokens_default: DEFAULT_GUARD_TOTAL_TOKENS,
+        cache_read_share: section.cache_read_share,
+        cache_read_share_default: DEFAULT_GUARD_CACHE_READ_SHARE,
+        cache_read_min_tokens: section.cache_read_min_tokens,
+        cache_read_min_tokens_default: DEFAULT_GUARD_CACHE_READ_MIN_TOKENS,
+    })
+}
+
+/// Writes the `guard` entries named in `updates` into the config file.
+///
+/// - `None` (or `null`) **removes** the key, restoring the built-in threshold.
+/// - Values arrive as raw JSON, as [`save_watchers`]' do, so `-1`, `"lots"`
+///   and a share of `2` are *this* layer's [`SaveError::Validation`] with a
+///   sentence naming the mistake rather than a deserializer rejection.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_commands`], [`save_pricing`], [`save_watchers`],
+///   [`save_speech`], [`save_listen`] and [`save_live`]: one read-modify-write
+///   over the whole document, so all six sections (and any mesa doesn't know)
+///   survive each other's edits.
+pub fn save_guard(updates: &HashMap<String, Option<serde_json::Value>>) -> Result<(), SaveError> {
+    save_guard_in(&config_file(), updates)
+}
+
+fn save_guard_in(
+    path: &Path,
+    updates: &HashMap<String, Option<serde_json::Value>>,
+) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        // Nothing named, nothing to do — and no empty `"guard": {}` written
+        // into a file the user never configured.
+        return Ok(());
+    }
+    let mut keys: Vec<&String> = updates.keys().collect();
+    keys.sort();
+    for key in &keys {
+        if !GUARD_KEYS.contains(&key.as_str()) {
+            return Err(SaveError::Validation(format!(
+                "unknown guard setting {key:?}; mesa configures {}",
+                GUARD_KEYS.join(", ")
+            )));
+        }
+        if let Some(value) = &updates[*key]
+            && !value.is_null()
+        {
+            validate_guard(key, value).map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("guard")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"guard\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for key in keys {
+        match &updates[key] {
+            Some(value) if !value.is_null() => {
+                section.insert(key.clone(), value.clone());
+            }
+            _ => {
+                section.remove(key);
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// The rule for one guard threshold. Two of the four are counts of tokens and
+/// must be whole numbers; two are continuous. A value of the wrong *shape* is
+/// named here rather than coerced into something the person did not ask for.
+fn validate_guard(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    match key {
+        GUARD_COST_USD => {
+            let Some(v) = value.as_f64() else {
+                return Err(format!(
+                    "{key} must be a number of dollars greater than 0 and at most \
+                     {MAX_GUARD_COST_USD}, got {value}"
+                ));
+            };
+            if !v.is_finite() || v <= 0.0 || v > MAX_GUARD_COST_USD {
+                return Err(format!(
+                    "{key} must be greater than 0 and at most {MAX_GUARD_COST_USD}, got {v}"
+                ));
+            }
+        }
+        GUARD_TOTAL_TOKENS | GUARD_CACHE_READ_MIN_TOKENS => {
+            let Some(v) = value.as_i64() else {
+                return Err(format!(
+                    "{key} must be a whole number of tokens of at least 1, got {value}"
+                ));
+            };
+            if v < 1 {
+                return Err(format!("{key} must be at least 1 token, got {v}"));
+            }
+        }
+        GUARD_CACHE_READ_SHARE => {
+            let Some(v) = value.as_f64() else {
+                return Err(format!(
+                    "{key} must be a share between {MIN_GUARD_CACHE_READ_SHARE} and 1, got {value}"
+                ));
+            };
+            if !v.is_finite() || !(MIN_GUARD_CACHE_READ_SHARE..=1.0).contains(&v) {
+                return Err(format!(
+                    "{key} must be between {MIN_GUARD_CACHE_READ_SHARE} and 1, got {v}"
+                ));
+            }
+        }
+        _ => unreachable!("unknown guard keys are refused before validation"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1752,6 +2019,157 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(&path, json).unwrap();
         path
+    }
+
+    // ---- guard (mesa task 1018) ------------------------------------------
+
+    fn guard_update(
+        entries: &[(&str, Option<serde_json::Value>)],
+    ) -> HashMap<String, Option<serde_json::Value>> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn an_absent_guard_section_is_the_built_in_thresholds() {
+        let t = guard_thresholds_in(Path::new("/nonexistent/config.json")).unwrap();
+        assert_eq!(t.cost_usd, DEFAULT_GUARD_COST_USD);
+        assert_eq!(t.total_tokens, DEFAULT_GUARD_TOTAL_TOKENS);
+        assert_eq!(t.cache_read_share, DEFAULT_GUARD_CACHE_READ_SHARE);
+        assert_eq!(t.cache_read_min_tokens, DEFAULT_GUARD_CACHE_READ_MIN_TOKENS);
+
+        let view = guard_in(Path::new("/nonexistent/config.json")).unwrap();
+        assert_eq!(view.cost_usd, None);
+        assert_eq!(view.cost_usd_default, DEFAULT_GUARD_COST_USD);
+    }
+
+    #[test]
+    fn a_configured_guard_threshold_wins_and_reads_back_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"guard": {"cost-usd": 5.5, "cache-read-share": 0.6}}"#,
+        );
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.cost_usd, 5.5);
+        assert_eq!(t.cache_read_share, 0.6);
+        // Untouched keys stay on their built-ins.
+        assert_eq!(t.total_tokens, DEFAULT_GUARD_TOTAL_TOKENS);
+
+        let view = guard_in(&path).unwrap();
+        assert_eq!(view.cost_usd, Some(5.5));
+        assert_eq!(view.total_tokens, None);
+    }
+
+    #[test]
+    fn a_hand_edited_out_of_range_guard_value_falls_back_per_key() {
+        // The editor refuses to write these; a hand-edited file can still hold
+        // them, and a `0` ceiling must not silently switch the guard off.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"guard": {"cost-usd": 0, "cache-read-share": 4, "total-tokens": 500}}"#,
+        );
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.cost_usd, DEFAULT_GUARD_COST_USD);
+        assert_eq!(t.cache_read_share, DEFAULT_GUARD_CACHE_READ_SHARE);
+        // The one value that IS in range is still honoured.
+        assert_eq!(t.total_tokens, 500);
+        // …and the reader still shows the file as written.
+        assert_eq!(guard_in(&path).unwrap().cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn a_guard_value_of_the_wrong_type_is_an_error_not_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"guard": {"cost-usd": "lots"}}"#);
+        assert!(guard_thresholds_in(&path).is_err());
+    }
+
+    #[test]
+    fn save_guard_rejects_a_bad_threshold_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"guard": {"cost-usd": 12.0}}"#;
+        let path = write_config(dir.path(), before);
+        for (label, key, value) in [
+            ("zero dollars", GUARD_COST_USD, serde_json::json!(0)),
+            ("negative dollars", GUARD_COST_USD, serde_json::json!(-1)),
+            ("dollars as text", GUARD_COST_USD, serde_json::json!("25")),
+            (
+                "over the sanity bound",
+                GUARD_COST_USD,
+                serde_json::json!(100_001),
+            ),
+            ("zero tokens", GUARD_TOTAL_TOKENS, serde_json::json!(0)),
+            (
+                "fractional tokens",
+                GUARD_TOTAL_TOKENS,
+                serde_json::json!(2.5),
+            ),
+            (
+                "a share above one",
+                GUARD_CACHE_READ_SHARE,
+                serde_json::json!(1.5),
+            ),
+            (
+                "a share below the floor",
+                GUARD_CACHE_READ_SHARE,
+                serde_json::json!(0.2),
+            ),
+            (
+                "a zero spin floor",
+                GUARD_CACHE_READ_MIN_TOKENS,
+                serde_json::json!(0),
+            ),
+        ] {
+            let err = save_guard_in(&path, &guard_update(&[(key, Some(value))])).unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "{label}: {err:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{label}");
+        }
+        let err = save_guard_in(
+            &path,
+            &guard_update(&[("cost-eur", Some(serde_json::json!(1)))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m) if m.contains("unknown guard setting")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn save_guard_writes_one_section_and_leaves_the_others_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"commands": {"todo-watcher": "mytool {id}"},
+                "watchers": {"todo-concurrency": 3},
+                "live": {"auto-send-ms": 3000}}"#,
+        );
+        save_guard_in(
+            &path,
+            &guard_update(&[
+                (GUARD_COST_USD, Some(serde_json::json!(9.5))),
+                (GUARD_TOTAL_TOKENS, Some(serde_json::json!(250))),
+            ]),
+        )
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["commands"]["todo-watcher"], "mytool {id}");
+        assert_eq!(root["watchers"]["todo-concurrency"], 3);
+        assert_eq!(root["live"]["auto-send-ms"], 3000);
+        assert_eq!(root["guard"]["cost-usd"], 9.5);
+        assert_eq!(root["guard"]["total-tokens"], 250);
+
+        // `null` removes a key, restoring the built-in behind it.
+        save_guard_in(&path, &guard_update(&[(GUARD_COST_USD, None)])).unwrap();
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.cost_usd, DEFAULT_GUARD_COST_USD);
+        assert_eq!(t.total_tokens, 250);
     }
 
     #[test]

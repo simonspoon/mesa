@@ -355,6 +355,14 @@ cached — the table is loaded **once per dashboard request** and a save applies
 to the next read, past sessions included, with no restart. Cost is derived on
 every read, so there is no stored figure to migrate.
 
+In the Settings editor a row's four boxes show the built-in rate as their
+**placeholder**, so a box left blank on a part-filled row means "keep that
+rate": mesa fills the untouched boxes from the default before the PUT, which
+sends all four numbers as the server requires (mesa task 1020). A blank box is
+only an error on a prefix the user added, which has no default to fall back on;
+a row whose boxes are *all* blank is still the reset, not four copies of the
+built-in.
+
 The Settings page renders the pricing rows in a **Model pricing** section, and
 that section also carries the one non-config control on the page: **Reset CC
 index** (`POST /api/cc/reset`, mesa task 698) — a confirmed operator action

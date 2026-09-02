@@ -8101,6 +8101,15 @@ button:focus-visible,
   align-items: center;
 }
 
+/* A row's complaint sits under it, spanning the whole grid rather than
+   auto-placing into the prefix column and wrapping. The container's row gap
+   already spaces it, so it carries no margin of its own. */
+.settings-prices > .error {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.8rem;
+}
+
 .settings-price-head {
   font-size: 0.7rem;
   text-transform: uppercase;

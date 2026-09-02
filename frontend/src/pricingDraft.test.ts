@@ -12,6 +12,8 @@ import {
   newRowErrors,
   prefixError,
   rateError,
+  resolveRates,
+  rowErrors,
   type NewRow,
   type PricingDraft,
 } from './pricingDraft'
@@ -85,8 +87,12 @@ describe('effectiveRates', () => {
     expect(effectiveRates(OPUS, draft)).toEqual(OPUS.default)
     draft['claude-opus'] = text(rates(9, 9, 9, 9))
     expect(effectiveRates(OPUS, draft)).toEqual(rates(9, 9, 9, 9))
-    // A half-typed row shows the default rather than a garbage number.
+    // A part-filled row takes the built-in rate for the boxes left blank,
+    // which is what their placeholders showed (mesa task 1020).
     draft['claude-opus'] = { ...blankRates(), input: '9' }
+    expect(effectiveRates(OPUS, draft)).toEqual(rates(9, 25, 0.5, 6.25))
+    // A garbage number still shows the default rather than NaN.
+    draft['claude-opus'] = { ...blankRates(), input: 'abc' }
     expect(effectiveRates(OPUS, draft)).toEqual(OPUS.default)
   })
 
@@ -130,12 +136,76 @@ describe('changedPricing', () => {
 })
 
 describe('isSavable', () => {
-  it('is false while a row is half-typed', () => {
+  it('is false while a row holds a bad number', () => {
     const draft: PricingDraft = {
       'claude-opus': { ...blankRates(), input: '-3' },
     }
     expect(isSavable([OPUS], draft)).toBe(false)
     expect(isSavable([OPUS], draftFrom([OPUS]))).toBe(true)
+  })
+
+  it('is true for a part-filled row over a built-in rate (mesa task 1020)', () => {
+    const draft: PricingDraft = {
+      'claude-opus': { ...blankRates(), input: '9' },
+    }
+    expect(rowErrors(OPUS.prefix, draft['claude-opus'], OPUS.default)).toEqual(
+      [],
+    )
+    expect(isSavable([OPUS], draft)).toBe(true)
+    expect(isDirty([OPUS], draft)).toBe(true)
+  })
+
+  it('still demands every box on a prefix with no built-in rate', () => {
+    const draft: PricingDraft = { newco: { ...blankRates(), input: '9' } }
+    expect(rowErrors(ADDED.prefix, draft['newco'], ADDED.default)).toEqual([
+      'output: required',
+      'cache_read: required',
+      'cache_write: required',
+    ])
+    expect(isSavable([ADDED], draft)).toBe(false)
+  })
+})
+
+describe('resolveRates', () => {
+  it('fills each blank box from the built-in rate the placeholder showed', () => {
+    const draft: PricingDraft = {
+      'claude-opus': { ...blankRates(), input: '9' },
+    }
+    expect(changedPricing([OPUS], draft)).toEqual({
+      'claude-opus': rates(9, 25, 0.5, 6.25),
+    })
+    expect(effectiveRates(OPUS, draft)).toEqual(rates(9, 25, 0.5, 6.25))
+    expect(resolveRates(draft['claude-opus'], OPUS.default)).toEqual(
+      rates(9, 25, 0.5, 6.25),
+    )
+  })
+
+  it('leaves a wholly blank row meaning reset, not the default written out', () => {
+    const prices = [OPUS, ADDED]
+    const draft = draftFrom(prices)
+    draft['newco'] = blankRates()
+    expect(changedPricing(prices, draft)).toEqual({ newco: null })
+    // The built-in row is untouched: blank is its loaded state.
+    expect(isRowChanged(OPUS, draft)).toBe(false)
+  })
+
+  it('rejects a negative box even where the rest fall back', () => {
+    const draft: PricingDraft = {
+      'claude-opus': { ...blankRates(), input: '-1' },
+    }
+    expect(rowErrors(OPUS.prefix, draft['claude-opus'], OPUS.default)).toEqual([
+      'input: must be ≥ 0',
+    ])
+    expect(isSavable([OPUS], draft)).toBe(false)
+  })
+
+  it('treats the default typed back into one box as an explicit override', () => {
+    const draft: PricingDraft = {
+      'claude-opus': { ...blankRates(), input: '5' },
+    }
+    expect(changedPricing([OPUS], draft)).toEqual({
+      'claude-opus': rates(5, 25, 0.5, 6.25),
+    })
   })
 })
 

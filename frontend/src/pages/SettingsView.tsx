@@ -31,6 +31,7 @@ import {
   isSavable,
   newRow,
   newRowErrors,
+  rowErrors,
   type NewRow,
   type PricingDraft,
   type RateField,
@@ -1197,39 +1198,47 @@ function PriceRow({
 }) {
   const row = draft[price.prefix] ?? blankRates()
   const overridden = !isBlank(row)
+  const errors = rowErrors(price.prefix, row, price.default)
   return (
-    <div className="settings-price-row">
-      <code className="settings-price-prefix">{price.prefix}</code>
-      {RATE_FIELDS.map((field) => (
-        <input
-          key={field}
-          type="number"
-          min="0"
-          step="any"
-          className="settings-price-input"
-          aria-label={`${price.prefix} ${field}`}
-          value={row[field]}
-          placeholder={price.default ? String(price.default[field]) : '0'}
-          onChange={(e) => onEdit(field, e.target.value)}
-        />
+    <>
+      <div className="settings-price-row">
+        <code className="settings-price-prefix">{price.prefix}</code>
+        {RATE_FIELDS.map((field) => (
+          <input
+            key={field}
+            type="number"
+            min="0"
+            step="any"
+            className="settings-price-input"
+            aria-label={`${price.prefix} ${field}`}
+            value={row[field]}
+            placeholder={price.default ? String(price.default[field]) : '0'}
+            onChange={(e) => onEdit(field, e.target.value)}
+          />
+        ))}
+        {overridden ? (
+          <button
+            type="button"
+            className="settings-reset"
+            title={
+              price.default
+                ? 'Clear this row, restoring the built-in rate'
+                : 'Remove this prefix'
+            }
+            onClick={onClear}
+          >
+            {price.default ? 'reset to default' : 'remove'}
+          </button>
+        ) : (
+          <span className="muted settings-price-note">built-in</span>
+        )}
+      </div>
+      {errors.map((e) => (
+        <p className="error" key={e}>
+          {price.prefix} — {e}
+        </p>
       ))}
-      {overridden ? (
-        <button
-          type="button"
-          className="settings-reset"
-          title={
-            price.default
-              ? 'Clear this row, restoring the built-in rate'
-              : 'Remove this prefix'
-          }
-          onClick={onClear}
-        >
-          {price.default ? 'reset to default' : 'remove'}
-        </button>
-      ) : (
-        <span className="muted settings-price-note">built-in</span>
-      )}
-    </div>
+    </>
   )
 }
 

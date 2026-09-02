@@ -70,7 +70,8 @@ export function isBlank(row: RateDraft): boolean {
 /**
  * The complaint about one rate box, or `null` if it is fine. Blank is only an
  * error when the *rest* of the row isn't — a wholly blank row is the reset,
- * not four mistakes.
+ * not four mistakes — and, on a row mesa ships a rate for, not even then: the
+ * box shows that rate as its placeholder, so a blank box means "keep it".
  */
 export function rateError(text: string): string | null {
   const trimmed = (text ?? '').trim()
@@ -93,18 +94,51 @@ export function prefixError(text: string): string | null {
 /**
  * Every error in one drafted row — the prefix's, plus each rate's unless the
  * row is entirely blank (which is the legitimate "remove this override").
+ *
+ * `defaults` is the built-in rate the row's boxes show as placeholders, and it
+ * is what a *blank* box in a part-filled row means: the server needs all four
+ * numbers, so mesa fills the untouched ones from the rate the user was looking
+ * at rather than calling the row unsavable (mesa task 1020). A prefix the user
+ * added has no default, so there a blank box is still `required`.
  */
-export function rowErrors(prefix: string, row: RateDraft): string[] {
+export function rowErrors(
+  prefix: string,
+  row: RateDraft,
+  defaults?: ModelRates | null,
+): string[] {
   const errors: string[] = []
   const bad = prefixError(prefix)
   if (bad) errors.push(bad)
   if (!isBlank(row)) {
     for (const f of RATE_FIELDS) {
+      if (defaults && (row[f] ?? '').trim() === '') continue
       const e = rateError(row[f] ?? '')
       if (e) errors.push(`${f}: ${e}`)
     }
   }
   return errors
+}
+
+/**
+ * The four numbers a part-filled row resolves to: each box as typed, each
+ * blank one from the built-in rate. Only meaningful once [`rowErrors`] is
+ * empty, which is what guarantees a blank box has a default to fall back on.
+ */
+export function resolveRates(
+  row: RateDraft,
+  defaults?: ModelRates | null,
+): ModelRates {
+  const at = (f: RateField): number => {
+    const text = (row[f] ?? '').trim()
+    if (text === '' && defaults) return defaults[f]
+    return Number(text)
+  }
+  return {
+    input: at('input'),
+    output: at('output'),
+    cache_read: at('cache_read'),
+    cache_write: at('cache_write'),
+  }
 }
 
 /** What a row's cost will actually be computed from: the draft, else the default. */
@@ -114,13 +148,10 @@ export function effectiveRates(
 ): ModelRates | null {
   const row = draft[price.prefix]
   if (!row || isBlank(row)) return price.default
-  if (rowErrors(price.prefix, row).length > 0) return price.default
-  return {
-    input: Number(row.input),
-    output: Number(row.output),
-    cache_read: Number(row.cache_read),
-    cache_write: Number(row.cache_write),
+  if (rowErrors(price.prefix, row, price.default).length > 0) {
+    return price.default
   }
+  return resolveRates(row, price.default)
 }
 
 function sameRates(a: ModelRates | null, b: ModelRates | null): boolean {
@@ -133,17 +164,8 @@ export function isRowChanged(price: ConfigPrice, draft: PricingDraft): boolean {
   const row = draft[price.prefix]
   if (!row) return false
   if (isBlank(row)) return price.value !== null
-  if (rowErrors(price.prefix, row).length > 0) return true
-  return !sameRates(effectiveRatesRaw(row), price.value)
-}
-
-function effectiveRatesRaw(row: RateDraft): ModelRates {
-  return {
-    input: Number(row.input),
-    output: Number(row.output),
-    cache_read: Number(row.cache_read),
-    cache_write: Number(row.cache_write),
-  }
+  if (rowErrors(price.prefix, row, price.default).length > 0) return true
+  return !sameRates(resolveRates(row, price.default), price.value)
 }
 
 /**
@@ -162,7 +184,7 @@ export function changedPricing(
   for (const p of prices) {
     if (!isRowChanged(p, draft)) continue
     const row = draft[p.prefix]
-    changed[p.prefix] = isBlank(row) ? null : effectiveRatesRaw(row)
+    changed[p.prefix] = isBlank(row) ? null : resolveRates(row, p.default)
   }
   return changed
 }
@@ -174,9 +196,10 @@ export function isDirty(prices: ConfigPrice[], draft: PricingDraft): boolean {
 
 /** True when nothing drafted would be rejected by the server. */
 export function isSavable(prices: ConfigPrice[], draft: PricingDraft): boolean {
-  return prices.every(
-    (p) => rowErrors(p.prefix, draft[p.prefix] ?? blankRates()).length === 0,
-  )
+  return prices.every((p) => {
+    const row = draft[p.prefix] ?? blankRates()
+    return rowErrors(p.prefix, row, p.default).length === 0
+  })
 }
 
 /**
@@ -213,7 +236,7 @@ export function addedPricing(rows: NewRow[]): Record<string, ModelRates | null> 
   const added: Record<string, ModelRates | null> = {}
   for (const r of rows) {
     if (!isNewRowStarted(r) || newRowErrors([r]).length > 0) continue
-    added[r.prefix.trim()] = effectiveRatesRaw(r.rates)
+    added[r.prefix.trim()] = resolveRates(r.rates)
   }
   return added
 }

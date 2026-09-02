@@ -147,9 +147,8 @@ create, on its own stricter gate (`docs/fs-browse.md`).
   comes from the **existing** `content_disposition()` helper the attachments
   download uses (quoting + RFC 5987 escaping included), not a second copy.
   Gate: the standard `guard` only, like the content GET and the git reads —
-  it is a read, so neither `require_local_path_write` nor
-  `require_agent_access` applies and the Content-Type gate doesn't fire on a
-  GET. A download is a read and added no write of its own — rename and delete
+  it is a read, so `require_agent_access` does not apply and the Content-Type
+  gate doesn't fire on a GET. A download is a read and added no write of its own — rename and delete
   arrived later, on task 877's separate `/files/entry` route with its own gate
   (below); a **move** is still a non-goal.
 - `GET /api/projects/{id}/files/raw?path=<relpath>` (task 801) → the file's
@@ -176,7 +175,7 @@ create, on its own stricter gate (`docs/fs-browse.md`).
   success (every mutation in this API echoes the full updated object).
   `write_file`'s `NotFound` is 404 `not_found`; `Validation(reason)` is 422
   `validation`. Gated by `require_agent_access` — **not** the plain guard the
-  read routes above use, and not `require_local_path_write` either: writing
+  read routes above use: writing
   file *content* under `local_path` is code-execution-adjacent (the bytes
   written can be a hook script, a git hook, anything that later executes),
   the same capability class the agents/hooks routes already guard — under
@@ -564,8 +563,8 @@ Scope is the tree pane only: the `files-panes` split ratio divider (task 670),
 ## Creating a file from the tree (task 672)
 
 The surface's one create. Scope is deliberately a *file*: no duplicate, no
-folder create (that stays `POST /api/fs/dirs` in the new-project picker, on its
-own stricter loopback-only gate), and no implicit intermediate directories —
+folder create (that stays `POST /api/fs/dirs` in the new-project picker, on
+`require_agent_access` like this route), and no implicit intermediate directories —
 `create_file` is one `fs::write`, never `create_dir_all`. Rename and delete were
 out of scope here and arrived in task 877, whose section at the end of this file
 reuses this one's containment rule; a **move** is still a non-goal.
@@ -1453,7 +1452,7 @@ Three more decisions:
   a *shape* choice (there is nothing to send but one path, and the content GET
   already names a path that way), not an exit from the gate.
 - **Gate: `require_agent_access`, the same one the content writes use.** Not the
-  plain `guard` the reads use, and not `require_local_path_write` either. The
+  plain `guard` the reads use. The
   reasoning is the content PATCH's, verbatim: these bytes live under a project's
   `local_path`, so touching them is code-execution-adjacent, and a peer who can
   already overwrite a file in that folder gains nothing new from being able to

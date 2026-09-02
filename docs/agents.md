@@ -84,7 +84,7 @@ a different tool yields sessions the sidebar can't list or attach to.
   - **`--lan` mode** serves LAN peers (the opt-in "trust every device on the
     LAN" posture includes the terminal, so the web UI — including attach — works
     from a remote machine), but composes two ordered, interdependent checks
-    (`require_lan_page_access`, also reused by the `local_path` write) that keep
+    (`require_lan_page_access`) that keep
     hostile *pages* out: `require_lan_agent_host` — Host must be
     `localhost:<port>` or an IP-literal on the serve port (plus the portless
     forms browsers send when the port is 80), which kills DNS rebinding without
@@ -98,15 +98,20 @@ a different tool yields sessions the sidebar can't list or attach to.
     from CORS). Order matters — the Origin match trusts the Host, so the Host is
     validated first. The peer-sensitive branch is pinned by `src/api.rs` unit
     tests (the shell gate always sees a loopback peer).
-- **Writing a project's `local_path` is loopback-only** (`require_local_path_write`
-  on `create`/`update`, both modes): it is the folder `claude --bg` runs in —
-  an execution anchor, not mere data — so a LAN peer (who under `--lan` can
-  otherwise write any project field) must not point a future locally-triggered
-  agent at a directory of their choosing. Under `--lan` the loopback peer alone
-  is not enough (the global `guard` skips its Host check there, so a
-  DNS-rebinding page on the server's own machine arrives with a loopback peer),
-  so the agent routes' Host/Origin checks stack on top. Every other project
-  field stays writable under `--lan`.
+- **Writing a project's `local_path` carries `require_agent_access`** (on
+  `create`/`update`, mesa task 1022 — the same reversal tasks 1004 and 1021
+  made for the library and Settings, replacing a loopback-only check). It is
+  the folder `claude --bg` runs in — an execution anchor, not mere data — so
+  it belongs in the agent routes' capability class rather than plain CRUD. In
+  **default** mode the new gate is strictly stronger than the old one
+  (loopback peer plus local Host plus local Origin). Under **`--lan`** it
+  relaxes rather than refuses: a page this server handed out may set it,
+  exactly as it may already open a terminal in that folder, while a rebinding
+  page (DNS-name Host) and a cross-site page (foreign Origin) stay refused.
+  Every other project field stays writable under `--lan` with no gate at all.
+  `scripts/agents-check.sh` drives the Host/Origin half over real HTTP; the
+  peer half is `lan_page_may_write_local_path_but_not_from_a_rebound_page` in
+  `src/api.rs`.
 - Gate: `scripts/agents-check.sh` (stub `claude`, asserts the JSON contract and
   the local_path CLI plumbing). The WS bridge itself is verified by live QA.
 

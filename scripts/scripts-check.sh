@@ -14,8 +14,9 @@
 #   * cwd is resolved server-side: a project-bound script runs in that
 #     project's `local_path`, an unbound one in `$HOME`, and a bound project
 #     with no `local_path` is 422 validation;
-#   * the read/write asymmetry — reads and run behind `require_agent_access`,
-#     authoring loopback-only — holds in BOTH `serve` and `serve --lan`.
+#   * ONE gate over all six routes — reads, run and authoring alike behind
+#     `require_agent_access` (mesa task 1022) — holds in BOTH `serve` and
+#     `serve --lan`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -633,12 +634,14 @@ api 404 DELETE /api/scripts/999999
 ok "DELETE /api/scripts/{id} unknown id: 404 not_found"
 
 # ================= gates: default mode =================
-# A script body is a program mesa will execute, so reads/run sit behind
-# require_agent_access while authoring is loopback-only in BOTH modes. Every
+# A script body is a program mesa will execute, so all six routes — reads, run
+# and authoring alike — sit behind `require_agent_access` (mesa task 1022,
+# replacing the loopback-only check the three mutations used to carry). Every
 # curl below originates on this machine, so the server always sees a LOOPBACK
 # peer — the genuinely remote-peer case cannot be forged here (it is pinned by
-# the Rust unit tests); what IS reachable is the Host/Origin half of the same
-# gate, which is what these assertions pin.
+# the Rust unit tests, along with the fact that `--lan` now lets a real LAN
+# page author); what IS reachable is the Host/Origin half of the same gate,
+# which is what these assertions pin.
 
 raw() { # raw <method> <path> [extra curl args...]
   local method=$1 path=$2; shift 2
@@ -681,6 +684,24 @@ raw DELETE "/api/scripts/$AS" -H "Host: evil.example" -H 'Content-Type: applicat
 api 200 GET "/api/scripts/$AS"
 [ "$(jqb .description)" = "patched" ] || fail "default: a refused authoring request must write nothing"
 ok "default mode: POST/PATCH/DELETE /api/scripts from a foreign Host are all 403, writing nothing"
+
+# The Origin half of `require_agent_access` (mesa task 1022): in default mode
+# the three mutations now run `require_local_origin`, which the loopback-only
+# gate they used to carry never did. A cross-site page's Origin is refused; a
+# request with no Origin at all — curl, or the embedded UI's own same-origin
+# fetch — is fine, which is what every other assertion in this file relies on.
+raw POST /api/scripts -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example' \
+  -H 'Content-Type: application/json' -d '{"name":"origin-probe","body":"echo x"}'
+[ "$STATUS" = "403" ] || fail "default: authoring POST with a foreign Origin must be 403, got $STATUS"
+raw PATCH "/api/scripts/$AS" -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example' \
+  -H 'Content-Type: application/json' -d '{"description":"origin probe"}'
+[ "$STATUS" = "403" ] || fail "default: authoring PATCH with a foreign Origin must be 403"
+raw DELETE "/api/scripts/$AS" -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example' \
+  -H 'Content-Type: application/json'
+[ "$STATUS" = "403" ] || fail "default: authoring DELETE with a foreign Origin must be 403"
+api 200 GET "/api/scripts/$AS"
+[ "$(jqb .description)" = "patched" ] || fail "default: an Origin-refused authoring request must write nothing"
+ok "default mode: a foreign Origin is refused on all three mutations, writing nothing"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
@@ -731,8 +752,7 @@ ok "--lan: the global Host allowlist is skipped, but /api/scripts keeps its own 
   fail "--lan: GET /api/scripts must reject a foreign Origin (cross-site defense)"
 ok "--lan: reads follow require_agent_access — IP-literal Host on our port allowed, foreign Origin refused"
 
-# The run route is a read-shaped gate by design: a LAN peer may TRIGGER a
-# script but never choose the program.
+# The run route carries the same gate as everything else on this surface.
 [ "$(lan_req POST "/api/scripts/$AS/run" "192.0.2.7:$LAN_PORT" '' '{"values":{"who":"lan"}}')" = "200" ] ||
   fail "--lan: run must be reachable from a LAN-shaped request (require_agent_access)"
 [ "$(lan_req POST "/api/scripts/$AS/run" 'evil.example' '' '{"values":{"who":"x"}}')" = "403" ] ||
@@ -741,7 +761,8 @@ ok "--lan: reads follow require_agent_access — IP-literal Host on our port all
   fail "--lan: run must reject a foreign Origin"
 ok "--lan: POST /api/scripts/{id}/run is reachable LAN-side (trigger allowed) but shut to rebinding and cross-site pages"
 
-# Authoring — choosing the PROGRAM — stays loopback-only in this mode too.
+# Authoring carries that identical gate as of mesa task 1022: a rebinding page
+# and a cross-site page are refused, a page this server handed out is not.
 [ "$(lan_req POST /api/scripts "evil.example:$LAN_PORT" '' '{"name":"lan-probe","body":"echo x"}')" = "403" ] ||
   fail "--lan: authoring POST must reject a DNS-name Host"
 [ "$(lan_req POST /api/scripts "127.0.0.1:$LAN_PORT" 'https://evil.example' '{"name":"lan-probe","body":"echo x"}')" = "403" ] ||
@@ -759,6 +780,14 @@ ok "--lan: POST/PATCH/DELETE /api/scripts are refused for a rebinding or cross-s
 [ "$(lan_req POST /api/scripts "127.0.0.1:$LAN_PORT" '' '{"name":"lan-authored","body":"echo x"}')" = "201" ] ||
   fail "--lan: authoring from this machine's own page must still work"
 ok "--lan: authoring from a loopback peer with a local Host still works (the flag never locks the owner out)"
+
+# ...and, as of mesa task 1022, so does a genuine LAN-shaped page — the same
+# request shape the run route already accepted. (A curl from this machine
+# always has a loopback peer, so the peer half of that claim is pinned by
+# `lan_page_may_author_a_script_but_not_from_a_rebound_page` in api.rs.)
+[ "$(lan_req POST /api/scripts "192.0.2.7:$LAN_PORT" "http://192.0.2.7:$LAN_PORT" '{"name":"lan-page-authored","body":"echo x"}')" = "201" ] ||
+  fail "--lan: authoring from a LAN-shaped page must be 201"
+ok "--lan: authoring is reachable from a LAN-shaped page, exactly like the run route"
 
 # The Content-Type gate does not relax under --lan.
 LAN_NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Host: 127.0.0.1:$LAN_PORT" \

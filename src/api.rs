@@ -821,9 +821,8 @@ pub fn serve(
         }
         let listener = tokio::net::TcpListener::bind((host, port)).await?;
         println!("{}", json!({"listening": format!("http://{host}:{port}")}));
-        // ConnectInfo carries the peer address so the agent endpoints and
-        // local_path writes can be gated on loopback in default mode (see
-        // `require_agent_access` / `require_local_path_write`).
+        // ConnectInfo carries the peer address so the agent endpoints can be
+        // gated on loopback in default mode (see `require_agent_access`).
         axum::serve(
             listener,
             router(state).into_make_service_with_connect_info::<SocketAddr>(),
@@ -1006,11 +1005,11 @@ fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT)),
         )
         // Scripts: user-authored shell run from a generated form. A script
-        // body is a program mesa executes, so authoring is the strictest gate
-        // in the file (`require_local_path_write`, loopback-only in BOTH
-        // modes) while reading and *running* share the agents' code-execution
-        // gate — a LAN peer may trigger a run but must never choose the
-        // program. See `docs/scripts.md`.
+        // body is a program mesa executes, so all six routes — authoring,
+        // reading and *running* alike — share the agents' code-execution gate
+        // `require_agent_access` (mesa task 1022, the reversal tasks 1004 and
+        // 1021 already made for the library and Settings). See
+        // `docs/scripts.md`.
         .route("/api/scripts", get(list_scripts).post(create_script))
         .route(
             "/api/scripts/{id}",
@@ -1050,8 +1049,8 @@ fn router(state: AppState) -> Router {
         )
         // Artifacts: small agent-written pages (HTML mockup, SVG diagram, or
         // markdown) bound to a project (mesa task 974). All six routes below
-        // sit behind the standard `guard` and nothing more — not
-        // `require_agent_access`, not `require_local_path_write` — including
+        // sit behind the standard `guard` and nothing more — not even
+        // `require_agent_access` — including
         // the render route, which is the one that actually serves an
         // artifact's body back as markup. See `render_project_artifact`'s
         // doc comment and `docs/artifacts.md` for why that is deliberate and
@@ -1174,8 +1173,8 @@ fn router(state: AppState) -> Router {
         )
         // New-project folder picker: unscoped (not one project's local_path)
         // server-side directory listing, plus creating one folder to pick.
-        // Loopback-only in BOTH serve modes, reusing `require_local_path_write`
-        // as-is — see that fn's doc and `docs/fs-browse.md`. The GET skips the
+        // Both verbs carry `require_agent_access` (mesa task 1022) — see
+        // `list_fs_dirs`'s doc and `docs/fs-browse.md`. The GET skips the
         // Content-Type gate; the POST is inside it like every other mutation.
         .route("/api/fs/dirs", get(list_fs_dirs).post(create_fs_dir))
         // CC Dashboard: read-only Claude Code telemetry (no Store access).
@@ -1203,7 +1202,7 @@ fn router(state: AppState) -> Router {
         // The one CC *write*: purge the stored telemetry and re-ingest from
         // the transcripts on disk. An explicit operator action (Settings →
         // Model pricing), never something a read can trigger — so it is a
-        // POST, on its own route, loopback-only in BOTH modes.
+        // POST, on its own route, carrying `require_agent_access`.
         .route("/api/cc/reset", post(reset_cc_index))
         // Project-scoped CC Dashboard: same telemetry, filtered to sessions
         // whose cwd matches this project's local_path. Reads the store only
@@ -1470,12 +1469,7 @@ async fn create_project(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     if body.local_path.is_some() {
-        require_local_path_write(
-            &state,
-            &addr,
-            &headers,
-            "local_path is an agent execution anchor; it can only be set from this machine",
-        )?;
+        require_agent_access(&state, &addr, &headers)?;
     }
     let mut store = state.store.lock().unwrap();
     let project = store.create_project(
@@ -1510,12 +1504,7 @@ async fn update_project(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     if body.local_path.is_some() {
-        require_local_path_write(
-            &state,
-            &addr,
-            &headers,
-            "local_path is an agent execution anchor; it can only be set from this machine",
-        )?;
+        require_agent_access(&state, &addr, &headers)?;
     }
     let patch = ProjectPatch {
         name: body.name,
@@ -3258,15 +3247,23 @@ async fn list_scripts(
 }
 
 /// Authoring a script is choosing a program mesa will run, so this and its two
-/// sibling mutations are loopback-only in **both** serve modes — the
-/// `/api/config` posture (see `update_config`), for the same reason.
+/// sibling mutations carry [`require_agent_access`] — the SAME gate as the
+/// reads and the run beside them (mesa task 1022, the reversal tasks 1004 and
+/// 1021 already made for the library and Settings). In **default** mode that
+/// is strictly stronger than the loopback-only check these three used to
+/// carry: loopback peer **plus** local Host **plus** local Origin. Under
+/// **`--lan`** it *relaxes rather than refuses* — a page this server handed a
+/// phone may author a script, while both confused-deputy defenses stay shut.
+/// `--lan` already hands the whole network a terminal and the ability to
+/// *run* any stored script, so refusing it the editor was a distinction with
+/// no security content.
 async fn create_script(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<ScriptCreate>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
     let script = store.create_script(
@@ -3297,7 +3294,7 @@ async fn update_script(
     Path(id): Path<i64>,
     body: Result<Json<ScriptUpdate>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     // `name` and `body` are the script's identity and its whole point; an
     // explicit `null` for either is rejected rather than read as "omitted",
@@ -3334,7 +3331,7 @@ async fn delete_script(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    require_local_path_write(&state, &addr, &headers, SCRIPT_AUTHORING_LOOPBACK)?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut store = state.store.lock().unwrap();
     // The full destroyed record is the echo that stands in for the
     // confirmation prompt mesa deliberately does not have.
@@ -3383,11 +3380,6 @@ async fn run_script(
             .map_err(agents_unavailable)?;
     Ok(Json(run).into_response())
 }
-
-/// The message every script mutation refuses a non-loopback peer with. One
-/// constant so the three cannot drift apart.
-const SCRIPT_AUTHORING_LOOPBACK: &str =
-    "authoring scripts is loopback-only; connect from this machine";
 
 /// The working directory a run happens in, resolved **server-side** from the
 /// script's own project binding — never client-supplied. A bound project uses
@@ -3746,8 +3738,8 @@ async fn import_library(
 // this record type share a name and nothing else.
 //
 // All six routes below sit behind the standard `guard` middleware and
-// nothing more: no `require_agent_access`, no `require_local_path_write`, no
-// per-route check of any kind, identically in default and `--lan` mode. See
+// nothing more: no `require_agent_access`, no per-route check of any kind,
+// identically in default and `--lan` mode. See
 // `docs/artifacts.md` and `render_project_artifact`'s doc comment for why.
 
 #[derive(Deserialize)]
@@ -4768,8 +4760,8 @@ async fn search_project_files(
 ///
 /// Gate: the standard `guard` only, like `get_project_files_content` and the
 /// git read routes. It reads a file the tree route already lists; it writes
-/// nothing, so neither `require_local_path_write` nor `require_agent_access`
-/// applies, and the Content-Type gate doesn't fire on a GET.
+/// nothing, so `require_agent_access` does not apply, and the Content-Type
+/// gate doesn't fire on a GET.
 async fn download_project_file(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -4933,9 +4925,8 @@ struct FilesContentUpdate {
 /// written bytes can be a hook script, a git hook, or anything else that
 /// later executes), the same capability class as the agents/hooks routes —
 /// under `--lan` a peer who can already spawn an agent or run a hook in this
-/// folder gains nothing new here, so reusing that gate (rather than the
-/// stricter loopback-only `require_local_path_write`) is the coherent choice,
-/// not a looser one. On success, re-reads and returns the fresh
+/// folder gains nothing new here, so reusing that gate is the coherent
+/// choice, not a looser one. On success, re-reads and returns the fresh
 /// `FileContentView` (matches every other mutation in this API echoing the
 /// full updated object). `core::files::write_file`'s `NotFound` collapses
 /// path-traversal/nonexistent/directory/write-failure into 404 `not_found`;
@@ -4998,8 +4989,8 @@ struct FilesContentCreate {
 /// for the same reason: bytes written under a project's `local_path` are
 /// code-execution-adjacent, and a peer who can already overwrite a file in
 /// that folder gains nothing new by being able to add one. Not the plain read
-/// guard, and not the stricter loopback-only `require_local_path_write` the
-/// unscoped `/api/fs/dirs` uses. Being a mutation with a JSON body, it also
+/// guard — the same gate the unscoped `/api/fs/dirs` carries. Being a
+/// mutation with a JSON body, it also
 /// sits inside the global Content-Type/CSRF gate.
 ///
 /// `core::files::create_file`'s errors map exactly like `create_fs_dir`'s:
@@ -5220,10 +5211,23 @@ struct FsDirsQuery {
 /// project-scoped and not rooted at any `local_path`: `path` is an absolute
 /// filesystem path (or omitted, defaulting to `$HOME` via the same
 /// `directories::BaseDirs::new().home_dir()` call `terminal_attach`/
-/// `bridge_attach` already use). Gated by [`require_local_path_write`] as-is
-/// (loopback-only in BOTH `serve` modes) — arch.md §6: browsing the
-/// filesystem is the same capability class as anchoring where an agent
-/// executes, not plain CRUD, so it gets the same boundary. The bound on
+/// `bridge_attach` already use). Gated by [`require_agent_access`] (mesa task
+/// 1022, replacing the loopback-only check this route used to carry) —
+/// arch.md §6: browsing the filesystem is the same capability class as
+/// anchoring where an agent executes, not plain CRUD, so it gets the same
+/// boundary as the agent routes.
+///
+/// In **default** mode that is strictly stronger than the loopback-only check
+/// this route used to carry: loopback peer **plus** local Host **plus** local
+/// Origin. Under **`--lan`** it *relaxes rather than refuses* — a page this
+/// server handed a phone is served, while both confused-deputy defenses stay
+/// shut (`require_lan_agent_host` for DNS rebinding,
+/// `require_origin_matches_host` for a cross-site fetch). `--lan` is already
+/// the opt-in "trust every device on this network" posture that hands that
+/// network a terminal and a shell; refusing it this route while granting it
+/// the shell was a distinction with no security content.
+///
+/// The bound on
 /// *which* paths can be listed is the OS's own permission model, not a mesa-
 /// imposed prefix (arch.md §0-§2) — `core::files::list_dir` does the
 /// resolve/read; any failure (unresolvable path, not a directory, unreadable)
@@ -5236,12 +5240,7 @@ async fn list_fs_dirs(
     headers: HeaderMap,
     Query(q): Query<FsDirsQuery>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "this endpoint is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let requested = match q.path {
         Some(p) => p,
         None => {
@@ -5285,15 +5284,11 @@ struct FsDirCreate {
 /// the ones the GET lists, so the client can navigate into it without a
 /// second request.
 ///
-/// Gated by [`require_local_path_write`] — the SAME gate as the GET beside it,
+/// Gated by [`require_agent_access`] — the SAME gate as the GET beside it,
 /// deliberately: creating a directory is a strictly larger capability than
-/// listing one, so it can never be gated more loosely than its own read. It is
-/// not `require_agent_access` (which `update_project_files_content` uses):
-/// that gate's `--lan` relaxation is justified by the write being confined to
-/// a project's `local_path`, where a LAN peer could already spawn an agent —
-/// this route is unscoped, so it keeps the stricter loopback-only-in-both-modes
-/// bound the rest of this endpoint has. Being a mutation, it also sits inside
-/// the global Content-Type/CSRF gate.
+/// listing one, so it can never be gated more loosely than its own read (mesa
+/// task 1022, which moved both verbs off the old loopback-only check). Being a
+/// mutation, it also sits inside the global Content-Type/CSRF gate.
 ///
 /// `core::files::create_dir`'s errors map one-to-one: `NotFound` → 404 (the
 /// parent vanished — the same collapse the GET performs), `Validation` → 422
@@ -5304,12 +5299,7 @@ async fn create_fs_dir(
     headers: HeaderMap,
     Json(body): Json<FsDirCreate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "this endpoint is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let parent = body.path.clone();
     let name = body.name.clone();
     let created = tokio::task::spawn_blocking(move || files::create_dir(&parent, &name))
@@ -5351,41 +5341,6 @@ fn require_loopback(addr: &SocketAddr) -> Result<(), ApiError> {
         code: "validation",
         message: "agent endpoints are loopback-only; connect from this machine".into(),
     })
-}
-
-/// A project's `local_path` is the folder `claude --bg`/`claude agents` run
-/// in — an execution input, not mere task data. So writing it is loopback-only
-/// even under `--lan`: a LAN peer (who under `--lan` can otherwise write any
-/// project field) must not be able to point a future locally-triggered agent
-/// at a directory of their choosing. Under `--lan` the loopback peer alone is
-/// not enough: the global `guard` skips its Host check there, so a
-/// DNS-rebinding page on THIS machine reaches us with a loopback peer and its
-/// own hostname in Host — the same confused-deputy the agent routes block —
-/// hence the Host/Origin checks stack on top (in default mode `guard` already
-/// pinned the Host).
-///
-/// Also reused as-is (not duplicated) by BOTH halves of the filesystem-browse
-/// endpoint (`GET /api/fs/dirs`, mesa task 405/arch.md §6, and `POST
-/// /api/fs/dirs`, task 489) — listing a directory or creating one is a
-/// different capability than writing `local_path`, but the same "loopback-only
-/// in BOTH modes" rationale applies (filesystem-exposure adjacent to the
-/// execution-anchor concept, not plain CRUD), so `message` is caller-supplied
-/// rather than hardcoded to `local_path`-specific copy.
-fn require_local_path_write(
-    state: &AppState,
-    addr: &SocketAddr,
-    headers: &HeaderMap,
-    message: &'static str,
-) -> Result<(), ApiError> {
-    require_loopback(addr).map_err(|_| ApiError {
-        status: StatusCode::FORBIDDEN,
-        code: "validation",
-        message: message.into(),
-    })?;
-    if state.lan {
-        require_lan_page_access(addr, headers, state.port)?;
-    }
-    Ok(())
 }
 
 /// The Host-allowlist half of the DNS-rebinding defense for the agent
@@ -5676,9 +5631,11 @@ struct ConfigUpdate {
 /// is already the opt-in "trust every device on this network" posture that
 /// hands that network a terminal, a shell and script execution; refusing it
 /// the Settings page while granting it the shell was a distinction with no
-/// security content. What stays loopback-only in both modes is the narrower
-/// set where the capability differs in kind — the scripts' *authoring*
-/// routes, `local_path`, `/api/fs/dirs` and the CC index reset.
+/// security content. **mesa task 1022** then applied that same reasoning to
+/// the last routes still loopback-only in both modes — the scripts'
+/// *authoring* routes, the `local_path` write, `/api/fs/dirs` and the CC
+/// index reset — so all of them now carry this gate and nothing in the API is
+/// loopback-only in both modes any more.
 async fn update_config(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -6715,13 +6672,13 @@ async fn get_cc_dashboard(
 /// the same code path as `mesa cc reset`). The corrective counterpart to
 /// `sync --rebuild`; the Settings page's confirmed operator action.
 ///
-/// **Loopback-only in both modes**, like the `local_path` write and
-/// `/api/fs/dirs` (and unlike the config writes beside it on the Settings
-/// page, which moved to `require_agent_access` in mesa task 1021): it destroys
-/// stored history (a session whose transcript file is gone cannot come back),
-/// which is not a capability a LAN peer gets from `--lan`'s "trust the LAN"
-/// opt-in.
-/// Being a mutation it also sits inside the Content-Type gate.
+/// Gated by [`require_agent_access`], like the config writes beside it on the
+/// Settings page and every other route that moved off the old loopback-only
+/// check (mesa task 1022). In default mode that is strictly stronger than
+/// what this route used to carry; under `--lan` it relaxes rather than
+/// refuses, since `--lan` already hands the network a terminal that can
+/// delete the transcripts outright. Being a mutation it also sits inside the
+/// Content-Type gate.
 ///
 /// No explicit cache invalidation: both CC caches are keyed by
 /// `Store::cc_stamp`, and the purge moves it (see that fn's doc on why it is
@@ -6731,12 +6688,7 @@ async fn reset_cc_index(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "resetting the CC index is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let report = {
         let mut store = state.store.lock().unwrap();
         crate::core::cc::reset_and_sync(&mut store)?
@@ -8554,25 +8506,71 @@ mod tests {
         assert!(resp.unwrap_err().status.is_client_error());
     }
 
+    /// mesa task 1022 moved this route off the loopback-only
+    /// `require_local_path_write` onto `require_agent_access`, so under
+    /// `--lan` a genuine LAN page may browse folders — the same posture the
+    /// library (task 1004) and Settings (task 1021) already took. The two
+    /// confused-deputy defenses stay shut, which is the pairing that must not
+    /// drift apart: a rebound page (DNS-name Host) and a cross-site fetch
+    /// (foreign Origin) are still refused. Only a Rust test can reach the
+    /// peer-address half — every curl from this machine is a loopback peer.
     #[tokio::test]
-    async fn fs_dirs_rejects_non_loopback_peer_under_lan_mode() {
+    async fn lan_page_may_browse_fs_dirs_but_not_from_a_rebound_page() {
         let (dir, mut state) = test_state();
         state.lan = true;
-        // A Host/Origin pair that would satisfy `require_lan_page_access` on
-        // its own — the loopback check must still reject this peer first,
-        // proving the endpoint is loopback-only in BOTH modes, not just
-        // default.
-        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        let resp = list_fs_dirs(
-            State(state),
-            ConnectInfo(lan_peer()),
-            headers,
-            Query(FsDirsQuery {
-                path: Some(dir.path().to_str().unwrap().to_string()),
-            }),
+        let path = dir.path().to_str().unwrap().to_string();
+        let listing = |state: AppState, headers: HeaderMap| {
+            let path = path.clone();
+            async move {
+                list_fs_dirs(
+                    State(state),
+                    ConnectInfo(lan_peer()),
+                    headers,
+                    Query(FsDirsQuery { path: Some(path) }),
+                )
+                .await
+            }
+        };
+
+        // A genuine LAN page: IP-literal Host on our port, matching Origin.
+        listing(
+            state.clone(),
+            hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0")),
         )
-        .await;
-        assert!(resp.unwrap_err().status.is_client_error());
+        .await
+        .unwrap();
+        // A rebound page sends its own DNS name in Host.
+        assert!(
+            listing(state.clone(), hdrs(Some("evil.example.com:0"), None))
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+        );
+        // A cross-site fetch carries a foreign Origin.
+        assert!(
+            listing(
+                state.clone(),
+                hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com"))
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+
+        // Nothing about the single-machine posture loosened.
+        state.lan = false;
+        assert!(
+            listing(
+                state,
+                hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"))
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
     }
 
     // --- Settings: /api/config (mesa task 654) ------------------------------
@@ -8778,10 +8776,10 @@ mod tests {
     // --- CC index reset: POST /api/cc/reset (mesa task 698) -----------------
     //
     // The gate is what matters here: the handler destroys stored history, so
-    // it stays loopback-only in BOTH modes (`require_local_path_write`) — unlike
-    // the config writes beside it on the Settings page, which moved to
-    // `require_agent_access` in mesa task 1021 — rather than the plain guard
-    // the /api/cc reads use. What it *does* is covered by
+    // it carries `require_agent_access` — the gate the config writes beside it
+    // on the Settings page took in mesa task 1021, and this route in task
+    // 1022 — rather than the plain guard the /api/cc reads use. What it *does*
+    // is covered by
     // `core::cc`'s tests and `scripts/cc-check.sh` against a synthetic tree.
 
     #[tokio::test]
@@ -8797,15 +8795,41 @@ mod tests {
         assert!(resp.unwrap_err().status.is_client_error());
     }
 
+    /// mesa task 1022: under `--lan` a genuine LAN page may reset the index —
+    /// `--lan` already hands that network a terminal, which can delete the
+    /// transcripts outright — while a rebound page (DNS-name Host) and a
+    /// cross-site fetch (foreign Origin) stay refused.
     #[tokio::test]
-    async fn reset_cc_index_rejects_non_loopback_peer_under_lan_mode() {
+    async fn lan_page_may_reset_the_cc_index_but_not_from_a_rebound_page() {
         let (_dir, mut state) = test_state();
         state.lan = true;
-        // Host/Origin `require_lan_page_access` would accept: a LAN peer that
-        // under `--lan` may write tasks still must not get to wipe the index.
-        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        let resp = reset_cc_index(State(state), ConnectInfo(lan_peer()), headers).await;
-        assert!(resp.unwrap_err().status.is_client_error());
+        let reset = |state: AppState, headers: HeaderMap| async move {
+            reset_cc_index(State(state), ConnectInfo(lan_peer()), headers).await
+        };
+
+        reset(
+            state.clone(),
+            hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0")),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reset(state.clone(), hdrs(Some("evil.example.com:0"), None))
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+        );
+        assert!(
+            reset(
+                state,
+                hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com"))
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
     }
 
     // --- fs/dirs: POST /api/fs/dirs (mesa task 489) -------------------------
@@ -8891,31 +8915,76 @@ mod tests {
         assert!(!dir.path().parent().unwrap().join("escape").exists());
     }
 
-    /// The POST is gated exactly like the GET beside it: loopback-only in BOTH
-    /// serve modes, so creating a directory is never reachable more widely
-    /// than listing one.
+    /// The POST is gated exactly like the GET beside it (mesa task 1022), so
+    /// creating a directory is never reachable more widely than listing one:
+    /// refused for a non-loopback peer in default mode, served to a genuine
+    /// LAN page under `--lan`, still refused there from a rebound page or a
+    /// cross-site fetch. Every refusal must also leave the disk untouched.
     #[tokio::test]
-    async fn create_fs_dir_rejects_non_loopback_peer_in_both_modes() {
-        for lan in [false, true] {
-            let (dir, mut state) = test_state();
-            state.lan = lan;
-            // A Host/Origin pair that would satisfy `require_lan_page_access`
-            // on its own — the loopback check must still reject the peer.
-            let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-            let err = create_fs_dir(
+    async fn create_fs_dir_is_gated_exactly_like_the_listing_beside_it() {
+        let make = |state: AppState, headers: HeaderMap, path: String, name: &'static str| async move {
+            create_fs_dir(
                 State(state),
                 ConnectInfo(lan_peer()),
                 headers,
                 Json(FsDirCreate {
-                    path: dir.path().to_str().unwrap().to_string(),
-                    name: "nope".to_string(),
+                    path,
+                    name: name.to_string(),
                 }),
             )
             .await
-            .unwrap_err();
-            assert!(err.status.is_client_error(), "lan={lan}");
-            assert!(!dir.path().join("nope").exists(), "lan={lan}");
-        }
+        };
+        let local = || hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+
+        // Default mode: a non-loopback peer is refused, disk untouched.
+        let (dir, state) = test_state();
+        let root = dir.path().to_str().unwrap().to_string();
+        assert!(!state.lan);
+        assert!(
+            make(state, local(), root.clone(), "nope")
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+        );
+        assert!(!dir.path().join("nope").exists());
+
+        // `--lan`: a genuine LAN page may create the folder…
+        let (dir, mut state) = test_state();
+        state.lan = true;
+        let root = dir.path().to_str().unwrap().to_string();
+        make(state.clone(), local(), root.clone(), "yes")
+            .await
+            .unwrap();
+        assert!(dir.path().join("yes").is_dir());
+
+        // …but a rebound page and a cross-site fetch are still refused.
+        assert!(
+            make(
+                state.clone(),
+                hdrs(Some("evil.example.com:0"), None),
+                root.clone(),
+                "rebound"
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        assert!(
+            make(
+                state,
+                hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com")),
+                root,
+                "crosssite"
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        assert!(!dir.path().join("rebound").exists());
+        assert!(!dir.path().join("crosssite").exists());
     }
 
     // --- Locked edge anchors: three-state PATCH validation (mesa task 350) ---
@@ -10159,11 +10228,17 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         assert_eq!(stored[0].body, "true");
     }
 
-    /// The load-bearing asymmetry: under `--lan`, a legitimate LAN page passes
-    /// `require_agent_access` and may *run* a stored script, but authoring is
-    /// loopback-only in both modes — a LAN peer must never choose the program.
+    /// mesa task 1022 removed the asymmetry this test used to assert: all six
+    /// script routes now share `require_agent_access`, so under `--lan` a
+    /// legitimate LAN page may *run* a stored script and **author** one —
+    /// `--lan` already hands that network the shell, so refusing it the editor
+    /// while granting it the run was a distinction with no security content.
+    /// What must not drift apart is the pairing beneath it: a rebound page
+    /// (DNS-name Host) and a cross-site fetch (foreign Origin) are still
+    /// refused on all three mutations. Only a Rust test can reach the
+    /// peer-address half — every curl from this machine is a loopback peer.
     #[tokio::test]
-    async fn lan_page_may_run_a_script_but_may_never_author_one() {
+    async fn lan_page_may_author_a_script_but_not_from_a_rebound_page() {
         let (_dir, mut state) = test_state();
         state.lan = true;
         let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
@@ -10182,20 +10257,156 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         .unwrap();
         assert_eq!(ran.status(), StatusCode::OK);
 
-        let authored = create_script(
+        let authored = |state: AppState, headers: HeaderMap, name: &'static str| async move {
+            create_script(
+                State(state),
+                ConnectInfo(lan_peer()),
+                headers,
+                Ok(Json(ScriptCreate {
+                    name: name.into(),
+                    body: "echo hi".into(),
+                    project_id: None,
+                    description: None,
+                    args: vec![],
+                })),
+            )
+            .await
+        };
+
+        // A genuine LAN page may now create, update and delete.
+        authored(state.clone(), headers.clone(), "from-the-lan")
+            .await
+            .unwrap();
+        update_script(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(script.id),
+            Ok(Json(ScriptUpdate {
+                project_id: None,
+                name: None,
+                description: None,
+                body: Some(Some("echo edited".into())),
+                args: None,
+            })),
+        )
+        .await
+        .unwrap();
+        delete_script(
             State(state.clone()),
             ConnectInfo(lan_peer()),
             headers,
-            Ok(Json(ScriptCreate {
-                name: "evil".into(),
-                body: "echo pwned".into(),
-                project_id: None,
-                description: None,
-                args: vec![],
-            })),
+            Path(script.id),
         )
-        .await;
-        assert!(authored.unwrap_err().status.is_client_error());
+        .await
+        .unwrap();
+
+        // A rebound page and a cross-site fetch are still refused.
+        assert!(
+            authored(
+                state.clone(),
+                hdrs(Some("evil.example.com:0"), None),
+                "rebound"
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        assert!(
+            authored(
+                state.clone(),
+                hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com")),
+                "crosssite"
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        let stored = state.store.lock().unwrap().list_scripts(None).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "from-the-lan");
+    }
+
+    /// A project's `local_path` is the folder an agent executes in, so writing
+    /// it used to be loopback-only in both serve modes. mesa task 1022 moved it
+    /// onto `require_agent_access`, the gate the agents and terminal routes
+    /// beside it already carry: under `--lan` a genuine LAN page — which may
+    /// already open a terminal in that folder — may set it, while a rebound
+    /// page and a cross-site fetch stay refused, and default mode still
+    /// refuses a non-loopback peer outright. `scripts/agents-check.sh` drives
+    /// the Host/Origin half over real HTTP; only this test can forge the peer.
+    #[tokio::test]
+    async fn lan_page_may_write_local_path_but_not_from_a_rebound_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let create = |state: AppState, headers: HeaderMap, name: &'static str, path: String| async move {
+            create_project(
+                State(state),
+                ConnectInfo(lan_peer()),
+                headers,
+                Ok(Json(ProjectCreate {
+                    name: name.into(),
+                    description: None,
+                    root_commit: None,
+                    local_path: Some(path),
+                    parent_id: None,
+                })),
+            )
+            .await
+        };
+        let local = || hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+
+        let (_dir, state) = test_state();
+        assert!(!state.lan);
+        assert!(
+            create(state, local(), "default-mode", path.clone())
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+        );
+
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        create(state.clone(), local(), "from-the-lan", path.clone())
+            .await
+            .unwrap();
+        assert!(
+            create(
+                state.clone(),
+                hdrs(Some("evil.example.com:0"), None),
+                "rebound",
+                path.clone()
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        assert!(
+            create(
+                state.clone(),
+                hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com")),
+                "crosssite",
+                path
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        let names: Vec<String> = state
+            .store
+            .lock()
+            .unwrap()
+            .list_projects()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["from-the-lan".to_string()]);
     }
 
     #[tokio::test]
@@ -10578,9 +10789,9 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
     /// loopback-only `require_local_path_write` onto `require_agent_access`,
     /// the gate the agents, terminal and scripts routes already use — so
     /// under `--lan` a real LAN page may now both READ and AUTHOR the
-    /// library, exactly as it may already run a script
-    /// (`lan_page_may_run_a_script_but_may_never_author_one`) or open a
-    /// terminal. `--lan` is the opt-in "trust every device on this network"
+    /// library, exactly as it may already run or author a script
+    /// (`lan_page_may_author_a_script_but_not_from_a_rebound_page`, which mesa
+    /// task 1022 made the scripts' own posture) or open a terminal. `--lan` is the opt-in "trust every device on this network"
     /// posture that hands that network a shell; refusing it the catalogue
     /// while granting it the shell was a distinction with no security
     /// content.

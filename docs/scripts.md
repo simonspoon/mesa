@@ -105,19 +105,31 @@ request/response record, the `HookRun` twin.
   | Route | Success | Gate |
   | --- | --- | --- |
   | `GET /api/scripts` (`?project=<id>`) | 200, bare array | `require_agent_access` |
-  | `POST /api/scripts` | **201** | `require_local_path_write` |
+  | `POST /api/scripts` | **201** | `require_agent_access` |
   | `GET /api/scripts/{id}` | 200 | `require_agent_access` |
-  | `PATCH /api/scripts/{id}` | 200 | `require_local_path_write` |
-  | `DELETE /api/scripts/{id}` | 200, destroyed record | `require_local_path_write` |
+  | `PATCH /api/scripts/{id}` | 200 | `require_agent_access` |
+  | `DELETE /api/scripts/{id}` | 200, destroyed record | `require_agent_access` |
   | `POST /api/scripts/{id}/run` (`{"values": {…}}`) | 200 | `require_agent_access` |
 
-  **The read/write asymmetry is the point.** Authoring a script is *choosing a
-  program mesa will execute*, so the three mutations take the `/api/config`
-  posture — **loopback-only in both serve modes**, one notch stronger than the
-  agent routes that `--lan` does open. Running one is *triggering* execution of
-  something already stored, which is the agents' capability class, so it shares
-  their gate. A LAN peer may trigger a run; it must never choose the program.
-  Do not weaken either half, and do not let them drift together.
+  **All six routes share one gate** (mesa task 1022, the reversal tasks 1004
+  and 1021 already made for the library and Settings). Authoring a script is
+  *choosing a program mesa will execute* and running one is *triggering*
+  execution of something already stored — both are the agents' capability
+  class, so both take `require_agent_access`. In **default** mode that is
+  strictly stronger than the loopback-only check the three mutations used to
+  carry: loopback peer **plus** local Host **plus** local Origin, the
+  per-route `require_local_origin` being new. Under **`--lan`** it *relaxes
+  rather than refuses* — a page this server handed a phone may author a
+  script, while both confused-deputy defenses stay shut
+  (`require_lan_agent_host` for DNS rebinding, `require_origin_matches_host`
+  for a cross-site fetch). `--lan` is already the opt-in "trust every device
+  on this network" posture that hands that network a terminal and the ability
+  to run any stored script, so refusing it the editor while granting it the
+  shell was a distinction with no security content. A same-machine `curl`
+  cannot prove the peer-address half of that (its peer is always loopback,
+  which makes the relaxed and strict gates identical under `--lan`), so it is
+  a Rust test with a forged non-loopback `SocketAddr`
+  (`lan_page_may_author_a_script_but_not_from_a_rebound_page`).
   A malformed body is 422 (every handler takes `Result<Json<T>, JsonRejection>`,
   never bare `Json`); values that fail `validate_values` are 422 `validation`;
   a bash that will not start is 502 `unavailable`. The run's blocking

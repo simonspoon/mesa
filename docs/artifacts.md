@@ -194,9 +194,9 @@ reasoning rather than just the rule:
 - An artifact's body is project content, not an execution input. It sits in
   the same trust class as a task's `description` — which `/api/tasks`
   already serves unauthenticated in both serve modes — not in the class a
-  script body or a `local_path` occupies. Neither `require_agent_access` nor
-  `require_local_path_write` is the matching capability here; reaching for
-  either would be gating a document read as if it were a program choice.
+  script body or a `local_path` occupies. `require_agent_access` is not the
+  matching capability here; reaching for it would be gating a document read
+  as if it were a program choice.
 - More importantly: **the sandbox is the whole defense, and a defense that is
   the whole defense must be unconditional.** The task's own brief warns that
   the framing rules must not differ between `serve` and `serve --lan` by
@@ -212,8 +212,8 @@ reasoning rather than just the rule:
 
 **The obvious objection, and why it doesn't apply here.** `scripts` and
 `library` both put a per-route gate on their *reads* — scripts on the agents'
-code-execution gate (with authoring loopback-only in *both* serve modes), and
-library on that same `require_agent_access` for all eleven of its routes,
+code-execution gate on all six of its routes, authoring included (mesa task
+1022), and library on that same `require_agent_access` for all eleven of its routes,
 reads included (mesa task 1004), on the reasoning that "a row's `body` IS the
 agent definition, hook script or CLAUDE.md." An artifact is also a `body`
 column served over a route, and it carries no per-route gate at all. Why is

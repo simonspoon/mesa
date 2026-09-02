@@ -333,9 +333,10 @@ What that gate means, per mode:
 
 - **Default (`mesa serve`)** — a **loopback TCP peer** (`require_loopback`),
   **plus** a local `Host` (`require_local_host`) **plus** a local `Origin`
-  (`require_local_origin`). That is *strictly stronger* than the
-  loopback-only `require_local_path_write` this surface used to carry, which
-  checked the peer alone and leaned on the router-wide `guard` for the Host.
+  (`require_local_origin`). That is *strictly stronger* than the loopback-only
+  check this surface used to carry (`require_local_path_write`, removed
+  outright by mesa task 1022), which checked the peer alone and leaned on the
+  router-wide `guard` for the Host.
   Nothing about the ordinary single-machine install loosened; a cross-site
   page's `Origin` is now refused by the route itself.
 - **`--lan` (`mesa serve --lan`)** — the peer check *relaxes*: a browser on
@@ -361,10 +362,12 @@ while granting it the shell was a distinction with no security content — the
 peer that can run anything gains nothing by being denied the catalogue, and
 loses the entire page. This is the posture `POST /api/live/transcribe` took
 for the same reason (`docs/live.md`, `docs/listen.md`): `require_agent_access`
-relaxes rather than refuses. What stays loopback-only in both modes is the
-narrower set where the capability really is different in kind — the scripts'
-*authoring* routes (a LAN peer must never choose the program) and
-`GET`/`POST /api/fs/dirs`.
+relaxes rather than refuses. **mesa task 1022** finished the job: the
+scripts' *authoring* routes, the `local_path` write, `GET`/`POST
+/api/fs/dirs` and the CC index reset — the last routes still loopback-only in
+both modes — moved onto this same gate for the same reason, and
+`require_local_path_write` was deleted. Nothing in the API is loopback-only
+in both modes any more.
 
 **How the boundary is actually proved.** A same-machine `curl` to `127.0.0.1`
 cannot exercise the peer-address half of any of this, in either serve mode:
@@ -381,7 +384,7 @@ a forged non-loopback `SocketAddr`, which a shell script driving a real
 `lan_page_may_read_and_author_the_library_but_not_from_a_rebound_page` in
 `src/api.rs` (with
 `lan_page_may_import_the_library_but_not_from_a_rebound_page` for the bundle
-half), mirroring `lan_page_may_run_a_script_but_may_never_author_one`: it
+half), mirroring `lan_page_may_author_a_script_but_not_from_a_rebound_page`: it
 calls `list_library`/`show_library`/`list_library_versions`/`export_library`
 and `create_library` directly with `ConnectInfo` set to a LAN address and
 asserts they now succeed, that the same peer behind a DNS-name `Host` or a

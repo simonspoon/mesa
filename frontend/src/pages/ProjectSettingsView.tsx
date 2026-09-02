@@ -16,10 +16,11 @@ import { useFetch } from '../useFetch'
  * — one `getProject` drives both the page header and this view.
  *
  * Each section owns its own in-flight flag and its own error slot: both the
- * `local_path` PATCH and the `/api/fs/dirs` listing behind `DirBrowser` are
- * loopback-gated in *both* serve modes, so over `--lan` they 403 with
- * "local_path is an agent execution anchor; …". That message is shown as-is;
- * there is deliberately no client-side pre-check for it.
+ * `local_path` PATCH and the `/api/fs/dirs` listing behind `DirBrowser` sit
+ * behind the server's `require_agent_access` gate (mesa task 1022), so over
+ * `--lan` a page this server handed out is served and a rebound or cross-site
+ * one 403s. That message is shown as-is; there is deliberately no client-side
+ * pre-check for it.
  */
 export function ProjectSettingsView({
   projectId,

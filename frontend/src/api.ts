@@ -1325,8 +1325,11 @@ export function getScript(id: number): Promise<Script> {
 
 /**
  * Authoring a script is authoring a program mesa will execute, so all three
- * mutations are loopback-only in *both* serve modes (docs/scripts.md) — a 403
- * here is a LAN peer, not a bug. A duplicate name is 409 `conflict`.
+ * mutations sit behind the server's `require_agent_access` gate — the same one
+ * the reads and the run beside them carry (mesa task 1022, docs/scripts.md):
+ * strictly local in default mode, and under `--lan` served to a page this
+ * server handed out. A 403 here is a rebound or cross-site page, not a bug.
+ * A duplicate name is 409 `conflict`.
  */
 export function createScript(body: ScriptWrite): Promise<Script> {
   return request('/api/scripts', jsonInit('POST', body))

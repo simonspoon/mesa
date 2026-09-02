@@ -321,16 +321,20 @@ lan_req() { # lan_req <method> <path> <host> [origin] [json-body]
 [ "$(lan_req GET "/api/projects/$P/agents" "192.0.2.7:$LAN_PORT" "http://localhost:5173")" = "200" ] ||
   fail "--lan: agent route must still accept a local (vite dev) Origin from a loopback peer"
 
-# local_path is an execution anchor: under --lan a rebinding page (loopback
-# peer, DNS-name Host) or a cross-site page (foreign Origin) must not be able to
-# write it — same Host/Origin discriminator as the agent routes, on top of the
-# loopback-peer requirement.
+# local_path is an execution anchor, so writing it carries `require_agent_access`
+# — the agent routes' own gate (mesa task 1022, replacing the loopback-only
+# check it used to have). Under --lan a rebinding page (DNS-name Host) or a
+# cross-site page (foreign Origin) must not be able to write it, while a page
+# this server handed out may; the peer half is pinned by
+# `lan_page_may_write_local_path_but_not_from_a_rebound_page` in api.rs.
 [ "$(lan_req PATCH "/api/projects/$P" "evil.example:$LAN_PORT" '' "{\"local_path\":\"$TMP\"}")" = "403" ] ||
   fail "--lan: local_path write must reject a DNS-name Host (rebinding defense)"
 [ "$(lan_req PATCH "/api/projects/$P" "127.0.0.1:$LAN_PORT" 'https://evil.example' "{\"local_path\":\"$TOPLEVEL\"}")" = "403" ] ||
   fail "--lan: local_path write must reject a foreign Origin (cross-site defense)"
 [ "$(lan_req PATCH "/api/projects/$P" "127.0.0.1:$LAN_PORT" '' "{\"local_path\":\"$TOPLEVEL\"}")" = "200" ] ||
   fail "--lan: local_path write must pass from a local client"
+[ "$(lan_req PATCH "/api/projects/$P" "192.0.2.7:$LAN_PORT" "http://192.0.2.7:$LAN_PORT" "{\"local_path\":\"$TOPLEVEL\"}")" = "200" ] ||
+  fail "--lan: local_path write must pass from a LAN-shaped page (mesa task 1022)"
 [ "$(lan_req PATCH "/api/projects/$P" "evil.example:$LAN_PORT" '' '{"name":"Repo proj"}')" = "200" ] ||
   fail "--lan: non-local_path project fields must stay writable under any Host"
 

@@ -211,7 +211,8 @@ Absent or `null` is the built-in default for that key alone. `GET`/`PUT
 and reports each value **verbatim** beside its built-in, and the `PUT` carries
 that **same** gate like every other config write (mesa task 1021 — strictly
 stronger than the loopback-only check it used to carry in default mode, and
-relaxing rather than refusing under `--lan`). A bad
+relaxing rather than refusing under `--lan`; mesa task 1022 took every
+remaining route onto it too). A bad
 value is `validation` (422) and writes **nothing** — the whole update is
 checked before the file is touched. A hand-edited value of the right type but
 outside its bound falls back to the built-in *for that key*, the clamp posture

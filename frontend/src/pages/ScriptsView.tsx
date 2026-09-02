@@ -241,9 +241,11 @@ function ScriptForm({
  * `local_path` becomes the run's working directory) but does not have to, so
  * the page lives above projects rather than as a project tab.
  *
- * Authoring is loopback-only server-side in both serve modes: a script body is
- * a program mesa will execute, so a LAN peer may *run* one but never choose
- * what runs. A 403 from a save is that gate, not a bug (docs/scripts.md).
+ * Authoring carries the server's `require_agent_access` gate, the same one the
+ * reads and the run carry (mesa task 1022): a script body is a program mesa
+ * will execute, and `--lan` already hands the network the shell. A 403 from a
+ * save is that gate refusing a rebound or cross-site page, not a bug
+ * (docs/scripts.md).
  */
 export function ScriptsView() {
   const { data: scripts, error, refetch } = useFetch(() => listScripts(), 'scripts')

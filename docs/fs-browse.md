@@ -54,39 +54,33 @@ browser catches that *in its loader*, forgets the key, and falls back to
 `$HOME` (an effect keyed on `error` would set state during an effect, which
 the frontend lint rejects).
 
-## Access gate: the same `require_local_path_write`, now parameterized
+## Access gate: `require_agent_access`, on both verbs
 
-Gated by `require_local_path_write(&state, &addr, &headers, message)`
-(`src/api.rs`) — reused as-is, not a new or separate gate function. This is
-the same loopback-only-in-BOTH-`serve`-modes check that already guards
-writing a project's `local_path` (an execution-anchor input for
-`claude --bg`/`claude agents`): `require_loopback` always, plus
-`require_lan_page_access` under `--lan`. Listing a directory (or creating an
-empty one) is a different capability than writing `local_path`, but the same
-rationale class applies — filesystem-exposure adjacent to the execution-anchor
-concept, not plain CRUD — so under `--lan` a peer who could already point a
-future agent at an arbitrary folder gains nothing new from also being able to
-browse for one.
+Gated by `require_agent_access(&state, &addr, &headers)` (`src/api.rs`) —
+the agent routes' own gate, which this endpoint moved onto in **mesa task
+1022**, replacing the loopback-only-in-both-modes check it used to share with
+the `local_path` write. Listing a directory (or creating an empty one) is
+filesystem exposure adjacent to the execution-anchor concept, not plain CRUD,
+so it belongs in that capability class.
 
-**Both** verbs on the route take that same gate. The POST is deliberately NOT
-on `require_agent_access` (the gate the Files tab's write route uses): that
-gate's `--lan` relaxation is earned by the write being confined to one
-project's `local_path`, where a LAN peer can already spawn an agent. This
-route is unscoped, and creating is a strictly larger capability than
-listing — so it can never be gated more loosely than its own read. Loosening
-the POST alone would be a silent widening of this surface, not a consistency
-fix.
+In **default** mode the new gate is strictly stronger than the old one:
+`require_loopback` **plus** `require_local_host` **plus**
+`require_local_origin`, the last being new here. Under **`--lan`** it relaxes
+rather than refuses — a page this server handed out may browse, while both
+confused-deputy defenses stay shut (`require_lan_agent_host` for DNS
+rebinding, `require_origin_matches_host` for a cross-site fetch). `--lan` is
+already the opt-in "trust every device on this network" posture that hands
+that network a terminal, which can list any folder on this machine anyway; so
+refusing it the picker while granting it the shell was a distinction with no
+security content.
 
-The one adjustment made to land this reuse: `require_local_path_write`'s
-loopback-rejection message used to be hardcoded to `local_path`-specific
-copy ("local_path is an agent execution anchor; it can only be set from this
-machine"), which reads wrong for a listing rejection. It now takes a
-caller-supplied `message: &'static str` — both existing call sites
-(`create_project`, `update_project`) pass their original copy explicitly,
-and `list_fs_dirs`/`create_fs_dir` pass their own ("this endpoint is
-loopback-only; connect from this machine"). Do not read this as a second
-gate: the loopback + LAN-page-access logic itself is untouched and still
-lives in exactly one function.
+**Both** verbs on the route take that same gate, and always must: creating a
+directory is a strictly larger capability than listing one, so it can never be
+gated more loosely than its own read. A same-machine `curl` cannot prove the
+peer-address half (its peer is always loopback, which makes the relaxed and
+strict gates identical under `--lan`), so that half is pinned by
+`lan_page_may_browse_fs_dirs_but_not_from_a_rebound_page` and
+`create_fs_dir_is_gated_exactly_like_the_listing_beside_it` in `src/api.rs`.
 
 The GET, being a GET, skips the Content-Type/CSRF gate; the POST sits inside
 it like every other mutation in the API.
@@ -105,7 +99,7 @@ endpoint is the wrong move; don't.
   that legitimate case for no real security gain.
 - The actual boundary is **who may call the endpoint at all** (the gate
   above), not which paths it may return. mesa is local-first, single-user:
-  once a caller clears the loopback gate, they *are* the same OS user mesa
+  once a caller clears the access gate, they *are* the same OS user mesa
   runs as, who already has Finder/Terminal-level read access to everything
   their account can read. A mesa-side path bound on top of that would protect
   nothing the user couldn't already `ls` themselves — it would only be a

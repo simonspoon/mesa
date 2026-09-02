@@ -312,9 +312,10 @@ Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
   already the opt-in "trust every device on this network" choice that hands
   that network a terminal, a shell and script execution, so refusing it the
   Settings page while granting it the shell was a distinction with no security
-  content. What stays loopback-only in both modes is the narrower set where
-  the capability differs in kind — the scripts' *authoring* routes,
-  `local_path`, `/api/fs/dirs` and the CC index reset.
+  content. As of **mesa task 1022** nothing is loopback-only in both modes any
+  more: the scripts' *authoring* routes, the `local_path` write,
+  `/api/fs/dirs` and the CC index reset all moved onto this same gate, and
+  `require_local_path_write` is gone.
 
 Nothing is cached: a save is live on the next dispatch, with no restart.
 

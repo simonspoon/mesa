@@ -74,7 +74,9 @@ request/response record, the `HookRun` twin.
   never from the caller.** A bound script runs in that project's `local_path`,
   via the standard ladder the terminal and agents use: no `local_path`, or a
   path that is not a directory on this machine, is `validation` (422). An
-  unbound script runs in `$HOME`.
+  unbound script runs in `~/.mesa/workspace` (`config::workspace_dir()`,
+  created on demand — Claude Code never persists folder trust for the home
+  directory, so mesa owns one folder instead).
 - CLI: `mesa script {create,list,show,get,update,delete,run}`. A script
   argument takes an **id or a name** everywhere, and every project argument
   resolves by id or name as usual. `create <NAME> <BODY>` takes both

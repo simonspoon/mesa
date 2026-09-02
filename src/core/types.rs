@@ -1496,9 +1496,10 @@ pub struct Script {
     #[ts(type = "number")]
     pub id: i64,
     /// The project this script belongs to, or null for a global script. Also
-    /// the run's working directory (the project's `local_path`; `$HOME` when
-    /// null). Deleting the project un-binds rather than destroys the script —
-    /// the FK is `ON DELETE SET NULL`, as the inbox's is.
+    /// the run's working directory (the project's `local_path`;
+    /// `~/.mesa/workspace` when null). Deleting the project un-binds rather
+    /// than destroys the script — the FK is `ON DELETE SET NULL`, as the
+    /// inbox's is.
     #[ts(type = "number | null")]
     pub project_id: Option<i64>,
     /// Unique (case-insensitively), non-empty: the CLI resolves a script by id

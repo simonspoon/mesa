@@ -2,7 +2,8 @@
 
 The **Terminal** page is a global nav entry (`#/terminal`,
 left `Sidebar` link next to Inbox) showing a pane-tree of real interactive
-shells — plain `$SHELL` processes at `$HOME`, not `claude attach` sessions.
+shells — plain `$SHELL` processes at `~/.mesa/workspace`, not `claude attach`
+sessions.
 Unlike Agents, there is no server-side session registry: every websocket
 connection to the backend endpoint spawns a **new** shell process and dies
 with it, and the client owns the pane tree's shape entirely in its own state.
@@ -19,15 +20,18 @@ navigating to another page and back never disturbs an open pane.
   `TERM=xterm-256color`. No path id — each connection is its own shell, so
   there's nothing to select. Closing the socket (from either side) kills that
   connection's shell process only; other open panes are unaffected.
-- **cwd is `$HOME`, or a project's folder with `?project=<id>`** (the project
-  Terminal tab, below). The path is never client-supplied: the id is resolved
+- **cwd is `~/.mesa/workspace`, or a project's folder with `?project=<id>`**
+  (the project Terminal tab, below). The workspace is `config::workspace_dir()`,
+  created on demand: Claude Code never persists folder trust for the home
+  directory, so mesa owns one folder instead. The path is never
+  client-supplied: the id is resolved
   through the store to that project's `local_path`, and rejected exactly as
   `spawn_project_agent` rejects its own spawn folder — unknown id is
   `not_found`, unset or non-directory `local_path` is `validation` (422).
   Both fail the handshake *before* the upgrade, so a bad scope never spawns a
   shell somewhere the caller didn't ask for. This adds no new reachability:
   the gate below is unchanged, and any caller that clears it can already run
-  `cd <anywhere>` in a `$HOME` shell.
+  `cd <anywhere>` in a workspace shell.
 - **Shares `require_agent_access` verbatim with the Agents attach
   endpoint** — same gate, same call shape, no new/weaker/stronger logic; see
   `docs/agents.md`'s "All four agent routes share..." writeup for the full
@@ -41,7 +45,7 @@ navigating to another page and back never disturbs an open pane.
   isn't granting a new class of access, just a different shell for the same
   already-gated caller.
 - One posture note worth calling out explicitly: because the Terminal page is
-  always mounted (below) and seeds one shell pane by default, a `$HOME` shell
+  always mounted (below) and seeds one shell pane by default, a workspace shell
   spawns on **every app load, on any route** — not only once the user
   actually navigates to `#/terminal`. It's gated by the exact same
   `require_agent_access` check as ever; what's changed is that reaching the
@@ -179,8 +183,8 @@ consequence of being shared.
 
 `#/projects/:id/terminal` is the same `TerminalPage` component rendered as a
 project tab beside Files, with its shells rooted in that project's
-`local_path` instead of `$HOME`. One optional `projectId` prop is the whole
-difference: it picks the endpoint (`?project=<id>`, so the *server* resolves
+`local_path` instead of `~/.mesa/workspace`. One optional `projectId` prop is
+the whole difference: it picks the endpoint (`?project=<id>`, so the *server* resolves
 the folder) and the scope key. Everything else — the tree engine, the
 drag/split/resize model, `PtySlot`/`PtyPool`, `+ new shell` — is the global
 page's code unchanged.

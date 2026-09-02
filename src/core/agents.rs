@@ -596,6 +596,49 @@ echo '[]'"#,
         assert_eq!(list_sessions(&bin).unwrap(), vec![]);
     }
 
+    /// mesa applies **no** state/command/pid filter to what `claude agents
+    /// --json` reports — a `done` row sitting in the home folder stays listed,
+    /// and the sidebar's DONE bucket (mesa task 861) is where it belongs.
+    ///
+    /// Measured (mesa task 1040): every `claude --bg` agent, running ones
+    /// included, is a daemon-claimed process whose argv is `claude bg-spare
+    /// --bg-spare <claim.sock>`, so filtering rows on that command line would
+    /// hide every agent; and `claude agents --json` already omits an unclaimed
+    /// spare, so an idle daemon worker never appears as a row in the first
+    /// place. There is nothing left for mesa to filter out.
+    #[test]
+    fn list_all_keeps_done_rows_because_every_bg_agent_is_a_daemon_spare() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_claude(
+            dir.path(),
+            r#"[ "$*" = "agents --json" ] || { echo "bad argv: $*" >&2; exit 1; }
+cat <<'JSON'
+[
+  {"pid": 11, "id": "dddddddd", "cwd": "/Users/someone", "kind": "background", "startedAt": 1, "sessionId": "s1", "state": "done"},
+  {"pid": 12, "id": "eeeeeeee", "cwd": "/repo", "kind": "background", "startedAt": 2, "sessionId": "s2", "state": "working"}
+]
+JSON"#,
+        );
+        let sessions = list_sessions(&bin).unwrap();
+        let rows: Vec<_> = sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.id.as_deref().unwrap(),
+                    s.state.as_deref().unwrap(),
+                    s.cwd.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("dddddddd", "done", "/Users/someone"),
+                ("eeeeeeee", "working", "/repo"),
+            ]
+        );
+    }
+
     /// The other end of a spawn receipt: `claude stop <short id>`, the short
     /// job id and nothing else (the full `sessionId` UUID is not a job).
     #[test]

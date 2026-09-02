@@ -222,6 +222,38 @@ pub fn config_file() -> PathBuf {
     dot.join("config.json")
 }
 
+/// `~/.mesa/workspace`, created on demand — the working directory for every
+/// agent or shell mesa runs that is **not** bound to a project (the live
+/// agent and its summary agent, an inbox-watcher dispatch, an unbound script,
+/// the global Terminal page, the `claude attach` client).
+///
+/// That fallback used to be `$HOME`, but Claude Code never persists folder
+/// trust for the home directory — trust accepted there is held for the
+/// current session only and is never written to disk, with no setting to
+/// change that — so anything interactive mesa started there re-prompted
+/// forever. One folder mesa owns gets that prompt answered once.
+///
+/// Deliberately independent of `MESA_CONFIG_FILE`: that override moves the
+/// config *file*, not mesa's home. Never fails — an undeterminable home or an
+/// uncreatable directory falls back to the home directory (or `.`) exactly as
+/// before, because no spawn should die over a working folder.
+pub fn workspace_dir() -> PathBuf {
+    match directories::BaseDirs::new() {
+        Some(dirs) => workspace_in(dirs.home_dir()),
+        None => PathBuf::from("."),
+    }
+}
+
+/// The body of [`workspace_dir`], taking `home` explicitly so it is testable
+/// without touching process-wide env.
+fn workspace_in(home: &Path) -> PathBuf {
+    let dir = home.join(".mesa").join("workspace");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(_) => home.to_path_buf(),
+    }
+}
+
 /// The `commands` map. Deliberately not `deny_unknown_fields`: the file is
 /// meant to grow other sections, and an unknown key must not break spawning.
 #[derive(Debug, Default, Deserialize)]
@@ -2019,6 +2051,22 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(&path, json).unwrap();
         path
+    }
+
+    /// The unbound-agent working folder is created on demand, and asking for
+    /// it twice is the same answer — a spawn calls this every time.
+    #[test]
+    fn the_workspace_folder_is_created_on_demand_and_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let want = home.path().join(".mesa").join("workspace");
+
+        let first = workspace_in(home.path());
+        assert_eq!(first, want);
+        assert!(want.is_dir());
+
+        let second = workspace_in(home.path());
+        assert_eq!(second, want);
+        assert!(want.is_dir());
     }
 
     // ---- guard (mesa task 1018) ------------------------------------------

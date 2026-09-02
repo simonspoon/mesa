@@ -59,6 +59,14 @@ a different tool yields sessions the sidebar can't list or attach to.
   client→server binary frames are keystrokes, text frames are JSON control
   (`{"resize":{cols,rows}}`). Closing the socket kills only the attach client —
   the background session keeps running (claude's own attach/detach contract).
+  The attach client is given a stable cwd mesa owns, `~/.mesa/workspace`
+  (`config::workspace_dir()`, the folder every unbound spawn now uses) — the
+  server's own cwd may be anywhere, and Claude Code never persists folder trust
+  for the home directory, so a `$HOME` cwd re-prompted on every session.
+  Note that `claude attach <id>` on a **finished (`done`) session wakes it**:
+  Claude Code prints "Waking session …" and the row comes back into `claude
+  agents --json`. Opening a pane on a DONE row therefore restarts that process
+  rather than showing a frozen transcript.
   Only background sessions (those with a short `id`) are attachable;
   interactive ones are listed as not-attachable.
 - `GET /api/agents` → `Vec<AgentSession>` (bare array, no `path` wrapper) via

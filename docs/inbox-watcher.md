@@ -32,8 +32,9 @@ tick constant. `--watch-inbox` alone never claims a task or dispatches
   structure to pace it. A server started against a large backlog therefore
   fans out that many agents at once; that is the chosen behavior, not an
   oversight (mesa task 544).
-- cwd is **`$HOME`**, not a project folder — the same
-  `directories::BaseDirs::new().home_dir()` the global Terminal page uses. An
+- cwd is **`~/.mesa/workspace`**, not a project folder — the same
+  `config::workspace_dir()` the global Terminal page uses, created on demand
+  because Claude Code never persists folder trust for the home directory. An
   inbox item belongs to no project (`project_id` is null for its whole life,
   see `docs/inbox.md`), so there is no `local_path` to spawn in; the triage
   skill derives the project itself and reads each candidate repo by absolute
@@ -103,7 +104,8 @@ Without the set, that item would respawn an agent every tick, forever.
   retry, cwd/name/prompt shape, no re-dispatch of a still-pending item, new
   item picked up, whole queue in one tick, independence from `--watch-todo`,
   pruning after delete and after assign) against a stub `claude` binary, with
-  `HOME` pointed at a throwaway dir so the `$HOME` cwd assertion is hermetic.
+  `HOME` pointed at a throwaway dir so the `~/.mesa/workspace` cwd assertion
+  is hermetic.
   Rust unit tests cover `inbox_session_name` (including multi-byte
   truncation), the dispatch-once/pick-up-new behavior, and claim release on
   spawn failure.

@@ -158,8 +158,9 @@ function ScriptForm({
           value={draft.projectId}
           onChange={(e) => setDraft({ ...draft, projectId: e.target.value })}
         >
-          {/* No project = no folder to run in, so the run's cwd is $HOME. */}
-          <option value="">$HOME (no project)</option>
+          {/* No project = no folder to run in, so the run's cwd is the
+              workspace folder mesa owns (see docs/scripts.md). */}
+          <option value="">~/.mesa/workspace (no project)</option>
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
               {p.name}
@@ -280,7 +281,7 @@ export function ScriptsView() {
       <p className="muted">
         Shell scripts you author here and run from a generated form. Each
         declares its own arguments; a script bound to a project runs in that
-        project&apos;s folder, an unbound one in your home directory.
+        project&apos;s folder, an unbound one in <code>~/.mesa/workspace</code>.
       </p>
 
       <div className="task-actions">
@@ -315,7 +316,7 @@ export function ScriptsView() {
                 <span className="script-name">{s.name}</span>
                 <span className="muted script-meta">
                   {s.project_id === null
-                    ? '$HOME'
+                    ? 'workspace'
                     : (projects?.find((p) => p.id === s.project_id)?.name ??
                       `project ${s.project_id}`)}
                   {s.args.length > 0 && ` · ${s.args.length} arg(s)`}

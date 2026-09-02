@@ -265,10 +265,11 @@ fn inbox_session_name(item: &InboxItem) -> String {
 /// projects, so — unlike the todo-watcher, which is naturally capped at one
 /// agent per project — every un-dispatched item goes out in the same tick.
 ///
-/// cwd is `$HOME`, not a project folder: an inbox item belongs to no project
-/// (`project_id` is null for its whole life) and the triage skill derives the
-/// project itself, reading each candidate repo by absolute `local_path`. Same
-/// `$HOME` the global Terminal page uses.
+/// cwd is `~/.mesa/workspace`, not a project folder: an inbox item belongs to
+/// no project (`project_id` is null for its whole life) and the triage skill
+/// derives the project itself, reading each candidate repo by absolute
+/// `local_path`. Same folder the global Terminal page uses
+/// (`config::workspace_dir`).
 ///
 /// The dedup set (`AppState::inbox_dispatched`) stands in for the
 /// todo-watcher's `in_progress` claim, which has no inbox equivalent — an
@@ -288,11 +289,7 @@ fn inbox_session_name(item: &InboxItem) -> String {
 /// across a spawn would freeze every other API request for the duration of
 /// each spawn — a regression this codebase has shipped once already.
 fn inbox_watcher_tick(state: &AppState) {
-    let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) else {
-        eprintln!("inbox-watcher: no home directory to dispatch in");
-        return;
-    };
-    let home = home.to_string_lossy().into_owned();
+    let dispatch_dir = config::workspace_dir().to_string_lossy().into_owned();
 
     let items = {
         let store = match state.store.lock() {
@@ -334,7 +331,7 @@ fn inbox_watcher_tick(state: &AppState) {
         // `claude --bg … -- /inbox-triage <id>`.
         if let Err(e) = agents::spawn_bg(
             config::INBOX_WATCHER,
-            &home,
+            &dispatch_dir,
             Some(id),
             Some(&session_name),
             None,
@@ -2532,8 +2529,8 @@ struct LiveQuery {
 struct LiveStart {
     /// The project the conversation is about, if any. Optional: live is a
     /// global surface (like the inbox), and a session with no project simply
-    /// runs its agent in `$HOME`. An unknown id is a `validation` error from
-    /// `Store`.
+    /// runs its agent in `~/.mesa/workspace`. An unknown id is a
+    /// `validation` error from `Store`.
     #[serde(default)]
     project_id: Option<i64>,
 }
@@ -2583,22 +2580,21 @@ fn no_live_session() -> ApiError {
 }
 
 /// The folder a live agent is spawned in: the bound project's `local_path` when
-/// it is still a directory on this machine, else `$HOME` — the inbox-watcher's
-/// fallback, and the same folder the global Terminal page opens in.
+/// it is still a directory on this machine, else `~/.mesa/workspace` — the
+/// inbox-watcher's fallback, and the same folder the global Terminal page opens
+/// in (`config::workspace_dir`).
 ///
 /// Deliberately a fallback rather than the 422 `spawn_project_agent` gives: a
 /// live conversation is not scoped to a repo (its `project_id` is optional, and
 /// the whole session survives that project's deletion), so a missing or stale
 /// path is a session with no working folder, not a broken request.
-fn live_spawn_dir(local_path: Option<String>) -> Result<String, ApiError> {
+fn live_spawn_dir(local_path: Option<String>) -> String {
     if let Some(path) = local_path
         && std::path::Path::new(&path).is_dir()
     {
-        return Ok(path);
+        return path;
     }
-    directories::BaseDirs::new()
-        .map(|d| d.home_dir().to_string_lossy().into_owned())
-        .ok_or_else(|| agents_unavailable("no home directory to run a live agent in".into()))
+    config::workspace_dir().to_string_lossy().into_owned()
 }
 
 /// The Live page's whole read: the current session and the turns after its
@@ -2707,7 +2703,7 @@ fn live_agent_dir(
         }
         None => (None, format!("mesa live {session_id}")),
     };
-    let dir = live_spawn_dir(local_path)?;
+    let dir = live_spawn_dir(local_path);
     Ok((dir, name))
 }
 
@@ -2857,8 +2853,8 @@ async fn stop_live(
                 // Same cache invalidation as a spawn: the Agents sidebar must
                 // show the session finishing on the next poll, not after the
                 // TTL. Cleared whole — the spawn folder is the conversation's
-                // project path or `$HOME`, and the global list caches under
-                // its own key.
+                // project path or `~/.mesa/workspace`, and the global list
+                // caches under its own key.
                 state.agents_cache.lock().unwrap().clear();
                 state.agents_gen.fetch_add(1, Ordering::SeqCst);
             }
@@ -3384,13 +3380,11 @@ async fn run_script(
 /// The working directory a run happens in, resolved **server-side** from the
 /// script's own project binding — never client-supplied. A bound project uses
 /// its `local_path` (the terminal/agents ladder: no path, or a path that is not
-/// a directory here, is 422 `validation`); an unbound script runs in `$HOME`,
-/// like an inbox-watcher dispatch.
+/// a directory here, is 422 `validation`); an unbound script runs in
+/// `~/.mesa/workspace`, like an inbox-watcher dispatch.
 fn script_cwd(state: &AppState, script: &Script) -> Result<Option<String>, ApiError> {
     let Some(project_id) = script.project_id else {
-        return Ok(
-            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
-        );
+        return Ok(Some(config::workspace_dir().to_string_lossy().into_owned()));
     };
     let local_path = state
         .store
@@ -3958,8 +3952,9 @@ struct TerminalAttachQuery {
     cols: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
-    /// Omitted = the global Terminal page's `$HOME` shell. Set = the project
-    /// Terminal tab: the shell's cwd is that project's `local_path`.
+    /// Omitted = the global Terminal page's `~/.mesa/workspace` shell.
+    /// Set = the project Terminal tab: the shell's cwd is that project's
+    /// `local_path`.
     #[serde(default)]
     project: Option<i64>,
 }
@@ -5209,9 +5204,10 @@ struct FsDirsQuery {
 /// new-project folder picker (mesa task 405; see `.scratch/arch.md`, spec
 /// task 404's Open Question A). UNLIKE the Files tab above, this is not
 /// project-scoped and not rooted at any `local_path`: `path` is an absolute
-/// filesystem path (or omitted, defaulting to `$HOME` via the same
-/// `directories::BaseDirs::new().home_dir()` call `terminal_attach`/
-/// `bridge_attach` already use). Gated by [`require_agent_access`] (mesa task
+/// filesystem path (or omitted, defaulting to `$HOME` — the folder a person
+/// browses from, deliberately still the home directory and not the
+/// `~/.mesa/workspace` an unbound agent now runs in). Gated by
+/// [`require_agent_access`] (mesa task
 /// 1022, replacing the loopback-only check this route used to carry) —
 /// arch.md §6: browsing the filesystem is the same capability class as
 /// anchoring where an agent executes, not plain CRUD, so it gets the same
@@ -6385,7 +6381,8 @@ async fn attach_agent(
 /// = code execution either way); see that function's doc for the gate's
 /// mode-branched behavior.
 ///
-/// cwd is `$HOME` (the global Terminal page) unless `?project=<id>` is given
+/// cwd is `~/.mesa/workspace` (the global Terminal page) unless
+/// `?project=<id>` is given
 /// (the project Terminal tab), in which case it is that project's
 /// `local_path` — resolved, and rejected, exactly as [`spawn_project_agent`]
 /// resolves its own spawn folder: unknown id is `not_found`, unset or
@@ -6438,11 +6435,7 @@ async fn terminal_attach(
         cmd.env("TERM", "xterm-256color");
         match cwd {
             Some(path) => cmd.cwd(path),
-            None => {
-                if let Some(dirs) = directories::BaseDirs::new() {
-                    cmd.cwd(dirs.home_dir());
-                }
-            }
+            None => cmd.cwd(config::workspace_dir()),
         }
         if let Err(err) = pump_pty(socket, cmd, size).await {
             eprintln!("terminal attach: {err}");
@@ -6474,11 +6467,9 @@ async fn bridge_attach(socket: WebSocket, id: String, size: PtySize) -> Result<(
     let mut cmd = CommandBuilder::new(agents::claude_bin());
     cmd.args(["attach", &id]);
     cmd.env("TERM", "xterm-256color");
-    // Give the child a stable cwd: attach resolves the job from claude's
-    // global registry, and the server's own cwd may be anywhere.
-    if let Some(dirs) = directories::BaseDirs::new() {
-        cmd.cwd(dirs.home_dir());
-    }
+    // Give the child a stable cwd mesa owns: attach resolves the job from
+    // claude's global registry, and the server's own cwd may be anywhere.
+    cmd.cwd(config::workspace_dir());
     pump_pty(socket, cmd, size).await
 }
 
@@ -10500,9 +10491,9 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
     }
 
     /// cwd comes from the script's own project binding, resolved server-side;
-    /// an unbound script runs in `$HOME`.
+    /// an unbound script runs in `~/.mesa/workspace`.
     #[tokio::test]
-    async fn run_script_cwd_is_the_bound_projects_local_path_else_home() {
+    async fn run_script_cwd_is_the_bound_projects_local_path_else_the_workspace() {
         let (dir, state) = test_state();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -10519,10 +10510,9 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         state.store.lock().unwrap().delete_script(bound.id).unwrap();
         let unbound = new_script(&state, None, "pwd");
         let body = json_body(run_one(&state, unbound.id).await.unwrap()).await;
-        let home = directories::BaseDirs::new().unwrap().home_dir().to_owned();
         assert_eq!(
             std::fs::canonicalize(body["stdout"].as_str().unwrap().trim()).unwrap(),
-            std::fs::canonicalize(home).unwrap()
+            std::fs::canonicalize(config::workspace_dir()).unwrap()
         );
     }
 

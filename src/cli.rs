@@ -131,9 +131,9 @@ enum Command {
     /// reach the web UI, and the Host-header check is skipped. WARNING: LAN
     /// mode has NO authentication — every device on your network has full read
     /// and write access to all your data AND can open a terminal into any
-    /// project's folder (the Agents tab runs `claude` there) or a raw shell at
-    /// $HOME (the Terminal tab), i.e. run code on this machine. Only use it on
-    /// networks you trust.
+    /// project's folder (the Agents tab runs `claude` there) or a raw shell in
+    /// ~/.mesa/workspace (the Terminal tab), i.e. run code on this machine.
+    /// Only use it on networks you trust.
     Serve {
         /// Port to bind
         #[arg(long, default_value_t = 7770)]
@@ -158,7 +158,8 @@ enum Command {
         /// Periodically auto-start a background `claude` agent to triage each
         /// pending item in the global inbox (default prompt:
         /// `/inbox-triage <id>`, configurable in ~/.mesa/config.json; cwd
-        /// `$HOME` — an inbox item belongs to no project). Off by default:
+        /// `~/.mesa/workspace` — an inbox item belongs to no project). Off by
+        /// default:
         /// this spawns real agents (API cost, code execution) with no user
         /// request behind it. Independent of --watch-todo. Each item is
         /// dispatched at most once per server run. Preserved across the web
@@ -983,7 +984,8 @@ EXAMPLES
         /// Bind the script to a project, by id or name (default: global)
         ///
         /// A bound script runs in that project's `local_path`; a global one
-        /// runs in $HOME. Deleting the project un-binds rather than deletes.
+        /// runs in ~/.mesa/workspace. Deleting the project un-binds rather
+        /// than deletes.
         #[arg(long)]
         project: Option<String>,
         /// What the script is for; free text
@@ -1087,8 +1089,8 @@ EXAMPLES
     /// starting. Output is captured (not streamed) and capped at 64 KiB per
     /// stream, with `truncated` saying so.
     ///
-    /// The working directory is the bound project's `local_path`, or $HOME for
-    /// a global script. It is never caller-supplied.
+    /// The working directory is the bound project's `local_path`, or
+    /// ~/.mesa/workspace for a global script. It is never caller-supplied.
     ///
     /// A value is never interpolated into a string a shell parses: it arrives
     /// as one positional argument and as MESA_ARG_<NAME>. A declared argument
@@ -1454,13 +1456,14 @@ enum LiveCmd {
     /// The agent is spawned through the same `agents::spawn_bg` chokepoint the
     /// watchers use, with the `live-agent` command template from
     /// ~/.mesa/config.json. Its working directory is the bound project's
-    /// local_path when that folder exists, else $HOME. If the spawn fails the
+    /// local_path when that folder exists, else ~/.mesa/workspace. If the
+    /// spawn fails the
     /// session is ENDED again and the command exits 1 with code "unavailable"
     /// — a live session no agent is listening to would be a conversation that
     /// never answers and would block the next `live start` with a `conflict`.
     #[command(after_help = "\
 EXAMPLES
-  mesa live start                 # global conversation, agent runs in $HOME
+  mesa live start                 # global conversation, runs in ~/.mesa/workspace
   mesa live start mesa            # scoped to a project (id or name)
   mesa live start --project 1
   mesa live start --no-agent      # session only; drive `listen` yourself")]
@@ -3905,11 +3908,12 @@ fn current_live_session(store: &Store) -> Result<LiveSession> {
 
 /// Where the live agent runs, and what its session is called.
 ///
-/// The bound project's `local_path` when that folder still exists, else `$HOME`
-/// — the inbox-watcher's fallback, and the same `$HOME` the global Terminal
-/// page uses. Unlike `script run`, a missing or stale `local_path` is NOT an
-/// error here: a live conversation is about talking to mesa, which needs no
-/// checkout, so it degrades to the global shell rather than refusing to start.
+/// The bound project's `local_path` when that folder still exists, else
+/// `~/.mesa/workspace` — the inbox-watcher's fallback, and the same folder the
+/// global Terminal page uses. Unlike `script run`, a missing or stale
+/// `local_path` is NOT an error here: a live conversation is about talking to
+/// mesa, which needs no checkout, so it degrades to the global shell rather
+/// than refusing to start.
 ///
 /// The session NAME is what a person reads in the Agents sidebar, so it is the
 /// project name plus the session id when the conversation is scoped to a
@@ -3923,18 +3927,14 @@ fn live_agent_dir(
     project_id: Option<i64>,
     session_id: i64,
 ) -> Result<(String, String)> {
-    let home = || {
-        std::env::var("HOME").map_err(|_| {
-            Error::Validation("no HOME directory to run the live agent in".to_string())
-        })
-    };
+    let workspace = || config::workspace_dir().to_string_lossy().into_owned();
     let Some(id) = project_id else {
-        return Ok((home()?, format!("mesa live {session_id}")));
+        return Ok((workspace(), format!("mesa live {session_id}")));
     };
     let project = store.get_project(id)?;
     let dir = match project.local_path {
         Some(path) if Path::new(&path).is_dir() => path,
-        _ => home()?,
+        _ => workspace(),
     };
     Ok((dir, format!("{}: live {session_id}", project.name)))
 }
@@ -4256,12 +4256,13 @@ fn resolve_library(store: &Store, arg: &str) -> Result<LibraryItem> {
 }
 
 /// The working directory for a run: the bound project's `local_path`, or
-/// `$HOME` for a global script. Never caller-supplied, and the same four-step
-/// ladder the API's terminal route walks — an unset or vanished `local_path`
-/// is a `validation` error, not a silent fallback to some other directory.
+/// `~/.mesa/workspace` for a global script. Never caller-supplied, and the
+/// same four-step ladder the API's terminal route walks — an unset or vanished
+/// `local_path` is a `validation` error, not a silent fallback to some other
+/// directory.
 fn script_run_cwd(store: &Store, script: &Script) -> Result<Option<String>> {
     let Some(id) = script.project_id else {
-        return Ok(std::env::var("HOME").ok());
+        return Ok(Some(config::workspace_dir().to_string_lossy().into_owned()));
     };
     let Some(path) = store.get_project(id)?.local_path else {
         return Err(Error::Validation(format!(

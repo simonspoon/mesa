@@ -47,7 +47,7 @@ isolation.
 | `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, `/files/search` (hits grouped by file, excluded/binary files skipped, both toggles, the `?q=` contract), and the read/write gate pairing in default *and* `--lan` | |
 | `agents-check` | `local_path` plumbing + `/api/projects/{id}/agents` | `MESA_CLAUDE_BIN` (stub) |
 | `todo-watcher-check` | `serve --watch-todo` dispatch loop | `MESA_WATCH_TODO_TICK_MS` |
-| `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME` — use a throwaway) | `MESA_WATCH_INBOX_TICK_MS` |
+| `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME/.mesa/workspace` — use a throwaway `HOME`) | `MESA_WATCH_INBOX_TICK_MS` |
 | `hooks-check` | `task-execute` over CLI + API | `MESA_HOOKS_FILE` |
 | `config-check` | The configurable spawn commands: configured template drives each, built-in argv unchanged when absent, multi-line **script mode** (env handoff, unset-not-empty, injection-proof), plus the Settings page's `GET`/`PUT /api/config`, `.../pricing`, `.../watchers`, `.../speech` and `.../live`, and the `listen` section (the model `live transcribe` runs `auris` with, reaching its argv as `-m <model>` with no restart, byte-identical argv when unconfigured) | writes a real `~/.mesa` under a throwaway `HOME` |
 | `cc-check` | `mesa cc` contract against a synthetic transcript tree | `MESA_CC_PROJECTS_DIR` |

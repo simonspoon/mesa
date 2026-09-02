@@ -8,9 +8,10 @@ import type { ScriptArg } from "./ScriptArg";
 export type Script = { id: number, 
 /**
  * The project this script belongs to, or null for a global script. Also
- * the run's working directory (the project's `local_path`; `$HOME` when
- * null). Deleting the project un-binds rather than destroys the script —
- * the FK is `ON DELETE SET NULL`, as the inbox's is.
+ * the run's working directory (the project's `local_path`;
+ * `~/.mesa/workspace` when null). Deleting the project un-binds rather
+ * than destroys the script — the FK is `ON DELETE SET NULL`, as the
+ * inbox's is.
  */
 project_id: number | null, 
 /**

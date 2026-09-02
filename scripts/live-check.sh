@@ -557,18 +557,25 @@ run 0 "$MESA" live status
 [ "$STDOUT" = "null" ] || fail "a failed agent stop must still leave no live session"
 ok "live stop is best-effort: no agent is a no-op, a failing \`claude stop\` warns on stderr and still exits 0"
 
-# By ID, and a project with no local_path: the folder degrades to $HOME rather
-# than refusing to start (a conversation needs no checkout).
+# The folder every unbound agent runs in: `~/.mesa/workspace`, created on
+# demand (mesa task 1040). Physically resolved, because a throwaway $HOME may
+# sit behind a symlink and the stub records `pwd` in the child.
+workspace_path() { (cd "$HOME/.mesa/workspace" && pwd -P); }
+
+# By ID, and a project with no local_path: the folder degrades to the workspace
+# rather than refusing to start (a conversation needs no checkout).
 NOPATH=$("$MESA" project create "Live gate pathless" --no-git | jq -r .id)
 run 0 "$MESA" live start --project "$NOPATH"
 S4=$(jqs .id)
 [ "$(jqs .project_id)" = "$NOPATH" ] || fail "live start --project <id>: project_id"
-[ "$(cat "$STUB_DIR/last-cwd")" = "$HOME" ] ||
-  fail "live spawn with no local_path: must fall back to \$HOME (got $(cat "$STUB_DIR/last-cwd"))"
+[ -d "$HOME/.mesa/workspace" ] ||
+  fail "live spawn with no local_path: must create ~/.mesa/workspace on demand"
+[ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
+  fail "live spawn with no local_path: must fall back to ~/.mesa/workspace (got $(cat "$STUB_DIR/last-cwd"))"
 run 0 "$MESA" live stop >/dev/null
-ok "live start --project <id>: resolves by id; a pathless project runs the agent in \$HOME"
+ok "live start --project <id>: resolves by id; a pathless project runs the agent in ~/.mesa/workspace"
 
-# An unscoped session names itself `mesa live <id>` and also runs in $HOME.
+# An unscoped session names itself `mesa live <id>` and also runs in the workspace.
 run 0 "$MESA" live start
 S5=$(jqs .id)
 head -5 "$STUB_DIR/last-flags" | tail -1 >"$TMP/name"
@@ -1556,7 +1563,12 @@ grep -q 'Your only job is to write down what it was about' "$STUB_DIR/last-promp
   fail "live-summary spawn: the prompt argument must be core::live's summariser instructions"
 grep -q "summarising mesa live session $SUM4" "$STUB_DIR/last-prompt" ||
   fail "live-summary spawn: the prompt must name the session it is summarising"
-ok "live stop: spawns the live-summary template — the argv shape, the session name, one prompt argument"
+# The summariser is an unbound agent too — this session has no project, so it
+# must run in the workspace, never in $HOME (mesa task 1040: Claude Code never
+# persists folder trust for the home directory).
+[ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
+  fail "live-summary spawn: an unbound summariser must run in ~/.mesa/workspace (got $(cat "$STUB_DIR/last-cwd"))"
+ok "live stop: spawns the live-summary template — the argv shape, the session name, one prompt argument, the workspace cwd"
 
 # ---- the recall join: a stored summary reaches the NEXT conversation's
 #      spawned prompt (store -> prompt -> spawn_bg -> argv) ----

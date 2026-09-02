@@ -55,6 +55,17 @@ file itself instead of a directory — both are accepted, since "a config in
 `~/.mesa`" reads either way and a user who wrote one file shouldn't get a
 silent no-op.
 
+`~/.mesa` holds one other thing: **`workspace/`**, the working directory for
+every agent or shell mesa runs that is not bound to a project (the live agent
+and its summariser, an inbox-watcher dispatch, an unbound script, the global
+Terminal page, the `claude attach` client). It exists because Claude Code
+never persists folder trust for the home directory — trust accepted there is
+held for the current session only and is never written to disk, with no
+setting to change that — so anything interactive mesa started in `$HOME`
+re-prompted forever. `config::workspace_dir()` creates it on demand and is
+deliberately **independent of `MESA_CONFIG_FILE`**: that override moves the
+config *file*, not mesa's home.
+
 A value has **two modes**, chosen by the value itself: one line is an argv
 template (below), more than one is a bash script
 ([Script mode](#script-mode)). There is no mode key and nothing to migrate —

@@ -11,7 +11,7 @@
 # The config file is read at its REAL default location, so HOME is pointed at
 # a throwaway dir (MESA_CONFIG_FILE, the unit tests' seam, would sidestep the
 # path resolution this gate exists to check). That also suits the
-# inbox-watcher, which dispatches in $HOME.
+# inbox-watcher, which dispatches in $HOME/.mesa/workspace.
 #
 # Two stubs stand in for the outside world: `mytool` (the replacement command,
 # logging its argv) and `claude` (the built-in default's program, logging to a
@@ -135,6 +135,9 @@ export MESA_AURIS_BIN="$STUB_DIR/auris"
 # so the stubs' logged pwd would otherwise never match.
 mkdir -p "$TMP/home/.mesa" "$TMP/projA"
 FAKE_HOME=$(cd "$TMP/home" && pwd -P)
+# Where every unbound spawn (here: the inbox-watcher) runs — mesa creates it on
+# demand (mesa task 1040), so it deliberately does not exist yet.
+WORKSPACE="$FAKE_HOME/.mesa/workspace"
 DIR_A=$(cd "$TMP/projA" && pwd -P)
 CONFIG="$FAKE_HOME/.mesa/config.json"
 
@@ -199,9 +202,9 @@ grep -qx "$DIR_A|dispatch|one arg|--task|$TASK_A|--label|A: task a" "$ARGV_LOG" 
   fail "todo-watcher did not run the configured command: $(cat "$ARGV_LOG")"
 ok "todo-watcher runs the configured command, in the project folder, with {id}/{name} substituted (a quoted template token stays one arg; so does a name with spaces)"
 
-grep -qx "$FAKE_HOME|triage|$ITEM_1" "$ARGV_LOG" ||
+grep -qx "$WORKSPACE|triage|$ITEM_1" "$ARGV_LOG" ||
   fail "inbox-watcher did not run the configured command: $(cat "$ARGV_LOG")"
-ok "inbox-watcher runs the configured command in \$HOME with {id} substituted"
+ok "inbox-watcher runs the configured command in ~/.mesa/workspace with {id} substituted"
 
 [ "$(curl -sf "http://127.0.0.1:$PORT/api/tasks/$TASK_A" | jq -r .status)" = "in_progress" ] ||
   fail "a configured command must still be a real dispatch (task left unclaimed)"
@@ -374,7 +377,7 @@ ok "a multi-line todo-watcher runs as bash -c in the project folder, with MESA_I
   fail "an untrusted task name was parsed as shell syntax — script mode leaks"
 ok "a task name of \`\"; touch <file> #\` round-trips as one string: the body reaches bash verbatim, values arrive out-of-band"
 
-grep -Fqx "inbox-watcher|$FAKE_HOME|$ITEM_3|inbox $ITEM_3: script-mode triage|swe|<unset>" "$SCRIPT_LOG" ||
+grep -Fqx "inbox-watcher|$WORKSPACE|$ITEM_3|inbox $ITEM_3: script-mode triage|swe|<unset>" "$SCRIPT_LOG" ||
   fail "inbox-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
 ok "the inbox-watcher takes a script too, in its own cwd"
 
@@ -1108,7 +1111,7 @@ ok "the unconfigured todo-watcher keeps its built-in \`--agent swe --name <proje
 run 0 "$MESA" inbox add --task "$TASK_B" --kind change-request "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)
 wait_lines "$CLAUDE_LOG" 3
-grep -qx "$FAKE_HOME|--agent|swe|--name|inbox $ITEM_2: loki: find exits 0 on no match|--|/inbox-triage $ITEM_2" "$CLAUDE_LOG" ||
+grep -qx "$WORKSPACE|--agent|swe|--name|inbox $ITEM_2: loki: find exits 0 on no match|--|/inbox-triage $ITEM_2" "$CLAUDE_LOG" ||
   fail "the built-in inbox-watcher argv changed: $(cat "$CLAUDE_LOG")"
 ok "the unconfigured inbox-watcher keeps its built-in \`--name inbox <id>: <body> -- /inbox-triage <id>\` argv"
 

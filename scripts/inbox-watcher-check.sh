@@ -5,9 +5,11 @@
 # MESA_CLAUDE_BIN) to shrink the tick from 60s down to test speed.
 #
 # HOME is pointed at a throwaway dir for the server process: the inbox-watcher
-# dispatches in $HOME (an inbox item belongs to no project, so there is no
-# local_path to spawn in), and the stub logs its cwd — asserting against the
-# real home directory would be neither hermetic nor portable.
+# dispatches in $HOME/.mesa/workspace (an inbox item belongs to no project, so
+# there is no local_path to spawn in), and the stub logs its cwd — asserting
+# against the real home directory would be neither hermetic nor portable. That
+# the folder follows $HOME at all is what proves mesa's home lookup reads the
+# environment, not the passwd entry.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -73,6 +75,9 @@ chmod +x "$STUB_DIR/claude"
 # path, so the stub's logged pwd would otherwise never match the expectation.
 mkdir -p "$TMP/home" "$TMP/projA"
 FAKE_HOME=$(cd "$TMP/home" && pwd -P)
+# mesa creates this on demand (mesa task 1040); it deliberately does not exist
+# yet, and the dispatch assertions below are what prove it appears.
+WORKSPACE="$FAKE_HOME/.mesa/workspace"
 DIR_A=$(cd "$TMP/projA" && pwd -P)
 
 # A project with a real path and an actionable todo task, purely to prove the
@@ -136,13 +141,14 @@ sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 0 ] || fail "a failing spawn must log nothing"
 rm -f "$STUB_DIR/fail"
 
-# ---- flag ON: dispatches the pending item in $HOME with /inbox-triage <id> ----
+# ---- flag ON: dispatches the pending item in the workspace with /inbox-triage <id> ----
 
 wait_bg_lines 1
 LINE=$(head -1 "$BG_LOG")
-EXPECT="$FAKE_HOME|inbox $ITEM_1: khora: eval errors on undefined|/inbox-triage $ITEM_1"
+EXPECT="$WORKSPACE|inbox $ITEM_1: khora: eval errors on undefined|/inbox-triage $ITEM_1"
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
-ok "spawn failure releases the claim; the next tick retries and dispatches in \$HOME, prompt '/inbox-triage <id>', session named 'inbox <id>: <first body line>'"
+[ -d "$WORKSPACE" ] || fail "the dispatch folder ~/.mesa/workspace must be created on demand"
+ok "spawn failure releases the claim; the next tick retries and dispatches in ~/.mesa/workspace (created on demand), prompt '/inbox-triage <id>', session named 'inbox <id>: <first body line>'"
 
 # Triage sessions run under an agent persona too (default `swe`).
 [ "$(cat "$STUB_DIR/last-agent")" = "swe" ] ||
@@ -167,7 +173,7 @@ run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "loki: find exits
 ITEM_2=$(jqs .id)
 wait_bg_lines 2
 LINE=$(sed -n 2p "$BG_LOG")
-EXPECT="$FAKE_HOME|inbox $ITEM_2: loki: find exits 0 on no match|/inbox-triage $ITEM_2"
+EXPECT="$WORKSPACE|inbox $ITEM_2: loki: find exits 0 on no match|/inbox-triage $ITEM_2"
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
 ok "a new inbox item is dispatched on the next tick, with its own id"
 

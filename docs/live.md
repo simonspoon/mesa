@@ -696,7 +696,10 @@ takes exactly one value.
   stop signal the routine `status` poll used to be.
 - **`start` spawns the agent** through `agents::spawn_bg` with the
   `live-agent` command template (`docs/config.md`), in the project's
-  `local_path` when that is a live directory and `$HOME` otherwise — the
+  `local_path` when that is a live directory and `~/.mesa/workspace` otherwise
+  (`config::workspace_dir`, the folder every unbound agent runs in — Claude
+  Code never persists folder trust for the home directory, so a `$HOME` spawn
+  re-prompted forever; the live **summary** agent takes the same folder) — the
   inbox-watcher's fallback, for the same reason: a conversation is not scoped
   to a checkout (its `project_id` is optional and it outlives that project), so
   a missing or stale path is a session with no working folder, not a bad

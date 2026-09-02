@@ -301,11 +301,20 @@ Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
   **422 `validation`**; an unreadable/unwritable file is **502 `unavailable`**.
   The write is a temp-file rename, since the config is read on every spawn with
   no lock between the two.
-- The write is **loopback-only in both serve modes** — one notch stronger than
-  the agent routes, which `--lan` does open to LAN peers. Rewriting these
-  templates chooses the *program* mesa will execute on the next dispatch, so it
-  gets the `local_path` rule (`require_local_path_write`), not the agent one.
-  The read sits in the agents' class (`require_agent_access`).
+- The write is gated by **`require_agent_access`** — the same gate as the read
+  beside it (mesa task 1021, the reversal mesa task 1004 already made for the
+  library's eleven routes). In **default** mode that is strictly stronger than
+  the loopback-only check this route used to carry: loopback peer **plus**
+  local Host **plus** local Origin. Under **`--lan`** it *relaxes rather than
+  refuses* — a page this server handed a phone may edit Settings, while both
+  confused-deputy defenses stay shut (`require_lan_agent_host` for DNS
+  rebinding, `require_origin_matches_host` for a cross-site fetch). `--lan` is
+  already the opt-in "trust every device on this network" choice that hands
+  that network a terminal, a shell and script execution, so refusing it the
+  Settings page while granting it the shell was a distinction with no security
+  content. What stays loopback-only in both modes is the narrower set where
+  the capability differs in kind — the scripts' *authoring* routes,
+  `local_path`, `/api/fs/dirs` and the CC index reset.
 
 Nothing is cached: a save is live on the next dispatch, with no restart.
 
@@ -382,9 +391,9 @@ See `docs/cc-dashboard.md` for the permanent-loss property.
 - `PUT /api/config/pricing`, body `{"pricing": {"<prefix>": {rates} | null}}`
   → echoes the getter. Only the keys present are touched, so two editors can't
   clobber each other. A bad prefix or rate is **422 `validation`**. Gated with
-  `require_local_path_write` — **loopback-only in both serve modes**, exactly
-  like `PUT /api/config`: it is the same file, and which file a LAN peer may
-  rewrite is not a per-section question.
+  `require_agent_access` — exactly like `PUT /api/config` (mesa task 1021): it
+  is the same file, and which section a write lands in is not the distinction
+  that matters.
 
 `/api/config`'s own shape is unchanged — a bare `ConfigCommand[]` and
 `{commands: {…}}` — because that is what agents and `config-check.sh` assert.
@@ -432,9 +441,9 @@ the todo-watcher's per-project concurrency limit (mesa task 777,
 - `PUT /api/config/watchers`, body `{"todo_concurrency": <1..=20> | null}` →
   echoes the getter. `null` removes the key, restoring the default. An
   out-of-range or non-integer value is **422 `validation`**, writing nothing.
-  Gated with `require_local_path_write` — **loopback-only in both serve
-  modes**, the same posture as the other two config writes: it is the same
-  file, and which file a LAN peer may rewrite is not a per-section question.
+  Gated with `require_agent_access` — the same posture as the other two config
+  writes (mesa task 1021): it is the same file, and which section a write lands
+  in is not the distinction that matters.
 
 The sections are siblings over one document: saving `watchers` preserves
 `commands`, `pricing`, `speech`, `guard` and any section mesa doesn't know
@@ -499,8 +508,8 @@ reads an item in (mesa task 822, `docs/inbox.md`).
   getter. `null` **and** blank both remove the key, restoring the binary's own
   voice. A name that isn't a voice — or, when mesa has a list, isn't on it —
   is **422 `validation`**, writing nothing. Gated with
-  `require_local_path_write`: **loopback-only in both serve modes**, the same
-  posture as every other config write.
+  `require_agent_access`, the same posture as every other config write (mesa
+  task 1021).
 - `GET /api/config/speech/preview?voice=<name>` → `audio/wav`, streamed, no
   `Content-Length`: the **test** button beside the picker (mesa task 824),
   which is how a voice is heard *before* it is saved. Two things make it a
@@ -605,7 +614,8 @@ conversation starting).
   by the deserializer as a 400.) `prompt` is no longer a key this route
   accepts — naming it is the same "unknown live setting" mistake naming
   `voice` here always was, not a special case. Gated with
-  `require_local_path_write`: **loopback-only in both serve modes**.
+  `require_agent_access`, the same posture as every other config write (mesa
+  task 1021).
 
 ## Listen
 
@@ -666,8 +676,8 @@ mirror of Speech, above.
   getter. `null` **and** blank both remove the key, restoring the binary's own
   model. A name that isn't a model — or, when mesa has a list, isn't on it —
   is **422 `validation`**, writing nothing. Gated with
-  `require_local_path_write`: **loopback-only in both serve modes**, the same
-  posture as every other config write.
+  `require_agent_access`, the same posture as every other config write (mesa
+  task 1021).
 
 ## Guard
 
@@ -724,8 +734,8 @@ session against (mesa task 1018, `docs/cost-guard.md`).
   Absent leaves a key alone; `null` removes it, restoring the built-in. Any
   out-of-range or wrong-typed value is **422 `validation`**, writing nothing —
   the whole update is checked before the file is touched. Gated with
-  `require_local_path_write`: **loopback-only in both serve modes**, the same
-  posture as every other config write.
+  `require_agent_access`, the same posture as every other config write (mesa
+  task 1021).
 
 ## Gate
 

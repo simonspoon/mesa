@@ -1218,7 +1218,10 @@ fn router(state: AppState) -> Router {
         .route("/api/restart", post(restart_server))
         // The Settings page's view of `~/.mesa/config.json` — the three
         // agent-spawn command templates. Both verbs sit in the agents'
-        // capability class (see `get_config`/`update_config`), not task CRUD.
+        // capability class (see `get_config`/`update_config`), not task CRUD:
+        // as of mesa task 1021 every PUT here carries `require_agent_access`,
+        // the same gate as its GET, rather than the loopback-only check it
+        // used to (the reversal mesa task 1004 made for the library).
         .route("/api/config", get(get_config).put(update_config))
         // The same file's `pricing` section — the CC Dashboard's cost rates.
         // Separate routes so `/api/config`'s shape (a bare ConfigCommand[])
@@ -5662,23 +5665,27 @@ struct ConfigUpdate {
 
 /// `PUT /api/config` — writes command templates and echoes the new settings.
 ///
-/// **Loopback-only in both modes**, one notch stronger than the agent routes:
-/// this rewrites the argv mesa itself runs on the next dispatch, so a LAN peer
-/// under `--lan` (who may spawn an agent) still must not be able to choose the
-/// *program* that spawn executes. Same rule, and the same helper, as the
-/// `local_path` write — the other "execution input, not data" field.
+/// Gated by `require_agent_access` — the SAME gate as the `GET` beside it
+/// (mesa task 1021, the reversal mesa task 1004 already made for the eleven
+/// library routes). In **default** mode that is strictly stronger than the
+/// loopback-only check this route used to carry: loopback peer **plus** local
+/// Host **plus** local Origin. Under **`--lan`** it *relaxes rather than
+/// refuses* — a page this server handed a phone may edit Settings, while both
+/// confused-deputy defenses stay shut (`require_lan_agent_host` for DNS
+/// rebinding, `require_origin_matches_host` for a cross-site fetch). `--lan`
+/// is already the opt-in "trust every device on this network" posture that
+/// hands that network a terminal, a shell and script execution; refusing it
+/// the Settings page while granting it the shell was a distinction with no
+/// security content. What stays loopback-only in both modes is the narrower
+/// set where the capability differs in kind — the scripts' *authoring*
+/// routes, `local_path`, `/api/fs/dirs` and the CC index reset.
 async fn update_config(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ConfigUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     config::save_commands(&body.commands).map_err(|e| match e {
         config::SaveError::Validation(message) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -5727,22 +5734,16 @@ struct PricingUpdate {
 
 /// `PUT /api/config/pricing` — writes price rows and echoes the table.
 ///
-/// **Loopback-only in both modes**, like `update_config`: it is the same file,
-/// and a write that a LAN peer could aim at mesa's own config is exactly the
-/// thing that gate exists to stop — the section it lands in is not the
-/// distinction that matters.
+/// `require_agent_access`, like `update_config` (mesa task 1021): it is the
+/// same file, and the section a write lands in is not the distinction that
+/// matters.
 async fn update_config_pricing(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<PricingUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     config::save_pricing(&body.pricing).map_err(|e| match e {
         config::SaveError::Validation(message) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -5802,21 +5803,16 @@ where
 
 /// `PUT /api/config/watchers` — writes the watcher settings and echoes them.
 ///
-/// **Loopback-only in both modes**, like `update_config` and
-/// `update_config_pricing`: it is the same file mesa's own argv comes out of,
-/// and the section a write lands in is not the distinction that matters.
+/// `require_agent_access`, like `update_config` and `update_config_pricing`
+/// (mesa task 1021): it is the same file mesa's own argv comes out of, and the
+/// section a write lands in is not the distinction that matters.
 async fn update_config_watchers(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<WatchersUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut updates = HashMap::new();
     if let Some(value) = body.todo_concurrency {
         updates.insert(config::TODO_CONCURRENCY.to_string(), value);
@@ -5876,21 +5872,16 @@ struct GuardUpdate {
 
 /// `PUT /api/config/guard` — writes the guard thresholds and echoes them.
 ///
-/// **Loopback-only in both modes**, like every other config write: it is the
-/// same file mesa's own argv comes out of, and the section a write lands in is
-/// not the distinction that matters.
+/// `require_agent_access`, like every other config write (mesa task 1021): it
+/// is the same file mesa's own argv comes out of, and the section a write
+/// lands in is not the distinction that matters.
 async fn update_config_guard(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<GuardUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut updates = HashMap::new();
     for (key, value) in [
         (config::GUARD_COST_USD, body.cost_usd),
@@ -5975,21 +5966,16 @@ struct SpeechUpdate {
 
 /// `PUT /api/config/speech` — writes the voice and echoes the settings.
 ///
-/// **Loopback-only in both modes**, like every other config write: it is the
-/// same file mesa's own argv comes out of, and the section a write lands in is
-/// not the distinction that matters.
+/// `require_agent_access`, like every other config write (mesa task 1021): it
+/// is the same file mesa's own argv comes out of, and the section a write
+/// lands in is not the distinction that matters.
 async fn update_config_speech(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<SpeechUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut updates = HashMap::new();
     if let Some(value) = body.voice {
         updates.insert(config::VOICE.to_string(), value);
@@ -6045,7 +6031,7 @@ struct LiveUpdate {
 
 /// `PUT /api/config/live` — writes `auto-send-ms` and echoes the settings.
 ///
-/// **Loopback-only in both modes**, like every other config write. The
+/// `require_agent_access`, like every other config write (mesa task 1021). The
 /// live-conversation prompt itself moved to the library (mesa task 919) — a
 /// `library` route, not this one — so `LiveSection` now holds only the one
 /// key.
@@ -6055,12 +6041,7 @@ async fn update_config_live(
     headers: HeaderMap,
     Json(body): Json<LiveUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut updates = HashMap::new();
     if let Some(value) = body.auto_send_ms {
         updates.insert(config::LIVE_AUTO_SEND_MS.to_string(), value);
@@ -6121,21 +6102,16 @@ struct ListenUpdate {
 
 /// `PUT /api/config/listen` — writes the model and echoes the settings.
 ///
-/// **Loopback-only in both modes**, like every other config write: it is the
-/// same file mesa's own argv comes out of, and the section a write lands in is
-/// not the distinction that matters.
+/// `require_agent_access`, like every other config write (mesa task 1021): it
+/// is the same file mesa's own argv comes out of, and the section a write
+/// lands in is not the distinction that matters.
 async fn update_config_listen(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ListenUpdate>,
 ) -> ApiResult<Response> {
-    require_local_path_write(
-        &state,
-        &addr,
-        &headers,
-        "editing the mesa config is loopback-only; connect from this machine",
-    )?;
+    require_agent_access(&state, &addr, &headers)?;
     let mut updates = HashMap::new();
     if let Some(value) = body.model {
         updates.insert(config::MODEL.to_string(), value);
@@ -6739,9 +6715,12 @@ async fn get_cc_dashboard(
 /// the same code path as `mesa cc reset`). The corrective counterpart to
 /// `sync --rebuild`; the Settings page's confirmed operator action.
 ///
-/// **Loopback-only in both modes**, like `update_config`: it destroys stored
-/// history (a session whose transcript file is gone cannot come back), which
-/// is not a capability a LAN peer gets from `--lan`'s "trust the LAN" opt-in.
+/// **Loopback-only in both modes**, like the `local_path` write and
+/// `/api/fs/dirs` (and unlike the config writes beside it on the Settings
+/// page, which moved to `require_agent_access` in mesa task 1021): it destroys
+/// stored history (a session whose transcript file is gone cannot come back),
+/// which is not a capability a LAN peer gets from `--lan`'s "trust the LAN"
+/// opt-in.
 /// Being a mutation it also sits inside the Content-Type gate.
 ///
 /// No explicit cache invalidation: both CC caches are keyed by
@@ -8600,9 +8579,12 @@ mod tests {
     //
     // The round trip (read, write, validate, fall back) is covered by
     // `core::config`'s unit tests and, over HTTP against a real `~/.mesa`, by
-    // `scripts/config-check.sh`. What can only be asserted here is the gate:
-    // both handlers must refuse before they ever touch the file, since
-    // `config_file()` resolves off HOME and these tests share one process.
+    // `scripts/config-check.sh`. What can only be asserted here is the gate,
+    // whose peer-address half no same-machine curl can reach. A refusal test
+    // never touches the file at all; the one test below that expects a PUT to
+    // SUCCEED does write, so it pins `MESA_CONFIG_FILE` at a tempdir under
+    // `ENV_LOCK` — otherwise `config_file()` resolves off HOME and these tests
+    // share one process with the real `~/.mesa`.
 
     #[tokio::test]
     async fn get_config_rejects_non_loopback_peer_in_default_mode() {
@@ -8617,27 +8599,165 @@ mod tests {
         assert!(resp.unwrap_err().status.is_client_error());
     }
 
+    /// mesa task 1021's reversal, the same one mesa task 1004 made for the
+    /// eleven library routes: the seven config `PUT`s moved off the
+    /// loopback-only `require_local_path_write` onto `require_agent_access`,
+    /// the gate their own `GET` halves already carry. Under `--lan` a real LAN
+    /// page may therefore edit Settings, exactly as it may already open a
+    /// terminal or run a script — `--lan` is the opt-in "trust every device on
+    /// this network" posture that hands that network a shell, and refusing it
+    /// the Settings page while granting it the shell was a distinction with no
+    /// security content. In DEFAULT mode the new gate is strictly *stronger*
+    /// than the old one (loopback peer plus local Host plus local Origin).
+    ///
+    /// This has to be a Rust test rather than a curl in
+    /// `scripts/config-check.sh`: every curl from this machine arrives with a
+    /// LOOPBACK peer, so a shell script can only ever exercise the Host/Origin
+    /// half — the peer-address half needs a forged non-loopback `SocketAddr`
+    /// handed straight to the handler.
+    ///
+    /// All seven routes are named rather than a representative few, because a
+    /// route left out has NO regression pressure at all: reverting just that
+    /// one to `require_local_path_write` leaves both `cargo test` and
+    /// `scripts/config-check.sh` green — the shell script structurally (its
+    /// curl is always a loopback peer, which makes the two gates identical
+    /// under `--lan`) and the Rust suite by omission.
+    ///
+    /// The success half genuinely writes, so `MESA_CONFIG_FILE` is pinned at a
+    /// tempdir under `ENV_LOCK` and every body is a no-op (an empty map / all
+    /// keys absent) — the subject is the gate, not the section.
+    // `ENV_LOCK` is held across the handlers' `.await`s on purpose: it guards a
+    // process-global env var, and `#[tokio::test]` is a current-thread runtime,
+    // so no other task on it can contend for the guard while this one is
+    // parked. The lock must outlive every write for the same reason.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn update_config_rejects_non_loopback_peer_under_lan_mode() {
+    async fn lan_page_may_edit_the_config_but_not_from_a_rebound_page() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", cfg.path().join("config.json")) };
+
+        /// Puts a no-op body through all seven config writes and asserts each
+        /// one landed on `$ok` (`true` = the gate let it through).
+        macro_rules! all_seven {
+            ($state:expr, $peer:expr, $headers:expr, $ok:expr, $label:expr) => {{
+                let mut got: Vec<(&str, bool)> = Vec::new();
+                got.push((
+                    "",
+                    update_config(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(ConfigUpdate {
+                            commands: HashMap::new(),
+                        }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/pricing",
+                    update_config_pricing(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(PricingUpdate {
+                            pricing: HashMap::new(),
+                        }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/watchers",
+                    update_config_watchers(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(WatchersUpdate {
+                            todo_concurrency: None,
+                        }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/guard",
+                    update_config_guard(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(GuardUpdate {
+                            cost_usd: None,
+                            total_tokens: None,
+                            cache_read_share: None,
+                            cache_read_min_tokens: None,
+                        }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/speech",
+                    update_config_speech(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(SpeechUpdate { voice: None }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/live",
+                    update_config_live(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(LiveUpdate { auto_send_ms: None }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/listen",
+                    update_config_listen(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(ListenUpdate { model: None }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                for (route, ok) in got {
+                    assert_eq!(ok, $ok, "{} on PUT /api/config{}", $label, route);
+                }
+            }};
+        }
+
+        // A legitimate LAN page: IP-literal Host on our port, matching Origin.
         let (_dir, mut state) = test_state();
         state.lan = true;
-        // Host/Origin that `require_lan_page_access` would accept — a LAN peer
-        // that under `--lan` may spawn an agent still must not get to choose
-        // the program that spawn runs. Loopback-only in BOTH modes.
-        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        let resp = update_config(
-            State(state),
-            ConnectInfo(lan_peer()),
-            headers,
-            Json(ConfigUpdate {
-                commands: HashMap::from([(
-                    config::TODO_WATCHER.to_string(),
-                    "attacker-tool".to_string(),
-                )]),
-            }),
-        )
-        .await;
-        assert!(resp.unwrap_err().status.is_client_error());
+        let legit = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        all_seven!(state, lan_peer(), legit, true, "legit LAN page");
+
+        // The same LAN peer, rebound: a DNS-name Host is the only shape a
+        // rebinding page can send, and a foreign Origin is the cross-site
+        // fetch. Both defenses stay shut.
+        let rebound = hdrs(Some("evil.example:0"), Some("http://192.168.1.50:0"));
+        all_seven!(state, lan_peer(), rebound, false, "rebound Host");
+        let cross_site = hdrs(Some("192.168.1.50:0"), Some("https://evil.example"));
+        all_seven!(state, lan_peer(), cross_site, false, "foreign Origin");
+
+        // DEFAULT mode: the non-loopback peer is still refused outright, so
+        // nothing about the single-machine posture loosened.
+        state.lan = false;
+        all_seven!(state, lan_peer(), legit, false, "default mode, LAN peer");
     }
 
     // The pricing verbs share the config gates exactly — same file, same
@@ -8655,36 +8775,13 @@ mod tests {
         assert!(resp.unwrap_err().status.is_client_error());
     }
 
-    #[tokio::test]
-    async fn update_config_pricing_rejects_non_loopback_peer_under_lan_mode() {
-        let (_dir, mut state) = test_state();
-        state.lan = true;
-        let headers = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        let resp = update_config_pricing(
-            State(state),
-            ConnectInfo(lan_peer()),
-            headers,
-            Json(PricingUpdate {
-                pricing: HashMap::from([(
-                    "claude-opus".to_string(),
-                    Some(ModelRates {
-                        input: 0.0,
-                        output: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                    }),
-                )]),
-            }),
-        )
-        .await;
-        assert!(resp.unwrap_err().status.is_client_error());
-    }
-
     // --- CC index reset: POST /api/cc/reset (mesa task 698) -----------------
     //
     // The gate is what matters here: the handler destroys stored history, so
-    // it carries the config routes' loopback-only-in-BOTH-modes gate rather
-    // than the plain guard the /api/cc reads use. What it *does* is covered by
+    // it stays loopback-only in BOTH modes (`require_local_path_write`) — unlike
+    // the config writes beside it on the Settings page, which moved to
+    // `require_agent_access` in mesa task 1021 — rather than the plain guard
+    // the /api/cc reads use. What it *does* is covered by
     // `core::cc`'s tests and `scripts/cc-check.sh` against a synthetic tree.
 
     #[tokio::test]

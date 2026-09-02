@@ -501,8 +501,10 @@ api PUT /api/config/pricing '{"pricing": {"claude opus": {"input": 1, "output": 
   fail "a rejected pricing PUT must not touch the file: $(cat "$CONFIG")"
 ok "PUT /api/config/pricing rejects a negative rate and a whitespace-bearing prefix as 422 validation, writing nothing"
 
-# The write is loopback-only in both modes; from a loopback shell the reachable
-# half of that gate is the Host allowlist the same stack enforces.
+# Both verbs carry `require_agent_access` (mesa task 1021); from a loopback
+# shell the reachable half of that gate is the Host allowlist the same stack
+# enforces. The peer-address half needs a forged non-loopback SocketAddr, so it
+# lives in the Rust test `lan_page_may_edit_the_config_but_not_from_a_rebound_page`.
 CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
   "http://127.0.0.1:$PORT/api/config/pricing")
 [ "$CODE" = "403" ] || fail "GET pricing with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"

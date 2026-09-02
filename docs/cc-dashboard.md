@@ -308,7 +308,9 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   since deleted cannot be re-read and is gone permanently. So unlike
   `--rebuild` it *is* exposed to the UI, but only ever as a deliberate,
   confirmed **operator action** — `mesa cc reset` and `POST /api/cc/reset`
-  (loopback-only in both serve modes, like the config writes), reached from a
+  (loopback-only in both serve modes, like the `local_path` write and
+  `/api/fs/dirs` — and unlike the config writes beside it on that page, which
+  moved to `require_agent_access` in mesa task 1021), reached from a
   confirm button in Settings → Model pricing. No read path — `GET /api/cc`,
   `cc summary`, the auto-ingest — can trigger it. Both CC caches invalidate on
   their own, being keyed by `Store::cc_stamp`, which the purge moves (it is

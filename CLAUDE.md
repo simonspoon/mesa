@@ -12,6 +12,7 @@ contents here.
 
 ```bash
 scripts/build.sh      # the ONLY supported release build → target/release/mesa
+scripts/build.sh --verify   # same chain, types checked against the export not git — for an uncommitted tree
 scripts/install.sh    # build.sh + copy onto PATH (PREFIX=/usr/local overrides ~/.local/bin)
 ```
 

@@ -8,9 +8,25 @@
 # Fails if frontend/src/types/ is dirty, checked both before the export
 # (uncommitted manual edits) and after it (committed types stale against the
 # Rust definitions — regenerate and commit them).
+#
+# `--verify` runs the same chain against an uncommitted worktree: it asks
+# whether the types on disk *match* the export rather than whether git is
+# clean, by snapshotting frontend/src/types/ and diffing it after the export.
+# That is the same question for an agent that may not commit — it can have the
+# regenerated types exactly right and still have nothing but a dirty tree to
+# show for it — and git cleanliness is not consulted in this mode.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+verify=0
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--verify" ]; }; then
+  echo "usage: $(basename "$0") [--verify]" >&2
+  exit 2
+fi
+if [ "$#" -eq 1 ]; then
+  verify=1
+fi
 
 check_types_clean() {
   local dirty
@@ -51,9 +67,28 @@ fi
 # pinned order compiles (cargo test) before the frontend is built.
 mkdir -p frontend/dist
 
-check_types_clean "uncommitted edits to generated types"
+if [ "$verify" -eq 1 ]; then
+  types_snapshot=$(mktemp -d)
+  trap 'rm -rf "$types_snapshot"' EXIT
+  cp -R frontend/src/types/. "$types_snapshot/"
+else
+  check_types_clean "uncommitted edits to generated types"
+fi
+
 cargo test
-check_types_clean "export changed generated types; commit the regenerated files"
+
+if [ "$verify" -eq 1 ]; then
+  # -r also reports a file present on only one side, i.e. an export that adds
+  # or drops one.
+  if ! drift=$(diff -r "$types_snapshot" frontend/src/types); then
+    echo "FAIL: cargo test's export changed frontend/src/types/" \
+      "(types on disk are stale against the Rust definitions):" >&2
+    echo "$drift" >&2
+    exit 1
+  fi
+else
+  check_types_clean "export changed generated types; commit the regenerated files"
+fi
 
 # `npm ci` copies the lockfile to node_modules/.package-lock.json, so that file
 # is a reliable stamp of what is actually installed. Reinstall when it is

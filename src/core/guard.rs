@@ -37,6 +37,71 @@ pub const COST: &str = "cost";
 pub const TOKENS: &str = "tokens";
 /// The spin-loop rule: enormous volume that is almost entirely cache reads.
 pub const SPIN: &str = "spin";
+/// The repeat rule: the same trivial shell command, over and over.
+pub const REPEAT: &str = "repeat";
+
+/// What the watcher does about a breach (mesa task 1054).
+///
+/// A switch and not a boolean because the two answers are different postures
+/// rather than a feature being on or off, and because the default changed: the
+/// guard shipped reporting only, on the reasoning that a person should decide.
+/// The incident that followed — a session that ran `echo idle` 4,600 times
+/// across eight hours and $1,373 while three inbox items about it went unread
+/// — is what settled that argument. A person who is not there cannot decide.
+///
+/// Stopping is [`crate::core::agents::stop`], `claude stop <job id>`: the
+/// session's conversation survives it and `claude attach <job id>` resumes it,
+/// so the destructive-sounding verb is closer to a pause than a kill. Only a
+/// **background** session mesa can find a job id for can be stopped at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardAction {
+    /// Stop the session, then file the alert saying so. The built-in.
+    Stop,
+    /// File the alert and nothing else — the behaviour before task 1054.
+    Report,
+}
+
+impl GuardAction {
+    /// The config spelling, or `None` for a word mesa does not know — the
+    /// clamp posture every other guard key takes.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "stop" => Some(Self::Stop),
+            "report" => Some(Self::Report),
+            _ => None,
+        }
+    }
+
+    /// The config spelling of this action.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Report => "report",
+        }
+    }
+}
+
+/// What actually happened to a breaching session on this tick — the sentence
+/// the alert closes with, and the reason [`alert_body`] takes it as an
+/// argument rather than restating policy. A person reading an alert needs to
+/// know whether the thing is still running, and only the caller knows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum StopOutcome {
+    /// mesa ran `claude stop <job_id>` and it succeeded.
+    Stopped { job_id: String },
+    /// mesa found a session to stop on an earlier tick and already did.
+    AlreadyStopped,
+    /// mesa tried and could not; the session is still running.
+    StopFailed { reason: String },
+    /// No background job id names this session, so there is nothing mesa can
+    /// stop — an interactive session in someone's own terminal, or one started
+    /// by something other than `claude --bg`.
+    NotBackground,
+    /// The `report` action: mesa did not try.
+    Reported,
+}
 
 /// The resolved numbers one tick guards against, read fresh from
 /// `~/.mesa/config.json` each time (`core::config::guard_thresholds`). A plain
@@ -52,6 +117,12 @@ pub struct GuardThresholds {
     pub cache_read_share: f64,
     /// Tokens a session must have *before* `spin` is allowed to fire at all.
     pub cache_read_min_tokens: i64,
+    /// Identical trivial `Bash` calls in a row at or above which `repeat`
+    /// fires.
+    #[serde(rename = "repeat_count")]
+    pub repeat_count: u64,
+    /// What the watcher does about any of the above.
+    pub action: GuardAction,
 }
 
 /// One rule a session has tripped: which rule, what mesa measured, and the
@@ -109,6 +180,18 @@ pub fn breaches(session: &CcLiveSession, t: &GuardThresholds) -> Vec<GuardBreach
             });
         }
     }
+    // The one rule that reads a *shape* off the transcript rather than a
+    // number off the meter — and therefore the only one that can fire before
+    // any real money is spent.
+    if let Some(repeat) = &session.repeat
+        && repeat.count >= t.repeat_count
+    {
+        out.push(GuardBreach {
+            threshold: REPEAT,
+            observed: repeat.count as f64,
+            limit: t.repeat_count as f64,
+        });
+    }
     out
 }
 
@@ -138,6 +221,7 @@ pub fn alert_body(
     breaches: &[GuardBreach],
     window_minutes: i64,
     minutes: Option<i64>,
+    outcome: &StopOutcome,
 ) -> String {
     let short: String = session.session_id.chars().take(8).collect();
     let where_ = match (&session.project, &session.cwd) {
@@ -166,20 +250,46 @@ pub fn alert_body(
         status = session.status,
     );
     for b in breaches {
-        body.push_str(&explain(b));
+        body.push_str(&explain(b, session));
         body.push('\n');
     }
-    body.push_str(
-        "\nmesa does not stop sessions. If this one is working as intended, no action is \
-         needed; otherwise the session is the one to interrupt. Run `mesa cc guard` to see \
-         every live session currently over a threshold.\n",
-    );
+    body.push('\n');
+    body.push_str(&outcome_sentence(outcome));
+    body.push_str(" Run `mesa cc guard` to see every live session currently over a threshold.\n");
     body
+}
+
+/// What mesa did about it, as one spoken sentence. Every branch says plainly
+/// whether the session is still running, because that is the only thing a
+/// person woken by this alert actually needs to decide about.
+fn outcome_sentence(outcome: &StopOutcome) -> String {
+    match outcome {
+        StopOutcome::Stopped { job_id } => format!(
+            "mesa has stopped this session by running claude stop {job_id}. The conversation is \
+             not lost: run claude attach {job_id} to look at it or carry it on."
+        ),
+        StopOutcome::AlreadyStopped => {
+            "mesa already stopped this session on an earlier check, so it is not running now."
+                .to_string()
+        }
+        StopOutcome::StopFailed { reason } => format!(
+            "mesa tried to stop this session and could not: {reason}. It is still running, so it \
+             is the one to interrupt."
+        ),
+        StopOutcome::NotBackground => "mesa could not find a background session to stop, so it \
+             is still running. Only a session mesa started in the background can be stopped this \
+             way; this one has to be interrupted wherever it is running."
+            .to_string(),
+        StopOutcome::Reported => "mesa is configured to report rather than stop, so this session \
+             is still running. If it is working as intended, no action is needed; otherwise it is \
+             the one to interrupt."
+            .to_string(),
+    }
 }
 
 /// One breach as a sentence, saying what the rule means rather than restating
 /// its name — an inbox item is read by a person who did not write the config.
-fn explain(b: &GuardBreach) -> String {
+fn explain(b: &GuardBreach, session: &CcLiveSession) -> String {
     match b.threshold {
         COST => format!(
             "Cost: estimated spend of ${:.2} reached the ${:.2} guard threshold.",
@@ -196,6 +306,19 @@ fn explain(b: &GuardBreach) -> String {
             b.observed * 100.0,
             b.limit * 100.0
         ),
+        REPEAT => {
+            let command = session
+                .repeat
+                .as_ref()
+                .map(|r| r.command.as_str())
+                .unwrap_or("the same command");
+            format!(
+                "Repeat: this session has run the command {command} {} times in a row, at or \
+                 above the {} the guard allows, and each run produced almost no output. That is \
+                 an agent stuck in a loop rather than working.",
+                b.observed as i64, b.limit as i64
+            )
+        }
         other => format!("{other}: {} reached {}.", b.observed, b.limit),
     }
 }
@@ -236,6 +359,8 @@ pub struct GuardSessionReport {
     pub output_tokens: i64,
     pub est_cost_usd: f64,
     pub cache_read_share: f64,
+    /// The trailing run of identical trivial `Bash` calls, or `null`.
+    pub repeat: Option<crate::core::types::CcRepeat>,
     pub breaches: Vec<GuardBreach>,
     /// The task an alert about this session would name, resolved through
     /// [`resolve_task`]; `null` when nothing in mesa claims it.
@@ -343,6 +468,7 @@ pub fn report(store: &Store, live: &CcLive, thresholds: &GuardThresholds) -> Res
             output_tokens: session.tokens.output,
             est_cost_usd: session.est_cost_usd,
             cache_read_share: cache_read_share(session),
+            repeat: session.repeat.clone(),
             breaches,
             task_id: resolve_task(store, session)?,
         });
@@ -358,7 +484,7 @@ pub fn report(store: &Store, live: &CcLive, thresholds: &GuardThresholds) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::CcTokens;
+    use crate::core::types::{CcRepeat, CcTokens};
 
     fn thresholds() -> GuardThresholds {
         GuardThresholds {
@@ -366,6 +492,8 @@ mod tests {
             total_tokens: 100_000_000,
             cache_read_share: 0.98,
             cache_read_min_tokens: 20_000_000,
+            repeat_count: 30,
+            action: GuardAction::Stop,
         }
     }
 
@@ -394,6 +522,7 @@ mod tests {
             used_subagent: false,
             subagents: vec![],
             spark: vec![],
+            repeat: None,
         }
     }
 
@@ -533,7 +662,13 @@ mod tests {
     #[test]
     fn the_alert_body_is_speakable_prose_naming_the_session() {
         let s = session(1_413.72, 5_000_000, 520_000, 2_754_480_000);
-        let body = alert_body(&s, &breaches(&s, &thresholds()), 60, Some(475));
+        let body = alert_body(
+            &s,
+            &breaches(&s, &thresholds()),
+            60,
+            Some(475),
+            &StopOutcome::Reported,
+        );
         assert!(body.contains("c2b83256"), "{body}");
         assert!(body.contains(&s.session_id), "{body}");
         assert!(body.contains("project mesa"), "{body}");
@@ -545,8 +680,97 @@ mod tests {
     #[test]
     fn an_unknown_duration_is_simply_omitted() {
         let s = session(30.0, 1_000, 500, 1_000);
-        let body = alert_body(&s, &breaches(&s, &thresholds()), 60, None);
+        let body = alert_body(
+            &s,
+            &breaches(&s, &thresholds()),
+            60,
+            None,
+            &StopOutcome::Reported,
+        );
         assert!(!body.contains("running for"), "{body}");
+    }
+
+    fn looping(count: u64, command: &str) -> CcLiveSession {
+        let mut s = session(0.10, 5_000, 400, 1_000);
+        s.repeat = Some(CcRepeat {
+            command: command.to_string(),
+            count,
+        });
+        s
+    }
+
+    #[test]
+    fn repeat_fires_at_the_count_and_costs_nothing_to_reach() {
+        // The whole point of this rule: a session far under every money
+        // threshold is still a runaway if it is looping.
+        assert_eq!(kinds(&looping(30, "echo idle")), vec![REPEAT]);
+        assert_eq!(kinds(&looping(4_600, "echo idle")), vec![REPEAT]);
+        assert!(kinds(&looping(29, "echo idle")).is_empty());
+        assert!(kinds(&session(0.10, 5_000, 400, 1_000)).is_empty());
+    }
+
+    #[test]
+    fn a_repeat_breach_names_the_command_and_the_count() {
+        let s = looping(4_600, "echo idle");
+        let body = alert_body(
+            &s,
+            &breaches(&s, &thresholds()),
+            60,
+            Some(480),
+            &StopOutcome::Stopped {
+                job_id: "89dc6ccd".into(),
+            },
+        );
+        assert!(body.contains("echo idle"), "{body}");
+        assert!(body.contains("4600 times in a row"), "{body}");
+        assert!(!body.contains('|'), "no markdown tables: {body}");
+    }
+
+    #[test]
+    fn the_closing_sentence_says_what_happened_to_the_session() {
+        let s = looping(50, "echo ok");
+        let breaches = breaches(&s, &thresholds());
+        let body = |outcome: StopOutcome| alert_body(&s, &breaches, 60, None, &outcome);
+
+        let stopped = body(StopOutcome::Stopped {
+            job_id: "89dc6ccd".into(),
+        });
+        assert!(stopped.contains("claude stop 89dc6ccd"), "{stopped}");
+        assert!(stopped.contains("claude attach 89dc6ccd"), "{stopped}");
+
+        let already = body(StopOutcome::AlreadyStopped);
+        assert!(already.contains("already stopped"), "{already}");
+
+        let failed = body(StopOutcome::StopFailed {
+            reason: "claude stop 89dc6ccd failed: no such session".into(),
+        });
+        assert!(failed.contains("could not: claude stop"), "{failed}");
+        assert!(failed.contains("still running"), "{failed}");
+
+        let not_bg = body(StopOutcome::NotBackground);
+        assert!(
+            not_bg.contains("could not find a background session"),
+            "{not_bg}"
+        );
+
+        let reported = body(StopOutcome::Reported);
+        assert!(reported.contains("report rather than stop"), "{reported}");
+
+        // Every outcome still points at the read-only inspector.
+        for text in [stopped, failed, not_bg, reported] {
+            assert!(text.contains("mesa cc guard"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_action_is_two_words_and_nothing_else() {
+        assert_eq!(GuardAction::parse("stop"), Some(GuardAction::Stop));
+        assert_eq!(GuardAction::parse("report"), Some(GuardAction::Report));
+        assert_eq!(GuardAction::parse("pause"), None);
+        assert_eq!(GuardAction::parse("Stop"), None);
+        assert_eq!(GuardAction::parse(""), None);
+        assert_eq!(GuardAction::Stop.as_str(), "stop");
+        assert_eq!(GuardAction::Report.as_str(), "report");
     }
 
     #[test]

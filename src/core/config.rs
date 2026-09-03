@@ -128,7 +128,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::core::guard::GuardThresholds;
+use crate::core::guard::{GuardAction, GuardThresholds};
 use crate::core::listen;
 use crate::core::speech;
 use crate::core::types::{
@@ -1793,11 +1793,19 @@ pub const GUARD_CACHE_READ_SHARE: &str = "cache-read-share";
 /// will fire at all.
 pub const GUARD_CACHE_READ_MIN_TOKENS: &str = "cache-read-min-tokens";
 
+/// The config key holding how many identical trivial `Bash` calls in a row
+/// fire the repeat rule.
+pub const GUARD_REPEAT_COUNT: &str = "repeat-count";
+/// The config key holding what the watcher does about a breach.
+pub const GUARD_ACTION: &str = "action";
+
 /// Every key the `guard` section understands, for the unknown-key error.
 const GUARD_KEYS: &[&str] = &[
+    GUARD_ACTION,
     GUARD_CACHE_READ_MIN_TOKENS,
     GUARD_CACHE_READ_SHARE,
     GUARD_COST_USD,
+    GUARD_REPEAT_COUNT,
     GUARD_TOTAL_TOKENS,
 ];
 
@@ -1831,6 +1839,22 @@ pub const MIN_GUARD_CACHE_READ_SHARE: f64 = 0.5;
 /// separates "reading its context" from "reading its context forever".
 pub const DEFAULT_GUARD_CACHE_READ_MIN_TOKENS: i64 = 20_000_000;
 
+/// Identical trivial `Bash` calls in a row at which a session is reported.
+///
+/// Thirty, because no honest workflow runs one command that produces nothing
+/// thirty times without a different tool call in between — and because the
+/// motivating loop reached 4,600. It is deliberately well above the handful of
+/// retries a polling loop legitimately makes.
+pub const DEFAULT_GUARD_REPEAT_COUNT: i64 = 30;
+
+/// The largest repeat count the editor will write — the [`MAX_GUARD_COST_USD`]
+/// sanity bound, not a policy. Past it the rule could never fire.
+pub const MAX_GUARD_REPEAT_COUNT: i64 = 100_000;
+
+/// What the watcher does about a breach when the config says nothing:
+/// **stop** the session (`docs/cost-guard.md`, mesa task 1054).
+pub const DEFAULT_GUARD_ACTION: GuardAction = GuardAction::Stop;
+
 /// The `guard` map, deserialized on its own for the reason every other section
 /// is: independent features share one file, and a broken value in any of them
 /// must not take the others down.
@@ -1850,6 +1874,14 @@ struct GuardSection {
     cache_read_share: Option<f64>,
     #[serde(default, rename = "cache-read-min-tokens")]
     cache_read_min_tokens: Option<i64>,
+    #[serde(default, rename = "repeat-count")]
+    repeat_count: Option<i64>,
+    /// Kept as the raw string the file holds, not a parsed [`GuardAction`]: a
+    /// word mesa does not know falls back to the built-in on the watcher's
+    /// side and is still shown **verbatim** by the editor, the clamp posture
+    /// every other key in this section takes.
+    #[serde(default)]
+    action: Option<String>,
 }
 
 fn read_guard(path: &Path) -> Result<GuardSection, String> {
@@ -1897,6 +1929,15 @@ fn guard_thresholds_in(path: &Path) -> Result<GuardThresholds, String> {
             .cache_read_min_tokens
             .filter(|v| *v >= 1)
             .unwrap_or(DEFAULT_GUARD_CACHE_READ_MIN_TOKENS),
+        repeat_count: section
+            .repeat_count
+            .filter(|v| (1..=MAX_GUARD_REPEAT_COUNT).contains(v))
+            .unwrap_or(DEFAULT_GUARD_REPEAT_COUNT) as u64,
+        action: section
+            .action
+            .as_deref()
+            .and_then(GuardAction::parse)
+            .unwrap_or(DEFAULT_GUARD_ACTION),
     })
 }
 
@@ -1921,6 +1962,10 @@ fn guard_in(path: &Path) -> Result<ConfigGuard, String> {
         cache_read_share_default: DEFAULT_GUARD_CACHE_READ_SHARE,
         cache_read_min_tokens: section.cache_read_min_tokens,
         cache_read_min_tokens_default: DEFAULT_GUARD_CACHE_READ_MIN_TOKENS,
+        repeat_count: section.repeat_count,
+        repeat_count_default: DEFAULT_GUARD_REPEAT_COUNT,
+        action: section.action,
+        action_default: DEFAULT_GUARD_ACTION.as_str().to_string(),
     })
 }
 
@@ -2035,6 +2080,35 @@ fn validate_guard(key: &str, value: &serde_json::Value) -> Result<(), String> {
             if !v.is_finite() || !(MIN_GUARD_CACHE_READ_SHARE..=1.0).contains(&v) {
                 return Err(format!(
                     "{key} must be between {MIN_GUARD_CACHE_READ_SHARE} and 1, got {v}"
+                ));
+            }
+        }
+        GUARD_REPEAT_COUNT => {
+            let Some(v) = value.as_i64() else {
+                return Err(format!(
+                    "{key} must be a whole number of repeats between 1 and \
+                     {MAX_GUARD_REPEAT_COUNT}, got {value}"
+                ));
+            };
+            if !(1..=MAX_GUARD_REPEAT_COUNT).contains(&v) {
+                return Err(format!(
+                    "{key} must be between 1 and {MAX_GUARD_REPEAT_COUNT}, got {v}"
+                ));
+            }
+        }
+        GUARD_ACTION => {
+            let Some(v) = value.as_str() else {
+                return Err(format!(
+                    "{key} must be the string \"{}\" or \"{}\", got {value}",
+                    GuardAction::Stop.as_str(),
+                    GuardAction::Report.as_str()
+                ));
+            };
+            if GuardAction::parse(v).is_none() {
+                return Err(format!(
+                    "{key} must be \"{}\" or \"{}\", got {v:?}",
+                    GuardAction::Stop.as_str(),
+                    GuardAction::Report.as_str()
                 ));
             }
         }
@@ -2186,6 +2260,118 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn the_repeat_count_and_action_read_defaults_clamp_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Absent: the built-ins, and stopping is the built-in posture.
+        let path = write_config(dir.path(), r#"{}"#);
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.repeat_count, DEFAULT_GUARD_REPEAT_COUNT as u64);
+        assert_eq!(t.action, GuardAction::Stop);
+        let shown = guard_in(&path).unwrap();
+        assert_eq!(shown.repeat_count, None);
+        assert_eq!(shown.action, None);
+        assert_eq!(shown.repeat_count_default, 30);
+        assert_eq!(shown.action_default, "stop");
+
+        // Configured: both honoured, with no restart in between.
+        let path = write_config(
+            dir.path(),
+            r#"{"guard": {"repeat-count": 5, "action": "report"}}"#,
+        );
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.repeat_count, 5);
+        assert_eq!(t.action, GuardAction::Report);
+
+        // Hand-edited nonsense of the right *type* clamps to the built-in for
+        // that key alone, and the editor still shows the file verbatim — the
+        // posture every other key in this section takes.
+        let path = write_config(
+            dir.path(),
+            r#"{"guard": {"repeat-count": 0, "action": "pause", "cost-usd": 12.0}}"#,
+        );
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.repeat_count, DEFAULT_GUARD_REPEAT_COUNT as u64);
+        assert_eq!(t.action, GuardAction::Stop);
+        assert_eq!(t.cost_usd, 12.0);
+        let shown = guard_in(&path).unwrap();
+        assert_eq!(shown.repeat_count, Some(0));
+        assert_eq!(shown.action.as_deref(), Some("pause"));
+
+        // A value of the wrong type is still an error on read, so the tick
+        // skips rather than guessing.
+        let path = write_config(dir.path(), r#"{"guard": {"action": 3}}"#);
+        assert!(guard_thresholds_in(&path).is_err());
+    }
+
+    #[test]
+    fn save_guard_rejects_a_bad_repeat_count_or_action_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"guard": {"cost-usd": 12.0}}"#;
+        let path = write_config(dir.path(), before);
+        for (label, key, value) in [
+            ("zero repeats", GUARD_REPEAT_COUNT, serde_json::json!(0)),
+            (
+                "negative repeats",
+                GUARD_REPEAT_COUNT,
+                serde_json::json!(-4),
+            ),
+            (
+                "fractional repeats",
+                GUARD_REPEAT_COUNT,
+                serde_json::json!(2.5),
+            ),
+            (
+                "past the sanity bound",
+                GUARD_REPEAT_COUNT,
+                serde_json::json!(100_001),
+            ),
+            (
+                "repeats as text",
+                GUARD_REPEAT_COUNT,
+                serde_json::json!("30"),
+            ),
+            (
+                "an unknown action",
+                GUARD_ACTION,
+                serde_json::json!("pause"),
+            ),
+            (
+                "a capitalised action",
+                GUARD_ACTION,
+                serde_json::json!("Stop"),
+            ),
+            ("an action as a number", GUARD_ACTION, serde_json::json!(1)),
+            ("an action as a bool", GUARD_ACTION, serde_json::json!(true)),
+        ] {
+            let err = save_guard_in(&path, &guard_update(&[(key, Some(value))])).unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "{label}: {err:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{label}");
+        }
+        // Both good values write, and `null` puts each back to the built-in.
+        save_guard_in(
+            &path,
+            &guard_update(&[
+                (GUARD_REPEAT_COUNT, Some(serde_json::json!(4))),
+                (GUARD_ACTION, Some(serde_json::json!("report"))),
+            ]),
+        )
+        .unwrap();
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.repeat_count, 4);
+        assert_eq!(t.action, GuardAction::Report);
+        save_guard_in(
+            &path,
+            &guard_update(&[(GUARD_REPEAT_COUNT, None), (GUARD_ACTION, None)]),
+        )
+        .unwrap();
+        let t = guard_thresholds_in(&path).unwrap();
+        assert_eq!(t.repeat_count, DEFAULT_GUARD_REPEAT_COUNT as u64);
+        assert_eq!(t.action, GuardAction::Stop);
+        assert_eq!(t.cost_usd, 12.0, "the sibling key is untouched");
     }
 
     #[test]

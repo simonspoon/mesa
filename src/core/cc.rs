@@ -60,10 +60,10 @@ use super::store::{
 use super::types::{
     CcAgentStat, CcChatAsk, CcChatOption, CcChatQuestion, CcChatTurn, CcChatTurnKind, CcDashboard,
     CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent,
-    CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview, CcProjectStat, CcSessionBucket,
-    CcSessionChat, CcSessionDetail, CcSessionGraph, CcSessionModelStat, CcSessionRow,
-    CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat,
-    CcUsage,
+    CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview, CcProjectStat, CcRepeat,
+    CcSessionBucket, CcSessionChat, CcSessionDetail, CcSessionGraph, CcSessionModelStat,
+    CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat,
+    CcTokens, CcToolStat, CcUsage,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -214,6 +214,69 @@ impl RawMessage {
             .collect()
     }
 
+    /// The `(tool_use_id, result_bytes)` of every `tool_result` block in this
+    /// message — the `user` line that carries a tool's output back into the
+    /// conversation. `result_bytes` is how long that output is: a string
+    /// block's own length, an array of blocks' summed `text` lengths, and any
+    /// other shape's compact JSON length.
+    ///
+    /// Only the **size** is read, never the content. The repeat rule asks one
+    /// question of a result — "did this command actually produce anything" —
+    /// and a size answers it without a second unbounded payload entering the
+    /// process.
+    fn tool_results(&self) -> Vec<(String, usize)> {
+        let Some(blocks) = self.content.as_ref().and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .filter_map(|b| {
+                let id = b.get("tool_use_id")?.as_str()?;
+                Some((id.to_string(), result_len(b.get("content"))))
+            })
+            .collect()
+    }
+
+    /// Every tool call in this message as `(tool_use_id, bash_command)`, where
+    /// `bash_command` is `Some` only for a `Bash` call carrying a string
+    /// `command`. A call to any other tool is present with `None`, because the
+    /// repeat rule needs to see it: one `Read` in the middle of a run of
+    /// `echo idle` is what ends the run.
+    ///
+    /// The command is the **full**, unsanitized text, deliberately not
+    /// [`tool_target`]'s 200-char copy: the rule compares two commands for
+    /// equality, and a cap would call two different long commands the same. It
+    /// is compared and counted here, never stored — only the sanitized capped
+    /// copy on [`crate::core::types::CcRepeat`] leaves this module.
+    fn tool_calls(&self) -> Vec<(String, Option<String>)> {
+        let Some(blocks) = self.content.as_ref().and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("tool_use") | Some("server_tool_use")
+                )
+            })
+            .filter_map(|b| {
+                let id = b.get("id")?.as_str()?.to_string();
+                let command = match b.get("name").and_then(|n| n.as_str()) {
+                    Some("Bash") => b
+                        .get("input")
+                        .and_then(|i| i.as_object())
+                        .and_then(|o| o.get("command"))
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string),
+                    _ => None,
+                };
+                Some((id, command))
+            })
+            .collect()
+    }
+
     /// This message's prose: the `text` of every `type: "text"` block, in
     /// array order, joined with a single space and then run once through
     /// [`sanitize_capped`]. `None` when `content` is not an array (a user
@@ -249,6 +312,24 @@ impl RawMessage {
         } else {
             Some(joined)
         }
+    }
+}
+
+/// How many bytes of output a `tool_result` block's `content` carries. `0` for
+/// an absent or null content — a command that produced nothing is the
+/// *most* trivial case, not an unknown one.
+fn result_len(content: Option<&serde_json::Value>) -> usize {
+    match content {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(serde_json::Value::String(s)) => s.len(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .map(|b| match b.get("text").and_then(|t| t.as_str()) {
+                Some(text) => text.len(),
+                None => b.to_string().len(),
+            })
+            .sum(),
+        Some(other) => other.to_string().len(),
     }
 }
 
@@ -1265,6 +1346,120 @@ struct LiveAcc {
     subagents: HashMap<String, SubAcc>,
     /// One total-token bucket per window minute (oldest→newest).
     spark: Vec<i64>,
+    /// Rolling state for the repeat rule.
+    repeat: RepeatAcc,
+}
+
+/// How long a `tool_result` may be and still count as **trivial**, in bytes.
+///
+/// Sixteen, because the incident this rule exists for ran `echo idle`
+/// (`"idle\n"`, 5 bytes) and `echo ok` (3) thousands of times in a row. A real
+/// command — a build, a test run, a `git status`, even an `ls` — clears this
+/// in its first line. The point of the floor is that a *loop* is only worth
+/// reporting when the loop is doing nothing: an agent legitimately re-running
+/// one long-output command is making progress, or at least producing something
+/// a person can read.
+pub const REPEAT_TRIVIAL_OUTPUT_BYTES: usize = 16;
+
+/// The trailing run of identical trivial `Bash` calls in one session, tracked
+/// as the transcript is read.
+///
+/// Everything that is not "the same trivial command again" ends the run: a
+/// different command, a call to any other tool, or a result too long to be
+/// trivial. Only the tail matters, so the run itself is three fields — the
+/// command, its length so far, and the calls whose results have not landed
+/// yet.
+///
+/// One assistant message may carry **several** `tool_use` blocks, dispatched
+/// in parallel, so the in-flight calls are a list and not one slot. Holding
+/// only the newest id let an earlier block's real output go unmatched: the
+/// run kept climbing through a command that was plainly doing something, and
+/// under the built-in `stop` action that is a working session stopped for
+/// nothing.
+#[derive(Default)]
+struct RepeatAcc {
+    /// The command the current run is made of; `None` when there is no run.
+    command: Option<String>,
+    /// How many times it has been run in a row.
+    count: u64,
+    /// The `tool_use_id`s dispatched but not yet answered, so each result
+    /// pairs back to its own call.
+    pending: Vec<String>,
+    /// Every `tool_use_id` already counted. One API response is written as
+    /// several transcript lines, and re-reading a block must not count the
+    /// call twice — kept separately from `pending` because a call stops being
+    /// in flight the moment its result lands but never stops being counted.
+    seen: Vec<String>,
+}
+
+/// How many ids [`RepeatAcc`] remembers on each of its two lists.
+///
+/// A bound, not a policy: a call whose result never arrives inside the guard
+/// window would otherwise sit on `pending` forever. Real parallel batches are
+/// a handful of blocks and a duplicated line follows within one or two, so
+/// this is orders of magnitude more history than either job needs.
+const REPEAT_ID_MEMORY: usize = 64;
+
+impl RepeatAcc {
+    /// One tool call, in transcript order.
+    fn call(&mut self, id: &str, command: Option<&str>) {
+        if self.seen.iter().any(|s| s == id) {
+            // The same block, re-emitted on a second line of one response.
+            return;
+        }
+        match command {
+            Some(cmd) if self.command.as_deref() == Some(cmd) => self.count += 1,
+            Some(cmd) => {
+                self.command = Some(cmd.to_string());
+                self.count = 1;
+            }
+            // Any other tool ends the run.
+            None => {
+                self.command = None;
+                self.count = 0;
+            }
+        }
+        remember(&mut self.seen, id);
+        remember(&mut self.pending, id);
+    }
+
+    /// One tool result, paired by `tool_use_id`. A result too long to be
+    /// trivial ends the run: the command was doing something.
+    ///
+    /// A result for a call this session never saw dispatched is ignored — it
+    /// belongs to a block outside the window, and nothing can be concluded
+    /// from it.
+    fn result(&mut self, id: &str, bytes: usize) {
+        let Some(at) = self.pending.iter().position(|p| p == id) else {
+            return;
+        };
+        self.pending.remove(at);
+        if bytes >= REPEAT_TRIVIAL_OUTPUT_BYTES {
+            self.command = None;
+            self.count = 0;
+        }
+    }
+
+    /// What the session reports, `None` when it is not in a run.
+    fn finish(self) -> Option<CcRepeat> {
+        let command = self.command?;
+        if self.count == 0 {
+            return None;
+        }
+        Some(CcRepeat {
+            command: sanitize_capped(&command).unwrap_or_default(),
+            count: self.count,
+        })
+    }
+}
+
+/// Pushes `id` onto a bounded most-recent-last list, dropping the oldest entry
+/// once it is full.
+fn remember(ids: &mut Vec<String>, id: &str) {
+    if ids.len() >= REPEAT_ID_MEMORY {
+        ids.remove(0);
+    }
+    ids.push(id.to_string());
 }
 
 /// Per-subagent accumulator within a live session (keyed by `agentId`).
@@ -1362,6 +1557,7 @@ pub fn live(window_minutes: i64) -> CcLive {
                 used_subagent: s.sidechain,
                 subagents,
                 spark: s.spark,
+                repeat: s.repeat.finish(),
             }
         })
         .collect();
@@ -1458,6 +1654,22 @@ fn parse_live_file(
             }
             if sub.skill.is_none() {
                 sub.skill = raw.attribution_skill.clone();
+            }
+        }
+
+        // The repeat rule, tracked before the usage gate below: a tool
+        // *result* arrives on a `user` line, which carries no usage at all.
+        // Sidechain lines are skipped — a subagent's own loop is its own
+        // transcript, and interleaving it here would break a main-thread run
+        // that is genuinely unbroken.
+        if raw.is_sidechain != Some(true)
+            && let Some(message) = raw.message.as_ref()
+        {
+            for (id, command) in message.tool_calls() {
+                s.repeat.call(&id, command.as_deref());
+            }
+            for (id, bytes) in message.tool_results() {
+                s.repeat.result(&id, bytes);
             }
         }
 
@@ -3715,6 +3927,269 @@ mod tests {
         assert_eq!(s.spark.len(), 15);
         assert_eq!(s.spark.iter().sum::<i64>(), 150);
         assert_eq!(s.spark[13] + s.spark[14], 150);
+    }
+
+    /// One `assistant` line carrying a single tool call, and the `user` line
+    /// that carries its result back — the exact pair a real transcript writes.
+    fn tool_pair(session: &str, id: &str, tool: &str, command: &str, result: &str) -> Vec<String> {
+        let input = if tool == "Bash" {
+            format!(r#"{{"command":{}}}"#, json_str(command))
+        } else {
+            format!(r#"{{"file_path":{}}}"#, json_str(command))
+        };
+        vec![
+            format!(
+                r#"{{"type":"assistant","sessionId":"{session}","timestamp":"{ts}","cwd":"/home/me/work/widget","message":{{"model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"{id}","name":"{tool}","input":{input}}}],"usage":{{"input_tokens":5,"output_tokens":5}}}}}}"#,
+                ts = iso_at(30)
+            ),
+            format!(
+                r#"{{"type":"user","sessionId":"{session}","timestamp":"{ts}","message":{{"role":"user","content":[{{"tool_use_id":"{id}","type":"tool_result","content":{result}}}]}}}}"#,
+                ts = iso_at(29),
+                result = json_str(result)
+            ),
+        ]
+    }
+
+    fn json_str(raw: &str) -> String {
+        serde_json::Value::String(raw.to_string()).to_string()
+    }
+
+    #[test]
+    fn a_run_of_trivial_bash_calls_is_counted_and_everything_else_ends_it() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-repeat-project");
+        fs::create_dir_all(&proj).unwrap();
+
+        let mut lines: Vec<String> = Vec::new();
+        // A plain run of three.
+        for i in 0..3 {
+            lines.extend(tool_pair(
+                "loop",
+                &format!("t{i}"),
+                "Bash",
+                "echo idle",
+                "idle\n",
+            ));
+        }
+        // A different *tool* in the middle resets the run.
+        for i in 0..2 {
+            lines.extend(tool_pair(
+                "mixed",
+                &format!("m{i}"),
+                "Bash",
+                "echo idle",
+                "idle\n",
+            ));
+        }
+        lines.extend(tool_pair("mixed", "mr", "Read", "/etc/hosts", "ok\n"));
+        lines.extend(tool_pair("mixed", "m9", "Bash", "echo idle", "idle\n"));
+        // A different *command* starts a new run.
+        for i in 0..2 {
+            lines.extend(tool_pair(
+                "switch",
+                &format!("s{i}"),
+                "Bash",
+                "echo idle",
+                "idle\n",
+            ));
+        }
+        lines.extend(tool_pair("switch", "s9", "Bash", "echo ok", "ok\n"));
+        // A result too long to be trivial ends the run outright.
+        for i in 0..2 {
+            lines.extend(tool_pair(
+                "noisy",
+                &format!("n{i}"),
+                "Bash",
+                "echo idle",
+                "idle\n",
+            ));
+        }
+        lines.extend(tool_pair(
+            "noisy",
+            "n9",
+            "Bash",
+            "echo idle",
+            "this line is comfortably past sixteen bytes\n",
+        ));
+        // The same block re-emitted on a second transcript line counts once.
+        let dupe = tool_pair("dupe", "d0", "Bash", "echo idle", "idle\n");
+        lines.push(dupe[0].clone());
+        lines.push(dupe[0].clone());
+        lines.push(dupe[1].clone());
+        // A subagent's own loop is not the main thread's.
+        for i in 0..5 {
+            let pair = tool_pair("sidechain", &format!("x{i}"), "Bash", "echo idle", "idle\n");
+            for line in pair {
+                lines.push(line.replace(
+                    r#""type":"assistant""#,
+                    r#""type":"assistant","isSidechain":true"#,
+                ));
+            }
+        }
+
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        write_jsonl(&proj, "repeat.jsonl", &refs);
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
+        }
+        let l = live(15);
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        let repeat = |id: &str| {
+            l.sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .unwrap_or_else(|| panic!("no session {id}"))
+                .repeat
+                .clone()
+        };
+
+        let run = repeat("loop").expect("a run of three trivial echoes");
+        assert_eq!(run.count, 3);
+        assert_eq!(run.command, "echo idle");
+
+        assert_eq!(repeat("mixed").unwrap().count, 1, "a Read ends the run");
+        let switched = repeat("switch").unwrap();
+        assert_eq!(switched.count, 1);
+        assert_eq!(switched.command, "echo ok");
+        assert!(repeat("noisy").is_none(), "a real output ends the run");
+        assert_eq!(repeat("dupe").unwrap().count, 1, "one block, counted once");
+        assert!(
+            repeat("sidechain").is_none(),
+            "a subagent's loop is its own"
+        );
+    }
+
+    /// One assistant message carrying SEVERAL `tool_use` blocks, and the one
+    /// user message that carries all their results back — the parallel-batch
+    /// shape, as opposed to [`tool_pair`]'s one-at-a-time one.
+    fn parallel_batch(session: &str, calls: &[(&str, &str, &str)]) -> Vec<String> {
+        let uses: Vec<String> = calls
+            .iter()
+            .map(|(id, command, _)| {
+                format!(
+                    r#"{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":{}}}}}"#,
+                    json_str(command)
+                )
+            })
+            .collect();
+        let results: Vec<String> = calls
+            .iter()
+            .map(|(id, _, result)| {
+                format!(
+                    r#"{{"tool_use_id":"{id}","type":"tool_result","content":{}}}"#,
+                    json_str(result)
+                )
+            })
+            .collect();
+        vec![
+            format!(
+                r#"{{"type":"assistant","sessionId":"{session}","timestamp":"{ts}","cwd":"/home/me/work/widget","message":{{"model":"claude-opus-4-8","content":[{}],"usage":{{"input_tokens":5,"output_tokens":5}}}}}}"#,
+                uses.join(","),
+                ts = iso_at(28)
+            ),
+            format!(
+                r#"{{"type":"user","sessionId":"{session}","timestamp":"{ts}","message":{{"role":"user","content":[{}]}}}}"#,
+                results.join(","),
+                ts = iso_at(27)
+            ),
+        ]
+    }
+
+    #[test]
+    fn one_real_result_in_a_parallel_batch_still_ends_the_run() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("-parallel-project");
+        fs::create_dir_all(&proj).unwrap();
+
+        // 66 bytes: an ordinary command's first line of output, far past the
+        // 16-byte triviality floor.
+        let real = "warning: 3 targets rebuilt; 1 test failed in crates/widget-core-xy";
+        assert_eq!(real.len(), 66);
+        assert!(real.len() > REPEAT_TRIVIAL_OUTPUT_BYTES);
+
+        let mut lines: Vec<String> = Vec::new();
+        // Five serial trivial calls build a run…
+        for (session, order) in [("first-real", true), ("last-real", false)] {
+            for i in 0..5 {
+                lines.extend(tool_pair(
+                    session,
+                    &format!("{session}-s{i}"),
+                    "Bash",
+                    "echo idle",
+                    "idle\n",
+                ));
+            }
+            // …then one message dispatches two blocks at once, and only ONE of
+            // them comes back with real output. Whichever order the results
+            // land in, the run is over: that command was doing something.
+            let a = (
+                format!("{session}-pa"),
+                "echo idle".to_string(),
+                real.to_string(),
+            );
+            let b = (
+                format!("{session}-pb"),
+                "echo idle".to_string(),
+                "idle\n".to_string(),
+            );
+            let pair = if order { [&a, &b] } else { [&b, &a] };
+            let calls: Vec<(&str, &str, &str)> = pair
+                .iter()
+                .map(|(id, cmd, res)| (id.as_str(), cmd.as_str(), res.as_str()))
+                .collect();
+            lines.extend(parallel_batch(session, &calls));
+        }
+        // A parallel batch re-emitted on a second transcript line counts once,
+        // not twice — the duplicate guard has to cover every block, not just
+        // the last one in the message.
+        let batch = parallel_batch(
+            "dupe-batch",
+            &[
+                ("db-a", "echo idle", "idle\n"),
+                ("db-b", "echo idle", "idle\n"),
+            ],
+        );
+        lines.push(batch[0].clone());
+        lines.push(batch[0].clone());
+        lines.push(batch[1].clone());
+
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        write_jsonl(&proj, "parallel.jsonl", &refs);
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path());
+        }
+        let l = live(15);
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        let repeat = |id: &str| {
+            l.sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .unwrap_or_else(|| panic!("no session {id}"))
+                .repeat
+                .clone()
+        };
+
+        assert!(
+            repeat("first-real").is_none(),
+            "a real result on the earlier of two parallel blocks ends the run, got {:?}",
+            repeat("first-real")
+        );
+        assert!(
+            repeat("last-real").is_none(),
+            "…and so does one on the later block, got {:?}",
+            repeat("last-real")
+        );
+        assert_eq!(
+            repeat("dupe-batch").unwrap().count,
+            2,
+            "two blocks in one message, re-emitted on a second line, count twice and no more"
+        );
     }
 
     #[test]

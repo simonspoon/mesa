@@ -349,6 +349,18 @@ pub struct ConfigGuard {
     /// The built-in spin-loop token floor mesa ships.
     #[ts(type = "number")]
     pub cache_read_min_tokens_default: i64,
+    /// How many identical trivial `Bash` calls in a row fire the `repeat`
+    /// rule, or `null` for the built-in.
+    #[ts(type = "number | null")]
+    pub repeat_count: Option<i64>,
+    /// The built-in repeat count mesa ships.
+    #[ts(type = "number")]
+    pub repeat_count_default: i64,
+    /// What the watcher does about a breach — `"stop"` or `"report"` — or
+    /// `null` for the built-in.
+    pub action: Option<String>,
+    /// The built-in action mesa ships (`"stop"`).
+    pub action_default: String,
 }
 
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
@@ -2600,6 +2612,28 @@ pub struct CcLiveSession {
     /// Per-minute total-token buckets over the window, oldest→newest.
     #[ts(type = "Array<number>")]
     pub spark: Vec<i64>,
+    /// The trailing run of identical trivial `Bash` calls this session is
+    /// currently in, or `null` when its newest tool call was anything else.
+    /// The cost guard's `repeat` rule reads it (`docs/cost-guard.md`).
+    pub repeat: Option<CcRepeat>,
+}
+
+/// A session stuck repeating one trivial shell command — the *shape* of a
+/// wedged agent rather than its cost, and the only guard signal that can fire
+/// before any money is spent (mesa task 1054).
+///
+/// `command` is the full `Bash` input run through `cc::sanitize_capped`, so it
+/// is bounded and control-character-free like every other transcript-derived
+/// string mesa surfaces: it is untrusted model-authored text, and it is data.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcRepeat {
+    /// The command being repeated, sanitized and capped at
+    /// `cc::TARGET_MAX_CHARS`.
+    pub command: String,
+    /// How many times in a row it has just been run.
+    #[ts(type = "number")]
+    pub count: u64,
 }
 
 /// The live-sessions payload (`mesa cc live` / `GET /api/cc/live`): the slice of

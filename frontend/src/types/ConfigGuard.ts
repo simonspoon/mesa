@@ -44,4 +44,22 @@ cache_read_min_tokens: number | null,
 /**
  * The built-in spin-loop token floor mesa ships.
  */
-cache_read_min_tokens_default: number, };
+cache_read_min_tokens_default: number, 
+/**
+ * How many identical trivial `Bash` calls in a row fire the `repeat`
+ * rule, or `null` for the built-in.
+ */
+repeat_count: number | null, 
+/**
+ * The built-in repeat count mesa ships.
+ */
+repeat_count_default: number, 
+/**
+ * What the watcher does about a breach — `"stop"` or `"report"` — or
+ * `null` for the built-in.
+ */
+action: string | null, 
+/**
+ * The built-in action mesa ships (`"stop"`).
+ */
+action_default: string, };

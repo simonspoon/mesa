@@ -522,6 +522,10 @@ reads an item in (mesa task 822, `docs/inbox.md`).
   is **422 `validation`**, writing nothing. Gated with
   `require_agent_access`, the same posture as every other config write (mesa
   task 1021).
+
+There is deliberately **no Settings page UI** for this section — there never
+was one, and task 1054 did not add one. The routes exist so a future editor
+has something to talk to, and so the gate can drive the validation.
 - `GET /api/config/speech/preview?voice=<name>` → `audio/wav`, streamed, no
   `Content-Length`: the **test** button beside the picker (mesa task 824),
   which is how a voice is heard *before* it is saved. Two things make it a
@@ -693,9 +697,10 @@ mirror of Speech, above.
 
 ## Guard
 
-A seventh, independent section holds the **cost-guard** thresholds — the
-numbers `serve --watch-cost` and `mesa cc guard` compare a running Claude Code
-session against (mesa task 1018, `docs/cost-guard.md`).
+A seventh, independent section holds the **cost-guard** settings — the numbers
+`serve --watch-cost` and `mesa cc guard` compare a running Claude Code session
+against, and what the watcher does about a session that crosses one (mesa tasks
+1018 and 1054, `docs/cost-guard.md`).
 
 ```json
 {
@@ -703,7 +708,9 @@ session against (mesa task 1018, `docs/cost-guard.md`).
     "cost-usd": 25.0,
     "total-tokens": 100000000,
     "cache-read-share": 0.98,
-    "cache-read-min-tokens": 20000000
+    "cache-read-min-tokens": 20000000,
+    "repeat-count": 30,
+    "action": "stop"
   }
 }
 ```
@@ -724,6 +731,21 @@ session against (mesa task 1018, `docs/cost-guard.md`).
   fires at all. **Absent or `null` ⇒ 20000000.** A whole number ≥ 1. A session
   three messages long is trivially 100% cache-read and perfectly healthy; this
   is what separates it from an agent re-reading its context forever.
+- `repeat-count` — how many times in a row a session may run the **same**
+  trivial `Bash` command before it is reported. **Absent or `null` ⇒ 30.** A
+  whole number between 1 and 100000; the upper bound is the `cost-usd` sanity
+  cap, not a policy. "Trivial" means the command's output was under 16 bytes,
+  which is what separates a wedged `echo idle` loop from an agent legitimately
+  re-running something that produces work.
+- `action` — what the watcher **does** about a breach. **Absent or `null` ⇒
+  `"stop"`.** Exactly one of two lowercase strings:
+  - `"stop"` — run `claude stop <job id>` on the session, then file the alert
+    saying so. The conversation survives; `claude attach <job id>` resumes it.
+  - `"report"` — file the alert and nothing else, the behaviour before task
+    1054.
+
+  Anything else is refused by the editor, and in a hand-edited file falls back
+  to the built-in like an out-of-range number.
 - **Read at the top of every tick, not cached** — the `watchers` rule: edit
   the file (or Settings) and the very next tick uses it, no restart. A config
   file that cannot be *parsed* skips the tick and logs, rather than guarding
@@ -736,13 +758,14 @@ session against (mesa task 1018, `docs/cost-guard.md`).
 
 ### Routes
 
-- `GET /api/config/guard` → `ConfigGuard`: each of the four keys **verbatim**
+- `GET /api/config/guard` → `ConfigGuard`: each of the six keys **verbatim**
   (`null` when unset) beside its built-in (`cost_usd_default`,
   `total_tokens_default`, `cache_read_share_default`,
-  `cache_read_min_tokens_default`). Gated like the other config getters
+  `cache_read_min_tokens_default`, `repeat_count_default`, `action_default`). Gated like the other config getters
   (`require_agent_access`); a malformed config is **502 `unavailable`**.
 - `PUT /api/config/guard`, body `{"cost_usd": <n> | null, "total_tokens": …,
-  "cache_read_share": …, "cache_read_min_tokens": …}` → echoes the getter.
+  "cache_read_share": …, "cache_read_min_tokens": …, "repeat_count": …,
+  "action": "stop" | "report" | null}` → echoes the getter.
   Absent leaves a key alone; `null` removes it, restoring the built-in. Any
   out-of-range or wrong-typed value is **422 `validation`**, writing nothing —
   the whole update is checked before the file is touched. Gated with

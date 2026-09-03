@@ -356,6 +356,57 @@ pub fn stop(job_id: &str) -> Result<(), String> {
     stop_session(&claude_bin(), job_id)
 }
 
+/// The short **background job id** of the session whose `sessionId` is
+/// `session_id`, or `Ok(None)` when nothing on this machine names it.
+///
+/// The cost guard's other end (mesa task 1054): it knows a session by the uuid
+/// its transcript is written under, and [`stop`] takes the short id
+/// `claude --bg` printed. Only `claude agents` knows both, so this is a lookup
+/// and never an inference — the two ids share a prefix on most rows
+/// (`89dc6ccd` and `89dc6ccd-d3c1-…`) and slicing one out of the other would
+/// be a guess that stops the wrong session on the row where it does not hold.
+///
+/// `--all` because a runaway is by definition not in the folder mesa is asking
+/// from; an interactive session has no `id` at all, so it answers `None` and
+/// the guard reports that it could not stop anything.
+pub fn find_job_for_session(session_id: &str) -> Result<Option<String>, String> {
+    find_job(&claude_bin(), session_id)
+}
+
+fn find_job(bin: &str, session_id: &str) -> Result<Option<String>, String> {
+    let out = Command::new(bin)
+        .args(["agents", "--json", "--all"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run {bin}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "claude agents failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    job_for_session(&out.stdout, session_id)
+}
+
+/// Pure half of [`find_job_for_session`] — bytes in, job id out — so the
+/// payload contract is unit-testable without a claude binary, like
+/// [`parse_sessions`].
+///
+/// Rows are read as loose JSON rather than as [`AgentSession`]: this asks two
+/// string keys of each row, and a payload that grew a field mesa's typed shape
+/// rejects must not cost the guard its only way to stop anything. A row
+/// missing either key is skipped; JSON that is not an array of objects is the
+/// error.
+fn job_for_session(bytes: &[u8], session_id: &str) -> Result<Option<String>, String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|e| format!("unexpected claude agents payload: {e}"))?;
+    Ok(rows.into_iter().find_map(|row| {
+        (row.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
+            .then(|| row.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .flatten()
+    }))
+}
+
 /// The binary is threaded in — like `list_sessions` under `list_all` — so the
 /// argv is unit-testable against a stub without mutating process-global env.
 fn stop_session(bin: &str, job_id: &str) -> Result<(), String> {
@@ -524,6 +575,44 @@ mod tests {
         assert!(!is_under("/repo-other", "/repo")); // string-prefix, not path-prefix
         assert!(!is_under("/repo", "/repo/sub")); // parent is not under its child
         assert!(!is_under("/elsewhere", "/repo"));
+    }
+
+    #[test]
+    fn a_session_uuid_resolves_to_its_short_job_id() {
+        let bytes = SESSIONS_JSON.as_bytes();
+        // The background row: the short id is looked up, never sliced out of
+        // the uuid — they only happen to share a prefix.
+        assert_eq!(
+            job_for_session(bytes, "e34b8ed9-d391-4797-9d39-546d5b463357").unwrap(),
+            Some("e34b8ed9".to_string())
+        );
+        // An interactive session has no job id at all, so there is nothing to
+        // stop — `None`, not an error.
+        assert_eq!(
+            job_for_session(bytes, "4230f7c7-5e6b-41a0-9f5e-7c6fa4e570f9").unwrap(),
+            None
+        );
+        // A session no row names.
+        assert_eq!(job_for_session(bytes, "c2b83256-1111").unwrap(), None);
+        assert_eq!(job_for_session(b"[]", "anything").unwrap(), None);
+        // A row shape mesa's typed `AgentSession` would reject still answers,
+        // because the lookup asks for two string keys and nothing else.
+        assert_eq!(
+            job_for_session(br#"[{"id":"abc","sessionId":"zzz","brandNew":{}}]"#, "zzz").unwrap(),
+            Some("abc".to_string())
+        );
+        // Rows missing either key are skipped rather than fatal, so the first
+        // matching row that actually names a job is the answer.
+        assert_eq!(
+            job_for_session(
+                br#"[{"sessionId":"zzz"},{"id":"abc","sessionId":"zzz"}]"#,
+                "zzz"
+            )
+            .unwrap(),
+            Some("abc".to_string())
+        );
+        assert!(job_for_session(b"not json", "zzz").is_err());
+        assert!(job_for_session(br#"{"id":"abc"}"#, "zzz").is_err());
     }
 
     #[test]

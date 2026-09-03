@@ -184,6 +184,15 @@ struct AppState {
     /// session that is *still* burning money is the recoverable direction —
     /// see `docs/cost-guard.md`.
     cost_alerted: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    /// Session ids the cost guard has already **stopped** in this server's
+    /// lifetime (`docs/cost-guard.md`, mesa task 1054). The sibling of
+    /// `cost_alerted` and pruned alongside it, but keyed on the session alone:
+    /// a session is stopped once whatever it goes on to trip, because
+    /// `claude stop` on a session that is already stopped is either a no-op or
+    /// an error, and neither is worth a second round trip. Only a *successful*
+    /// stop is recorded, so a failure retries on the next tick that finds a
+    /// fresh breach. Not persisted, for `cost_alerted`'s reason.
+    cost_stopped: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// How often the todo-watcher (`watch_todo`) checks every project for
@@ -350,9 +359,20 @@ fn inbox_watcher_tick(state: &AppState) {
 /// configured thresholds against each, and file **one inbox item per session
 /// per tripped threshold** (`docs/cost-guard.md`, mesa task 1018).
 ///
-/// mesa reports; it never stops a session. The whole feature exists because
-/// the numbers that would have caught a $1,413 spin loop were already in
-/// `mesa cc` the entire time and nothing was watching them.
+/// mesa **stops and reports**, as of mesa task 1054. Under the built-in
+/// `stop` action a session with a newly-tripped breach is stopped with
+/// `claude stop <job id>` — which keeps the conversation, so `claude attach`
+/// resumes it — and the alert says so; under `report` mesa only files, which
+/// is what the feature shipped as. The switch flipped because reporting alone
+/// let a session run `echo idle` 4,600 times across eight hours and $1,373
+/// while the alerts about it went unread.
+///
+/// The stop is **best-effort and off the store lock**: resolving a job id
+/// shells out to `claude agents --json --all` and stopping shells out again,
+/// so both happen in phase two before the lock is taken, and neither failure
+/// can fail the tick or block the alert. It happens whether or not a task
+/// resolves — an unattributable runaway is exactly the one nobody else is
+/// going to stop.
 ///
 /// Two-phase like [`inbox_watcher_tick`] and `todo_watcher_tick`: reading the
 /// transcripts and evaluating the rules is the slow part and happens with no
@@ -391,6 +411,13 @@ fn cost_watcher_tick(state: &AppState) {
             .map(|s| s.session_id.as_str())
             .collect();
         alerted.retain(|(session_id, _)| present.contains(session_id.as_str()));
+        {
+            let mut stopped = match state.cost_stopped.lock() {
+                Ok(s) => s,
+                Err(e) => e.into_inner(),
+            };
+            stopped.retain(|session_id| present.contains(session_id.as_str()));
+        }
         for session in &live.sessions {
             let fresh: Vec<guard::GuardBreach> = guard::breaches(session, &thresholds)
                 .into_iter()
@@ -406,11 +433,17 @@ fn cost_watcher_tick(state: &AppState) {
     }
 
     for (session, fresh) in pending {
+        // Phase two, still lock-free: act, then say what happened. Acting
+        // first is deliberate — the alert's closing sentence is the outcome,
+        // and a person reading it needs to know whether the thing is still
+        // running.
+        let outcome = stop_runaway(state, &thresholds, &session.session_id);
         let body = guard::alert_body(
             session,
             &fresh,
             live.window_minutes,
             guard::running_minutes(session),
+            &outcome,
         );
         let filed = {
             let mut store = match state.store.lock() {
@@ -430,13 +463,14 @@ fn cost_watcher_tick(state: &AppState) {
                 Ok(None) => {
                     eprintln!(
                         "cost-guard: session {} tripped {} but names no mesa task \
-                         (no claim, no project at its cwd); see `mesa cc guard`",
+                         (no claim, no project at its cwd); {}; see `mesa cc guard`",
                         session.session_id,
                         fresh
                             .iter()
                             .map(|b| b.threshold)
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", "),
+                        outcome_note(&outcome)
                     );
                     // Deliberately NOT a failure: there is nothing to retry.
                     // The pair stays claimed so this line is printed once, not
@@ -458,6 +492,71 @@ fn cost_watcher_tick(state: &AppState) {
             for b in &fresh {
                 alerted.remove(&(session.session_id.clone(), b.threshold.to_string()));
             }
+        }
+    }
+}
+
+/// Stops one breaching session, if the configured action says to and mesa has
+/// not already stopped it in this process's lifetime.
+///
+/// Two shell-outs, both best-effort and neither holding a lock: `claude agents
+/// --json --all` to turn the transcript's session uuid into the short job id
+/// `claude stop` takes, then the stop itself. Every failure is a *reported*
+/// outcome rather than an error — the alert still gets filed, and it says the
+/// session is still running.
+///
+/// Only a successful stop is remembered, so a transient failure retries on the
+/// next tick that finds a fresh breach.
+fn stop_runaway(
+    state: &AppState,
+    thresholds: &guard::GuardThresholds,
+    session_id: &str,
+) -> guard::StopOutcome {
+    if thresholds.action == guard::GuardAction::Report {
+        return guard::StopOutcome::Reported;
+    }
+    {
+        let stopped = match state.cost_stopped.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        if stopped.contains(session_id) {
+            return guard::StopOutcome::AlreadyStopped;
+        }
+    }
+    let outcome = match agents::find_job_for_session(session_id) {
+        Ok(Some(job_id)) => match agents::stop(&job_id) {
+            Ok(()) => guard::StopOutcome::Stopped { job_id },
+            Err(reason) => guard::StopOutcome::StopFailed { reason },
+        },
+        Ok(None) => guard::StopOutcome::NotBackground,
+        Err(reason) => guard::StopOutcome::StopFailed { reason },
+    };
+    if let guard::StopOutcome::Stopped { .. } = &outcome {
+        let mut stopped = match state.cost_stopped.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        stopped.insert(session_id.to_string());
+    }
+    outcome
+}
+
+/// The same outcome as a stderr fragment, for the one runaway that files no
+/// inbox item at all: an unattributable session is the one whose fate is
+/// *only* visible in the log, so the log has to say whether it was stopped.
+fn outcome_note(outcome: &guard::StopOutcome) -> String {
+    match outcome {
+        guard::StopOutcome::Stopped { job_id } => format!("mesa stopped it (claude stop {job_id})"),
+        guard::StopOutcome::AlreadyStopped => "mesa had already stopped it".to_string(),
+        guard::StopOutcome::StopFailed { reason } => {
+            format!("mesa could not stop it: {reason}")
+        }
+        guard::StopOutcome::NotBackground => {
+            "mesa found no background session to stop, so it is still running".to_string()
+        }
+        guard::StopOutcome::Reported => {
+            "mesa is configured to report only, so it is still running".to_string()
         }
     }
 }
@@ -777,6 +876,7 @@ pub fn serve(
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
         inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
         cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -5785,7 +5885,7 @@ async fn update_config_watchers(
     get_config_watchers(State(state), ConnectInfo(addr), headers).await
 }
 
-/// `GET /api/config/guard` — the cost-guard's four thresholds, each with the
+/// `GET /api/config/guard` — the cost-guard's six settings, each with the
 /// built-in behind it (`docs/cost-guard.md`, mesa task 1018).
 ///
 /// Gated like `get_config_watchers` — same file, same class of secret — and a
@@ -5821,6 +5921,10 @@ struct GuardUpdate {
     cache_read_share: Option<Option<serde_json::Value>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     cache_read_min_tokens: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    repeat_count: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    action: Option<Option<serde_json::Value>>,
 }
 
 /// `PUT /api/config/guard` — writes the guard thresholds and echoes them.
@@ -5844,6 +5948,8 @@ async fn update_config_guard(
             config::GUARD_CACHE_READ_MIN_TOKENS,
             body.cache_read_min_tokens,
         ),
+        (config::GUARD_REPEAT_COUNT, body.repeat_count),
+        (config::GUARD_ACTION, body.action),
     ] {
         if let Some(value) = value {
             updates.insert(key.to_string(), value);
@@ -7149,6 +7255,7 @@ mod tests {
             shutdown_tx: Arc::new(Mutex::new(None)),
             inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
         (dir, state)
     }
@@ -8685,6 +8792,8 @@ mod tests {
                             total_tokens: None,
                             cache_read_share: None,
                             cache_read_min_tokens: None,
+                            repeat_count: None,
+                            action: None,
                         }),
                     )
                     .await

@@ -1,9 +1,9 @@
 # Cost guard
 
 `mesa serve --watch-cost` starts a periodic background loop that watches the
-Claude Code sessions running **right now** and files an inbox alert for any one
-that has crossed a spending threshold. `mesa cc guard` is the same verdict on
-demand, printed instead of filed.
+Claude Code sessions running **right now**, **stops** any one that has gone
+wrong, and files an inbox alert saying so. `mesa cc guard` is the same verdict
+on demand, printed instead of acted on.
 
 The motivating incident is the whole design brief. One session spent
 **$1,413.72 across 2.76B tokens in 7h55m**, 91.2% of it inside a single 6h14m
@@ -12,9 +12,37 @@ re-reading the same context forever. Every number in that sentence was already
 in `mesa cc` while it was happening. Nothing was *watching* them, so it was
 found the next morning, in a bill.
 
-mesa **reports; it never stops a session.** There is no kill switch and no
-`--force`. The person decides — the guard's whole job is to make sure they get
-to decide while it is still running.
+## mesa stops the session (mesa task 1054)
+
+The guard shipped reporting only, on the reasoning that a person should decide.
+Then a session ran `echo idle` **4,600 times in a row across eight hours and
+about $1,373**, and two others did the same with `echo ok`. Inbox items were
+filed about all three. Nobody was there to read them. A person who is not there
+cannot decide, and a guard whose only power is to write something down is not a
+guard.
+
+So the built-in `action` is now **`stop`**: a session with a newly tripped rule
+is stopped with `claude stop <job id>` before the alert is written, and the
+alert's closing sentence says what happened.
+
+Three things keep that proportionate:
+
+- **`claude stop` is not a kill.** It ends the running process; the
+  conversation survives, and `claude attach <job id>` picks it back up. The
+  alert names that command. The destructive-sounding verb is closer to a pause
+  than a delete, which is what makes stopping-by-default defensible at all.
+- **Only a background session can be stopped.** The stop needs a short job id,
+  and only `claude --bg` prints one. An interactive session in someone's own
+  terminal has none, so mesa reports that it found nothing to stop and leaves
+  it running. It never guesses an id — the job id and the session uuid share a
+  prefix on most rows and slicing one out of the other would eventually stop
+  the wrong session.
+- **`"action": "report"` puts it back.** One config key restores the original
+  behaviour exactly: alerts, no stops.
+
+Everything is still **best-effort**. Resolving a job id and stopping shell out
+twice, both off the store lock; every failure is a *reported outcome* rather
+than an error, the alert is filed either way, and nothing can fail the tick.
 
 It also ingests nothing new. It reads exactly what `crate::core::cc::live()`
 already computes, the one sanctioned live-transcript read the CC Dashboard
@@ -42,10 +70,15 @@ Server** action relaunches with.
 3. **Evaluate**, with no store lock held. This and step 2 are the slow part;
    holding the lock across them would freeze every other API request, the
    two-phase shape `inbox_watcher_tick` and `todo_watcher_tick` already have.
-4. **File**, taking the store lock only for the task resolution and the inbox
-   write.
+4. **Act**, still with no store lock held: under the `stop` action, look the
+   session's short job id up with `claude agents --json --all` and run
+   `claude stop <job id>`. Two shell-outs, both best-effort. This happens
+   **before** the filing and regardless of whether a task resolves — an
+   unattributable runaway is exactly the one nobody else is going to stop.
+5. **File**, taking the store lock only for the task resolution and the inbox
+   write. The alert's last sentence is what step 4 actually did.
 
-## Three rules, and why three
+## Four rules, and why four
 
 `core::guard::breaches` is a pure function over one `CcLiveSession` and the
 thresholds. Every comparison is `>=` — a limit is a limit, not a number to
@@ -56,8 +89,9 @@ exceed.
 | `cost` | `est_cost_usd >= cost-usd` | $25 |
 | `tokens` | `total_tokens >= total-tokens` | 100,000,000 |
 | `spin` | `total_tokens >= cache-read-min-tokens` **and** `cache_read / total_tokens >= cache-read-share` | 20,000,000 and 0.98 |
+| `repeat` | the newest `repeat-count` tool calls are the same trivial `Bash` command | 30 |
 
-They are not three spellings of one rule:
+They are not four spellings of one rule:
 
 - **`cost`** is the number a person actually cares about, but it is estimated
   from a price table (`docs/config.md`'s `pricing` section) and a cheap model
@@ -68,11 +102,51 @@ They are not three spellings of one rule:
   kind* — an agent looping rather than working. It is the rule that would have
   caught the motivating session hours before either of the others mattered, and
   the one whose alert tells a person what they are about to find.
+- **`repeat`** is the only rule that can fire before any real money is spent,
+  and the only one that reads a *shape* off the transcript rather than a number
+  off the meter. A wedged agent running `echo idle` costs a few tokens per call
+  and can run for hours under every other line; what gives it away is that it
+  is doing the same nothing over and over.
 
 The `cache-read-min-tokens` floor is what makes `spin` usable at all: a session
 three messages long is trivially 100% cache reads and perfectly healthy. The
 floor is also, by construction, what makes the division safe — a session with
 no tokens can never reach it, so there is no divide-by-zero to guard separately.
+
+### The repeat rule
+
+A **run** is consecutive `Bash` `tool_use` blocks whose `command` input is
+byte-identical and whose paired `tool_result` is under
+`cc::REPEAT_TRIVIAL_OUTPUT_BYTES` (**16 bytes**). Three things end a run: a
+different command, a call to any other tool, and a result too long to be
+trivial. The count is the length of the run the session is in *right now* —
+its tail, not its longest ever.
+
+Sixteen bytes is the whole judgement, so it is worth stating plainly. The
+incident ran `echo idle` (`idle\n`, five bytes) and `echo ok` (three). A real
+command — a build, a test run, a `git status`, even an `ls` — clears sixteen
+bytes on its first line. The rule is not "this agent is repeating itself",
+which is often legitimate; it is "this agent is repeating itself and nothing
+is coming back". Thirty in a row is the count, deliberately well above the
+handful of retries an honest polling loop makes and far below the 4,600 the
+incident reached.
+
+It is computed in `cc::parse_live_file` as **rolling state per session**
+(`RepeatAcc`: the current command, its length so far, the calls still awaiting
+results, and the ids already counted), so it costs the live read nothing
+measurable. One assistant message may dispatch **several** `tool_use` blocks in
+parallel, so the in-flight calls are a bounded list and not one slot: holding
+only the newest id let an earlier block's real output go unmatched, and the run
+kept climbing through a command that was plainly working. Results pair to calls
+by `tool_use_id`, and only the result's **size** is ever read — the rule asks
+one question of a result and a length answers it without a second unbounded
+payload entering the process. The command reaches
+`CcLiveSession::repeat` through `cc::sanitize_capped`, like every other
+transcript-derived string mesa surfaces: it is untrusted model-authored text,
+and it is data.
+
+Sidechain lines are skipped. A subagent's own loop is its own transcript, and
+interleaving it here would break a main-thread run that is genuinely unbroken.
 
 A session can trip several rules at once, and each is reported separately
 inside one alert. The **fire-once key is the pair** `(session_id, threshold)`,
@@ -146,6 +220,21 @@ mesa-side row to claim with, so the stand-in is in-memory state.
   runaway is exactly the failure this feature exists to prevent. Persisting it
   would also mean a migration to store state about an entity mesa does not own.
 
+## The already-stopped set
+
+`AppState::cost_stopped`, a `HashSet<String>` of session ids, is the sibling
+`cost_alerted` grew for task 1054. Same lifetime, same pruning, same refusal to
+persist — but keyed on the **session alone**, not the `(session, threshold)`
+pair. A session is stopped once whatever else it goes on to trip: `claude stop`
+on a session that is already stopped is either a no-op or an error, and neither
+is worth a second round trip.
+
+Only a **successful** stop is recorded, so a transient failure retries on the
+next tick that finds a fresh breach. A session mesa already stopped and then
+sees breach again — the transcript stays inside the hour-wide window long after
+the process is gone — gets an alert saying it was already stopped, not a second
+attempt.
+
 ## The alert
 
 One inbox item per session per tick, carrying every rule newly tripped.
@@ -161,10 +250,18 @@ One inbox item per session per tick, carrying every rule newly tripped.
   reads", not a markdown grid. It names the session (short and full id), the
   project or cwd if known, how long it has been running, the tokens, the
   estimated cost, the cache-read share, the output tokens, which rules tripped
-  and what each one means — and closes by saying mesa stops nothing and
-  pointing at `mesa cc guard`.
-- Session ids, cwds and project names are **data**. Nothing on this path
-  reaches a shell; the guard shells out to nothing and spawns nothing.
+  and what each one means — and closes by saying **what mesa did about it**:
+  that it was stopped and how to resume it (`claude attach <job id>`), that the
+  stop failed and why, that there was no background session to stop, that it
+  had already been stopped, or that mesa is configured to report only. Every
+  branch says plainly whether the thing is still running, because that is the
+  only thing a person woken by this alert has to decide about. Each then points
+  at `mesa cc guard`.
+- Session ids, cwds, project names and the repeated command are **data**.
+  Nothing on this path is built into a string a shell parses: the two commands
+  the guard runs are fixed argv (`claude agents --json --all`, `claude stop
+  <job id>`) and the job id is one `Command::arg` mesa read out of `claude`'s
+  own JSON, never out of a transcript.
 
 ## `mesa cc guard`
 
@@ -173,14 +270,16 @@ mesa cc guard [--minutes N]
 ```
 
 The read-only half. Prints one JSON object: `generated_at_unix`,
-`window_minutes`, the `thresholds` in force, and a `sessions` array of every
-live session currently over one of them — identity, `running_minutes`, the
-token split the rules read, `est_cost_usd`, `cache_read_share`, the `breaches`
-it tripped and the resolved `task_id` (or `null`).
+`window_minutes`, the `thresholds` in force (all six, `repeat_count` and
+`action` included), and a `sessions` array of every live session currently over
+one of them — identity, `running_minutes`, the token split the rules read,
+`est_cost_usd`, `cache_read_share`, the `repeat` run it is in (or `null`), the
+`breaches` it tripped and the resolved `task_id` (or `null`).
 
-- Reads transcripts and the mesa db; **writes nothing**, files nothing, and
-  does not touch the fire-once set. Running it is not a substitute for the
-  watcher and cannot silence one.
+- Reads transcripts and the mesa db; **writes nothing**, files nothing, **stops
+  nothing** whatever `action` says, and does not touch the fire-once or
+  already-stopped sets. Running it is not a substitute for the watcher and
+  cannot silence one.
 - No `cc sync`: the subject is what is running now, which is a live transcript
   read (`cc live`), not a db aggregate.
 - No `--quiet` — it is neither a mutation nor a `show`, so the flag is an
@@ -201,10 +300,18 @@ The `guard` section of `~/.mesa/config.json` — a seventh independent section
     "cost-usd": 25.0,
     "total-tokens": 100000000,
     "cache-read-share": 0.98,
-    "cache-read-min-tokens": 20000000
+    "cache-read-min-tokens": 20000000,
+    "repeat-count": 30,
+    "action": "stop"
   }
 }
 ```
+
+`repeat-count` is a whole number between 1 and 100,000. `action` is exactly
+`"stop"` or `"report"` — lowercase, and any other word is refused by the editor
+and falls back to the built-in in a hand-edited file, the clamp posture the
+numbers take. There is deliberately **no Settings UI** for this section: there
+never was one, and task 1054 did not add one.
 
 Absent or `null` is the built-in default for that key alone. `GET`/`PUT
 /api/config/guard` is the Settings-page pair: the `GET` is `require_agent_access`
@@ -222,19 +329,37 @@ A value of the wrong *type* is an error on read, and the tick skips.
 ## Gate
 
 `scripts/cost-guard-check.sh`, against a synthetic Claude Code transcript tree
-(`MESA_CC_PROJECTS_DIR`, the seam `scripts/cc-check.sh` uses) and a throwaway
-db and `HOME`: a runaway in a folder mesa knows, a healthy session beside it,
-and a runaway in a folder no project claims. It asserts the flag-off silence,
-exactly one alert for the runaway (task-summary, authored `cost-guard`, filed
-against the claimed task), no alert and exactly one stderr warning for the
-unattributable one, no re-filing on later ticks, `cc guard`'s two rows and its
-`--quiet` refusal, the built-in thresholds under an absent config, that a
-configured threshold actually governs the verdict with no restart, that every
-bad value is a 422 that writes nothing, that `null` restores the built-in, and
-that **all six** other config sections survive the guard section's save.
+(`MESA_CC_PROJECTS_DIR`, the seam `scripts/cc-check.sh` uses), a throwaway db
+and `HOME`, and a stub `claude` (`MESA_CLAUDE_BIN`) that answers
+`agents --json --all` from a fixture and records every `stop` call to a file.
+Five synthetic sessions: a runaway in a folder mesa knows, a healthy session
+beside it, a runaway in a folder no project claims, a `looper` that is under
+every money threshold but 35 `echo idle` calls deep, and a sibling one call
+short of the count.
+
+It asserts the flag-off silence (no alerts *and* no stops), one alert each for
+the runaway and the looper (task-summary, authored `cost-guard`, filed against
+their claimed tasks), that the looper's alert names `repeat` and `echo idle`
+and the 29-call sibling trips nothing, that each of the three breaching
+sessions is stopped **exactly once** and not again on later ticks, that the
+bodies name `claude stop`/`claude attach`, no alert and exactly one stderr
+warning — naming the stop — for the unattributable one, `cc guard`'s three rows
+and its `--quiet` refusal, the built-in thresholds and `stop` action under an
+absent config, that `"action": "report"` on a fresh server files alerts and
+stops nothing, that a `MESA_CLAUDE_BIN` pointing at nothing is a reported
+outcome rather than a failed tick, that a configured threshold actually governs
+the verdict with no restart, that every bad value (the new `repeat-count` and
+`action` included) is a 422 that writes nothing, that `null` restores the
+built-in, and that **all six** other config sections survive the guard
+section's save.
 
 Rust unit tests cover the rules themselves (each threshold over and under, a
 zero-token session, a small 100%-cache-read session under the floor, the
-motivating incident tripping all three), the alert body, the resolution
-ladder's three rungs including exact-`cwd` matching, `find_task_by_owner`, and
-the config section's read/validate/save behaviour.
+motivating incident tripping all three, `repeat` at 29/30/4,600), the run
+parsing end to end through `cc::live` (a plain run, a different tool, a
+different command, a non-trivial result, a re-emitted block, a subagent's own
+loop), the alert body under every stop outcome, `agents::job_for_session`
+(match, interactive row, no match, unknown fields, malformed JSON), the
+resolution ladder's three rungs including exact-`cwd` matching,
+`find_task_by_owner`, and the config section's read/validate/save behaviour for
+all six keys.

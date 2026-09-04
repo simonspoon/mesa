@@ -4,8 +4,19 @@ import type { LiveIndicator } from '../liveIndicator'
 import { indicatorLabel } from '../liveIndicator'
 
 /**
+ * How big the aperture is drawn, in CSS pixels. It was 18 while it lived in
+ * the page header, absolutely positioned in a band with a row of buttons to
+ * stay out of the way of; since mesa task 1069 it leads the conversation
+ * panel's own head, where it is the picture of the conversation rather than a
+ * hint that one exists. `drawAperture` is parametric on `w`/`h` — every stroke
+ * and radius in it is a fraction of the height — so this is the only number
+ * that changes.
+ */
+const APERTURE_PX = 44
+
+/**
  * The conversation indicator's drawing surface (mesa task 973) — one
- * 18×18 canvas replacing the old five-bar band, painted by `liveBand.ts`'s
+ * 44×44 canvas replacing the old five-bar band, painted by `liveBand.ts`'s
  * `drawAperture`. `liveBand.ts` carries the reasoning for *what* is drawn;
  * this component is only the plumbing that keeps a canvas fed at 60fps
  * without dragging React into the hot path.
@@ -62,8 +73,8 @@ export function LiveBand({ state, level }: { state: LiveIndicator; level: number
     if (ctx === null) return
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2)
-    const w = 18
-    const h = 18
+    const w = APERTURE_PX
+    const h = APERTURE_PX
     canvas.width = Math.round(w * dpr)
     canvas.height = Math.round(h * dpr)
     canvas.style.width = w + 'px'

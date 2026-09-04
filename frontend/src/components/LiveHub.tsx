@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { LiveBand } from './LiveBand'
+import { LiveMeter } from './LiveMeter'
 import {
   getLive,
   getLiveConfig,
@@ -44,6 +45,7 @@ import {
   writeInputChoice,
   type AudioInput,
 } from '../liveDevices'
+import { elapsedLabel, endsInHead, liveHeadTitle } from '../liveHead'
 import { headerIndicator } from '../liveIndicator'
 import {
   buildVocabulary,
@@ -87,6 +89,7 @@ import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadCut, vadStep } from '../liveVa
 import { sameBox, windowBox } from '../liveWindow'
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
+import { parseTimestamp } from '../time'
 import type { ConfigLive } from '../types/ConfigLive'
 import type { LiveContext } from '../types/LiveContext'
 import type { LiveTurn } from '../types/LiveTurn'
@@ -202,6 +205,114 @@ function LiveMark() {
 }
 
 /**
+ * The head's three presses, as glyphs (mesa task 1069).
+ *
+ * Pause, End and Close are 44px squares in a strip that also holds a 44px
+ * aperture and a title, and three words there would be a paragraph. They are
+ * drawn rather than lettered for `LiveMark`'s reason: one stroked path in
+ * `currentColor` takes the button's amber/red/muted and its hover for free,
+ * and each has a real `aria-label`, so nothing is lost to the reader who
+ * cannot see the shape.
+ */
+function PauseMark() {
+  return (
+    <svg
+      className="live-icon-mark"
+      viewBox="0 0 24 24"
+      width="15"
+      height="15"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M9 5v14M15 5v14" />
+    </svg>
+  )
+}
+
+function ResumeMark() {
+  return (
+    <svg
+      // Filled rather than stroked: a stroked triangle at 15px reads as an
+      // outline nobody recognises.
+      className="live-icon-mark live-icon-solid"
+      viewBox="0 0 24 24"
+      width="15"
+      height="15"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M8 5l11 7-11 7z" />
+    </svg>
+  )
+}
+
+/** Ending is a power symbol rather than a square stop: the conversation is a
+ *  thing that was switched on, and the agent behind it is switched off with
+ *  it. */
+function EndMark() {
+  return (
+    <svg
+      className="live-icon-mark"
+      viewBox="0 0 24 24"
+      width="15"
+      height="15"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M12 3v9M6.5 6.5a8 8 0 1 0 11 0" />
+    </svg>
+  )
+}
+
+function CloseMark() {
+  return (
+    <svg
+      className="live-icon-mark"
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M6 6l12 12M18 6L6 18" />
+    </svg>
+  )
+}
+
+/** The listen switch's own glyph: a microphone on its stand. */
+function MicMark() {
+  return (
+    <svg
+      className="live-icon-mark"
+      viewBox="0 0 24 24"
+      width="19"
+      height="19"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+    </svg>
+  )
+}
+
+/**
+ * How long this conversation has been going, ticking once a second.
+ *
+ * Its own component so that clock is not `LiveHub`'s: the hub is a large tree
+ * that re-renders on every poll already, and a second timer driving it would
+ * be the most expensive thing on the page for the least reason.
+ */
+function LiveElapsed({ startedAt }: { startedAt: string }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  return <>{elapsedLabel(parseTimestamp(startedAt).getTime(), now)}</>
+}
+
+/**
  * How long a route/context change settles before it is reported. Ambient
  * telemetry, so the wait costs nothing the person can feel; long enough that a
  * caret walking down a file or a tab being flicked through is one report
@@ -278,21 +389,30 @@ export function LiveHub({
   // lost, not a conversation broken — the ref just keeps the built-in set.
   const vocabRef = useRef<Vocabulary>(buildVocabulary(MESA_VOCABULARY))
   const vocabBuiltFor = useRef<number | null>(null)
+  // What the conversation is *about*, for the head's chip (mesa task 1069) —
+  // the name behind the session's `project_id`, off the fetch above rather
+  // than a second one. Null while it is unknown, and the chip simply does not
+  // render then: a conversation is routinely unscoped, and "Project · —" is a
+  // worse answer than no chip at all.
+  const [projectName, setProjectName] = useState<string | null>(null)
   useEffect(() => {
     const id = session?.id ?? null
     if (id === null || vocabBuiltFor.current === id) return
     vocabBuiltFor.current = id
+    const scope = session?.project_id ?? null
     listProjects()
       .then((projects) => {
         vocabRef.current = buildVocabulary([
           ...MESA_VOCABULARY,
           ...projects.map((p) => p.name),
         ])
+        setProjectName(projects.find((p) => p.id === scope)?.name ?? null)
       })
       .catch(() => {
         vocabRef.current = buildVocabulary(MESA_VOCABULARY)
+        setProjectName(null)
       })
-  }, [session?.id])
+  }, [session?.id, session?.project_id])
 
   // The transcript, accumulated: each poll answers only with what is new, so
   // this component holds the conversation and the server holds the tail.
@@ -1877,20 +1997,37 @@ export function LiveHub({
   // Pulled out of the object so its narrowing survives into the handler below.
   const secondary = controls.secondary
   const pauseButton = controls.pause
+  // The press that ends the conversation, wherever `liveControls` put it
+  // (mesa task 1069): the primary while this browser has joined, the secondary
+  // while it has not and `Listen` leads instead. At most one of the two is
+  // ever a real End, and the panel head is where it now lives.
+  const endButton = endsInHead(controls.primary)
+    ? controls.primary
+    : endsInHead(secondary)
+      ? secondary
+      : null
+  // What the head says about the conversation, in one word (`liveHead.ts`) —
+  // the same ranking the aperture beside it draws.
+  const headTitle = liveHeadTitle({
+    live,
+    speaking,
+    paused,
+    interim: interim !== '' ? interim : recording,
+    draft,
+    error: actionError,
+  })
+  // What mesa is saying *right now*, for the preview panel above the composer.
+  // `sounding` is a ref because the run advances from a media event, ahead of
+  // any render — but `speaking` is state, set from the element's own `playing`
+  // and cleared everywhere the ref is, so a render that sees `speaking` sees a
+  // ref that has already been written.
+  const speakingTurn = speaking
+    ? (turns.find((turn) => turn.id === sounding.current) ?? null)
+    : null
+  const speakingText = speakingTurn === null ? null : spokenText(speakingTurn)
 
   return (
     <div className="live-hub">
-      {/* The conversation indicator, centered in the header band (the header is
-          the positioning context) — with the panel closed it is the only sign
-          of either side talking, or of the agent working on what was said.
-          One element in one state at a time, so the band never shows two
-          things at once (`liveIndicator.ts`). Drawn as an aperture rather than
-          bars (mesa task 973, `liveBand.ts`); `level` is already throttled at
-          its source (0.03/100ms, see the capture effect above) and the
-          band's own per-frame smoothing (`smoothLevel`) is what turns that
-          into something that reads as continuous. */}
-      {indicator !== null && <LiveBand state={indicator} level={level} />}
-
       {controls.panel && (
         <button
           type="button"
@@ -1906,31 +2043,28 @@ export function LiveHub({
           <LiveMark />
         </button>
       )}
-      {/* Stepping out without ending it (mesa task 882) — offered only while
-          the conversation is live and this browser is in it. Sits before the
-          primary control so the press that destroys the conversation stays
-          where it has always been: last. */}
-      {pauseButton && (
+      {/* The header keeps only the presses that *begin* a conversation —
+          `Go live`, and the `Listen` that joins one already running (mesa
+          task 1069). Ending it moved into the panel head, beside Pause and
+          the transcript it is about, so the one press that destroys the
+          conversation is no longer a neighbour of the one that opens the
+          panel. `Going live…` is the exception `endsInHead` names: it is
+          labelled `stop` while the spawn runs, and it stays here, where the
+          person pressed and is still looking. */}
+      {!endsInHead(controls.primary) && (
         <button
           type="button"
-          className={`live-toggle${paused ? ' live-paused' : ''}`}
-          disabled={pauseButton.disabled}
-          onClick={() => togglePause(pauseButton)}
+          className={`live-toggle${controls.primary.action === 'stop' ? ' live-on' : ''}`}
+          disabled={controls.primary.disabled}
+          onClick={() => act(controls.primary)}
         >
-          {pauseButton.label}
+          {controls.primary.label}
         </button>
       )}
-      <button
-        type="button"
-        className={`live-toggle${controls.primary.action === 'stop' ? ' live-on' : ''}`}
-        disabled={controls.primary.disabled}
-        onClick={() => act(controls.primary)}
-      >
-        {controls.primary.label}
-      </button>
       {/* Present only while there are two things worth doing at once — the
-          conversation is running and this browser has not joined it yet. */}
-      {secondary && (
+          conversation is running and this browser has not joined it yet. In
+          that pair the secondary is the End, which the head takes. */}
+      {secondary && !endsInHead(secondary) && (
         <button
           type="button"
           className="live-toggle live-on"
@@ -1965,25 +2099,116 @@ export function LiveHub({
             aria-label="the live conversation"
           >
             <div className="live-sidebar-body">
+              {/* The head (mesa task 1069): the aperture, one word for what
+                  is happening, how loud the room has been, and the two
+                  presses that belong to a running conversation. It is the
+                  panel's own instrument cluster — everything here used to be
+                  either in the page header, where it had to answer for a
+                  conversation whose panel was usually shut, or nowhere. */}
               <div className="live-sidebar-head">
-                <span className={actionError !== null ? 'error' : 'muted'}>
+                <div className="live-head-row">
+                  {/* Fixed box whether or not there is a state to draw, so the
+                      row does not jump 44px sideways the moment the aperture
+                      has something to say. */}
+                  <div className="live-head-aperture">
+                    {indicator !== null && <LiveBand state={indicator} level={level} />}
+                  </div>
+                  <div className="live-head-say">
+                    <div className="live-head-title">{headTitle}</div>
+                    {/* The level meter (mesa task 956, moved here by 1069):
+                        shown on the auris path alone, since a browser-path
+                        page reports itself through the interim guess instead
+                        and a meter nothing feeds would read as broken rather
+                        than as "this path uses something else". */}
+                    {path === 'auris' && recognizes && <LiveMeter level={level} />}
+                  </div>
+                  <div className="live-head-actions">
+                    {/* Stepping out without ending it (mesa task 882) — offered
+                        only while the conversation is live and this browser is
+                        in it. Sits before End so the press that destroys the
+                        conversation stays last. */}
+                    {pauseButton && (
+                      <button
+                        type="button"
+                        className="live-icon live-icon-pause"
+                        aria-label={
+                          paused ? 'resume the conversation' : 'pause the conversation'
+                        }
+                        title={pauseButton.label}
+                        // Out of the tab order while the panel is clipped, for
+                        // the reason the close button is: `pointer-events`
+                        // stops the mouse, not a Tab.
+                        tabIndex={open ? undefined : -1}
+                        disabled={pauseButton.disabled}
+                        onClick={() => togglePause(pauseButton)}
+                      >
+                        {paused ? <ResumeMark /> : <PauseMark />}
+                      </button>
+                    )}
+                    {endButton && (
+                      <button
+                        type="button"
+                        className="live-icon live-icon-end"
+                        aria-label="end the conversation"
+                        title={endButton.label}
+                        tabIndex={open ? undefined : -1}
+                        disabled={endButton.disabled}
+                        onClick={() => act(endButton)}
+                      >
+                        <EndMark />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="live-icon live-sidebar-close"
+                      aria-label="hide the conversation"
+                      // Out of the tab order while clipped: an invisible button a Tab
+                      // can land on is a trap. The textarea stays tabbable — it is the
+                      // one element meant to hold focus while the panel is shut.
+                      tabIndex={open ? undefined : -1}
+                      onClick={() => {
+                        setOpen(false)
+                        reclaim('hub-press', armed.current)
+                      }}
+                    >
+                      <CloseMark />
+                    </button>
+                  </div>
+                </div>
+
+                {/* How long, and what this conversation is about. Both are
+                    shown only where they are actually known: a session that
+                    has not started has no clock, and an unscoped one has no
+                    project — a fabricated chip is worse than a missing one. */}
+                <div className="live-head-meta">
+                  <span className="live-head-clock">
+                    {session !== null && (
+                      <>
+                        <LiveElapsed startedAt={session.started_at} /> ·{' '}
+                      </>
+                    )}
+                    mesa
+                  </span>
+                  <span className="live-head-chips">
+                    {recognizes && (
+                      <span className="live-chip live-chip-mic">Mic ready</span>
+                    )}
+                    {projectName !== null && (
+                      <span className="live-chip">Project · {projectName}</span>
+                    )}
+                  </span>
+                </div>
+
+                {/* The sentence under the instruments: what the conversation
+                    is doing in the words a person would use, and the one place
+                    a failed press is reported. The title above says the state
+                    in a word; this says why — "no agent is attached", "press
+                    Go live" — which a one-word title cannot. */}
+                <span
+                  className={`live-head-status ${actionError !== null ? 'error' : 'muted'}`}
+                >
                   {liveStatusLine(session, speaking, actionError, paused)}
                 </span>
-                <button
-                  type="button"
-                  className="live-sidebar-close"
-                  aria-label="hide the conversation"
-                  // Out of the tab order while clipped: an invisible button a Tab
-                  // can land on is a trap. The textarea stays tabbable — it is the
-                  // one element meant to hold focus while the panel is shut.
-                  tabIndex={open ? undefined : -1}
-                  onClick={() => {
-                    setOpen(false)
-                    reclaim('hub-press', armed.current)
-                  }}
-                >
-                  ×
-                </button>
               </div>
 
               {error && <p className="error">{error}</p>}
@@ -2027,6 +2252,57 @@ export function LiveHub({
                 )}
               </div>
 
+              {/* What is being said right now, by whichever side is saying
+                  it (mesa task 1069) — one panel between the settled
+                  transcript and the box, since at any moment there is at most
+                  one thing in flight. mesa's own line ranks above the
+                  recording for `liveIndicator.ts`'s reason: while she speaks
+                  the microphone is shut, so a panel claiming to be hearing the
+                  person would be describing a microphone that is not open. */}
+              {speakingText !== null ? (
+                <div className="live-preview live-preview-mesa">
+                  <div className="live-preview-label">mesa</div>
+                  <div className="live-preview-body">{speakingText}</div>
+                </div>
+              ) : (
+                (recording !== '' || interim !== '' || hearing > 0) && (
+                  /* The recording (task 889): every settled sentence since the
+                     switch went on, with whatever the engine is still guessing
+                     at on the end of it. Shown together because they are one
+                     thing to the person — what mesa will be told when they stop
+                     listening — and shown at all because a microphone recording
+                     out of sight is the thing this must never be. */
+                  <div className="live-preview live-preview-hearing">
+                    <div className="live-preview-label">hearing</div>
+                    <div className="live-preview-body">
+                      {recording}
+                      {recording !== '' && (interim !== '' || hearing > 0) ? ' ' : ''}
+                      {/* One live region, fed by whichever path is running
+                          (mesa task 957): the browser path's real interim guess
+                          (`interim !== ''`), or, since one-shot transcription
+                          has no partial result to show mid-segment, an
+                          in-flight note while a segment is on its way back from
+                          `auris` (`hearing > 0`). Either way it is announced
+                          once, while it is still news, for the same reason the
+                          original recognizer's guess was: a recording sitting
+                          on screen with no visible sign anything is happening
+                          reads as broken. */}
+                      {interim !== '' && (
+                        <span className="live-guessing" aria-live="polite">
+                          {interim}
+                        </span>
+                      )}
+                      {interim === '' && hearing > 0 && (
+                        <span className="live-guessing" aria-live="polite">
+                          transcribing…
+                        </span>
+                      )}
+                      <span className="live-caret" aria-hidden="true" />
+                    </div>
+                  </div>
+                )
+              )}
+
               <form
                 className="live-composer"
                 onSubmit={(e) => {
@@ -2034,27 +2310,81 @@ export function LiveHub({
                   send()
                 }}
               >
-                {/* How mesa hears this room: the switch, and the microphone
-                    it listens through (mesa tasks 887 and 884). Both belong
-                    here rather than in the header cluster beside the presses
-                    — they are settings on the conversation's input, read at
-                    the moment the person is deciding whether to talk or to
-                    type, and the header is where the press that destroys the
-                    conversation lives. */}
-                <div className="live-listen-row">
+                {/* The box and the switch, on one line (mesa task 1069):
+                    the microphone is a square beside the field rather than a
+                    word above it, since it is the other way of saying the
+                    same thing the box is for. Both stay in the panel rather
+                    than the header cluster (mesa task 887) — they are
+                    settings on the conversation's input, read at the moment
+                    the person is deciding whether to talk or to type. */}
+                <div className="live-input-row">
+                  <textarea
+                    ref={capture}
+                    className="live-input"
+                    rows={2}
+                    value={draft}
+                    // Paused is the same answer as not-live for the box: nothing typed
+                    // here would be heard until Resume, and a field that accepts words
+                    // nobody will read is worse than one that says it is shut.
+                    disabled={!live || paused}
+                    placeholder={
+                      !live
+                        ? 'go live to start the conversation'
+                        : paused
+                          ? 'paused — press Resume to talk to mesa'
+                          : recognizes
+                            ? 'listening — or type here'
+                            : 'dictate or type here…'
+                    }
+                    aria-label="say something to mesa"
+                    onChange={(e) => updateDraft(e.target.value)}
+                    onBlur={(e) => {
+                      // The arbiter: focus lost to somewhere a person types, on the
+                      // heels of a gesture, is them deliberately going elsewhere —
+                      // concede. Everything else — a page's autofocus after a
+                      // `navigate`, a click on a button or on nothing — is taken
+                      // back: none of it means "stop listening".
+                      const to = e.relatedTarget as HTMLElement | null
+                      if (
+                        to !== null &&
+                        isEditableTarget(to.tagName, to.isContentEditable) &&
+                        userTookFocus(gestureAt.current, Date.now())
+                      ) {
+                        standingDown.current = true
+                        return
+                      }
+                      reclaim('focus-lost-no-gesture', armed.current)
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key !== 'Enter' || e.shiftKey) return
+                      // The Enter that commits an IME candidate is not a send: it
+                      // arrives as a plain `Enter` keydown with `isComposing` set, and
+                      // acting on it would ship half-converted text. The same guard,
+                      // for the same reason, as the agent chat composer's.
+                      if (e.nativeEvent.isComposing) return
+                      e.preventDefault()
+                      send()
+                    }}
+                  />
                   {/* Offered on the same terms as Pause: there is a live
-                      conversation, this browser is in it, and the microphone
-                      could actually open — a browser with no recognizer, or
-                      one whose microphone was refused, has nothing for this
-                      switch to do, and the hint below says which of the two
-                      it is. A button reading "listening" before the
-                      conversation has started would claim something that is
-                      not happening. */}
+                    conversation, this browser is in it, and the microphone
+                    could actually open — a browser with no recognizer, or one
+                    whose microphone was refused, has nothing for this switch
+                    to do, and the caption below says which of the two it is.
+                    A switch reading "listening" before the conversation has
+                    started would claim something that is not happening.
+
+                    A press, not a hold (mesa task 1069 kept this deliberately):
+                    it is the same toggle the ⌘/Ctrl+Shift+L chord drives, and
+                    the two must not mean different things. */}
                   {live && unlocked && supported && !blocked && (
                     <button
                       type="button"
-                      className={`live-listen${muted ? '' : ' live-on'}`}
+                      className={`live-icon live-mic${muted ? '' : ' live-on'}`}
                       aria-pressed={!muted}
+                      aria-label={
+                        muted ? 'listen through this browser' : 'stop listening'
+                      }
                       // Out of the tab order while the panel is clipped, for
                       // the same reason the close button is: `pointer-events`
                       // stops the mouse, not a Tab, and an invisible control
@@ -2066,9 +2396,17 @@ export function LiveHub({
                       } (${LISTEN_CHORD})`}
                       onClick={() => toggleListening(!muted)}
                     >
-                      {muted ? 'listen' : 'listening'}
+                      <MicMark />
                     </button>
                   )}
+                </div>
+                {/* The caption under the box: which microphone, and what the
+                    page is doing with it. The chooser moved down here from
+                    the row above (mesa task 1069) — it is a machine-local
+                    setting read once, not a control the person reaches for
+                    mid-sentence, and the box and the switch own that line
+                    now. */}
+                <div className="live-caption">
                   {/* Offered only where there is more than one microphone and
                       the browser takes a track (`liveDevices.ts`) — a control
                       that cannot change what mesa hears is worse than no
@@ -2098,117 +2436,18 @@ export function LiveHub({
                       ))}
                     </select>
                   )}
-                  {/* The level meter (mesa task 956): the auris path's own
-                      sign the microphone is doing anything at all, since a
-                      one-shot transcription has no partial result to show
-                      mid-segment the way the browser path's interim preview
-                      does. Shown only on that path — the browser path's own
-                      sign is the interim text itself, and a meter that never
-                      moves because nothing feeds it would read as broken
-                      rather than as "this path uses something else".
-                      `aria-hidden` because it is decoration for the eye; the
-                      hint below is what actually reports state to a screen
-                      reader. */}
-                  {path === 'auris' && recognizes && (
-                    <div className="live-level" aria-hidden="true">
-                      <div
-                        className="live-level-bar"
-                        style={{ width: `${Math.min(1, Math.sqrt(level) * 3) * 100}%` }}
-                      />
-                    </div>
-                  )}
-                </div>
-                <textarea
-                  ref={capture}
-                  className="live-input"
-                  rows={2}
-                  value={draft}
-                  // Paused is the same answer as not-live for the box: nothing typed
-                  // here would be heard until Resume, and a field that accepts words
-                  // nobody will read is worse than one that says it is shut.
-                  disabled={!live || paused}
-                  placeholder={
-                    !live
-                      ? 'go live to start the conversation'
-                      : paused
-                        ? 'paused — press Resume to talk to mesa'
-                        : recognizes
-                          ? 'listening — or type here'
-                          : 'dictate or type here…'
-                  }
-                  aria-label="say something to mesa"
-                  onChange={(e) => updateDraft(e.target.value)}
-                  onBlur={(e) => {
-                    // The arbiter: focus lost to somewhere a person types, on the
-                    // heels of a gesture, is them deliberately going elsewhere —
-                    // concede. Everything else — a page's autofocus after a
-                    // `navigate`, a click on a button or on nothing — is taken
-                    // back: none of it means "stop listening".
-                    const to = e.relatedTarget as HTMLElement | null
-                    if (
-                      to !== null &&
-                      isEditableTarget(to.tagName, to.isContentEditable) &&
-                      userTookFocus(gestureAt.current, Date.now())
-                    ) {
-                      standingDown.current = true
-                      return
-                    }
-                    reclaim('focus-lost-no-gesture', armed.current)
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key !== 'Enter' || e.shiftKey) return
-                    // The Enter that commits an IME candidate is not a send: it
-                    // arrives as a plain `Enter` keydown with `isComposing` set, and
-                    // acting on it would ship half-converted text. The same guard,
-                    // for the same reason, as the agent chat composer's.
-                    if (e.nativeEvent.isComposing) return
-                    e.preventDefault()
-                    send()
-                  }}
-                />
-                {/* The recording (task 889): every settled sentence since the
-                    switch went on, with whatever the engine is still guessing
-                    at on the end of it. Shown together because they are one
-                    thing to the person — what mesa will be told when they stop
-                    listening — and shown at all because a microphone recording
-                    out of sight is the thing this must never be. */}
-                {(recording !== '' || interim !== '' || hearing > 0) && (
-                  <div className="live-interim">
-                    {recording}
-                    {recording !== '' && (interim !== '' || hearing > 0) ? ' ' : ''}
-                    {/* One live region, fed by whichever path is running
-                        (mesa task 957): the browser path's real interim guess
-                        (`interim !== ''`), or, since one-shot transcription
-                        has no partial result to show mid-segment, an
-                        in-flight note while a segment is on its way back from
-                        `auris` (`hearing > 0`). Either way it is announced
-                        once, while it is still news, for the same reason the
-                        original recognizer's guess was: a recording sitting
-                        on screen with no visible sign anything is happening
-                        reads as broken. */}
-                    {interim !== '' && (
-                      <span className="live-guessing" aria-live="polite">
-                        {interim}
-                      </span>
-                    )}
-                    {interim === '' && hearing > 0 && (
-                      <span className="live-guessing" aria-live="polite">
-                        transcribing…
-                      </span>
-                    )}
-                  </div>
-                )}
-                <div className="live-hint muted">
-                  {captureHint({
-                    live,
-                    joined: unlocked,
-                    path,
-                    blocked,
-                    listening: recognizes,
-                    paused,
-                    muted,
-                  })}{' '}
-                  {!paused && 'Enter sends.'}
+                  <span className="live-hint muted">
+                    {captureHint({
+                      live,
+                      joined: unlocked,
+                      path,
+                      blocked,
+                      listening: recognizes,
+                      paused,
+                      muted,
+                    })}{' '}
+                    {!paused && 'Enter sends.'}
+                  </span>
                 </div>
               </form>
             </div>

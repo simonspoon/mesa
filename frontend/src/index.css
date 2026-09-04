@@ -44,6 +44,18 @@
     10px 100%,
     0 calc(100% - 10px)
   );
+  /* The same chamfer at half the bite, for the things too small to wear the
+     10px one: a 44px icon button, a 28px chip, a speech bubble. At 10px the
+     cut eats a visible fraction of a 28px-tall box and the shape stops
+     reading as a corner. */
+  --cut-sm: polygon(
+    0 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% 100%,
+    6px 100%,
+    0 calc(100% - 6px)
+  );
 }
 
 * {

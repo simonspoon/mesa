@@ -8577,10 +8577,11 @@ button:focus-visible,
 }
 
 /* Mesa Live (mesa tasks 855, 857): the conversation lives in the header — a
-   control cluster on the right beside the plan-limit chips, a talking
-   indicator centered in the band while she speaks, and a transcript panel
-   anchored under the header that opens and closes without touching the
-   session. */
+   control cluster on the right beside the plan-limit chips, and a transcript
+   panel anchored under the header that opens and closes without touching the
+   session. Since mesa task 1069 the header keeps only the presses that *begin*
+   a conversation: the indicator, the clock, Pause and End all moved into the
+   panel's own head, which is where the conversation is. */
 .header-right {
   display: flex;
   align-items: center;
@@ -8614,14 +8615,6 @@ button:focus-visible,
   border-color: rgba(255, 59, 92, 0.5);
 }
 
-/* Paused is a held state, not an action in flight: the button carries the
-   colour of the conversation it is holding open, so a paused hub is readable
-   from across the room and never mistaken for one that has ended. */
-.live-toggle.live-paused {
-  color: var(--amber);
-  border-color: rgba(255, 180, 68, 0.5);
-}
-
 .live-panel-toggle.live-open {
   color: var(--cyan);
   border-color: rgba(0, 229, 255, 0.5);
@@ -8647,24 +8640,17 @@ button:focus-visible,
 }
 
 /* The conversation indicator (mesa task 874, redrawn as an aperture by mesa
-   task 973): one small canvas in the middle of the header band, in one state
-   at a time — mesa speaking, the person being heard, the agent at work on
-   what was said (task 894), a paused page, or the microphone simply open.
-   With the panel closed this is the only sign of either side talking, so
-   which state it is has to read at a glance: colour carries who (cyan is
-   mesa, green is the person, violet is the agent working, muted is nobody
+   task 973, moved into the panel head at 44px by task 1069): one canvas in
+   one state at a time — mesa speaking, the person being heard, the agent at
+   work on what was said (task 894), a paused page, or the microphone simply
+   open. Which state it is has to read at a glance: colour carries who (cyan
+   is mesa, green is the person, violet is the agent working, muted is nobody
    yet) and the drawing itself — rings, an orbit, a breathing dot, a single
    still arc — carries how much is happening and in which direction
-   (`liveBand.ts` has the full reasoning for each shape). Absolute against
-   the header, so it takes no room from the flex row, and the canvas paints
-   itself; nothing here animates. */
+   (`liveBand.ts` has the full reasoning for each shape). The canvas sizes
+   itself in JS and paints itself; nothing here animates. */
 .live-band {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: 18px;
-  height: 18px;
+  display: block;
   pointer-events: none;
 }
 
@@ -8769,27 +8755,214 @@ button:focus-visible,
   pointer-events: none;
 }
 
+/* The head (mesa task 1069): the panel's instrument cluster — three stacked
+   rows, of which only the first is ever busy. */
 .live-sidebar-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Aperture | what is happening | the presses. The middle column is the only
+   one that flexes: the aperture and the three 44px squares are fixed, and at
+   a narrow width it is the title and the meter that give, never a button. */
+.live-head-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* Held at the aperture's own size whether or not there is a state to draw, so
+   the row does not shift 44px sideways the moment one arrives. */
+.live-head-aperture {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.live-head-say {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* The one line of display type in the panel: this is the conversation's own
+   name for what it is doing, and Orbitron is what this app titles things in.
+   Ellipsised rather than wrapped — the row is 44px tall by the aperture
+   beside it, and a second line would push the meter out of it. */
+.live-head-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: 1.44px;
+  text-transform: uppercase;
+  color: var(--text-h);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The level meter (mesa task 956, moved here by 1069): twelve bars of how
+   loud this room has been, newest on the right, bottom-aligned so the row
+   reads as a skyline rather than as text. `LiveMeter` owns the history and
+   the heights; this owns the box it sits in — and it shrinks (to nothing, if
+   it has to) before any button does. */
+.live-meter {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 18px;
+  max-width: 120px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.live-meter-bar {
+  flex: 1 1 11px;
+  min-width: 0;
+  background: var(--green);
+  opacity: 0.85;
+}
+
+.live-head-actions {
+  flex: none;
+  display: flex;
+  gap: 8px;
+}
+
+/* A 44px square with a drawn glyph in it, in the colour of what it does: the
+   head has room for three presses or for three words, and it wants three
+   presses. Sized to the touch target the phone tier needs, so the same button
+   serves both tiers. */
+.live-icon {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  clip-path: var(--cut-sm);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+/* Stroked, never filled, and in `currentColor` — so each button's own colour,
+   its hover and its disabled state carry straight through to the glyph, the
+   same deal `.live-mark` gets. */
+.live-icon-mark {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  display: block;
+}
+
+/* Resume is the one glyph that is a solid shape rather than a stroke: a
+   stroked triangle at 15px reads as an outline nobody recognises. */
+.live-icon-mark.live-icon-solid {
+  fill: currentColor;
+}
+
+/* Pause carries the colour of the conversation it is holding open, End the
+   colour of what it will do — the same amber/red `.live-toggle` used when
+   these were words in the header. */
+.live-icon-pause {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
+.live-icon-end {
+  color: var(--red);
+  border-color: rgba(255, 59, 92, 0.5);
+}
+
+.live-sidebar-close {
+  color: var(--muted);
+  border-color: var(--border);
+}
+
+.live-sidebar-close:hover {
+  color: var(--text-h);
+}
+
+/* How long, and what this is about. Small, upright, and the only tabular
+   figures in the panel — a clock that re-flows its own width every second is
+   a distraction beside a title that does not move. */
+.live-head-meta {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
-  font-size: 0.85rem;
-}
-
-.live-sidebar-close {
-  flex: none;
-  background: none;
-  border: none;
-  padding: 0 0.25rem;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
   color: var(--muted);
-  font-size: 1.1rem;
-  line-height: 1;
-  cursor: pointer;
 }
 
-.live-sidebar-close:hover {
-  color: var(--fg);
+.live-head-clock {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.live-head-chips {
+  display: flex;
+  gap: 8px;
+  /* Shrinkable, and allowed to go below its content width: the clock beside it
+     is `flex: none`, so this row is what gives when a project is called
+     something long. */
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* Each chip is a fact about the conversation that is only shown when it is
+   actually known (`LiveHub` decides): the microphone is genuinely open, or
+   this conversation is genuinely scoped to a project.
+
+   `inline-block` rather than `inline-flex`, and centred on its own line box:
+   the project chip carries a name of any length, and `text-overflow` needs a
+   block box with the text inside it — inside a flex container the text is an
+   anonymous item and the ellipsis never lands, which is how a long name came
+   to be sliced off mid-word at the phone tier instead of trailing off. */
+.live-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-block;
+  height: 28px;
+  /* 28px minus the two 1px borders — `box-sizing` is `border-box` here. */
+  line-height: 26px;
+  padding: 0 10px;
+  clip-path: var(--cut-sm);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Two words, and the one chip whose whole content is load-bearing: it is
+   either there or it is not, so it never gives up width to its neighbour. */
+.live-chip-mic {
+  flex: none;
+  color: var(--green);
+  border-color: rgba(43, 255, 156, 0.35);
+}
+
+/* The sentence under the instruments (`liveStatusLine`): what a one-word
+   title cannot say — that no agent is attached, or that the last press
+   failed. */
+.live-head-status {
+  font-size: 0.75rem;
 }
 
 /* The conversation itself: the one scrolling part, so a long exchange never
@@ -8821,10 +8994,15 @@ button:focus-visible,
   text-align: right;
 }
 
+.live-group.live-user,
+.live-group.live-mesa {
+  max-width: 86%;
+}
+
 .live-who {
-  font-size: 0.7rem;
+  font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: 1.4px;
   text-transform: uppercase;
   color: var(--muted);
 }
@@ -8836,15 +9014,21 @@ button:focus-visible,
 /* Dictation and spoken prose are both free text that may carry a bare URL with
    no break opportunity at all — the same rule `.inbox-body` needs. */
 .live-turn {
-  padding: 0.4rem 0.6rem;
+  padding: 8px 11px;
   border: 1px solid var(--border);
   background: var(--bg);
+  clip-path: var(--cut-sm);
+  font-size: 13.5px;
+  line-height: 1.6;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 
+/* The dictated side is the brighter one: it is what the person said, and it is
+   what they check when a mishearing needs spotting. */
 .live-user .live-turn {
   border-color: rgba(0, 229, 255, 0.4);
+  color: var(--text-h);
 }
 
 /* What a turn DID, as opposed to what it said: a navigate turn may carry no
@@ -8862,70 +9046,141 @@ button:focus-visible,
   gap: 0.35rem;
 }
 
-/* How mesa hears this room (mesa task 887): the switch and the microphone it
-   listens through, above the box rather than in the header — they are
-   settings on the input, read where the person decides whether to talk. */
-.live-listen-row {
+/* What is being said right now (mesa task 1069), by whichever side is saying
+   it: the recording the microphone is holding, or the line mesa is speaking.
+   Its own panel between the settled transcript and the box, rather than the
+   loose text under the box it used to be — this is the one thing on the panel
+   that is still in flight, and it reads at the size a person glances at
+   rather than at caption size. The 10px chamfer, not the small one: it is a
+   panel, the same kind of box the transcript is. */
+.live-preview {
+  flex: none;
   display: flex;
-  align-items: center;
-  gap: 0.4rem;
+  flex-direction: column;
+  gap: 7px;
+  padding: 14px;
+  clip-path: var(--cut);
+  background: var(--panel);
 }
 
-/* Listening is a state, not just a press — the same deal `.live-toggle.live-on`
-   gets, in the colour of the side of the conversation it belongs to: cyan is
-   the person. */
-.live-listen {
-  font-size: 0.75rem;
-  padding: 0.2rem 0.5rem;
+/* Green while the microphone is holding it, cyan while mesa is saying it —
+   the two colours this surface already means by "the person" and "mesa". */
+.live-preview-hearing {
+  border: 1px solid rgba(43, 255, 156, 0.35);
 }
 
-.live-listen.live-on {
+.live-preview-mesa {
+  border: 1px solid rgba(0, 229, 255, 0.3);
+}
+
+.live-preview-label {
+  font-size: 11px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+}
+
+.live-preview-hearing .live-preview-label {
+  color: var(--green);
+}
+
+.live-preview-mesa .live-preview-label {
   color: var(--cyan);
-  border-color: rgba(0, 229, 255, 0.5);
-}
-
-/* The level meter (mesa task 956): what replaced the interim preview once the
-   microphone stopped feeding a recognizer that could guess at words. A
-   microphone with no visible response looks broken, and a bar that moves with
-   the room is the cheap honest answer where a partial transcript would need a
-   streaming decoder mesa does not have. Sized to sit in the same row as the
-   switch and the chooser rather than as its own line. */
-.live-level {
-  flex: 1 1 3rem;
-  min-width: 3rem;
-  height: 0.3rem;
-  border-radius: 0.15rem;
-  background: rgba(255, 255, 255, 0.08);
-  overflow: hidden;
-}
-
-.live-level-bar {
-  height: 100%;
-  background: var(--cyan);
-  /* A width transition rather than redrawing on every block: the meter
-     already throttles how often its own state changes, so this just smooths
-     the jump between those steps. */
-  transition: width 80ms linear;
-}
-
-.live-input {
-  width: 100%;
-  resize: vertical;
-}
-
-.live-hint {
-  font-size: 0.75rem;
 }
 
 /* The recording (mesa tasks 873, 889): what the microphone has heard since the
    switch went on, and what will be sent as one turn when it goes off. Upright
-   and in the ordinary text colour, because it *is* what was said — and capped
+   and in the bright text colour, because it *is* what was said — and capped
    in height with its own scroll, since a recording runs for as long as the
    person talks and must not push the capture box off the panel. */
-.live-interim {
-  font-size: 0.8rem;
+.live-preview-body {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-h);
   max-height: 8rem;
   overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+/* The blinking end of the line: the cheapest possible sign that this text is
+   still being added to, where the words themselves may sit unchanged for a
+   second at a time. Decoration — `aria-hidden` in the markup — so it is
+   allowed to be nothing but a rectangle. */
+.live-caret {
+  display: inline-block;
+  width: 1px;
+  height: 16px;
+  margin-left: 3px;
+  vertical-align: -3px;
+  background: var(--cyan);
+  animation: live-caret 1.1s step-end infinite;
+}
+
+@keyframes live-caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Nothing in this panel is worth motion sickness: the caret simply stands
+   still, which still marks the end of the line. */
+@media (prefers-reduced-motion: reduce) {
+  .live-caret {
+    animation: none;
+  }
+}
+
+/* The box and the switch, on one line (mesa task 1069). */
+.live-input-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.live-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 42px;
+  clip-path: var(--cut-sm);
+  resize: vertical;
+}
+
+/* Listening is a state, not just a press — the same deal `.live-toggle.live-on`
+   gets. Green rather than the cyan the word-shaped switch used to carry: this
+   is the microphone, and green is what the aperture and the meter above
+   already mean by the person being heard. Amber while muted, so a switch that
+   is off says so in a colour rather than only in a label. */
+.live-mic {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
+.live-mic.live-on {
+  color: var(--green);
+  border-color: rgba(43, 255, 156, 0.5);
+}
+
+/* The caption under the box: which microphone, and what the page is doing
+   with it. */
+.live-caption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
+}
+
+/* The hint takes a line of its own under the chooser rather than the ~230px
+   column left beside it, where a sentence wraps four or five times and drags
+   the caption taller than the box it belongs to. `100%` as the basis is what
+   forces the wrap: it can never share a line, so the row is one line when
+   there is no chooser and two when there is. */
+.live-hint {
+  flex: 1 1 100%;
+  min-width: 0;
+  font-size: 0.75rem;
 }
 
 /* The provisional tail of the recording (mesa task 956): once the recognizer's
@@ -9006,8 +9261,28 @@ button:focus-visible,
     padding: 0.5rem 0.5rem 0.75rem;
   }
 
+  /* The head's meter is the first thing to give at 390px, and the only one:
+     the title has to stay readable and the three presses have to stay 44px
+     to stay pressable, so the one part of the row with no words in it is
+     what goes. */
+  .live-meter {
+    display: none;
+  }
+
+  .live-head-row {
+    gap: 0.5rem;
+  }
+
+  .live-head-actions {
+    gap: 6px;
+  }
+
   .live-transcript {
     padding: 0.5rem;
+  }
+
+  .live-preview {
+    padding: 10px;
   }
 
   /* Below the phone tier the name and description always stack, whatever

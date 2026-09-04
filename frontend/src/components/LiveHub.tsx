@@ -55,6 +55,7 @@ import {
   correctVocabulary,
   isBlockingError,
   isListenChord,
+  isSilentTranscribe,
   LISTEN_CHORD,
   heldFlush,
   heldWith,
@@ -1231,6 +1232,9 @@ export function LiveHub({
       try {
         const { text: raw } = await transcribeAudio(toBase64(wav))
         if (!running && !outlives) return
+        // A segment that came back is proof this page is still in touch, so
+        // whatever the last failure was, it is over.
+        setActionError(null)
         const text = utteranceFrom(correctVocabulary(raw, vocabRef.current))
         if (text === null) return
         // The preview is cleared here rather than waiting for the next
@@ -1253,7 +1257,14 @@ export function LiveHub({
         // and there is nothing this page can do with the difference. Say so,
         // and try the next utterance rather than ending listening outright or
         // switching paths mid-conversation over one bad segment.
-        setActionError(err instanceof Error ? err.message : String(err))
+        //
+        // Except when auris merely heard nothing (mesa task 1072): a breath or
+        // a quiet room is a normal outcome of listening, and auris plainly
+        // ran, so the error is cleared and nothing is said — a banner for it
+        // latched the panel into `Reconnecting` for the rest of the
+        // conversation while turns kept flowing.
+        const message = err instanceof Error ? err.message : String(err)
+        setActionError(isSilentTranscribe(message) ? null : message)
       } finally {
         setHearing((n) => n - 1)
       }

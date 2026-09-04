@@ -281,6 +281,29 @@ export function isBlockingError(code: string): boolean {
 }
 
 /**
+ * Whether a failed transcription means auris heard nothing, rather than that
+ * auris broke.
+ *
+ * A segment the VAD ended on a breath, a door or a stretch of room noise
+ * reaches auris as audio with no speech in it, and auris reports that as a
+ * failure — mesa's `/api/live/transcribe` has no transcript to answer with, so
+ * it is a 503 like any other (`docs/listen.md`). That is a normal outcome of
+ * listening, not something to tell the person about, so the caller says
+ * nothing for it.
+ *
+ * The match is on the shape of auris's own wording, case-insensitively,
+ * because the sentence comes from that binary's stderr rather than from mesa
+ * and may be reworded. Erring toward "this is a real error" is deliberate: a
+ * missed silence shows a banner that now clears itself on the next successful
+ * segment, while a false positive would hide a genuinely broken binary for the
+ * whole conversation.
+ */
+export function isSilentTranscribe(message: string): boolean {
+  const said = message.toLowerCase()
+  return said.includes('no speech') || said.includes('nothing transcribed')
+}
+
+/**
  * The final text and the interim preview in one event, plus how far the
  * results list has now been consumed.
  *

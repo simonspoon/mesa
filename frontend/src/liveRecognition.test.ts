@@ -9,6 +9,7 @@ import {
   heldWith,
   isBlockingError,
   isListenChord,
+  isSilentTranscribe,
   listenPath,
   MESA_VOCABULARY,
   readResults,
@@ -218,6 +219,26 @@ describe('isBlockingError', () => {
     for (const code of ['no-speech', 'aborted', 'network', 'audio-capture', 'unknown']) {
       expect(isBlockingError(code)).toBe(false)
     }
+  })
+})
+
+describe('isSilentTranscribe', () => {
+  it('auris hearing nothing is not a failure worth reporting', () => {
+    expect(
+      isSilentTranscribe(
+        'auris produced no transcript: auris: nothing transcribed; no speech in the audio',
+      ),
+    ).toBe(true)
+  })
+
+  it('the wording is matched however it is cased', () => {
+    expect(isSilentTranscribe('AURIS: No Speech In The Audio')).toBe(true)
+  })
+
+  it('a broken binary is a real error', () => {
+    expect(isSilentTranscribe('failed to spawn auris: No such file or directory')).toBe(false)
+    expect(isSilentTranscribe('auris exited with exit status: 2')).toBe(false)
+    expect(isSilentTranscribe('')).toBe(false)
   })
 })
 

@@ -3584,7 +3584,14 @@ mod tests {
     // this lock for the set→collect→unset window, or one test's dir leaks into
     // another's `collect()`. Recover from poison so a panic in one test fails
     // only that test, not every other test queued on the lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    //
+    // It is the **crate-wide** lock, not one of this module's own: the pricing
+    // tests below also move `MESA_CONFIG_FILE`, which `src/api.rs`'s watcher
+    // tests hold constant for their duration — two separate mutexes exclude
+    // each other's module but not each other, and a config file swapped out
+    // from under a running `todo_watcher_tick` reads as an unconfigured
+    // concurrency limit.
+    use crate::core::attachments::ENV_LOCK;
 
     fn write_jsonl(dir: &Path, name: &str, lines: &[&str]) {
         let path = dir.join(name);

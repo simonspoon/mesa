@@ -669,4 +669,137 @@ ok "a failing 'claude agents' counts as zero live sessions and dispatch still ha
 stop_holder
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
+# ---- the reaper (mesa task 1057): a session the watcher dispatched is
+# stopped once its task stops being in_progress. Own db/port/log/stub, same
+# isolation reason as the blocks above. This stub is the first one whose
+# `agents` branch names the jobs it handed out (from $REAP_IDS) and whose
+# `stop` branch records its argument, which is the whole of what the reaper
+# touches. The reported pid is a number no process has, so the live-work probe
+# finds no shell children and the dispatch rules above are unaffected. ----
+
+REAP_DB="$TMP/reap.db"
+REAP_LOG="$TMP/reap-bg.log"
+REAP_IDS="$TMP/reap-ids"
+REAP_STOPS="$TMP/reap-stops.log"
+REAP_STATUS="$TMP/reap-status"
+touch "$REAP_LOG" "$REAP_IDS" "$REAP_STOPS"
+echo idle > "$REAP_STATUS"
+# Each dispatch gets its own receipt id, so a stop can be attributed to the
+# session it belongs to rather than to "the" job.
+REAP_COUNTER="$TMP/reap-counter"
+echo 0 > "$REAP_COUNTER"
+
+mkdir -p "$TMP/reapDir"
+REAP_DIR=$(cd "$TMP/reapDir" && pwd -P)
+
+REAP_STUB="$STUB_DIR/claude-reap"
+cat > "$REAP_STUB" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "--bg" ]; then
+  shift
+  if [ "\$1" = "--agent" ]; then shift; shift; fi
+  NAME=""
+  if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
+  PROMPT=""
+  if [ "\$1" = "--" ]; then shift; PROMPT="\$1"; fi
+  N=\$(( \$(cat "$REAP_COUNTER") + 1 ))
+  echo "\$N" > "$REAP_COUNTER"
+  ID=\$(printf 'job%04d' "\$N")
+  echo "\$ID" >> "$REAP_IDS"
+  echo "\$(pwd)|\$NAME|\$PROMPT|\$ID" >> "$REAP_LOG"
+  echo "backgrounded · \$ID (idle — send a prompt to start)"
+  exit 0
+fi
+if [ "\$1" = "agents" ]; then
+  STATUS=\$(cat "$REAP_STATUS")
+  FIRST=1
+  printf '['
+  while read -r id; do
+    [ -z "\$id" ] && continue
+    [ "\$FIRST" = 1 ] || printf ','
+    FIRST=0
+    printf '{"pid":424242,"id":"%s","cwd":"$REAP_DIR","kind":"background","startedAt":1783000000000,"sessionId":"%s-0000-0000-0000-000000000000","name":"reap","status":"%s","state":"done"}' "\$id" "\$id" "\$STATUS"
+  done < "$REAP_IDS"
+  printf ']\n'
+  exit 0
+fi
+if [ "\$1" = "stop" ]; then echo "\$2" >> "$REAP_STOPS"; exit 0; fi
+exit 2
+EOF
+chmod +x "$REAP_STUB"
+
+export MESA_DB="$REAP_DB"
+run 0 "$MESA" project create "Reap" --no-git
+REAP_P=$(jqs .id)
+run 0 "$MESA" project update "$REAP_P" --path "$REAP_DIR"
+run 0 "$MESA" task create "$REAP_P" "task reap"
+REAP_T1=$(jqs .id)
+
+REAP_PORT=17788
+MESA_CLAUDE_BIN="$REAP_STUB" MESA_WATCH_TODO_TICK_MS=150 \
+  "$MESA" serve --port "$REAP_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$REAP_PORT"
+
+wait_reap_bg_lines() { # wait_reap_bg_lines <n>
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$REAP_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n reap-check bg dispatch(es); log:\n$(cat "$REAP_LOG")"
+}
+wait_stop_lines() { # wait_stop_lines <n>
+  local n=$1
+  for _ in $(seq 1 60); do
+    [ "$(wc -l < "$REAP_STOPS")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n stop(s); log:\n$(cat "$REAP_STOPS")"
+}
+
+wait_reap_bg_lines 1
+REAP_J1=$(cut -d'|' -f4 < "$REAP_LOG" | sed -n '1p')
+sleep 1
+[ "$(wc -l < "$REAP_STOPS")" -eq 0 ] ||
+  fail "an in_progress task's session must never be stopped: $(cat "$REAP_STOPS")"
+ok "the reaper leaves a dispatched session alone while its task is in_progress"
+
+# A session still `busy` has just closed its task and is writing its report:
+# it must survive several passes untouched.
+# The status file is flipped a few ticks BEFORE the task closes: a pass that
+# fetched the listing while it still said `idle` and then read the store after
+# the close would legitimately stop the session, and that interleaving is the
+# test's own doing, not the reaper's.
+echo busy > "$REAP_STATUS"
+sleep 0.8
+run 0 "$MESA" task update "$REAP_T1" --status done
+sleep 1
+[ "$(wc -l < "$REAP_STOPS")" -eq 0 ] ||
+  fail "a busy session must not be stopped: $(cat "$REAP_STOPS")"
+ok "a session still busy after its task closed is left for a later pass"
+
+echo idle > "$REAP_STATUS"
+wait_stop_lines 1
+sleep 1
+[ "$(wc -l < "$REAP_STOPS")" -eq 1 ] ||
+  fail "a stopped session must be stopped exactly once: $(cat "$REAP_STOPS")"
+[ "$(head -1 "$REAP_STOPS")" = "$REAP_J1" ] ||
+  fail "expected 'claude stop $REAP_J1', got '$(head -1 "$REAP_STOPS")'"
+ok "closing a dispatched task stops exactly its own session, exactly once"
+
+# A task pushed back to `todo` is one the agent is equally finished with: its
+# old session is stopped whether or not the task is re-dispatched after.
+run 0 "$MESA" task create "$REAP_P" "task reap two"
+REAP_T2=$(jqs .id)
+wait_reap_bg_lines 2
+REAP_J2=$(cut -d'|' -f4 < "$REAP_LOG" | sed -n '2p')
+run 0 "$MESA" task update "$REAP_T2" --status todo
+wait_stop_lines 2
+grep -qx "$REAP_J2" "$REAP_STOPS" ||
+  fail "a task set back to todo must stop its old session ($REAP_J2); got: $(cat "$REAP_STOPS")"
+ok "a dispatched task set back to todo has its old session stopped too"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
 echo "ALL OK ($CHECKS checks)"

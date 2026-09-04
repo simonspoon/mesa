@@ -152,6 +152,56 @@ because someone ran `mesa serve`.
   `in_progress` regardless. If the current leaf count is already at or above
   the (now-lower) limit, the tick simply dispatches nothing new until enough
   of them finish to drop the count back under it.
+- **A dispatched session is stopped once its task is no longer `in_progress`**
+  (mesa task 1057). The watcher used to only ever *start* agents: a session
+  whose task closed sat idle for hours holding a worktree, a simulator and a
+  context window, and nothing but a person noticing ever ended it. So each
+  successful dispatch records the short job id off `claude --bg`'s
+  `backgrounded · <id>` receipt against the task it was started for
+  (`AppState::todo_dispatched`), and a second loop — `todo_reaper_tick` —
+  reaps them.
+  - Each pass reads the task and looks the job up in one unfiltered
+    `claude agents --json` listing (`reap_verdict` is the whole decision, a
+    pure function of the two). `in_progress` is the one status that means
+    "still mine"; `done`, `cancelled`, a task pushed back to `todo`/`backlog`
+    and a deleted task all mean the agent is finished with what it was
+    started for. A row with no `pid`, or a job the listing no longer names, is
+    simply forgotten — there is nothing to stop. Anything else live is
+    `agents::stop(job_id)`, i.e. `claude stop <id>` through the same binary
+    (and the same `MESA_CLAUDE_BIN` seam) the spawn went through.
+  - **A `busy` session is left for the next pass**, never stopped. An agent
+    that has just closed its task is usually still writing its closing report
+    or its inbox summary, and cutting that off would lose the very thing the
+    run was for.
+  - **Re-dispatching a task stops the session it supersedes**, at the moment
+    of the spawn rather than on a reaper pass: mesa starting a second agent on
+    a task says the first is finished with it, whatever the task's status
+    reads a moment later. The old entry is *marked* superseded rather than
+    dropped, and forgotten only once its stop succeeds — a job dropped on a
+    stop that then failed would be both unstopped and untracked. A superseded
+    entry is what the reaper reads as a closed task, since the task itself is
+    `in_progress` again under the new session.
+  - Every shell-out is best-effort and off the store lock. A failing listing
+    keeps every entry rather than forgetting sessions mesa can no longer see,
+    and a failing stop keeps its entry so the next pass retries. A pass with
+    an empty map returns before any lock and spawns no process at all.
+  - The map is **in memory**, like `inbox_dispatched` and the cost guard's
+    `cost_stopped`, and deliberately not persisted: a `serve` restart forgets
+    the sessions spawned before it, which leaves them to be stopped by hand.
+    A replacement `todo-watcher` template that prints no `backgrounded · <id>`
+    receipt records nothing and so leaves nothing to stop — the same
+    limitation the attach pane already has. (A multi-line **script** template
+    is not that case: its stdout is read exactly as an argv command's is, so
+    a script whose last line is `claude --bg …` still hands mesa the id.)
+  - The reaper runs on its own `WATCH_TODO_REAP_TICK` (20s) interval loop,
+    started alongside the dispatch loop and only under `--watch-todo`, so a
+    closed task's session ends well inside a minute. It shares
+    `MESA_WATCH_TODO_TICK_MS` rather than adding a seam of its own — the two
+    loops are one feature.
+  - Regressions: `api::tests::todo_reaper_tick_stops_a_dispatched_session_once_its_task_closes`,
+    `api::tests::todo_watcher_tick_stops_the_session_a_re_dispatch_supersedes`
+    and the three `reap_verdict_*` unit tests, plus the reaper block in
+    `scripts/todo-watcher-check.sh` end-to-end.
 - The tick cadence is a fixed internal constant (`WATCH_TODO_TICK`, 60s), not
   user-configurable. `MESA_WATCH_TODO_TICK_MS` overrides it, a test-only seam
   (mirrors `MESA_CLAUDE_BIN`) so `scripts/todo-watcher-check.sh` isn't stuck
@@ -168,5 +218,7 @@ because someone ran `mesa serve`.
   process holding a real shell child parking the slot until it is killed, and
   the fail-open path where an erroring `agents` probe still dispatches)
   against a stub `claude`
-  binary — no CLI surface of its own beyond the `serve` flag, matching the
+  binary — plus the reaper (a dispatched session left alone while its task is
+  in_progress and while it is still `busy`, stopped exactly once when its task
+  closes, and the old session stopped when a task goes back to `todo`) — no CLI surface of its own beyond the `serve` flag, matching the
   agents surface's "no `mesa agent` CLI" precedent.

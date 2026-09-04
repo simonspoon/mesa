@@ -193,6 +193,22 @@ struct AppState {
     /// stop is recorded, so a failure retries on the next tick that finds a
     /// fresh breach. Not persisted, for `cost_alerted`'s reason.
     cost_stopped: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Background job id → what it was dispatched for, for every session
+    /// the todo-watcher spawned in this server's lifetime and has not yet
+    /// reaped (mesa task 1057). The reaper's whole memory: a dispatched
+    /// session that has finished with its task sits idle for hours holding a
+    /// worktree, and nothing in the db records which session was started for
+    /// which task, so this map is what lets `todo_reaper_tick` stop exactly
+    /// the sessions mesa itself started.
+    ///
+    /// In memory, like `inbox_dispatched` and `cost_stopped`, and deliberately
+    /// not persisted: a restart forgets the sessions spawned before it, which
+    /// leaves them to be stopped by hand — the same direction every other
+    /// watcher set takes, and cheaper than a column that could name a session
+    /// that no longer exists. A spawn that printed no `backgrounded · <id>`
+    /// receipt records nothing, since there is no id to stop with (the
+    /// limitation the attach pane already has).
+    todo_dispatched: Arc<Mutex<HashMap<String, DispatchedSession>>>,
 }
 
 /// How often the todo-watcher (`watch_todo`) checks every project for
@@ -208,6 +224,23 @@ fn watch_todo_tick() -> Duration {
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_TODO_TICK)
+}
+
+/// How often the todo-watcher's **reaper** (`todo_reaper_tick`) checks the
+/// sessions it dispatched for ones whose task has closed. A third of
+/// [`WATCH_TODO_TICK`] so "the session ends within a minute of its task
+/// closing" holds comfortably against the dispatch cadence, and it shares
+/// `MESA_WATCH_TODO_TICK_MS` rather than adding a seam of its own — the two
+/// loops are one feature, and a gate that shrinks one wants the other shrunk
+/// with it.
+const WATCH_TODO_REAP_TICK: Duration = Duration::from_secs(20);
+
+fn watch_todo_reap_tick() -> Duration {
+    std::env::var("MESA_WATCH_TODO_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_TODO_REAP_TICK)
 }
 
 /// How often the inbox-watcher (`watch_inbox`) checks the global inbox for
@@ -815,25 +848,241 @@ fn todo_watcher_tick(state: &AppState) {
         // The command — including which slash command executes a task — comes
         // from `~/.mesa/config.json`'s `todo-watcher` entry, defaulting to
         // `claude --bg … -- /execute-mesa-task <id>`.
-        if let Err(e) = agents::spawn_bg(
+        match agents::spawn_bg(
             config::TODO_WATCHER,
             &local_path,
             Some(task_id),
             Some(&session_name),
             None,
         ) {
-            eprintln!("todo-watcher: spawn failed for task {task_id}: {e}");
-            let mut store = match state.store.lock() {
-                Ok(s) => s,
-                Err(e) => e.into_inner(),
-            };
-            let revert = TaskPatch {
-                status: Some(Status::Todo),
-                ..Default::default()
-            };
-            let _ = store.update_task(task_id, &revert);
+            // The receipt's short job id is what `claude stop` takes, so
+            // remembering it here is the whole of what the reaper needs
+            // (mesa task 1057). A command that printed no receipt leaves
+            // nothing to stop, exactly as it leaves nothing to attach to.
+            Ok(job_id) => {
+                if let Some(job_id) = job_id {
+                    // Starting a *second* agent on this task says the first is
+                    // finished with it, whatever the task's status reads right
+                    // now — so the superseded session is stopped here rather
+                    // than left for a reaper pass that would see the task
+                    // in_progress again and spare it (mesa task 1057).
+                    for stale in supersede_dispatch(state, task_id) {
+                        match agents::stop(&stale) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "todo-watcher: task {task_id} was re-dispatched, stopped its \
+                                     previous session (claude stop {stale})"
+                                );
+                                forget_dispatch(state, &stale);
+                            }
+                            // Left marked superseded rather than forgotten, so
+                            // the next reaper pass tries the stop again.
+                            Err(e) => {
+                                eprintln!("todo-watcher: stopping session {stale} failed: {e}")
+                            }
+                        }
+                    }
+                    let mut dispatched = match state.todo_dispatched.lock() {
+                        Ok(d) => d,
+                        Err(e) => e.into_inner(),
+                    };
+                    dispatched.insert(
+                        job_id,
+                        DispatchedSession {
+                            task_id,
+                            superseded: false,
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("todo-watcher: spawn failed for task {task_id}: {e}");
+                let mut store = match state.store.lock() {
+                    Ok(s) => s,
+                    Err(e) => e.into_inner(),
+                };
+                let revert = TaskPatch {
+                    status: Some(Status::Todo),
+                    ..Default::default()
+                };
+                let _ = store.update_task(task_id, &revert);
+            }
         }
     }
+}
+
+/// One session the todo-watcher spawned, as `AppState::todo_dispatched`
+/// remembers it: the task it was dispatched onto, and whether a later
+/// dispatch onto that same task has since **superseded** it.
+///
+/// A superseded session is finished with its task by construction — mesa
+/// started a second agent on it — so the reaper reads it as a closed task
+/// whatever the task's own status says, which is what keeps a re-claimed
+/// `in_progress` from sparing the session it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchedSession {
+    task_id: i64,
+    superseded: bool,
+}
+
+/// What the reaper should do with one dispatched session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapVerdict {
+    /// Still working, or still finishing up: look again next pass.
+    Keep,
+    /// Nothing left to stop — the process is gone, or the job is not listed.
+    Forget,
+    /// Finished with its task and still running: `claude stop <job id>`.
+    Stop,
+}
+
+/// The reaper's whole decision, kept pure so it is testable without a
+/// `claude` binary: the task's status (`None` = the task was deleted, which
+/// counts as closed) and the session's row in the current `claude agents`
+/// listing (`None` = not listed).
+///
+/// `in_progress` is the one status that means "still mine": every other one —
+/// `done`, `cancelled`, and a task pushed back to `todo`/`backlog` by hand —
+/// says the agent is finished with the work it was started for, whether or
+/// not it finished it well.
+///
+/// A **busy** session is left for the next pass rather than stopped: an agent
+/// that has just closed its task is usually still writing its report or its
+/// inbox summary, and cutting that off would lose the very thing the run was
+/// for. Every other live state (`idle`, `waiting`, or a row with no status at
+/// all) is a session sitting on a worktree with nothing to do.
+fn reap_verdict(status: Option<Status>, listed: Option<&AgentSession>) -> ReapVerdict {
+    if status == Some(Status::InProgress) {
+        return ReapVerdict::Keep;
+    }
+    match listed {
+        // Not listed, or listed with no pid: the process is already gone.
+        None => ReapVerdict::Forget,
+        Some(session) if session.pid.is_none() => ReapVerdict::Forget,
+        Some(session) if session.status.as_deref() == Some("busy") => ReapVerdict::Keep,
+        Some(_) => ReapVerdict::Stop,
+    }
+}
+
+/// One reaper pass: stop the sessions the todo-watcher dispatched whose task
+/// has since closed (mesa task 1057).
+///
+/// The watcher's dispatch is one-directional — it starts agents and never
+/// ends them — so a session whose task closed sits idle for hours holding a
+/// worktree, a simulator and a context window. This is the other end of that:
+/// `AppState::todo_dispatched` remembers `(job id → task id)` per spawn, and
+/// each pass asks the store what became of the task and `claude agents` what
+/// became of the session ([`reap_verdict`] decides).
+///
+/// Cheap when idle: an empty map returns before any lock and before any
+/// subprocess, so a server whose watcher has dispatched nothing spawns no
+/// `claude` on this cadence. Everything else is best-effort — a failing
+/// listing keeps every entry for the next pass rather than forgetting
+/// sessions mesa can no longer see, and a failing stop keeps its entry so a
+/// transient failure retries.
+fn todo_reaper_tick(state: &AppState) {
+    let dispatched: Vec<(String, DispatchedSession)> = {
+        let map = match state.todo_dispatched.lock() {
+            Ok(d) => d,
+            Err(e) => e.into_inner(),
+        };
+        map.iter().map(|(j, d)| (j.clone(), *d)).collect()
+    };
+    if dispatched.is_empty() {
+        return;
+    }
+    // One listing per pass, taken before the store lock — it is a `claude`
+    // shell-out, and holding the lock across it would freeze every other
+    // request, exactly as in `todo_watcher_tick`.
+    let sessions = match agents::list_all() {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            eprintln!("todo-watcher: reaper could not list sessions, retrying next pass: {e}");
+            return;
+        }
+    };
+    let statuses: Vec<Option<Status>> = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        dispatched
+            .iter()
+            // A superseded session is finished with its task whatever that
+            // task now reads, and a task that no longer exists counts as
+            // closed: either way, this is not that task's worker any more.
+            .map(|(_, d)| {
+                (!d.superseded)
+                    .then(|| store.get_task(d.task_id).ok().map(|t| t.status))
+                    .flatten()
+            })
+            .collect()
+    };
+    for ((job_id, dispatch), status) in dispatched.into_iter().zip(statuses) {
+        let task_id = dispatch.task_id;
+        let listed = sessions
+            .iter()
+            .find(|s| s.id.as_deref() == Some(job_id.as_str()));
+        match reap_verdict(status, listed) {
+            ReapVerdict::Keep => {}
+            ReapVerdict::Forget => forget_dispatch(state, &job_id),
+            ReapVerdict::Stop => match agents::stop(&job_id) {
+                Ok(()) => {
+                    let why = if dispatch.superseded {
+                        "was re-dispatched"
+                    } else {
+                        "is closed"
+                    };
+                    eprintln!(
+                        "todo-watcher: task {task_id} {why}, stopped its session \
+                         (claude stop {job_id})"
+                    );
+                    forget_dispatch(state, &job_id);
+                }
+                // Kept, so the next pass tries again — the session is still
+                // running and still holding whatever it holds.
+                Err(e) => eprintln!("todo-watcher: stopping session {job_id} failed: {e}"),
+            },
+        }
+    }
+}
+
+/// Marks every job recorded against `task_id` **superseded** and returns
+/// their ids — the sessions a fresh dispatch onto that task replaces.
+/// Normally empty: only a task that went back to `todo` (or `backlog`) and
+/// was picked up again has an older session at all.
+///
+/// Marked rather than removed, because the stop that follows is best-effort:
+/// a job dropped here whose stop then failed would be both unstopped and
+/// untracked, the one state nothing ever recovers from. Marked, it stays
+/// reapable, and `superseded` is what stops the reaper reading the task's
+/// freshly re-claimed `in_progress` as "this session is still working".
+fn supersede_dispatch(state: &AppState, task_id: i64) -> Vec<String> {
+    let mut map = match state.todo_dispatched.lock() {
+        Ok(d) => d,
+        Err(e) => e.into_inner(),
+    };
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, d)| d.task_id == task_id && !d.superseded)
+        .map(|(job_id, _)| job_id.clone())
+        .collect();
+    for job_id in &stale {
+        if let Some(d) = map.get_mut(job_id) {
+            d.superseded = true;
+        }
+    }
+    stale
+}
+
+/// Drops one job from `todo_dispatched` — the reaper is done with it, either
+/// because it stopped the session or because there was nothing to stop.
+fn forget_dispatch(state: &AppState, job_id: &str) {
+    let mut map = match state.todo_dispatched.lock() {
+        Ok(d) => d,
+        Err(e) => e.into_inner(),
+    };
+    map.remove(job_id);
 }
 
 /// Opens the default store and serves the API, blocking until the process is
@@ -877,6 +1126,7 @@ pub fn serve(
         inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
         cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        todo_dispatched: Arc::new(Mutex::new(HashMap::new())),
     };
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -891,6 +1141,19 @@ pub fn serve(
                     ticker.tick().await;
                     let state = watch_state.clone();
                     let _ = tokio::task::spawn_blocking(move || todo_watcher_tick(&state)).await;
+                }
+            });
+            // The reaper is the dispatch loop's other end (mesa task 1057),
+            // so it lives and dies with the same flag — but on its own
+            // shorter cadence, since a session that is finished with its task
+            // should not wait a whole dispatch tick to be stopped.
+            let reap_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(watch_todo_reap_tick());
+                loop {
+                    ticker.tick().await;
+                    let state = reap_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || todo_reaper_tick(&state)).await;
                 }
             });
         }
@@ -7256,6 +7519,7 @@ mod tests {
             inbox_dispatched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            todo_dispatched: Arc::new(Mutex::new(HashMap::new())),
         };
         (dir, state)
     }
@@ -9615,6 +9879,401 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             log.lines().count(),
             2,
             "an epic holding its own claim parks the project: {log:?}"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    // --- the reaper: dispatched sessions end when their task does (1057) ---
+
+    /// Writes an executable stub `claude` that answers the three verbs the
+    /// reaper's path uses: `--bg` prints a receipt for the fixed job id
+    /// `job0001`, `agents` prints whatever `agents_file` currently holds (so
+    /// a test drives the listing by rewriting one file), and `stop` appends
+    /// its argument to `stop_log` — **before** deciding whether to fail, so a
+    /// failing stop is still provably attempted. `<dir>/stop-fail` is what
+    /// makes it fail.
+    ///
+    /// Pins `MESA_CONFIG_FILE` at a nonexistent path for `stub_claude_bg`'s
+    /// reason: these tests assert the built-in spawn command.
+    fn stub_claude_reaper(
+        dir: &std::path::Path,
+        agents_file: &std::path::Path,
+        stop_log: &std::path::Path,
+    ) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        unsafe { std::env::set_var("MESA_CONFIG_FILE", dir.join("no-such-config.json")) };
+        std::fs::write(agents_file, "[]").unwrap();
+        let path = dir.join("claude");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  --bg) echo "backgrounded · job0001 (idle — send a prompt to start)"; exit 0 ;;
+  agents) cat "{agents}"; exit 0 ;;
+  stop)
+    echo "$2" >> "{stops}"
+    [ -e "{fail}" ] && exit 1
+    exit 0 ;;
+esac
+exit 2
+"#,
+                agents = agents_file.display(),
+                stops = stop_log.display(),
+                fail = dir.join("stop-fail").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// One `claude agents --json` row for job `id`. `pid` absent means the
+    /// process has exited; `status` is the CLI's own (`busy` / `idle` / …).
+    fn agents_listing(id: &str, pid: Option<i64>, status: Option<&str>) -> String {
+        serde_json::json!([{
+            "pid": pid,
+            "id": id,
+            "cwd": "/tmp",
+            "kind": "background",
+            "startedAt": 1_783_000_000_000i64,
+            "sessionId": format!("{id}-0000-0000-0000-000000000000"),
+            "status": status,
+            "state": "done",
+        }])
+        .to_string()
+    }
+
+    fn session_row(pid: Option<i64>, status: Option<&str>) -> AgentSession {
+        serde_json::from_str(&agents_listing("job0001", pid, status))
+            .map(|mut rows: Vec<AgentSession>| rows.pop().unwrap())
+            .unwrap()
+    }
+
+    fn stops(stop_log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(stop_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn dispatched_task(state: &AppState, job_id: &str) -> Option<i64> {
+        state
+            .todo_dispatched
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .map(|d| d.task_id)
+    }
+
+    fn superseded(state: &AppState, job_id: &str) -> Option<bool> {
+        state
+            .todo_dispatched
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .map(|d| d.superseded)
+    }
+
+    /// Seeds `todo_dispatched` the way a dispatch would have.
+    fn seed_dispatch(state: &AppState, job_id: &str, task_id: i64) {
+        state.todo_dispatched.lock().unwrap().insert(
+            job_id.to_string(),
+            DispatchedSession {
+                task_id,
+                superseded: false,
+            },
+        );
+    }
+
+    #[test]
+    fn reap_verdict_keeps_an_in_progress_task_whatever_the_session_says() {
+        for row in [
+            Some(session_row(Some(4242), Some("idle"))),
+            Some(session_row(None, None)),
+            None,
+        ] {
+            assert_eq!(
+                reap_verdict(Some(Status::InProgress), row.as_ref()),
+                ReapVerdict::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn reap_verdict_stops_a_live_idle_session_of_a_closed_task() {
+        // Every non-`in_progress` status means the agent is finished with the
+        // work it was started for -- including a task pushed back to `todo`.
+        for status in [
+            Some(Status::Done),
+            Some(Status::Cancelled),
+            Some(Status::Todo),
+            Some(Status::Backlog),
+            // A deleted task counts as closed.
+            None,
+        ] {
+            assert_eq!(
+                reap_verdict(status, Some(&session_row(Some(4242), Some("idle")))),
+                ReapVerdict::Stop,
+                "status {status:?} must be reaped"
+            );
+        }
+        // No status at all is still a live session with nothing to do.
+        assert_eq!(
+            reap_verdict(Some(Status::Done), Some(&session_row(Some(4242), None))),
+            ReapVerdict::Stop
+        );
+    }
+
+    #[test]
+    fn reap_verdict_waits_out_a_busy_session_and_forgets_a_dead_one() {
+        // Still writing its closing report: stop it on a later pass.
+        assert_eq!(
+            reap_verdict(
+                Some(Status::Done),
+                Some(&session_row(Some(4242), Some("busy")))
+            ),
+            ReapVerdict::Keep
+        );
+        // Process gone, and not listed at all: nothing to stop either way.
+        assert_eq!(
+            reap_verdict(Some(Status::Done), Some(&session_row(None, Some("idle")))),
+            ReapVerdict::Forget
+        );
+        assert_eq!(reap_verdict(Some(Status::Done), None), ReapVerdict::Forget);
+    }
+
+    #[test]
+    fn todo_reaper_tick_stops_a_dispatched_session_once_its_task_closes() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let agents_file = stub_dir.path().join("agents.json");
+        let stop_log = stub_dir.path().join("stops.log");
+        let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let task = new_task(&state, project);
+
+        // The dispatch records the receipt's job id against the task.
+        todo_watcher_tick(&state);
+        assert_eq!(
+            dispatched_task(&state, "job0001"),
+            Some(task),
+            "a successful dispatch must record its job id against its task"
+        );
+
+        // While the task is in_progress the session is left alone, however
+        // idle the listing says it is.
+        std::fs::write(
+            &agents_file,
+            agents_listing("job0001", Some(4242), Some("idle")),
+        )
+        .unwrap();
+        todo_reaper_tick(&state);
+        assert!(
+            stops(&stop_log).is_empty(),
+            "an in_progress task's session must never be stopped"
+        );
+        assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+
+        // Task closed, but the session is still busy: it is writing its
+        // closing report, so this pass stops nothing.
+        set_status(&state, task, Status::Done);
+        std::fs::write(
+            &agents_file,
+            agents_listing("job0001", Some(4242), Some("busy")),
+        )
+        .unwrap();
+        todo_reaper_tick(&state);
+        assert!(
+            stops(&stop_log).is_empty(),
+            "a busy session must be left for the next pass"
+        );
+        assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+
+        // Idle now: stopped exactly once, and forgotten.
+        std::fs::write(
+            &agents_file,
+            agents_listing("job0001", Some(4242), Some("idle")),
+        )
+        .unwrap();
+        todo_reaper_tick(&state);
+        assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+        assert_eq!(dispatched_task(&state, "job0001"), None);
+        todo_reaper_tick(&state);
+        assert_eq!(
+            stops(&stop_log),
+            vec!["job0001".to_string()],
+            "a stopped session must not be stopped again"
+        );
+
+        // A job the listing no longer names is forgotten without a stop.
+        seed_dispatch(&state, "job0002", task);
+        std::fs::write(&agents_file, "[]").unwrap();
+        todo_reaper_tick(&state);
+        assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+        assert_eq!(dispatched_task(&state, "job0002"), None);
+
+        // A failing stop keeps its entry, so the next pass retries.
+        std::fs::write(stub_dir.path().join("stop-fail"), "").unwrap();
+        seed_dispatch(&state, "job0003", task);
+        std::fs::write(
+            &agents_file,
+            agents_listing("job0003", Some(4242), Some("idle")),
+        )
+        .unwrap();
+        todo_reaper_tick(&state);
+        assert_eq!(
+            stops(&stop_log),
+            vec!["job0001".to_string(), "job0003".to_string()],
+            "the failing stop must still have been attempted"
+        );
+        assert_eq!(
+            dispatched_task(&state, "job0003"),
+            Some(task),
+            "a failed stop keeps its entry for the next pass"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn todo_watcher_tick_stops_the_session_a_re_dispatch_supersedes() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let agents_file = stub_dir.path().join("agents.json");
+        let stop_log = stub_dir.path().join("stops.log");
+        let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let task = new_task(&state, project);
+        // A session dispatched onto this task earlier, whose task was pushed
+        // back to `todo` before any reaper pass reached it.
+        seed_dispatch(&state, "job0009", task);
+
+        todo_watcher_tick(&state);
+
+        assert_eq!(
+            stops(&stop_log),
+            vec!["job0009".to_string()],
+            "re-dispatching a task must stop the session it supersedes"
+        );
+        assert_eq!(dispatched_task(&state, "job0009"), None);
+        assert_eq!(
+            dispatched_task(&state, "job0001"),
+            Some(task),
+            "the fresh session takes the task's place in the map"
+        );
+
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+    }
+
+    #[test]
+    fn todo_watcher_tick_keeps_a_superseded_session_whose_stop_failed() {
+        // The supersede path's failure mode: a job dropped from the map on a
+        // stop that then failed would be both unstopped and untracked. It
+        // stays marked instead, and the task reading `in_progress` again
+        // under its new session must not spare it.
+        //
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let agents_file = stub_dir.path().join("agents.json");
+        let stop_log = stub_dir.path().join("stops.log");
+        let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // Every `claude stop` fails while this marker exists.
+        let stop_fail = stub_dir.path().join("stop-fail");
+        std::fs::write(&stop_fail, "").unwrap();
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+        let task = new_task(&state, project);
+        seed_dispatch(&state, "job0009", task);
+
+        todo_watcher_tick(&state);
+
+        assert_eq!(
+            stops(&stop_log),
+            vec!["job0009".to_string()],
+            "the supersede stop must have been attempted"
+        );
+        assert_eq!(
+            dispatched_task(&state, "job0009"),
+            Some(task),
+            "a failed supersede stop must keep its entry"
+        );
+        assert_eq!(superseded(&state, "job0009"), Some(true));
+        assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+        assert_eq!(superseded(&state, "job0001"), Some(false));
+
+        // The next reaper pass finishes the job: the task is `in_progress`
+        // again under the new session, so only the superseded flag can tell
+        // the two entries apart.
+        std::fs::remove_file(&stop_fail).unwrap();
+        assert_eq!(
+            state.store.lock().unwrap().get_task(task).unwrap().status,
+            Status::InProgress
+        );
+        std::fs::write(
+            &agents_file,
+            serde_json::json!([
+                {
+                    "pid": 4242,
+                    "id": "job0009",
+                    "cwd": "/tmp",
+                    "kind": "background",
+                    "startedAt": 1_783_000_000_000i64,
+                    "sessionId": "job0009-0000-0000-0000-000000000000",
+                    "status": "idle",
+                    "state": "done",
+                },
+                {
+                    "pid": 4243,
+                    "id": "job0001",
+                    "cwd": "/tmp",
+                    "kind": "background",
+                    "startedAt": 1_783_000_000_000i64,
+                    "sessionId": "job0001-0000-0000-0000-000000000000",
+                    "status": "idle",
+                    "state": "done",
+                },
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        todo_reaper_tick(&state);
+
+        assert_eq!(
+            stops(&stop_log),
+            vec!["job0009".to_string(), "job0009".to_string()],
+            "the retry must stop the superseded session and nothing else"
+        );
+        assert_eq!(dispatched_task(&state, "job0009"), None);
+        assert_eq!(
+            dispatched_task(&state, "job0001"),
+            Some(task),
+            "the session actually working the task must be left alone"
         );
 
         unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };

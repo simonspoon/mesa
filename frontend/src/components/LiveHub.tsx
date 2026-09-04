@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { LiveBand } from './LiveBand'
+import { LiveBoardPanel } from './LiveBoardPanel'
 import { LiveMeter } from './LiveMeter'
 import {
   getLive,
@@ -26,6 +27,7 @@ import {
   wavFromFrames,
   type CapturedFrame,
 } from '../liveAudio'
+import { boardPanelFor, closedBoardPanel, type BoardPanel } from '../liveBoard'
 import {
   autoSendIdleMs,
   isEditableTarget,
@@ -331,6 +333,7 @@ const POLL_MS = 2000
 export function LiveHub({
   onSidebars,
   slot,
+  boardSlot,
 }: {
   /** Fold both sidebars away (`true`) or bring them back. App owns that state
    *  — the hub only relays what the conversation asked for. */
@@ -338,6 +341,12 @@ export function LiveHub({
   /** Where the conversation panel is rendered (mesa task 887): the shell's
    *  right-hand sidebar slot, `null` until App's own ref has landed. */
   slot: HTMLElement | null
+  /** Where the whiteboard is rendered (mesa task 1071): its own slot, just
+   *  before the conversation's, so a pushed picture sits beside the page it
+   *  is about rather than over it. Its own slot rather than the one above
+   *  because the two panels open and close independently — a board arrives
+   *  while the conversation is shut as often as not. */
+  boardSlot: HTMLElement | null
 }) {
   // The exclusive id cursor the poll asks from. A ref, not state: it is read
   // inside `load` on every tick and rendered nowhere, so advancing it must not
@@ -643,6 +652,31 @@ export function LiveHub({
   useEffect(() => {
     held.current = turns
   }, [turns])
+
+  // ---- the whiteboard (mesa task 1071) ----
+
+  // The boards this conversation has pushed, off the poll above rather than a
+  // second one: `LiveState.boards` is bodiless and capped at twenty, so the
+  // whole history rides on the two-second read the hub already makes.
+  // Memoised so the panel's own view is not recomputed on every render of
+  // this component — only when a poll actually changed the history.
+  const boards = useMemo(() => data?.boards ?? [], [data])
+  // Whether the panel is showing, and the newest board this component has
+  // taken in hand — `handled`'s claim-once discipline in the shape a picture
+  // needs (`liveBoard.ts::boardPanelFor`): a board the person has not been
+  // shown opens the panel, because the agent pushed it *instead of* saying
+  // something and a board nobody sees is the same as no board, while every
+  // later poll carrying that same board must not re-open one they have since
+  // put away. Closing is this browser's own act, no route, exactly like the
+  // conversation panel's own close.
+  //
+  // Applied during render rather than in an effect, `useFetch.ts`'s pattern:
+  // the answer is a pure function of the poll, and `boardPanelFor` hands back
+  // the state it was given — by identity — on every tick where nothing moved,
+  // so this settles in one pass.
+  const [boardPanel, setBoardPanel] = useState<BoardPanel>(closedBoardPanel)
+  const nextBoardPanel = boardPanelFor(boardPanel, boards)
+  if (nextBoardPanel !== boardPanel) setBoardPanel(nextBoardPanel)
 
   // The transcript follows the conversation: a spoken reply the reader cannot
   // see is the one thing the panel must never do. The clip-hidden closed state
@@ -2453,6 +2487,23 @@ export function LiveHub({
             </div>
           </aside>,
           slot,
+        )}
+
+      {/* The whiteboard (mesa task 1071), portalled into its own slot beside
+          the conversation's. A second portal rather than a second component
+          higher up: the hub already holds the one poll this reads, and the
+          panel opens on a board arriving — which only the code watching that
+          poll can know. It renders nothing but the render route's URL; there
+          is no board write route at all, and the close button below only
+          closes. */}
+      {boardSlot !== null &&
+        createPortal(
+          <LiveBoardPanel
+            boards={boards}
+            open={nextBoardPanel.open}
+            onClose={() => setBoardPanel((panel) => ({ ...panel, open: false }))}
+          />,
+          boardSlot,
         )}
 
       {/* One player for the whole app, mounted for its whole life: a press

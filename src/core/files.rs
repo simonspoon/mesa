@@ -107,6 +107,28 @@ pub fn image_mime(path: &str) -> Option<&'static str> {
     })
 }
 
+/// Every mime [`image_mime`] can answer with — the same allowlist read the
+/// other way round, for a caller holding a stored content type rather than a
+/// path (`Store::add_live_board`, mesa task 1071). One list rather than a
+/// second table: a test below pins it against `image_mime`'s own arms in both
+/// directions, so neither can gain an entry the other does not have.
+pub const IMAGE_MIMES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/x-icon",
+    "image/svg+xml",
+];
+
+/// Whether `content_type` is one of [`IMAGE_MIMES`] — the allowlist decision
+/// made against a type mesa already stored, for the case where the file it
+/// came from is long gone.
+pub fn is_image_mime(content_type: &str) -> bool {
+    IMAGE_MIMES.contains(&content_type)
+}
+
 /// Extracts a lowercased extension from a path's basename, or `None` when
 /// there isn't one.
 fn extension_of(path: &Path) -> Option<String> {
@@ -1597,6 +1619,29 @@ mod tests {
         ] {
             assert_eq!(image_mime(name), Some(mime), "{name}");
         }
+    }
+
+    /// The two directions of one allowlist: everything `image_mime` answers
+    /// with is an [`IMAGE_MIMES`] entry, and every entry is something it can
+    /// actually answer with. Either half failing means the pair has drifted,
+    /// which is exactly what having one list is meant to prevent.
+    #[test]
+    fn image_mimes_and_image_mime_are_the_same_allowlist() {
+        let extensions = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg"];
+        for ext in extensions {
+            let mime = image_mime(&format!("a.{ext}")).expect(ext);
+            assert!(is_image_mime(mime), "{mime} is not in IMAGE_MIMES");
+        }
+        for mime in IMAGE_MIMES {
+            assert!(
+                extensions
+                    .iter()
+                    .any(|ext| image_mime(&format!("a.{ext}")) == Some(mime)),
+                "{mime} is in IMAGE_MIMES but no extension produces it"
+            );
+        }
+        assert!(!is_image_mime("text/html"), "markup is never an image type");
+        assert!(!is_image_mime(""), "an empty type is not an image type");
     }
 
     #[test]

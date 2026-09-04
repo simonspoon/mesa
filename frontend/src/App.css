@@ -8755,6 +8755,146 @@ button:focus-visible,
   pointer-events: none;
 }
 
+/* Where the hub portals the whiteboard (mesa task 1071) — a slot with no box
+   of its own (`display: contents`, like `.live-slot`), rendered inside
+   `.main-slot` rather than on `.shell-body`'s row. That placement is the
+   whole design: `.main-slot` is already the positioned box the two page panes
+   fill, so an overlay hung inside it covers exactly the page and nothing else
+   — never the left nav, never the conversation, and taking no width on the
+   row at all.
+
+   The conversation earns its layout width because the person types into it
+   continuously; a board is something mesa throws up mid-sentence and the
+   person dismisses, so it must never fight the page underneath. As a flex
+   item it did: with the nav, the conversation and the agents panel also open,
+   a board claiming 40rem left `main` exactly zero pixels at 1280 and 1440. */
+.board-slot {
+  display: contents;
+}
+
+/* The whiteboard itself: `.live-sidebar`'s rules, hung off `.main-slot`'s
+   right edge — which is where the conversation's own left edge is, so it
+   still reads as a panel beside it — and at a width a picture can actually be
+   read at. A conversation is a column of short sentences; an HTML mockup, a
+   diagram or a screenshot is a document, so this panel is wider —
+   `min(40rem, 50vw)`, the same `min` shape, capped at the page's own width so
+   a narrow window is covered rather than overrun. */
+.live-board {
+  --live-board-width: min(40rem, 50vw);
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: var(--live-board-width);
+  max-width: 100%;
+  height: 100%;
+  /* Above both `.main-slot-pane`s, which are positioned too. */
+  z-index: 5;
+  border-left: 1px solid var(--border);
+  /* Opaque, unlike the conversation's translucent panel: this one is over the
+     page rather than beside it, and a mockup read through the dashboard
+     behind it is not a mockup. */
+  background: #060a10;
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  transition: clip-path 0.15s;
+}
+
+/* Closed is a clip, never `display: none` and never unmounted: an `<iframe>`
+   that is torn down reloads its document — and re-runs whatever script it
+   holds — on every open, and a board is a snapshot that should look the same
+   each time it is looked at. Clipped away to its own right edge rather than
+   animated to `width: 0` as the conversation is, because this panel is
+   already out of flow (it costs the row nothing either way) and a width that
+   moves is a framed document re-laying itself out on every frame of the
+   transition — the reflow `.live-sidebar-body`'s held width exists to dodge,
+   dodged here by never changing the width at all. */
+.live-board.collapsed {
+  clip-path: inset(0 0 0 100%);
+  pointer-events: none;
+}
+
+.live-board-body {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+}
+
+/* The head is `.live-sidebar-head`'s one-row form: this panel has a name, a
+   kind and a place in the history to show, and nothing that is *happening*. */
+.live-board-head {
+  gap: 0;
+}
+
+.live-board-kind {
+  align-self: flex-start;
+}
+
+/* ‹ N/M › — the history, beside the close button. */
+.live-board-steps {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.live-board-step {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  clip-path: var(--cut-sm);
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.live-board-step:disabled {
+  opacity: 0.4;
+}
+
+.live-board-count {
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+/* The board itself gets everything the head does not. */
+.live-board-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+/* On white, always: an HTML mockup or an SVG is written for a page, not for
+   this app's dark shell, and the frame is an opaque origin whose document
+   mesa does not style. */
+.live-board-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #fff;
+}
+
+.live-board-image {
+  max-width: 100%;
+  margin: auto;
+  object-fit: contain;
+}
+
+.live-board-markdown {
+  flex: 1;
+  overflow: auto;
+}
+
 /* The head (mesa task 1069): the panel's instrument cluster — three stacked
    rows, of which only the first is ever busy. */
 .live-sidebar-head {
@@ -9258,6 +9398,32 @@ button:focus-visible,
 
   .live-sidebar:not(.collapsed) .live-sidebar-body {
     width: 100%;
+    padding: 0.5rem 0.5rem 0.75rem;
+  }
+
+  /* The whiteboard takes the same drawer treatment as the two panels beside
+     it — and sits *under* the conversation. All three are the same rectangle
+     on a 390px screen, so the order has to be decided, and the documented
+     rule is that the drawer receiving keyboard input wins: the conversation
+     (z-index 1201) is holding the keyboard and sending what is typed into it,
+     so it stays on top, and the whiteboard sits one below it at 1199 — above
+     the page it is a picture of, below the panel a person is talking into. */
+  /* Off `.main-slot` and onto the viewport, full height, and brighter-edged:
+     on this tier it is a drawer over the whole app rather than an overlay
+     over the page. Everything else — the background, the shadow, the clipped
+     closed state — it already has. */
+  .live-board:not(.collapsed) {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: min(24rem, 95vw);
+    max-width: none;
+    height: calc(var(--phone-shell-height) - var(--phone-tabbar-reserve));
+    z-index: 1199;
+    border-left: 1px solid var(--border-bright);
+  }
+
+  .live-board:not(.collapsed) .live-board-body {
     padding: 0.5rem 0.5rem 0.75rem;
   }
 

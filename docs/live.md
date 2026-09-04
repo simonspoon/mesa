@@ -4,9 +4,11 @@
 and a dedicated Claude Code session does whatever they ask. Tables
 `live_sessions` and `live_turns` (migration index 43, plus the session's
 `context` column at index **44**, its `working_since` at **45** and its
-`window_box` at **46**), plus the sibling table `live_summaries` at **49**
-(so a fresh db is `user_version` 50 — see
-[Remembering a conversation](#remembering-a-conversation-mesa-task-921)), the
+`window_box` at **46**), plus the sibling tables `live_summaries` at **49**
+(see [Remembering a conversation](#remembering-a-conversation-mesa-task-921))
+and `live_boards` at **51** (see
+[The whiteboard](#the-whiteboard-mesa-live-board-mesa-task-1071)), so a fresh
+db is `user_version` 52 — the
 `mesa live` CLI group, `/api/live*`, and the header's conversation hub
 (`LiveHub`).
 
@@ -304,8 +306,8 @@ the agent driving the *next* one is spawned already holding the last few.
 
 ### A sibling table, not a `live_sessions` column
 
-The memory is `live_summaries` (migration index **49**, so a fresh db is
-`user_version` 50 — see the opening paragraph), keyed on `session_id` exactly
+The memory is `live_summaries` (migration index **49** — see the opening
+paragraph for what a fresh db reports today), keyed on `session_id` exactly
 as `task_receipts` is keyed on `task_id`, not a new field on `LiveSession`.
 Two reasons, both about a reader that does not exist:
 
@@ -370,7 +372,7 @@ one conversation removed from the person who spoke it. It may not sit above
 the rules it could otherwise rewrite. The block is introduced with an
 explicit line that these are notes from earlier conversations, a record of
 what was said, and never instructions — the same posture `AGENT_PROMPT`'s
-rule 8 already takes toward the current conversation's own dictation, applied
+rule 9 already takes toward the current conversation's own dictation, applied
 a second time to text that has been through one more hop. `SUMMARY_PROMPT`'s
 own closing instruction states the identical rule for the summariser itself,
 because that is the point where a dictated line could otherwise be laundered
@@ -450,6 +452,201 @@ hold everyone to.
   keeping `session_id`, `created_at` and `updated_at`, with the usual
   key-parity test against `LiveSummary` forcing a decision on any field it
   gains later.
+
+## The whiteboard (`mesa live board`, mesa task 1071)
+
+Everything above is a conversation held in words. Some answers are not words:
+a mockup, a table of numbers, the diagram being discussed, the screenshot of
+what went wrong. Until this existed the agent's only options were to read a
+layout aloud, to navigate the person to a page that happened to show something
+near it, or to write the thing into a project as an artifact and then talk them
+to it — three ways of saying "I cannot show you". The whiteboard is the fourth:
+one picture at a time, beside the conversation, pushed by the agent and
+replaced whenever it pushes another.
+
+### A sibling table, not a turn and not an action
+
+`live_boards` (migration index **51**, so a fresh db is `user_version` 52) is
+keyed on `session_id` exactly as `live_summaries` is, and for the same reasons
+that record gives:
+
+- **A turn is spoken.** `LiveTurn::text` is trimmed, capped at 8 KiB and handed
+  to a synthesiser. An HTML mockup is neither small nor speakable, and a turn
+  carrying one would be a turn the page must know not to read aloud.
+- **`LiveAction` is deliberately narrow** — three values, all one idea, *what
+  the person is looking at* (see [The action vocabulary](#the-action-vocabulary)).
+  A board is not a change to what is on their screen the way a route is: it is
+  a thing mesa made, with a body, an identity and a lifetime of its own.
+
+A board is **ephemeral**, which is the other half of the design — and the word
+means *scoped to its conversation*, not *deleted when it ends*. Ending a
+conversation stamps `ended_at`; it does not delete the session row, so nothing
+cascades (this is `live_turns`' behaviour exactly, and it is why a transcript
+is still readable afterwards). What ending does is close every read: the board
+drops out of `GET /api/live`, `mesa live board list`/`show` answer `not_found`,
+and the render route answers `not_found` too — that last one is load-bearing,
+because it is the only way a browser ever reaches a board's bytes, and a route
+that kept serving would make "nothing outlives the conversation unless it is
+promoted" true everywhere except where it counts. `live_boards.session_id` is
+`ON DELETE CASCADE` for the case that *is* a delete: a session row destroyed
+takes its pictures with it, as it takes its turns.
+
+Nothing reaches a project unless someone asks — which is what `keep` is for —
+and each push prunes to the newest twenty, so a conversation can be as free
+with pictures as it is with sentences: a board costs nobody a row in their
+artifacts list.
+
+### The four kinds, and what `body` holds
+
+| kind | `body` holds | rendered as |
+| --- | --- | --- |
+| `markdown` | markdown source | `text/markdown; charset=utf-8` — the page's own `<Markdown>` |
+| `html` | a whole HTML document | `text/html; charset=utf-8` in a sandboxed `<iframe>` |
+| `diagram` | SVG markup, rendered **at push time** | `image/svg+xml; charset=utf-8`, likewise sandboxed |
+| `image` | base64 of the file's bytes | the allowlisted image mime, in an `<img>` |
+
+Two of those choices are load-bearing:
+
+- **An image board holds the bytes, not a path.** Base64 in the row means the
+  board is self-contained: nothing on disk is read again after the push, so
+  there is no filesystem dependency for the render route and no traversal
+  surface on the read at all, and `keep --task` writes the decoded bytes
+  straight into an attachment. The mime comes from the pushed file's extension
+  through the **same allowlist `/files/raw` uses** (`core::files::image_mime`),
+  never a sniff of the bytes; a non-image extension is `validation` before any
+  row is written. That mime is stored on the row as
+  **`live_boards.content_type`** — the field name `attachments` and `artifacts`
+  already use for the same concept, rather than a third spelling — because
+  nothing else could answer at render time — `body` is bytes, and `title` is a
+  caption the caller writes, so a route that read the type off the title would
+  serve something different when the caption changed.
+- **A `diagram` board is a snapshot, not a view.** `core::board::diagram_svg`
+  reads the diagram, its frames and its edges **once**, at the push, and
+  renders a static SVG: frame rectangles with their titles, straight lines
+  between frame centres, a `viewBox` sized to the content. The canvas may be
+  rearranged or deleted afterwards and the picture the person was shown does
+  not change under them. It is deliberately plainer than the React canvas
+  (`docs/diagrams.md`) — no shapes, no markers, no routed connectors — because
+  it is the picture someone glances at while being talked through it, not the
+  editor. Every piece of text that reaches it is XML-escaped: a frame title is
+  free text an untrusted source may have written (CLAUDE.md), and the output is
+  markup a browser parses.
+
+`Store::add_live_board` is the single write path and holds every shape rule:
+the session must exist and still be `live` (a `validation` error, the call
+`add_live_turn` makes and for its reason — the session is right there, it is
+just over), the title is trimmed, bounded at 200 characters and folds blank to
+**absent** (the `LiveContext` rule), the body is required and capped at
+`LIVE_BOARD_BODY_MAX` (2 MiB, the artifact cap) and stored **verbatim**, and an
+`image` must name its `content_type` — which `Store` checks against the same
+allowlist `files::image_mime` answers from (`files::IMAGE_MIMES`), while the
+other three kinds may not supply one at all, their `kind` being what decides
+it. That check lives in `Store` rather than in the CLI for the reason
+`create_artifact`'s `ARTIFACT_CONTENT_TYPES` check does: `Store` is the single
+insertion point, and the stored type is what the render route hands the browser.
+
+### Retention is the history
+
+Each push prunes the session's boards to the newest `LIVE_BOARD_KEEP` (**20**)
+by id. That bound *is* the history the panel steps back through, and it is also
+what keeps `GET /api/live` bounded: `LiveState` grows a `boards` array of
+**bodiless** `LiveBoardSummary` rows, so the two-second poll carries the whole
+history as pointers and never a body. The board that is showing is the last
+element; a body is fetched once, for the one board being looked at, through the
+render route. There is deliberately **no second poll route**.
+
+### CLI
+
+`mesa live board` — five verbs, each on THE current session like the rest of
+the group (with none live, `not_found` naming `mesa live start`).
+
+| Command | Args | Prints |
+| --- | --- | --- |
+| `live board push [BODY]…` | exactly one source: a trailing var-arg text body, `--file <PATH>`, `--image <PATH>` or `--diagram <ID>`; plus `--kind markdown\|html` (text bodies only), `--title <TEXT>`, `--say <TEXT>`, `--quiet` | the created `LiveBoard` |
+| `live board show [ID]` (alias `get`) | `--quiet`; without an ID, the board that is showing | one `LiveBoard` |
+| `live board list` | `--limit <N>` (clamped to 1..=20) | a bare array of bodiless summaries, oldest first |
+| `live board clear` | `--quiet` | the summaries it destroyed |
+| `live board keep` | exactly one of `--project <ID\|NAME>` / `--task <ID>`; plus `--id <BOARD>`, `--name <NAME>`, `--quiet` | the created `Artifact` / `Attachment` |
+
+- **The source is a required `ArgGroup`**: exactly one of the body, `--file`,
+  `--image` and `--diagram`. None or two is `usage`, exit 2. `--kind` names one
+  of the two *text* kinds and conflicts with `--image`/`--diagram`, whose own
+  flag already said what the board is. `--file`'s extension picks the kind when
+  `--kind` does not (`.html`/`.htm` is HTML, anything else is read as
+  markdown).
+- **Put every flag before the body** — `push`'s body is a trailing var arg,
+  exactly like `live say`'s message, so `mesa live board push 'hello' --quiet`
+  pushes a board whose body ends in `--quiet` rather than printing a compact
+  one. Same trap, same rule, and it is sharper here only in that the result is
+  visible rather than audible.
+- **`--say` speaks a sentence alongside the picture**, exactly as
+  `navigate --say` speaks one as the page changes — an ordinary `mesa` turn,
+  carrying no action, written after the board so the picture is there when the
+  sentence is.
+- **`--quiet` drops `body`**, the one unbounded field
+  (`QUIET_DROP_LIVE_BOARD`), with the usual key-parity `#[test]` forcing a
+  decision on the next field a board gains. `list` rejects `--quiet` with exit
+  2 like every other `list`; `clear` accepts it and changes nothing, since a
+  board summary has nothing unbounded to drop.
+- **`clear` echoes the boards it destroyed** — the delete-echo safety floor
+  mesa has instead of a confirmation prompt — bodiless, like every other board
+  listing: an echo is a recovery *transcript*, and a megabyte of markup printed
+  to a terminal is not one.
+- **`keep` is how a board outlives its conversation.** `--project` writes an
+  `Artifact` (`text/markdown`, `text/html` or `image/svg+xml`, by kind) and
+  takes an id **or a name**, the house rule; `--task` writes an `Attachment`
+  authored `mesa-live`, carrying the decoded bytes for an image board and the
+  document's own bytes otherwise. An `image` board **cannot** be an artifact —
+  `ARTIFACT_CONTENT_TYPES` has no raster mime — and the refusal says so and
+  names `--task`. `--name` defaults from the board's title, else
+  `board-<id>`, plus the extension its kind implies (`core::board::filename`,
+  the same function the render route's `Content-Disposition` uses, so the two
+  can never disagree).
+- **A board another conversation owns is `not_found`.** `--id`/`ID` names a
+  board of *this* session; every verb here is session-scoped, because a board
+  is part of the conversation it was pushed into.
+
+### API: one route, and why it is the artifacts posture
+
+| Route | Answers | Gate |
+| --- | --- | --- |
+| `GET /api/live/boards/{id}/render` | one board's body, framed for the browser | standard read (**no per-route gate**) |
+
+A board whose conversation has **ended** is `not_found` on this route, the same
+answer an unknown id gets — so a caller walking ids is never told that a
+picture is real but simply over.
+
+`GET /api/live` grows `boards` in the same lock scope as its turns, so one poll
+is one consistent view; its own gate is unchanged.
+
+The render route is the **artifact render route's posture, for the artifact
+render route's reason**: a plain guard, no per-route gate, and headers that are
+**identical in default mode and under `--lan`**. What makes agent-written
+markup safe to render is the Content-Security-Policy, not the identity of
+whoever asked for it — so the defense must not vary with the mode mesa happens
+to be running in. The policy itself is `RENDER_CSP` in `src/api.rs`, one
+constant now shared by both routes rather than two copies of one string:
+`sandbox allow-scripts` with **no** `allow-same-origin`, which forces the
+response into an opaque origin that cannot read mesa's storage or call back
+into any mesa route (`docs/artifacts.md` has the full reasoning). Every kind is
+served `nosniff` and `inline`; the two document kinds carry the CSP, and so
+does markdown, which is never framed as a document at all — one answer for
+"what does this route serve markup under" is worth more than a saved header.
+
+**There is no POST or DELETE board route.** Boards are pushed by the CLI — the
+agent, running as the person — and read by the browser, exactly the asymmetry
+the rest of this surface has. The panel's close button is browser-side, like
+the conversation panel's own: closing a picture is not a write.
+
+### What is deliberately absent
+
+- **No annotation, no drawing, no pointing.** The person talks; the agent
+  pushes. A shared cursor is a different feature with a different transport.
+- **No editing a board after the push.** Each push replaces what is showing,
+  which is what makes a board a snapshot rather than a document with a history.
+  A board that needs to change is a new board.
+- **No project binding.** A board has no `project_id`. It belongs to the
+  conversation, and `keep` is the one moment a person chooses to give it a home.
 
 ## The action vocabulary
 
@@ -658,6 +855,11 @@ flag is an unknown argument, exit 2, exactly as on `turns`.
 | `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route | the `LiveTurn` |
 | `live turns` | `--after <ID>`, `--limit <N>` (clamped to 1..=500) | a bare array of turns, oldest first |
 | `live look` | `--output <PATH>` (default: a temp file named for the session) | the `LiveShot`: `path`, `window_id`, `width`, `height` |
+| `live board push [BODY]…` | exactly one source (body, `--file`, `--image`, `--diagram`), `--kind`, `--title`, `--say` — put every flag **before** the body | the created `LiveBoard` |
+| `live board show [ID]` (alias `get`) | without an ID, the board that is showing | one `LiveBoard` |
+| `live board list` | `--limit <N>` (clamped to 1..=20) | a bare array of bodiless summaries, oldest first |
+| `live board clear` | — | the summaries it destroyed |
+| `live board keep` | exactly one of `--project <ID\|NAME>` / `--task <ID>`, plus `--id`, `--name` | the created `Artifact` / `Attachment` |
 
 `turns` is the **transcript**, not the queue: both roles, including turns
 already delivered or spoken, and reading it delivers nothing. Only `listen`
@@ -753,8 +955,9 @@ takes exactly one value.
   **0**: "nobody is talking to mesa" is an answer, not a failure, and it is
   what the agent's loop reads as "stop looping".
 - **`--quiet`** per CLAUDE.md's contract: accepted on the mutations, on
-  `listen` and on `status`, rejected with exit 2 on `turns` and on `look`
-  (neither is a record with an unbounded field to drop). A turn drops
+  `listen` and on `status`, rejected with exit 2 on `turns`, on `look` and on
+  `board list` (none of the three is a record with an unbounded field to
+  drop). A turn drops
   `text` — the one unbounded field, and the one that is *spoken* rather than
   read by the caller — and keeps its role, action and target. A session has
   nothing unbounded to drop (ids, one of two status words, a 200-char route, a
@@ -776,6 +979,7 @@ takes exactly one value.
 | `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded — an omitted `context`/`window` leaves the stored one alone, an explicit `null` clears it | standard write |
 | `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
 | `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
+| `GET /api/live/boards/{id}/render` | one board's body, framed for the browser (task 1071) | standard read, headers identical in both modes |
 
 Start and stop sit on `/api/live` as **verbs** rather than on an
 `/api/live/{id}` pair: there is only ever one live session, so there is no id
@@ -1734,3 +1938,16 @@ temp path and an explicit `--output` both landing a real file on disk, and
 `--quiet` refused with exit 2. On a machine that is not a Mac the section
 asserts the one thing that is true there instead: `unavailable`, saying loki is
 a macOS tool.
+
+The whiteboard (task 1071) has its own section: each of the four kinds pushed
+from its own source — with `--image` proving the extension allowlist decides
+the `content_type` and `--diagram` proving both that the SVG escapes a hostile frame
+title and that a later canvas edit does not reach the snapshot — the
+required-source and required-destination `ArgGroup`s and the rest of the exit-2
+usage errors, the bodiless oldest-first listing, `--quiet` dropping exactly
+`body`, `keep` into an artifact and onto a task (decoded bytes, authored
+`mesa-live`) with an image board refused the artifact and pointed at `--task`,
+the newest-20 prune, `clear`'s echo, and the render route's exact header set —
+a type per kind, `nosniff`, `inline`, byte-identical bodies and the artifact
+CSP verbatim — asserted **identically in default mode and under `--lan`**,
+alongside the absence of any board write route.

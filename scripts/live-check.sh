@@ -74,10 +74,28 @@
 #      missing binary; a body one byte over the 25 MiB cap answered 413
 #      validation naming the limit, still as JSON, distinct from 422 for
 #      invalid/empty/missing base64; both halves of the boundary in default
-#      mode (Content-Type, agent gate); and under `--lan` the route is
-#      **absent**, not gated — a well-formed request never reaches the
-#      handler, answered by the embedded static-file fallback's plain-text
-#      405 instead of the gate's JSON 403.
+#      mode (Content-Type, agent gate); and under `--lan` **both verbs are
+#      present and relaxed, not absent** — a LAN POST reaches the stub auris
+#      with the same argv, the GET answers `{"available": true}`, and the
+#      Content-Type gate still fires;
+#  13. the whiteboard (mesa task 1071): `mesa live board` — the four kinds and
+#      where each body comes from (a typed body, `--file` with the kind from
+#      its extension, `--image` stored as base64 with its `content_type` from the
+#      inline-image allowlist, `--diagram` as an ESCAPED SVG snapshot a later
+#      canvas edit cannot change), `--say` speaking a turn beside the board,
+#      the required-source and required-destination ArgGroups and the rest of
+#      the exit-2 usage errors (`list --quiet` among them), the bodiless
+#      oldest-first `list`/`show` and the `--quiet` key set (drops `body`
+#      alone), `keep` into an artifact and onto a task (decoded image bytes,
+#      authored `mesa-live`) with an image board refused the artifact and
+#      pointed at `--task`, the retention bound pruning to the newest 20,
+#      `clear`'s bodiless echo, and `GET /api/live/boards/{id}/render` — a
+#      type per kind, nosniff, inline, byte-identical bodies and the artifact
+#      CSP verbatim on the two document kinds — with the identical header set
+#      in default mode AND under `--lan`, the absence of any board write
+#      route, and the render route answering 404 `not_found` once the
+#      conversation has ended (the row survives like a turn's; every read of
+#      it stops).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -227,6 +245,14 @@ export MESA_LOKI_BIN="$STUB_DIR/loki"
 # stderr and writing nothing to stdout.
 cat > "$STUB_DIR/auris" <<EOF
 #!/usr/bin/env bash
+# The model probe (`auris --no-download --list-models`) is how mesa answers
+# GET /api/live/transcribe's `{"available": bool}`. It records nothing: a
+# probe must not clobber the argv or the stdin the transcribe assertions
+# read back.
+if [ "\$1" = "--no-download" ] && [ "\$2" = "--list-models" ]; then
+  echo "parakeet-tdt-0.6b-v2-int8"
+  exit 0
+fi
 printf '%s\n' "\$*" > "$STUB_DIR/last-argv"
 cat > "$STUB_DIR/last-stdin"
 [ -e "$STUB_DIR/auris-fail" ] && { echo "stub auris is down" >&2; exit 1; }
@@ -1856,15 +1882,21 @@ kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
 
-# ---- --lan: the route is ABSENT, not gated ----
+# ---- --lan: the route is PRESENT and relaxed, not absent ----
 #
-# `transcribe_router` never registers this route under --lan, so a
-# well-formed request falls through to the embedded-static-file fallback
-# (`axum_embed::ServeEmbed`, GET/HEAD only), which answers a plain-text 405 —
-# nothing like the gate's `{"error":{"code":"validation",...}}` 403. That 405
-# is an artifact of the SPA fallback, not a status mesa chose, so this is
-# written against the property (the handler was never reached, and the stub
-# was never invoked) rather than against the number.
+# `/api/live/transcribe` is registered unconditionally (`src/api.rs`), both
+# verbs on the one entry, and its `require_agent_access` **relaxes rather than
+# refuses** under --lan — the posture every other agent route already takes.
+# Decoding a posted recording is strictly less power than the shell --lan
+# already hands the whole network through the Agents and Terminal routes, so
+# refusing the phone a transcription while granting it a terminal would be a
+# distinction with no security content. `mesa live look` keeps the structural
+# refusal instead, because photographing the owner's screen is a genuinely
+# different capability rather than a stronger one, not merely a bigger one.
+#
+# The two confused-deputy defenses are untouched by that relaxation: the
+# Content-Type gate below still fires in this mode, exactly as it does in
+# default mode.
 LAN_PORT=17782
 LAN_BASE="http://127.0.0.1:$LAN_PORT"
 "$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan12.log" 2>&1 &
@@ -1876,25 +1908,407 @@ done
 curl -sf "$LAN_BASE/api/live" >/dev/null ||
   fail "LAN server did not start for section 12 (log: $(cat "$TMP/lan12.log"))"
 
+# A LAN page this server handed a phone reaches the decoder, and the recording
+# reaches auris exactly as it does in default mode.
 rm -f "$STUB_DIR/last-argv"
 STATUS=$(curl -s -o "$TMP/lan-body" -w '%{http_code}' -H 'Content-Type: application/json' \
   -d "$TRANSCRIBE_BODY" "$LAN_BASE/api/live/transcribe")
 LAN_BODY=$(cat "$TMP/lan-body")
-[ "$STATUS" != "200" ] || fail "--lan: /api/live/transcribe must not be reachable at all, got 200"
-grep -q '"text"' <<<"$LAN_BODY" && fail "--lan: a transcript came back — the route must not exist here"
-[ "$(jq -e . <<<"$LAN_BODY" 2>/dev/null | jq -r '.error.code // empty' 2>/dev/null)" != "validation" ] ||
-  fail "--lan: a validation error shape means the route was gated, not absent"
-[ ! -e "$STUB_DIR/last-argv" ] ||
-  fail "--lan: auris must never be invoked — the route is absent, not merely refused"
-ok "--lan: POST /api/live/transcribe never reaches the handler (not 200, no transcript, not the gate's JSON 403) and auris is never run"
+[ "$STATUS" = "200" ] ||
+  fail "--lan: POST /api/live/transcribe must reach the handler, got $STATUS ($LAN_BODY)"
+[ "$(jq -r .text <<<"$LAN_BODY")" = "hello there" ] ||
+  fail "--lan: the stub's transcript must come back, got $LAN_BODY"
+[ "$(cat "$STUB_DIR/last-argv")" = "-q --format json" ] ||
+  fail "--lan: auris must be run with the same argv as in default mode, got $(cat "$STUB_DIR/last-argv" 2>/dev/null)"
+ok "--lan: POST /api/live/transcribe reaches the stub auris with the same argv — require_agent_access relaxes rather than refuses, the posture every agent route takes"
+
+# The GET half rides the same route entry, so a LAN page reads the same real
+# answer a default-mode page does rather than a hard-coded false.
+STATUS=$(curl -s -o "$TMP/lan-avail" -w '%{http_code}' "$LAN_BASE/api/live/transcribe")
+LAN_AVAIL=$(cat "$TMP/lan-avail")
+[ "$STATUS" = "200" ] ||
+  fail "--lan: GET /api/live/transcribe expected 200, got $STATUS ($LAN_AVAIL)"
+[ "$(jq -r .available <<<"$LAN_AVAIL")" = "true" ] ||
+  fail "--lan: GET /api/live/transcribe must answer available:true against a working stub, got $LAN_AVAIL"
+ok "--lan: GET /api/live/transcribe answers {\"available\": true} off the same route entry — both verbs are present, not just the POST"
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' -d 'audio_base64=form+post' "$LAN_BASE/api/live/transcribe")
 [ "$STATUS" = "415" ] ||
-  fail "--lan: the Content-Type gate must still fire on this path (it runs in middleware before routing), got $STATUS"
-ok "--lan: the Content-Type gate still rejects a form-encoded POST to the absent transcribe route — the middleware runs before routing decides the route does not exist"
+  fail "--lan: the Content-Type gate must still fire, got $STATUS"
+ok "--lan: the Content-Type gate still rejects a form-encoded POST — the cross-site defense is untouched by the agent gate relaxing"
 
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true
 LAN_PID=
+
+# =====================================================================
+# 13. The whiteboard: `mesa live board` and the render route (task 1071)
+# =====================================================================
+#
+# A board is a picture the agent puts in front of the person — a sibling
+# table, not a turn, and ephemeral: it belongs to the conversation until
+# `keep` copies it into a project. Covered here: the four kinds and where
+# each one's body comes from, the required-source ArgGroup, the --quiet key
+# sets and the two commands that refuse the flag, `clear`'s echo, both `keep`
+# destinations and the image-cannot-be-an-artifact rule, `LiveState.boards`
+# bodiless and capped, and the render route's exact headers in default mode
+# AND under --lan (they must be identical: the CSP is the defense, not the
+# caller's identity).
+
+# Nothing is live after section 12; every board verb needs a conversation.
+run 1 "$MESA" live board push hello
+[ "$(jqe .error.code)" = "not_found" ] || fail "live board push with no session: error.code"
+grep -q 'mesa live start' <<<"$STDERR" ||
+  fail "live board push with no session: the message must name \`mesa live start\`"
+run 1 "$MESA" live board list
+[ "$(jqe .error.code)" = "not_found" ] || fail "live board list with no session: error.code"
+ok "every live board verb with no session: exit 1 not_found, hinting at \`live start\`"
+
+run 0 "$MESA" live start --project "$PROJ" --no-agent
+BS=$(jqs .id)
+
+# ---- the four kinds, and where each body comes from ----
+
+run 0 "$MESA" live board push --quiet --title "The plan" '## Plan' 'Three steps.'
+B_MD=$(jqs .id)
+[ "$(jqs .kind)" = "markdown" ] || fail "board push: a text body is markdown by default"
+[ "$(jqs .title)" = "The plan" ] || fail "board push: --title"
+[ "$(jqs .content_type)" = "null" ] ||
+  fail "board push: only an image board records a content_type"
+jq -e 'has("body") | not' <<<"$STDOUT" >/dev/null ||
+  fail "board push --quiet must drop the body"
+run 0 "$MESA" live board show "$B_MD"
+[ "$(jqs .body)" = "## Plan Three steps." ] ||
+  fail "board push: the trailing var-arg body is joined with spaces, got $(jqs .body)"
+
+printf '<h1>Mockup</h1>\n' > "$TMP/mockup.html"
+run 0 "$MESA" live board push --kind html --file "$TMP/mockup.html" --say "Here is the mockup."
+B_HTML=$(jqs .id)
+[ "$(jqs .kind)" = "html" ] || fail "board push --kind html"
+[ "$(jqs .body)" = "<h1>Mockup</h1>" ] || fail "board push --file: the file IS the body"
+# --say adds an ordinary mesa turn beside the board, exactly like navigate --say.
+[ "$("$MESA" live turns | jq -r '.[-1].text')" = "Here is the mockup." ] ||
+  fail "board push --say must speak a mesa turn alongside the board"
+[ "$("$MESA" live turns | jq -r '.[-1].action')" = "null" ] ||
+  fail "board push --say: a board is not an action — the turn carries none"
+
+# The extension names the kind when --kind does not.
+printf '# From a file\n' > "$TMP/note.md"
+run 0 "$MESA" live board push --file "$TMP/note.md"
+[ "$(jqs .kind)" = "markdown" ] || fail "board push --file note.md: the extension names the kind"
+run 0 "$MESA" live board push --file "$TMP/mockup.html"
+[ "$(jqs .kind)" = "html" ] || fail "board push --file mockup.html: the extension names the kind"
+
+# An image is stored as base64 IN the board — self-contained, so nothing on
+# disk is read again — and its content_type comes from the extension allowlist.
+printf '\x89PNG\r\n\x1a\nmesa-live-board' > "$TMP/shot.png"
+run 0 "$MESA" live board push --image "$TMP/shot.png" --title "The overlap"
+B_IMG=$(jqs .id)
+[ "$(jqs .kind)" = "image" ] || fail "board push --image: kind"
+[ "$(jqs .content_type)" = "image/png" ] ||
+  fail "board push --image: the content_type comes from the extension allowlist"
+SHOT_BYTES=$(wc -c < "$TMP/shot.png" | tr -d ' ')
+[ "$(jqs .body | base64 --decode | wc -c | tr -d ' ')" = "$SHOT_BYTES" ] ||
+  fail "board push --image: the body is base64 of the file's own bytes"
+# The allowlist decides, not a sniff: a non-image extension never becomes a board.
+printf 'not an image\n' > "$TMP/notes.txt"
+run 1 "$MESA" live board push --image "$TMP/notes.txt"
+[ "$(jqe .error.code)" = "validation" ] || fail "board push --image <non-image>: error.code"
+run 1 "$MESA" live board push --image "$TMP/no-such-file.png"
+[ "$(jqe .error.code)" = "validation" ] || fail "board push --image <missing>: error.code"
+
+# A diagram board is a SNAPSHOT: the SVG is rendered at push time and never
+# tracks the canvas again.
+DIA=$("$MESA" diagram create "$PROJ" "Board flow" | jq -r .id)
+"$MESA" diagram frame create "$DIA" "Start" --x 10 --y 10 >/dev/null
+"$MESA" diagram frame create "$DIA" '<script>alert(1)</script>' --x 300 --y 200 >/dev/null
+run 0 "$MESA" live board push --diagram "$DIA" --title "The flow"
+B_SVG=$(jqs .id)
+[ "$(jqs .kind)" = "diagram" ] || fail "board push --diagram: kind"
+grep -q '<svg' <<<"$(jqs .body)" || fail "board push --diagram: the body must be SVG markup"
+grep -q '>Start</text>' <<<"$(jqs .body)" || fail "board push --diagram: a frame title must be drawn"
+grep -q '<script>' <<<"$(jqs .body)" &&
+  fail "board push --diagram: a frame title must be ESCAPED — this is markup a browser parses"
+grep -q '&lt;script&gt;' <<<"$(jqs .body)" || fail "board push --diagram: the escaped title is missing"
+# The snapshot is frozen: renaming the frame afterwards changes nothing.
+SNAP_FRAME=$("$MESA" diagram show "$DIA" | jq -r '.frames[0].id')
+"$MESA" diagram frame update --title "Renamed" "$SNAP_FRAME" >/dev/null
+run 0 "$MESA" live board show "$B_SVG"
+grep -q '>Start</text>' <<<"$(jqs .body)" ||
+  fail "board push --diagram is a SNAPSHOT: a later canvas edit must not change it"
+ok "live board push: all four kinds — a text body, --file (kind from the extension), --image (base64 + allowlisted content_type) and --diagram (an escaped, frozen SVG snapshot) — plus --say speaking beside it"
+
+# ---- the required source, and the other usage errors ----
+
+run 2 "$MESA" live board push
+[ -z "$STDOUT" ] || fail "live board push with no source: stdout must be empty"
+[ "$(jqe .error.code)" = "usage" ] || fail "live board push with no source: error.code"
+run 2 "$MESA" live board push --image "$TMP/shot.png" --diagram "$DIA"
+[ "$(jqe .error.code)" = "usage" ] || fail "live board push with two sources: error.code"
+run 2 "$MESA" live board push --file "$TMP/note.md" body words
+[ "$(jqe .error.code)" = "usage" ] || fail "live board push with --file AND a body: error.code"
+run 2 "$MESA" live board push --kind html --image "$TMP/shot.png"
+[ "$(jqe .error.code)" = "usage" ] || fail "live board push --kind with --image: error.code"
+run 2 "$MESA" live board push --kind sideways body
+[ "$(jqe .error.code)" = "usage" ] || fail "live board push --kind <junk>: a closed vocabulary"
+run 2 "$MESA" live board keep
+[ "$(jqe .error.code)" = "usage" ] || fail "live board keep with no destination: error.code"
+run 2 "$MESA" live board keep --project "$PROJ" --task 1
+[ "$(jqe .error.code)" = "usage" ] || fail "live board keep with both destinations: error.code"
+run 2 "$MESA" live board list --quiet
+[ -z "$STDOUT" ] || fail "live board list --quiet: stdout must be empty on a usage error"
+[ "$(jqe .error.code)" = "usage" ] || fail "live board list --quiet: error.code"
+ok "live board usage errors are exit 2: no source, two sources, --kind on a non-text source, no destination, both destinations, and --quiet on \`list\`"
+
+# ---- list, show and the --quiet key sets (jq, never byte-for-byte) ----
+
+run 0 "$MESA" live board list
+[ "$(jqs 'type')" = "array" ] || fail "live board list: a bare array"
+[ "$(jqs '.[0].id')" = "$B_MD" ] || fail "live board list: oldest first"
+[ "$(jqs '.[-1].id')" = "$B_SVG" ] || fail "live board list: the newest is last"
+jq -e 'map(has("body")) | any | not' <<<"$STDOUT" >/dev/null ||
+  fail "live board list: the history is bodiless — one body is fetched by the render route"
+run 0 "$MESA" live board show
+[ "$(jqs .id)" = "$B_SVG" ] || fail "live board show with no id: the board that is showing"
+FULL=$("$MESA" live board show "$B_MD" | jq -S 'keys')
+QUIET=$("$MESA" live board show --quiet "$B_MD" | jq -S 'keys')
+[ "$(jq -r 'length' <<<"$FULL")" = "7" ] || fail "LiveBoard key count changed: $FULL"
+[ "$(jq -c 'map(select(. != "body"))' <<<"$FULL")" = "$(jq -c '.' <<<"$QUIET")" ] ||
+  fail "live board show --quiet must drop exactly \`body\`: $FULL vs $QUIET"
+ok "live board list/show: oldest-first, bodiless history; --quiet drops exactly \`body\`"
+
+# ---- keep: an artifact, an attachment, and the rule between them ----
+
+run 0 "$MESA" live board keep --id "$B_MD" --project "Live gate project"
+ART=$(jqs .id)
+[ "$(jqs .content_type)" = "text/markdown" ] || fail "board keep --project: a markdown board is text/markdown"
+[ "$(jqs .name)" = "The plan.md" ] || fail "board keep: the name defaults from the title + extension, got $(jqs .name)"
+[ "$("$MESA" artifact show "$ART" | jq -r .body)" = "## Plan Three steps." ] ||
+  fail "board keep --project: the artifact body is the board's own"
+run 0 "$MESA" live board keep --id "$B_SVG" --project "$PROJ" --name flow.svg
+[ "$(jqs .content_type)" = "image/svg+xml" ] || fail "board keep: a diagram board is image/svg+xml"
+
+# An image cannot be an artifact — ARTIFACT_CONTENT_TYPES has no raster mime —
+# and the error says where it CAN go.
+run 1 "$MESA" live board keep --id "$B_IMG" --project "$PROJ"
+[ "$(jqe .error.code)" = "validation" ] || fail "board keep: an image board is not an artifact"
+grep -q -- '--task' <<<"$STDERR" || fail "board keep: the refusal must point at --task"
+
+TASK=$("$MESA" task create "$PROJ" "Board gate task" | jq -r .id)
+run 0 "$MESA" live board keep --id "$B_IMG" --task "$TASK"
+[ "$(jqs .filename)" = "The overlap.png" ] ||
+  fail "board keep --task: the name defaults from the title + extension, got $(jqs .filename)"
+[ "$(jqs .content_type)" = "image/png" ] || fail "board keep --task: content_type"
+[ "$(jqs .size_bytes)" = "$SHOT_BYTES" ] ||
+  fail "board keep --task: the DECODED bytes are attached, not the base64"
+[ "$(jqs .author)" = "mesa-live" ] || fail "board keep --task: author"
+# An untitled board falls back to board-<id> plus its kind's extension.
+run 0 "$MESA" live board keep --id "$B_HTML" --task "$TASK"
+[ "$(jqs .filename)" = "board-$B_HTML.html" ] ||
+  fail "board keep --task: an untitled board is board-<id>.<ext>, got $(jqs .filename)"
+run 0 "$MESA" live board keep --id "$B_HTML" --task "$TASK" --name mockup.html
+[ "$(jqs .filename)" = "mockup.html" ] || fail "board keep --name is used verbatim"
+[ "$(jqs .size_bytes)" = "$(wc -c < "$TMP/mockup.html" | tr -d ' ')" ] ||
+  fail "board keep --task: a text board attaches its own bytes, verbatim"
+# The extension is always the kind's (or an image's recorded content_type's),
+# never one read off the caption: a title claiming another format still gets
+# the derived extension appended.
+CAP=$("$MESA" live board push --quiet --image "$TMP/shot.png" --title "shot.jpg" | jq -r .id)
+run 0 "$MESA" live board keep --id "$CAP" --task "$TASK"
+[ "$(jqs .filename)" = "shot.jpg.png" ] ||
+  fail "board keep: the extension comes from the board, not the title, got $(jqs .filename)"
+ok "live board keep: into an artifact (content type by kind, name from the title) and onto a task (decoded image bytes, authored mesa-live); an image board refuses the artifact and names --task"
+
+# A board from another conversation is not reachable by id: every verb here is
+# scoped to the current session.
+run 1 "$MESA" live board show 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "live board show <unknown>: error.code"
+ok "live board show on a board this conversation does not own: not_found"
+
+# ---- the poll payload: bodiless, and capped at the retention bound ----
+
+for i in $(seq 1 22); do
+  "$MESA" live board push --quiet --title "bulk $i" "body $i" >/dev/null
+done
+run 0 "$MESA" live board list --limit 100
+[ "$(jqs 'length')" = "20" ] ||
+  fail "live board list: the newest 20 survive a push, got $(jqs 'length')"
+[ "$(jqs '.[-1].title')" = "bulk 22" ] || fail "live board list: the newest push is last"
+run 0 "$MESA" live board show
+[ "$(jqs .title)" = "bulk 22" ] || fail "each push replaces what is showing"
+ok "live board push prunes to the newest 20 — that bound IS the history, and it keeps the 2s poll bounded"
+
+# ---- clear: the delete echo ----
+
+run 0 "$MESA" live board clear
+[ "$(jqs 'length')" = "20" ] || fail "live board clear: the echo must carry every destroyed board"
+jq -e 'map(has("body")) | any | not' <<<"$STDOUT" >/dev/null ||
+  fail "live board clear: the echo is bodiless, like every other board listing"
+run 0 "$MESA" live board list
+[ "$STDOUT" = "[]" ] || fail "live board clear: nothing survives"
+run 1 "$MESA" live board show
+[ "$(jqe .error.code)" = "not_found" ] || fail "live board show with none pushed: error.code"
+run 0 "$MESA" live board clear --quiet
+[ "$STDOUT" = "[]" ] || fail "live board clear on an empty whiteboard: an empty echo, not an error"
+ok "live board clear: echoes the destroyed boards (the delete-echo safety floor) and is empty-safe"
+
+# ---- the render route, in DEFAULT mode ----
+
+R_MD=$("$MESA" live board push --quiet --title "Rendered plan" '## Plan' | jq -r .id)
+R_HTML=$("$MESA" live board push --quiet --kind html --file "$TMP/mockup.html" | jq -r .id)
+R_SVG=$("$MESA" live board push --quiet --diagram "$DIA" | jq -r .id)
+R_IMG=$("$MESA" live board push --quiet --image "$TMP/shot.png" | jq -r .id)
+
+PORT=17781
+BASE="http://127.0.0.1:$PORT"
+"$MESA" serve --port "$PORT" >"$TMP/serve13.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$BASE/api/live" >/dev/null ||
+  fail "server did not start for section 13 (log: $(cat "$TMP/serve13.log"))"
+
+# The board history rides on the page's existing poll — bodiless, no second
+# route to fetch it from.
+BODY=$(curl -s "$BASE/api/live")
+[ "$(jqb '.boards | length')" = "4" ] || fail "GET /api/live: boards must carry the history"
+jq -e '.boards | map(has("body")) | any | not' <<<"$BODY" >/dev/null ||
+  fail "GET /api/live: the boards in the poll must be bodiless"
+[ "$(jqb '.boards[-1].id')" = "$R_IMG" ] || fail "GET /api/live: the last board is the one showing"
+ok "GET /api/live: LiveState.boards is the whole history, oldest first and bodiless — no second poll route"
+
+# CSP_EXPECTED is the artifact render route's policy, byte for byte: the two
+# routes share one constant precisely so they cannot drift.
+CSP_EXPECTED="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+
+board_headers() { # board_headers <base> <id> -> $TMP/bh, STATUS
+  STATUS=$(curl -s -o "$TMP/bbody" -D "$TMP/bh" -w '%{http_code}' "$1/api/live/boards/$2/render")
+}
+header_of() { grep -i "^$1:" "$TMP/bh" | head -1 | cut -d' ' -f2- | tr -d '\r'; }
+
+check_board_render() { # check_board_render <base> <label>
+  local base=$1 label=$2
+
+  board_headers "$base" "$R_MD"
+  [ "$STATUS" = "200" ] || fail "$label: markdown render expected 200, got $STATUS"
+  [ "$(header_of content-type)" = "text/markdown; charset=utf-8" ] ||
+    fail "$label: markdown Content-Type is $(header_of content-type)"
+  [ "$(header_of x-content-type-options)" = "nosniff" ] || fail "$label: markdown nosniff"
+  grep -qi '^content-disposition: inline;' "$TMP/bh" || fail "$label: markdown must be inline"
+  [ "$(cat "$TMP/bbody")" = "## Plan" ] || fail "$label: markdown body must be byte-identical"
+
+  board_headers "$base" "$R_HTML"
+  [ "$(header_of content-type)" = "text/html; charset=utf-8" ] ||
+    fail "$label: html Content-Type is $(header_of content-type)"
+  [ "$(header_of content-security-policy)" = "$CSP_EXPECTED" ] ||
+    fail "$label: the html CSP must be the artifact policy verbatim, got $(header_of content-security-policy)"
+  [ "$(header_of x-content-type-options)" = "nosniff" ] || fail "$label: html nosniff"
+
+  board_headers "$base" "$R_SVG"
+  [ "$(header_of content-type)" = "image/svg+xml; charset=utf-8" ] ||
+    fail "$label: diagram Content-Type is $(header_of content-type)"
+  [ "$(header_of content-security-policy)" = "$CSP_EXPECTED" ] ||
+    fail "$label: the diagram CSP must be the artifact policy verbatim"
+
+  board_headers "$base" "$R_IMG"
+  [ "$(header_of content-type)" = "image/png" ] ||
+    fail "$label: image Content-Type must be the allowlisted mime, got $(header_of content-type)"
+  [ "$(header_of x-content-type-options)" = "nosniff" ] || fail "$label: image nosniff"
+  grep -qi '^content-disposition: inline;' "$TMP/bh" || fail "$label: image must be inline"
+  cmp -s "$TMP/bbody" "$TMP/shot.png" ||
+    fail "$label: the image must come back as the file's own bytes, decoded"
+
+  board_headers "$base" 999999
+  [ "$STATUS" = "404" ] || fail "$label: an unknown board must be 404, got $STATUS"
+  [ "$(jq -r .error.code <"$TMP/bbody")" = "not_found" ] || fail "$label: unknown board error.code"
+}
+
+check_board_render "$BASE" "render (default mode)"
+ok "GET /api/live/boards/{id}/render: markdown/html/diagram/image each with their own type, nosniff and inline, the artifact CSP on the two document kinds, byte-identical bodies, 404 for an unknown board"
+
+# There is no write route: boards are pushed by the CLI and read by the
+# browser, and the panel's close button is browser-side.
+STATUS=$(curl -s -o "$TMP/bbody" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d '{"kind":"markdown","body":"from the network"}' "$BASE/api/live/boards")
+[ "$STATUS" != "200" ] && [ "$STATUS" != "201" ] ||
+  fail "there must be no POST board route, got $STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H 'Content-Type: application/json' \
+  "$BASE/api/live/boards/$R_MD")
+[ "$STATUS" != "200" ] || fail "there must be no DELETE board route, got $STATUS"
+[ "$("$MESA" live board list | jq 'length')" = "4" ] ||
+  fail "an HTTP write must not have changed the whiteboard"
+ok "no POST/DELETE board route exists: the CLI is the only writer"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
+
+# ---- the same headers under --lan ----
+#
+# Plain guard in both modes, identical headers in both: what makes an
+# agent-written document safe to render is the CSP, not who asked for it, so
+# the answer must not vary with the mode mesa is running in.
+LAN_PORT=17782
+LAN_BASE="http://127.0.0.1:$LAN_PORT"
+"$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan13.log" 2>&1 &
+LAN_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$LAN_BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$LAN_BASE/api/live" >/dev/null ||
+  fail "LAN server did not start for section 13 (log: $(cat "$TMP/lan13.log"))"
+
+check_board_render "$LAN_BASE" "render (--lan)"
+ok "--lan: the render route answers with the identical header set, CSP included — the sandbox is the defense, not the caller's identity"
+
+kill "$LAN_PID" 2>/dev/null || true
+wait "$LAN_PID" 2>/dev/null || true
+LAN_PID=
+
+# ---- ending the conversation closes the render route ----
+#
+# A board is scoped to its conversation, and this route is the only way a
+# browser reaches one, so it has to stop answering when the conversation is
+# over — otherwise "nothing outlives the conversation unless `keep` promotes
+# it" would hold for every read except the one that hands out the bytes. The
+# row itself survives an `ended` exactly as a turn's does; this is a status
+# check, not a cascade. `not_found`, the same answer an unknown id gets, so a
+# caller walking ids is not told the picture is real but simply over.
+"$MESA" serve --port "$PORT" >"$TMP/serve13b.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$BASE/api/live" >/dev/null ||
+  fail "server did not restart for the end-of-conversation check (log: $(cat "$TMP/serve13b.log"))"
+
+board_headers "$BASE" "$R_HTML"
+[ "$STATUS" = "200" ] || fail "the board must still render while the conversation is live, got $STATUS"
+
+run 0 "$MESA" live stop
+[ "$(jqs .status)" = "ended" ] || fail "live stop: status must be ended"
+
+for id in "$R_MD" "$R_HTML" "$R_SVG" "$R_IMG"; do
+  board_headers "$BASE" "$id"
+  [ "$STATUS" = "404" ] ||
+    fail "after live stop: board $id must be 404, got $STATUS"
+  [ "$(jq -r .error.code <"$TMP/bbody")" = "not_found" ] ||
+    fail "after live stop: board $id error.code must be not_found"
+done
+api 200 GET "/api/live"
+[ "$(jqb .session)" = "null" ] || fail "after live stop: the page is idle again"
+[ "$(jqb '.boards | length')" = "0" ] || fail "after live stop: no boards ride in the poll"
+run 1 "$MESA" live board list
+[ "$(jqe .error.code)" = "not_found" ] || fail "after live stop: live board list is not_found"
+ok "ending the conversation closes the whiteboard on every surface: the render route answers 404 not_found, the poll carries no boards, and the CLI is not_found — a board outlives it only through \`keep\`"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
+
 
 echo "all $CHECKS checks passed"

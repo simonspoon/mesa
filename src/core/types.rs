@@ -3220,6 +3220,127 @@ pub struct LiveSummary {
     pub updated_at: String,
 }
 
+/// What one live **board** holds — the four things a picture can be in a
+/// spoken conversation (mesa task 1071). The kind decides what `body` is and
+/// how `GET /api/live/boards/{id}/render` serves it, and it is fixed at push
+/// time: a board is a snapshot, so there is nothing to convert later.
+///
+/// - `markdown` — markdown source, rendered by the page's own `<Markdown>`.
+/// - `html` — a whole HTML document, framed in a sandboxed `<iframe>` behind
+///   the same CSP an artifact is rendered under.
+/// - `diagram` — SVG markup, rendered from a mesa diagram *at push time*
+///   (`core::board::diagram_svg`), which is what makes it a snapshot rather
+///   than a live view of a canvas that may have moved on since.
+/// - `image` — base64 of a file's bytes, so a board is self-contained: no
+///   filesystem dependency after the push, no traversal surface on the read,
+///   and `keep --task` writes the bytes straight into an attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LiveBoardKind {
+    Markdown,
+    Html,
+    Diagram,
+    Image,
+}
+
+impl LiveBoardKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveBoardKind::Markdown => "markdown",
+            LiveBoardKind::Html => "html",
+            LiveBoardKind::Diagram => "diagram",
+            LiveBoardKind::Image => "image",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LiveBoardKind> {
+        match s {
+            "markdown" => Some(LiveBoardKind::Markdown),
+            "html" => Some(LiveBoardKind::Html),
+            "diagram" => Some(LiveBoardKind::Diagram),
+            "image" => Some(LiveBoardKind::Image),
+            _ => None,
+        }
+    }
+
+    /// What the render route labels this kind's body, for the three kinds
+    /// whose type is fixed by the kind itself. An `image` has no answer here —
+    /// its mime is the allowlisted one the pushed file's extension named, and
+    /// it rides on the row as [`LiveBoard::content_type`].
+    pub fn content_type(self) -> Option<&'static str> {
+        match self {
+            LiveBoardKind::Markdown => Some("text/markdown"),
+            LiveBoardKind::Html => Some("text/html"),
+            LiveBoardKind::Diagram => Some("image/svg+xml"),
+            LiveBoardKind::Image => None,
+        }
+    }
+}
+
+/// One picture the agent put in front of the person during a live conversation
+/// (mesa task 1071) — a mockup, a report, a diagram snapshot or a screenshot.
+///
+/// A board is deliberately **not** a [`LiveTurn`]: a turn's `text` is spoken
+/// and capped at 8 KiB, and [`LiveAction`] is the narrow "what the person is
+/// looking at" vocabulary. An HTML mockup is neither small nor speakable, so
+/// this is a sibling table, the `LiveSummary` precedent.
+///
+/// It is also **ephemeral**, in the sense of *scoped to its conversation*: an
+/// ended conversation keeps its rows (the `live_turns` rule — `ended_at` is a
+/// stamp, not a delete) but every read of a board closes, the render route
+/// included, and nothing reaches a project until `mesa live board keep` copies
+/// it into an artifact or an attachment. `session_id` is `ON DELETE CASCADE`
+/// for the case that really is a delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveBoard {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub session_id: i64,
+    pub kind: LiveBoardKind,
+    /// What to call it in the panel's head row. Optional, bounded, and folded
+    /// to absent when blank — the [`LiveContext`] rule, for the same reason.
+    pub title: Option<String>,
+    /// The whole picture: markdown source, an HTML document, SVG markup, or
+    /// base64 of an image file's bytes, depending on `kind`. The one unbounded
+    /// field, which is why `--quiet` drops it and [`LiveBoardSummary`] has
+    /// none of it.
+    pub body: String,
+    /// The allowlisted image mime an `image` board's bytes are, taken from the
+    /// pushed file's extension at push time (`files::image_mime`, the same
+    /// allowlist `/files/raw` uses). Null for every other kind, whose type the
+    /// kind itself decides ([`LiveBoardKind::content_type`]). Named for
+    /// [`Attachment::content_type`] and `artifacts.content_type`, which are
+    /// this same field on the two other tables that store one.
+    ///
+    /// It is stored rather than re-derived because nothing else on the row
+    /// carries it: `body` is bytes, and `title` is a caption the caller may
+    /// write anything into, so a render that read the type off the title would
+    /// change what it serves when the caption changed.
+    pub content_type: Option<String>,
+    /// When it was pushed (SQLite `datetime` text, UTC).
+    pub created_at: String,
+}
+
+/// A board without its body — what rides in [`LiveState`], which the page
+/// polls every two seconds. The bodies are megabyte-scale documents and the
+/// page only ever renders **one** of them (through the render route, in an
+/// `<iframe>` or an `<img>`), so the poll carries the history as pointers and
+/// nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveBoardSummary {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub session_id: i64,
+    pub kind: LiveBoardKind,
+    pub title: Option<String>,
+    pub created_at: String,
+}
+
 /// The Live page's whole read (`GET /api/live`): the conversation that is
 /// running, and the turns after the cursor the page asked from. A **view**,
 /// never stored — it is assembled per request out of the one live session and
@@ -3234,6 +3355,14 @@ pub struct LiveSummary {
 pub struct LiveState {
     pub session: Option<LiveSession>,
     pub turns: Vec<LiveTurn>,
+    /// The boards pushed in this conversation, oldest first and **bodiless**
+    /// (mesa task 1071) — the whole history the panel steps through, and its
+    /// last element is the board that is showing. Bounded by the store's own
+    /// retention (the newest 20 survive a push), so this poll stays a small
+    /// response no matter how many pictures a conversation went through, and
+    /// there is deliberately no second route to fetch them from: a body is
+    /// fetched once, by the render route, for the one board being looked at.
+    pub boards: Vec<LiveBoardSummary>,
 }
 
 #[cfg(test)]

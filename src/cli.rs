@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use base64::Engine;
 use clap::error::ErrorKind;
 use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
@@ -27,10 +28,10 @@ use crate::core::{
     Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew,
     EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
     InboxItem, InboxKind, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope,
-    LibrarySyncStatus, LiveAction, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn,
-    NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg,
-    ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt, agents, config,
-    library, live, look, receipt,
+    LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveRole, LiveSession, LiveStatus,
+    LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result,
+    Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt,
+    agents, board, config, files, library, live, look, receipt,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1650,6 +1651,142 @@ EXAMPLES
     /// A session's remembered summary (mesa task 921) — set/show/list
     #[command(subcommand)]
     Summary(LiveSummaryCmd),
+    /// The conversation's whiteboard (mesa task 1071) — push/show/list/clear/keep
+    #[command(subcommand)]
+    Board(LiveBoardCmd),
+}
+
+/// The live conversation's **whiteboard** (mesa task 1071): the pictures the
+/// agent puts in front of the person when a mockup, a report, a diagram
+/// snapshot or a screenshot answers better than a sentence read aloud does.
+///
+/// A board is not a turn — a turn's text is *spoken* — and it is
+/// **ephemeral**: it is scoped to this conversation and drops out of every
+/// read once the conversation ends, until `keep` copies one into a project as
+/// an artifact or onto a task as an attachment. The newest 20 of a session's
+/// boards survive each push, which is the history the panel steps back
+/// through.
+///
+/// Every verb here acts on THE current live session, like the rest of `live`:
+/// with none live each is `not_found` naming `mesa live start`.
+#[derive(Subcommand)]
+enum LiveBoardCmd {
+    /// Show the person a picture; prints the created board
+    ///
+    /// Exactly one source, and the source decides the kind: a text BODY typed
+    /// after `push` (markdown, or `--kind html`), `--file` (kind from the
+    /// extension), `--image` (any file the inline-image allowlist accepts —
+    /// png, jpg, gif, webp, bmp, ico, svg), or `--diagram <ID>`, which renders
+    /// that diagram to an SVG SNAPSHOT: the picture is frozen as it was at the
+    /// push, so a canvas edited afterwards does not change what the person was
+    /// shown. Each push replaces what is showing.
+    ///
+    /// `--say` speaks a sentence alongside it, exactly like `navigate --say`.
+    /// Put every flag BEFORE the body text: everything after `push` that is
+    /// not a leading flag is swallowed as the body (the `live say` trap).
+    #[command(after_help = "\
+EXAMPLES
+  mesa live board push --title Plan '## Plan' 'Three steps, in order.'
+  mesa live board push --kind html --file /tmp/mockup.html --say \"Here is the mockup.\"
+  mesa live board push --image /tmp/screenshot.png --title \"The overlap\"
+  mesa live board push --diagram 7 --say \"This is the flow we discussed.\"")]
+    #[command(group(ArgGroup::new("source").required(true).args(["body", "file", "image", "diagram"])))]
+    Push {
+        /// The board body as text (everything after `push`); quoting optional
+        #[arg(num_args = 1.., trailing_var_arg = true)]
+        body: Vec<String>,
+        /// Read the body from a file; the kind comes from its extension
+        ///
+        /// `.md`/`.markdown` is markdown and `.html`/`.htm` is html; anything
+        /// else is read as markdown. `--kind` overrides either way.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Show an image file; its bytes are stored in the board itself
+        #[arg(long, value_name = "PATH")]
+        image: Option<String>,
+        /// Snapshot a mesa diagram as SVG, as it looks right now
+        #[arg(long, value_name = "ID")]
+        diagram: Option<i64>,
+        /// `markdown` (the default) or `html` — text bodies only
+        #[arg(
+            long,
+            value_name = "KIND",
+            value_parser = parse_text_board_kind,
+            conflicts_with_all = ["image", "diagram"],
+        )]
+        kind: Option<LiveBoardKind>,
+        /// Caption for the panel's head row (≤ 200 characters)
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        /// Say this while the board appears; without it nothing is spoken
+        #[arg(long, value_name = "TEXT")]
+        say: Option<String>,
+        /// Print the board without its `body` instead of in full
+        ///
+        /// Must come BEFORE the body text.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Take the whiteboard down; prints the boards it destroyed
+    ///
+    /// The echo is the recovery transcript mesa has instead of a confirmation
+    /// prompt — bodiless, like every other board listing.
+    Clear {
+        /// Print the destroyed boards in their compact shape
+        ///
+        /// A board summary carries nothing unbounded, so this is identical to
+        /// the default; the flag is accepted for uniformity.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Copy a board out of the conversation, where it will outlive it
+    ///
+    /// Exactly one destination: `--project` writes an artifact (id or name,
+    /// the house rule), `--task` writes an attachment. Without `--id` it is
+    /// the board that is showing. An `image` board can only go to a task —
+    /// an artifact is markdown, HTML or SVG, never raster bytes.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live board keep --project mesa
+  mesa live board keep --task 42 --name overlap.png
+  mesa live board keep --id 7 --project 1 --name plan.md")]
+    #[command(group(ArgGroup::new("destination").required(true).args(["project", "task"])))]
+    Keep {
+        /// Project to write an artifact to, by id or name
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// Task to attach the board to
+        #[arg(long, value_name = "ID")]
+        task: Option<i64>,
+        /// Which board to keep; defaults to the one showing
+        #[arg(long, value_name = "BOARD")]
+        id: Option<i64>,
+        /// Name for the artifact / attachment; defaults from the board's title
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Print the created record in its compact shape instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Print this conversation's boards as a bare JSON array, oldest first
+    ///
+    /// Bodiless — the whole history as pointers, exactly what the web panel
+    /// polls. Fetch one body with `show`.
+    List {
+        /// Maximum number of boards to print (clamped to 1..=20)
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: i64,
+    },
+    /// Print one board in full; without an ID, the one showing
+    #[command(visible_alias = "get")]
+    Show {
+        /// Which board to print; defaults to the one showing
+        #[arg(value_name = "ID")]
+        id: Option<i64>,
+        /// Print the board without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 /// A live session's summary — a short prose memory of one ended conversation,
@@ -2415,6 +2552,18 @@ fn parse_sidebars_action(s: &str) -> std::result::Result<LiveAction, String> {
     }
 }
 
+/// `--kind` on `live board push` names one of the two **text** kinds. The
+/// other two are named by their own source flag (`--image`, `--diagram`),
+/// which is also where the bytes come from, so offering them here would be a
+/// second way to say something the source already said.
+fn parse_text_board_kind(s: &str) -> std::result::Result<LiveBoardKind, String> {
+    match s {
+        "markdown" => Ok(LiveBoardKind::Markdown),
+        "html" => Ok(LiveBoardKind::Html),
+        _ => Err(format!("'{s}' is not one of markdown|html")),
+    }
+}
+
 fn parse_diagram_type(s: &str) -> std::result::Result<DiagramType, String> {
     DiagramType::parse(s)
         .ok_or_else(|| format!("'{s}' is not one of storyboard|flowchart|erd|brainstorm"))
@@ -2748,6 +2897,11 @@ const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
 /// Keys dropped from a `LiveSummary` under `--quiet` (task 921): its own
 /// unbounded prose body. `session_id`/`created_at`/`updated_at` all stay.
 const QUIET_DROP_LIVE_SUMMARY: &[&str] = &["body"];
+
+/// A board's one unbounded field is its `body` — a whole document, an SVG or
+/// a base64 image. Everything else (ids, a fixed kind word, a 200-char title,
+/// a content type, a timestamp) is bounded and stays.
+const QUIET_DROP_LIVE_BOARD: &[&str] = &["body"];
 /// Keys dropped from a `TaskReceipt` under `--quiet` (task 920): `commits`,
 /// a git log capped at `core::git::LOG_CAP` but still unbounded as far as a
 /// caller reading one JSON line is concerned, and `note`, the one field on a
@@ -2874,6 +3028,10 @@ fn print_live_turn(turn: &LiveTurn, is_quiet: bool) {
 }
 
 /// Print one live summary: the full record, or the record minus `body`.
+fn print_live_board(board: &LiveBoard, is_quiet: bool) {
+    print_record(board, is_quiet, QUIET_DROP_LIVE_BOARD);
+}
+
 fn print_live_summary(summary: &LiveSummary, is_quiet: bool) {
     print_record(summary, is_quiet, QUIET_DROP_LIVE_SUMMARY);
 }
@@ -4194,6 +4352,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             print_json(&look::shoot(&window, &path)?);
         }
         LiveCmd::Summary(cmd) => run_live_summary(&mut store, cmd)?,
+        LiveCmd::Board(cmd) => run_live_board(&mut store, cmd)?,
     }
     Ok(())
 }
@@ -4213,6 +4372,191 @@ fn run_live_summary(store: &mut Store, cmd: LiveSummaryCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The whiteboard's five verbs (mesa task 1071). Every one of them resolves
+/// THE current live session first, like the rest of the group: a board belongs
+/// to a conversation, so with none live there is nothing to push to, show or
+/// keep.
+fn run_live_board(store: &mut Store, cmd: LiveBoardCmd) -> Result<()> {
+    let session = current_live_session(store)?;
+    match cmd {
+        LiveBoardCmd::Push {
+            body,
+            file,
+            image,
+            diagram,
+            kind,
+            title,
+            say,
+            quiet,
+        } => {
+            // Exactly one source — clap's required ArgGroup has already
+            // refused none and both, so this only has to say which it was.
+            let (kind, content, content_type) = if let Some(path) = image {
+                // The content type comes from the extension, through the SAME
+                // allowlist `/files/raw` uses: an allowlist, never a sniff of
+                // the bytes, and never the caption. Anything not on it is a
+                // `validation` error before a row is written.
+                let content_type = files::image_mime(&path).ok_or_else(|| {
+                    Error::Validation(format!(
+                        "{path} is not an image mesa can show: the extension must be one of \
+                         png, jpg, jpeg, gif, webp, bmp, ico or svg"
+                    ))
+                })?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| Error::Validation(format!("could not read {path}: {e}")))?;
+                (
+                    LiveBoardKind::Image,
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                    Some(content_type.to_string()),
+                )
+            } else if let Some(id) = diagram {
+                // A SNAPSHOT: the diagram is read once, here, and the SVG the
+                // board holds never changes again. What the person was shown
+                // is what they were shown.
+                let view = store.get_diagram_view(id)?;
+                (LiveBoardKind::Diagram, board::diagram_svg(&view), None)
+            } else if let Some(path) = file {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| Error::Validation(format!("could not read {path}: {e}")))?;
+                (
+                    kind.unwrap_or_else(|| board_kind_for_path(&path)),
+                    text,
+                    None,
+                )
+            } else {
+                (
+                    kind.unwrap_or(LiveBoardKind::Markdown),
+                    body.join(" "),
+                    None,
+                )
+            };
+            let board = store.add_live_board(
+                session.id,
+                kind,
+                title.as_deref(),
+                &content,
+                content_type.as_deref(),
+            )?;
+            // The board goes up first, then the sentence about it: the turn is
+            // spoken as the picture appears, exactly as `navigate --say` is
+            // spoken as the page changes.
+            if let Some(say) = say {
+                store.add_live_turn(session.id, LiveRole::Mesa, &say, None, None)?;
+            }
+            print_live_board(&board, quiet);
+        }
+        LiveBoardCmd::Clear { quiet: _ } => {
+            // The echo is bodiless already — a board summary has nothing
+            // unbounded to drop — so `--quiet` is accepted and changes
+            // nothing, exactly as it does on a live session.
+            let destroyed = store.clear_live_boards(session.id)?;
+            print_json(&destroyed);
+        }
+        LiveBoardCmd::Keep {
+            project,
+            task,
+            id,
+            name,
+            quiet,
+        } => {
+            let board = resolve_live_board(store, &session, id)?;
+            let name = name.unwrap_or_else(|| board::filename(&board));
+            match (project, task) {
+                // Exactly one destination; clap's required ArgGroup refuses
+                // none and both, so the remaining arms cannot happen.
+                (Some(project), _) => {
+                    let project_id = resolve_project(store, &project)?;
+                    let content_type = board.kind.content_type().ok_or_else(|| {
+                        Error::Validation(format!(
+                            "live board {} is an image, and an artifact may only be \
+                             markdown, HTML or SVG; keep it on a task instead \
+                             (mesa live board keep --task <ID>)",
+                            board.id
+                        ))
+                    })?;
+                    let artifact = store.create_artifact(
+                        project_id,
+                        None,
+                        &name,
+                        Some(content_type),
+                        &board.body,
+                    )?;
+                    print_artifact(&artifact, quiet);
+                }
+                (_, Some(task_id)) => {
+                    // An image board holds base64; every other kind is the
+                    // document itself, so the attachment gets exactly the
+                    // bytes the render route would have served.
+                    let bytes = match board.kind {
+                        LiveBoardKind::Image => base64::engine::general_purpose::STANDARD
+                            .decode(board.body.as_bytes())
+                            .map_err(|e| {
+                                Error::Validation(format!(
+                                    "live board {} does not hold valid base64: {e}",
+                                    board.id
+                                ))
+                            })?,
+                        _ => board.body.clone().into_bytes(),
+                    };
+                    let attachment =
+                        store.create_attachment(task_id, &name, &bytes, Some("mesa-live"))?;
+                    print_json(&attachment);
+                }
+                (None, None) => unreachable!("clap requires --project or --task"),
+            }
+        }
+        LiveBoardCmd::List { limit } => {
+            print_json(&store.list_live_boards(session.id, limit)?);
+        }
+        LiveBoardCmd::Show { id, quiet } => {
+            let board = resolve_live_board(store, &session, id)?;
+            print_live_board(&board, quiet);
+        }
+    }
+    Ok(())
+}
+
+/// The board a command means: the one named by `--id`/`ID`, else the one
+/// showing. A board from another conversation is `not_found` rather than
+/// reachable by id — every verb here is scoped to the current session, and a
+/// board is part of the conversation it was pushed into.
+fn resolve_live_board(store: &Store, session: &LiveSession, id: Option<i64>) -> Result<LiveBoard> {
+    match id {
+        Some(id) => {
+            let board = store.get_live_board(id)?;
+            if board.session_id != session.id {
+                return Err(Error::NotFound(format!(
+                    "live board {id} is not part of live session {}",
+                    session.id
+                )));
+            }
+            Ok(board)
+        }
+        None => store.current_live_board(session.id)?.ok_or_else(|| {
+            Error::NotFound(format!(
+                "live session {} has no board; push one with `mesa live board push`",
+                session.id
+            ))
+        }),
+    }
+}
+
+/// `--file`'s extension names the kind, so a markdown file and an HTML mockup
+/// do not each need a flag saying what they obviously are. Anything else is
+/// read as markdown — the kind that renders any plain text legibly — and
+/// `--kind` overrides all of it.
+fn board_kind_for_path(path: &str) -> LiveBoardKind {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("html") | Some("htm") => LiveBoardKind::Html,
+        _ => LiveBoardKind::Markdown,
+    }
 }
 
 /// Resolves a script argument — a numeric id or a script name — to the record.
@@ -5398,6 +5742,53 @@ mod tests {
                 QUIET_DROP_LIVE_TURN
             ))),
             minus(&full, QUIET_DROP_LIVE_TURN),
+        );
+    }
+
+    fn sample_live_board() -> LiveBoard {
+        LiveBoard {
+            id: 3,
+            session_id: 2,
+            kind: LiveBoardKind::Markdown,
+            title: Some("The plan".into()),
+            body: "## Plan\n\nThree steps, in order.".into(),
+            content_type: None,
+            created_at: "2026-01-01 00:00:00".into(),
+        }
+    }
+
+    #[test]
+    fn live_board_quiet_drops_body() {
+        let full = keys(&sample_live_board());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "session_id",
+                // One of four fixed words, and what decides how the board is
+                // rendered at all: bounded and load-bearing.
+                "kind",
+                // The caption, capped at 200 characters by `Store` — the head
+                // row's whole text, and what `keep` names the file it writes.
+                "title",
+                // The one unbounded field: a whole document, an SVG, or a
+                // base64 image. Dropped.
+                "body",
+                // A short fixed mime string or null, and the only thing that
+                // says what an image board's bytes are — the field name
+                // `Attachment` and `Artifact` already use for it.
+                "content_type",
+                "created_at",
+            ]),
+            "LiveBoard gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_live_board(),
+                QUIET_DROP_LIVE_BOARD
+            ))),
+            minus(&full, QUIET_DROP_LIVE_BOARD),
         );
     }
 

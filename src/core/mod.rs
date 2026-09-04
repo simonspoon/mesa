@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod attachments;
+pub mod board;
 pub mod cc;
 pub mod config;
 pub mod files;
@@ -20,8 +21,8 @@ pub mod version;
 
 pub use store::{
     ArtifactPatch, DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch, ImportDoc,
-    LIVE_AUDIO_MAX, LibraryPatch, NextResult, ProjectPatch, ReceiptPatch, Result, ScriptPatch,
-    Store, TaskPatch, default_db_path,
+    LIVE_AUDIO_MAX, LIVE_BOARD_BODY_MAX, LIVE_BOARD_KEEP, LibraryPatch, NextResult, ProjectPatch,
+    ReceiptPatch, Result, ScriptPatch, Store, TaskPatch, default_db_path,
 };
 pub use types::{
     ARTIFACT_CONTENT_TYPES, AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactSummary,
@@ -33,10 +34,10 @@ pub use types::{
     EdgeMarker, EdgeStyle, FileContentView, FileTreeEntry, Frame, FrameEdge, FrameShape, GitCommit,
     GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, HookRun, InboxItem, InboxKind,
     LibraryBundle, LibraryImportResult, LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult,
-    LibrarySyncRow, LibrarySyncStatus, LibraryVersion, LiveAction, LiveContext, LiveContextKind,
-    LiveRole, LiveSession, LiveState, LiveStatus, LiveSummary, LiveTranscript, LiveTurn,
-    LiveWindow, MesaVersion, ModelRates, Priority, Project, ProjectAgents, ProjectFileTree,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectVersion, Script, ScriptArg,
-    ScriptArgKind, ScriptRun, Status, Task, TaskReceipt, TaskSummary, Waypoint,
-    is_valid_artifact_content_type, task_name,
+    LibrarySyncRow, LibrarySyncStatus, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
+    LiveBoardSummary, LiveContext, LiveContextKind, LiveRole, LiveSession, LiveState, LiveStatus,
+    LiveSummary, LiveTranscript, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project,
+    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
+    ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, Task, TaskReceipt,
+    TaskSummary, Waypoint, is_valid_artifact_content_type, task_name,
 };

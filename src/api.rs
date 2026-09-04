@@ -41,13 +41,14 @@ use crate::core::{
     AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactPatch, ArtifactSummary, CcDashboard,
     CcLiveSession, CcUsage, DiagramPatch, DiagramType, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
     Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LibraryBundle,
-    LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveContext, LiveRole, LiveState,
-    LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates, NextResult, Priority,
-    ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch,
-    ProjectVersion, ReceiptPatch, Script, ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskSummary, Waypoint, agents, attachments, config, files, git, guard, hooks, library, listen,
-    live, receipt, scripts, speech, version,
+    GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP,
+    LibraryBundle, LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveBoardKind,
+    LiveContext, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion,
+    ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script,
+    ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
+    attachments, board, config, files, git, guard, hooks, library, listen, live, receipt, scripts,
+    speech, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -1345,6 +1346,15 @@ fn router(state: AppState) -> Router {
         // the inbox's play button — see `speak_inbox` for why that pair, and
         // why a GET.
         .route("/api/live/turns/{id}/speak", get(speak_live_turn))
+        // Rendering one board — the picture the agent put in front of the
+        // person (mesa task 1071). Plain `guard`, no per-route gate, in both
+        // serve modes: the artifacts posture, for the artifacts reason — what
+        // makes an agent-written document safe to render is the CSP below it,
+        // not who asked for it. There is deliberately no POST or DELETE here:
+        // boards are pushed by the CLI (the agent) and read by the browser,
+        // and the panel's close button is browser-side, exactly like the live
+        // panel's own.
+        .route("/api/live/boards/{id}/render", get(render_live_board))
         // Transcribing one recording with `auris` (mesa task 954, revisited
         // task 972). Registered in **both** serve modes now: gated by the
         // same `require_agent_access` + `require_same_site_fetch` pair
@@ -2974,13 +2984,20 @@ async fn get_live(
         return Ok(Json(LiveState {
             session: None,
             turns: vec![],
+            boards: vec![],
         })
         .into_response());
     };
     let turns = store.list_live_turns(session.id, q.after, LIVE_TURNS_LIMIT)?;
+    // The whole board history, bodiless (mesa task 1071) — every board this
+    // conversation pushed, in the order the panel steps through them, read in
+    // the same lock scope as the turns so one poll is one consistent view.
+    // `LIVE_BOARD_KEEP` is all there is: the store prunes to it on every push.
+    let boards = store.list_live_boards(session.id, LIVE_BOARD_KEEP)?;
     Ok(Json(LiveState {
         session: Some(session),
         turns,
+        boards,
     })
     .into_response())
 }
@@ -3367,6 +3384,127 @@ async fn speak_live_turn(
         Body::from_stream(ReceiverStream::new(speech.chunks)),
     )
         .into_response())
+}
+
+/// The Content-Security-Policy every rendered agent-written document is served
+/// under — [`render_project_artifact`]'s policy and [`render_live_board`]'s,
+/// one constant rather than two copies, because it is one problem: agent-written markup, rendered by the browser, that must not be
+/// able to behave like an ordinary same-origin mesa page. The load-bearing
+/// directive is `sandbox allow-scripts` with no `allow-same-origin`; the full
+/// reasoning is on [`render_project_artifact`] and in `docs/artifacts.md`, and
+/// the shared constant is what keeps the two routes' answer identical.
+const RENDER_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+     img-src data:; font-src data:; media-src data:; form-action 'none'; \
+     base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts";
+
+/// Serves one live board's stored body, framed for direct rendering: markdown
+/// as text the page hands to its own `<Markdown>`, an HTML document or a
+/// diagram snapshot inside a sandboxed `<iframe>`, an image as its own bytes
+/// in an `<img>` (mesa task 1071, `docs/live.md`).
+///
+/// **Plain guard, no per-route gate, identical headers in both serve modes** —
+/// the [`render_project_artifact`] posture, taken for the same reason: what
+/// makes agent-written markup safe to render is the CSP, not the identity of
+/// whoever asked for it, so the defense must not vary with the mode mesa
+/// happens to be running in.
+///
+/// The two `text/html`-adjacent kinds ride the artifact route's exception to
+/// [`raw_project_file`]'s "no route may ever return `text/html`" rule, and
+/// under exactly the same terms: this is a record mesa itself validated, and
+/// [`RENDER_CSP`] is what strips the document of mesa's origin.
+///
+/// A board whose conversation has **ended** is `not_found` here, exactly as an
+/// unknown id is: the ephemeral half of the design is only honest if the one
+/// route that hands out bytes stops handing them out too.
+///
+/// An `image` board is the one kind whose type is not decided by its `kind`:
+/// its bytes are stored base64 and its `content_type` is the allowlisted mime the pushed
+/// file's extension named (`files::image_mime`, at push time), so the row is
+/// what answers here — never a sniff of the bytes, and never the caption.
+async fn render_live_board(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    // A board is scoped to its conversation, and this is the one surface a
+    // browser can reach a board through — so it has to stop answering when the
+    // conversation is over, or "nothing outlives the conversation unless
+    // `keep` promotes it" would be true of every read except the one that
+    // hands out the bytes. The session row survives an `ended` (the turns'
+    // rule, unchanged), so this is a status check rather than a cascade.
+    //
+    // This is not the artifacts posture drifting: an artifact *is* a kept
+    // document, so serving it is the whole point of its route.
+    //
+    // A board whose session has ended is `not_found`, the same answer an
+    // unknown id gets — the route does not confirm to a caller walking ids
+    // that the picture is real but simply over.
+    let board = {
+        let store = state.store.lock().unwrap();
+        let board = store.get_live_board(id)?;
+        let session = store.get_live_session(board.session_id)?;
+        if session.status != LiveStatus::Live {
+            return Err(Error::NotFound(format!("live board {id} not found")).into());
+        }
+        board
+    };
+    let filename = board::filename(&board);
+    let mut csp = None;
+    let (content_type, bytes) = match board.kind {
+        LiveBoardKind::Image => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(board.body.as_bytes())
+                .map_err(|e| ApiError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "validation",
+                    message: format!("live board {id} does not hold valid base64: {e}"),
+                })?;
+            // `Store` requires an image board to name its content type, so
+            // this is belt and braces on a hand-edited row: an image with no
+            // type is never guessed at.
+            let content_type = board.content_type.clone().ok_or_else(|| ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "validation",
+                message: format!("live board {id} has no image type recorded"),
+            })?;
+            (content_type, bytes)
+        }
+        kind => {
+            // A markdown board is fetched as text and never framed as a
+            // document, so it needs no policy; the two that ARE documents get
+            // the artifact CSP, and giving all three the same header keeps
+            // one answer for "what does this route serve markup under".
+            csp = Some(RENDER_CSP);
+            let content_type = format!(
+                "{}; charset=utf-8",
+                kind.content_type()
+                    .expect("every non-image board kind names its content type")
+            );
+            (content_type, board.body.clone().into_bytes())
+        }
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, header_value(&content_type)?);
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        header_value(&disposition("inline", &filename))?,
+    );
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    if let Some(csp) = csp {
+        headers.insert(header::CONTENT_SECURITY_POLICY, header_value(csp)?);
+    }
+    Ok((StatusCode::OK, headers, bytes).into_response())
+}
+
+/// One header value, or a `validation` error rather than a panic — a title a
+/// caller wrote reaches the `Content-Disposition`, and `disposition` folds it
+/// to ASCII, so this cannot fire in practice; it exists so a value that is
+/// somehow unrepresentable is an answer rather than a dropped connection.
+fn header_value(value: &str) -> Result<axum::http::HeaderValue, ApiError> {
+    axum::http::HeaderValue::from_str(value).map_err(|e| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message: format!("invalid header value: {e}"),
+    })
 }
 
 /// Upper bound on the raw HTTP request body for the transcribe route. Same
@@ -4279,13 +4417,7 @@ async fn render_project_artifact(
                 disposition("inline", &artifact.name),
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-                 img-src data:; font-src data:; media-src data:; form-action 'none'; \
-                 base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
-                    .to_string(),
-            ),
+            (header::CONTENT_SECURITY_POLICY, RENDER_CSP.to_string()),
         ],
         artifact.body.into_bytes(),
     )

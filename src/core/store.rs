@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
+use super::files;
 use super::types::{
     AnchorSide, Artifact, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat,
     EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind,
-    LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveContext, LiveRole,
-    LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script,
-    ScriptArg, ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint,
-    is_valid_artifact_content_type, task_name,
+    LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
+    LiveBoardSummary, LiveContext, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn,
+    LiveWindow, Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Task, TaskEvent,
+    TaskReceipt, Waypoint, is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -715,6 +716,42 @@ const MIGRATIONS: &[&str] = &[
         updated_at   TEXT NOT NULL
     );
     CREATE INDEX idx_artifacts_project ON artifacts(project_id);",
+    // Task 1071: live boards — the pictures an agent puts in front of the
+    // person during a spoken conversation, when a mockup, a report, a diagram
+    // snapshot or a screenshot answers better than a sentence does.
+    //
+    // A sibling table rather than a `live_turns` row or a `LiveAction` value,
+    // the `live_summaries` precedent: a turn's `text` is *spoken* and capped
+    // at 8 KiB, and the action vocabulary is deliberately narrow ("what the
+    // person is looking at"), while a board body is a megabyte-scale document
+    // nothing ever reads aloud.
+    //
+    // A board is **ephemeral** by design, in the sense of *scoped to its
+    // conversation*: an ended conversation keeps its rows (ending stamps
+    // `ended_at` rather than deleting, exactly as it does for `live_turns`)
+    // but every read of a board closes, the render route included, and
+    // nothing reaches a project until `mesa live board keep` copies it into
+    // an artifact or an attachment. `session_id` is `ON DELETE CASCADE` for
+    // the case that really is a delete.
+    //
+    // `content_type` carries an `image` board's allowlisted mime, taken from
+    // the pushed file's extension (`files::image_mime`) — the same field name
+    // `attachments` and `artifacts` already use for the same concept. It is
+    // stored because nothing else on the row could answer at render time:
+    // `body` is base64 bytes and `title` is a caption the caller writes, so
+    // deriving the type from either would mean sniffing content or letting a
+    // caption decide what a route serves. NULL for every other kind, whose
+    // type its `kind` decides.
+    "CREATE TABLE live_boards (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id   INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+        kind         TEXT NOT NULL,
+        title        TEXT,
+        body         TEXT NOT NULL,
+        content_type TEXT,
+        created_at   TEXT NOT NULL
+    );
+    CREATE INDEX idx_live_boards_session ON live_boards(session_id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -991,6 +1028,53 @@ fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
         played_at: row.get(8)?,
+    })
+}
+
+const LIVE_BOARD_COLUMNS: &str = "id, session_id, kind, title, body, content_type, created_at";
+
+/// The same list without the body — what [`Store::list_live_boards`] and
+/// [`Store::clear_live_boards`] read, since the page's 2s poll carries the
+/// history as pointers and fetches one body at a time through the render
+/// route.
+const LIVE_BOARD_SUMMARY_COLUMNS: &str = "id, session_id, kind, title, created_at";
+
+/// Largest board body, in bytes — the artifact cap, and for the artifact
+/// reason: this is an agent-written document (or one image file) held in the
+/// database, not the attachments' arbitrary-binary case.
+pub const LIVE_BOARD_BODY_MAX: usize = 2 * 1024 * 1024;
+
+/// How many of a session's boards survive a push, newest kept. That bound
+/// **is** the history the panel steps through, and it is also what keeps the
+/// 2s poll bounded — a conversation that pushed a hundred pictures still
+/// answers with twenty pointers.
+pub const LIVE_BOARD_KEEP: i64 = 20;
+
+/// Longest a board's title may be. The [`LIVE_CONTEXT_FIELD_MAX`] shape and
+/// number: a caption is a label in a head row, not a body.
+const LIVE_BOARD_TITLE_MAX: usize = 200;
+
+fn row_to_live_board(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveBoard> {
+    let kind: String = row.get(2)?;
+    Ok(LiveBoard {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        kind: LiveBoardKind::parse(&kind).expect("invalid live board kind in db"),
+        title: row.get(3)?,
+        body: row.get(4)?,
+        content_type: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn row_to_live_board_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveBoardSummary> {
+    let kind: String = row.get(2)?;
+    Ok(LiveBoardSummary {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        kind: LiveBoardKind::parse(&kind).expect("invalid live board kind in db"),
+        title: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
@@ -4560,6 +4644,175 @@ impl Store {
         ))?;
         let rows = stmt.query_map([limit], row_to_live_summary)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- live boards (the conversation's whiteboard, mesa task 1071) ----
+
+    /// Pushes one picture into the live conversation — the single write path
+    /// for boards, and where every shape rule lives (the schema enforces none
+    /// of it, per CLAUDE.md):
+    ///
+    /// - the session must exist and still be `live`, a `validation` error
+    ///   rather than a swallowed write, exactly as [`Store::add_live_turn`]
+    ///   decides it — the session is right there, it is just over;
+    /// - `title` is trimmed and bounded ([`LIVE_BOARD_TITLE_MAX`]), and a
+    ///   blank one folds to **absent** rather than `""`, the `LiveContext`
+    ///   rule: "no caption" is genuinely nothing;
+    /// - `body` is required and bounded ([`LIVE_BOARD_BODY_MAX`] bytes), and
+    ///   is stored **verbatim** — trimming only judges emptiness, since a
+    ///   body may be base64 or markup whose whitespace is its own;
+    /// - an `image` board must name the `content_type` its bytes are, because
+    ///   nothing else on the row could answer that at render time; every other
+    ///   kind stores none, its `kind` being what decides the type.
+    ///
+    /// After the write, prunes the session's boards down to the newest
+    /// [`LIVE_BOARD_KEEP`] by id. That bound *is* the history the panel steps
+    /// through, and it is what keeps `GET /api/live`'s two-second poll
+    /// bounded.
+    pub fn add_live_board(
+        &mut self,
+        session_id: i64,
+        kind: LiveBoardKind,
+        title: Option<&str>,
+        body: &str,
+        content_type: Option<&str>,
+    ) -> Result<LiveBoard> {
+        let session = self.get_live_session(session_id).map_err(|e| match e {
+            Error::NotFound(_) => Error::Validation(format!("live session {session_id} not found")),
+            e => e,
+        })?;
+        if session.status != LiveStatus::Live {
+            return Err(Error::Validation(format!(
+                "live session {session_id} has ended"
+            )));
+        }
+        let title = title.map(str::trim).filter(|t| !t.is_empty());
+        if let Some(title) = title
+            && title.chars().count() > LIVE_BOARD_TITLE_MAX
+        {
+            return Err(Error::Validation(format!(
+                "board title must be at most {LIVE_BOARD_TITLE_MAX} characters"
+            )));
+        }
+        if body.trim().is_empty() {
+            return Err(Error::Validation(
+                "a board body is required and may not be empty".into(),
+            ));
+        }
+        if body.len() > LIVE_BOARD_BODY_MAX {
+            return Err(Error::Validation(format!(
+                "board body must be at most {LIVE_BOARD_BODY_MAX} bytes"
+            )));
+        }
+        // The content type is the image kind's alone: it is the one type the
+        // row cannot derive from `kind`, and one on a markdown board is a
+        // caller that has confused itself, not a field to ignore. It is
+        // checked against the same allowlist `files::image_mime` answers from
+        // — the rule belongs in `Store` (the single insertion point) rather
+        // than in whichever caller happens to be careful today, exactly as
+        // `create_artifact` checks `ARTIFACT_CONTENT_TYPES` here rather than
+        // trusting the CLI.
+        let content_type = match kind {
+            LiveBoardKind::Image => {
+                let value = content_type
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| {
+                        Error::Validation(
+                            "an image board must name the content type of its bytes".into(),
+                        )
+                    })?;
+                if !files::is_image_mime(value) {
+                    return Err(Error::Validation(format!(
+                        "board content type {value:?} is not an image type mesa can show;                          it must be one of {mimes:?}",
+                        mimes = files::IMAGE_MIMES
+                    )));
+                }
+                Some(value)
+            }
+            _ => {
+                if content_type.map(str::trim).is_some_and(|m| !m.is_empty()) {
+                    return Err(Error::Validation(format!(
+                        "only an image board records a content type; a {} board's kind \
+                         decides it",
+                        kind.as_str()
+                    )));
+                }
+                None
+            }
+        };
+        self.conn.execute(
+            "INSERT INTO live_boards (session_id, kind, title, body, content_type, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            (session_id, kind.as_str(), title, body, content_type),
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "DELETE FROM live_boards WHERE session_id = ?1 AND id NOT IN \
+             (SELECT id FROM live_boards WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            (session_id, LIVE_BOARD_KEEP),
+        )?;
+        self.get_live_board(id)
+    }
+
+    pub fn get_live_board(&self, id: i64) -> Result<LiveBoard> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIVE_BOARD_COLUMNS} FROM live_boards WHERE id = ?1"),
+                [id],
+                row_to_live_board,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("live board {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// The board that is showing — the newest by id, or `None` for a
+    /// conversation that has pushed none. What `mesa live board show` and
+    /// `keep` default to, since "the board" is the one in front of the person.
+    pub fn current_live_board(&self, session_id: i64) -> Result<Option<LiveBoard>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {LIVE_BOARD_COLUMNS} FROM live_boards \
+                     WHERE session_id = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                [session_id],
+                row_to_live_board,
+            )
+            .optional()?)
+    }
+
+    /// A session's boards **oldest first and bodiless** — the history in the
+    /// order the panel steps through it. `limit` is clamped into
+    /// `1..=`[`LIVE_BOARD_KEEP`], the reasoning [`Store::list_live_turns`]
+    /// gives for its own clamp; the retention bound is the ceiling here
+    /// because it is already all there is.
+    pub fn list_live_boards(&self, session_id: i64, limit: i64) -> Result<Vec<LiveBoardSummary>> {
+        let limit = limit.clamp(1, LIVE_BOARD_KEEP);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIVE_BOARD_SUMMARY_COLUMNS} FROM live_boards \
+             WHERE session_id = ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map((session_id, limit), row_to_live_board_summary)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Wipes a session's boards, echoing what it destroyed — the delete-echo
+    /// safety floor mesa has instead of a confirmation prompt. Bodiless like
+    /// the listing: the echo is a recovery *transcript*, and a megabyte of
+    /// markup printed to a terminal is not one.
+    pub fn clear_live_boards(&mut self, session_id: i64) -> Result<Vec<LiveBoardSummary>> {
+        let destroyed = self.list_live_boards(session_id, LIVE_BOARD_KEEP)?;
+        self.conn.execute(
+            "DELETE FROM live_boards WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(destroyed)
     }
 
     // ---- scripts (user-authored shell) ----
@@ -10652,15 +10905,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            51,
-            "a fresh db should report user_version 51"
+            52,
+            "a fresh db should report user_version 52"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
     }
 
     /// Pins the artifacts migration (mesa task 974) at index 50, the position
@@ -10673,6 +10926,245 @@ mod tests {
         assert!(
             MIGRATIONS[ARTIFACTS].contains("CREATE TABLE artifacts"),
             "migration {ARTIFACTS} is no longer the artifacts migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+    }
+
+    /// Every shape rule `add_live_board` owns, in one place: the session must
+    /// be live, the title is bounded and folds blank to absent, the body is
+    /// required and bounded, and an image must name its content type.
+    #[test]
+    fn add_live_board_enforces_its_shape_rules() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+
+        let board = store
+            .add_live_board(
+                session.id,
+                LiveBoardKind::Markdown,
+                Some("  The plan  "),
+                "## Plan",
+                None,
+            )
+            .unwrap();
+        assert_eq!(board.title.as_deref(), Some("The plan"), "trimmed");
+        assert_eq!(board.body, "## Plan", "stored verbatim");
+        assert_eq!(
+            board.content_type, None,
+            "only an image board records a content type"
+        );
+
+        // Blank folds to absent rather than "" — the `LiveContext` rule.
+        let untitled = store
+            .add_live_board(
+                session.id,
+                LiveBoardKind::Html,
+                Some("   "),
+                "<p>hi</p>",
+                None,
+            )
+            .unwrap();
+        assert_eq!(untitled.title, None);
+
+        let long = "t".repeat(LIVE_BOARD_TITLE_MAX + 1);
+        assert!(matches!(
+            store.add_live_board(session.id, LiveBoardKind::Markdown, Some(&long), "x", None),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.add_live_board(session.id, LiveBoardKind::Markdown, None, "   ", None),
+            Err(Error::Validation(_))
+        ));
+        let big = "x".repeat(LIVE_BOARD_BODY_MAX + 1);
+        assert!(matches!(
+            store.add_live_board(session.id, LiveBoardKind::Markdown, None, &big, None),
+            Err(Error::Validation(_))
+        ));
+        // An image board's content type is the one thing the row cannot derive.
+        assert!(matches!(
+            store.add_live_board(session.id, LiveBoardKind::Image, None, "AAAA", None),
+            Err(Error::Validation(_))
+        ));
+        let image = store
+            .add_live_board(
+                session.id,
+                LiveBoardKind::Image,
+                None,
+                "AAAA",
+                Some("image/png"),
+            )
+            .unwrap();
+        assert_eq!(image.content_type.as_deref(), Some("image/png"));
+
+        // A dead conversation is `validation`, not `not_found`: the session is
+        // right there, it is just over — `add_live_turn`'s call, for its
+        // reason. An unknown session is validation too, being a field of the
+        // record being written.
+        store.end_live_session(session.id).unwrap();
+        assert!(matches!(
+            store.add_live_board(session.id, LiveBoardKind::Markdown, None, "x", None),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.add_live_board(9999, LiveBoardKind::Markdown, None, "x", None),
+            Err(Error::Validation(_))
+        ));
+    }
+
+    /// An image board's content type goes through the **same allowlist**
+    /// `files::image_mime` answers from, checked here rather than in whichever
+    /// caller happens to be careful: `Store` is the single insertion point,
+    /// and a stored type is what the render route serves the bytes as.
+    #[test]
+    fn add_live_board_refuses_an_image_content_type_off_the_allowlist() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        for bad in [
+            // The one that matters: markup must never be servable as an image
+            // board's bytes.
+            "text/html",
+            "application/octet-stream",
+            "image/png; charset=utf-8",
+            "IMAGE/PNG",
+            "png",
+        ] {
+            let err =
+                store.add_live_board(session.id, LiveBoardKind::Image, None, "AAAA", Some(bad));
+            assert!(
+                matches!(err, Err(Error::Validation(_))),
+                "{bad} should be refused, got {err:?}"
+            );
+        }
+        // And nothing was written on the way through.
+        assert!(store.list_live_boards(session.id, 20).unwrap().is_empty());
+        assert!(
+            store
+                .add_live_board(
+                    session.id,
+                    LiveBoardKind::Image,
+                    None,
+                    "AAAA",
+                    Some("  image/svg+xml  "),
+                )
+                .is_ok(),
+            "an allowlisted type is accepted, trimmed"
+        );
+    }
+
+    /// The other half of the same rule: the three kinds whose `kind` decides
+    /// their type may not supply one. A caller passing a content type there
+    /// has confused itself, and silently dropping it would hide that.
+    #[test]
+    fn add_live_board_refuses_a_content_type_on_a_kind_that_decides_its_own() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        for kind in [
+            LiveBoardKind::Markdown,
+            LiveBoardKind::Html,
+            LiveBoardKind::Diagram,
+        ] {
+            let err = store.add_live_board(session.id, kind, None, "body", Some("text/markdown"));
+            assert!(
+                matches!(err, Err(Error::Validation(_))),
+                "{} should refuse a content type, got {err:?}",
+                kind.as_str()
+            );
+            // A blank one is not a claim about anything, so it folds to absent
+            // rather than being refused.
+            let board = store
+                .add_live_board(session.id, kind, None, "body", Some("   "))
+                .unwrap();
+            assert_eq!(board.content_type, None);
+        }
+    }
+
+    /// The retention bound IS the history: a push prunes to the newest
+    /// `LIVE_BOARD_KEEP`, the listing is oldest-first and bodiless, and the
+    /// current board is the newest.
+    #[test]
+    fn live_boards_are_pruned_to_the_keep_bound_and_listed_oldest_first() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        for i in 0..(LIVE_BOARD_KEEP + 5) {
+            store
+                .add_live_board(
+                    session.id,
+                    LiveBoardKind::Markdown,
+                    Some(&format!("board {i}")),
+                    &format!("body {i}"),
+                    None,
+                )
+                .unwrap();
+        }
+        let boards = store.list_live_boards(session.id, i64::MAX).unwrap();
+        assert_eq!(boards.len(), LIVE_BOARD_KEEP as usize);
+        assert_eq!(boards[0].title.as_deref(), Some("board 5"), "oldest first");
+        assert_eq!(
+            boards.last().unwrap().title,
+            Some(format!("board {}", LIVE_BOARD_KEEP + 4)),
+        );
+        let current = store.current_live_board(session.id).unwrap().unwrap();
+        assert_eq!(current.id, boards.last().unwrap().id, "newest is current");
+        assert_eq!(current.body, format!("body {}", LIVE_BOARD_KEEP + 4));
+
+        // The pruned ones are gone, not merely unlisted.
+        assert!(matches!(store.get_live_board(1), Err(Error::NotFound(_))));
+    }
+
+    /// `clear` echoes what it destroyed — the delete-echo safety floor — and a
+    /// session with no boards has no current one.
+    #[test]
+    fn clear_live_boards_echoes_what_it_destroyed() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert!(store.current_live_board(session.id).unwrap().is_none());
+        for i in 0..3 {
+            store
+                .add_live_board(
+                    session.id,
+                    LiveBoardKind::Markdown,
+                    Some(&format!("b{i}")),
+                    "body",
+                    None,
+                )
+                .unwrap();
+        }
+        let destroyed = store.clear_live_boards(session.id).unwrap();
+        assert_eq!(destroyed.len(), 3);
+        assert_eq!(destroyed[0].title.as_deref(), Some("b0"));
+        assert!(store.list_live_boards(session.id, 20).unwrap().is_empty());
+        assert!(store.current_live_board(session.id).unwrap().is_none());
+        // Clearing an empty whiteboard is an empty echo, not an error.
+        assert!(store.clear_live_boards(session.id).unwrap().is_empty());
+    }
+
+    /// A board is ephemeral: it belongs to its conversation and cascades away
+    /// with it. Nothing reaches a project until `keep` copies it.
+    #[test]
+    fn live_boards_cascade_with_their_session() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM live_sessions WHERE id = ?1", [session.id])
+            .unwrap();
+        assert!(matches!(
+            store.get_live_board(board.id),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// Pins the live-boards migration (mesa task 1071) at index 51, the same
+    /// "never edit a shipped migration" guard the two above give their own.
+    #[test]
+    fn the_live_boards_table_arrives_at_migration_51() {
+        const BOARDS: usize = 51;
+        assert!(
+            MIGRATIONS[BOARDS].contains("CREATE TABLE live_boards"),
+            "migration {BOARDS} is no longer the live boards migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
     }

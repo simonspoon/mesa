@@ -1424,6 +1424,16 @@ export function artifactRenderUrl(projectId: number, artifactId: number): string
   return `/api/projects/${projectId}/artifacts/${artifactId}/render`
 }
 
+/** Where one live board's body is served from (mesa task 1071): an
+ * `<iframe src>`, an `<img src>` or a plain `fetch` for the markdown kind —
+ * never `request()`, since it is not JSON. The route carries its own
+ * Content-Type and, for the two document kinds, the byte-identical CSP
+ * `artifactRenderUrl` above is rendered under; framing it is what makes an
+ * agent-written document safe to look at. */
+export function liveBoardRenderUrl(id: number): string {
+  return `/api/live/boards/${id}/render`
+}
+
 // ---- Library (mesa task 919) ----
 
 export interface LibraryCreate {

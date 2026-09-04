@@ -37,21 +37,24 @@ pub struct Builtin {
     pub body: &'static str,
 }
 
-/// The starter set — deliberately tiny. `live-agent-prompt` is the
-/// replacement for `config.json`'s old `live.prompt` key: its body is
-/// `core::live::AGENT_PROMPT` itself, so the tests that pin the loop that
-/// constant states keep working unchanged. `live-summary-prompt` is its
-/// sibling (mesa task 921): the instructions for the short-lived agent that
-/// writes a live conversation's memory once it ends, body
-/// `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it
-/// belongs beside.
+/// The starter set — deliberately tiny. `mesa-live` is the agent definition
+/// the live conversation runs as (mesa task 1068, replacing the old
+/// `live-agent-prompt` *prompt*): its body is `core::live::AGENT_DEFINITION`,
+/// frontmatter plus the loop `core::live::AGENT_PROMPT` states, and because it
+/// is an [`LibraryKind::Agent`] it has a real path — `.claude/agents/mesa-live.md`
+/// — so the sync flow carries it like any other agent definition, and
+/// `core::live::ensure_agent_definition` seeds it there on the first spawn.
+/// `live-summary-prompt` is still a `prompt` (mesa task 921): the instructions
+/// for the short-lived agent that writes a live conversation's memory once it
+/// ends, body `core::live::SUMMARY_PROMPT`, spawned as a plain prompt rather
+/// than by name.
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
-        id: "live-agent-prompt",
-        name: "live-agent-prompt",
-        kind: LibraryKind::Prompt,
+        id: crate::core::live::LIVE_AGENT_BUILTIN,
+        name: crate::core::live::LIVE_AGENT_BUILTIN,
+        kind: LibraryKind::Agent,
         scope: LibraryScope::User,
-        body: crate::core::live::AGENT_PROMPT,
+        body: crate::core::live::AGENT_DEFINITION,
     },
     Builtin {
         id: "live-summary-prompt",
@@ -858,8 +861,42 @@ fn import_one(
     }
 }
 
+/// A controlled `user`-scope base for tests, and the lock that keeps two of
+/// them from seeing each other's `$HOME`. Lives outside `mod tests` because
+/// `core::live`'s seed tests need the **same** lock: `$HOME` is process-global,
+/// so one mutex per module would serialise nothing.
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::path::Path;
+
+    /// Serializes every test that needs a controlled `user`-scope base — the
+    /// `claude-md` and `mesa-live` built-ins only exist at `user` scope, so
+    /// exercising them means overriding the real, process-global `$HOME` for
+    /// the duration of the closure. Guarded by a mutex (not just "no other
+    /// test reads MESA_DB"-style luck) because several tests need it, and
+    /// `cargo test` runs them on separate threads: two of these running
+    /// concurrently without a lock could each briefly see the other's temp
+    /// `$HOME`. Tests that stay on `project` scope never take this lock and
+    /// are unaffected either way, since a passing `$HOME` value they never
+    /// asked for and don't inspect is harmless to them.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn with_home_dir<F: FnOnce(&Path)>(f: F) {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        f(dir.path());
+        match original {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_home::with_home_dir;
     use super::*;
     use crate::core::store::LibraryPatch;
 
@@ -906,16 +943,27 @@ mod tests {
             Some(PathBuf::from("CLAUDE.md"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Prompt, LibraryScope::User, "live-agent-prompt"),
+            relative_path(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                "live-summary-prompt"
+            ),
             None
         );
         assert_eq!(
             relative_path(
                 LibraryKind::Prompt,
                 LibraryScope::Project,
-                "live-agent-prompt"
+                "live-summary-prompt"
             ),
             None
+        );
+        // mesa task 1068: the live conversation's instructions are an agent
+        // definition now, so unlike the prompt they used to be they have a
+        // path and the sync flow carries them.
+        assert_eq!(
+            relative_path(LibraryKind::Agent, LibraryScope::User, "mesa-live"),
+            Some(PathBuf::from(".claude/agents/mesa-live.md"))
         );
     }
 
@@ -1240,7 +1288,8 @@ mod tests {
 
     #[test]
     fn builtin_lookup() {
-        assert!(builtin("live-agent-prompt").is_some());
+        assert!(builtin("mesa-live").is_some());
+        assert!(builtin("live-summary-prompt").is_some());
         assert!(builtin("starter-claude-md").is_some());
         assert!(builtin("stop-notify").is_some());
         assert!(builtin("no-such-builtin").is_none());
@@ -1265,61 +1314,35 @@ mod tests {
             .id
     }
 
-    /// Serializes every test that needs a controlled `user`-scope base — the
-    /// `claude-md` built-in only exists at `user` scope, so exercising it
-    /// means overriding the real, process-global `$HOME` for the duration of
-    /// the closure. Guarded by a mutex (not just "no other test reads
-    /// MESA_DB"-style luck) because several tests in this module need it,
-    /// and `cargo test` runs them on separate threads: two of these running
-    /// concurrently without a lock could each briefly see the other's temp
-    /// `$HOME`. Tests that stay on `project` scope never take this lock and
-    /// are unaffected either way, since a passing `$HOME` value they never
-    /// asked for and don't inspect is harmless to them.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_home_dir<F: FnOnce(&Path)>(f: F) {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", dir.path()) };
-        f(dir.path());
-        match original {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
-
     #[test]
     fn effective_items_includes_unshadowed_builtin_and_omits_it_once_forked() {
         let (store, _dir) = temp_store();
         let items = effective_items(&store, None).unwrap();
         let found = items
             .iter()
-            .find(|i| i.builtin_id.as_deref() == Some("live-agent-prompt"))
+            .find(|i| i.builtin_id.as_deref() == Some("mesa-live"))
             .expect("unshadowed built-in must be reported");
         assert!(found.builtin);
         assert_eq!(found.id, None);
-        assert_eq!(found.body, crate::core::live::AGENT_PROMPT);
+        assert_eq!(found.body, crate::core::live::AGENT_DEFINITION);
+        assert_eq!(found.path.as_deref(), Some(".claude/agents/mesa-live.md"));
 
         let (mut store, _dir) = temp_store();
         store
             .create_library_item(
-                LibraryKind::Prompt,
+                LibraryKind::Agent,
                 LibraryScope::User,
                 None,
-                "live-agent-prompt",
-                "a custom prompt",
-                Some("live-agent-prompt"),
+                "mesa-live",
+                "a custom definition",
+                Some("mesa-live"),
             )
             .unwrap();
         let items = effective_items(&store, None).unwrap();
-        let matches: Vec<_> = items
-            .iter()
-            .filter(|i| i.name == "live-agent-prompt")
-            .collect();
+        let matches: Vec<_> = items.iter().filter(|i| i.name == "mesa-live").collect();
         assert_eq!(matches.len(), 1, "a fork must shadow, not duplicate");
         assert!(!matches[0].builtin);
-        assert_eq!(matches[0].body, "a custom prompt");
+        assert_eq!(matches[0].body, "a custom definition");
     }
 
     #[test]
@@ -1765,8 +1788,8 @@ mod tests {
         // spanning both scopes at once: a project with its own agent and
         // claude-md, the user-scope claude-md built-in (untouched, so it
         // stays unshadowed), a stray disk-new file on each scope, and a
-        // forked live-agent-prompt (a `prompt`, which has no path at all and
-        // so must contribute no row).
+        // forked live-summary-prompt (a `prompt`, which has no path at all
+        // and so must contribute no row).
         with_home_dir(|home| {
             fs::create_dir_all(home.join(".claude/agents")).unwrap();
             fs::write(home.join(".claude/CLAUDE.md"), "home claude md").unwrap();
@@ -1804,9 +1827,9 @@ mod tests {
                     LibraryKind::Prompt,
                     LibraryScope::User,
                     None,
-                    "live-agent-prompt",
+                    "live-summary-prompt",
                     "a forked prompt",
-                    Some("live-agent-prompt"),
+                    Some("live-summary-prompt"),
                 )
                 .unwrap();
 
@@ -1831,12 +1854,12 @@ mod tests {
         let (mut store, _dir) = temp_store();
         store
             .create_library_item(
-                LibraryKind::Prompt,
+                LibraryKind::Agent,
                 LibraryScope::User,
                 None,
-                "live-agent-prompt",
-                "a custom prompt",
-                Some("live-agent-prompt"),
+                "mesa-live",
+                "a custom definition",
+                Some("mesa-live"),
             )
             .unwrap();
 
@@ -1846,10 +1869,10 @@ mod tests {
         let forked = bundle
             .items
             .iter()
-            .find(|i| i.name == "live-agent-prompt")
+            .find(|i| i.name == "mesa-live")
             .expect("a forked built-in must be exported");
-        assert_eq!(forked.builtin_id.as_deref(), Some("live-agent-prompt"));
-        assert_eq!(forked.body, "a custom prompt");
+        assert_eq!(forked.builtin_id.as_deref(), Some("mesa-live"));
+        assert_eq!(forked.body, "a custom definition");
 
         // live-summary-prompt was never forked, so it must not appear at all.
         assert!(

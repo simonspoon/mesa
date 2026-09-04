@@ -102,8 +102,9 @@
 //! ([`DEFAULT_LIVE_AUTO_SEND_MS`]). The instruction block a live
 //! conversation's agent is spawned with **used to** live here too
 //! (`live.prompt`) but moved to the library as of mesa task 919 — it is now
-//! the `live-agent-prompt` library item, resolved by
-//! [`crate::core::live::agent_prompt`]. A `live.prompt` key left behind in a
+//! the `mesa-live` agent definition in the library (mesa task 1068 turned it
+//! from a `prompt` into a real agent definition). A `live.prompt` key left
+//! behind in a
 //! hand-edited file is silently ignored: `LiveSection` simply has no field
 //! for it any more. See `docs/live.md`.
 //!
@@ -181,9 +182,15 @@ pub const DEFAULT_INBOX_WATCHER: &str =
 pub const DEFAULT_AGENT_SPAWN: &str = "{bin} --bg --agent {agent} -- {prompt}";
 /// Built-in default for [`LIVE_AGENT`]. The union of the two shapes above: a
 /// live session is a mesa record (so it has an `{id}` and a `{name}`) *and*
-/// carries a prompt mesa supplies — `core::live::agent_prompt`, the loop the
-/// conversation runs — so the feature works with no user configuration.
-pub const DEFAULT_LIVE_AGENT: &str = "{bin} --bg --agent {agent} --name {name} -- {prompt}";
+/// carries a prompt mesa supplies — `core::live::agent_prompt`, the session
+/// line and any recalled memory — so the feature works with no user
+/// configuration. The agent is named **literally** rather than through
+/// `{agent}` (mesa task 1068): the conversation runs as the `mesa-live` agent
+/// definition (`core::live::AGENT_DEFINITION`, seeded to
+/// `~/.claude/agents/mesa-live.md` by `core::live::ensure_agent_definition`),
+/// which is where its instructions now live. `{agent}` is still offered on
+/// this action, so an override may go back to mesa's generic agent name.
+pub const DEFAULT_LIVE_AGENT: &str = "{bin} --bg --agent mesa-live --name {name} -- {prompt}";
 /// Built-in default for [`LIVE_SUMMARY`] — identical in shape to
 /// [`DEFAULT_LIVE_AGENT`]: the summariser is also a mesa record (a session
 /// id and a name) carrying a prompt mesa supplies
@@ -2705,9 +2712,11 @@ mod tests {
                 "look at the tests"
             ]
         );
-        // The live agent takes both halves: a named session id *and* the loop
+        // The live agent takes both halves: a named session id *and* the
         // prompt mesa supplies. The prompt is one argv entry however long or
-        // hostile its text — it is never re-split after substitution.
+        // hostile its text — it is never re-split after substitution. Its
+        // agent is the literal `mesa-live` definition (mesa task 1068), so
+        // `{agent}` is ignored here even when a value is available.
         let live = Vars {
             bin: Some("claude"),
             agent: Some("swe"),
@@ -2721,7 +2730,7 @@ mod tests {
                 "claude",
                 "--bg",
                 "--agent",
-                "swe",
+                "mesa-live",
                 "--name",
                 "mesa live 12",
                 "--",

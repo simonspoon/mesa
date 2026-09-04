@@ -4,9 +4,10 @@ mesa stores Claude Code's agent definitions, skills, hooks, commands, and
 CLAUDE.md files as first-class records — the library — and syncs them
 file-by-file against `.claude` (and a project's root `CLAUDE.md`), with the
 user picking a winner per file (mesa task 919). It also absorbs a fifth kind
-mesa itself uses: the live-conversation prompt, which used to be a
-`~/.mesa/config.json` key (`docs/config.md`) and is now the
-`live-agent-prompt` library item — see [Where the live prompt went](#where-the-live-prompt-went).
+mesa itself uses: the live-conversation summariser's prompt, which used to be a
+`~/.mesa/config.json` key (`docs/config.md`) — as did the live agent's own
+instructions, now the `mesa-live` **agent definition** (mesa task 1068) — see
+[Where the live prompt went](#where-the-live-prompt-went).
 
 ## The record
 
@@ -108,12 +109,12 @@ The starter set is deliberately tiny — four rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
-| `live-agent-prompt` | `prompt` | `user` | The live conversation's agent prompt — literally `core::live::AGENT_PROMPT`, moved here rather than duplicated |
+| `mesa-live` | `agent` | `user` | The agent definition the live conversation runs as — literally `core::live::AGENT_DEFINITION`, YAML frontmatter plus `core::live::AGENT_PROMPT`, moved here rather than duplicated (mesa task 1068) |
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops |
 
-`live-agent-prompt`'s body being the literal `AGENT_PROMPT` constant (and
+`mesa-live`'s body being the literal `AGENT_DEFINITION` constant (and
 `live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
 `docs/live.md`'s tests of "the loop is fully stated" keep passing unchanged —
 each built-in and its constant are the same text, never two copies that could
@@ -446,28 +447,42 @@ with no field flag, is still the usage error rather than a legal no-op call.
 ## Where the live prompt went
 
 `~/.mesa/config.json`'s `live.prompt` (mesa task 867, `docs/config.md`) is
-**gone**, not shadowed — the library is the only place the block lives now,
-as the `live-agent-prompt` built-in.
+**gone**, not shadowed — the library is the only place the live agent's
+instructions live now. Since mesa task 1068 they are the `mesa-live` **agent
+definition** (kind `agent`, user scope) rather than the `live-agent-prompt`
+*prompt* they were between tasks 919 and 1068: `core::live::AGENT_DEFINITION`
+is YAML frontmatter (`name`, `description`, `model`, `tools: Bash, Read` — the
+image reader `mesa live look` needs) followed by `core::live::AGENT_PROMPT`,
+the loop text, unchanged.
 
-`core::live::agent_prompt(store, session_id)` resolves the block by looking
-for a fork — `store.find_library_fork("live-agent-prompt")` — and falling
-back to `core::live::AGENT_PROMPT` (the same constant `live-agent-prompt`'s
-built-in body *is*) when there is none. **A store error resolving the fork
-also falls back to the built-in** rather than failing the call: a database
-hiccup must not be what stops a conversation from starting, since the very
-next step in either spawn site is `agents::spawn_bg` reading the same store
-for the command template, which will report *that* failure as `unavailable`
-if the database is genuinely unreachable — so a real problem still surfaces
-once, not twice. Both spawn sites (`api.rs`'s `spawn_live_agent`, `cli.rs`'s
-`LiveCmd::Start`) already hold a `Store`, so the signature change from
-`agent_prompt(session_id)` to `agent_prompt(&store, session_id)` cost nothing
-at either call site.
+Being an `agent` rather than a `prompt` gives it a real path,
+`.claude/agents/mesa-live.md`, so it rides the ordinary sync flow like every
+other agent definition instead of being invisible to it. The `live-agent`
+command template spawns `claude --bg --agent mesa-live …`
+(`core::config::DEFAULT_LIVE_AGENT`), and Claude Code errors on an agent it has
+never seen, so **the first spawn seeds the file**:
+`core::live::ensure_agent_definition(store)` runs at both spawn sites
+(`api.rs`'s `spawn_live_agent`, `cli.rs`'s `LiveCmd::Start`) before
+`agents::spawn_bg`. It resolves the effective row — the fork
+(`store.find_library_fork("mesa-live")`) if there is one, the built-in
+otherwise — computes the target through this module's own `relative_path`,
+`scope_base` and `resolve`, so `$HOME` is honoured and the traversal check
+holds exactly as it does on the sync path, creates the parent directory, and
+writes the body.
 
-Forking `live-agent-prompt` **replaces** the built-in rather than extending
-it — the same rule the old config key followed, just moved: what the forked
-row holds is the whole of what mesa sends. The one thing mesa still appends
-is the session line, `You are driving mesa live session <id>.`, because that
-is plumbing rather than instruction.
+It **never overwrites an existing file**. After the first seed the file belongs
+to the sync flow, where a difference between disk and mesa is a row the user
+resolves; rewriting it on every start would make one side of that decision
+impossible to keep. A failure (no `HOME`, an unwritable `.claude`) is returned
+as an error and both spawn sites treat it exactly like a failed spawn —
+`unavailable`, and the session that was just opened is ended again.
+
+What `core::live::agent_prompt(store, session_id)` injects is now only what the
+definition cannot know: `Drive mesa live session <id>.`, plus the recall block
+of earlier session summaries when there are any. Forking `mesa-live`
+**replaces** the built-in rather than extending it — the same rule the old
+config key followed, just moved: what the forked row holds is the whole of what
+the agent is.
 
 `config.rs`'s `LiveSection` now holds one key, `auto-send-ms`
 (`docs/config.md`); a `live.prompt` key left behind by an older mesa, or
@@ -476,17 +491,19 @@ read from — because the struct simply has no field for it any more.
 
 ### And where the summariser's went
 
-`live-summary-prompt` (mesa task 921) is `live-agent-prompt`'s sibling, cut
-from the same cloth: same kind (`prompt`), same scope (`user`), the same
-fork-replaces-the-built-in rule, and — being mesa-internal, like the prompt
-beside it — no on-disk path either (`relative_path` answers `None` for every
-`prompt` row, `src/core/library.rs:109`). `core::live::summary_prompt(store,
-session_id)` resolves it exactly as `agent_prompt` resolves its own: a fork
-of `live-summary-prompt` if one exists, else `core::live::SUMMARY_PROMPT`,
-falling back to the built-in on a store error for the same reason — a
-database hiccup must not be what stops the short-lived summariser from being
-spawned. It never existed as a config key in the first place, so there is
-nothing here for an old `config.json` to leave behind.
+`live-summary-prompt` (mesa task 921) is still a `prompt`: nothing spawns the
+summariser *by name*, so it has no reason to be an agent definition, and —
+being mesa-internal — it has no on-disk path either (`relative_path` answers
+`None` for every `prompt` row). `core::live::summary_prompt(store,
+session_id)` resolves it the way the live agent's block used to be resolved: a
+fork of `live-summary-prompt` if one exists, else `core::live::SUMMARY_PROMPT`.
+**A store error resolving the fork also falls back to the built-in** rather
+than failing the call: a database hiccup must not be what stops the short-lived
+summariser from being spawned, and the very next step is `agents::spawn_bg`
+reading the same store for the command template, which reports *that* failure
+as `unavailable` if the database is genuinely unreachable — so a real problem
+still surfaces once, not twice. It never existed as a config key in the first
+place, so there is nothing here for an old `config.json` to leave behind.
 
 ## Gate
 
@@ -551,14 +568,15 @@ API:
   (`validation`, exit 1, nothing written). `--quiet` on `export` and on
   `import` is the unknown-argument error, exit 2. `--output` to a path that
   already exists refuses rather than overwriting.
-- **The live-conversation prompt now coming from the library**: with nothing
-  forked, `mesa live start` spawns the stub `claude` with the built-in
-  `live-agent-prompt` block (`mesa live listen` present) plus the session
-  line; forking `live-agent-prompt` to a different body makes the *next*
-  start spawn with that body instead — the built-in text absent, the forked
-  text present, the session line still appended.
+- **The live conversation's agent definition coming from the library**:
+  `mesa-live` starts unshadowed (`id: null`, kind `agent`, path
+  `.claude/agents/mesa-live.md`) and appears in `sync status`; `sync apply`
+  with mesa winning writes it to `$HOME/.claude/agents/mesa-live.md`; editing
+  it forks it (`builtin_id: mesa-live`, `id` no longer null); and the prompt that
+  `mesa live start` spawns the stub `claude` with carries the session line
+  only — never the loop text, which now travels as the definition.
 
 The same pairing `api-check.sh` holds for tasks and `config-check.sh` holds
 for the config-write routes. The "a configured prompt replaces the built-in
 at spawn" assertion that used to live in `config-check.sh` lives here now,
-proved through a forked `live-agent-prompt` row instead of a config key.
+proved through the `mesa-live` library row instead of a config key.

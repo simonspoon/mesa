@@ -422,8 +422,8 @@ function WatchersSection() {
  *
  * The instruction block the conversation's agent is spawned with used to
  * live here too (mesa task 867), but moved to the library as of mesa task
- * 919 — it is now the `live-agent-prompt` library item, edited on
- * `#/library` like any other row, so this section only links there instead
+ * 919 — it is now the `mesa-live` agent definition (mesa task 1068), edited
+ * on `#/library` like any other row, so this section only links there instead
  * of holding a second editor for it.
  *
  * One thing it must not soften: **a blank wait is the two seconds mesa
@@ -489,11 +489,11 @@ function LivePromptSection() {
     <>
       <h2>Live conversation</h2>
       <section className="settings-command">
-        <span className="settings-command-title">Agent prompt</span>
+        <span className="settings-command-title">Agent definition</span>
         <p className="muted settings-command-blurb">
           What the agent driving a spoken conversation is told to do now
           lives in the library — see <a href="#/library">the library</a>,
-          under the <code>live-agent-prompt</code> item.
+          under the <code>mesa-live</code> agent.
         </p>
       </section>
 

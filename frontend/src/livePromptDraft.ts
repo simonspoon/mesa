@@ -8,8 +8,8 @@ import type { ConfigLive } from './types/ConfigLive'
  *
  * This module used to own two boxes — the agent's prompt and the auto-send
  * wait (mesa task 867) — but the prompt moved to the library as of mesa task
- * 919: it is now the `live-agent-prompt` library item, edited on `#/library`
- * like any other row. This module keeps its name and its one remaining job:
+ * 919: it is now the `mesa-live` agent definition (mesa task 1068), edited on
+ * `#/library` like any other row. This module keeps its name and its one remaining job:
  * the wait box, using the same rule [`speechDraft`](./speechDraft.ts) and
  * [`watchersDraft`](./watchersDraft.ts) model —
  *

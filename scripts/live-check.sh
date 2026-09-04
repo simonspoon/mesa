@@ -16,9 +16,12 @@
 #      8192-char text bound, a mesa turn with neither text nor action, an
 #      unknown project — and the `conflict` that enforces one live session;
 #   4. the spawn: project resolution by id AND by name, the `live-agent`
-#      template's argv, the session name and working folder, the prompt
-#      arriving as ONE argument (a hostile project name is data, never syntax),
-#      and a failed spawn ending the session it opened rather than stranding it;
+#      template's argv (`--agent mesa-live`), the session name and working
+#      folder, the prompt arriving as ONE argument and carrying the session
+#      line alone (a hostile project name is data, never syntax), the
+#      `mesa-live` agent definition seeded into $HOME/.claude/agents on the
+#      first start and never overwritten after it, and a failed spawn ending
+#      the session it opened rather than stranding it;
 #   5. the API twin over a live `serve` — the `{session:null,turns:[]}` empty
 #      state, start/stop, the 409, the utterance write, the route write and the
 #      context riding with it (both halves recorded, the CLI reading back the
@@ -59,7 +62,7 @@
 #      two guards (no turns spawns nothing; a second stop is not_found and
 #      spawns nothing), the recall join proving a stored summary reaches the
 #      NEXT conversation's spawned prompt argv (and lands after the
-#      instruction block, never before), a write-then-immediate-read-back
+#      session line, never before), a write-then-immediate-read-back
 #      regression for a session older than the retained set, and the
 #      project-delete cascade;
 #  12. POST /api/live/transcribe (mesa task 954), against a stub `auris`
@@ -92,6 +95,14 @@ export MESA_DB="$TMP/mesa.db"
 # ~/.mesa/config.json must not leak in (config-check.sh owns the configured
 # half, under a throwaway HOME).
 export MESA_CONFIG_FILE="$TMP/no-such-config.json"
+# A live start seeds the `mesa-live` agent definition into
+# $HOME/.claude/agents (mesa task 1068), and every unbound spawn runs in
+# $HOME/.mesa/workspace, so the whole gate runs under a throwaway home rather
+# than writing into the developer's own. Physically resolved: a child records
+# its cwd, and /tmp is a symlink on macOS.
+mkdir -p "$TMP/home"
+HOME=$(cd "$TMP/home" && pwd -P)
+export HOME
 
 CHECKS=0
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -498,12 +509,14 @@ S3=$(jqs .id)
 ok "live start <PROJECT>: resolves a project by name and binds the spawn receipt"
 
 # The argv the built-in `live-agent` template produces:
-#   {bin} --bg --agent {agent} --name {name} -- {prompt}
+#   {bin} --bg --agent mesa-live --name {name} -- {prompt}
+# The agent is named literally (mesa task 1068): the conversation runs as the
+# `mesa-live` agent definition, which is where its instructions live now.
 [ "$(cat "$STUB_DIR/last-argc")" = "7" ] ||
   fail "live spawn: expected 7 arguments, got $(cat "$STUB_DIR/last-argc")"
 EXPECTED_FLAGS="--bg
 --agent
-swe
+mesa-live
 --name
 Live gate project: live $S3
 --"
@@ -512,16 +525,42 @@ Live gate project: live $S3
 $EXPECTED_FLAGS
 got
 $(cat "$STUB_DIR/last-flags")"
-# The prompt is ONE argument, carrying the instruction block and the session id.
-grep -q 'You are the voice of mesa' "$STUB_DIR/last-prompt" ||
-  fail "live spawn: the prompt argument must be core::live's instruction block"
-grep -q "session $S3" "$STUB_DIR/last-prompt" ||
-  fail "live spawn: the prompt must name the session it drives"
-grep -q 'mesa live listen' "$STUB_DIR/last-prompt" ||
-  fail "live spawn: the prompt must state the loop's own command spellings"
+# The prompt is ONE argument, and since mesa task 1068 it carries the session
+# line and nothing else — the loop travels as the agent definition.
+grep -q "Drive mesa live session $S3" "$STUB_DIR/last-prompt" ||
+  fail "live spawn: the prompt must be the session line naming the session it drives"
+if grep -q 'You are the voice of mesa' "$STUB_DIR/last-prompt"; then
+  fail "live spawn: the instruction block must NOT be injected into the prompt any more"
+fi
+if grep -q 'mesa live listen' "$STUB_DIR/last-prompt"; then
+  fail "live spawn: the loop belongs to the agent definition, not the prompt"
+fi
 [ "$(cat "$STUB_DIR/last-cwd")" = "$WORKDIR" ] ||
   fail "live spawn: must run in the project's local_path (got $(cat "$STUB_DIR/last-cwd"))"
-ok "live spawn: the built-in live-agent argv, the session name, the prompt as one argument, the project's folder"
+ok "live spawn: the built-in live-agent argv (--agent mesa-live), the session name, the session line as one argument, the project's folder"
+
+# ---- the agent definition is seeded before the spawn (mesa task 1068) ----
+#
+# `claude --agent mesa-live` errors on an agent Claude Code has never seen, and
+# nothing auto-syncs the library, so the first start writes the definition to
+# $HOME/.claude/agents/mesa-live.md itself.
+SEEDED="$HOME/.claude/agents/mesa-live.md"
+[ -f "$SEEDED" ] ||
+  fail "live spawn: must seed the mesa-live agent definition at $SEEDED"
+grep -q 'mesa live listen' "$SEEDED" ||
+  fail "the seeded agent definition must carry the loop"
+head -1 "$SEEDED" | grep -q -- '---' ||
+  fail "the seeded agent definition must open with YAML frontmatter"
+ok "live spawn: seeds the mesa-live agent definition into \$HOME/.claude/agents"
+
+# It never overwrites: after the first seed the file belongs to the library
+# sync flow, where the user picks a winner between disk and mesa.
+printf 'sentinel, hand-edited\n' > "$SEEDED"
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live start "$PROJ"
+[ "$(cat "$SEEDED")" = "sentinel, hand-edited" ] ||
+  fail "live spawn: an existing agent definition must be left byte-identical"
+ok "live spawn: never overwrites an existing mesa-live agent definition"
 
 # ---- stopping the conversation stops its agent ----
 #
@@ -1591,14 +1630,14 @@ grep -q "$RECALL_TEXT" "$STUB_DIR/last-prompt" ||
 # text — and untrusted text may not sit above the rules (the plan's posture).
 # An argv log is the only place this can be checked as a fact about what was
 # actually sent, rather than about what `prompt_with` returned in isolation.
-INSTR_POS=$(grep -bo 'You are the voice of mesa' "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+SESSION_POS=$(grep -bo 'Drive mesa live session' "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
 RECALL_POS=$(grep -bo "$RECALL_TEXT" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
-[ -n "$INSTR_POS" ] || fail "recall join: could not find the instruction block in the spawned prompt"
+[ -n "$SESSION_POS" ] || fail "recall join: could not find the session line in the spawned prompt"
 [ -n "$RECALL_POS" ] || fail "recall join: could not find the recall text in the spawned prompt"
-[ "$RECALL_POS" -gt "$INSTR_POS" ] ||
-  fail "recall must be appended AFTER the instruction block, never before — untrusted text may not outrank the rules"
+[ "$RECALL_POS" -gt "$SESSION_POS" ] ||
+  fail "recall must be appended AFTER the session line, never before — untrusted text may not outrank the rules"
 run 0 "$MESA" live stop >/dev/null
-ok "a stored summary reaches the next conversation's spawned prompt, appended after the instruction block"
+ok "a stored summary reaches the next conversation's spawned prompt, appended after the session line"
 
 # ---- guard: a session with no turns spawns no summariser ----
 rm -f "$STUB_DIR/last-argc"

@@ -4057,13 +4057,20 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 // — comes from `~/.mesa/config.json`'s `live-agent` entry. The
                 // prompt is one argument, never spliced into a shell string.
                 let spawned = match live_agent_dir(&store, project_id, session.id) {
-                    Ok((dir, name)) => agents::spawn_bg(
-                        config::LIVE_AGENT,
-                        &dir,
-                        Some(session.id),
-                        Some(&name),
-                        Some(&live::agent_prompt(&store, session.id)),
-                    ),
+                    // The `mesa-live` agent definition is seeded to disk first
+                    // (mesa task 1068): the default template spawns
+                    // `--agent mesa-live`, which errors on an agent Claude Code
+                    // has never seen. A failure here is a failed spawn like any
+                    // other and goes through the same rollback below.
+                    Ok((dir, name)) => live::ensure_agent_definition(&store).and_then(|_| {
+                        agents::spawn_bg(
+                            config::LIVE_AGENT,
+                            &dir,
+                            Some(session.id),
+                            Some(&name),
+                            Some(&live::agent_prompt(&store, session.id)),
+                        )
+                    }),
                     Err(e) => Err(e.to_string()),
                 };
                 bind_live_agent_or_end(&mut store, session, spawned)?
@@ -4864,7 +4871,7 @@ mod tests {
             scope: LibraryScope::Project,
             project_id: Some(2),
             body: "# reviewer\n".into(),
-            builtin_id: Some("live-agent-prompt".into()),
+            builtin_id: Some("mesa-live".into()),
             builtin: false,
             path: Some(".claude/agents/reviewer.md".into()),
             synced_body: Some("# reviewer\n".into()),

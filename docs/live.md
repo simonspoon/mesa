@@ -107,9 +107,10 @@ The consequence at the other end is the same shape mesa already has everywhere:
 `GET /api/live?after=<cursor>` at 2s through the ordinary `useFetch` polling,
 like every other view.
 
-The instruction block the agent is spawned with is
-`core::live::AGENT_PROMPT` — one constant in `core`, because both spawn sites
-(the CLI's `live start` and `POST /api/live`) hand the same text to the same
+The instructions the agent is spawned with are the **`mesa-live` agent
+definition** (mesa task 1068) — `core::live::AGENT_DEFINITION`, YAML
+frontmatter plus `core::live::AGENT_PROMPT`, one constant in `core` because
+both spawn sites (the CLI's `live start` and `POST /api/live`) drive the same
 `agents::spawn_bg` chokepoint. It states the loop, the route vocabulary, the
 step that tells the agent to run **`mesa live status`** to find out what the
 person is looking at — the page as `route` and what is open on it as `context`,
@@ -117,23 +118,34 @@ person is looking at — the page as `route` and what is open on it as `context`
 tells it to run **`mesa live look`** when the answer depends on what actually
 rendered rather than on which page is open (task 895) — the "this is
 speech, so write prose" rule (a bulleted reply gets read aloud as punctuation)
-and the untrusted-input posture below. `live::agent_prompt(store, id)`
-appends the session id — the only per-call part.
+and the untrusted-input posture below.
 
-That block is the **default**, not the only possibility: the library
-(`docs/library.md`, mesa task 919) can hold a **fork** of it — the
-`live-agent-prompt` built-in, forked into a db row the moment someone edits it
-— and a fork replaces the built-in whenever one exists. This used to be
-`~/.mesa/config.json`'s `live.prompt` (mesa task 867); that config key is gone,
-and the block lives only in the library now. Resolved fresh on every start
-(`store.find_library_fork("live-agent-prompt")`), so an edit lands on the next
-conversation with no restart; no fork means the built-in, and the session line
-is the one thing mesa still appends either way. A store error resolving the
-fork falls back to the built-in rather than failing the start — a database
-hiccup must not be what stops a conversation. A rewritten prompt is how the
-conversation changes character — but the loop `AGENT_PROMPT` describes is what
-makes the feature work, and a prompt that never mentions `mesa live listen`
-produces an agent that hears nothing.
+The definition is a **library** row (`docs/library.md`): the `mesa-live`
+built-in, kind `agent`, user scope, which is why it has a real path —
+`.claude/agents/mesa-live.md` — and rides the ordinary library sync. The
+`live-agent` template spawns `claude --bg --agent mesa-live …`, and Claude Code
+errors on an agent it has never seen, so **the first start seeds the file**:
+`live::ensure_agent_definition(store)` runs at both spawn sites, before
+`spawn_bg`, resolves the effective `mesa-live` row (its fork if one exists, the
+built-in otherwise), computes the target through the library's own
+`relative_path`/`scope_base`/`resolve` machinery — so `$HOME` is honoured and
+the traversal check holds — creates the parent directory and writes the body.
+It **never overwrites**: after the first seed the file belongs to the sync
+flow, where a difference between disk and mesa is a row the user resolves, and
+silently rewriting it on every start would make one side of that decision
+impossible to keep. A failure (no `HOME`, an unwritable `.claude`) is treated
+exactly like a failed spawn — `unavailable`, and the session that was just
+opened is ended again.
+
+What `live::agent_prompt(store, id)` injects is therefore only what the
+definition cannot know: `Drive mesa live session <id>.`, plus the recall block
+below when there are earlier summaries. Editing the built-in forks it into a db
+row and a fork replaces the built-in, as everywhere else in the library; before
+mesa task 919 this block was `~/.mesa/config.json`'s `live.prompt`, and before
+mesa task 1068 it was the `live-agent-prompt` *prompt* built-in glued into the
+injected prompt. A rewritten definition is how the conversation changes
+character — but the loop it describes is what makes the feature work, and one
+that never mentions `mesa live listen` produces an agent that hears nothing.
 
 ## Why the queue lives in SQLite
 
@@ -1567,16 +1579,20 @@ conversation") working with no backend change.
 ## Config
 
 The spawn is the fourth configurable command: **`live-agent`**, defaulting to
-`{bin} --bg --agent {agent} --name {name} -- {prompt}` — the union of the two
+`{bin} --bg --agent mesa-live --name {name} -- {prompt}` — the union of the two
 existing shapes, since a live session is a mesa record (so it has an `{id}` and
 a `{name}`) *and* carries a prompt mesa supplies. That prompt is
 `live::agent_prompt`, so the feature works with **no user configuration**. The
-prompt itself used to be the config file's fifth section, `live.prompt` (mesa
-task 867); as of mesa task 919 it lives in the library instead, as the
-`live-agent-prompt` built-in — forking it **replaces** the built-in block, the
+agent is named **literally** here rather than through `{agent}` (mesa task
+1068): the conversation runs as the `mesa-live` agent definition, which is
+where its instructions live. `{agent}` stays in the placeholder vocabulary this
+action offers, so an override may still use it. The instructions used to be the
+config file's fifth section, `live.prompt` (mesa task 867); as of mesa task 919
+they live in the library instead, and as of mesa task 1068 as an agent
+definition rather than a prompt — forking it **replaces** the built-in, the
 same rule the old config key followed. The file's `live` section holds one key
 now, `live.auto-send-ms` — the recording's silence boundary above, read by the
-page rather than by the spawn; see `docs/library.md` for the prompt and
+page rather than by the spawn; see `docs/library.md` for the definition and
 `docs/config.md` for the wait. A `live.prompt` key left behind in a hand-edited
 config file is silently ignored, never an error. Everything else about the
 `live-agent` template — argv vs script mode, tokenize-then-substitute, the

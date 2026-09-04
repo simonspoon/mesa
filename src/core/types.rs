@@ -301,8 +301,8 @@ pub struct ConfigListen {
 ///
 /// This used to carry the instruction block a live agent is spawned with too
 /// (`prompt`/`default_prompt`), but that moved to the library as of mesa task
-/// 919 — it is now the `live-agent-prompt` library item, edited on
-/// `#/library` rather than here.
+/// 919 — it is now the `mesa-live` agent definition (mesa task 1068), edited
+/// on `#/library` rather than here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct ConfigLive {

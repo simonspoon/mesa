@@ -42,11 +42,13 @@
 #      (rebinding) and a foreign Origin (cross-site) are refused but a
 #      genuine LAN page is served; plus the Content-Type gate firing on every
 #      mutation in both modes;
-#   9. the live prompt now comes from the library (mesa task 919's migration
-#      off `config.json`'s `live.prompt`): with nothing forked, `live start`
-#      spawns the agent with the built-in block; with `live-agent-prompt`
-#      forked to a different body, that body REPLACES the built-in while the
-#      session line is still appended;
+#   9. the live conversation's agent definition comes from the library (mesa
+#      task 1068, replacing the `live-agent-prompt` prompt task 919 had made
+#      of `config.json`'s `live.prompt`): `mesa-live` starts unshadowed as a
+#      user-scope `agent` at `.claude/agents/mesa-live.md`, appears in `sync
+#      status` and is written to disk by `sync apply`, the spawned prompt
+#      carries the session line ALONE, and editing it forks it with the
+#      forked body replacing the built-in;
 #  10. import/export (mesa task 963): a CLI round trip (a user row plus a
 #      forked built-in export, with no unshadowed built-in and none of
 #      id/synced_*/created_at/updated_at/path on an item), importing that
@@ -182,11 +184,11 @@ ok "CLI library create with a duplicate (kind,scope,name): exit 1 conflict"
 
 run 0 "$MESA" library list
 [ "$(jqs type)" = "array" ] || fail "CLI list: bare array"
-[ "$(jqs 'map(select(.builtin_id=="live-agent-prompt")) | length')" = "1" ] ||
-  fail "CLI list: the live-agent-prompt built-in must be present, got $STDOUT"
-[ "$(jqs '.[] | select(.builtin_id=="live-agent-prompt") | .id')" = "null" ] ||
+[ "$(jqs 'map(select(.builtin_id=="mesa-live")) | length')" = "1" ] ||
+  fail "CLI list: the mesa-live built-in must be present, got $STDOUT"
+[ "$(jqs '.[] | select(.builtin_id=="mesa-live") | .id')" = "null" ] ||
   fail "CLI list: an unshadowed built-in must report id:null"
-[ "$(jqs '.[] | select(.builtin_id=="live-agent-prompt") | .builtin')" = "true" ] ||
+[ "$(jqs '.[] | select(.builtin_id=="mesa-live") | .builtin')" = "true" ] ||
   fail "CLI list: an unshadowed built-in must report builtin:true"
 ok "CLI library list: bare array including every unshadowed built-in (id:null, builtin:true)"
 
@@ -330,7 +332,7 @@ ok "CLI library create: '../evil', 'a/b', '..', '.', and an empty name are each 
 # section 7, once it is up.
 
 # ================= 4. built-ins: fork / restore =================
-# `stop-notify` is the fixture for this section, leaving `live-agent-prompt`
+# `stop-notify` is the fixture for this section, leaving `mesa-live`
 # untouched for section 9.
 
 run 0 "$MESA" library list
@@ -392,7 +394,7 @@ run 0 "$MESA" library versions "$LIB_REVIEWER"
 run 0 "$MESA" library update "$LIB_REVIEWER" --name reviewer
 ok "renaming without changing the body appends no version either"
 
-run 0 "$MESA" library versions live-agent-prompt
+run 0 "$MESA" library versions live-summary-prompt
 [ "$(jqs type)" = "array" ] || fail "CLI versions on an unshadowed built-in: bare array"
 [ "$(jqs length)" = "0" ] || fail "CLI versions on an unshadowed built-in: expected empty, got $STDOUT"
 ok "library versions on an unshadowed built-in: empty array (no row, no history)"
@@ -905,44 +907,70 @@ LAN_PID=
 
 echo "== library-check: sections 7-8 (API + gates) passed ($CHECKS checks so far) =="
 
-# ================= 9. the live prompt now comes from the library =================
-# `core::live::agent_prompt` resolves the `live-agent-prompt` library row
-# (forked, else the built-in) rather than config.json's old `live.prompt` key.
+# ============ 9. the live agent definition comes from the library ============
+# mesa task 1068: the live conversation runs as the `mesa-live` agent
+# definition — an `agent` row with a real path, seeded to disk before the
+# spawn and synced like any other — rather than as a `prompt` glued into the
+# prompt argument.
 
-run 0 "$MESA" library show live-agent-prompt
-[ "$(jqs .id)" = "null" ] || fail "fixture: live-agent-prompt must start unshadowed for this section"
-BUILTIN_PROMPT=$(jqs .body)
-grep -q "mesa live listen" <<<"$BUILTIN_PROMPT" ||
-  fail "fixture: the built-in AGENT_PROMPT must mention mesa live listen"
+run 0 "$MESA" library show mesa-live
+[ "$(jqs .id)" = "null" ] || fail "fixture: mesa-live must start unshadowed for this section"
+[ "$(jqs .kind)" = "agent" ] || fail "mesa-live must be an agent definition, got $(jqs .kind)"
+[ "$(jqs .scope)" = "user" ] || fail "mesa-live must be user-scoped, got $(jqs .scope)"
+[ "$(jqs .path)" = ".claude/agents/mesa-live.md" ] ||
+  fail "mesa-live must map to .claude/agents/mesa-live.md, got $(jqs .path)"
+BUILTIN_DEF=$(jqs .body)
+grep -q "mesa live listen" <<<"$BUILTIN_DEF" ||
+  fail "fixture: the built-in definition must state the loop"
+grep -q "^name: mesa-live$" <<<"$BUILTIN_DEF" ||
+  fail "fixture: the built-in definition must carry YAML frontmatter naming the agent"
+ok "mesa-live starts unshadowed as a user-scope agent definition at .claude/agents/mesa-live.md"
 
+# Having a path means the sync flow carries it, unlike the prompt it replaced.
+rm -f "$CLAUDE_DIR/agents/mesa-live.md"
+run 0 "$MESA" library sync status
+[ "$(jqs 'map(select(.path==".claude/agents/mesa-live.md")) | length')" = "1" ] ||
+  fail "sync status must report a row for the mesa-live definition, got $STDOUT"
+MESA_LIVE_STATUS=$(jqs '.[] | select(.path==".claude/agents/mesa-live.md") | .status')
+[ "$MESA_LIVE_STATUS" = "mesa-new" ] ||
+  fail "with no file on disk, mesa-live must be mesa-new, got $MESA_LIVE_STATUS"
+run 0 "$MESA" library sync apply --resolve '.claude/agents/mesa-live.md=mesa' 
+grep -q "mesa live listen" "$CLAUDE_DIR/agents/mesa-live.md" ||
+  fail "sync apply (mesa wins) must write the definition to \$HOME/.claude/agents/mesa-live.md"
+ok "the mesa-live definition appears in sync status and sync apply writes it to \$HOME/.claude/agents"
+
+# The prompt mesa injects is the session line alone: the loop travels as the
+# definition now, never as the prompt argument.
 rm -f "$STUB_DIR/last-prompt"
 run 0 "$MESA" live start
 S1=$(jqs .id)
 [ -f "$STUB_DIR/last-prompt" ] || fail "live start must spawn the stub claude"
-grep -q "mesa live listen" "$STUB_DIR/last-prompt" ||
-  fail "with nothing forked, live start must spawn with the built-in block: $(cat "$STUB_DIR/last-prompt")"
-grep -q "You are driving mesa live session $S1\." "$STUB_DIR/last-prompt" ||
-  fail "live start must still append the session line: $(cat "$STUB_DIR/last-prompt")"
+if grep -q "mesa live listen" "$STUB_DIR/last-prompt"; then
+  fail "the loop must NOT be injected into the prompt any more: $(cat "$STUB_DIR/last-prompt")"
+fi
+grep -q "Drive mesa live session $S1\." "$STUB_DIR/last-prompt" ||
+  fail "live start must inject the session line: $(cat "$STUB_DIR/last-prompt")"
 run 0 "$MESA" live stop
-ok "with nothing forked, mesa live start spawns the agent with the library's built-in live-agent-prompt block"
+ok "the spawned prompt carries the session line only — the instructions are the agent definition"
 
-run 0 "$MESA" library update live-agent-prompt --body 'You are a custom live agent. Be terse.'
-[ "$(jqs .builtin_id)" = "live-agent-prompt" ] || fail "forking live-agent-prompt: builtin_id"
+# Editing the built-in forks it, exactly as for any other library row.
+run 0 "$MESA" library update mesa-live --body '---
+name: mesa-live
+---
 
-rm -f "$STUB_DIR/last-prompt"
-run 0 "$MESA" live start
-S2=$(jqs .id)
-[ -f "$STUB_DIR/last-prompt" ] || fail "live start (forked) must spawn the stub claude"
-! grep -q "mesa live listen" "$STUB_DIR/last-prompt" ||
-  fail "with live-agent-prompt forked, the built-in block must NOT appear: $(cat "$STUB_DIR/last-prompt")"
-grep -q "You are a custom live agent. Be terse." "$STUB_DIR/last-prompt" ||
-  fail "the forked body must REPLACE the built-in: $(cat "$STUB_DIR/last-prompt")"
-grep -q "You are driving mesa live session $S2\." "$STUB_DIR/last-prompt" ||
-  fail "the session line must still be appended after a forked prompt: $(cat "$STUB_DIR/last-prompt")"
-run 0 "$MESA" live stop
-ok "with live-agent-prompt forked to a different body, that body REPLACES the built-in (mesa never appends to it) while the session line is still appended"
+You are a custom live agent. Be terse.'
+[ "$(jqs .builtin_id)" = "mesa-live" ] || fail "forking mesa-live: builtin_id"
+[ "$(jqs .id)" != "null" ] || fail "forking mesa-live: the fork must be a real row"
+[ "$(jqs .kind)" = "agent" ] || fail "forking mesa-live: the fork keeps its kind"
+run 0 "$MESA" library show mesa-live
+grep -q "Be terse." <<<"$(jqs .body)" ||
+  fail "the forked body must REPLACE the built-in: $STDOUT"
+if grep -q "mesa live listen" <<<"$(jqs .body)"; then
+  fail "a fork replaces the built-in rather than extending it: $STDOUT"
+fi
+ok "editing mesa-live forks it, and the forked body replaces the built-in definition"
 
-echo "== library-check: section 9 (live prompt) passed ($CHECKS checks so far) =="
+echo "== library-check: section 9 (live agent definition) passed ($CHECKS checks so far) =="
 
 # ================= 10. import / export (mesa task 963) =================
 # `starter-claude-md` is already forked (section 7, over the API) with body

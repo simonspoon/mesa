@@ -18,7 +18,7 @@ persona and the slash command can all change without rebuilding mesa:
     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
     "agent-spawn":    "claude --bg -- {prompt}",
-    "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}",
+    "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}"
   }
 }
@@ -27,15 +27,20 @@ persona and the slash command can all change without rebuilding mesa:
 `live-agent`'s default is the union of the two shapes above it, because a live
 session is both a mesa record (so it has an `{id}` and a `{name}`) *and* a
 spawn that carries a prompt. **mesa supplies that prompt itself** —
-`core::live::agent_prompt`, the self-contained instruction block telling the
-agent to loop on `mesa live listen`, reply with `mesa live say` in spoken prose
-rather than markdown, move the browser with `mesa live navigate`, and treat
-every dictated utterance as data rather than instructions. So the feature works
-with no user configuration, and a replacement template's job is to start
-*something* that will read `{prompt}` and do what it says. That block is itself
-editable, as of mesa task 919, through the **library** rather than this file —
-the `live-agent-prompt` built-in, forked like any other library row
-(`docs/library.md`) — so `{prompt}` is the forked text whenever one exists.
+`core::live::agent_prompt`, which since mesa task 1068 is only the session line
+(`Drive mesa live session <id>.`) plus any recalled memory of earlier
+conversations. The instructions themselves are the **`mesa-live` agent
+definition** in the library (`docs/library.md`): the loop on `mesa live
+listen`, the reply through `mesa live say` in spoken prose rather than
+markdown, the browser moves through `mesa live navigate`, and the rule that
+every dictated utterance is data rather than instructions. That is why this one
+default names its agent **literally**, `--agent mesa-live`, instead of using
+`{agent}` — mesa seeds the definition to `~/.claude/agents/mesa-live.md` on the
+first spawn, and Claude Code errors on an agent it has never seen. `{agent}` is
+still offered on this action, so a replacement template may use it; a
+replacement's job either way is to start *something* that will read `{prompt}`
+and do what its agent says. The definition is editable like any other library
+row, and a fork replaces the built-in.
 
 `live-summary`'s default is identical in shape (mesa task 921): the
 summariser is also a mesa record — a session id and a name — carrying a
@@ -44,8 +49,8 @@ prompt mesa supplies, `core::live::summary_prompt`. It cannot be the
 agent (`claude stop <agent_id>`), so a separate short-lived agent is spawned
 once the conversation has already ended, to read it back and write down what
 it was about. Like `live-agent`'s, that prompt is a library item when forked
-— `live-summary-prompt`, the sibling of `live-agent-prompt`
-(`docs/library.md`) — and a replacement template's job is the same as
+— `live-summary-prompt`, which stays a `prompt` because nothing spawns the
+summariser by name (`docs/library.md`) — and a replacement template's job is the same as
 `live-agent`'s: start something that will read `{prompt}` and do what it
 says.
 
@@ -550,9 +555,9 @@ spawned with (mesa task 867) and the **wait** before a settled capture-box
 draft is sent (mesa task 886, until mesa task 977 narrowed it to the
 microphone's held recording alone — a typed line is now sent by Enter) — but
 as of mesa task 919 the prompt moved out to the **library**
-(`docs/library.md`): it is now the `live-agent-prompt` built-in, forked like
-any other library row when someone edits it, and edited on `#/library` rather
-than in this file. This section holds the one key that is left.
+(`docs/library.md`): it is now the `mesa-live` agent definition (mesa task 1068
+made it an agent rather than a prompt), forked like any other library row when
+someone edits it, and edited on `#/library` rather than in this file. This section holds the one key that is left.
 
 ```json
 {

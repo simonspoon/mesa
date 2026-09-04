@@ -386,7 +386,8 @@ start locations in the global Agents sidebar.
   change the binary, its flags, the persona or the slash command without
   rebuilding. Placeholders `{id}`, `{name}`, `{prompt}` (plus `{bin}`,
   `{agent}`). Templates are argv, not shell: no config file means the built-in
-  `claude --bg --agent swe …` command, unchanged. A multi-line value opts that
+  `claude --bg --agent swe …` command, unchanged (the live conversation's own
+  default names its agent `mesa-live`, the definition it runs as). A multi-line value opts that
   one command into a `bash -c` script instead, whose values arrive as `MESA_*`
   environment variables rather than being substituted into the body — either
   way, no mesa data is ever spliced into a string a shell parses. The same file

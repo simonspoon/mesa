@@ -11495,7 +11495,7 @@ mod tests {
                 LibraryKind::Prompt,
                 LibraryScope::User,
                 None,
-                "live-agent-prompt",
+                "live-summary-prompt",
                 "custom prompt",
                 Some("no-such-builtin"),
             ),
@@ -11507,27 +11507,27 @@ mod tests {
                 LibraryKind::Prompt,
                 LibraryScope::User,
                 None,
-                "live-agent-prompt",
+                "live-summary-prompt",
                 "custom prompt",
-                Some("live-agent-prompt"),
+                Some("live-summary-prompt"),
             )
             .unwrap();
-        assert_eq!(forked.builtin_id.as_deref(), Some("live-agent-prompt"));
+        assert_eq!(forked.builtin_id.as_deref(), Some("live-summary-prompt"));
         // Forking the same builtin a second time is a conflict.
         assert!(matches!(
             store.create_library_item(
                 LibraryKind::Prompt,
                 LibraryScope::User,
                 None,
-                "live-agent-prompt-2",
+                "live-summary-prompt-2",
                 "another",
-                Some("live-agent-prompt"),
+                Some("live-summary-prompt"),
             ),
             Err(Error::Conflict(_))
         ));
         assert_eq!(
             store
-                .find_library_fork("live-agent-prompt")
+                .find_library_fork("live-summary-prompt")
                 .unwrap()
                 .unwrap()
                 .id,

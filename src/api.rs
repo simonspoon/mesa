@@ -3089,6 +3089,12 @@ async fn spawn_live_agent(
     let (dir, name) = live_agent_dir(&state.store.lock().unwrap(), project_id, session_id)?;
     let path = dir.clone();
     let prompt = live::agent_prompt(&state.store.lock().unwrap(), session_id);
+    // The `mesa-live` agent definition is seeded to disk before the spawn
+    // (mesa task 1068): the default template spawns `--agent mesa-live`, which
+    // errors on an agent Claude Code has never seen. A failure is treated
+    // exactly like a failed spawn — `unavailable`, and the caller ends the
+    // session it just opened.
+    live::ensure_agent_definition(&state.store.lock().unwrap()).map_err(agents_unavailable)?;
     // Two-phase like every other spawn site in this file: the store lock is
     // dropped before the blocking `claude --bg` shell-out, which would
     // otherwise freeze every other API request for its duration.
@@ -12062,58 +12068,63 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A live start seeds the `mesa-live` agent definition under `$HOME`
+        // (mesa task 1068), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let root = proj_dir.path().canonicalize().unwrap();
-        let id = new_project(&state, Some(root.to_str().unwrap()));
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let root = proj_dir.path().canonicalize().unwrap();
+            let id = new_project(&state, Some(root.to_str().unwrap()));
 
-        let resp = block_on(start_live(
-            State(state.clone()),
-            ConnectInfo(loopback()),
-            loopback_agent_headers(),
-            Ok(Json(LiveStart {
-                project_id: Some(id),
-            })),
-        ))
-        .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = block_on(json_body(resp));
-        assert_eq!(body["status"], "live");
-        assert_eq!(body["project_id"], id);
-        assert_eq!(body["agent_id"], "deadbeef");
-        let session_id = body["id"].as_i64().unwrap();
+            let resp = block_on(start_live(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Ok(Json(LiveStart {
+                    project_id: Some(id),
+                })),
+            ))
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let body = block_on(json_body(resp));
+            assert_eq!(body["status"], "live");
+            assert_eq!(body["project_id"], id);
+            assert_eq!(body["agent_id"], "deadbeef");
+            let session_id = body["id"].as_i64().unwrap();
 
-        // The stub logs `<cwd>|<name>|<prompt>`; the prompt is multi-line, so
-        // match the head of the line rather than splitting the whole thing.
-        // A name AND a prompt together is what pins the `live-agent` template:
-        // it is the only action whose default offers both.
-        let logged = std::fs::read_to_string(&log_path).unwrap();
-        // A scoped conversation is named project-first, the Agents sidebar's
-        // idiom — `new_project` names its project "proj".
-        let head = format!("{}|proj: live {session_id}|", root.display());
-        assert!(logged.starts_with(&head), "{logged}");
-        assert!(
-            logged.contains(&format!("mesa live session {session_id}")),
-            "the session's own prompt must reach the agent: {logged}"
-        );
+            // The stub logs `<cwd>|<name>|<prompt>`; match the head of the
+            // line rather than splitting the whole thing. A name AND a prompt
+            // together is what pins the `live-agent` template: it is the only
+            // action whose default offers both.
+            let logged = std::fs::read_to_string(&log_path).unwrap();
+            // A scoped conversation is named project-first, the Agents sidebar's
+            // idiom — `new_project` names its project "proj".
+            let head = format!("{}|proj: live {session_id}|", root.display());
+            assert!(logged.starts_with(&head), "{logged}");
+            assert!(
+                logged.contains(&format!("mesa live session {session_id}")),
+                "the session's own prompt must reach the agent: {logged}"
+            );
 
-        // One live session at a time: the second start is the store's
-        // `conflict`, and it must not have spawned anything.
-        let err = block_on(start_live(
-            State(state.clone()),
-            ConnectInfo(loopback()),
-            loopback_agent_headers(),
-            Ok(Json(LiveStart { project_id: None })),
-        ))
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::CONFLICT);
-        assert_eq!(err.code, "conflict");
-        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), logged);
+            // One live session at a time: the second start is the store's
+            // `conflict`, and it must not have spawned anything.
+            let err = block_on(start_live(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Ok(Json(LiveStart { project_id: None })),
+            ))
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::CONFLICT);
+            assert_eq!(err.code, "conflict");
+            assert_eq!(std::fs::read_to_string(&log_path).unwrap(), logged);
+        });
     }
 
     /// A spawn that fails must not strand a live session: nothing is listening
@@ -12130,26 +12141,28 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let bin = stub_claude_bg(stub_dir.path(), &log_path);
         std::fs::write(stub_dir.path().join("fail"), "").unwrap();
         unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
-
-        let (_dir, state) = test_state();
-        let err = block_on(start_live(
-            State(state.clone()),
-            ConnectInfo(loopback()),
-            loopback_agent_headers(),
-            Ok(Json(LiveStart { project_id: None })),
-        ))
-        .unwrap_err();
-        assert_eq!(err.code, "unavailable");
-        assert!(
-            state
-                .store
-                .lock()
-                .unwrap()
-                .current_live_session()
-                .unwrap()
-                .is_none(),
-            "a failed spawn must leave no live session behind"
-        );
+        // As above: the seed writes under `$HOME`.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let (_dir, state) = test_state();
+            let err = block_on(start_live(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Ok(Json(LiveStart { project_id: None })),
+            ))
+            .unwrap_err();
+            assert_eq!(err.code, "unavailable");
+            assert!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .current_live_session()
+                    .unwrap()
+                    .is_none(),
+                "a failed spawn must leave no live session behind"
+            );
+        });
     }
 
     /// A mesa turn may carry a navigate action instead of words. Asking to

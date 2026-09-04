@@ -14,6 +14,7 @@ contents here.
 scripts/build.sh      # the ONLY supported release build → target/release/mesa
 scripts/build.sh --verify   # same chain, types checked against the export not git — for an uncommitted tree
 scripts/install.sh    # build.sh + copy onto PATH (PREFIX=/usr/local overrides ~/.local/bin)
+scripts/worktree-warm.sh    # seed a fresh worktree's target/ from main's (APFS clone + mtime sync); no args warms .claude/worktrees/*, elsewhere pass the path
 ```
 
 `build.sh` runs `cargo test` (which re-exports the TS types), fails if

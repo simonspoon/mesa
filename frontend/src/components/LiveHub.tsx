@@ -56,6 +56,7 @@ import {
   isBlockingError,
   isListenChord,
   isSilentTranscribe,
+  HEARING_HOLD_MS,
   LISTEN_CHORD,
   heldFlush,
   heldWith,
@@ -66,6 +67,7 @@ import {
   recognizesSpeech,
   shouldFlushSilence,
   shouldListen,
+  showsHearing,
   utteranceFrom,
   type ListenPath,
   type SpeechRecognitionLike,
@@ -613,6 +615,29 @@ export function LiveHub({
   // assumed to be: it is a count, not a flag, so a slow request does not read
   // as "stopped hearing" for the length of it.
   const [hearing, setHearing] = useState(0)
+  // When the person was last audibly talking, or `null` while the microphone
+  // is shut. Written from the same place `level` is, and read only through
+  // `showsHearing` — the hold it feeds is what keeps the hearing panel and the
+  // header aperture steady across a sentence instead of blinking once per
+  // segment (mesa task 1073).
+  const [voicedAt, setVoicedAt] = useState<number | null>(null)
+  // What actually drops the panel when the person goes quiet. `showsHearing`
+  // is still the rule — this only guarantees a render at the moment its hold
+  // clause goes false, because nothing else will: `setLevel` bails out on an
+  // unchanged value, so a stream of digital silence (muted hardware, or a
+  // synthetic all-zero buffer) renders nothing at all and the panel would
+  // stay latched open, the same bug we are fixing turned the other way
+  // round. It re-arms on every newer stamp, which is cheap now the stamp
+  // rides the meter's throttle, and the `at === voicedAt` guard means a
+  // stamp that landed after this timer was set is never the one it clears.
+  useEffect(() => {
+    if (voicedAt === null) return
+    const timer = setTimeout(
+      () => setVoicedAt((at) => (at === voicedAt ? null : at)),
+      HEARING_HOLD_MS,
+    )
+    return () => clearTimeout(timer)
+  }, [voicedAt])
 
   // Which session the held transcript belongs to. A new conversation is a new
   // transcript — going live again is a fresh session with its own turns, and
@@ -1278,6 +1303,20 @@ export function LiveHub({
         lastLevelValue = rms
         lastLevelAt = at
         setLevel(rms)
+        // The last moment the person was audible (mesa task 1073), stamped
+        // here because this is the only place a raw audio frame is in hand —
+        // and only here, so the browser path (mesa task 957) leaves it `null`
+        // and falls through to its own real `interim`, exactly as `level` and
+        // `hearing` already do.
+        //
+        // Deliberately **inside** the throttle. `at` is a fresh number on
+        // every frame, so a stamp outside it would re-render the hub at the
+        // full ~125 blocks a second for the length of every sentence — the
+        // exact cost the throttle above exists to avoid, and worse than the
+        // meter's, since nothing bails out on an unchanged value. Under it
+        // the stamp is up to ~100ms stale, which is free against a 1000ms
+        // hold.
+        if (rms >= DEFAULT_VAD.onsetRms) setVoicedAt(at)
       }
       const step = vadStep(vad, { rms, at })
       vad = step.state
@@ -1412,6 +1451,12 @@ export function LiveHub({
       // through mesa's whole reply, which is the opposite of what shutting
       // the microphone while she speaks is meant to show.
       setLevel(0)
+      // And so does the hold (mesa task 1073). The effect below drops a stale
+      // stamp on its own clock, but a torn-down capture — mesa speaking, a
+      // pause, a mute, the conversation ending — is not a hold running out,
+      // it is the microphone closing, and the panel goes with it immediately
+      // rather than a second later.
+      setVoicedAt(null)
       node?.port.close?.()
       node?.disconnect()
       source?.disconnect()
@@ -2002,16 +2047,30 @@ export function LiveHub({
     postRef.current = post
   })
 
-  // Whether the person is audibly talking right now, or a segment they just
-  // finished is still on its way back from `auris` — the auris path's own
-  // sign the bars key on, since a one-shot transcription has no partial
-  // result to say so otherwise (mesa task 956). Only ever true on that path:
-  // `level` and `hearing` are written only inside the capture effect, so on
-  // the browser path (mesa task 957) this stays `false` and the line below
-  // falls through to that path's real `interim` guess instead — one
-  // expression, still answering "is the person heard" for whichever path is
-  // actually running.
-  const voiced = level >= DEFAULT_VAD.onsetRms || hearing > 0
+  // Whether the person is being heard right now — the recording so far, a
+  // segment still on its way back from `auris`, or a frame audible recently
+  // enough to still count (mesa task 1073). One predicate, `showsHearing`,
+  // for both this and the panel under the transcript, because they are the
+  // same question asked twice.
+  //
+  // The hold is what this used to be missing. `level >= onsetRms` is a single
+  // audio frame, so it chattered between syllables, and the two signals it
+  // was or-ed with are edge-triggered and do not overlap — so the sign of
+  // being heard blinked its way through every sentence. `voicedAt` held for
+  // `HEARING_HOLD_MS` bridges the VAD's own hangover into the in-flight
+  // segment, and the effect beside its state is what renders the moment it
+  // runs out. Still auris-path-only, exactly as before: `voicedAt`, `level`
+  // and `hearing` are written only inside the capture effect, so on the
+  // browser path (mesa task 957) this falls through to that path's real
+  // `interim` guess instead.
+  const voiced = showsHearing({
+    recording: '',
+    interim: '',
+    hearing,
+    voicedAt,
+    now: Date.now(),
+    holdMs: HEARING_HOLD_MS,
+  })
 
   // What the header band says about the conversation (`liveIndicator.ts`):
   // mesa speaking, the person being heard, the agent at work, or the
@@ -2310,13 +2369,32 @@ export function LiveHub({
                   <div className="live-preview-body">{speakingText}</div>
                 </div>
               ) : (
-                (recording !== '' || interim !== '' || hearing > 0) && (
+                showsHearing({
+                  recording,
+                  interim,
+                  hearing,
+                  voicedAt,
+                  now: Date.now(),
+                  holdMs: HEARING_HOLD_MS,
+                }) && (
                   /* The recording (task 889): every settled sentence since the
                      switch went on, with whatever the engine is still guessing
                      at on the end of it. Shown together because they are one
                      thing to the person — what mesa will be told when they stop
                      listening — and shown at all because a microphone recording
-                     out of sight is the thing this must never be. */
+                     out of sight is the thing this must never be.
+
+                     Shown on `showsHearing` (mesa task 1073) rather than on the
+                     three raw signals: none of them covers the person's *first*
+                     sentence, which is heard for at least the VAD's hangover
+                     before a segment exists to be in flight, so the panel used
+                     to appear only once a segment was posted and vanish again
+                     at every boundary. The hold off the last audible frame is
+                     what makes it steady, and it still drops when they go
+                     quiet: the timer beside `voicedAt`'s state clears the
+                     stamp exactly when the hold runs out, and the capture
+                     effect's cleanup clears it the moment the microphone
+                     closes. */
                   <div className="live-preview live-preview-hearing">
                     <div className="live-preview-label">hearing</div>
                     <div className="live-preview-body">

@@ -4,6 +4,7 @@ import {
   captureHint,
   COMMON_ENGLISH,
   correctVocabulary,
+  HEARING_HOLD_MS,
   HELD_MAX,
   heldFlush,
   heldWith,
@@ -17,10 +18,12 @@ import {
   recognizesSpeech,
   shouldFlushSilence,
   shouldListen,
+  showsHearing,
   soundKey,
   utteranceFrom,
   type RecognitionResult,
 } from './liveRecognition'
+import { DEFAULT_VAD } from './liveVad'
 
 /** A result list the way the API hands one over: array-like, cumulative. */
 function results(...items: [string, boolean][]): ArrayLike<RecognitionResult> {
@@ -624,5 +627,44 @@ describe('captureHint', () => {
     expect(captureHint({ ...base, paused: true })).toMatch(/Resume/)
     expect(captureHint({ ...base, paused: true, path: 'none' })).toMatch(/Resume/)
     expect(captureHint({ ...base, paused: true, blocked: true })).toMatch(/Resume/)
+  })
+})
+
+describe('showsHearing', () => {
+  const now = 1_000_000
+  const base = { recording: '', interim: '', hearing: 0, voicedAt: null as number | null, now, holdMs: HEARING_HOLD_MS }
+
+  it('shows the panel while the person is saying their first sentence', () => {
+    // The case that used to blink: nothing is recorded yet and no segment
+    // exists to be in flight, because the VAD has not ended one — but the
+    // person is plainly talking.
+    expect(showsHearing({ ...base, voicedAt: now - 200 })).toBe(true)
+  })
+
+  it('bridges the VAD hangover, so the hold reaches the segment it ends', () => {
+    // The whole point of deriving the hold from `hangoverMs`: the last audible
+    // frame is at least that long before the segment is posted.
+    expect(showsHearing({ ...base, voicedAt: now - DEFAULT_VAD.hangoverMs })).toBe(true)
+  })
+
+  it('drops once the person has actually gone quiet', () => {
+    expect(showsHearing({ ...base, voicedAt: now - 1500 })).toBe(false)
+  })
+
+  it('shows the panel while a finished segment is in flight', () => {
+    expect(showsHearing({ ...base, hearing: 1 })).toBe(true)
+  })
+
+  it('shows the panel for a recording nothing is adding to right now', () => {
+    expect(showsHearing({ ...base, recording: 'what I said' })).toBe(true)
+  })
+
+  it('shows the panel for the browser path\'s own interim guess', () => {
+    // `voicedAt` is auris-path-only, so this is the browser path's whole case.
+    expect(showsHearing({ ...base, interim: 'half a sen' })).toBe(true)
+  })
+
+  it('shows nothing when nothing is being heard', () => {
+    expect(showsHearing(base)).toBe(false)
   })
 })

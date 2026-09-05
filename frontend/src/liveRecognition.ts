@@ -62,6 +62,8 @@
  * a machine with no `auris`.
  */
 
+import { DEFAULT_VAD } from './liveVad'
+
 /** One reading of what was heard. The API offers alternatives; mesa takes the first. */
 export type RecognitionAlternative = { transcript: string }
 
@@ -263,6 +265,51 @@ export function shouldFlushSilence(input: {
   if (!input.listening) return false
   if (input.recording.trim() === '' && input.interim.trim() === '') return false
   return input.idleMs >= input.idleThresholdMs
+}
+
+/**
+ * How long the "hearing" panel stays up after the last audible frame
+ * (mesa task 1073).
+ *
+ * Derived from the VAD's own hangover rather than picked: the gap between the
+ * person's last audible frame and the segment reaching the transcribe route is
+ * *at minimum* `hangoverMs`, because that is how long `vadStep` waits before
+ * it will call an utterance ended at all — only then is the WAV windowed and
+ * posted, which is the first moment `hearing` goes above zero. A hold of a
+ * "few hundred ms" would therefore expire inside every ordinary pause between
+ * words and blink the panel out mid-sentence, which is the bug. The extra
+ * 300ms covers the windowing and the encode before the post is in flight.
+ */
+export const HEARING_HOLD_MS = DEFAULT_VAD.hangoverMs + 300
+
+/**
+ * Whether the person is being heard right now — the one rule behind both the
+ * "hearing" panel under the transcript and the header aperture's own hearing
+ * state (mesa task 1073).
+ *
+ * The three original signals are all **edge-triggered and non-overlapping**,
+ * which is why the panel used to blink: `hearing` is above zero only while a
+ * finished segment is on its way back from `auris`, `recording` latches only
+ * once a segment returns text and is wiped on every flush, and on the auris
+ * path `interim` is permanently empty (one-shot transcription has no partial
+ * result). Nothing was continuous, so the panel was *absent* for the whole of
+ * the person's first sentence and dropped out again at every segment boundary.
+ *
+ * `voicedAt` — the last audible frame — is what makes it continuous, held for
+ * `holdMs` so it bridges the VAD's hangover into the in-flight segment. `now`
+ * is a parameter rather than a `Date.now()` inside, so the rule is a pure
+ * function and testable without a clock.
+ */
+export function showsHearing(input: {
+  recording: string
+  interim: string
+  hearing: number
+  voicedAt: number | null
+  now: number
+  holdMs: number
+}): boolean {
+  if (input.recording !== '' || input.interim !== '' || input.hearing > 0) return true
+  return input.voicedAt !== null && input.now - input.voicedAt < input.holdMs
 }
 
 /**

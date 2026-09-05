@@ -907,7 +907,7 @@ LAN_PID=
 
 echo "== library-check: sections 7-8 (API + gates) passed ($CHECKS checks so far) =="
 
-# ============ 9. the live agent definition comes from the library ============
+# ========== 9. the named agent definitions come from the library ===========
 # mesa task 1068: the live conversation runs as the `mesa-live` agent
 # definition — an `agent` row with a real path, seeded to disk before the
 # spawn and synced like any other — rather than as a `prompt` glued into the
@@ -970,7 +970,60 @@ if grep -q "mesa live listen" <<<"$(jqs .body)"; then
 fi
 ok "editing mesa-live forks it, and the forked body replaces the built-in definition"
 
-echo "== library-check: section 9 (live agent definition) passed ($CHECKS checks so far) =="
+# ---- the supervisor definition is the same shape one step up (task 1075) ----
+# The auto-dispatched `/execute-todo` run is supervised by a named agent for
+# the same reason the conversation is: the rules travel as a definition on
+# disk, not as text glued into the prompt argument.
+
+run 0 "$MESA" library show supervisor
+[ "$(jqs .id)" = "null" ] || fail "fixture: supervisor must start unshadowed for this section"
+[ "$(jqs .kind)" = "agent" ] || fail "supervisor must be an agent definition, got $(jqs .kind)"
+[ "$(jqs .scope)" = "user" ] || fail "supervisor must be user-scoped, got $(jqs .scope)"
+[ "$(jqs .path)" = ".claude/agents/supervisor.md" ] ||
+  fail "supervisor must map to .claude/agents/supervisor.md, got $(jqs .path)"
+SUPERVISOR_DEF=$(jqs .body)
+grep -q "^name: supervisor$" <<<"$SUPERVISOR_DEF" ||
+  fail "fixture: the built-in definition must carry YAML frontmatter naming the agent"
+grep -q "^model: opus$" <<<"$SUPERVISOR_DEF" ||
+  fail "fixture: the built-in definition must run on opus"
+grep -q "^tools:.*ExitWorktree" <<<"$SUPERVISOR_DEF" ||
+  fail "fixture: the built-in definition must state its tool list"
+if grep -qE "^tools:.*(Edit|Write)" <<<"$SUPERVISOR_DEF"; then
+  fail "a supervisor must not be able to edit: $SUPERVISOR_DEF"
+fi
+ok "supervisor starts unshadowed as a user-scope agent definition at .claude/agents/supervisor.md"
+
+# Having a path means the sync flow carries it, exactly as for mesa-live.
+rm -f "$CLAUDE_DIR/agents/supervisor.md"
+run 0 "$MESA" library sync status
+[ "$(jqs 'map(select(.path==".claude/agents/supervisor.md")) | length')" = "1" ] ||
+  fail "sync status must report a row for the supervisor definition, got $STDOUT"
+SUPERVISOR_STATUS=$(jqs '.[] | select(.path==".claude/agents/supervisor.md") | .status')
+[ "$SUPERVISOR_STATUS" = "mesa-new" ] ||
+  fail "with no file on disk, supervisor must be mesa-new, got $SUPERVISOR_STATUS"
+run 0 "$MESA" library sync apply --resolve '.claude/agents/supervisor.md=mesa'
+grep -q "^name: supervisor$" "$CLAUDE_DIR/agents/supervisor.md" ||
+  fail "sync apply (mesa wins) must write the definition to \$HOME/.claude/agents/supervisor.md"
+ok "the supervisor definition appears in sync status and sync apply writes it to \$HOME/.claude/agents"
+
+# Editing the built-in forks it, exactly as for any other library row.
+run 0 "$MESA" library update supervisor --body '---
+name: supervisor
+---
+
+You are a custom supervisor. Be terse.'
+[ "$(jqs .builtin_id)" = "supervisor" ] || fail "forking supervisor: builtin_id"
+[ "$(jqs .id)" != "null" ] || fail "forking supervisor: the fork must be a real row"
+[ "$(jqs .kind)" = "agent" ] || fail "forking supervisor: the fork keeps its kind"
+run 0 "$MESA" library show supervisor
+grep -q "Be terse." <<<"$(jqs .body)" ||
+  fail "the forked body must REPLACE the built-in: $STDOUT"
+if grep -q "^model: opus$" <<<"$(jqs .body)"; then
+  fail "a fork replaces the built-in rather than extending it: $STDOUT"
+fi
+ok "editing supervisor forks it, and the forked body replaces the built-in definition"
+
+echo "== library-check: section 9 (named agent definitions) passed ($CHECKS checks so far) =="
 
 # ================= 10. import / export (mesa task 963) =================
 # `starter-claude-md` is already forked (section 7, over the API) with body

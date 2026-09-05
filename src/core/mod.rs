@@ -15,6 +15,7 @@ pub mod receipt;
 pub mod scripts;
 pub mod speech;
 mod store;
+pub mod supervisor;
 mod types;
 pub mod usage;
 pub mod version;

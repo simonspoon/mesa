@@ -208,40 +208,12 @@ pub fn agent_prompt(store: &crate::core::Store, session_id: i64) -> String {
 /// nothing else puts the file there — the library sync is a thing the user
 /// runs, not something a conversation may depend on.
 ///
-/// The body is the effective `mesa-live` row: its library fork if one exists,
-/// the built-in otherwise. The target goes through the library's own path
-/// machinery ([`crate::core::library::relative_path`], `scope_base` and the
-/// `resolve` traversal chokepoint), so `$HOME` is honoured and the
-/// containment check holds here exactly as it does on the sync path.
-///
-/// It **never overwrites**. After the first seed the file belongs to the
-/// library sync flow, where a difference between disk and mesa is a row the
-/// user resolves — silently rewriting it on every `live start` would make one
-/// side of that decision impossible to keep.
+/// The seeding itself — the fork-or-built-in body, the library's own path
+/// machinery, and the never-overwrite rule — is
+/// [`crate::core::library::ensure_agent_file`], shared with `supervisor`
+/// (mesa task 1075).
 pub fn ensure_agent_definition(store: &crate::core::Store) -> Result<std::path::PathBuf, String> {
-    use crate::core::library;
-    use crate::core::types::{LibraryKind, LibraryScope};
-
-    let body = store
-        .find_library_fork(LIVE_AGENT_BUILTIN)
-        .ok()
-        .flatten()
-        .map(|item| item.body)
-        .unwrap_or_else(|| AGENT_DEFINITION.to_string());
-    let rel = library::relative_path(LibraryKind::Agent, LibraryScope::User, LIVE_AGENT_BUILTIN)
-        .ok_or_else(|| format!("{LIVE_AGENT_BUILTIN} has no path"))?;
-    let base = library::scope_base(LibraryScope::User, None)
-        .ok_or_else(|| "cannot seed the mesa-live agent definition: no HOME".to_string())?;
-    let full = library::resolve(&base, &rel)?;
-    if full.exists() {
-        return Ok(full);
-    }
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(&full, body).map_err(|e| format!("cannot write {}: {e}", full.display()))?;
-    Ok(full)
+    crate::core::library::ensure_agent_file(store, LIVE_AGENT_BUILTIN, AGENT_DEFINITION)
 }
 
 /// The instructions for the short-lived agent `live stop` spawns to write

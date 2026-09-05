@@ -6,7 +6,7 @@ persona and the slash command can all change without rebuilding mesa:
 
 | Key | Used by | Built-in default |
 | --- | --- | --- |
-| `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}"` |
+| `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `{bin} --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"` |
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"` |
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `{bin} --bg --agent {agent} -- {prompt}` |
 | `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `{bin} --bg --agent {agent} --name {name} -- {prompt}` |

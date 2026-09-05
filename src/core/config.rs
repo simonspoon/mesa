@@ -163,16 +163,23 @@ pub const ACTIONS: [&str; 5] = [
 ];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
-/// config file existed, spelled as a template. `{bin}`/`{agent}` carry the
-/// pre-existing `MESA_CLAUDE_BIN`/`MESA_CLAUDE_AGENT` env seams, so with no
-/// config file the resulting argv is byte-identical to the hardcoded one.
+/// config file existed, spelled as a template. `{bin}` carries the
+/// pre-existing `MESA_CLAUDE_BIN` env seam.
+///
+/// The agent is named **literally** rather than through `{agent}` (mesa task
+/// 1075): the run happens as the `supervisor` agent definition
+/// (`core::supervisor::SUPERVISOR_DEFINITION`, seeded to
+/// `~/.claude/agents/supervisor.md` by
+/// `core::supervisor::ensure_agent_definition`), which is where the
+/// supervising rules now live. `{agent}` is still offered on this action, so
+/// an override may go back to mesa's generic agent name.
 ///
 /// Note the quotes around the prompt: a slash command and its argument are
 /// **one** argv entry (`claude` takes the prompt as a single positional), and
 /// tokenization is by whitespace. Unquoted, `/execute-mesa-task {id}` would
 /// arrive as two arguments and the id would be lost.
 pub const DEFAULT_TODO_WATCHER: &str =
-    r#"{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}""#;
+    r#"{bin} --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}""#;
 /// Built-in default for [`INBOX_WATCHER`]; see [`DEFAULT_TODO_WATCHER`].
 pub const DEFAULT_INBOX_WATCHER: &str =
     r#"{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}""#;
@@ -2675,7 +2682,9 @@ mod tests {
                 "claude",
                 "--bg",
                 "--agent",
-                "swe",
+                // Literal since mesa task 1075: the run is supervised by the
+                // `supervisor` agent definition, not by `{agent}`.
+                "supervisor",
                 "--name",
                 "mesa: do the thing",
                 "--",
@@ -2758,7 +2767,14 @@ mod tests {
         };
         assert_eq!(
             expand(TODO_WATCHER, DEFAULT_TODO_WATCHER, &named).unwrap(),
-            ["claude", "--bg", "--", "/execute-mesa-task 7"]
+            [
+                "claude",
+                "--bg",
+                "--agent",
+                "supervisor",
+                "--",
+                "/execute-mesa-task 7"
+            ]
         );
         // A dropped token only takes a *flag* with it, never a positional.
         let vars = Vars {

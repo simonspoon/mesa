@@ -105,11 +105,12 @@ That split is the whole point:
   `Store::create_library_item`/the fork route both check
   `Store::find_library_fork` first and answer `conflict` on a second attempt.
 
-The starter set is deliberately tiny — four rows:
+The starter set is deliberately tiny — five rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
 | `mesa-live` | `agent` | `user` | The agent definition the live conversation runs as — literally `core::live::AGENT_DEFINITION`, YAML frontmatter plus `core::live::AGENT_PROMPT`, moved here rather than duplicated (mesa task 1068) |
+| `supervisor` | `agent` | `user` | The agent definition an auto-dispatched `/execute-todo` run is supervised as — literally `core::supervisor::SUPERVISOR_DEFINITION` (mesa task 1075), seeded to `~/.claude/agents/supervisor.md` by `core::supervisor::ensure_agent_definition` before the `todo-watcher` spawn |
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops |

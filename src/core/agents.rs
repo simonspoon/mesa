@@ -843,11 +843,13 @@ JSON"#,
     #[test]
     fn spawn_bg_passes_agent_before_name_and_prompt() {
         // `--agent` must land after `--bg` and before the `--` separator, or a
-        // prompt-leading `-` swallows it. The stub asserts the full argv.
+        // prompt-leading `-` swallows it. The stub asserts the full argv. The
+        // agent is the literal `supervisor` since mesa task 1075, so the
+        // `Some("swe")` below is deliberately not what lands in argv.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
-            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] &&
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "supervisor" ] &&
               [ "$4" = "--name" ] && [ "$5" = "n" ] && [ "$6" = "--" ] &&
               [ "$7" = "/execute-mesa-task 9" ] ||
               { echo "bad argv: $*" >&2; exit 1; }
@@ -980,10 +982,14 @@ echo "prompt was: $3" >&2"#,
 
     #[test]
     fn spawn_bg_passes_name_flag_before_prompt_separator() {
+        // No `{agent}` value is supplied, but the todo-watcher default names
+        // its agent literally (mesa task 1075), so `--agent supervisor` is
+        // still there; what this pins is `--name` landing before the `--`.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
-            r#"[ "$1" = "--bg" ] && [ "$2" = "--name" ] && [ "$3" = "proj: do the thing" ] && [ "$4" = "--" ] ||
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "supervisor" ] &&
+              [ "$4" = "--name" ] && [ "$5" = "proj: do the thing" ] && [ "$6" = "--" ] ||
               { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · cf0c3945 · proj: do the thing""#,
         );

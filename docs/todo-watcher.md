@@ -36,11 +36,16 @@ because someone ran `mesa serve`.
   as its `{id}`/`{name}`. **The command line itself — including which slash
   command runs — is user-configurable** in `~/.mesa/config.json`
   (`docs/config.md`); its default is
-  `{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}"`, so
-  by default the name reaches `claude --bg` as `-n/--name` and the
+  `{bin} --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"`,
+  so by default the name reaches `claude --bg` as `-n/--name` and the
   auto-dispatched session shows up identifiably (prompt box, `/resume` picker,
-  terminal title, Agents sidebar) instead of generically, running under the
-  `swe` agent persona (`MESA_CLAUDE_AGENT`, `docs/agents.md`). Deriving the
+  terminal title, Agents sidebar) instead of generically, running as the
+  `supervisor` agent definition — the library built-in mesa seeds to
+  `~/.claude/agents/supervisor.md` before the spawn (mesa task 1075,
+  `docs/library.md`), which is where the supervising rules live. The agent is
+  named literally rather than through `{agent}`; the placeholder is still
+  offered on this action, so an override may go back to the generic `swe`
+  persona (`MESA_CLAUDE_AGENT`, `docs/agents.md`). Deriving the
   name is still mesa's job, not the template's: a template chooses whether to
   pass it. Claiming the task before the spawn closes
   the race window between dispatch and the agent's own `/execute-mesa-task`

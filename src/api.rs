@@ -48,7 +48,7 @@ use crate::core::{
     ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script,
     ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
     attachments, board, config, files, git, guard, hooks, library, listen, live, receipt, scripts,
-    speech, version,
+    speech, supervisor, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -846,9 +846,22 @@ fn todo_watcher_tick(state: &AppState) {
         claimed
     };
     for (task_id, local_path, session_name) in claimed {
+        // The default template spawns `--agent supervisor`, so the definition
+        // has to be on disk before the spawn — `claude --agent` errors on an
+        // agent it has never seen (mesa task 1075). The store lock taken to
+        // claim the tasks above is long gone by here, so re-lock for this one
+        // read. A failure skips *this* task the way a failed spawn does; the
+        // tick goes on.
+        {
+            let store = state.store.lock().unwrap();
+            if let Err(e) = supervisor::ensure_agent_definition(&store) {
+                eprintln!("todo-watcher: cannot seed the supervisor agent definition: {e}");
+                continue;
+            }
+        }
         // The command — including which slash command executes a task — comes
         // from `~/.mesa/config.json`'s `todo-watcher` entry, defaulting to
-        // `claude --bg … -- /execute-mesa-task <id>`.
+        // `claude --bg --agent supervisor … -- /execute-mesa-task <id>`.
         match agents::spawn_bg(
             config::TODO_WATCHER,
             &local_path,
@@ -9691,64 +9704,76 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let archived_dir = tempfile::tempdir().unwrap();
-        let normal_dir = tempfile::tempdir().unwrap();
-        let archived_path = archived_dir.path().to_str().unwrap();
-        let normal_path = normal_dir.path().to_str().unwrap();
+            let (_dir, state) = test_state();
+            let archived_dir = tempfile::tempdir().unwrap();
+            let normal_dir = tempfile::tempdir().unwrap();
+            let archived_path = archived_dir.path().to_str().unwrap();
+            let normal_path = normal_dir.path().to_str().unwrap();
 
-        let archived_id = new_project(&state, Some(archived_path));
-        let normal_id = new_project(&state, Some(normal_path));
-        let archived_task = new_task(&state, archived_id);
-        let normal_task = new_task(&state, normal_id);
-        state
-            .store
-            .lock()
-            .unwrap()
-            .archive_project(archived_id)
-            .unwrap();
+            let archived_id = new_project(&state, Some(archived_path));
+            let normal_id = new_project(&state, Some(normal_path));
+            let archived_task = new_task(&state, archived_id);
+            let normal_task = new_task(&state, normal_id);
+            state
+                .store
+                .lock()
+                .unwrap()
+                .archive_project(archived_id)
+                .unwrap();
 
-        todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
 
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            1,
-            "expected exactly one dispatch (the unarchived project), got: {log:?}"
-        );
-        // Auto-dispatch spawns under an agent persona (`MESA_CLAUDE_AGENT`,
-        // default `swe`) — asserted here because the watcher path is the one
-        // that must never regress to a generic session.
-        let agent = std::fs::read_to_string(stub_dir.path().join("last-agent")).unwrap_or_default();
-        assert_eq!(agent.trim(), "swe", "dispatch must pass --agent swe");
-        assert!(
-            log.contains(normal_path),
-            "the unarchived project's task must be dispatched: {log:?}"
-        );
-        assert!(
-            !log.contains(archived_path),
-            "the archived project's task must never be dispatched: {log:?}"
-        );
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "expected exactly one dispatch (the unarchived project), got: {log:?}"
+            );
+            // Auto-dispatch spawns as the `supervisor` agent definition (mesa
+            // task 1075, literal in the template rather than `{agent}`) —
+            // asserted here because the watcher path is the one that must never
+            // regress to a generic session.
+            let agent =
+                std::fs::read_to_string(stub_dir.path().join("last-agent")).unwrap_or_default();
+            assert_eq!(
+                agent.trim(),
+                "supervisor",
+                "dispatch must pass --agent supervisor"
+            );
+            assert!(
+                log.contains(normal_path),
+                "the unarchived project's task must be dispatched: {log:?}"
+            );
+            assert!(
+                !log.contains(archived_path),
+                "the archived project's task must never be dispatched: {log:?}"
+            );
 
-        let archived_task = state.store.lock().unwrap().get_task(archived_task).unwrap();
-        assert_eq!(
-            archived_task.status,
-            Status::Todo,
-            "archived project's task must stay todo, never claimed"
-        );
-        let normal_task = state.store.lock().unwrap().get_task(normal_task).unwrap();
-        assert_eq!(
-            normal_task.status,
-            Status::InProgress,
-            "unarchived project's task must be claimed in_progress"
-        );
+            let archived_task = state.store.lock().unwrap().get_task(archived_task).unwrap();
+            assert_eq!(
+                archived_task.status,
+                Status::Todo,
+                "archived project's task must stay todo, never claimed"
+            );
+            let normal_task = state.store.lock().unwrap().get_task(normal_task).unwrap();
+            assert_eq!(
+                normal_task.status,
+                Status::InProgress,
+                "unarchived project's task must be claimed in_progress"
+            );
+        });
     }
 
     // --- todo-watcher umbrella tasks (mesa task 570) -----------------------
@@ -9798,87 +9823,93 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
 
-        // An unrelated todo, an umbrella held in_progress, and two children.
-        let outsider = new_task(&state, project);
-        let parent = new_task(&state, project);
-        let child_a = new_subtask(&state, project, parent, "child a");
-        let child_b = new_subtask(&state, project, parent, "child b");
-        set_status(&state, parent, Status::InProgress);
+            // An unrelated todo, an umbrella held in_progress, and two children.
+            let outsider = new_task(&state, project);
+            let parent = new_task(&state, project);
+            let child_a = new_subtask(&state, project, parent, "child a");
+            let child_b = new_subtask(&state, project, parent, "child b");
+            set_status(&state, parent, Status::InProgress);
 
-        todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
 
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            1,
-            "an open umbrella must not wedge its project: {log:?}"
-        );
-        assert!(
-            log.contains(&format!("/execute-mesa-task {child_a}")),
-            "the umbrella's first child must be the dispatched task: {log:?}"
-        );
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        assert_eq!(get(child_a), Status::InProgress);
-        assert_eq!(get(parent), Status::InProgress, "the umbrella is untouched");
-        assert_eq!(
-            get(outsider),
-            Status::Todo,
-            "an open umbrella unblocks only its own children"
-        );
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "an open umbrella must not wedge its project: {log:?}"
+            );
+            assert!(
+                log.contains(&format!("/execute-mesa-task {child_a}")),
+                "the umbrella's first child must be the dispatched task: {log:?}"
+            );
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            assert_eq!(get(child_a), Status::InProgress);
+            assert_eq!(get(parent), Status::InProgress, "the umbrella is untouched");
+            assert_eq!(
+                get(outsider),
+                Status::Todo,
+                "an open umbrella unblocks only its own children"
+            );
 
-        // The dispatched child is a leaf, so the project is busy again: the
-        // second child must wait rather than fan out concurrently.
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            1,
-            "an in_progress leaf still wedges the project: {log:?}"
-        );
-        assert_eq!(get(child_b), Status::Todo);
+            // The dispatched child is a leaf, so the project is busy again: the
+            // second child must wait rather than fan out concurrently.
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "an in_progress leaf still wedges the project: {log:?}"
+            );
+            assert_eq!(get(child_b), Status::Todo);
 
-        // Child done -> the next tick takes the umbrella's second child.
-        set_status(&state, child_a, Status::Done);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 2, "second child dispatched: {log:?}");
-        assert!(
-            log.contains(&format!("/execute-mesa-task {child_b}")),
-            "{log:?}"
-        );
+            // Child done -> the next tick takes the umbrella's second child.
+            set_status(&state, child_a, Status::Done);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 2, "second child dispatched: {log:?}");
+            assert!(
+                log.contains(&format!("/execute-mesa-task {child_b}")),
+                "{log:?}"
+            );
 
-        // Subtree exhausted while the umbrella is still open -> the watcher
-        // stops rather than reaching for the unrelated todo.
-        set_status(&state, child_b, Status::Done);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "an exhausted subtree must not fall back to the wider project: {log:?}"
-        );
-        assert_eq!(get(outsider), Status::Todo);
+            // Subtree exhausted while the umbrella is still open -> the watcher
+            // stops rather than reaching for the unrelated todo.
+            set_status(&state, child_b, Status::Done);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "an exhausted subtree must not fall back to the wider project: {log:?}"
+            );
+            assert_eq!(get(outsider), Status::Todo);
 
-        // Umbrella closed -> the project is plainly idle again.
-        set_status(&state, parent, Status::Done);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 3, "idle project resumes: {log:?}");
-        assert!(
-            log.contains(&format!("/execute-mesa-task {outsider}")),
-            "{log:?}"
-        );
+            // Umbrella closed -> the project is plainly idle again.
+            set_status(&state, parent, Status::Done);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 3, "idle project resumes: {log:?}");
+            assert!(
+                log.contains(&format!("/execute-mesa-task {outsider}")),
+                "{log:?}"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -9896,57 +9927,63 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
 
-        // Idle project whose only work is backlog: nothing to dispatch.
-        let shelved = new_task(&state, project);
-        set_status(&state, shelved, Status::Backlog);
+            // Idle project whose only work is backlog: nothing to dispatch.
+            let shelved = new_task(&state, project);
+            set_status(&state, shelved, Status::Backlog);
 
-        todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
 
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert!(
-            log.is_empty(),
-            "a backlog task must never be auto-dispatched: {log:?}"
-        );
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        assert_eq!(get(shelved), Status::Backlog, "and must not be claimed");
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                log.is_empty(),
+                "a backlog task must never be auto-dispatched: {log:?}"
+            );
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            assert_eq!(get(shelved), Status::Backlog, "and must not be claimed");
 
-        // Same on the umbrella path: an agent holding a parent in_progress and
-        // creating its children as backlog keeps its own subtree to itself.
-        let parent = new_task(&state, project);
-        let child = new_subtask(&state, project, parent, "child");
-        set_status(&state, child, Status::Backlog);
-        set_status(&state, parent, Status::InProgress);
+            // Same on the umbrella path: an agent holding a parent in_progress and
+            // creating its children as backlog keeps its own subtree to itself.
+            let parent = new_task(&state, project);
+            let child = new_subtask(&state, project, parent, "child");
+            set_status(&state, child, Status::Backlog);
+            set_status(&state, parent, Status::InProgress);
 
-        todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
 
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert!(
-            log.is_empty(),
-            "a backlog subtask must not be dispatched under an open umbrella: {log:?}"
-        );
-        assert_eq!(get(child), Status::Backlog);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                log.is_empty(),
+                "a backlog subtask must not be dispatched under an open umbrella: {log:?}"
+            );
+            assert_eq!(get(child), Status::Backlog);
 
-        // The opt-out is the status and nothing else: releasing the child to
-        // `todo` dispatches it on the very next tick.
-        set_status(&state, child, Status::Todo);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert!(
-            log.contains(&format!("/execute-mesa-task {child}")),
-            "a released child must dispatch normally: {log:?}"
-        );
-        assert_eq!(get(child), Status::InProgress);
+            // The opt-out is the status and nothing else: releasing the child to
+            // `todo` dispatches it on the very next tick.
+            set_status(&state, child, Status::Todo);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                log.contains(&format!("/execute-mesa-task {child}")),
+                "a released child must dispatch normally: {log:?}"
+            );
+            assert_eq!(get(child), Status::InProgress);
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -9963,63 +10000,69 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
 
-        // An all-todo epic: lowest id, so a plain `next_task` picks it.
-        let epic = new_task(&state, project);
-        let child = new_subtask(&state, project, epic, "child");
-        let grandchild = new_subtask(&state, project, child, "grandchild");
+            // An all-todo epic: lowest id, so a plain `next_task` picks it.
+            let epic = new_task(&state, project);
+            let child = new_subtask(&state, project, epic, "child");
+            let grandchild = new_subtask(&state, project, child, "grandchild");
 
-        todo_watcher_tick(&state);
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 1, "one dispatch: {log:?}");
-        assert!(
-            log.contains(&format!("/execute-mesa-task {grandchild}")),
-            "the deepest actionable descendant is the unit of work, not the epic: {log:?}"
-        );
-        assert_eq!(get(epic), Status::Todo, "the epic must not be claimed");
-        assert_eq!(get(child), Status::Todo, "the mid-level parent likewise");
+            todo_watcher_tick(&state);
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 1, "one dispatch: {log:?}");
+            assert!(
+                log.contains(&format!("/execute-mesa-task {grandchild}")),
+                "the deepest actionable descendant is the unit of work, not the epic: {log:?}"
+            );
+            assert_eq!(get(epic), Status::Todo, "the epic must not be claimed");
+            assert_eq!(get(child), Status::Todo, "the mid-level parent likewise");
 
-        // Second tick: the claimed grandchild is a leaf, so the project is
-        // busy. Without the leaf rule the epic would have been in_progress
-        // here and this tick would spawn a second agent alongside it.
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            1,
-            "no second agent in the repo: {log:?}"
-        );
+            // Second tick: the claimed grandchild is a leaf, so the project is
+            // busy. Without the leaf rule the epic would have been in_progress
+            // here and this tick would spawn a second agent alongside it.
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "no second agent in the repo: {log:?}"
+            );
 
-        // Subtree exhausted -> the epic is finally the actionable leaf, and
-        // its own claim parks the project rather than dispatching alongside.
-        set_status(&state, grandchild, Status::Done);
-        set_status(&state, child, Status::Done);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 2, "roll-up dispatched: {log:?}");
-        assert!(
-            log.contains(&format!("/execute-mesa-task {epic}")),
-            "{log:?}"
-        );
-        assert_eq!(get(epic), Status::InProgress);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "an epic holding its own claim parks the project: {log:?}"
-        );
+            // Subtree exhausted -> the epic is finally the actionable leaf, and
+            // its own claim parks the project rather than dispatching alongside.
+            set_status(&state, grandchild, Status::Done);
+            set_status(&state, child, Status::Done);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 2, "roll-up dispatched: {log:?}");
+            assert!(
+                log.contains(&format!("/execute-mesa-task {epic}")),
+                "{log:?}"
+            );
+            assert_eq!(get(epic), Status::InProgress);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "an epic holding its own claim parks the project: {log:?}"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     // --- the reaper: dispatched sessions end when their task does (1057) ---
@@ -10190,98 +10233,104 @@ exit 2
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let agents_file = stub_dir.path().join("agents.json");
-        let stop_log = stub_dir.path().join("stops.log");
-        let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let task = new_task(&state, project);
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let task = new_task(&state, project);
 
-        // The dispatch records the receipt's job id against the task.
-        todo_watcher_tick(&state);
-        assert_eq!(
-            dispatched_task(&state, "job0001"),
-            Some(task),
-            "a successful dispatch must record its job id against its task"
-        );
+            // The dispatch records the receipt's job id against the task.
+            todo_watcher_tick(&state);
+            assert_eq!(
+                dispatched_task(&state, "job0001"),
+                Some(task),
+                "a successful dispatch must record its job id against its task"
+            );
 
-        // While the task is in_progress the session is left alone, however
-        // idle the listing says it is.
-        std::fs::write(
-            &agents_file,
-            agents_listing("job0001", Some(4242), Some("idle")),
-        )
-        .unwrap();
-        todo_reaper_tick(&state);
-        assert!(
-            stops(&stop_log).is_empty(),
-            "an in_progress task's session must never be stopped"
-        );
-        assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+            // While the task is in_progress the session is left alone, however
+            // idle the listing says it is.
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("idle")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert!(
+                stops(&stop_log).is_empty(),
+                "an in_progress task's session must never be stopped"
+            );
+            assert_eq!(dispatched_task(&state, "job0001"), Some(task));
 
-        // Task closed, but the session is still busy: it is writing its
-        // closing report, so this pass stops nothing.
-        set_status(&state, task, Status::Done);
-        std::fs::write(
-            &agents_file,
-            agents_listing("job0001", Some(4242), Some("busy")),
-        )
-        .unwrap();
-        todo_reaper_tick(&state);
-        assert!(
-            stops(&stop_log).is_empty(),
-            "a busy session must be left for the next pass"
-        );
-        assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+            // Task closed, but the session is still busy: it is writing its
+            // closing report, so this pass stops nothing.
+            set_status(&state, task, Status::Done);
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("busy")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert!(
+                stops(&stop_log).is_empty(),
+                "a busy session must be left for the next pass"
+            );
+            assert_eq!(dispatched_task(&state, "job0001"), Some(task));
 
-        // Idle now: stopped exactly once, and forgotten.
-        std::fs::write(
-            &agents_file,
-            agents_listing("job0001", Some(4242), Some("idle")),
-        )
-        .unwrap();
-        todo_reaper_tick(&state);
-        assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
-        assert_eq!(dispatched_task(&state, "job0001"), None);
-        todo_reaper_tick(&state);
-        assert_eq!(
-            stops(&stop_log),
-            vec!["job0001".to_string()],
-            "a stopped session must not be stopped again"
-        );
+            // Idle now: stopped exactly once, and forgotten.
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("idle")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+            assert_eq!(dispatched_task(&state, "job0001"), None);
+            todo_reaper_tick(&state);
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0001".to_string()],
+                "a stopped session must not be stopped again"
+            );
 
-        // A job the listing no longer names is forgotten without a stop.
-        seed_dispatch(&state, "job0002", task);
-        std::fs::write(&agents_file, "[]").unwrap();
-        todo_reaper_tick(&state);
-        assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
-        assert_eq!(dispatched_task(&state, "job0002"), None);
+            // A job the listing no longer names is forgotten without a stop.
+            seed_dispatch(&state, "job0002", task);
+            std::fs::write(&agents_file, "[]").unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+            assert_eq!(dispatched_task(&state, "job0002"), None);
 
-        // A failing stop keeps its entry, so the next pass retries.
-        std::fs::write(stub_dir.path().join("stop-fail"), "").unwrap();
-        seed_dispatch(&state, "job0003", task);
-        std::fs::write(
-            &agents_file,
-            agents_listing("job0003", Some(4242), Some("idle")),
-        )
-        .unwrap();
-        todo_reaper_tick(&state);
-        assert_eq!(
-            stops(&stop_log),
-            vec!["job0001".to_string(), "job0003".to_string()],
-            "the failing stop must still have been attempted"
-        );
-        assert_eq!(
-            dispatched_task(&state, "job0003"),
-            Some(task),
-            "a failed stop keeps its entry for the next pass"
-        );
+            // A failing stop keeps its entry, so the next pass retries.
+            std::fs::write(stub_dir.path().join("stop-fail"), "").unwrap();
+            seed_dispatch(&state, "job0003", task);
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0003", Some(4242), Some("idle")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0001".to_string(), "job0003".to_string()],
+                "the failing stop must still have been attempted"
+            );
+            assert_eq!(
+                dispatched_task(&state, "job0003"),
+                Some(task),
+                "a failed stop keeps its entry for the next pass"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -10291,35 +10340,41 @@ exit 2
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let agents_file = stub_dir.path().join("agents.json");
-        let stop_log = stub_dir.path().join("stops.log");
-        let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let task = new_task(&state, project);
-        // A session dispatched onto this task earlier, whose task was pushed
-        // back to `todo` before any reaper pass reached it.
-        seed_dispatch(&state, "job0009", task);
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let task = new_task(&state, project);
+            // A session dispatched onto this task earlier, whose task was pushed
+            // back to `todo` before any reaper pass reached it.
+            seed_dispatch(&state, "job0009", task);
 
-        todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
 
-        assert_eq!(
-            stops(&stop_log),
-            vec!["job0009".to_string()],
-            "re-dispatching a task must stop the session it supersedes"
-        );
-        assert_eq!(dispatched_task(&state, "job0009"), None);
-        assert_eq!(
-            dispatched_task(&state, "job0001"),
-            Some(task),
-            "the fresh session takes the task's place in the map"
-        );
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0009".to_string()],
+                "re-dispatching a task must stop the session it supersedes"
+            );
+            assert_eq!(dispatched_task(&state, "job0009"), None);
+            assert_eq!(
+                dispatched_task(&state, "job0001"),
+                Some(task),
+                "the fresh session takes the task's place in the map"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -10334,87 +10389,93 @@ exit 2
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let agents_file = stub_dir.path().join("agents.json");
-        let stop_log = stub_dir.path().join("stops.log");
-        let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
-        // Every `claude stop` fails while this marker exists.
-        let stop_fail = stub_dir.path().join("stop-fail");
-        std::fs::write(&stop_fail, "").unwrap();
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            // Every `claude stop` fails while this marker exists.
+            let stop_fail = stub_dir.path().join("stop-fail");
+            std::fs::write(&stop_fail, "").unwrap();
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let task = new_task(&state, project);
-        seed_dispatch(&state, "job0009", task);
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let task = new_task(&state, project);
+            seed_dispatch(&state, "job0009", task);
 
-        todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
 
-        assert_eq!(
-            stops(&stop_log),
-            vec!["job0009".to_string()],
-            "the supersede stop must have been attempted"
-        );
-        assert_eq!(
-            dispatched_task(&state, "job0009"),
-            Some(task),
-            "a failed supersede stop must keep its entry"
-        );
-        assert_eq!(superseded(&state, "job0009"), Some(true));
-        assert_eq!(dispatched_task(&state, "job0001"), Some(task));
-        assert_eq!(superseded(&state, "job0001"), Some(false));
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0009".to_string()],
+                "the supersede stop must have been attempted"
+            );
+            assert_eq!(
+                dispatched_task(&state, "job0009"),
+                Some(task),
+                "a failed supersede stop must keep its entry"
+            );
+            assert_eq!(superseded(&state, "job0009"), Some(true));
+            assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+            assert_eq!(superseded(&state, "job0001"), Some(false));
 
-        // The next reaper pass finishes the job: the task is `in_progress`
-        // again under the new session, so only the superseded flag can tell
-        // the two entries apart.
-        std::fs::remove_file(&stop_fail).unwrap();
-        assert_eq!(
-            state.store.lock().unwrap().get_task(task).unwrap().status,
-            Status::InProgress
-        );
-        std::fs::write(
-            &agents_file,
-            serde_json::json!([
-                {
-                    "pid": 4242,
-                    "id": "job0009",
-                    "cwd": "/tmp",
-                    "kind": "background",
-                    "startedAt": 1_783_000_000_000i64,
-                    "sessionId": "job0009-0000-0000-0000-000000000000",
-                    "status": "idle",
-                    "state": "done",
-                },
-                {
-                    "pid": 4243,
-                    "id": "job0001",
-                    "cwd": "/tmp",
-                    "kind": "background",
-                    "startedAt": 1_783_000_000_000i64,
-                    "sessionId": "job0001-0000-0000-0000-000000000000",
-                    "status": "idle",
-                    "state": "done",
-                },
-            ])
-            .to_string(),
-        )
-        .unwrap();
-        todo_reaper_tick(&state);
+            // The next reaper pass finishes the job: the task is `in_progress`
+            // again under the new session, so only the superseded flag can tell
+            // the two entries apart.
+            std::fs::remove_file(&stop_fail).unwrap();
+            assert_eq!(
+                state.store.lock().unwrap().get_task(task).unwrap().status,
+                Status::InProgress
+            );
+            std::fs::write(
+                &agents_file,
+                serde_json::json!([
+                    {
+                        "pid": 4242,
+                        "id": "job0009",
+                        "cwd": "/tmp",
+                        "kind": "background",
+                        "startedAt": 1_783_000_000_000i64,
+                        "sessionId": "job0009-0000-0000-0000-000000000000",
+                        "status": "idle",
+                        "state": "done",
+                    },
+                    {
+                        "pid": 4243,
+                        "id": "job0001",
+                        "cwd": "/tmp",
+                        "kind": "background",
+                        "startedAt": 1_783_000_000_000i64,
+                        "sessionId": "job0001-0000-0000-0000-000000000000",
+                        "status": "idle",
+                        "state": "done",
+                    },
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
 
-        assert_eq!(
-            stops(&stop_log),
-            vec!["job0009".to_string(), "job0009".to_string()],
-            "the retry must stop the superseded session and nothing else"
-        );
-        assert_eq!(dispatched_task(&state, "job0009"), None);
-        assert_eq!(
-            dispatched_task(&state, "job0001"),
-            Some(task),
-            "the session actually working the task must be left alone"
-        );
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0009".to_string(), "job0009".to_string()],
+                "the retry must stop the superseded session and nothing else"
+            );
+            assert_eq!(dispatched_task(&state, "job0009"), None);
+            assert_eq!(
+                dispatched_task(&state, "job0001"),
+                Some(task),
+                "the session actually working the task must be left alone"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     // --- the configurable per-project concurrency limit (mesa task 777) ----
@@ -10438,50 +10499,56 @@ exit 2
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
-        config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let first = new_task(&state, project);
-        let second = new_task(&state, project);
-        let third = new_task(&state, project);
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let first = new_task(&state, project);
+            let second = new_task(&state, project);
+            let third = new_task(&state, project);
 
-        // One tick fills both slots — the limit is a ceiling on concurrent
-        // agents, not a rate of one per tick.
-        todo_watcher_tick(&state);
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "two dispatches in one tick: {log:?}"
-        );
-        assert_eq!(get(first), Status::InProgress);
-        assert_eq!(get(second), Status::InProgress);
-        assert_eq!(get(third), Status::Todo, "the third waits for a free slot");
+            // One tick fills both slots — the limit is a ceiling on concurrent
+            // agents, not a rate of one per tick.
+            todo_watcher_tick(&state);
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "two dispatches in one tick: {log:?}"
+            );
+            assert_eq!(get(first), Status::InProgress);
+            assert_eq!(get(second), Status::InProgress);
+            assert_eq!(get(third), Status::Todo, "the third waits for a free slot");
 
-        // Full: further ticks dispatch nothing.
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 2, "the project is full: {log:?}");
+            // Full: further ticks dispatch nothing.
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 2, "the project is full: {log:?}");
 
-        // Freeing one slot releases exactly one more.
-        set_status(&state, first, Status::Done);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            3,
-            "the freed slot is refilled: {log:?}"
-        );
-        assert_eq!(get(third), Status::InProgress);
+            // Freeing one slot releases exactly one more.
+            set_status(&state, first, Status::Done);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                3,
+                "the freed slot is refilled: {log:?}"
+            );
+            assert_eq!(get(third), Status::InProgress);
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -10493,27 +10560,33 @@ exit 2
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        // `stub_claude_bg` pins MESA_CONFIG_FILE at a path that does not exist.
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            // `stub_claude_bg` pins MESA_CONFIG_FILE at a path that does not exist.
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let first = new_task(&state, project);
-        let second = new_task(&state, project);
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let first = new_task(&state, project);
+            let second = new_task(&state, project);
 
-        todo_watcher_tick(&state);
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 1, "one agent per project: {log:?}");
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        assert_eq!(get(first), Status::InProgress);
-        assert_eq!(get(second), Status::Todo);
+            todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 1, "one agent per project: {log:?}");
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            assert_eq!(get(first), Status::InProgress);
+            assert_eq!(get(second), Status::Todo);
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     // --- live shells / subagents park a slot (mesa task 802) --------------
@@ -10563,76 +10636,82 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let sessions = stub_dir.path().join("sessions.json");
-        let bin = stub_claude_agents(stub_dir.path(), &sessions, &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let sessions = stub_dir.path().join("sessions.json");
+            let bin = stub_claude_agents(stub_dir.path(), &sessions, &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let local_path = proj_dir.path().to_str().unwrap().to_string();
-        let project = new_project(&state, Some(&local_path));
-        let first = new_task(&state, project);
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let local_path = proj_dir.path().to_str().unwrap().to_string();
+            let project = new_project(&state, Some(&local_path));
+            let first = new_task(&state, project);
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
 
-        // A `done` session in this project's folder, with a subagent
-        // transcript written just now.
-        let session_id = "e34b8ed9-d391-4797-9d39-546d5b463357";
-        std::fs::write(
-            &sessions,
-            serde_json::json!([{
-                "pid": 4242, "id": "e34b8ed9", "cwd": local_path,
-                "kind": "background", "startedAt": 1, "sessionId": session_id,
-                "status": "idle", "state": "done",
-            }])
-            .to_string(),
-        )
-        .unwrap();
-        let cc_dir = tempfile::tempdir().unwrap();
-        let subagents = cc_dir
-            .path()
-            .join("-proj")
-            .join(session_id)
-            .join("subagents");
-        std::fs::create_dir_all(&subagents).unwrap();
-        std::fs::write(subagents.join("agent-1.jsonl"), "{}").unwrap();
-        unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", cc_dir.path()) };
+            // A `done` session in this project's folder, with a subagent
+            // transcript written just now.
+            let session_id = "e34b8ed9-d391-4797-9d39-546d5b463357";
+            std::fs::write(
+                &sessions,
+                serde_json::json!([{
+                    "pid": 4242, "id": "e34b8ed9", "cwd": local_path,
+                    "kind": "background", "startedAt": 1, "sessionId": session_id,
+                    "status": "idle", "state": "done",
+                }])
+                .to_string(),
+            )
+            .unwrap();
+            let cc_dir = tempfile::tempdir().unwrap();
+            let subagents = cc_dir
+                .path()
+                .join("-proj")
+                .join(session_id)
+                .join("subagents");
+            std::fs::create_dir_all(&subagents).unwrap();
+            std::fs::write(subagents.join("agent-1.jsonl"), "{}").unwrap();
+            unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", cc_dir.path()) };
 
-        todo_watcher_tick(&state);
-        assert!(
-            std::fs::read_to_string(&log_path).is_err(),
-            "a session with work in flight parks the project's only slot"
-        );
-        assert_eq!(get(first), Status::Todo);
+            todo_watcher_tick(&state);
+            assert!(
+                std::fs::read_to_string(&log_path).is_err(),
+                "a session with work in flight parks the project's only slot"
+            );
+            assert_eq!(get(first), Status::Todo);
 
-        // The session finishes: nothing live, and the slot refills.
-        std::fs::write(&sessions, "[]").unwrap();
-        todo_watcher_tick(&state);
-        assert_eq!(
-            std::fs::read_to_string(&log_path)
-                .unwrap_or_default()
-                .lines()
-                .count(),
-            1,
-            "dispatch resumes once the work is gone"
-        );
-        assert_eq!(get(first), Status::InProgress);
+            // The session finishes: nothing live, and the slot refills.
+            std::fs::write(&sessions, "[]").unwrap();
+            todo_watcher_tick(&state);
+            assert_eq!(
+                std::fs::read_to_string(&log_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .count(),
+                1,
+                "dispatch resumes once the work is gone"
+            );
+            assert_eq!(get(first), Status::InProgress);
 
-        // And the probe fails **open**: with no session service at all the
-        // watcher still dispatches rather than parking forever.
-        set_status(&state, first, Status::Done);
-        let second = new_task(&state, project);
-        std::fs::remove_file(&sessions).unwrap();
-        todo_watcher_tick(&state);
-        assert_eq!(
-            get(second),
-            Status::InProgress,
-            "a broken `claude agents` must not park the watcher"
-        );
+            // And the probe fails **open**: with no session service at all the
+            // watcher still dispatches rather than parking forever.
+            set_status(&state, first, Status::Done);
+            let second = new_task(&state, project);
+            std::fs::remove_file(&sessions).unwrap();
+            todo_watcher_tick(&state);
+            assert_eq!(
+                get(second),
+                Status::InProgress,
+                "a broken `claude agents` must not park the watcher"
+            );
 
-        unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -10641,48 +10720,54 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
-        let config = config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 3}}"#);
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            let config = config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 3}}"#);
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let ids: Vec<i64> = (0..4).map(|_| new_task(&state, project)).collect();
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let ids: Vec<i64> = (0..4).map(|_| new_task(&state, project)).collect();
 
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 3, "three slots filled: {log:?}");
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 3, "three slots filled: {log:?}");
 
-        // Lowered under the in-flight count, mid-run, with no restart: the
-        // next tick reads the new value, dispatches nothing, and de-claims
-        // nothing.
-        std::fs::write(&config, r#"{"watchers": {"todo-concurrency": 1}}"#).unwrap();
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 3, "nothing new is picked: {log:?}");
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        for id in &ids[..3] {
-            assert_eq!(get(*id), Status::InProgress, "in-flight work is untouched");
-        }
-        assert_eq!(get(ids[3]), Status::Todo);
+            // Lowered under the in-flight count, mid-run, with no restart: the
+            // next tick reads the new value, dispatches nothing, and de-claims
+            // nothing.
+            std::fs::write(&config, r#"{"watchers": {"todo-concurrency": 1}}"#).unwrap();
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 3, "nothing new is picked: {log:?}");
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            for id in &ids[..3] {
+                assert_eq!(get(*id), Status::InProgress, "in-flight work is untouched");
+            }
+            assert_eq!(get(ids[3]), Status::Todo);
 
-        // Only once the count falls back under the new limit does it move.
-        for id in &ids[..3] {
-            set_status(&state, *id, Status::Done);
-        }
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            4,
-            "one more, at the new limit: {log:?}"
-        );
-        assert_eq!(get(ids[3]), Status::InProgress);
+            // Only once the count falls back under the new limit does it move.
+            for id in &ids[..3] {
+                set_status(&state, *id, Status::Done);
+            }
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                4,
+                "one more, at the new limit: {log:?}"
+            );
+            assert_eq!(get(ids[3]), Status::InProgress);
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     #[test]
@@ -10727,38 +10812,44 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
-        config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+        // A dispatch seeds the `supervisor` agent definition under `$HOME`
+        // (mesa task 1075), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            config_with(stub_dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
 
-        let (_dir, state) = test_state();
-        let proj_dir = tempfile::tempdir().unwrap();
-        let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
-        let epic = new_task(&state, project);
-        let child_a = new_subtask(&state, project, epic, "a");
-        let child_b = new_subtask(&state, project, epic, "b");
-        let outsider = new_task(&state, project);
-        set_status(&state, epic, Status::InProgress);
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let epic = new_task(&state, project);
+            let child_a = new_subtask(&state, project, epic, "a");
+            let child_b = new_subtask(&state, project, epic, "b");
+            let outsider = new_task(&state, project);
+            set_status(&state, epic, Status::InProgress);
 
-        todo_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "the umbrella occupies no slot, so both fill from under it: {log:?}"
-        );
-        let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
-        assert_eq!(get(child_a), Status::InProgress);
-        assert_eq!(get(child_b), Status::InProgress);
-        assert_eq!(
-            get(outsider),
-            Status::Todo,
-            "an open umbrella unblocks its own children and nothing else"
-        );
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "the umbrella occupies no slot, so both fill from under it: {log:?}"
+            );
+            let get = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+            assert_eq!(get(child_a), Status::InProgress);
+            assert_eq!(get(child_b), Status::InProgress);
+            assert_eq!(
+                get(outsider),
+                Status::Todo,
+                "an open umbrella unblocks its own children and nothing else"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     // --- inbox watcher (mesa task 544) -----------------------------------

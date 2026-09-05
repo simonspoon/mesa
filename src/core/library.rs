@@ -44,6 +44,11 @@ pub struct Builtin {
 /// is an [`LibraryKind::Agent`] it has a real path — `.claude/agents/mesa-live.md`
 /// — so the sync flow carries it like any other agent definition, and
 /// `core::live::ensure_agent_definition` seeds it there on the first spawn.
+/// `supervisor` is the same shape one step up (mesa task 1075): the agent
+/// definition an `/execute-todo` run is *supervised* as, body
+/// `core::supervisor::SUPERVISOR_DEFINITION`, at
+/// `.claude/agents/supervisor.md`, seeded by
+/// `core::supervisor::ensure_agent_definition` on the first dispatch.
 /// `live-summary-prompt` is still a `prompt` (mesa task 921): the instructions
 /// for the short-lived agent that writes a live conversation's memory once it
 /// ends, body `core::live::SUMMARY_PROMPT`, spawned as a plain prompt rather
@@ -55,6 +60,13 @@ pub const BUILTINS: &[Builtin] = &[
         kind: LibraryKind::Agent,
         scope: LibraryScope::User,
         body: crate::core::live::AGENT_DEFINITION,
+    },
+    Builtin {
+        id: crate::core::supervisor::SUPERVISOR_AGENT_BUILTIN,
+        name: crate::core::supervisor::SUPERVISOR_AGENT_BUILTIN,
+        kind: LibraryKind::Agent,
+        scope: LibraryScope::User,
+        body: crate::core::supervisor::SUPERVISOR_DEFINITION,
     },
     Builtin {
         id: "live-summary-prompt",
@@ -205,6 +217,52 @@ pub fn resolve(base: &Path, rel: &Path) -> Result<PathBuf, String> {
             base_canon.display()
         ))
     }
+}
+
+/// Writes a built-in **agent definition** to its user-scope path if it is not
+/// there already, and answers where it went. Both named-agent features seed
+/// their definition this way before spawning — `mesa-live`
+/// ([`crate::core::live::ensure_agent_definition`]) and `supervisor`
+/// ([`crate::core::supervisor::ensure_agent_definition`]) — because
+/// `claude --agent <name>` errors on an agent Claude Code has never seen and
+/// nothing else puts the file there: the library sync is a thing the user
+/// runs, not something a spawn may depend on.
+///
+/// The body is the effective row for `builtin_id`: its library fork if one
+/// exists, `fallback` otherwise. The target goes through this module's own
+/// path machinery ([`relative_path`], [`scope_base`] and the [`resolve`]
+/// traversal chokepoint), so `$HOME` is honoured and the containment check
+/// holds here exactly as it does on the sync path.
+///
+/// It **never overwrites**. After the first seed the file belongs to the sync
+/// flow, where a difference between disk and mesa is a row the user resolves —
+/// silently rewriting it on every spawn would make one side of that decision
+/// impossible to keep.
+pub fn ensure_agent_file(
+    store: &Store,
+    builtin_id: &str,
+    fallback: &str,
+) -> Result<PathBuf, String> {
+    let body = store
+        .find_library_fork(builtin_id)
+        .ok()
+        .flatten()
+        .map(|item| item.body)
+        .unwrap_or_else(|| fallback.to_string());
+    let rel = relative_path(LibraryKind::Agent, LibraryScope::User, builtin_id)
+        .ok_or_else(|| format!("{builtin_id} has no path"))?;
+    let base = scope_base(LibraryScope::User, None)
+        .ok_or_else(|| format!("cannot seed the {builtin_id} agent definition: no HOME"))?;
+    let full = resolve(&base, &rel)?;
+    if full.exists() {
+        return Ok(full);
+    }
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    fs::write(&full, body).map_err(|e| format!("cannot write {}: {e}", full.display()))?;
+    Ok(full)
 }
 
 /// The sync decision table (`docs` in the design), a total function over the
@@ -1289,6 +1347,7 @@ mod tests {
     #[test]
     fn builtin_lookup() {
         assert!(builtin("mesa-live").is_some());
+        assert!(builtin("supervisor").is_some());
         assert!(builtin("live-summary-prompt").is_some());
         assert!(builtin("starter-claude-md").is_some());
         assert!(builtin("stop-notify").is_some());

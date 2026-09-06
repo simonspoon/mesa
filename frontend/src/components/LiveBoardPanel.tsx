@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { liveBoardRenderUrl } from '../api'
 import {
   boardAt,
@@ -10,6 +10,12 @@ import {
   stepBoard,
   type BoardView,
 } from '../liveBoard'
+import {
+  clampLiveBoardWidth,
+  clearLiveBoardWidth,
+  loadLiveBoardWidth,
+  saveLiveBoardWidth,
+} from '../liveBoardWidth'
 import type { LiveBoardSummary } from '../types/LiveBoardSummary'
 import { useFetch } from '../useFetch'
 import { Markdown } from './Markdown'
@@ -112,6 +118,40 @@ function CloseMark() {
   )
 }
 
+/** Maximise/restore, drawn as four corner brackets pointing out or in —
+ *  `AgentSidebar`'s own `MaximizeGlyph`, redrawn on the 24-unit grid every
+ *  `.live-icon-mark` uses (as `CloseMark` above is `LiveHub`'s close glyph
+ *  redrawn), rather than a glyph-font character whose weight and baseline
+ *  differ per platform. */
+function MaximizeMark({ restore }: { restore: boolean }) {
+  return (
+    <svg
+      className="live-icon-mark"
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {restore ? (
+        <>
+          <path d="M4 9h5V4" />
+          <path d="M20 9h-5V4" />
+          <path d="M20 15h-5v5" />
+          <path d="M4 15h5v5" />
+        </>
+      ) : (
+        <>
+          <path d="M4 9V4h5" />
+          <path d="M15 4h5v5" />
+          <path d="M20 15v5h-5" />
+          <path d="M9 20H4v-5" />
+        </>
+      )}
+    </svg>
+  )
+}
+
 export function LiveBoardPanel({
   boards,
   open,
@@ -158,11 +198,101 @@ export function LiveBoardPanel({
     setView((held) => ({ ...held, index: stepBoard(held.index, delta, boards.length) }))
   }
 
+  // How wide the picture is, and this browser's own business exactly as which
+  // board is showing is. `null` is "no opinion", and the panel then sets no
+  // inline custom property at all so App.css's `min(40rem, 50vw)` stands —
+  // see `liveBoardWidth.ts` for why the default cannot be a number.
+  const [width, setWidth] = useState<number | null>(() => loadLiveBoardWidth())
+  const [resizing, setResizing] = useState(false)
+  // Maximised: the board covers the whole main area — the page behind it, and
+  // nothing else. It is `width: 100%` of `.main-slot`, which is what the panel
+  // is positioned inside, so the conversation sidebar and the left nav are out
+  // of reach by construction rather than by arithmetic.
+  const [maximized, setMaximized] = useState(false)
+  const asideRef = useRef<HTMLElement | null>(null)
+  // The width the drag has reached, so `mouseup` can store it without the
+  // effect having to re-subscribe on every frame of the drag.
+  const widthRef = useRef(width)
+
+  // Drag-resize: the handle is on the panel's left edge and the panel is
+  // pinned to `.main-slot`'s right edge, so the new width is the distance from
+  // the pointer to that edge — measured off the offset parent rather than the
+  // viewport, since the slot is what the panel is 100% of. Listeners live on
+  // `document`, not the handle, so the drag keeps tracking when the pointer
+  // outruns it (`AgentSidebar`'s own splitter, and its reason).
+  useEffect(() => {
+    if (!resizing) return
+    const onMove = (e: MouseEvent) => {
+      const slot = asideRef.current?.offsetParent
+      if (!(slot instanceof HTMLElement)) return
+      const box = slot.getBoundingClientRect()
+      const next = clampLiveBoardWidth(box.right - e.clientX, box.width)
+      widthRef.current = next
+      setWidth(next)
+    }
+    const onUp = () => {
+      setResizing(false)
+      // Stored on release rather than per frame: a drag is one decision, and
+      // localStorage is synchronous.
+      if (widthRef.current !== null) saveLiveBoardWidth(widthRef.current)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.classList.add('live-board-resizing')
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('live-board-resizing')
+    }
+  }, [resizing])
+
+  // Escape is the way out of whatever the panel is currently doing: it
+  // restores a maximised board first, and only closes the panel once the board
+  // is back at its own width — one press should never both un-maximise and
+  // dismiss. Bound only while open, so it never swallows an Escape the rest of
+  // the app wants while there is no board on screen.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (maximized) setMaximized(false)
+      else onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, maximized, onClose])
+
   return (
     <aside
-      className={`live-board${open ? '' : ' collapsed'}`}
+      ref={asideRef}
+      className={`live-board${open ? '' : ' collapsed'}${maximized ? ' maximized' : ''}${
+        resizing ? ' resizing' : ''
+      }`}
+      // Nothing stored and nothing dragged means no inline property at all —
+      // the stylesheet's `min(40rem, 50vw)` is the default, not a number.
+      style={
+        width === null
+          ? undefined
+          : ({ '--live-board-width': `${width}px` } as CSSProperties)
+      }
       aria-label="the live whiteboard"
     >
+      {/* Not rendered while maximised (there is no width to drag) nor while
+          clipped away, where the pointer cannot reach it anyway. */}
+      {open && !maximized && (
+        <div
+          className="live-board-resize-handle"
+          onMouseDown={(e) => {
+            e.preventDefault()
+            setResizing(true)
+          }}
+          onDoubleClick={() => {
+            widthRef.current = null
+            clearLiveBoardWidth()
+            setWidth(null)
+          }}
+        />
+      )}
       <div className="live-board-body">
         <div className="live-sidebar-head live-board-head">
           <div className="live-head-row">
@@ -206,6 +336,20 @@ export function LiveBoardPanel({
                   </button>
                 </div>
               )}
+              <button
+                type="button"
+                className="live-icon live-board-maximize"
+                aria-label={
+                  maximized
+                    ? 'restore the whiteboard width'
+                    : 'fill the page with the whiteboard'
+                }
+                title={maximized ? 'Restore width (Esc)' : 'Fill the page'}
+                tabIndex={open ? undefined : -1}
+                onClick={() => setMaximized((m) => !m)}
+              >
+                <MaximizeMark restore={maximized} />
+              </button>
               <button
                 type="button"
                 className="live-icon live-board-close"

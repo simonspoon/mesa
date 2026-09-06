@@ -555,6 +555,26 @@ history as pointers and never a body. The board that is showing is the last
 element; a body is fetched once, for the one board being looked at, through the
 render route. There is deliberately **no second poll route**.
 
+### The panel is the person's, not the agent's
+
+The width is a drag handle on the panel's left edge, stored per browser in
+`localStorage` (`frontend/src/liveBoardWidth.ts`, mesa task 1078) and floored
+at 384px, and a maximise button in the head fills the whole main area with the
+board. Both are browser-side and route-free, exactly as the close button is: a
+picture put away, or looked at closer, is not a write. Escape restores a
+maximised board and, once it is back at its own width, closes the panel — one
+press should never do both.
+
+The unset default is the stylesheet's own `min(40rem, 50vw)` and stays that
+way: nothing is written to the inline custom property until the person drags,
+because that expression answers differently per window and any number stored in
+its place would stop it doing so. What a drag must never do is change the
+panel's width with a *transition*: the `<iframe>` this panel exists to hold is
+never unmounted (a torn-down frame reloads its document), so an animated width
+would be a framed document re-laying itself out on every frame. Only
+`clip-path` animates here, which is the same rule the open/close already
+follows.
+
 ### CLI
 
 `mesa live board` — five verbs, each on THE current session like the rest of

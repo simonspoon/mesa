@@ -3507,7 +3507,8 @@ main {
    page doesn't get selected as the pointer sweeps across it. */
 body.agent-sidebar-resizing,
 body.nav-resizing,
-body.files-tree-resizing {
+body.files-tree-resizing,
+body.live-board-resizing {
   user-select: none;
   cursor: col-resize;
 }
@@ -8778,7 +8779,15 @@ button:focus-visible,
    read at. A conversation is a column of short sentences; an HTML mockup, a
    diagram or a screenshot is a document, so this panel is wider —
    `min(40rem, 50vw)`, the same `min` shape, capped at the page's own width so
-   a narrow window is covered rather than overrun. */
+   a narrow window is covered rather than overrun.
+
+   That is the *default* only (mesa task 1078): the drag handle on the left
+   edge overrides `--live-board-width` inline, and the stored width is a
+   number, so this expression is what a browser that has never dragged paints.
+   Both must move together — see `liveBoardWidth.ts`, which is also why an
+   unset width sets no inline property rather than a px twin of this rule: it
+   answers 640px on a laptop and on a 3440px monitor alike, and no single
+   number is that on both. */
 .live-board {
   --live-board-width: min(40rem, 50vw);
   position: absolute;
@@ -8812,6 +8821,34 @@ button:focus-visible,
 .live-board.collapsed {
   clip-path: inset(0 0 0 100%);
   pointer-events: none;
+}
+
+/* Maximised: the whole main area, which is exactly `.main-slot` — the panel's
+   own containing block. So the board covers the page behind it and reaches
+   neither the conversation sidebar nor the left nav, by construction rather
+   than by subtracting their widths from something. */
+.live-board.maximized {
+  width: 100%;
+}
+
+/* The splitter, `.agent-sidebar-resize-handle`'s twin: a 6px strip straddling
+   the panel's left edge. Deliberately no `transition` anywhere on this panel's
+   width — see `.live-board.collapsed` above: a width that animates is a framed
+   document re-laying itself out on every frame, and a drag is a width that
+   moves once per pointer event already. */
+.live-board-resize-handle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.live-board-resize-handle:hover,
+.live-board.resizing .live-board-resize-handle {
+  background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
 }
 
 .live-board-body {
@@ -8865,7 +8902,9 @@ button:focus-visible,
   white-space: nowrap;
 }
 
-/* The board itself gets everything the head does not. */
+/* The board itself gets everything the head does not. `overflow: auto` on
+   both axes: a board wider than the panel scrolls sideways rather than being
+   cut off, which is the whole reason the panel can now be widened at all. */
 .live-board-content {
   flex: 1;
   min-height: 0;
@@ -8884,8 +8923,14 @@ button:focus-visible,
   background: #fff;
 }
 
+/* Fit to the panel's width by default — the widest a pushed screenshot can be
+   read at, and what makes widening the panel do something for an image board.
+   `max-content` is the image's own natural width, so it is never blown up past
+   its pixels; `margin: auto` then centres whatever is left over. */
 .live-board-image {
-  max-width: 100%;
+  width: 100%;
+  max-width: max-content;
+  height: auto;
   margin: auto;
   object-fit: contain;
 }
@@ -9421,6 +9466,16 @@ button:focus-visible,
     height: calc(var(--phone-shell-height) - var(--phone-tabbar-reserve));
     z-index: 1199;
     border-left: 1px solid var(--border-bright);
+  }
+
+  /* Maximised is the whole screen here rather than the desktop rule's
+     `100%`: the drawer is `position: fixed`, so its containing block is the
+     viewport and not `.main-slot`, and a percentage would be measured against
+     an ancestor this panel no longer sits inside. The narrower default above
+     also has to be beaten on its own terms — it is declared later in the
+     sheet than `.live-board.maximized`, so the tie has to be broken here. */
+  .live-board.maximized:not(.collapsed) {
+    width: 100vw;
   }
 
   .live-board:not(.collapsed) .live-board-body {

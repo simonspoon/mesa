@@ -106,7 +106,7 @@ The code is the source of truth. These are the invariants you must not break:
   `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
   `fileSearch`, `fileTabs`, `filesTreeWidth`, `inboxFilter`, `inboxKind`, `inboxOrigin`, `inboxQueue`, `inboxRead`,
   `keyboardScope`,
-  `lastView`, `layout`, `libraryBundle`, `libraryDraft`, `librarySync`, `listenDraft`, `liveAudio`, `liveBand`, `liveBoard`, `liveCapture`, `liveContext`, `liveDevices`, `liveHead`, `liveIndicator`, `livePromptDraft`,
+  `lastView`, `layout`, `libraryBundle`, `libraryDraft`, `librarySync`, `listenDraft`, `liveAudio`, `liveBand`, `liveBoard`, `liveBoardWidth`, `liveCapture`, `liveContext`, `liveDevices`, `liveHead`, `liveIndicator`, `livePromptDraft`,
   `liveRecognition`,
   `liveSession`,
   `liveTurns`,

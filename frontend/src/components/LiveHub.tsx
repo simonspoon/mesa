@@ -47,6 +47,8 @@ import {
   writeInputChoice,
   type AudioInput,
 } from '../liveDevices'
+import { chordLabel, matchesShortcut } from '../keymap'
+import { useKeymap } from '../keymapStore'
 import { elapsedLabel, endsInHead, liveHeadTitle } from '../liveHead'
 import { headerIndicator } from '../liveIndicator'
 import {
@@ -54,7 +56,6 @@ import {
   captureHint,
   correctVocabulary,
   isBlockingError,
-  isListenChord,
   isSilentTranscribe,
   HEARING_HOLD_MS,
   LISTEN_CHORD,
@@ -122,7 +123,8 @@ import { useFetch } from '../useFetch'
  * recording path (`liveRecognition.ts`, task 873) completely unchanged: it
  * **holds** every settled utterance and sends the whole recording as one
  * `user` turn once the person goes quiet — the wait `live.auto-send-ms`
- * names — with the listen switch (`isListenChord` or the panel's button, task
+ * names — with the listen switch (the `live-listen` chord or the panel's
+ * button, task
  * 887) as an explicit early send; the same press is also what mutes the
  * microphone and keeps it muted for the rest of that session. The capture box
  * in the conversation panel stays as the fallback — a browser with no way to
@@ -351,6 +353,12 @@ export function LiveHub({
    *  while the conversation is shut as often as not. */
   boardSlot: HTMLElement | null
 }) {
+  // What the listen switch is bound to (mesa task 1079). The keymap is the
+  // page-wide one; the label is what the button's title and the capture hint
+  // say, so a rebound chord is named wherever the shipped one used to be.
+  const keymap = useKeymap()
+  const listenChordLabel = chordLabel(keymap['live-listen'][0] ?? LISTEN_CHORD)
+
   // The exclusive id cursor the poll asks from. A ref, not state: it is read
   // inside `load` on every tick and rendered nowhere, so advancing it must not
   // cost a render.
@@ -468,7 +476,7 @@ export function LiveHub({
   // *initialises* muted — a page with no conversation joined is not listening
   // to the room — but joining one opens it on its own (`micOpenedFor` below,
   // mesa task 917): a hands-free surface that waits for a press before it can
-  // hear is not hands-free. A press — the keystroke (`isListenChord`) or the
+  // hear is not hands-free. A press — the keystroke (`live-listen`) or the
   // button in the conversation panel — is what turns it back off, and keeps
   // it off for the rest of that session. Browser-side and this browser's
   // alone, like pause: no route, no session state, and mesa carries on
@@ -1163,20 +1171,21 @@ export function LiveHub({
   // listener of the hub's own, in the shape of the command palette's, because
   // the capture box holds the keyboard for most of a conversation: the switch
   // has to be reachable from inside a focused text field, which is the whole
-  // reason it is a chord rather than a key (`isListenChord`).
+  // reason it is a chord rather than a key — the `live-listen` action in
+  // `keymap.ts`, rebindable from Settings since mesa task 1079.
   //
   // Always `preventDefault`, like the palette's: whatever the browser does
   // with this chord, the conversation's microphone is the stronger claim
   // while mesa is on screen.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!isListenChord(e)) return
+      if (!matchesShortcut('live-listen', e, keymap)) return
       e.preventDefault()
       toggleListening(!mutedRef.current)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [toggleListening])
+  }, [toggleListening, keymap])
 
   // Capture opens a stream and a worklet rather than a recognizer (mesa task
   // 956) — this is the auris half of the pair task 957 added, guarded on
@@ -2516,7 +2525,7 @@ export function LiveHub({
                       tabIndex={open ? undefined : -1}
                       title={`${
                         muted ? 'Listen through this browser' : 'Stop listening'
-                      } (${LISTEN_CHORD})`}
+                      } (${listenChordLabel})`}
                       onClick={() => toggleListening(!muted)}
                     >
                       <MicMark />
@@ -2568,6 +2577,7 @@ export function LiveHub({
                       listening: recognizes,
                       paused,
                       muted,
+                      chord: listenChordLabel,
                     })}{' '}
                     {!paused && 'Enter sends.'}
                   </span>

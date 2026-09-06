@@ -8,6 +8,8 @@ import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
 import { inboxFilterFor } from './inboxFilter'
 import { unreadCount } from './inboxRead'
+import { matchesShortcut, type Keymap } from './keymap'
+import { useKeymap } from './keymapStore'
 import { rememberView } from './lastView'
 import { CCDashboardView, type CcTab } from './pages/CCDashboardView'
 import { CCSessionDetailView } from './pages/CCSessionDetailView'
@@ -125,20 +127,20 @@ function HeaderUsage() {
 }
 
 // Cmd+Shift+P (Mac) / Ctrl+Shift+P (elsewhere) opens the command palette,
-// wherever the app is mounted — checked via both metaKey and ctrlKey since
-// the modifier differs by platform. Always preventDefault so the browser's
-// own Ctrl/Cmd+Shift+P binding never fires underneath it.
-function useCommandPaletteShortcut(onOpen: () => void) {
+// wherever the app is mounted — the `command-palette` action in `keymap.ts`,
+// which is what makes it rebindable from Settings (mesa task 1079) and folds
+// the two platforms' modifiers into one `Mod`. Always preventDefault so the
+// browser's own binding for whatever chord this is never fires underneath it.
+function useCommandPaletteShortcut(onOpen: () => void, keymap: Keymap) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
-        e.preventDefault()
-        onOpen()
-      }
+      if (!matchesShortcut('command-palette', e, keymap)) return
+      e.preventDefault()
+      onOpen()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onOpen])
+  }, [onOpen, keymap])
 }
 
 function App() {
@@ -156,11 +158,14 @@ function App() {
   // and the conversation open and close independently, so each is its own
   // flex item on this row.
   const [boardSlot, setBoardSlot] = useState<HTMLDivElement | null>(null)
-  useCommandPaletteShortcut(() => setPaletteOpen(true))
+  // What the keyboard is bound to right now — the shipped chords until the
+  // one `GET /api/config/keymap` this page makes resolves (mesa task 1079).
+  const keymap = useKeymap()
+  useCommandPaletteShortcut(() => setPaletteOpen(true), keymap)
   // h/j/k/l + arrow-key spatial focus nav (mesa spec 449 story 454): a
   // second global window keydown listener, disjoint key set from the
   // shortcut above, mounted alongside it per arch-449-keyboard.md §3.
-  useSpatialNav()
+  useSpatialNav(keymap)
   // Keeps `--visual-viewport-height` current for the phone tier's
   // keyboard-aware shell (mesa task 560). Mounted here because `#root` is the
   // element the var sizes and App is the only permanent owner of it.

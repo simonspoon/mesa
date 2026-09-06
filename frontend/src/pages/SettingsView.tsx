@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   getConfig,
+  getKeymap,
   getListen,
   getLiveConfig,
   getPricing,
@@ -11,6 +12,7 @@ import {
   restartServer,
   speechPreviewUrl,
   updateConfig,
+  updateKeymap,
   updateListen,
   updateLiveConfig,
   updatePricing,
@@ -19,6 +21,27 @@ import {
   type CcResetReport,
 } from '../api'
 import { ConfirmDelete } from '../components/ConfirmDelete'
+import {
+  ACTIONS,
+  DEFAULT_KEYMAP,
+  chordFromEvent,
+  chordLabel,
+  formatChord,
+  type KeymapAction,
+} from '../keymap'
+import {
+  changedKeymap,
+  conflictingActions,
+  draftFrom as keymapDraftFrom,
+  isDirty as isKeymapDirty,
+  isOverridden,
+  isSavable as isKeymapSavable,
+  resetAll,
+  withChord,
+  withReset,
+  type KeymapDraft,
+} from '../keymapDraft'
+import { publishKeymap } from '../keymapStore'
 import {
   RATE_FIELDS,
   addedPricing,
@@ -295,11 +318,221 @@ export function SettingsView() {
       {saveError && <p className="error">{saveError}</p>}
 
       <WatchersSection />
+      <KeymapSection />
       <LivePromptSection />
       <SpeechSection />
       <ListenSection />
       <PricingSection />
     </div>
+  )
+}
+
+/**
+ * Keyboard shortcuts: which chord runs each of mesa's four global keyboard
+ * listeners (mesa task 1079). Its own section, draft and save button, for the
+ * same reason watchers and pricing have theirs — a separate endpoint, so one
+ * form's rejection must not strand the other's edits.
+ *
+ * The draft is the **whole** keymap rather than the overrides, because a
+ * conflict is a fact about every binding at once: a chord recorded here has to
+ * be judged against the six actions the user never touched as well. Only what
+ * actually changed is PUT (`changedKeymap`), and an action drafted back to the
+ * shipped chords is PUT as `null` — a default is an absence, never a stored
+ * copy of itself.
+ */
+function KeymapSection() {
+  const { data: config, error, refetch } = useFetch(() => getKeymap(), 'keymap')
+  const [draft, setDraft] = useState<KeymapDraft | null>(null)
+  const [recording, setRecording] = useState<KeymapAction | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+  // A recorded chord's own keyup must not reach the app either: the
+  // create-task shortcut is bound on keyup (mesa task 817), so recording `a`
+  // would otherwise open the create-task form behind this page.
+  const swallowKeyup = useRef(false)
+
+  const seeded: KeymapDraft = draft ?? (config ? keymapDraftFrom(config) : resetAll())
+
+  // The recording listener. Capture phase on `window`, so it runs before every
+  // global shortcut listener in the app and `stopPropagation` keeps the chord
+  // being recorded from also *firing* — pressing Cmd/Ctrl+Shift+P to rebind
+  // the palette must not open the palette.
+  useEffect(() => {
+    if (recording === null) return
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      if (e.key === 'Escape') {
+        setRecording(null)
+        swallowKeyup.current = true
+        return
+      }
+      const chord = chordFromEvent(e)
+      // A bare modifier is how every chord starts, not a chord: keep waiting.
+      if (chord === null) return
+      setDraft((d) => withChord(d ?? seeded, recording, chord))
+      setRecording(null)
+      setSaved(false)
+      swallowKeyup.current = true
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [recording, seeded])
+
+  useEffect(() => {
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (recording === null && !swallowKeyup.current) return
+      swallowKeyup.current = false
+      e.preventDefault()
+      e.stopPropagation()
+    }
+    window.addEventListener('keyup', onKeyUp, true)
+    return () => window.removeEventListener('keyup', onKeyUp, true)
+  }, [recording])
+
+  function save() {
+    if (!config) return
+    setSaving(true)
+    setSaveError(null)
+    updateKeymap(changedKeymap(config, seeded)).then(
+      (fresh) => {
+        // Re-seed from what the server read back, so the rows show what
+        // landed — and hand the same answer to the listeners, which are
+        // mounted above this page and would otherwise keep the old chords
+        // until a reload.
+        setDraft(keymapDraftFrom(fresh))
+        publishKeymap(fresh)
+        setSaving(false)
+        setSaved(true)
+        refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Keyboard shortcuts</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!config) {
+    return (
+      <>
+        <h2>Keyboard shortcuts</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isKeymapDirty(config, seeded)
+  const savable = isKeymapSavable(seeded)
+  const label = (id: KeymapAction) => ACTIONS.find((a) => a.id === id)?.label ?? id
+
+  return (
+    <>
+      <h2>Keyboard shortcuts</h2>
+      <p className="muted settings-command-blurb">
+        The shortcuts that work anywhere in the app. A chord is recorded from
+        the next key you press — ⌘ and Ctrl are one modifier, so a keymap means
+        the same thing on either platform. Shortcuts without a modifier stand
+        down while you are typing in a field, a terminal or a diagram; ones with
+        a modifier do not. The Files tab's own chords and a form's Escape are
+        not here: they belong to one panel while it is on screen, not to the
+        app.
+      </p>
+      {ACTIONS.map((spec) => {
+        const chords = seeded[spec.id] ?? []
+        const clash = conflictingActions(seeded, spec.id)
+        return (
+          <section className="settings-command" key={spec.id}>
+            <label>
+              <span className="settings-command-title">{spec.label}</span>
+              <code className="settings-command-key">{spec.id}</code>
+            </label>
+            <p className="muted settings-command-blurb">{spec.blurb}</p>
+            <div className="settings-keymap-row">
+              <span className="settings-keymap-chords">
+                {recording === spec.id ? (
+                  <span className="settings-pending">
+                    press a chord — Escape cancels
+                  </span>
+                ) : (
+                  chords.map((chord, i) => (
+                    <span className="settings-keymap-chord" key={chord}>
+                      {i > 0 && <span className="muted">or </span>}
+                      {formatChord(chord).map((cap) => (
+                        <kbd key={cap}>{cap}</kbd>
+                      ))}
+                    </span>
+                  ))
+                )}
+              </span>
+              <button
+                type="button"
+                aria-label={`Change the ${spec.label} shortcut`}
+                onClick={() => {
+                  setRecording(recording === spec.id ? null : spec.id)
+                  setSaved(false)
+                }}
+              >
+                {recording === spec.id ? 'cancel' : 'change'}
+              </button>
+              <button
+                type="button"
+                className="settings-reset"
+                disabled={!isOverridden(seeded, spec.id)}
+                title={`Back to ${DEFAULT_KEYMAP[spec.id].map(chordLabel).join(' or ')}`}
+                onClick={() => {
+                  setDraft(withReset(seeded, spec.id))
+                  setSaved(false)
+                }}
+              >
+                reset
+              </button>
+            </div>
+            {clash.length > 0 && (
+              <p className="error">
+                also bound to {clash.map(label).join(', ')} — one chord belongs
+                to one action
+              </p>
+            )}
+          </section>
+        )
+      })}
+
+      <div className="settings-actions">
+        <button
+          type="button"
+          disabled={!dirty || !savable || saving}
+          onClick={save}
+        >
+          {saving ? 'saving…' : 'save shortcuts'}
+        </button>
+        <button
+          type="button"
+          className="settings-inline-button"
+          onClick={() => {
+            setDraft(resetAll())
+            setRecording(null)
+            setSaved(false)
+          }}
+        >
+          reset all
+        </button>
+        {dirty && savable && !saving && (
+          <span className="muted">unsaved changes</span>
+        )}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {saveError && <p className="error">{saveError}</p>}
+    </>
   )
 }
 

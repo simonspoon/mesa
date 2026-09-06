@@ -3,8 +3,8 @@
 # replace the built-in `claude --bg …` argv — for the todo-watcher, the
 # inbox-watcher and the Agents surface's spawn route — and that a missing or
 # broken config behaves the way docs/config.md says. It also covers the
-# pricing, watchers, speech, live and listen sections that share the same
-# file — the last of these (mesa task 955) names the model `live transcribe`
+# pricing, watchers, keymap, speech, live and listen sections that share the
+# same file — the last of these (mesa task 955) names the model `live transcribe`
 # runs the external `auris` binary with, the input-side mirror of `speech`'s
 # `kokoro-rs` voice.
 #
@@ -594,6 +594,137 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused watchers PUT must not touch the file"
 ok "both watchers verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
+# ---- the keymap section: GET/PUT /api/config/keymap (mesa task 1079) ----
+#
+# The eighth section of the same file, and the only one whose value is a table
+# rather than a fixed set of keys: the body is a flat map of action id to
+# chords, so an absent action is left alone, `null` restores its built-in
+# chords and a list replaces them. It is also the only section with a rule
+# *between* its values — one chord belongs to one action — which the server
+# enforces so it refuses exactly what the editor refuses.
+write_config <<EOF
+{"other": {"x": 1}, "commands": {"todo-watcher": "$STUB_DIR/mytool dispatch {id}"}, "watchers": {"todo-concurrency": 3}}
+EOF
+api GET /api/config/keymap
+[ "$CODE" = "200" ] || fail "GET keymap: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.actions | length' <<<"$STDOUT")" = "7" ] ||
+  fail "GET keymap: expected the seven global actions, got $STDOUT"
+[ "$(jq -r '.actions[0].action' <<<"$STDOUT")" = "command-palette" ] ||
+  fail "GET keymap: the actions must arrive in the shipped order: $STDOUT"
+[ "$(jq -r '[.actions[].value] | unique | .[0]' <<<"$STDOUT")" = "null" ] ||
+  fail "an unconfigured keymap must report every value null, got $STDOUT"
+[ "$(jq -r '.actions[] | select(.action == "command-palette") | .default[0]' <<<"$STDOUT")" = "Mod+Shift+P" ] ||
+  fail "GET keymap: built-in palette chord wrong: $STDOUT"
+[ "$(jq -r '.actions[] | select(.action == "focus-left") | .default | join(",")' <<<"$STDOUT")" = "h,ArrowLeft" ] ||
+  fail "GET keymap: the spatial nav ships a letter AND an arrow: $STDOUT"
+ok "GET /api/config/keymap reports all seven actions with value: null and the chords mesa ships"
+
+api PUT /api/config/keymap '{"create-task": ["Shift+Mod+N"]}'
+[ "$CODE" = "200" ] || fail "PUT keymap: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.actions[] | select(.action == "create-task") | .value[0]' <<<"$STDOUT")" = "Mod+Shift+n" ] ||
+  fail "PUT must echo the stored override, canonicalized: $STDOUT"
+[ "$(jq -r '.keymap["create-task"][0]' < "$CONFIG")" = "Mod+Shift+n" ] ||
+  fail "PUT keymap did not write the chord: $(cat "$CONFIG")"
+[ "$(jq -r '.keymap | length' < "$CONFIG")" = "1" ] ||
+  fail "only the override may be stored; a default is an absence: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["todo-watcher"]' < "$CONFIG")" = "$STUB_DIR/mytool dispatch {id}" ] ||
+  fail "a keymap write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "3" ] ||
+  fail "a keymap write clobbered the watchers section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "a keymap write dropped a section it doesn't own: $(cat "$CONFIG")"
+ok "PUT /api/config/keymap stores one action's chords, canonicalized, leaving commands, watchers and an unknown section untouched"
+
+# The other savers have to be just as careful toward the keymap.
+api PUT /api/config '{"commands": {"inbox-watcher": "mytool triage {id}"}}'
+[ "$CODE" = "200" ] || fail "PUT commands after keymap: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.keymap["create-task"][0]' < "$CONFIG")" = "Mod+Shift+n" ] ||
+  fail "a commands write clobbered the keymap section: $(cat "$CONFIG")"
+api PUT /api/config/watchers '{"todo_concurrency": 4}'
+[ "$CODE" = "200" ] || fail "PUT watchers after keymap: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.keymap["create-task"][0]' < "$CONFIG")" = "Mod+Shift+n" ] ||
+  fail "a watchers write clobbered the keymap section: $(cat "$CONFIG")"
+api PUT /api/config/live '{"auto_send_ms": 2500}'
+[ "$CODE" = "200" ] || fail "PUT live after keymap: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.keymap["create-task"][0]' < "$CONFIG")" = "Mod+Shift+n" ] ||
+  fail "a live write clobbered the keymap section: $(cat "$CONFIG")"
+# …and the keymap saver toward them, in the other direction.
+api PUT /api/config/keymap '{"focus-up": ["Alt+ArrowUp"]}'
+[ "$CODE" = "200" ] || fail "PUT keymap again: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.watchers["todo-concurrency"]' < "$CONFIG")" = "4" ] ||
+  fail "a keymap write clobbered watchers: $(cat "$CONFIG")"
+[ "$(jq -r '.live["auto-send-ms"]' < "$CONFIG")" = "2500" ] ||
+  fail "a keymap write clobbered live: $(cat "$CONFIG")"
+[ "$(jq -r '.keymap["create-task"][0]' < "$CONFIG")" = "Mod+Shift+n" ] ||
+  fail "an action absent from the body must be left alone: $(cat "$CONFIG")"
+ok "saving commands, watchers or live preserves the keymap section, and a keymap write touches only the actions it names"
+
+api PUT /api/config/keymap '{"create-task": null, "focus-up": null}'
+[ "$CODE" = "200" ] || fail "PUT keymap null: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '[.actions[].value] | unique | .[0]' <<<"$STDOUT")" = "null" ] ||
+  fail "null must restore every named action's default, got $STDOUT"
+[ "$(jq -r '.keymap | length' < "$CONFIG")" = "0" ] ||
+  fail "null must remove the key, never store the default: $(cat "$CONFIG")"
+ok "PUT null on an action removes its key, restoring the chords mesa ships"
+
+api PUT /api/config/keymap '{"create-task": ["n"]}'
+[ "$CODE" = "200" ] || fail "PUT keymap for the refusal fixture: got $CODE: $STDOUT"
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config/keymap '{"create-task": "n"}'
+[ "$CODE" = "422" ] || fail "a bare string chord: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "a bare string chord: expected code validation, got $STDOUT"
+api PUT /api/config/keymap '{"create-task": []}'
+[ "$CODE" = "422" ] || fail "an empty chord list: expected 422, got $CODE: $STDOUT"
+api PUT /api/config/keymap '{"create-task": ["Hyper+n"]}'
+[ "$CODE" = "422" ] || fail "an unknown modifier: expected 422, got $CODE: $STDOUT"
+api PUT /api/config/keymap '{"create-task": ["Shift"]}'
+[ "$CODE" = "422" ] || fail "a bare modifier: expected 422, got $CODE: $STDOUT"
+api PUT /api/config/keymap '{"fly-me-to-the-moon": ["m"]}'
+[ "$CODE" = "422" ] || fail "an unknown action: expected 422, got $CODE: $STDOUT"
+jq -e '.error.message | contains("fly-me-to-the-moon")' <<<"$STDOUT" >/dev/null ||
+  fail "an unknown action must be named in the message: $STDOUT"
+# The rule no other section has: judged against every binding the save would
+# leave behind, including the six the user never touched.
+api PUT /api/config/keymap '{"create-task": ["h"]}'
+[ "$CODE" = "422" ] || fail "a chord the spatial nav already holds: expected 422, got $CODE: $STDOUT"
+jq -e '.error.message | contains("focus-left")' <<<"$STDOUT" >/dev/null ||
+  fail "a collision must name the other action: $STDOUT"
+api PUT /api/config/keymap '{"focus-up": ["z"], "focus-down": ["Z"]}'
+[ "$CODE" = "422" ] || fail "two clashing actions in one body: expected 422, got $CODE: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] ||
+  fail "a rejected keymap PUT must not touch the file: $(cat "$CONFIG")"
+ok "PUT /api/config/keymap rejects a malformed chord, an unknown action and a chord two actions would share as 422 validation, writing nothing"
+
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/keymap")
+[ "$CODE" = "403" ] || fail "GET keymap with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
+  -H 'Content-Type: application/json' \
+  --data '{"create-task": ["q"]}' \
+  "http://127.0.0.1:$PORT/api/config/keymap")
+[ "$CODE" = "403" ] || fail "PUT keymap with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused keymap PUT must not touch the file"
+ok "both keymap verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
+
+# A hand-edited entry mesa cannot use costs that action its override and
+# nothing else — the read path is forgiving where the write path is strict,
+# the `todo-concurrency` clamp posture.
+write_config <<'EOF'
+{"keymap": {"create-task": "n", "focus-up": [], "invent-a-shortcut": ["q"], "focus-left": ["Mod+Shift+H"]}}
+EOF
+api GET /api/config/keymap
+[ "$CODE" = "200" ] || fail "GET keymap over a hand-edited section: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.actions[] | select(.action == "create-task") | .value' <<<"$STDOUT")" = "null" ] ||
+  fail "a non-list entry must be dropped, not surfaced: $STDOUT"
+[ "$(jq -r '.actions[] | select(.action == "focus-up") | .value' <<<"$STDOUT")" = "null" ] ||
+  fail "an empty entry must be dropped: $STDOUT"
+[ "$(jq -r '.actions[] | select(.action == "focus-left") | .value[0]' <<<"$STDOUT")" = "Mod+Shift+h" ] ||
+  fail "a good entry beside a bad one must survive: $STDOUT"
+[ "$(jq -r '[.actions[].action] | index("invent-a-shortcut")' <<<"$STDOUT")" = "null" ] ||
+  fail "an action mesa doesn't bind must never reach the page: $STDOUT"
+ok "GET /api/config/keymap drops a hand-edited entry mesa cannot use, costing that action alone"
+
 # ---- the speech section: GET/PUT /api/config/speech (mesa task 822) ----
 #
 # The fourth section of the same file, and the only one whose value has to
@@ -1067,9 +1198,13 @@ api GET /api/config/listen
 [ "$CODE" = "502" ] || fail "malformed config listen GET: expected 502, got $CODE: $STDOUT"
 api PUT /api/config/listen '{"model": "parakeet-tdt-0.6b-v2-int8"}'
 [ "$CODE" = "502" ] || fail "malformed config listen PUT: expected 502, got $CODE: $STDOUT"
+api GET /api/config/keymap
+[ "$CODE" = "502" ] || fail "malformed config keymap GET: expected 502, got $CODE: $STDOUT"
+api PUT /api/config/keymap '{"create-task": ["n"]}'
+[ "$CODE" = "502" ] || fail "malformed config keymap PUT: expected 502, got $CODE: $STDOUT"
 [ "$(cat "$CONFIG")" = '{ not json' ] ||
   fail "a PUT must never overwrite a config it could not parse: $(cat "$CONFIG")"
-ok "a malformed config is 502 unavailable on all twelve config verbs, and a PUT never overwrites a file it could not read"
+ok "a malformed config is 502 unavailable on all fourteen config verbs, and a PUT never overwrites a file it could not read"
 
 # The preview is the one speech surface a malformed file cannot break, because
 # it reads no config at all — which is what makes it usable on the page whose

@@ -26,7 +26,8 @@
  *   answer a half-thought and then answer the rest of it, and the person had
  *   to talk to the pauses the engine chose rather than to mesa — silence
  *   after the *whole* thought is the pause that actually means something. The
- *   switch the person already has (`isListenChord`, the listen button)
+ *   switch the person already has (the `live-listen` chord in `keymap.ts`,
+ *   the listen button)
  *   remains the second boundary: an explicit early send for whenever the
  *   silence wait would be too slow or too fast for what was just said. The
  *   silence timer is measured on `shouldListen`, not `recognizesSpeech` —
@@ -460,33 +461,14 @@ export function heldFlush(held: string, interim: string): string[] {
   return [grown.flush, last].filter((t): t is string => t !== null)
 }
 
-/**
- * The chord that turns the microphone on and off (mesa task 887), as a
- * predicate over the keystroke rather than a check inside the hub — it is a
- * rule about which keystroke belongs to the conversation, which is exactly the
- * kind of thing that is wrong in a component and testable here.
- *
- * A **chord**, not a single key, and for the reason `keyboardScope.ts` sets
- * out: the capture box holds the keyboard for most of a conversation, so a
- * single-key shortcut would be typed into the box rather than pressed. That is
- * also why it cannot consult `shouldIgnoreShortcut` — that predicate's first
- * rule is "a modifier chord belongs to its existing owner" — and why it is the
- * hub's own listener, in the shape of the command palette's.
- *
- * Both modifiers are accepted because the platform differs (Cmd on a Mac,
- * Ctrl elsewhere), the same way the palette's does; Alt is not, so a
- * different chord that happens to end in L is not this one.
- */
-export function isListenChord(e: {
-  metaKey: boolean
-  ctrlKey: boolean
-  shiftKey: boolean
-  altKey: boolean
-  key: string
-}): boolean {
-  if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.altKey) return false
-  return e.key.toLowerCase() === 'l'
-}
+// The chord that turns the microphone on and off (mesa task 887) was
+// `isListenChord` here until mesa task 1079 made it rebindable: it is now the
+// `live-listen` action in `keymap.ts`, matched with `matchesShortcut` like
+// every other global shortcut. It is still a **chord** by default, and still
+// the hub's own window listener rather than a `shouldIgnoreShortcut` caller,
+// for the reason `keyboardScope.ts` sets out: the capture box holds the
+// keyboard for most of a conversation, so a single-key shortcut would be typed
+// into the box rather than pressed.
 
 /**
  * A rough phonetic fold, used to catch the browser mishearing a name mesa
@@ -755,10 +737,13 @@ export function correctVocabulary(text: string, vocab: Vocabulary): string {
   })
 }
 
-/** How the chord is written wherever the page names it. One string for both
- * platforms rather than a detected one: it is read next to the control it
- * describes, and being told which half is yours is cheaper than mesa guessing
- * wrong about a keyboard it cannot see. */
+/** How the **shipped** listen chord is written wherever the page names it.
+ * One string for both platforms rather than a detected one: it is read next to
+ * the control it describes, and being told which half is yours is cheaper than
+ * mesa guessing wrong about a keyboard it cannot see. Since mesa task 1079 the
+ * chord can be rebound, so this is the fallback the callers below use when
+ * nobody hands them the live one — `keymap.ts`'s `chordLabel` writes a rebound
+ * chord in exactly this shape. */
 export const LISTEN_CHORD = '⌘/Ctrl+Shift+L'
 
 /**
@@ -806,6 +791,10 @@ export function captureHint(input: {
   paused: boolean
   /** The person turned the microphone off (mesa task 887). */
   muted: boolean
+  /** The chord the listen switch is bound to, as written (mesa task 1079).
+   *  Optional because only the muted line names it, and the shipped chord is
+   *  the right thing to say when nobody has said otherwise. */
+  chord?: string
 }): string {
   if (input.paused) {
     return 'Paused. Press Resume to talk to mesa again — the conversation is still running.'
@@ -826,7 +815,7 @@ export function captureHint(input: {
     return 'Press Listen to join the conversation on this browser. You can also type here, or use your system dictation.'
   }
   if (input.muted) {
-    return `mesa is not listening. Press ${LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
+    return `mesa is not listening. Press ${input.chord ?? LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
   }
   if (input.listening) {
     // Named (mesa task 957): the person can act on the difference — auris is

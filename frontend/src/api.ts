@@ -16,6 +16,7 @@ import type { CcSessionDetail } from './types/CcSessionDetail'
 import type { CcSessionGraph } from './types/CcSessionGraph'
 import type { CcUsage } from './types/CcUsage'
 import type { ConfigCommand } from './types/ConfigCommand'
+import type { ConfigKeymap } from './types/ConfigKeymap'
 import type { ConfigPrice } from './types/ConfigPrice'
 import type { ConfigSpeech } from './types/ConfigSpeech'
 import type { ConfigListen } from './types/ConfigListen'
@@ -1215,6 +1216,31 @@ export function updateWatchers(
   watchers: Record<string, number | null>,
 ): Promise<ConfigWatchers> {
   return request('/api/config/watchers', jsonInit('PUT', watchers))
+}
+
+/**
+ * The global keyboard shortcuts in `~/.mesa/config.json` (mesa task 1079):
+ * every action mesa binds, the chords the config overrides it with (`value`,
+ * `null` when it says nothing) and the chords mesa ships (`default`). 502
+ * `unavailable` means the config file itself is unreadable, exactly as for
+ * `getConfig`.
+ */
+export function getKeymap(): Promise<ConfigKeymap> {
+  return request('/api/config/keymap')
+}
+
+/**
+ * Writes rebound shortcuts and echoes the keymap as re-read from disk. The
+ * body is a flat map of action id to chords: only the actions passed are
+ * touched, `null` removes one (restoring its built-in chords), and a list
+ * replaces it. 422 `validation` is an action mesa doesn't bind, a malformed
+ * chord, or a chord two actions would share — and nothing is written in that
+ * case.
+ */
+export function updateKeymap(
+  keymap: Record<string, string[] | null>,
+): Promise<ConfigKeymap> {
+  return request('/api/config/keymap', jsonInit('PUT', keymap))
 }
 
 /**

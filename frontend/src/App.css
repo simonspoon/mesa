@@ -6584,9 +6584,23 @@ body.live-board-resizing {
 }
 
 .command-palette-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
   padding: 0.4rem 0.6rem;
   cursor: pointer;
   font-size: 0.9rem;
+}
+
+/* The chord this row is also reachable by (mesa task 1079), right-aligned so
+   the labels still read as one column. Read from the keymap, so it is never a
+   chord the app does not actually answer to. */
+.command-palette-chord {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
 }
 
 .command-palette-item.active {
@@ -8041,6 +8055,40 @@ button:focus-visible,
 .settings-watcher-input {
   width: 6rem;
   font-size: 0.8rem;
+}
+
+/* One shortcut row: the caps it is bound to, then the two controls that change
+   it. Its own row rather than a label/input pair, because what it holds is not
+   editable text — a chord is recorded, never typed. */
+.settings-keymap-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.settings-keymap-chords {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1 1 12rem;
+  min-height: 1.6rem;
+  font-size: 0.8rem;
+}
+
+.settings-keymap-chord {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.settings-keymap-chords kbd {
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
 }
 
 /* The live agent's prompt is prose, not argv: it wraps rather than scrolling

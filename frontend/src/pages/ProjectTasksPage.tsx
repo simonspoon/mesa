@@ -26,7 +26,8 @@ import {
 } from '../projectPanes'
 import { TaskModal } from '../components/TaskModal'
 import { KanbanBoard } from '../KanbanBoard'
-import { shouldIgnoreShortcut } from '../keyboardScope'
+import { matchesShortcut, type Keymap } from '../keymap'
+import { useKeymap } from '../keymapStore'
 import { useFetch } from '../useFetch'
 import { ArtifactsView } from './ArtifactsView'
 import { CCDashboardView } from './CCDashboardView'
@@ -52,19 +53,26 @@ import { TerminalPage } from './TerminalPage'
 // it already covers modifiers, text-editing contexts, xterm panes, the
 // diagram canvas and open modals — i.e. every place on these views where
 // 'a' means the letter a. The remaining views have no key handling of their
-// own to collide with.
+// own to collide with. It is reached through `matchesShortcut` (keymap.ts,
+// mesa task 1079) rather than called here, so which chord this shortcut is
+// bound to and whether that chord is claimed from a text field are one
+// decision instead of two.
 //
 // `onOpen` is read through a ref so the listener is bound once, not
 // re-subscribed on every render by a caller-side closure.
-function useCreateTaskShortcut(onOpen: () => void) {
+function useCreateTaskShortcut(onOpen: () => void, keymap: Keymap) {
   const latest = useRef(onOpen)
   useEffect(() => {
     latest.current = onOpen
   })
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (shouldIgnoreShortcut(e)) return
-      if (e.key !== 'a') return
+      // `matchesShortcut` (mesa task 1079) is both the key comparison and the
+      // `shouldIgnoreShortcut` call that used to sit above it: the shipped
+      // chord is bare, so it is still suppressed exactly where it was, and a
+      // rebind to a real chord is claimed from a text field the way a chord
+      // should be.
+      if (!matchesShortcut('create-task', e, keymap)) return
       latest.current()
     }
     // Bound on keyup, not keydown (mesa task 817). The create form autoFocuses
@@ -74,7 +82,7 @@ function useCreateTaskShortcut(onOpen: () => void) {
     // for keyup lets the whole keystroke land on the (non-editable) view first.
     window.addEventListener('keyup', onKey)
     return () => window.removeEventListener('keyup', onKey)
-  }, [])
+  }, [keymap])
 }
 
 export function ProjectTasksPage({
@@ -270,7 +278,7 @@ export function ProjectTasksPage({
   // Called unconditionally, ahead of the early error return, per the rules of
   // hooks. `openCreate` is a hoisted function declaration, so referencing it
   // from here is fine.
-  useCreateTaskShortcut(openCreate)
+  useCreateTaskShortcut(openCreate, useKeymap())
 
   if (error) return <p className="error">{error}</p>
 

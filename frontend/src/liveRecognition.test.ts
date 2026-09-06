@@ -9,7 +9,6 @@ import {
   heldFlush,
   heldWith,
   isBlockingError,
-  isListenChord,
   isSilentTranscribe,
   listenPath,
   MESA_VOCABULARY,
@@ -524,30 +523,6 @@ describe('correctVocabulary', () => {
     const vocab = buildVocabulary(MESA_VOCABULARY)
     const sentence = "Don't forget, she's opening the course tomorrow!"
     expect(correctVocabulary(sentence, vocab)).toBe(sentence)
-  })
-})
-
-describe('isListenChord', () => {
-  const chord = { metaKey: true, ctrlKey: false, shiftKey: true, altKey: false, key: 'l' }
-
-  it('is the chord under either platform modifier', () => {
-    expect(isListenChord(chord)).toBe(true)
-    expect(isListenChord({ ...chord, metaKey: false, ctrlKey: true })).toBe(true)
-  })
-
-  it('reads the shifted key the browser actually reports', () => {
-    // Shift is held, so the key arrives capitalised on most layouts.
-    expect(isListenChord({ ...chord, key: 'L' })).toBe(true)
-  })
-
-  it('is not a bare L — the capture box is holding the keyboard', () => {
-    expect(isListenChord({ ...chord, metaKey: false })).toBe(false)
-    expect(isListenChord({ ...chord, shiftKey: false })).toBe(false)
-  })
-
-  it('leaves a different chord that happens to end in L alone', () => {
-    expect(isListenChord({ ...chord, altKey: true })).toBe(false)
-    expect(isListenChord({ ...chord, key: 'k' })).toBe(false)
   })
 })
 

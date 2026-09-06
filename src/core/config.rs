@@ -122,6 +122,25 @@
 //! default mesa names: it means no `-m` is passed at all, so `auris` picks its
 //! own default model and an unconfigured install runs the argv it ran before
 //! this setting existed. See [`listen_model`] and `docs/live.md`.
+//!
+//! ## Keymap
+//!
+//! An eighth section rebinds the web UI's **global** keyboard shortcuts (mesa
+//! task 1079). (The seventh, `guard`, is the cost guard's — it has no Settings
+//! UI and is documented in `docs/cost-guard.md`.)
+//!
+//! ```json
+//! { "keymap": { "create-task": ["n"], "focus-left": ["a", "ArrowLeft"] } }
+//! ```
+//!
+//! One entry per action mesa binds ([`KEYMAP_ACTIONS`]), holding a **list** of
+//! chords because the spatial nav answers to a letter *and* an arrow. An
+//! absent action is the chords mesa ships, so defaults are never written —
+//! only overrides are. This is the one section nothing in Rust reads: the
+//! shortcuts are the page's, and the server's job is to store them and to
+//! refuse what the editor refuses — an unknown action, a malformed chord, and
+//! a chord bound to two actions at once. See [`save_keymap`] and
+//! `docs/keyboard.md`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,8 +152,8 @@ use crate::core::guard::{GuardAction, GuardThresholds};
 use crate::core::listen;
 use crate::core::speech;
 use crate::core::types::{
-    ConfigCommand, ConfigGuard, ConfigListen, ConfigLive, ConfigPrice, ConfigSpeech,
-    ConfigWatchers, ModelRates,
+    ConfigCommand, ConfigGuard, ConfigKeymap, ConfigKeymapAction, ConfigListen, ConfigLive,
+    ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
 };
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
@@ -2131,6 +2150,375 @@ fn validate_guard(key: &str, value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Keymap
+// ---------------------------------------------------------------------------
+
+/// Every global shortcut the Settings page may rebind, with the chords mesa
+/// ships (mesa task 1079).
+///
+/// The **twin** of `frontend/src/keymap.ts`'s `ACTIONS` table, and deliberately
+/// so: the page needs the ids, the labels and the defaults before the first
+/// fetch resolves, and this side needs the ids and the defaults to answer "is
+/// that an action mesa knows" and "does this override collide with an action
+/// the user never touched". Labels are the page's alone — they are copy, not
+/// contract. `keymap_defaults_match_the_frontend_table` is the test that pins
+/// the two id/chord lists together; edit one and edit the other.
+///
+/// Only the four **global window listeners** are here. A Files-tab chord, the
+/// editor's Cmd/Ctrl+S and a modal's Escape are component-local — they belong
+/// to one surface that is on screen, which is a different thing from a binding
+/// the whole app answers to.
+pub const KEYMAP_ACTIONS: &[(&str, &[&str])] = &[
+    ("command-palette", &["Mod+Shift+P"]),
+    ("focus-left", &["h", "ArrowLeft"]),
+    ("focus-down", &["j", "ArrowDown"]),
+    ("focus-up", &["k", "ArrowUp"]),
+    ("focus-right", &["l", "ArrowRight"]),
+    ("create-task", &["a"]),
+    ("live-listen", &["Mod+Shift+L"]),
+];
+
+/// The most chords one action may be bound to. A **sanity bound, not a
+/// policy**: the editor records a single chord per change, and the only reason
+/// the shipped table needs more than one is the spatial nav's letter *and*
+/// arrow pair. Four leaves room for a keyboard mesa has not met.
+pub const MAX_KEYMAP_CHORDS: usize = 4;
+
+/// The longest chord string the editor will write — `Mod+Alt+Shift+ArrowLeft`
+/// is 23, so this is slack rather than a limit anyone meets. It exists so the
+/// config file cannot be stuffed through the route.
+pub const MAX_CHORD_LEN: usize = 32;
+
+/// The modifier names a chord may carry, in the order a canonical chord writes
+/// them. `Mod` is meta-or-ctrl — one name for the two platforms, because a
+/// keymap saved on a Mac has to mean the same thing on the Linux box reading
+/// the same config file.
+const CHORD_MODIFIERS: &[&str] = &["Mod", "Alt", "Shift"];
+
+/// The chords mesa ships for `action`, or `None` when it is not an action mesa
+/// knows.
+fn keymap_default(action: &str) -> Option<&'static [&'static str]> {
+    KEYMAP_ACTIONS
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map(|(_, chords)| *chords)
+}
+
+/// The `keymap` map, deserialized as raw JSON per action so one hand-edited
+/// entry can never take the rest of the section down with it — the read path is
+/// forgiving where the write path is strict, the posture `todo-concurrency`'s
+/// clamp already takes.
+#[derive(Debug, Default, Deserialize)]
+struct KeymapConfig {
+    #[serde(default)]
+    keymap: HashMap<String, serde_json::Value>,
+}
+
+fn read_keymap(path: &Path) -> Result<HashMap<String, serde_json::Value>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: KeymapConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.keymap)
+}
+
+/// The overrides the file actually holds, with every entry mesa cannot use
+/// dropped: an action id it does not know, or chords that are not a bounded
+/// list of well-formed chord strings. That action simply falls back to its
+/// **own** default, alone — a typo in one binding must not cost the user the
+/// six they got right.
+fn keymap_overrides_in(path: &Path) -> Result<HashMap<String, Vec<String>>, String> {
+    let raw = read_keymap(path)?;
+    let mut out = HashMap::new();
+    for (action, value) in raw {
+        if keymap_default(&action).is_none() {
+            continue;
+        }
+        if let Ok(chords) = parse_chords(&action, &value) {
+            out.insert(action, chords);
+        }
+    }
+    Ok(out)
+}
+
+/// The keymap for the Settings page (`GET /api/config/keymap`): every action
+/// mesa binds, in the shipped order, each carrying the configured chords
+/// (`null` when the file says nothing) beside the built-ins — the
+/// `{value, default}` idiom [`ConfigPrice`] and [`ConfigWatchers`] already use.
+pub fn keymap() -> Result<ConfigKeymap, String> {
+    keymap_in(&config_file())
+}
+
+fn keymap_in(path: &Path) -> Result<ConfigKeymap, String> {
+    let configured = keymap_overrides_in(path)?;
+    Ok(ConfigKeymap {
+        actions: KEYMAP_ACTIONS
+            .iter()
+            .map(|(action, defaults)| ConfigKeymapAction {
+                action: (*action).to_string(),
+                value: configured.get(*action).cloned(),
+                default: defaults.iter().map(|c| (*c).to_string()).collect(),
+            })
+            .collect(),
+    })
+}
+
+/// Writes the `keymap` entries named in `updates` into the config file.
+///
+/// - `None` **removes** the key, restoring that action's built-in chords —
+///   the same meaning blank has for a command and `null` for a price row.
+///   Defaults are therefore never stored; only overrides are.
+/// - Values arrive as raw JSON, as [`save_watchers`]' do, so `"h"`, `[]` and
+///   `["Mod+"]` are all *this* layer's [`SaveError::Validation`] with a
+///   sentence naming the mistake rather than a deserializer rejection.
+/// - **A collision between two actions is refused**, which is the one rule
+///   here that no other section has: a keymap is not a set of independent
+///   values but a partition of the keyboard, so an override has to be judged
+///   against everything else the map will hold once it lands — including the
+///   actions the user never touched, which is why the built-ins are consulted.
+///   The server refuses exactly what the editor refuses.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of [`save_commands`], [`save_pricing`], [`save_watchers`],
+///   [`save_speech`], [`save_listen`], [`save_live`] and [`save_guard`]: one
+///   read-modify-write over the whole document, so all eight sections (and any
+///   mesa doesn't know) survive each other's edits.
+pub fn save_keymap(updates: &HashMap<String, Option<serde_json::Value>>) -> Result<(), SaveError> {
+    save_keymap_in(&config_file(), updates)
+}
+
+fn save_keymap_in(
+    path: &Path,
+    updates: &HashMap<String, Option<serde_json::Value>>,
+) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        // Nothing named, nothing to do — and in particular no empty
+        // `"keymap": {}` written into a file the user never configured.
+        return Ok(());
+    }
+    let mut actions: Vec<&String> = updates.keys().collect();
+    actions.sort();
+
+    // The map this save would leave behind: the built-ins, overlaid with the
+    // overrides already on disk, overlaid with what is being written. That
+    // whole picture is what the collision rule is judged against.
+    let mut effective: HashMap<String, Vec<String>> = KEYMAP_ACTIONS
+        .iter()
+        .map(|(action, chords)| {
+            (
+                (*action).to_string(),
+                chords.iter().map(|c| (*c).to_string()).collect(),
+            )
+        })
+        .collect();
+    for (action, chords) in
+        keymap_overrides_in(path).map_err(|e| SaveError::Unavailable(e.clone()))?
+    {
+        effective.insert(action, chords);
+    }
+
+    for action in &actions {
+        let Some(defaults) = keymap_default(action) else {
+            return Err(SaveError::Validation(format!(
+                "unknown keyboard action {action:?}; mesa binds {}",
+                KEYMAP_ACTIONS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        match &updates[*action] {
+            None => {
+                effective.insert(
+                    (*action).clone(),
+                    defaults.iter().map(|c| (*c).to_string()).collect(),
+                );
+            }
+            Some(value) => {
+                let chords = parse_chords(action, value).map_err(SaveError::Validation)?;
+                effective.insert((*action).clone(), chords);
+            }
+        }
+    }
+    check_no_chord_collision(&effective).map_err(SaveError::Validation)?;
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("keymap")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"keymap\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for action in actions {
+        match &updates[action] {
+            None => {
+                section.remove(action);
+            }
+            Some(value) => {
+                // Stored canonicalized, so the file never holds two spellings
+                // of one chord and a later collision check cannot disagree
+                // with this one.
+                let chords: Vec<serde_json::Value> = parse_chords(action, value)
+                    .map_err(SaveError::Validation)?
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect();
+                section.insert(action.clone(), serde_json::Value::Array(chords));
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// A bound action's value: a JSON array of 1..=[`MAX_KEYMAP_CHORDS`] chord
+/// strings. An empty list is refused rather than read as "unbound": `null` is
+/// already the way to say "put this back", and a shortcut silently bound to
+/// nothing is the kind of thing a user cannot tell from a bug.
+fn parse_chords(action: &str, value: &serde_json::Value) -> Result<Vec<String>, String> {
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "the chords for {action:?} must be a list of chord strings, got {value}"
+        ));
+    };
+    if items.is_empty() {
+        return Err(format!(
+            "{action:?} needs at least one chord; write null to restore its default"
+        ));
+    }
+    if items.len() > MAX_KEYMAP_CHORDS {
+        return Err(format!(
+            "{action:?} may be bound to at most {MAX_KEYMAP_CHORDS} chords, got {}",
+            items.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(chord) = item.as_str() else {
+            return Err(format!(
+                "the chords for {action:?} must all be strings, got {item}"
+            ));
+        };
+        out.push(canonical_chord(chord).map_err(|e| format!("{action:?}: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// A chord string in its one canonical spelling: the modifiers it carries in
+/// [`CHORD_MODIFIERS`] order, then the key, lowercased when it is a single
+/// character so `A` and `a` are one binding rather than two. Errs with a
+/// sentence naming what is wrong with it.
+///
+/// The key itself keeps the browser's own `KeyboardEvent.key` spelling
+/// (`ArrowLeft`, `Enter`, `/`) — mesa invents no key names, so what the editor
+/// records from a real keystroke is exactly what it stores.
+fn canonical_chord(chord: &str) -> Result<String, String> {
+    let trimmed = chord.trim();
+    if trimmed.is_empty() {
+        return Err("a chord cannot be empty".to_string());
+    }
+    if trimmed.chars().count() > MAX_CHORD_LEN {
+        return Err(format!(
+            "the chord {trimmed:?} is longer than {MAX_CHORD_LEN} characters"
+        ));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "the chord {trimmed:?} contains whitespace; a key name has none"
+        ));
+    }
+    let parts: Vec<&str> = trimmed.split('+').collect();
+    let (key, mods) = parts.split_last().expect("split always yields one part");
+    if key.is_empty() {
+        return Err(format!("the chord {trimmed:?} names no key"));
+    }
+    let mut held: Vec<&str> = Vec::new();
+    for part in mods {
+        let Some(name) = CHORD_MODIFIERS
+            .iter()
+            .find(|m| m.eq_ignore_ascii_case(part))
+        else {
+            return Err(format!(
+                "{part:?} is not a modifier mesa knows; chords carry {}",
+                CHORD_MODIFIERS.join(", ")
+            ));
+        };
+        if held.contains(name) {
+            return Err(format!("the chord {trimmed:?} names {name} twice"));
+        }
+        held.push(name);
+    }
+    // A modifier on its own is not a chord — `Shift` alone can never fire, and
+    // recording one would swallow the very keystroke that starts a real chord.
+    for name in ["Mod", "Shift", "Control", "Ctrl", "Meta", "Alt", "AltGraph"] {
+        if key.eq_ignore_ascii_case(name) {
+            return Err(format!(
+                "{key:?} is a modifier, not a key; a chord ends in the key that is pressed"
+            ));
+        }
+    }
+    let key = if key.chars().count() == 1 {
+        key.to_lowercase()
+    } else {
+        (*key).to_string()
+    };
+    let mut out = String::new();
+    for name in CHORD_MODIFIERS {
+        if held.contains(name) {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out.push_str(&key);
+    Ok(out)
+}
+
+/// The collision rule: no chord may belong to two actions. Reported naming the
+/// chord and both actions, since "there is a conflict" is not something a user
+/// can act on.
+fn check_no_chord_collision(effective: &HashMap<String, Vec<String>>) -> Result<(), String> {
+    // Walked in the shipped order rather than the map's, so the same clash
+    // always reports the same pair in the same order.
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for (action, _) in KEYMAP_ACTIONS {
+        let Some(chords) = effective.get(*action) else {
+            continue;
+        };
+        for chord in chords {
+            let key = match canonical_chord(chord) {
+                Ok(k) => k,
+                // Already validated on every path that reaches here; a chord
+                // read off disk that isn't is dropped before this point.
+                Err(_) => continue,
+            };
+            if let Some(other) = seen.insert(key.clone(), action) {
+                return Err(format!(
+                    "the chord {key:?} is bound to both {other:?} and {action:?}; \
+                     one chord belongs to one action"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3362,6 +3750,25 @@ mod tests {
         let root = survives("listen");
         assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
         assert_eq!(root["listen"][MODEL], "parakeet-tdt-0.6b-v2-int8");
+        // And the keymap saver is the seventh (mesa task 1079).
+        save_keymap_in(&path, &{
+            let mut m = HashMap::new();
+            m.insert(
+                "create-task".to_string(),
+                Some(serde_json::json!(["Mod+Shift+N"])),
+            );
+            m
+        })
+        .unwrap();
+        let root = survives("keymap");
+        assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
+        assert_eq!(root["keymap"]["create-task"][0], "Mod+Shift+n");
+        // …and every other saver leaves the keymap alone in turn.
+        save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(9))])).unwrap();
+        assert_eq!(
+            survives("watchers again")["keymap"]["create-task"][0],
+            "Mod+Shift+n"
+        );
     }
 
     #[test]
@@ -3864,5 +4271,268 @@ mod tests {
             assert!(default_command(action).is_some(), "{action}");
         }
         assert_eq!(default_command("task-execute"), None);
+    }
+
+    fn keys(
+        pairs: &[(&str, Option<serde_json::Value>)],
+    ) -> HashMap<String, Option<serde_json::Value>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    /// The shipped chords are exactly what the app answered to before this
+    /// section existed — the Rust half of the pair `frontend/src/keymap.ts`'s
+    /// `defaults match today's behaviour` test pins on the other side. Edit
+    /// one table and this fails until the other is edited too.
+    #[test]
+    fn the_shipped_keymap_is_todays_behaviour() {
+        assert_eq!(
+            keymap_default("command-palette"),
+            Some(&["Mod+Shift+P"][..])
+        );
+        assert_eq!(keymap_default("focus-left"), Some(&["h", "ArrowLeft"][..]));
+        assert_eq!(keymap_default("focus-down"), Some(&["j", "ArrowDown"][..]));
+        assert_eq!(keymap_default("focus-up"), Some(&["k", "ArrowUp"][..]));
+        assert_eq!(
+            keymap_default("focus-right"),
+            Some(&["l", "ArrowRight"][..])
+        );
+        assert_eq!(keymap_default("create-task"), Some(&["a"][..]));
+        assert_eq!(keymap_default("live-listen"), Some(&["Mod+Shift+L"][..]));
+        assert_eq!(keymap_default("nope"), None);
+        // What mesa ships must itself pass the rule it enforces on a save.
+        let shipped: HashMap<String, Vec<String>> = KEYMAP_ACTIONS
+            .iter()
+            .map(|(a, c)| {
+                (
+                    (*a).to_string(),
+                    c.iter().map(|s| (*s).to_string()).collect(),
+                )
+            })
+            .collect();
+        check_no_chord_collision(&shipped).unwrap();
+        for chords in shipped.values() {
+            for chord in chords {
+                canonical_chord(chord).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn keymap_defaults_to_the_shipped_chords_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file at all, and a file with no keymap section: every action
+        // reports a null override beside the chords mesa ships.
+        for path in [dir.path().join("nope.json"), write_config(dir.path(), "{}")] {
+            let view = keymap_in(&path).unwrap();
+            assert_eq!(view.actions.len(), KEYMAP_ACTIONS.len());
+            assert!(view.actions.iter().all(|a| a.value.is_none()));
+            let palette = &view.actions[0];
+            assert_eq!(palette.action, "command-palette");
+            assert_eq!(palette.default, vec!["Mod+Shift+P".to_string()]);
+        }
+
+        let path = write_config(dir.path(), r#"{"commands": {}}"#);
+        save_keymap_in(
+            &path,
+            &keys(&[("create-task", Some(serde_json::json!(["n"])))]),
+        )
+        .unwrap();
+        let view = keymap_in(&path).unwrap();
+        let row = view
+            .actions
+            .iter()
+            .find(|a| a.action == "create-task")
+            .unwrap();
+        assert_eq!(row.value, Some(vec!["n".to_string()]));
+        assert_eq!(row.default, vec!["a".to_string()]);
+        // Only the override is stored — the other six actions stay absent.
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["keymap"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_keymap_override_restores_the_shipped_chords() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"keymap": {"create-task": ["n"]}}"#);
+        save_keymap_in(&path, &keys(&[("create-task", None)])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Removed, not stored as the default: absence is how a default is said.
+        assert!(written["keymap"].get("create-task").is_none());
+        let view = keymap_in(&path).unwrap();
+        assert!(view.actions.iter().all(|a| a.value.is_none()));
+    }
+
+    /// Chords are stored canonicalized, so the file never holds two spellings
+    /// of one binding — `Shift+Mod+a` and `Mod+Shift+A` are the same chord.
+    #[test]
+    fn a_chord_is_stored_in_one_canonical_spelling() {
+        assert_eq!(canonical_chord("Shift+Mod+A").unwrap(), "Mod+Shift+a");
+        assert_eq!(canonical_chord("mod+shift+p").unwrap(), "Mod+Shift+p");
+        assert_eq!(canonical_chord(" ArrowLeft ").unwrap(), "ArrowLeft");
+        assert_eq!(canonical_chord("H").unwrap(), "h");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "{}");
+        save_keymap_in(
+            &path,
+            &keys(&[("create-task", Some(serde_json::json!(["Shift+Mod+N"])))]),
+        )
+        .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["keymap"]["create-task"][0], "Mod+Shift+n");
+    }
+
+    #[test]
+    fn save_keymap_rejects_a_bad_binding_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"keymap": {"create-task": ["n"]}}"#;
+        let path = write_config(dir.path(), before);
+        for (label, value) in [
+            ("not a list", serde_json::json!("n")),
+            ("an empty list", serde_json::json!([])),
+            (
+                "too many chords",
+                serde_json::json!(["q", "w", "e", "r", "t"]),
+            ),
+            ("a non-string chord", serde_json::json!([7])),
+            ("an empty chord", serde_json::json!([""])),
+            ("a chord with no key", serde_json::json!(["Mod+"])),
+            ("an unknown modifier", serde_json::json!(["Hyper+k"])),
+            ("a repeated modifier", serde_json::json!(["Mod+Mod+k"])),
+            ("a bare modifier", serde_json::json!(["Shift"])),
+            ("a chord with whitespace", serde_json::json!(["Mod+ k"])),
+            (
+                "an over-long chord",
+                serde_json::json!([format!("Mod+{}", "x".repeat(MAX_CHORD_LEN))]),
+            ),
+        ] {
+            let err = save_keymap_in(&path, &keys(&[("create-task", Some(value))])).unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "{label}: {err:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{label}");
+        }
+        // An action mesa doesn't bind is a named validation error, not a
+        // silently stored row.
+        let err = save_keymap_in(
+            &path,
+            &keys(&[("fly-me-to-the-moon", Some(serde_json::json!(["m"])))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m)
+                if m.contains("unknown keyboard action") && m.contains("fly-me-to-the-moon")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// The rule no other section has: a keymap is a partition of the keyboard,
+    /// so an override is judged against the whole map it would leave behind —
+    /// including the actions the user never touched.
+    #[test]
+    fn save_keymap_refuses_a_chord_two_actions_would_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"{"keymap": {"create-task": ["n"]}}"#;
+        let path = write_config(dir.path(), before);
+
+        // Against a built-in nobody overrode: `h` is still the spatial nav's.
+        let err = save_keymap_in(
+            &path,
+            &keys(&[("create-task", Some(serde_json::json!(["h"])))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Validation(m)
+                if m.contains("focus-left") && m.contains("create-task")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Against an override already on disk, and through a different
+        // spelling of the same chord.
+        let err = save_keymap_in(
+            &path,
+            &keys(&[("focus-up", Some(serde_json::json!(["N"])))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Validation(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Two clashing actions in one batch, neither of them on disk.
+        let err = save_keymap_in(
+            &path,
+            &keys(&[
+                ("focus-up", Some(serde_json::json!(["z"]))),
+                ("focus-down", Some(serde_json::json!(["z"]))),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Validation(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // And the clash a *removal* would create: putting `create-task` back
+        // to `a` is fine, but only because nothing else holds `a`.
+        save_keymap_in(
+            &path,
+            &keys(&[("focus-up", Some(serde_json::json!(["a"])))]),
+        )
+        .unwrap();
+        let err = save_keymap_in(&path, &keys(&[("create-task", None)])).unwrap_err();
+        assert!(matches!(err, SaveError::Validation(_)), "{err:?}");
+    }
+
+    /// The read path is forgiving where the write path is strict (the
+    /// `todo-concurrency` clamp posture): one hand-edited entry mesa cannot use
+    /// costs that action its override and nothing else.
+    #[test]
+    fn a_hand_edited_keymap_entry_falls_back_to_its_own_default_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"keymap": {
+                 "create-task": "n",
+                 "focus-up": [],
+                 "invent-a-shortcut": ["q"],
+                 "focus-left": ["Mod+Shift+H"]
+               }}"#,
+        );
+        let view = keymap_in(&path).unwrap();
+        let value = |action: &str| {
+            view.actions
+                .iter()
+                .find(|a| a.action == action)
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(value("create-task"), None, "a non-list is dropped");
+        assert_eq!(value("focus-up"), None, "an empty list is dropped");
+        assert_eq!(value("focus-left"), Some(vec!["Mod+Shift+h".to_string()]));
+        assert!(
+            !view.actions.iter().any(|a| a.action == "invent-a-shortcut"),
+            "an action mesa doesn't bind never reaches the page"
+        );
+    }
+
+    #[test]
+    fn keymap_refuses_a_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "not json");
+        assert!(keymap_in(&path).is_err());
+        let err = save_keymap_in(
+            &path,
+            &keys(&[("create-task", Some(serde_json::json!(["n"])))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Unavailable(m) if m.contains("malformed mesa config")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 }

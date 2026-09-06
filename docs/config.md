@@ -269,7 +269,8 @@ of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). It is a form
 over `commands` — a text box per action, the built-in default shown as the
 box's placeholder, the action's placeholder vocabulary listed under it, and the
 argv that will actually run spelled out beneath — followed by one section per
-other part of the file (Watchers, Live conversation, Speech, Model pricing).
+other part of the file (Watchers, Keyboard shortcuts, Live conversation,
+Speech, Model pricing).
 **Each section has
 its own endpoint, draft and save button**: they are separate writes, so one
 form's rejection must never strand another's edits.
@@ -463,8 +464,8 @@ the todo-watcher's per-project concurrency limit (mesa task 777,
   in is not the distinction that matters.
 
 The sections are siblings over one document: saving `watchers` preserves
-`commands`, `pricing`, `speech`, `guard` and any section mesa doesn't know
-about, and vice versa.
+`commands`, `pricing`, `speech`, `guard`, `keymap` and any section mesa doesn't
+know about, and vice versa.
 
 ## Speech
 
@@ -777,6 +778,77 @@ against, and what the watcher does about a session that crosses one (mesa tasks
   `require_agent_access`, the same posture as every other config write (mesa
   task 1021).
 
+## Keymap
+
+An eighth, independent section rebinds the web UI's **global** keyboard
+shortcuts (mesa task 1079, `docs/keyboard.md`) — and the only one edited from
+Settings that mesa's own Rust reads nothing from.
+
+```json
+{
+  "keymap": {
+    "create-task": ["n"],
+    "focus-left": ["a", "ArrowLeft"]
+  }
+}
+```
+
+- One entry per **action**, holding a **list** of chords — because the spatial
+  nav has always answered to a letter *and* an arrow. The seven actions are
+  `command-palette`, `focus-left`, `focus-down`, `focus-up`, `focus-right`,
+  `create-task` and `live-listen`: exactly the four global `window` keydown
+  listeners the app mounts. The Files tab's chords, the code editor's
+  Cmd/Ctrl+S and a modal's Escape are deliberately **not** here — each belongs
+  to one panel that is on screen and owns the keyboard while it is, which is a
+  different thing from a binding the whole app answers to.
+- **An absent action ⇒ the chords mesa ships**, so defaults are never written:
+  only overrides live in the file, and `PUT null` removes an entry rather than
+  storing the default back. The shipped table is
+  `config::KEYMAP_ACTIONS` — `Mod+Shift+P`; `h`/`ArrowLeft`, `j`/`ArrowDown`,
+  `k`/`ArrowUp`, `l`/`ArrowRight`; `a`; `Mod+Shift+L` — which is exactly what
+  the app answered to before the section existed.
+- A **chord** is written modifiers-then-key, `Mod+Alt+Shift+<key>`, and stored
+  canonicalized (modifiers in that order, a single-character key lowercased),
+  so the file never holds two spellings of one binding. `Mod` is
+  meta-**or**-ctrl: one name for both platforms, because a keymap saved on a
+  Mac has to mean the same thing on the Linux box reading the same file. The
+  key itself is whatever `KeyboardEvent.key` reports (`ArrowLeft`, `Enter`,
+  `/`, `a`) — mesa invents no key names, so what the editor records from a real
+  keystroke is exactly what is stored.
+- **A collision between two actions is refused**, which is the one rule no
+  other section has: a keymap is not a set of independent values but a
+  partition of the keyboard, so an override is judged against the whole map the
+  save would leave behind — including the actions the user never touched. The
+  server refuses exactly what the editor refuses.
+- **Nothing in Rust reads this section.** The shortcuts are the page's; mesa's
+  job is to store them and to refuse what the editor refuses.
+- The read path is **forgiving** where the write path is strict, the
+  `todo-concurrency` clamp posture: a hand-edited entry mesa cannot use — a
+  non-list, an empty list, a malformed chord, an action it does not bind — is
+  dropped, costing **that action** its override and nothing else. The page then
+  falls back to that one action's shipped chords.
+- The page fetches the section **once, at mount** (`frontend/src/keymapStore.ts`
+  — one `GET` however many listeners ask), and the shipped chords are in force
+  until it answers, so a refused or unreadable config leaves the app with
+  shortcuts rather than none. A save publishes its own response straight to the
+  listeners, so a rebind takes effect with no reload.
+
+### Routes
+
+- `GET /api/config/keymap` → `ConfigKeymap`: `{actions: [{action, value,
+  default}]}` in the shipped order, where `value` is the override (`null` when
+  unset) and `default` is the chords mesa ships. Gated like the other config
+  getters (`require_agent_access`); a malformed config is **502
+  `unavailable`**.
+- `PUT /api/config/keymap`, body a **flat map of action id to chords** —
+  `{"create-task": ["n"], "focus-up": null}` — → echoes the getter. Unlike its
+  fixed-key siblings the body is a table, because the actions are one: an
+  absent action is left alone, `null` removes its override, a list replaces it.
+  An unknown action id (named in the message), a malformed chord, an empty list
+  and a chord two actions would share are each **422 `validation`**, writing
+  nothing. Gated with `require_agent_access`, the same posture as every other
+  config write (mesa task 1021).
+
 ## Gate
 
 `scripts/config-check.sh` — all three commands driven by a configured template
@@ -836,6 +908,17 @@ threshold governing the very next verdict with no restart, `null` restoring the
 built-in, every out-of-range and wrong-typed value 422 writing nothing, an
 unknown body key ignored, and **all six** other sections surviving the guard
 section's save.
+
+For keymap it covers the round trip (`GET` reporting all seven actions with a
+`null` override beside the chords mesa ships, the spatial nav's letter-and-arrow
+pair included), a chord stored **canonicalized** and only the override stored,
+`PUT null` removing an entry, `commands`/`watchers`/`live`/an unknown section
+surviving a keymap write and vice versa, an action absent from the body left
+alone, a malformed chord / an unknown action (named in the message) / a chord
+the spatial nav already holds / two clashing actions in one body each 422
+writing nothing, both verbs refused to a request that isn't from this machine's
+own page, and the forgiving read: a hand-edited entry mesa cannot use dropped
+beside a good one that survives.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with
 null values, an override and a wholly new prefix landing, `PUT null` restoring

@@ -5,7 +5,12 @@
 // contract) and §3 (listener ownership).
 
 import { useEffect } from 'react'
-import { shouldIgnoreShortcut } from './keyboardScope'
+import {
+  DEFAULT_KEYMAP,
+  matchesShortcut,
+  type Keymap,
+  type KeymapAction,
+} from './keymap'
 
 type Direction = 'left' | 'right' | 'up' | 'down'
 
@@ -16,18 +21,15 @@ type Direction = 'left' | 'right' | 'up' | 'down'
 const CANDIDATE_SELECTOR =
   'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])'
 
-// Matches on lowercase e.key only, same convention as the 'a' shortcut
-// (story 452) — e.key's case follows Shift, and a shifted letter chord is
-// not this feature's concern. Arrow key names don't change with Shift.
-const KEY_DIRECTION: Record<string, Direction> = {
-  h: 'left',
-  ArrowLeft: 'left',
-  l: 'right',
-  ArrowRight: 'right',
-  k: 'up',
-  ArrowUp: 'up',
-  j: 'down',
-  ArrowDown: 'down',
+// Which keymap action moves which way. The chords themselves moved out to
+// `keymap.ts` in mesa task 1079 so they could be rebound from Settings — this
+// table is now only the direction each action means, and the `h`/`ArrowLeft`
+// pair that used to live here is that action's default over there.
+const ACTION_DIRECTION: Record<string, Direction> = {
+  'focus-left': 'left',
+  'focus-right': 'right',
+  'focus-up': 'up',
+  'focus-down': 'down',
 }
 
 interface Rect {
@@ -206,21 +208,29 @@ export function moveFocus(dir: Direction): void {
 }
 
 /**
- * Mounts the global h/j/k/l + arrow-key spatial navigation listener (arch
- * doc §3) — a `window` keydown listener, bubble phase, with a key set
- * disjoint from the existing Cmd/Ctrl+Shift+P and 'a' shortcuts, so no
- * ordering coordination with either is required.
+ * Mounts the global spatial navigation listener (arch doc §3) — a `window`
+ * keydown listener, bubble phase, reading the four `focus-*` actions out of
+ * the keymap it is handed (`h/j/k/l` and the arrow keys, until Settings says
+ * otherwise). Its chords are disjoint from the palette's and the 'a'
+ * shortcut's, which the keymap's own conflict rule is what now guarantees, so
+ * no ordering coordination with either is required.
  */
-export function useSpatialNav(): void {
+export function useSpatialNav(keymap: Keymap = DEFAULT_KEYMAP): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const dir = KEY_DIRECTION[e.key]
-      if (!dir) return
-      if (shouldIgnoreShortcut(e)) return
-      e.preventDefault()
-      moveFocus(dir)
+      for (const [action, dir] of Object.entries(ACTION_DIRECTION)) {
+        // `matchesShortcut` is where `shouldIgnoreShortcut` is now consulted:
+        // it applies to a bare chord, which is what all eight defaults are, so
+        // this is the same suppression the inline check performed — but keyed
+        // on the chord, so a user who binds a direction to Alt+← still gets it
+        // inside a text field, as a chord shortcut should.
+        if (!matchesShortcut(action as KeymapAction, e, keymap)) continue
+        e.preventDefault()
+        moveFocus(dir)
+        return
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [keymap])
 }

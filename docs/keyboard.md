@@ -2,22 +2,32 @@
 
 Global keyboard control of the web UI: a create-task shortcut on any project
 view, and an app-wide spatial focus layer driven by `h/j/k/l` and the arrow
-keys. Frontend-only — no CLI, API, or Rust surface.
+keys. Frontend-only except for where the bindings are **stored** — since mesa
+task 1079 the four global listeners read a **keymap** the user can rebind from
+Settings, which lives in `~/.mesa/config.json`'s `keymap` section
+(`docs/config.md`). Nothing in Rust *reads* it: the shortcuts are still the
+page's.
 
 ## Bindings
 
-| Key | Scope | Effect |
-|---|---|---|
-| `a` | any project view | Opens the create-task modal **in place**, over the view you are on (task 811) |
-| `h` `j` `k` `l` | global | Move native DOM focus left / down / up / right |
-| `←` `↓` `↑` `→` | global | Same as `hjkl` |
-| `Enter` | global | Activates the focused element (native browser behavior) |
-| `Cmd/Ctrl+Shift+P` | global | Command palette — **pre-existing**, untouched |
-| `Cmd/Ctrl+F` | Files tab, focused pane, findable file | Opens find-in-file, selecting the remembered query (task 809) |
-| `Cmd/Ctrl+Shift+F` | Files tab | Opens the project-wide search panel in place of the tree, selecting the remembered query (task 813) |
-| `Cmd/Ctrl+S` | Files tab editor | Saves the file, staying in the editor (and swallows Save Page) |
-| `Alt+W` | Files tab | Closes the focused pane's active tab |
-| `Alt+[` `Alt+]` | Files tab | Previous / next tab in the focused pane |
+| Key | Action | Scope | Effect |
+|---|---|---|---|
+| `a` | `create-task` | any project view | Opens the create-task modal **in place**, over the view you are on (task 811) |
+| `h` `j` `k` `l` | `focus-*` | global | Move native DOM focus left / down / up / right |
+| `←` `↓` `↑` `→` | `focus-*` | global | Same as `hjkl` |
+| `Enter` | — | global | Activates the focused element (native browser behavior) |
+| `Cmd/Ctrl+Shift+P` | `command-palette` | global | Command palette |
+| `Cmd/Ctrl+Shift+L` | `live-listen` | global | Opens and shuts the microphone during a live conversation (task 887) |
+| `Cmd/Ctrl+F` | — | Files tab, focused pane, findable file | Opens find-in-file, selecting the remembered query (task 809) |
+| `Cmd/Ctrl+Shift+F` | — | Files tab | Opens the project-wide search panel in place of the tree, selecting the remembered query (task 813) |
+| `Cmd/Ctrl+S` | — | Files tab editor | Saves the file, staying in the editor (and swallows Save Page) |
+| `Alt+W` | — | Files tab | Closes the focused pane's active tab |
+| `Alt+[` `Alt+]` | — | Files tab | Previous / next tab in the focused pane |
+
+The **Action** column is the keymap action id: a row that has one is
+**rebindable** from Settings → Keyboard shortcuts, and the chord shown is only
+its default (see "The keymap" below). A row with `—` is not, and is not meant
+to be.
 
 `Enter` is deliberately *not* special-cased. Focus lands on real interactive
 elements, so the browser's own activation does the right thing: a link
@@ -51,15 +61,76 @@ the Terminal tab's panes are xterm (rule 3), a diagram canvas suppresses
 everything (rule 4). Do not re-add a per-view gate on top of it — that is the
 divergent second suppression check the chokepoint exists to prevent.
 
+## The keymap (task 1079)
+
+`frontend/src/keymap.ts` is the one table of what mesa binds, and the one place
+a keystroke is read against it. Before it, each listener compared `e.key`
+inline — the palette in `App.tsx`, the spatial nav's `KEY_DIRECTION`, the `a`
+shortcut in `ProjectTasksPage`, the listen chord's `isListenChord` — so there
+was nowhere to *state* what mesa binds and nothing to rebind.
+
+- **Seven actions**, exactly the four global `window` keydown listeners:
+  `command-palette`, the four `focus-*` directions, `create-task` and
+  `live-listen`. Component-local bindings stay hard-coded — the Files tab's
+  chords, the code editor's Cmd/Ctrl+S and a modal's Escape belong to one panel
+  while it is on screen, which is a different thing from a binding the whole
+  app answers to. Rebinding those would be rebinding a form.
+- **An action holds a list of chords**, because the spatial nav has always
+  answered to a letter *and* an arrow. A recording replaces the list with the
+  one chord recorded.
+- **A chord is `Mod+Alt+Shift+<key>`**, modifiers in that order, `Mod` being
+  meta-**or**-ctrl so one keymap means the same thing on either platform. The
+  key is whatever `KeyboardEvent.key` reports, lowercased when it is a single
+  character; `canonicalChord` is the one spelling, and every comparison —
+  matching, conflict detection, "is this still the default" — goes through it.
+- **`matchesShortcut(action, event, keymap)` is what every listener calls**,
+  and it is where `shouldIgnoreShortcut` is now consulted: **a matched chord
+  carrying no modifier is subject to it, wherever it is bound.** With the
+  shipped defaults that is byte-identical to the four inline checks it replaced
+  (exactly the bare chords — `h/j/k/l`, the arrows, `a` — consulted it before).
+  It has to be a rule about the chord rather than the call site because a user
+  may now bind `create-task` to Cmd+Shift+N, which must fire from inside a text
+  field as the palette does, or the palette to `p`, which must not be typed
+  into one.
+- **All three modifiers are compared exactly.** That is a hair stricter than
+  what it replaced: `Shift+←` used to move focus left, since the old table only
+  looked at `e.key`. Deliberate — a recording round-trips exactly, and two
+  chords differing only by a modifier are genuinely two chords, which is what
+  makes the conflict rule mean anything.
+- **A chord belongs to one action.** `conflicts()` is the editor's inline
+  complaint and the save's refusal; `config::check_no_chord_collision` is the
+  server refusing the same thing, judged against the whole map a save would
+  leave behind — including the actions the user never touched.
+- **`keymapStore.ts` is the one fetch.** One `GET /api/config/keymap` per page
+  however many listeners ask, the shipped chords in force until it answers (so
+  a refused or unreadable config leaves the app with shortcuts rather than
+  none), and a Settings save publishes its own response straight to the
+  listeners so a rebind takes effect with no reload.
+- The command palette shows the chord for any row that *is* a keymap action,
+  read from the same store — so the palette and the keyboard can never
+  disagree. Rows that are plain navigation show nothing; an invented chord
+  would be worse than none.
+
+Unit tests: `frontend/src/keymap.test.ts` (defaults, matching, recording,
+conflicts, the resolve fallback) and `frontend/src/keymapDraft.test.ts` (the
+Settings editor's draft). The shipped table is pinned on both sides —
+`the shipped keymap` there and
+`config::tests::the_shipped_keymap_is_todays_behaviour` here — so editing one
+without the other fails.
+
 ## The suppression chokepoint
 
 **`shouldIgnoreShortcut(e: KeyboardEvent): boolean`** in
 `frontend/src/keyboardScope.ts` is the single gate for every global
-single-key shortcut. Both the `a` shortcut and the spatial nav consume it.
+single-key shortcut. Since task 1079 its caller is `keymap.ts`'s
+`matchesShortcut`, on behalf of all four global listeners, whenever the matched
+chord carries no modifier — so every bare shortcut still consumes it, through
+one call instead of four.
 
-**Any new global single-key shortcut MUST call it.** Do not hand-roll a
-second suppression check, and do not fork this module — a divergent copy is
-how one surface starts eating another's keys.
+**Any new global single-key shortcut MUST call it** — in practice, by going
+through `matchesShortcut`. Do not hand-roll a second suppression check, and do
+not fork this module — a divergent copy is how one surface starts eating
+another's keys.
 
 Returns `true` (suppress) for, in order:
 
@@ -246,12 +317,20 @@ letter is not this feature's concern; arrow-key names don't change with Shift.
 
 ## Listeners
 
-Two independent `window` `keydown` listeners with disjoint key sets, mounted
-side by side in `App.tsx`: the pre-existing `useCommandPaletteShortcut`
-(Cmd/Ctrl+Shift+P) and `useSpatialNav()`. The `a` shortcut is a third,
-mounted inside `ProjectTasksPage` and gated on the Board view, so it is inert
-by construction on Diagrams/Git/Files/Dashboard — no route-string
-comparison involved.
+Four `window` listeners, each reading its own action out of the keymap it is
+handed: `useCommandPaletteShortcut` and `useSpatialNav()` side by side in
+`App.tsx`, `useCreateTaskShortcut` inside `ProjectTasksPage` (mounted with the
+page, so it is inert by construction where the page is not — no route-string
+comparison involved), and the listen chord's own listener in `LiveHub`. Their
+key sets are disjoint, which the keymap's conflict rule is now what
+guarantees rather than the shipped table happening to be so.
+
+The `a` shortcut is the one bound on **`keyup`** (task 817, above); the other
+three are `keydown`. The Settings editor's recording listener is a fifth, on
+the **capture** phase, mounted only while a row is recording: it
+`stopPropagation`s so the chord being recorded does not also *fire* — pressing
+Cmd/Ctrl+Shift+P to rebind the palette must not open the palette — and swallows
+the matching `keyup` too, since that is the phase `create-task` listens on.
 
 ## Verifying changes here
 

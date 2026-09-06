@@ -1651,6 +1651,13 @@ fn router(state: AppState) -> Router {
             "/api/config/guard",
             get(get_config_guard).put(update_config_guard),
         )
+        // The same file's `keymap` section — the web UI's global keyboard
+        // shortcuts (mesa task 1079). An eighth route for the same reason as
+        // the other six.
+        .route(
+            "/api/config/keymap",
+            get(get_config_keymap).put(update_config_keymap),
+        )
         // Everything outside /api is the embedded SPA; unknown paths fall
         // back to index.html with 200 so client-side routes deep-link.
         .fallback_service(axum_embed::ServeEmbed::<Assets>::with_parameters(
@@ -6384,6 +6391,62 @@ async fn update_config_guard(
     get_config_guard(State(state), ConnectInfo(addr), headers).await
 }
 
+/// `GET /api/config/keymap` — the web UI's global keyboard shortcuts: every
+/// action mesa binds, the chords the config overrides it with (`null` when it
+/// says nothing) and the chords mesa ships behind each (`docs/keyboard.md`,
+/// mesa task 1079).
+///
+/// Gated like `get_config_watchers` — same file, same class of secret — and a
+/// malformed config is the same 502 `unavailable`, so the editor never renders
+/// a blank keymap over a file it couldn't read.
+async fn get_config_keymap(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::keymap() {
+        Ok(keymap) => Ok(Json(keymap).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+/// `PUT /api/config/keymap` — writes the rebound shortcuts and echoes them.
+///
+/// The body is a **flat map of action id to chords**, unlike its fixed-key
+/// siblings, because the actions are a table rather than a struct: an absent
+/// action is left alone, `null` removes its override (restoring the built-in
+/// chords) and a list replaces it. The values stay raw JSON, as the watchers'
+/// do, so `"h"` and `[]` are the config layer's named 422 rather than a
+/// deserializer rejection the API would have to render as a 400.
+///
+/// `require_agent_access`, like every other config write (mesa task 1021).
+async fn update_config_keymap(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<HashMap<String, Option<serde_json::Value>>>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    config::save_keymap(&body).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_keymap(State(state), ConnectInfo(addr), headers).await
+}
+
 /// `GET /api/config/speech` — the voice the inbox's play button speaks in, plus
 /// the voices the installed synthesiser offers so the editor can be a list
 /// (`docs/config.md`, mesa task 822).
@@ -9152,9 +9215,9 @@ mod tests {
         let cfg = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("MESA_CONFIG_FILE", cfg.path().join("config.json")) };
 
-        /// Puts a no-op body through all seven config writes and asserts each
+        /// Puts a no-op body through all eight config writes and asserts each
         /// one landed on `$ok` (`true` = the gate let it through).
-        macro_rules! all_seven {
+        macro_rules! all_eight {
             ($state:expr, $peer:expr, $headers:expr, $ok:expr, $label:expr) => {{
                 let mut got: Vec<(&str, bool)> = Vec::new();
                 got.push((
@@ -9247,6 +9310,17 @@ mod tests {
                     .await
                     .is_ok(),
                 ));
+                got.push((
+                    "/keymap",
+                    update_config_keymap(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(HashMap::new()),
+                    )
+                    .await
+                    .is_ok(),
+                ));
                 for (route, ok) in got {
                     assert_eq!(ok, $ok, "{} on PUT /api/config{}", $label, route);
                 }
@@ -9257,20 +9331,20 @@ mod tests {
         let (_dir, mut state) = test_state();
         state.lan = true;
         let legit = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        all_seven!(state, lan_peer(), legit, true, "legit LAN page");
+        all_eight!(state, lan_peer(), legit, true, "legit LAN page");
 
         // The same LAN peer, rebound: a DNS-name Host is the only shape a
         // rebinding page can send, and a foreign Origin is the cross-site
         // fetch. Both defenses stay shut.
         let rebound = hdrs(Some("evil.example:0"), Some("http://192.168.1.50:0"));
-        all_seven!(state, lan_peer(), rebound, false, "rebound Host");
+        all_eight!(state, lan_peer(), rebound, false, "rebound Host");
         let cross_site = hdrs(Some("192.168.1.50:0"), Some("https://evil.example"));
-        all_seven!(state, lan_peer(), cross_site, false, "foreign Origin");
+        all_eight!(state, lan_peer(), cross_site, false, "foreign Origin");
 
         // DEFAULT mode: the non-loopback peer is still refused outright, so
         // nothing about the single-machine posture loosened.
         state.lan = false;
-        all_seven!(state, lan_peer(), legit, false, "default mode, LAN peer");
+        all_eight!(state, lan_peer(), legit, false, "default mode, LAN peer");
     }
 
     // The pricing verbs share the config gates exactly — same file, same
@@ -9280,6 +9354,21 @@ mod tests {
     async fn get_config_pricing_rejects_non_loopback_peer_in_default_mode() {
         let (_dir, state) = test_state();
         let resp = get_config_pricing(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    // The keymap verbs are the eighth of the same pair (mesa task 1079); the
+    // write half rides `all_eight!` above, so this is its read half.
+
+    #[tokio::test]
+    async fn get_config_keymap_rejects_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        let resp = get_config_keymap(
             State(state),
             ConnectInfo(lan_peer()),
             loopback_agent_headers(),

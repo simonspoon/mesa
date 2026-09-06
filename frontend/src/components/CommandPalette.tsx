@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { listProjects } from '../api'
+import { chordLabel, type KeymapAction } from '../keymap'
+import { useKeymap } from '../keymapStore'
 import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
 
@@ -11,6 +13,12 @@ interface Command {
   // task in") never cause a false match.
   search: string
   run: () => void
+  // The keymap action this row *is*, when it is one (mesa task 1079). The row
+  // then shows the chord that action is bound to, read from the same keymap
+  // the listener acts on, so the palette and the keyboard can never disagree.
+  // Most rows are navigation with no shortcut of their own and leave it unset
+  // — an invented chord would be worse than none.
+  action?: KeymapAction
 }
 
 function navigate(hash: string) {
@@ -98,6 +106,7 @@ function buildCommands(projects: Project[]): Command[] {
       label: `Create task in ${p.name}`,
       search: `${name} create task new`,
       run: () => navigate(`#/projects/${p.id}/create-task`),
+      action: 'create-task',
     })
   }
   return commands
@@ -118,6 +127,7 @@ function matches(command: Command, query: string): boolean {
  */
 export function CommandPalette({ onClose }: { onClose: () => void }) {
   const { data: projects } = useFetch(() => listProjects(), 'command-palette-projects')
+  const keymap = useKeymap()
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -200,7 +210,12 @@ export function CommandPalette({ onClose }: { onClose: () => void }) {
                 onMouseEnter={() => setSelected(i)}
                 onClick={() => run(i)}
               >
-                {c.label}
+                <span className="command-palette-label">{c.label}</span>
+                {c.action && (
+                  <span className="command-palette-chord">
+                    {(keymap[c.action] ?? []).map(chordLabel).join(' or ')}
+                  </span>
+                )}
               </li>
             ))
           )}

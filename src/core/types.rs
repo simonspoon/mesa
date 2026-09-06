@@ -363,6 +363,36 @@ pub struct ConfigGuard {
     pub action_default: String,
 }
 
+/// The global keyboard shortcuts as the Settings page sees them
+/// (`core::config`, `docs/keyboard.md`, mesa task 1079) — an eighth view of
+/// `~/.mesa/config.json`, with the same null-means-fallback rule as
+/// [`ConfigWatchers`]: an action the config says nothing about answers to the
+/// chords mesa ships, and writing `null` back is how the user restores them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigKeymap {
+    /// Every action mesa binds, in the order `config::KEYMAP_ACTIONS` ships
+    /// them — a list rather than a map so the page renders the rows in one
+    /// settled order without holding a second copy of it.
+    pub actions: Vec<ConfigKeymapAction>,
+}
+
+/// One rebindable action: what the config says, and what mesa ships behind it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigKeymapAction {
+    /// The action id (`command-palette`, `focus-left`, …). The label beside it
+    /// is the page's own: it is copy, not contract.
+    pub action: String,
+    /// The configured chords, or `null` when the config says nothing about
+    /// this action — then `default` is what applies. A **list**, because the
+    /// spatial nav answers to a letter and an arrow alike.
+    pub value: Option<Vec<String>>,
+    /// The chords mesa ships for this action, so the editor can show what
+    /// "reset" means without a second copy of the table.
+    pub default: Vec<String>,
+}
+
 /// Working-tree git status of one repo folder (see `core::git`). Decorative
 /// sidebar data: absence (no repo, no git) is represented by omission, not by
 /// a degenerate value.

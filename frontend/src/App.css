@@ -8057,6 +8057,116 @@ button:focus-visible,
   font-size: 0.8rem;
 }
 
+/* The System section (mesa task 1093): read-only meters over the host, so a
+   stack of rows rather than the label/input pairs the rest of the page uses.
+   The bars borrow `.cc-sub-*`'s geometry and colour bands deliberately — the
+   percentages come from the same 70/90 rule, so they must not look different.
+   A row whose value the host did not report simply has no track. */
+.settings-system {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.settings-system-rowtop {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.3rem;
+}
+
+.settings-system-label {
+  font-size: 0.82rem;
+  color: var(--text-h);
+}
+
+.settings-system-pct {
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  color: var(--text-h);
+}
+
+.settings-system-track {
+  height: 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.settings-system-fill {
+  height: 100%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan-dim);
+  transition: width 0.4s ease;
+}
+
+.settings-system-fill.warn {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber);
+}
+
+.settings-system-fill.crit {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+}
+
+.settings-system-detail {
+  font-size: 0.72rem;
+  margin-top: 0.25rem;
+}
+
+/* Per-core load, one thin column each: a shape to glance at (is one core
+   pinned, or all of them?), never a figure to read — the number is in the
+   title attribute. Wraps, since a 16-thread host is normal. */
+.settings-system-cores {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 2px;
+  height: 24px;
+}
+
+.settings-system-core {
+  display: flex;
+  align-items: flex-end;
+  width: 6px;
+  height: 100%;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+}
+
+.settings-system-core-fill {
+  width: 100%;
+  background: var(--cyan);
+  transition: height 0.4s ease;
+}
+
+.settings-system-core-fill.warn {
+  background: var(--amber);
+}
+
+.settings-system-core-fill.crit {
+  background: var(--red);
+}
+
+/* The values with no meter in them — host, OS, load, uptime. */
+.settings-system-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 0.8rem;
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.settings-system-facts dt {
+  color: var(--muted);
+}
+
+.settings-system-facts dd {
+  margin: 0;
+  color: var(--text-h);
+}
+
 /* One shortcut row: the caps it is bound to, then the two controls that change
    it. Its own row rather than a label/input pair, because what it holds is not
    editable text — a chord is recorded, never typed. */

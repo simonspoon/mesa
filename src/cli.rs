@@ -31,7 +31,7 @@ use crate::core::{
     LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveRole, LiveSession, LiveStatus,
     LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result,
     Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt,
-    agents, board, config, files, library, live, look, receipt,
+    agents, board, config, files, library, live, look, receipt, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -192,6 +192,17 @@ EXAMPLES
         /// Destination file for the snapshot; must not already exist
         path: PathBuf,
     },
+    /// Print the host's system state: memory, CPU, disk, GPU, uptime
+    ///
+    /// A live reading of the machine mesa is running on, derived on every
+    /// call and never stored. Anything this host will not report is `null` —
+    /// never a zero. Takes roughly 200ms: CPU utilisation is the difference
+    /// between two samples. Byte-identical to `GET /api/system`.
+    #[command(after_help = "\
+EXAMPLES
+  mesa system
+  mesa system | jq .ram_used_bytes")]
+    System,
 }
 
 #[derive(Subcommand)]
@@ -3131,6 +3142,10 @@ fn execute(command: Command) -> Result<()> {
             watch_inbox,
             watch_cost,
         } => crate::api::serve(port, lan, watch_todo, watch_inbox, watch_cost),
+        Command::System => {
+            print_json(&system::snapshot());
+            Ok(())
+        }
         Command::Backup { path } => {
             let store = Store::open_default()?;
             store.backup(&path)?;

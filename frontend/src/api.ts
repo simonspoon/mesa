@@ -67,6 +67,7 @@ import type { Script } from './types/Script'
 import type { ScriptArg } from './types/ScriptArg'
 import type { ScriptRun } from './types/ScriptRun'
 import type { Status } from './types/Status'
+import type { SystemInfo } from './types/SystemInfo'
 import type { Task } from './types/Task'
 import type { TaskReceipt } from './types/TaskReceipt'
 import type { TaskSummary } from './types/TaskSummary'
@@ -364,6 +365,15 @@ export function getGitStatus(): Promise<ProjectGitStatus[]> {
 /** mesa's own version (the running binary's CARGO_PKG_VERSION). */
 export function getMesaVersion(): Promise<MesaVersion> {
   return request('/api/version')
+}
+
+/**
+ * A live reading of the host the server runs on (memory, CPU, disk, GPU).
+ * Derived per request and never stored; any value the host will not report
+ * comes back `null`, never a zero, so the page must not draw the two alike.
+ */
+export function getSystemInfo(): Promise<SystemInfo> {
+  return request('/api/system')
 }
 
 /**

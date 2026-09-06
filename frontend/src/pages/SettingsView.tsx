@@ -6,6 +6,7 @@ import {
   getLiveConfig,
   getPricing,
   getSpeech,
+  getSystemInfo,
   getWatchers,
   listProjects,
   resetCcIndex,
@@ -42,6 +43,13 @@ import {
   type KeymapDraft,
 } from '../keymapDraft'
 import { publishKeymap } from '../keymapStore'
+import {
+  clampPct,
+  formatBytes,
+  formatUptime,
+  systemSeverity,
+  usedPct,
+} from '../systemMeter'
 import {
   RATE_FIELDS,
   addedPricing,
@@ -323,6 +331,7 @@ export function SettingsView() {
       <SpeechSection />
       <ListenSection />
       <PricingSection />
+      <SystemSection />
     </div>
   )
 }
@@ -1518,6 +1527,181 @@ function NewPriceRow({
       >
         remove
       </button>
+    </div>
+  )
+}
+
+/**
+ * The host mesa is running on (mesa task 1093). **Read-only** — unlike every
+ * other section on this page it edits nothing, has no draft and no save
+ * button, because the machine is not a setting. It is here because Settings
+ * is already the page about *this installation* rather than about a project,
+ * and because the server is often on a box nobody is sitting at.
+ *
+ * Polled rather than fetched once: it is a live reading, and `GET /api/system`
+ * itself blocks ~200ms taking a second CPU sample, so 3s is as fast as the
+ * numbers are worth. `useFetch` drops a poll whose result is unchanged and
+ * pauses entirely while the tab is hidden.
+ *
+ * The rule this section must not soften: **a value the host would not report
+ * is `null`, and a `null` is typeset, never metered.** Drawing an empty bar
+ * for an unknown figure would claim the machine has none of it.
+ */
+function SystemSection() {
+  const { data: info, error } = useFetch(getSystemInfo, 'system-info', {
+    pollMs: 3000,
+  })
+
+  if (error) {
+    return (
+      <>
+        <h2>System</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!info) {
+    return (
+      <>
+        <h2>System</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const load = info.load_average
+  return (
+    <>
+      <h2>System</h2>
+      <p className="muted">
+        The host this server is running on, read fresh every few seconds and
+        never stored. A dash means the machine did not report that figure —
+        which is not the same as zero.
+      </p>
+      <section className="settings-command settings-system">
+        <Meter
+          label="Memory"
+          pct={usedPct(info.ram_used_bytes, info.ram_total_bytes)}
+          detail={`${formatBytes(info.ram_used_bytes)} of ${formatBytes(info.ram_total_bytes)}`}
+        />
+        <Meter
+          label="Swap"
+          pct={usedPct(info.swap_used_bytes, info.swap_total_bytes)}
+          detail={
+            info.swap_total_bytes > 0
+              ? `${formatBytes(info.swap_used_bytes)} of ${formatBytes(info.swap_total_bytes)}`
+              : 'none configured'
+          }
+        />
+        <Meter
+          label="CPU"
+          pct={clampPct(info.cpu_usage_pct)}
+          detail={info.cpu_model ?? 'model not reported'}
+        />
+        <div className="settings-system-cores">
+          {info.cpu_per_core_pct.map((p, i) => {
+            const pct = clampPct(p) ?? 0
+            return (
+              <span
+                key={i}
+                className="settings-system-core"
+                title={`core ${i + 1}: ${pct.toFixed(0)}%`}
+              >
+                <span
+                  className={`settings-system-core-fill ${systemSeverity(pct)}`}
+                  style={{ height: `${pct}%` }}
+                />
+              </span>
+            )
+          })}
+        </div>
+        <Meter
+          label="Disk (mesa database volume)"
+          pct={
+            info.disk_total_bytes !== null && info.disk_free_bytes !== null
+              ? usedPct(
+                  info.disk_total_bytes - info.disk_free_bytes,
+                  info.disk_total_bytes,
+                )
+              : null
+          }
+          detail={
+            info.disk_free_bytes !== null
+              ? `${formatBytes(info.disk_free_bytes)} free of ${formatBytes(info.disk_total_bytes)}`
+              : 'not reported'
+          }
+        />
+        {info.gpu && (
+          <Meter
+            label="GPU"
+            // Always null today: real utilisation needs privileged
+            // `powermetrics`, so the row is a fact sheet, not a meter.
+            pct={clampPct(info.gpu.usage_pct)}
+            detail={
+              info.gpu.vram_bytes !== null
+                ? `${info.gpu.name} · ${formatBytes(info.gpu.vram_bytes)} VRAM`
+                : `${info.gpu.name} · shared memory`
+            }
+          />
+        )}
+        <dl className="settings-system-facts">
+          <dt>Host</dt>
+          <dd>{info.hostname ?? '—'}</dd>
+          <dt>OS</dt>
+          <dd>{info.os ?? '—'}</dd>
+          <dt>Cores</dt>
+          <dd>
+            {info.cpu_cores !== null
+              ? `${info.cpu_cores} physical · ${info.cpu_logical} logical`
+              : `${info.cpu_logical} logical`}
+          </dd>
+          <dt>Load</dt>
+          <dd>
+            {load
+              ? load.map((n) => n.toFixed(2)).join(' · ')
+              : 'not reported on this platform'}
+          </dd>
+          <dt>Uptime</dt>
+          <dd>{formatUptime(info.uptime_secs)}</dd>
+          <dt>mesa process</dt>
+          <dd>{formatBytes(info.process_rss_bytes)}</dd>
+        </dl>
+      </section>
+    </>
+  )
+}
+
+/**
+ * One labelled bar. A `null` percentage draws **no track at all** — just the
+ * label and whatever the host did say — which is the whole point of keeping
+ * `null` distinct from 0 all the way from `core::system`.
+ */
+function Meter({
+  label,
+  pct,
+  detail,
+}: {
+  label: string
+  pct: number | null
+  detail: string
+}) {
+  return (
+    <div className="settings-system-row">
+      <div className="settings-system-rowtop">
+        <span className="settings-system-label">{label}</span>
+        <span className="settings-system-pct">
+          {pct === null ? 'not reported' : `${pct.toFixed(0)}%`}
+        </span>
+      </div>
+      {pct !== null && (
+        <div className="settings-system-track">
+          <div
+            className={`settings-system-fill ${systemSeverity(pct)}`}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      )}
+      <div className="settings-system-detail muted">{detail}</div>
     </div>
   )
 }

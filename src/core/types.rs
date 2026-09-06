@@ -443,6 +443,73 @@ pub struct MesaVersion {
     pub version: String,
 }
 
+/// `GET /api/system` and `mesa system`: a live reading of the host the mesa
+/// server is running on (`core::system`). Derived on every read, never
+/// stored — mesa keeps no history of it.
+///
+/// Every field a platform may decline to report is `Option`, and `None` means
+/// **this host did not say**, never zero: a `null` and a reading of `0` are
+/// different facts and the UI must not draw them the same way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct SystemInfo {
+    // Every byte count is a `u64` in Rust but `number` in TypeScript: JSON
+    // has one number type and `JSON.parse` hands the page a `number`, so the
+    // `bigint` ts-rs would infer would be a lie about what actually arrives
+    // (the `ProjectGitStatus::project_id` precedent). None of these can reach
+    // 2^53 on hardware that exists.
+    #[ts(type = "number")]
+    pub ram_total_bytes: u64,
+    #[ts(type = "number")]
+    pub ram_used_bytes: u64,
+    #[ts(type = "number")]
+    pub swap_total_bytes: u64,
+    #[ts(type = "number")]
+    pub swap_used_bytes: u64,
+    /// The first CPU's brand string, e.g. "Apple M1 Pro".
+    pub cpu_model: Option<String>,
+    /// Physical cores; `None` where the platform will not say.
+    pub cpu_cores: Option<u32>,
+    /// Logical cores (hardware threads) — always known, since it is the
+    /// length of the per-core list below.
+    pub cpu_logical: u32,
+    /// Overall utilisation, 0–100, across the whole sampling window.
+    pub cpu_usage_pct: f64,
+    /// Per logical core, in `cpu_logical` order.
+    pub cpu_per_core_pct: Vec<f64>,
+    /// 1/5/15-minute load average; `None` where the platform has no such
+    /// idea (Windows), rather than three misleading zeroes.
+    pub load_average: Option<[f64; 3]>,
+    pub gpu: Option<GpuInfo>,
+    #[ts(type = "number")]
+    pub uptime_secs: u64,
+    /// The volume holding mesa's own database — not the whole machine's
+    /// storage, since that is the one disk a mesa user can fill.
+    #[ts(type = "number | null")]
+    pub disk_total_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub disk_free_bytes: Option<u64>,
+    /// Resident set size of the mesa process itself.
+    #[ts(type = "number | null")]
+    pub process_rss_bytes: Option<u64>,
+    pub os: Option<String>,
+    pub hostname: Option<String>,
+}
+
+/// The host's display adapter, as `system_profiler` reports it (macOS only —
+/// `SystemInfo::gpu` is `None` everywhere else). `usage_pct` is always `None`
+/// today: real utilisation needs privileged `powermetrics`, so mesa reports
+/// nothing rather than a number it cannot stand behind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct GpuInfo {
+    pub name: String,
+    /// Absent on Apple silicon, where the GPU shares system memory.
+    #[ts(type = "number | null")]
+    pub vram_bytes: Option<u64>,
+    pub usage_pct: Option<f64>,
+}
+
 /// One changed/untracked/conflicted path from `git status --porcelain=v2`
 /// (see `core::git::view_of`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

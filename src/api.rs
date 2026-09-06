@@ -46,9 +46,9 @@ use crate::core::{
     LiveContext, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion,
     ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
     ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script,
-    ScriptArg, ScriptPatch, Status, Store, Task, TaskPatch, TaskSummary, Waypoint, agents,
-    attachments, board, config, files, git, guard, hooks, library, listen, live, receipt, scripts,
-    speech, supervisor, version,
+    ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary, Waypoint,
+    agents, attachments, board, config, files, git, guard, hooks, library, listen, live, receipt,
+    scripts, speech, supervisor, system, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -1478,6 +1478,12 @@ fn router(state: AppState) -> Router {
         // no store, no gate (it leaks nothing and the header needs it under
         // `--lan` too).
         .route("/api/version", get(get_mesa_version))
+        // Settings page: how the host the server runs on is doing. Read-only
+        // external state and no store, so the same standard-guard-only
+        // posture as /api/version and /api/git-status — it names no project,
+        // task or file, and a `--lan` page needs it for the same reason a
+        // local one does.
+        .route("/api/system", get(get_system_info))
         // Project git tab: working-tree view (branch + changed files) and a
         // per-file unified diff. Read-only external state like /api/git-status,
         // so the same standard guard only — no agent access gate.
@@ -4553,6 +4559,21 @@ async fn get_mesa_version() -> Json<MesaVersion> {
     Json(MesaVersion {
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// `GET /api/system` — a live reading of the host (`core::system`), for the
+/// Settings page's System section. Infallible and always 200: every value the
+/// platform will not report is `null` in the body rather than an error.
+///
+/// `snapshot()` blocks for roughly `MINIMUM_CPU_UPDATE_INTERVAL` while it
+/// takes its second CPU sample, so it goes on the blocking pool — the same
+/// treatment `get_git_status` gives its subprocess.
+async fn get_system_info() -> Json<SystemInfo> {
+    Json(
+        tokio::task::spawn_blocking(system::snapshot)
+            .await
+            .expect("core::system::snapshot does not panic"),
+    )
 }
 
 /// `GET /api/projects/{id}/version` — the app version in the project's
@@ -12903,5 +12924,22 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 header_str(&lan_resp, h),
             );
         }
+    }
+
+    // --- GET /api/system (mesa task 1093) --------------------------------
+
+    /// The route answers 200 JSON that deserializes back into `SystemInfo`,
+    /// with the values the host always knows actually filled in. No state and
+    /// no gate — like `/api/version`, it is a plain informational read.
+    #[tokio::test]
+    async fn system_route_is_200_json() {
+        let resp = get_system_info().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_str(&resp, header::CONTENT_TYPE), "application/json",);
+        let body = body_bytes(resp).await;
+        let info: SystemInfo = serde_json::from_slice(&body).unwrap();
+        assert!(info.ram_total_bytes > 0);
+        assert!(info.cpu_logical >= 1);
+        assert_eq!(info.cpu_per_core_pct.len(), info.cpu_logical as usize);
     }
 }

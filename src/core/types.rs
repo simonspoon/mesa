@@ -1941,6 +1941,50 @@ pub struct LibrarySyncRow {
     pub mesa_body: Option<String>,
     pub disk_body: Option<String>,
     pub baseline: Option<String>,
+    /// The disk file's mtime, in mesa's own timestamp text (`YYYY-MM-DD
+    /// HH:MM:SS`, UTC — what SQLite's `datetime('now')` writes for every
+    /// stored timestamp). `None` when there is no file, or when the platform
+    /// does not report an mtime for it: a value mesa could not determine is
+    /// null, never a zero.
+    pub disk_mtime: Option<String>,
+    /// When mesa's own side last changed — the newest
+    /// `library_versions.created_at` for the item when it has any history,
+    /// else the item's `updated_at`, since `updated_at` also moves on a
+    /// rename. `None` for an unshadowed built-in (there is no row) and for a
+    /// `disk-new` row (there is no mesa side).
+    pub mesa_updated_at: Option<String>,
+    /// The line-level mesa-vs-disk diff, `Some` only when both sides exist
+    /// **and** differ — `None` for `in-sync` and for every one-sided status,
+    /// where the whole body of the one side that exists is the whole story.
+    /// Deliberately two-way: `baseline` is carried separately, and mesa-vs-disk
+    /// is what a resolution actually picks between.
+    pub diff: Option<Vec<LibraryDiffLine>>,
+}
+
+/// Which side one line of a [`LibrarySyncRow::diff`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LibraryDiffKind {
+    /// Present, identical, on both sides.
+    Context,
+    /// Only in mesa's stored body — choosing `disk` loses it.
+    MesaOnly,
+    /// Only in the file on disk — choosing `mesa` loses it.
+    DiskOnly,
+}
+
+/// One line of a sync row's diff. Line numbers are 1-based and present only
+/// on the side the line exists in; a line carrying **neither** is
+/// `core::library::diff_lines`'s truncation marker, the one line that is not
+/// content from either side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryDiffLine {
+    pub kind: LibraryDiffKind,
+    pub mesa_line: Option<u32>,
+    pub disk_line: Option<u32>,
+    pub text: String,
 }
 
 /// The outcome of applying one resolution from `POST /api/library/sync`.

@@ -3560,6 +3560,22 @@ fn fmt_date(epoch: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Formats Unix seconds as mesa's own *stored* timestamp text (`YYYY-MM-DD
+/// HH:MM:SS`, UTC) — the shape SQLite's `datetime('now')` writes for every
+/// timestamp in the db, so a date derived outside it (a file's mtime, in
+/// `core::library::sync_status`) reads exactly like one that came out of a
+/// column. The civil-date math has one implementation, [`fmt_date`].
+pub(crate) fn fmt_store_ts(epoch: i64) -> String {
+    let tod = epoch.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02}:{:02}",
+        fmt_date(epoch),
+        tod / 3_600,
+        (tod % 3_600) / 60,
+        tod % 60
+    )
+}
+
 /// Inverse of [`parse_ts`]: format Unix seconds as ISO-8601 UTC
 /// (`YYYY-MM-DDTHH:MM:SSZ`). Fractional seconds are not reconstructed — the
 /// stored integer is the truth, and the loss is cosmetic (see `.scratch/arch.md`).

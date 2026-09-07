@@ -208,12 +208,47 @@ a caller submit two resolutions for the same file in one `sync_apply` batch.
 There is a general invariant test asserting no two rows in one `sync_status`
 result ever share a `path`.
 
+### What a row carries besides the three bodies
+
+A `LibrarySyncRow` also reports **when each side last changed** and, for a
+two-sided row, **how they differ** (mesa task 1097) — all three derived on
+every read, nothing stored:
+
+| field | value |
+| --- | --- |
+| `disk_mtime` | the file's mtime, in mesa's own `YYYY-MM-DD HH:MM:SS` UTC text (the shape SQLite's `datetime('now')` writes), read off the metadata `read_bounded_with_mtime` already has rather than a second stat. `null` when there is no file, or when the filesystem reports no mtime — a value mesa could not determine is null, never a zero |
+| `mesa_updated_at` | the newest `library_versions.created_at` for the item, else its `updated_at` — versions first because `updated_at` also moves on a rename. `null` for an unshadowed built-in (there is no row) and for a `disk-new` row (there is no mesa side) |
+| `diff` | a `LibraryDiffLine[]`, `null` unless **both** sides exist *and* differ — so `in-sync` and every one-sided status carry none, and the whole body of the side that exists is the whole story there |
+
+`core::library::diff_lines` computes the diff: a hand-rolled line-level LCS,
+no crate and no new route — the row already carries both bodies, so the diff
+rides back with them and the web UI never runs a second implementation of its
+own. Each line is `{kind, mesa_line, disk_line, text}` with `kind` one of
+`context | mesa-only | disk-only`; line numbers are 1-based and set only on
+the side the line exists in, so a mesa-only line has a null `disk_line`. A
+replaced line is exactly one `mesa-only` and one `disk-only` — there is no
+"changed" kind, because a resolution picks a *side*. Both bodies are split
+with `str::lines`, so a missing trailing newline is not a diff line of its
+own.
+
+The result is bounded twice, and both bounds degrade to a **marker** line —
+`kind: context` with *both* line numbers null, the one line that is not
+content from either side — rather than to an error or an unbounded response:
+a table over `DIFF_MAX_CELLS` is not built at all (the marker names both line
+counts), and a result past `DIFF_MAX_LINES` (2000) is cut, the marker saying
+how many lines were dropped.
+
+The diff is **two-way on purpose**: `baseline` rides on the row separately,
+and mesa-vs-disk is what a resolution actually picks between — see the next
+paragraph.
+
 **There is deliberately no automatic merging and no three-way merge.** The
 common case — Claude edited a skill on disk, or the user edited it in mesa —
 is one-sided (`mesa-changed`/`disk-changed`), and the baseline is exactly what
 makes that classification possible: without it, every difference between M
 and D would look identical, whether one side changed or both did. A
-`both-changed` row shows both bodies and the user takes a side; mesa never
+`both-changed` row shows the mesa-vs-disk diff (with both whole bodies one
+click away) and the user takes a side; mesa never
 guesses which half of two independently-changed texts to keep. That is a
 deliberate, permanent property of this feature, not a v1 gap.
 
@@ -421,7 +456,10 @@ or a name — a built-in resolves by name too, since its name and its
   `list` by kind then name, `versions` newest first (empty for an unshadowed
   built-in, which has no history).
 - `sync status [PROJECT]` prints one `LibrarySyncRow` per path as a bare JSON
-  array. `sync apply [PROJECT]` takes either repeatable
+  array — including `disk_mtime`, `mesa_updated_at` and, for a two-sided row
+  that differs, the `diff`. There is deliberately no `--diff` flag and no
+  second subcommand: CLI output is JSON only, so the fields on these rows
+  *are* the CLI exposure. `sync apply [PROJECT]` takes either repeatable
   `--resolve PATH=mesa|disk|skip` flags or one of `--all-mesa`/`--all-disk`
   (resolve every non-`in-sync` row toward one side at once) — the three are
   mutually exclusive — and prints the resulting `LibrarySyncResult[]`.

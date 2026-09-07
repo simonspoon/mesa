@@ -1,3 +1,4 @@
+import type { LibraryDiffLine } from './types/LibraryDiffLine'
 import type { LibrarySyncResult } from './types/LibrarySyncResult'
 import type { LibrarySyncRow } from './types/LibrarySyncRow'
 import type { LibrarySyncStatus } from './types/LibrarySyncStatus'
@@ -160,4 +161,74 @@ export function resultLabel(result: LibrarySyncResult): string {
   if (result.applied) return 'applied'
   if (result.error !== null) return `failed — ${result.error}`
   return 'skipped'
+}
+
+/**
+ * True when the row carries a line-level diff worth showing. The server sends
+ * one only for a two-sided row that actually differs, so this is a length
+ * check on top of the null one — an empty array is not a view.
+ */
+export function hasDiff(row: LibrarySyncRow): boolean {
+  return row.diff !== null && row.diff.length > 0
+}
+
+/** The CSS class for one diff line. A `context` line carrying neither line
+ * number is `diff_lines`'s truncation marker, not content, and reads as its
+ * own thing rather than as an unchanged line of somebody's file. */
+export function diffLineClass(line: LibraryDiffLine): string {
+  if (line.kind === 'mesa-only') return 'library-diff-line library-diff-mesa'
+  if (line.kind === 'disk-only') return 'library-diff-line library-diff-disk'
+  if (line.mesa_line === null && line.disk_line === null) {
+    return 'library-diff-line library-diff-marker'
+  }
+  return 'library-diff-line library-diff-context'
+}
+
+/** The one-character gutter mark for a diff line — the diff convention, with
+ * a blank for context and for the truncation marker. */
+export function diffMark(line: LibraryDiffLine): string {
+  if (line.kind === 'mesa-only') return '-'
+  if (line.kind === 'disk-only') return '+'
+  return ' '
+}
+
+/**
+ * Which side changed more recently, or `null` when either date is missing (a
+ * one-sided row, an unshadowed built-in, a filesystem with no mtime). Both
+ * dates are mesa's `YYYY-MM-DD HH:MM:SS` UTC text, so they compare as
+ * strings — no Date parsing, and no local-timezone reinterpretation of a UTC
+ * value.
+ */
+export function newerSide(row: LibrarySyncRow): 'mesa' | 'disk' | 'same' | null {
+  const mesa = row.mesa_updated_at
+  const disk = row.disk_mtime
+  if (mesa === null || disk === null) return null
+  if (mesa === disk) return 'same'
+  return mesa > disk ? 'mesa' : 'disk'
+}
+
+/** The two change dates as one short line above a row's diff, naming which
+ * side is which and which is newer. `null` when neither side has a date —
+ * there is nothing to say, and an empty line is not worth the space. */
+export function changeDatesLabel(row: LibrarySyncRow): string | null {
+  const parts: string[] = []
+  if (row.mesa_updated_at !== null) parts.push(`mesa ${shortDate(row.mesa_updated_at)}`)
+  if (row.disk_mtime !== null) parts.push(`disk ${shortDate(row.disk_mtime)}`)
+  if (parts.length === 0) return null
+  const newer = newerSide(row)
+  const verdict =
+    newer === 'mesa'
+      ? ' (mesa is newer)'
+      : newer === 'disk'
+        ? ' (disk is newer)'
+        : newer === 'same'
+          ? ' (same time)'
+          : ''
+  return `${parts.join(' · ')}${verdict}`
+}
+
+/** `YYYY-MM-DD HH:MM:SS` cut to the minute — seconds are noise for "which of
+ * these two is newer". Anything not of that shape is shown verbatim. */
+function shortDate(ts: string): string {
+  return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(ts) ? ts.slice(0, 16) : ts
 }

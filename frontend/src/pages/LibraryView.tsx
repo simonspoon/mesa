@@ -29,7 +29,11 @@ import {
   type LibraryDraft,
 } from '../libraryDraft'
 import {
+  changeDatesLabel,
   defaultChoice,
+  diffLineClass,
+  diffMark,
+  hasDiff,
   needsAttention,
   resolutionsFor,
   resultLabel,
@@ -242,7 +246,8 @@ function LibraryVersions({ itemId }: { itemId: number }) {
 }
 
 /** One resolvable row inside the Sync modal: the status badge, an explainer
- * sentence, the before/after bodies, and the mesa/disk/skip picker. */
+ * sentence, when the two sides last changed, the diff (or the whole bodies,
+ * for a one-sided row), and the mesa/disk/skip picker. */
 function LibrarySyncRowView({
   rowKey: key,
   row,
@@ -258,6 +263,12 @@ function LibrarySyncRowView({
   choice: 'mesa' | 'disk' | 'skip'
   onChoose: (choice: 'mesa' | 'disk' | 'skip') => void
 }) {
+  // The diff is the default view for a row that has one; the whole bodies
+  // stay one click away, since a diff hides the lines both sides agree on and
+  // sometimes the agreement is what needs reading.
+  const [showBodies, setShowBodies] = useState(false)
+  const dates = changeDatesLabel(row)
+  const diff = hasDiff(row) ? row.diff : null
   return (
     <li className="library-sync-row">
       <div className="library-sync-row-head">
@@ -267,16 +278,37 @@ function LibrarySyncRowView({
         </span>
       </div>
       <p className="muted">{statusExplains(row.status)}</p>
-      <div className="library-sync-diff">
-        <div className="library-sync-side">
-          <h4>mesa</h4>
-          <pre>{row.mesa_body ?? '(not in mesa)'}</pre>
+      {dates !== null && <p className="library-sync-dates muted">{dates}</p>}
+      {diff !== null && (
+        <button
+          type="button"
+          className="library-sync-view-toggle"
+          onClick={() => setShowBodies((v) => !v)}
+        >
+          {showBodies ? 'show diff' : 'show both bodies'}
+        </button>
+      )}
+      {diff !== null && !showBodies ? (
+        <pre className="library-sync-difflines">
+          {diff.map((line, i) => (
+            <div key={i} className={diffLineClass(line)}>
+              <span className="library-diff-mark">{diffMark(line)}</span>
+              {line.text}
+            </div>
+          ))}
+        </pre>
+      ) : (
+        <div className="library-sync-diff">
+          <div className="library-sync-side">
+            <h4>mesa</h4>
+            <pre>{row.mesa_body ?? '(not in mesa)'}</pre>
+          </div>
+          <div className="library-sync-side">
+            <h4>disk</h4>
+            <pre>{row.disk_body ?? '(no file)'}</pre>
+          </div>
         </div>
-        <div className="library-sync-side">
-          <h4>disk</h4>
-          <pre>{row.disk_body ?? '(no file)'}</pre>
-        </div>
-      </div>
+      )}
       <div className="library-sync-choice">
         {(['mesa', 'disk', 'skip'] as const).map((c) => (
           <label key={c}>

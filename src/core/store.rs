@@ -5352,6 +5352,26 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The `created_at` of each item's newest version, keyed by item id — what
+    /// `library sync status` reports as mesa's own last-changed date for a
+    /// row, since an item's `updated_at` also moves on a rename. Newest is by
+    /// `id`, the same order `list_library_versions` reads in; one query for a
+    /// whole scan rather than one per row.
+    pub fn library_version_dates(&self) -> Result<HashMap<i64, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT item_id, created_at FROM library_versions ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (item_id, created_at) = row?;
+            out.insert(item_id, created_at);
+        }
+        Ok(out)
+    }
+
     /// Stamps the sync baseline without moving `updated_at` — the
     /// `claimed_at` asymmetry held a second time: this call records that mesa
     /// and the disk agree, it does not change what mesa itself holds, so it

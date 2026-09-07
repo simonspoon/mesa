@@ -9891,6 +9891,61 @@ button:focus-visible,
   word-break: break-word;
 }
 
+/* The two change dates, and the unified diff a two-sided row shows instead
+   of the whole bodies above. One column of lines, marked in the gutter and
+   coloured per side — mesa-only is what choosing `disk` would lose, and the
+   other way round. */
+.library-sync-dates {
+  margin: 0.35rem 0 0;
+  font-size: 0.75rem;
+}
+
+.library-sync-view-toggle {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+}
+
+.library-sync-difflines {
+  margin: 0.5rem 0 0;
+  max-height: 16rem;
+  overflow: auto;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.library-diff-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.library-diff-mark {
+  display: inline-block;
+  width: 1ch;
+  margin-right: 0.5ch;
+  color: var(--muted);
+}
+
+.library-diff-context {
+  color: var(--muted);
+}
+
+.library-diff-mesa {
+  color: var(--red);
+}
+
+.library-diff-disk {
+  color: var(--green);
+}
+
+.library-diff-marker {
+  color: var(--muted);
+  font-style: italic;
+}
+
 .library-sync-choice {
   display: flex;
   gap: 0.75rem;

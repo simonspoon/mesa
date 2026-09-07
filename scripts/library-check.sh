@@ -413,7 +413,13 @@ ROW=$(jqs '.[] | select(.name=="syncnew" and .kind=="agent")')
 [ "$(jq -r .path <<<"$ROW")" = ".claude/agents/syncnew.md" ] || fail "sync status: syncnew path"
 [ "$(jq -r .disk_body <<<"$ROW")" = "null" ] || fail "sync status: syncnew must have no disk_body yet"
 [ "$(jq -r .baseline <<<"$ROW")" = "null" ] || fail "sync status: syncnew must have no baseline yet"
-ok "sync status: a freshly-created item with no file on disk is mesa-new"
+[ "$(jq -r .disk_mtime <<<"$ROW")" = "null" ] ||
+  fail "sync status: a mesa-new row has no file, so disk_mtime must be null, got $ROW"
+[ "$(jq -r .diff <<<"$ROW")" = "null" ] ||
+  fail "sync status: a one-sided row has nothing to diff, so diff must be null, got $ROW"
+[ "$(jq -r .mesa_updated_at <<<"$ROW")" != "null" ] ||
+  fail "sync status: a real mesa row always has a mesa_updated_at, got $ROW"
+ok "sync status: a freshly-created item with no file on disk is mesa-new, with a null disk_mtime and no diff"
 
 run 0 "$MESA" library sync apply --resolve '.claude/agents/syncnew.md=mesa'
 RESULT=$(jqs '.[0]')
@@ -427,7 +433,11 @@ ok "sync apply (mesa) on a mesa-new row writes the file at the right path with t
 run 0 "$MESA" library sync status
 ROW=$(jqs '.[] | select(.name=="syncnew" and .kind=="agent")')
 [ "$(jq -r .status <<<"$ROW")" = "in-sync" ] || fail "sync status after apply: expected in-sync, got $ROW"
-ok "after applying mesa, the row reports in-sync"
+[ "$(jq -r .diff <<<"$ROW")" = "null" ] ||
+  fail "sync status: an in-sync row's two sides are the same text, so diff must be null, got $ROW"
+[ "$(jq -r .disk_mtime <<<"$ROW")" != "null" ] ||
+  fail "sync status: the file exists now, so disk_mtime must be a timestamp, got $ROW"
+ok "after applying mesa, the row reports in-sync, with a disk_mtime and no diff"
 
 # ---- disk-changed: the disk side moved since the last sync ----
 
@@ -471,6 +481,12 @@ run 0 "$MESA" library sync status
 ROW=$(jqs '.[] | select(.name=="adopted" and .kind=="command")')
 [ "$(jq -r .status <<<"$ROW")" = "disk-new" ] || fail "sync status: expected disk-new, got $ROW"
 [ "$(jq -r .item_id <<<"$ROW")" = "null" ] || fail "sync status: disk-new row must have no item_id"
+[ "$(jq -r .mesa_updated_at <<<"$ROW")" = "null" ] ||
+  fail "sync status: a disk-new row has no mesa side, so mesa_updated_at must be null, got $ROW"
+[ "$(jq -r .diff <<<"$ROW")" = "null" ] ||
+  fail "sync status: a disk-new row has nothing to diff, so diff must be null, got $ROW"
+[ "$(jq -r .disk_mtime <<<"$ROW")" != "null" ] ||
+  fail "sync status: a disk-new row's file must report an mtime, got $ROW"
 ok "a file with no mesa row at all reports disk-new"
 
 run 0 "$MESA" library sync apply --resolve '.claude/commands/adopted.md=disk'
@@ -522,6 +538,32 @@ ROW=$(jqs '.[] | select(.name=="conflictitem" and .kind=="command")')
 [ "$(jq -r .disk_body <<<"$ROW")" = "disk new" ] || fail "sync status both-changed: disk_body"
 [ "$(jq -r .baseline <<<"$ROW")" = "orig" ] || fail "sync status both-changed: baseline"
 ok "when both sides moved since the last sync, the row is offered as both-changed with both bodies"
+
+# The two change dates and the line-level diff a conflicting row carries
+# (mesa task 1097). One line differs on each side, so the diff is exactly one
+# mesa-only line and one disk-only one — never a "changed" kind, and never a
+# three-way attribution: `baseline` rides on the row separately.
+[ "$(jq -r '.diff | type' <<<"$ROW")" = "array" ] ||
+  fail "sync status both-changed: diff must be an array, got $ROW"
+[ "$(jq -r '.diff | length' <<<"$ROW")" -gt 0 ] ||
+  fail "sync status both-changed: diff must not be empty, got $ROW"
+[ "$(jq -r '[.diff[] | select(.kind=="mesa-only") | .text] | join(",")' <<<"$ROW")" = "mesa new" ] ||
+  fail "sync status both-changed: the mesa-only line must be mesa's body, got $ROW"
+[ "$(jq -r '[.diff[] | select(.kind=="disk-only") | .text] | join(",")' <<<"$ROW")" = "disk new" ] ||
+  fail "sync status both-changed: the disk-only line must be the file's body, got $ROW"
+[ "$(jq -r '.diff[] | select(.kind=="mesa-only") | .mesa_line' <<<"$ROW")" = "1" ] ||
+  fail "sync status both-changed: a mesa-only line carries a 1-based mesa_line, got $ROW"
+[ "$(jq -r '.diff[] | select(.kind=="mesa-only") | .disk_line' <<<"$ROW")" = "null" ] ||
+  fail "sync status both-changed: a mesa-only line has no disk_line, got $ROW"
+[ "$(jq -r '.diff[] | select(.kind=="disk-only") | .disk_line' <<<"$ROW")" = "1" ] ||
+  fail "sync status both-changed: a disk-only line carries a 1-based disk_line, got $ROW"
+[ "$(jq -r '.diff[] | select(.kind=="disk-only") | .mesa_line' <<<"$ROW")" = "null" ] ||
+  fail "sync status both-changed: a disk-only line has no mesa_line, got $ROW"
+echo "$ROW" | jq -e '.disk_mtime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$")' >/dev/null ||
+  fail "sync status both-changed: disk_mtime must be mesa timestamp text, got $ROW"
+echo "$ROW" | jq -e '.mesa_updated_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$")' >/dev/null ||
+  fail "sync status both-changed: mesa_updated_at must be mesa timestamp text, got $ROW"
+ok "a both-changed row carries a line-level mesa-vs-disk diff and both sides' change dates"
 
 run 0 "$MESA" library sync apply --resolve '.claude/commands/conflictitem.md=skip'
 RESULT=$(jqs '.[0]')

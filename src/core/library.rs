@@ -17,11 +17,12 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::store::{Error, LibraryPatch, Result as StoreResult, Store};
 use crate::core::types::{
-    LibraryBundle, LibraryBundleItem, LibraryImportResult, LibraryItem, LibraryKind, LibraryScope,
-    LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
+    LibraryBundle, LibraryBundleItem, LibraryDiffKind, LibraryDiffLine, LibraryImportResult,
+    LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
 };
 
 /// One built-in library entry — code, not a db row. `core::library::BUILTINS`
@@ -297,7 +298,9 @@ const SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// CLAUDE.md locations (`.claude/CLAUDE.md`, the `user`-scope convention, and
 /// `CLAUDE.md` at `base`'s root, the `project`-scope one —
 /// [`relative_path`]'s two answers for [`LibraryKind::ClaudeMd`]), returning
-/// `(kind, name, body)` for every file found. The caller already knows which
+/// `(kind, name, body, mtime)` for every file found — the mtime read off the
+/// same metadata the body was, so a `disk-new` row reports its date without a
+/// second stat. The caller already knows which
 /// scope `base` is for and so which of the two CLAUDE.md hits is the real
 /// one; scanning both costs nothing since at most one is ever present in
 /// practice. Bounded on purpose: it skips anything over [`SCAN_MAX_BYTES`],
@@ -318,7 +321,7 @@ const SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// directory canonicalizes to somewhere outside `base_canon`, `resolve`
 /// refuses it, and the scan silently skips it exactly as it already does for
 /// a directory that does not exist.
-pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String)> {
+pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String>)> {
     let mut found = Vec::new();
 
     let safe_dir = |rel: &str| -> Option<PathBuf> { resolve(base, Path::new(rel)).ok() };
@@ -344,8 +347,8 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String)> {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if let Some(body) = read_bounded(&path) {
-                found.push((kind, stem.to_string(), body));
+            if let Some((body, mtime)) = read_bounded_with_mtime(&path) {
+                found.push((kind, stem.to_string(), body, mtime));
             }
         }
     };
@@ -368,8 +371,8 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String)> {
                 continue;
             };
             let skill_md = entry.path().join("SKILL.md");
-            if let Some(body) = read_bounded(&skill_md) {
-                found.push((LibraryKind::Skill, name, body));
+            if let Some((body, mtime)) = read_bounded_with_mtime(&skill_md) {
+                found.push((LibraryKind::Skill, name, body, mtime));
             }
         }
     }
@@ -380,17 +383,20 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String)> {
         let Some(path) = safe_dir(rel) else {
             continue;
         };
-        if let Some(body) = read_bounded(&path) {
-            found.push((LibraryKind::ClaudeMd, "CLAUDE".to_string(), body));
+        if let Some((body, mtime)) = read_bounded_with_mtime(&path) {
+            found.push((LibraryKind::ClaudeMd, "CLAUDE".to_string(), body, mtime));
         }
     }
 
     found
 }
 
-/// Reads a file's contents, refusing anything over [`SCAN_MAX_BYTES`], a
-/// symlink, or non-UTF-8 bytes rather than failing the whole scan.
-fn read_bounded(path: &Path) -> Option<String> {
+/// Reads a file's contents and its mtime, refusing anything over
+/// [`SCAN_MAX_BYTES`], a symlink, or non-UTF-8 bytes rather than failing the
+/// whole scan. The mtime comes off the metadata this call already reads, so
+/// no caller stats the file twice, and it is its own `Option`: a filesystem
+/// that does not report one costs the caller a date, never the body.
+fn read_bounded_with_mtime(path: &Path) -> Option<(String, Option<String>)> {
     let meta = fs::symlink_metadata(path).ok()?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
@@ -398,7 +404,16 @@ fn read_bounded(path: &Path) -> Option<String> {
     if meta.len() > SCAN_MAX_BYTES {
         return None;
     }
-    fs::read_to_string(path).ok()
+    let mtime = meta.modified().ok().and_then(utc_text);
+    Some((fs::read_to_string(path).ok()?, mtime))
+}
+
+/// A [`SystemTime`] in the same UTC text every mesa timestamp uses. A time
+/// before the epoch (a clock nobody should have) is `None` rather than a
+/// wrong date.
+fn utc_text(t: SystemTime) -> Option<String> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(crate::core::cc::fmt_store_ts(secs as i64))
 }
 
 /// Every item the library offers: the db rows (`Store::list_library_items`),
@@ -441,8 +456,8 @@ pub fn effective_items(store: &Store, project: Option<i64>) -> StoreResult<Vec<L
 
 /// A file over this size, when read for a sync comparison, is treated as
 /// absent — the same bound [`scan_disk`] applies when it walks a directory.
-fn read_sync_side(path: &Path) -> Option<String> {
-    read_bounded(path)
+fn read_sync_side(path: &Path) -> Option<(String, Option<String>)> {
+    read_bounded_with_mtime(path)
 }
 
 /// Resolves the scope base for a given scope/project, returning `None` when
@@ -462,6 +477,11 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
         None => None,
     };
     let project_local_path = project_local_path.map(PathBuf::from);
+
+    // One query for the whole scan rather than one per row: mesa's own
+    // last-changed date is the newest version's `created_at`, because an
+    // item's `updated_at` moves on a rename too.
+    let version_dates = store.library_version_dates()?;
 
     let user_base = usable_base(LibraryScope::User, None);
     let project_base =
@@ -501,9 +521,22 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
         let Ok(full) = resolve(&base, &rel) else {
             continue;
         };
-        let disk_body = read_sync_side(&full);
+        let (disk_body, disk_mtime) = match read_sync_side(&full) {
+            Some((body, mtime)) => (Some(body), mtime),
+            None => (None, None),
+        };
         let baseline = item.synced_body.clone();
         let status = classify(&item.body, disk_body.as_deref(), baseline.as_deref());
+        // Two-sided rows only: a one-sided row has nothing to diff against,
+        // and an `in-sync` row's two sides are the same text.
+        let diff = disk_body
+            .as_deref()
+            .filter(|d| *d != item.body)
+            .map(|d| diff_lines(&item.body, d));
+        let mesa_updated_at = item
+            .id
+            .and_then(|id| version_dates.get(&id).cloned())
+            .or_else(|| item.updated_at.clone());
         rows.push(LibrarySyncRow {
             item_id: item.id,
             builtin_id: item.builtin_id.clone(),
@@ -516,6 +549,9 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
             mesa_body: Some(item.body.clone()),
             disk_body,
             baseline,
+            disk_mtime,
+            mesa_updated_at,
+            diff,
         });
     }
 
@@ -525,7 +561,7 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
     ] {
         let Some(base) = base else { continue };
         let mut seen: HashSet<String> = HashSet::new();
-        for (kind, name, body) in scan_disk(&base) {
+        for (kind, name, body, disk_mtime) in scan_disk(&base) {
             let Some(path) = relative_path(kind, scope, &name) else {
                 continue;
             };
@@ -557,6 +593,9 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
                 mesa_body: None,
                 disk_body: Some(body),
                 baseline: None,
+                disk_mtime,
+                mesa_updated_at: None,
+                diff: None,
             });
         }
     }
@@ -569,6 +608,112 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
             .then_with(|| a.path.cmp(&b.path))
     });
     Ok(rows)
+}
+
+/// The most lines one sync row's diff carries. A body is already bounded by
+/// [`SCAN_MAX_BYTES`], but a megabyte of one-character lines is still a
+/// response nobody can read, so the diff stops here and says so.
+pub const DIFF_MAX_LINES: usize = 2000;
+
+/// The largest LCS table [`diff_lines`] will build. Two 4000-line bodies is
+/// already past what the modal can show; beyond it the quadratic table costs
+/// more than the answer is worth, and the diff degrades to a marker instead.
+const DIFF_MAX_CELLS: usize = 16_000_000;
+
+/// The line-level mesa-vs-disk diff one [`LibrarySyncRow`] carries: a
+/// hand-rolled LCS over lines, no crate and no three-way merge attribution —
+/// `baseline` rides on the row separately, and a resolution picks a *side*.
+///
+/// Both bodies are split with `str::lines`, so a trailing newline is not a
+/// line of its own (it is not a difference a person resolves either). Line
+/// numbers are 1-based and only ever set on the side a line exists in. The
+/// result is bounded twice: a table over [`DIFF_MAX_CELLS`] is not built at
+/// all, and a result past [`DIFF_MAX_LINES`] is cut. Both degrade to a
+/// *marker* line — kind `Context`, both line numbers `None` — rather than an
+/// error or an unbounded response.
+pub fn diff_lines(mesa: &str, disk: &str) -> Vec<LibraryDiffLine> {
+    let a: Vec<&str> = mesa.lines().collect();
+    let b: Vec<&str> = disk.lines().collect();
+    if (a.len() + 1).saturating_mul(b.len() + 1) > DIFF_MAX_CELLS {
+        return vec![marker(format!(
+            "… diff not computed: {} lines in mesa, {} on disk …",
+            a.len(),
+            b.len()
+        ))];
+    }
+
+    // `lcs[i][j]` = the length of the longest common subsequence of `a[i..]`
+    // and `b[j..]`, filled from the end so the walk below can read it
+    // forwards. One flat row-major buffer, width `b.len() + 1`.
+    let w = b.len() + 1;
+    let mut lcs = vec![0u32; (a.len() + 1) * w];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i * w + j] = if a[i] == b[j] {
+                lcs[(i + 1) * w + j + 1] + 1
+            } else {
+                lcs[(i + 1) * w + j].max(lcs[i * w + j + 1])
+            };
+        }
+    }
+
+    let mut out: Vec<LibraryDiffLine> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(line(LibraryDiffKind::Context, Some(i), Some(j), a[i]));
+            i += 1;
+            j += 1;
+        } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
+            out.push(line(LibraryDiffKind::MesaOnly, Some(i), None, a[i]));
+            i += 1;
+        } else {
+            out.push(line(LibraryDiffKind::DiskOnly, None, Some(j), b[j]));
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        out.push(line(LibraryDiffKind::MesaOnly, Some(i), None, a[i]));
+        i += 1;
+    }
+    while j < b.len() {
+        out.push(line(LibraryDiffKind::DiskOnly, None, Some(j), b[j]));
+        j += 1;
+    }
+
+    if out.len() > DIFF_MAX_LINES {
+        let dropped = out.len() - DIFF_MAX_LINES;
+        out.truncate(DIFF_MAX_LINES);
+        out.push(marker(format!("… {dropped} more diff lines not shown …")));
+    }
+    out
+}
+
+/// One diff line, taking the 0-based indices the walk holds and reporting the
+/// 1-based numbers the row carries.
+fn line(
+    kind: LibraryDiffKind,
+    mesa: Option<usize>,
+    disk: Option<usize>,
+    text: &str,
+) -> LibraryDiffLine {
+    LibraryDiffLine {
+        kind,
+        mesa_line: mesa.map(|i| i as u32 + 1),
+        disk_line: disk.map(|j| j as u32 + 1),
+        text: text.to_string(),
+    }
+}
+
+/// A line that is not content from either side — how [`diff_lines`] reports
+/// that it stopped rather than silently answering short.
+fn marker(text: String) -> LibraryDiffLine {
+    LibraryDiffLine {
+        kind: LibraryDiffKind::Context,
+        mesa_line: None,
+        disk_line: None,
+        text,
+    }
 }
 
 /// Applies the caller's per-path choices from a `sync_status` scan.
@@ -958,6 +1103,140 @@ mod tests {
     use super::*;
     use crate::core::store::LibraryPatch;
 
+    /// `scan_disk` without the per-file mtime — a real clock's value is not
+    /// assertable, and every test below is about *which files* the scan finds.
+    fn scanned(base: &Path) -> Vec<(LibraryKind, String, String)> {
+        scan_disk(base)
+            .into_iter()
+            .map(|(kind, name, body, _)| (kind, name, body))
+            .collect()
+    }
+
+    fn kinds(diff: &[LibraryDiffLine]) -> Vec<(LibraryDiffKind, Option<u32>, Option<u32>, &str)> {
+        diff.iter()
+            .map(|l| (l.kind, l.mesa_line, l.disk_line, l.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn diff_lines_reports_identical_bodies_as_all_context() {
+        let diff = diff_lines("a\nb\n", "a\nb\n");
+        assert_eq!(
+            kinds(&diff),
+            vec![
+                (LibraryDiffKind::Context, Some(1), Some(1), "a"),
+                (LibraryDiffKind::Context, Some(2), Some(2), "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_reports_an_insertion_on_the_disk_side_only() {
+        let diff = diff_lines("a\nb\n", "a\nnew\nb\n");
+        assert_eq!(
+            kinds(&diff),
+            vec![
+                (LibraryDiffKind::Context, Some(1), Some(1), "a"),
+                (LibraryDiffKind::DiskOnly, None, Some(2), "new"),
+                (LibraryDiffKind::Context, Some(2), Some(3), "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_reports_a_deletion_on_the_mesa_side_only() {
+        let diff = diff_lines("a\ngone\nb\n", "a\nb\n");
+        assert_eq!(
+            kinds(&diff),
+            vec![
+                (LibraryDiffKind::Context, Some(1), Some(1), "a"),
+                (LibraryDiffKind::MesaOnly, Some(2), None, "gone"),
+                (LibraryDiffKind::Context, Some(3), Some(2), "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_reports_a_replaced_line_as_both_a_removal_and_an_addition() {
+        // No three-way attribution and no "changed" kind: a replacement is
+        // exactly a mesa-only line and a disk-only one, which is what a
+        // resolution actually picks between.
+        let diff = diff_lines("a\nold\nb\n", "a\nnew\nb\n");
+        assert_eq!(
+            kinds(&diff),
+            vec![
+                (LibraryDiffKind::Context, Some(1), Some(1), "a"),
+                (LibraryDiffKind::MesaOnly, Some(2), None, "old"),
+                (LibraryDiffKind::DiskOnly, None, Some(2), "new"),
+                (LibraryDiffKind::Context, Some(3), Some(3), "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_against_an_empty_side_is_every_line_of_the_other() {
+        assert_eq!(
+            kinds(&diff_lines("a\nb\n", "")),
+            vec![
+                (LibraryDiffKind::MesaOnly, Some(1), None, "a"),
+                (LibraryDiffKind::MesaOnly, Some(2), None, "b"),
+            ]
+        );
+        assert_eq!(
+            kinds(&diff_lines("", "a\n")),
+            vec![(LibraryDiffKind::DiskOnly, None, Some(1), "a")]
+        );
+    }
+
+    #[test]
+    fn diff_lines_ignores_a_missing_trailing_newline() {
+        // `str::lines` gives both sides the same two lines — a trailing
+        // newline is not something a person resolves a conflict over.
+        let diff = diff_lines("a\nb", "a\nb\n");
+        assert_eq!(
+            kinds(&diff),
+            vec![
+                (LibraryDiffKind::Context, Some(1), Some(1), "a"),
+                (LibraryDiffKind::Context, Some(2), Some(2), "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_caps_its_output_and_says_so() {
+        let mesa: String = (0..DIFF_MAX_LINES + 500)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let diff = diff_lines(&mesa, "");
+        assert_eq!(diff.len(), DIFF_MAX_LINES + 1);
+        let last = diff.last().unwrap();
+        assert_eq!(last.kind, LibraryDiffKind::Context);
+        assert_eq!(last.mesa_line, None);
+        assert_eq!(last.disk_line, None);
+        assert!(
+            last.text.contains("500 more diff lines"),
+            "the marker must say how much was dropped, got {:?}",
+            last.text
+        );
+    }
+
+    #[test]
+    fn diff_lines_refuses_to_build_a_pathological_table() {
+        // Past DIFF_MAX_CELLS the quadratic table is not built at all — one
+        // marker line, never an error and never an unbounded walk.
+        let big: String = (0..5000).map(|i| format!("line {i}\n")).collect();
+        let other: String = (0..5000).map(|i| format!("other {i}\n")).collect();
+        let diff = diff_lines(&big, &other);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].kind, LibraryDiffKind::Context);
+        assert_eq!(diff[0].mesa_line, None);
+        assert!(
+            diff[0].text.contains("diff not computed"),
+            "got {:?}",
+            diff[0].text
+        );
+    }
+
     #[test]
     fn relative_path_covers_every_kind_and_scope() {
         assert_eq!(
@@ -1193,7 +1472,7 @@ mod tests {
         // A non-matching extension in an agents dir must not be picked up.
         fs::write(base.join(".claude/agents/notes.txt"), "ignore me").unwrap();
 
-        let found = scan_disk(base);
+        let found = scanned(base);
 
         assert!(found.contains(&(
             LibraryKind::Agent,
@@ -1230,7 +1509,7 @@ mod tests {
         fs::create_dir_all(base.join(".claude/agents")).unwrap();
         let big = "x".repeat(SCAN_MAX_BYTES as usize + 1);
         fs::write(base.join(".claude/agents/huge.md"), big).unwrap();
-        let found = scan_disk(base);
+        let found = scanned(base);
         assert!(found.is_empty());
     }
 
@@ -1251,7 +1530,7 @@ mod tests {
         fs::write(base.join(".claude/commands/triage-inbox.md"), "triage body").unwrap();
         fs::write(base.join(".claude/commands/todo.md"), "todo body").unwrap();
 
-        let found = scan_disk(base);
+        let found = scanned(base);
 
         assert_eq!(found.len(), 3);
         assert!(
@@ -1279,7 +1558,7 @@ mod tests {
         fs::write(outside.join("secret.md"), "outside agent body").unwrap();
         std::os::unix::fs::symlink(&outside, base.join(".claude/agents")).unwrap();
 
-        let found = scan_disk(&base);
+        let found = scanned(&base);
         assert!(
             found.is_empty(),
             "a symlinked .claude/agents must not be walked, got {found:?}"
@@ -1298,7 +1577,7 @@ mod tests {
         fs::write(outside.join("dataviz/SKILL.md"), "outside skill body").unwrap();
         std::os::unix::fs::symlink(&outside, base.join(".claude/skills")).unwrap();
 
-        let found = scan_disk(&base);
+        let found = scanned(&base);
         assert!(
             found.is_empty(),
             "a symlinked .claude/skills must not be walked, got {found:?}"
@@ -1317,7 +1596,7 @@ mod tests {
         fs::write(outside.join("CLAUDE.md"), "outside claude md").unwrap();
         std::os::unix::fs::symlink(&outside, base.join(".claude")).unwrap();
 
-        let found = scan_disk(&base);
+        let found = scanned(&base);
         assert!(
             found.is_empty(),
             "a symlinked .claude must not be walked at all, got {found:?}"
@@ -1333,7 +1612,7 @@ mod tests {
         fs::create_dir_all(base.join(".claude/agents")).unwrap();
         fs::write(base.join(".claude/agents/reviewer.md"), "reviewer body").unwrap();
 
-        let found = scan_disk(base);
+        let found = scanned(base);
         assert_eq!(
             found,
             vec![(

@@ -1,15 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
+  changeDatesLabel,
   defaultChoice,
+  diffLineClass,
+  diffMark,
+  hasDiff,
   isOneSided,
   needsAttention,
   resolutionsFor,
+  newerSide,
   resultLabel,
   rowKey,
   statusExplains,
   statusLabel,
   summarize,
 } from './librarySync'
+import type { LibraryDiffLine } from './types/LibraryDiffLine'
 import type { LibrarySyncResult } from './types/LibrarySyncResult'
 import type { LibrarySyncRow } from './types/LibrarySyncRow'
 import type { LibrarySyncStatus } from './types/LibrarySyncStatus'
@@ -37,6 +43,9 @@ function row(overrides: Partial<LibrarySyncRow> = {}): LibrarySyncRow {
     mesa_body: 'same',
     disk_body: 'same',
     baseline: 'same',
+    disk_mtime: null,
+    mesa_updated_at: null,
+    diff: null,
     ...overrides,
   }
 }
@@ -200,6 +209,103 @@ describe('resultLabel', () => {
   it('reads as a failure only when error is non-null', () => {
     expect(resultLabel(result({ applied: false, error: 'permission denied' }))).toBe(
       'failed — permission denied',
+    )
+  })
+})
+
+describe('hasDiff', () => {
+  it('is false when the server sent no diff (one-sided or in-sync)', () => {
+    expect(hasDiff(row({ diff: null }))).toBe(false)
+  })
+
+  it('is false for an empty array — nothing to render is not a view', () => {
+    expect(hasDiff(row({ diff: [] }))).toBe(false)
+  })
+
+  it('is true when there are lines', () => {
+    expect(
+      hasDiff(
+        row({
+          diff: [{ kind: 'mesa-only', mesa_line: 1, disk_line: null, text: 'a' }],
+        }),
+      ),
+    ).toBe(true)
+  })
+})
+
+describe('diffLineClass / diffMark', () => {
+  function line(overrides: Partial<LibraryDiffLine> = {}): LibraryDiffLine {
+    return { kind: 'context', mesa_line: 1, disk_line: 1, text: 'a', ...overrides }
+  }
+
+  it('marks a mesa-only line as a removal', () => {
+    const l = line({ kind: 'mesa-only', disk_line: null })
+    expect(diffLineClass(l)).toBe('library-diff-line library-diff-mesa')
+    expect(diffMark(l)).toBe('-')
+  })
+
+  it('marks a disk-only line as an addition', () => {
+    const l = line({ kind: 'disk-only', mesa_line: null })
+    expect(diffLineClass(l)).toBe('library-diff-line library-diff-disk')
+    expect(diffMark(l)).toBe('+')
+  })
+
+  it('leaves a context line unmarked', () => {
+    expect(diffLineClass(line())).toBe('library-diff-line library-diff-context')
+    expect(diffMark(line())).toBe(' ')
+  })
+
+  it('reads a context line with neither line number as the truncation marker', () => {
+    const l = line({ mesa_line: null, disk_line: null, text: '… 500 more diff lines not shown …' })
+    expect(diffLineClass(l)).toBe('library-diff-line library-diff-marker')
+    expect(diffMark(l)).toBe(' ')
+  })
+})
+
+describe('newerSide', () => {
+  it('is null when either date is missing', () => {
+    expect(newerSide(row({ mesa_updated_at: '2026-09-06 21:04:00', disk_mtime: null }))).toBe(null)
+    expect(newerSide(row({ mesa_updated_at: null, disk_mtime: '2026-09-06 21:04:00' }))).toBe(null)
+  })
+
+  it('compares the two UTC timestamps as strings', () => {
+    expect(
+      newerSide(row({ mesa_updated_at: '2026-09-06 21:04:00', disk_mtime: '2026-09-06 22:11:00' })),
+    ).toBe('disk')
+    expect(
+      newerSide(row({ mesa_updated_at: '2026-09-07 01:00:00', disk_mtime: '2026-09-06 22:11:00' })),
+    ).toBe('mesa')
+  })
+
+  it('says "same" for two identical timestamps rather than picking a side', () => {
+    expect(
+      newerSide(row({ mesa_updated_at: '2026-09-06 21:04:00', disk_mtime: '2026-09-06 21:04:00' })),
+    ).toBe('same')
+  })
+})
+
+describe('changeDatesLabel', () => {
+  it('names both sides, to the minute, and which is newer', () => {
+    expect(
+      changeDatesLabel(
+        row({ mesa_updated_at: '2026-09-06 21:04:33', disk_mtime: '2026-09-06 22:11:02' }),
+      ),
+    ).toBe('mesa 2026-09-06 21:04 · disk 2026-09-06 22:11 (disk is newer)')
+  })
+
+  it('drops the verdict when only one side has a date', () => {
+    expect(changeDatesLabel(row({ mesa_updated_at: '2026-09-06 21:04:33', disk_mtime: null }))).toBe(
+      'mesa 2026-09-06 21:04',
+    )
+  })
+
+  it('is null when neither side has a date', () => {
+    expect(changeDatesLabel(row({ mesa_updated_at: null, disk_mtime: null }))).toBe(null)
+  })
+
+  it('shows an unexpected timestamp shape verbatim rather than slicing it', () => {
+    expect(changeDatesLabel(row({ mesa_updated_at: '2026-09-06T21:04:33Z', disk_mtime: null }))).toBe(
+      'mesa 2026-09-06T21:04:33Z',
     )
   })
 })

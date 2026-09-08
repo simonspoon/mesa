@@ -15,6 +15,7 @@ import {
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { bundleFilename, parseBundle, summarizeImport } from '../libraryBundle'
+import { historyEntries } from '../libraryHistory'
 import { diffLines, foldOverrides, itemKey } from '../libraryOverride'
 import {
   LIBRARY_KINDS,
@@ -214,28 +215,129 @@ function LibraryForm({
   )
 }
 
-/** The version-history reveal for one stored item. Built-ins have no history
- * (there is no row until a fork creates one), so the caller never mounts
- * this for one. */
-function LibraryVersions({ itemId }: { itemId: number }) {
-  const { data: versions, error } = useFetch(
-    () => listLibraryVersions(itemId),
-    `library-versions-${itemId}`,
-  )
+/**
+ * The version-history panel for one stored item (mesa task 1112): the versions
+ * down the left, newest first, and beside them the selected one's diff against
+ * the version immediately older — or its whole body. Built-ins have no history
+ * (there is no row until a fork creates one), so the caller never mounts this
+ * for one.
+ *
+ * `restore this version` is an ordinary body update, not a route of its own:
+ * the store appends a version whenever the body actually changes, so writing
+ * an old body back is recorded exactly like any other edit.
+ */
+function LibraryVersions({
+  itemId,
+  onRestored,
+}: {
+  itemId: number
+  onRestored: () => void
+}) {
+  const {
+    data: versions,
+    error,
+    refetch,
+  } = useFetch(() => listLibraryVersions(itemId), `library-versions-${itemId}`)
+  // The version the panel is showing, by id — `null` means the newest, which
+  // is also what a version the list no longer carries falls back to (a restore
+  // appends one, and the selection is made before that).
+  const [selected, setSelected] = useState<number | null>(null)
+  const [tab, setTab] = useState<'diff' | 'full'>('diff')
+  const [restoring, setRestoring] = useState(false)
+  const [restoreError, setRestoreError] = useState<string | null>(null)
+
   if (error) return <p className="error">{error}</p>
   if (!versions) return <p className="muted">Loading…</p>
   if (versions.length === 0) return <p className="muted">No history yet.</p>
+
+  const entries = historyEntries(versions)
+  const entry = entries.find((e) => e.version.id === selected) ?? entries[0]
+
+  function restore() {
+    setRestoring(true)
+    setRestoreError(null)
+    updateLibraryItem(itemId, { body: entry.version.body }).then(
+      () => {
+        setRestoring(false)
+        refetch()
+        onRestored()
+      },
+      (err: unknown) => {
+        setRestoring(false)
+        setRestoreError(err instanceof Error ? err.message : String(err))
+      },
+    )
+  }
+
   return (
-    <ul className="library-versions">
-      {versions.map((v) => (
-        <li key={v.id} className="library-version-row">
-          <span className="muted">
-            {v.created_at} · {v.source}
-          </span>
-          <pre className="library-version-body">{v.body}</pre>
-        </li>
-      ))}
-    </ul>
+    <div className="library-history">
+      <ul className="library-history-list">
+        {entries.map((e) => (
+          <li key={e.version.id}>
+            <button
+              type="button"
+              className={
+                e.version.id === entry.version.id
+                  ? 'library-history-version selected'
+                  : 'library-history-version'
+              }
+              onClick={() => {
+                setSelected(e.version.id)
+                setRestoreError(null)
+              }}
+            >
+              <span>
+                {e.version.created_at}
+                <span className="muted library-history-source">{e.sourceLabel}</span>
+              </span>
+              {e.added !== null && e.removed !== null && (
+                <span className="library-history-counts">
+                  <span className="library-diff-disk">+{e.added}</span>
+                  <span className="library-diff-mesa">-{e.removed}</span>
+                </span>
+              )}
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div className="library-history-detail">
+        <div className="library-history-tabs">
+          <button
+            type="button"
+            className={tab === 'diff' ? 'selected' : undefined}
+            onClick={() => setTab('diff')}
+          >
+            diff vs previous
+          </button>
+          <button
+            type="button"
+            className={tab === 'full' ? 'selected' : undefined}
+            onClick={() => setTab('full')}
+          >
+            full text
+          </button>
+          <button type="button" disabled={restoring} onClick={restore}>
+            {restoring ? 'restoring…' : 'restore this version'}
+          </button>
+        </div>
+        {restoreError !== null && <p className="error">{restoreError}</p>}
+        {tab === 'diff' && entry.diff === null && (
+          <p className="muted">Initial version — nothing before it, so the whole body follows.</p>
+        )}
+        {tab === 'diff' && entry.diff !== null ? (
+          <pre className="library-sync-difflines">
+            {entry.diff.map((line, i) => (
+              <div key={i} className={diffLineClass(line)}>
+                <span className="library-diff-mark">{diffMark(line)}</span>
+                {line.text}
+              </div>
+            ))}
+          </pre>
+        ) : (
+          <pre className="library-version-body">{entry.version.body}</pre>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -674,7 +776,7 @@ export function LibraryView() {
                       />
                     )}
                     {showingVersions === key && item.id !== null && (
-                      <LibraryVersions itemId={item.id} />
+                      <LibraryVersions itemId={item.id} onRestored={refetch} />
                     )}
                   </li>
                 )

@@ -152,6 +152,21 @@ Everything else about a row is one line now: name, scope (and project), path
 diff vs built-in · delete` right-aligned on the same line, with the edit form,
 the version history and the diff all opening below it as before.
 
+`history` opens **two columns** (mesa task 1112): every version as one line on
+the left — timestamp, source and how many lines it added and removed against
+the version immediately older — and on the right the selected version's `diff
+vs previous` or its `full text`. Newest first, newest selected. The oldest
+version has nothing before it, so it carries no counts, reads `created` rather
+than its stored `edit`, and its diff tab shows the whole body. The counts are
+read off the very `LibraryDiffLine[]` the diff renders, so the line and the
+panel beside it can never disagree, and a diff that degraded to a marker line
+reports no counts rather than counts of the part that fits
+(`frontend/src/libraryHistory.ts`, pinned by `libraryHistory.test.ts`).
+`restore this version` is an ordinary body update — the same
+`PATCH /api/library/{id}` the editor makes, with no route of its own — so the
+store appends a version for the restored body exactly as it does for any other
+edit, and restoring the newest version changes nothing and writes nothing.
+
 ## Where a row lives on disk
 
 `core::library::relative_path(kind, scope, name)`, relative to the **scope

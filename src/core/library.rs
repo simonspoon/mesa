@@ -21,8 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::store::{Error, LibraryPatch, Result as StoreResult, Store};
 use crate::core::types::{
-    LibraryBundle, LibraryBundleItem, LibraryDiffKind, LibraryDiffLine, LibraryImportResult,
-    LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
+    LibraryBundle, LibraryBundleItem, LibraryDiffKind, LibraryDiffLine, LibraryHookRegistration,
+    LibraryHookStatus, LibraryImportResult, LibraryItem, LibraryKind, LibraryScope,
+    LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
 };
 
 /// One built-in library entry — code, not a db row. `core::library::BUILTINS`
@@ -1086,6 +1087,1012 @@ fn import_one(
             },
             Err(e) => fail(e.to_string()),
         },
+    }
+}
+
+// ---- hook registration in `.claude/settings.json` (mesa task 1115) ----
+//
+// A hook file on disk does nothing until Claude Code is told to run it. That
+// wiring lives in `.claude/settings.json`, under an event name, as a group
+// carrying a `matcher` and a list of commands:
+//
+// ```json
+// {"hooks": {"Stop": [{"matcher": "*",
+//                      "hooks": [{"type": "command", "command": "…"}]}]}}
+// ```
+//
+// mesa owns none of that file — the user's own settings live beside the
+// `hooks` key — so every write here is a *targeted splice* of the `hooks`
+// value's byte span and nothing else, and a file mesa cannot parse is
+// refused rather than rewritten. See `docs/library.md`.
+
+/// The events a hook may be registered under — Claude Code's own vocabulary,
+/// pinned here because an unknown event silently never fires, which looks
+/// exactly like a broken hook. An event outside this list is `validation`.
+pub const HOOK_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "Notification",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "SessionStart",
+    "SessionEnd",
+];
+
+/// The matcher applied when the caller names none: every tool / every source.
+pub const DEFAULT_HOOK_MATCHER: &str = "*";
+
+/// A matcher is a tool-name pattern, not a document. Bounded because it is
+/// written verbatim into the user's settings file.
+pub const HOOK_MATCHER_MAX: usize = 200;
+
+/// Where a hook item's registration lives, and what it is registered *as*.
+struct HookTarget {
+    /// The `.claude/settings.json` this item's scope registers into.
+    settings: PathBuf,
+    /// `.claude/hooks/<name>` — the relative path the matching rule keys on.
+    rel: String,
+    /// The command mesa writes for this hook: `$CLAUDE_PROJECT_DIR`-relative
+    /// at `project` scope, absolute at `user` scope.
+    command: String,
+    /// The absolute path on this machine, which a hand-written command may
+    /// name instead.
+    absolute: String,
+}
+
+/// Resolves a library item to its settings file and command string.
+///
+/// Only a [`LibraryKind::Hook`] has a registration at all: every other kind
+/// is read by Claude Code because of *where it sits*, so there is nothing to
+/// wire up and asking is `validation` rather than an empty answer.
+fn hook_target(store: &Store, item: &LibraryItem) -> StoreResult<HookTarget> {
+    if item.kind != LibraryKind::Hook {
+        return Err(Error::Validation(format!(
+            "{:?} is an {} item; only a hook is registered in settings.json",
+            item.name,
+            item.kind.as_str()
+        )));
+    }
+    let rel = relative_path(LibraryKind::Hook, item.scope, &item.name)
+        .ok_or_else(|| Error::Validation(format!("{:?} has no path", item.name)))?;
+    let project_local_path = match item.project_id {
+        Some(id) => store.get_project(id)?.local_path,
+        None => None,
+    };
+    let project_local_path = project_local_path.map(PathBuf::from);
+    let base = scope_base(item.scope, project_local_path.as_deref()).ok_or_else(|| {
+        Error::Validation(format!(
+            "{:?} is a project-scope hook and its project has no local path recorded; \
+             there is no settings.json to register it in",
+            item.name
+        ))
+    })?;
+    let absolute = resolve(&base, &rel).map_err(Error::Validation)?;
+    let settings = resolve(&base, Path::new(".claude/settings.json")).map_err(Error::Validation)?;
+    let rel = rel.to_string_lossy().into_owned();
+    // `$CLAUDE_PROJECT_DIR` is Claude Code's own variable for the repo it is
+    // running in, so a project-scope registration stays portable across
+    // clones and worktrees; a user-scope hook has no such anchor and is
+    // named absolutely.
+    let command = match item.scope {
+        LibraryScope::Project => format!("$CLAUDE_PROJECT_DIR/{rel}"),
+        LibraryScope::User => absolute.to_string_lossy().into_owned(),
+    };
+    Ok(HookTarget {
+        settings,
+        rel,
+        command,
+        absolute: absolute.to_string_lossy().into_owned(),
+    })
+}
+
+/// Whether one settings.json command string runs *this* hook.
+///
+/// A command is arbitrary shell — `bash …/stop-notify.sh --quiet`,
+/// `$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh`, an absolute path — so
+/// the test is deliberately a substring one: the command is this hook's iff
+/// it is exactly the absolute path, or it *contains* `.claude/hooks/<name>`
+/// at a **path boundary** on both sides. The boundary is what keeps
+/// `.claude/hooks/foo.sh` from being read as the hook named `oo.sh` and
+/// `…/foo.sh.bak` from being read as `foo.sh`: the character on either side
+/// of the match may not itself be a filename character.
+fn command_runs_hook(command: &str, target: &HookTarget) -> bool {
+    if command.trim() == target.absolute {
+        return true;
+    }
+    let boundary = |c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+    let mut from = 0;
+    while let Some(offset) = command[from..].find(&target.rel) {
+        let start = from + offset;
+        let end = start + target.rel.len();
+        let before = command[..start].chars().next_back().is_none_or(boundary);
+        let after = command[end..].chars().next().is_none_or(boundary);
+        if before && after {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// The `hooks` object of a settings file, as mesa understands it — plus the
+/// raw text it came from, which every write splices back into.
+struct Settings {
+    raw: String,
+    hooks: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Reads and validates a settings file. A missing or whitespace-only file is
+/// an empty one.
+fn read_settings(path: &Path) -> StoreResult<Settings> {
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let hooks = parse_settings(&raw, path)?;
+    Ok(Settings { raw, hooks })
+}
+
+/// The validation half of [`read_settings`], run again on a splice's own
+/// output before it is written.
+///
+/// Anything mesa cannot understand — invalid JSON, a top level that is not an
+/// object, a `hooks` that is not an object, an event whose value is not an
+/// array — is `validation` **naming the file**, never a rewrite: the rest of
+/// that file is the user's own configuration, and a best-effort repair would
+/// destroy it. It is also what lets the raw-text splice below assume the
+/// shapes it navigates.
+fn parse_settings(
+    raw: &str,
+    path: &Path,
+) -> StoreResult<serde_json::Map<String, serde_json::Value>> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let root: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        Error::Validation(format!(
+            "{} is not valid JSON ({e}); mesa will not rewrite a settings file it cannot read",
+            path.display()
+        ))
+    })?;
+    let root = root.as_object().ok_or_else(|| {
+        Error::Validation(format!(
+            "{} does not hold a JSON object at its top level",
+            path.display()
+        ))
+    })?;
+    let hooks = match root.get("hooks") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        Some(_) => {
+            return Err(Error::Validation(format!(
+                "{}'s \"hooks\" is not an object; mesa will not rewrite it",
+                path.display()
+            )));
+        }
+    };
+    for (event, groups) in &hooks {
+        if !groups.is_array() {
+            return Err(Error::Validation(format!(
+                "{}'s \"hooks\".{event:?} is not an array; mesa will not rewrite it",
+                path.display()
+            )));
+        }
+    }
+    Ok(hooks)
+}
+
+/// A group's matcher, defaulting to `*` — an absent `matcher` key means
+/// "everything", so it is the same group as an explicit `"*"` and appending
+/// into it beats writing a second group that would fire on the same events.
+fn group_matcher(group: &serde_json::Value) -> &str {
+    group
+        .get("matcher")
+        .and_then(|m| m.as_str())
+        .unwrap_or(DEFAULT_HOOK_MATCHER)
+}
+
+/// Every registration of `target` currently in `hooks`, in event then group
+/// then command order.
+fn registrations_in(
+    hooks: &serde_json::Map<String, serde_json::Value>,
+    target: &HookTarget,
+) -> Vec<LibraryHookRegistration> {
+    let mut found = Vec::new();
+    for (event, groups) in hooks {
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let matcher = group_matcher(group).to_string();
+            let Some(commands) = group.get("hooks").and_then(|h| h.as_array()) else {
+                continue;
+            };
+            for entry in commands {
+                let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                if command_runs_hook(command, target) {
+                    found.push(LibraryHookRegistration {
+                        event: event.clone(),
+                        matcher: matcher.clone(),
+                        command: command.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Assembles the answer every one of the three public functions returns —
+/// the same shape whether anything was written or not, so a caller reads the
+/// outcome rather than inferring it.
+fn status_of(item: &LibraryItem, target: &HookTarget, settings: &Settings) -> LibraryHookStatus {
+    let registrations = registrations_in(&settings.hooks, target);
+    LibraryHookStatus {
+        item_id: item.id,
+        name: item.name.clone(),
+        settings_path: target.settings.to_string_lossy().into_owned(),
+        command: target.command.clone(),
+        registered: !registrations.is_empty(),
+        registrations,
+        events: HOOK_EVENTS.iter().map(|e| e.to_string()).collect(),
+    }
+}
+
+/// Where a hook item is registered right now — a pure read.
+pub fn hook_registrations(store: &Store, item: &LibraryItem) -> StoreResult<LibraryHookStatus> {
+    let target = hook_target(store, item)?;
+    let settings = read_settings(&target.settings)?;
+    Ok(status_of(item, &target, &settings))
+}
+
+/// Validates a caller-supplied event/matcher pair.
+fn validate_event(event: &str) -> StoreResult<String> {
+    HOOK_EVENTS
+        .iter()
+        .find(|e| **e == event)
+        .map(|e| (*e).to_string())
+        .ok_or_else(|| {
+            Error::Validation(format!(
+                "{event:?} is not a Claude Code hook event; expected one of {}",
+                HOOK_EVENTS.join(", ")
+            ))
+        })
+}
+
+fn validate_matcher(matcher: Option<&str>) -> StoreResult<String> {
+    let matcher = matcher.unwrap_or(DEFAULT_HOOK_MATCHER);
+    if matcher.is_empty() {
+        return Ok(DEFAULT_HOOK_MATCHER.to_string());
+    }
+    if matcher.len() > HOOK_MATCHER_MAX {
+        return Err(Error::Validation(format!(
+            "matcher is {} characters; the limit is {HOOK_MATCHER_MAX}",
+            matcher.len()
+        )));
+    }
+    if matcher.contains('\n') || matcher.contains('\r') {
+        return Err(Error::Validation(
+            "matcher may not contain a newline".into(),
+        ));
+    }
+    Ok(matcher.to_string())
+}
+
+/// Writes the hook's own script to disk if it is not there already, so a
+/// registration never names a file that does not exist.
+///
+/// A built-in hook is *code*, and a fork or a hand-authored row is a database
+/// row: neither reaches the disk until the user runs a library sync. Without
+/// this, enabling the shipped `stop-notify.sh` on a fresh install writes a
+/// command Claude Code then fails on every session — the same failure
+/// `HOOK_EVENTS` validation exists to prevent, only louder.
+///
+/// This is deliberately [`ensure_agent_file`]'s posture, for the same reason
+/// it has one: a spawn (there) and a registration (here) may not depend on
+/// something the user has to run first, but **neither may overwrite** — after
+/// the first seed the file belongs to the sync flow, where a difference
+/// between disk and mesa is a row the user resolves. The executable bit is
+/// set because a hook is a script Claude Code runs, not a file it reads.
+fn seed_hook_file(target: &HookTarget, body: &str) -> StoreResult<()> {
+    let path = Path::new(&target.absolute);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// Registers a hook under one event, and answers its status afterwards.
+///
+/// Idempotent: a group with the same `matcher` is appended into rather than
+/// duplicated, and a command already registered for that `(event, matcher)`
+/// leaves the file untouched — not even its mtime moves, since a write that
+/// would change nothing is skipped outright.
+pub fn register_hook(
+    store: &Store,
+    item: &LibraryItem,
+    event: &str,
+    matcher: Option<&str>,
+) -> StoreResult<LibraryHookStatus> {
+    let target = hook_target(store, item)?;
+    let event = validate_event(event)?;
+    let matcher = validate_matcher(matcher)?;
+    seed_hook_file(&target, &item.body)?;
+    let settings = read_settings(&target.settings)?;
+    let spliced = splice_register(&settings.raw, &event, &matcher, &target.command, &|c| {
+        command_runs_hook(c, &target)
+    });
+    apply(item, &target, settings, spliced)
+}
+
+/// Removes this hook's registrations — all of them, or only those under
+/// `event` (and `matcher`, when given). Removing something that was never
+/// registered is a no-op success, the mirror of `register_hook`'s
+/// idempotence.
+///
+/// Cleanup runs upward: a group whose command list empties is dropped, an
+/// event whose group list empties is dropped, and a `hooks` key that empties
+/// is removed from the file rather than left as `{}`.
+pub fn unregister_hook(
+    store: &Store,
+    item: &LibraryItem,
+    event: Option<&str>,
+    matcher: Option<&str>,
+) -> StoreResult<LibraryHookStatus> {
+    let target = hook_target(store, item)?;
+    let event = event.map(validate_event).transpose()?;
+    // An absent matcher here means "every matcher", not `*` — unlike
+    // `register_hook`, where there is one group to write and it needs a name.
+    // It is also **not validated**: on this path the matcher is a filter
+    // naming which existing registrations to cut, never text mesa writes, so
+    // `validate_matcher`'s input rules do not apply. Holding them here would
+    // make a matcher already hand-written into the file — over 200 bytes, or
+    // carrying a newline — impossible to narrow to, and an empty string would
+    // silently become `*` rather than the group actually named "".
+    let matcher = matcher.map(str::to_string);
+    let settings = read_settings(&target.settings)?;
+    let spliced = splice_unregister(&settings.raw, event.as_deref(), matcher.as_deref(), &|c| {
+        command_runs_hook(c, &target)
+    });
+    apply(item, &target, settings, spliced)
+}
+
+/// Writes a splice's result, if it produced one, and answers the resulting
+/// status either way. `Ok(None)` from a splice means the file already says
+/// what was asked for, so nothing is written at all — not even the mtime
+/// moves.
+///
+/// The new text is re-parsed before the status is built, which doubles as a
+/// self-check that the splice produced valid JSON.
+fn apply(
+    item: &LibraryItem,
+    target: &HookTarget,
+    settings: Settings,
+    spliced: Result<Option<String>, String>,
+) -> StoreResult<LibraryHookStatus> {
+    let spliced = spliced.map_err(|e| {
+        Error::Validation(format!(
+            "{} could not be edited ({e}); nothing was changed",
+            target.settings.display()
+        ))
+    })?;
+    let Some(raw) = spliced else {
+        return Ok(status_of(item, target, &settings));
+    };
+    let hooks = parse_settings(&raw, &target.settings)?;
+    if let Some(parent) = target.settings.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Written through a sibling temp file and renamed, the reasoning
+    // `config::write_atomically` states for mesa's *own* config holding
+    // doubly here: `fs::write` truncates first, so a crash mid-write would
+    // leave the user's settings a partial document — and unlike the config,
+    // this is a file mesa did not author and cannot regenerate. (Copied
+    // rather than called: that function reports a `config::SaveError`, and
+    // mapping it in would be more code than the three lines it saves.)
+    let mut tmp = target.settings.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, &raw)?;
+    fs::rename(&tmp, &target.settings).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
+    Ok(status_of(item, target, &Settings { raw, hooks }))
+}
+
+// ---- the splice ----
+//
+// mesa does not own `.claude/settings.json`: the user's model, environment,
+// permissions and everything else live beside the `hooks` key, and inside
+// `hooks` most of what is there was written by somebody else. So a write
+// here is not a reserialization of the file, nor even of its `hooks` block —
+// it is a cut or an insert at the span of **the one entry being added or
+// removed**. Bytes mesa did not semantically change do not move: a sibling
+// command, another group, another event and every key ordering among them
+// come through identical, because they are never re-emitted.
+//
+// Only genuinely new structure is serialized — and only the fragment being
+// introduced, spliced in at its neighbours' own indentation and comma style.
+
+/// A `(start, end)` byte span in the raw text, `end` exclusive.
+type Span = (usize, usize);
+
+/// One entry of a JSON object, located in the raw text.
+struct ObjEntry {
+    key: String,
+    /// The whole entry, from the key's opening quote to the end of its value.
+    span: Span,
+    /// The value alone.
+    value: Span,
+}
+
+/// Adds one command entry under `event`/`matcher`, answering the new text —
+/// or `Ok(None)` when the file already registers this hook there.
+///
+/// Exactly one thing is ever written: the innermost structure that does not
+/// exist yet. An existing group gains one command entry; a missing group,
+/// event or `hooks` key is introduced whole, but always spliced in beside its
+/// siblings rather than replacing them.
+fn splice_register(
+    raw: &str,
+    event: &str,
+    matcher: &str,
+    command: &str,
+    is_ours: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, String> {
+    let entry = serde_json::json!({"type": "command", "command": command});
+    let group = serde_json::json!({"matcher": matcher, "hooks": [entry]});
+
+    // A file with no JSON in it at all has nothing to preserve.
+    if raw.trim().is_empty() {
+        return Ok(Some(format!(
+            "{}\n",
+            pretty(&serde_json::json!({"hooks": {event: [group]}}))
+        )));
+    }
+
+    let (top_open, top_close, top) = top_level_object(raw)?;
+    let top_spans: Vec<Span> = top.iter().map(|e| e.span).collect();
+    let Some(hooks_entry) = top.iter().find(|e| e.key == "hooks") else {
+        let value = serde_json::json!({event: [group]});
+        return Ok(Some(insert_last(
+            raw,
+            top_open,
+            top_close,
+            &top_spans,
+            Some("hooks"),
+            &value,
+        )));
+    };
+
+    if is_null_value(raw, hooks_entry.value) {
+        // `parse_settings` reads a null `hooks` as an empty one, so the splice
+        // must too: writing the value in its place is the same act as
+        // introducing the key, one span further in.
+        let value = serde_json::json!({event: [group]});
+        return Ok(Some(replace_value(
+            raw,
+            hooks_entry.value,
+            top_open,
+            top_close,
+            &value,
+        )));
+    }
+    let hooks_open = expect_open(raw, hooks_entry.value.0, b'{', "\"hooks\"")?;
+    let (hooks_close, events) = object_entries(raw, hooks_open)?;
+    let event_spans: Vec<Span> = events.iter().map(|e| e.span).collect();
+    let Some(event_entry) = events.iter().find(|e| e.key == event) else {
+        return Ok(Some(insert_last(
+            raw,
+            hooks_open,
+            hooks_close,
+            &event_spans,
+            Some(event),
+            &serde_json::json!([group]),
+        )));
+    };
+
+    let event_open = expect_open(raw, event_entry.value.0, b'[', event)?;
+    let (event_close, groups) = array_elements(raw, event_open)?;
+    let mut found = None;
+    for span in &groups {
+        if raw.as_bytes()[span.0] != b'{' {
+            continue;
+        }
+        let (close, entries) = object_entries(raw, span.0)?;
+        if raw_group_matcher(raw, &entries) == matcher {
+            found = Some((span.0, close, entries));
+            break;
+        }
+    }
+    let Some((group_open, group_close, group_entries)) = found else {
+        return Ok(Some(insert_last(
+            raw,
+            event_open,
+            event_close,
+            &groups,
+            None,
+            &group,
+        )));
+    };
+
+    // An existing group for this matcher is appended into: two groups with
+    // one matcher fire on exactly the same events, so a second one is noise
+    // the user would have to reconcile by hand.
+    let group_spans: Vec<Span> = group_entries.iter().map(|e| e.span).collect();
+    let Some(commands_entry) = group_entries.iter().find(|e| e.key == "hooks") else {
+        return Ok(Some(insert_last(
+            raw,
+            group_open,
+            group_close,
+            &group_spans,
+            Some("hooks"),
+            &serde_json::json!([entry]),
+        )));
+    };
+    let commands_open = expect_open(raw, commands_entry.value.0, b'[', "a group's \"hooks\"")?;
+    let (commands_close, commands) = array_elements(raw, commands_open)?;
+    for span in &commands {
+        if raw_command(raw, *span).is_some_and(|c| is_ours(&c)) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(insert_last(
+        raw,
+        commands_open,
+        commands_close,
+        &commands,
+        None,
+        &entry,
+    )))
+}
+
+/// Cuts out every command entry this hook owns, answering the new text — or
+/// `Ok(None)` when there was nothing to remove.
+///
+/// The cut escalates only as far as it must: a group whose command list would
+/// empty is cut instead of its commands, an event whose group list would
+/// empty is cut instead of its groups, and a `hooks` key that would empty is
+/// cut from the file rather than left behind as `{}`. Anything that survives
+/// is never rewritten.
+fn splice_unregister(
+    raw: &str,
+    event_filter: Option<&str>,
+    matcher_filter: Option<&str>,
+    is_ours: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, String> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let (top_open, top_close, top) = top_level_object(raw)?;
+    let Some(hooks_index) = top.iter().position(|e| e.key == "hooks") else {
+        return Ok(None);
+    };
+    if is_null_value(raw, top[hooks_index].value) {
+        // A null `hooks` holds no registration, so there is nothing to cut —
+        // the same no-op success an absent key gets, and the same reading
+        // `parse_settings` already takes of it.
+        return Ok(None);
+    }
+    let hooks_open = expect_open(raw, top[hooks_index].value.0, b'{', "\"hooks\"")?;
+    let (hooks_close, events) = object_entries(raw, hooks_open)?;
+
+    let mut cuts: Vec<Span> = Vec::new();
+    let mut dead_events = vec![false; events.len()];
+    for (event_index, event) in events.iter().enumerate() {
+        if event_filter.is_some_and(|wanted| wanted != event.key) {
+            continue;
+        }
+        let event_open = expect_open(raw, event.value.0, b'[', &event.key)?;
+        let (event_close, groups) = array_elements(raw, event_open)?;
+        let mut dead_groups = vec![false; groups.len()];
+        let mut inner: Vec<Span> = Vec::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            if raw.as_bytes()[group.0] != b'{' {
+                continue;
+            }
+            let (group_close, entries) = object_entries(raw, group.0)?;
+            if matcher_filter.is_some_and(|m| m != raw_group_matcher(raw, &entries)) {
+                continue;
+            }
+            let Some(commands_entry) = entries.iter().find(|e| e.key == "hooks") else {
+                continue;
+            };
+            let commands_open =
+                expect_open(raw, commands_entry.value.0, b'[', "a group's \"hooks\"")?;
+            let (commands_close, commands) = array_elements(raw, commands_open)?;
+            let dead: Vec<bool> = commands
+                .iter()
+                .map(|s| raw_command(raw, *s).is_some_and(|c| is_ours(&c)))
+                .collect();
+            let count = dead.iter().filter(|d| **d).count();
+            if count == 0 {
+                continue;
+            }
+            if count == commands.len() {
+                // Every command in this group is ours: cut the group, not its
+                // contents, so no empty `{"matcher": …, "hooks": []}` is left.
+                let _ = (group_close, commands_close);
+                dead_groups[group_index] = true;
+            } else {
+                inner.extend(cut_spans(
+                    raw,
+                    &commands,
+                    &dead,
+                    commands_open,
+                    commands_close,
+                ));
+            }
+        }
+        let count = dead_groups.iter().filter(|d| **d).count();
+        if count > 0 && count == groups.len() {
+            dead_events[event_index] = true;
+        } else {
+            if count > 0 {
+                cuts.extend(cut_spans(
+                    raw,
+                    &groups,
+                    &dead_groups,
+                    event_open,
+                    event_close,
+                ));
+            }
+            cuts.extend(inner);
+        }
+    }
+
+    let count = dead_events.iter().filter(|d| **d).count();
+    if count > 0 && count == events.len() && cuts.is_empty() {
+        // Nothing would be left under `hooks`: cut the key itself.
+        let top_spans: Vec<Span> = top.iter().map(|e| e.span).collect();
+        let mut dead_top = vec![false; top.len()];
+        dead_top[hooks_index] = true;
+        cuts = cut_spans(raw, &top_spans, &dead_top, top_open, top_close);
+    } else if count > 0 {
+        let event_spans: Vec<Span> = events.iter().map(|e| e.span).collect();
+        cuts.extend(cut_spans(
+            raw,
+            &event_spans,
+            &dead_events,
+            hooks_open,
+            hooks_close,
+        ));
+    }
+
+    if cuts.is_empty() {
+        return Ok(None);
+    }
+    // Applied last-first so an earlier cut's offsets stay valid.
+    cuts.sort_by_key(|(start, _)| std::cmp::Reverse(*start));
+    let mut out = raw.to_string();
+    for (start, end) in cuts {
+        out.replace_range(start..end, "");
+    }
+    Ok(Some(out))
+}
+
+/// The spans to delete so that exactly the items flagged in `dead` are gone,
+/// each taking one separating comma with it and leaving every survivor's own
+/// bytes — indentation included — untouched.
+///
+/// Two rules, and the split between them is what keeps the spans from
+/// overlapping when a run of items at the end is removed: an item before the
+/// last survivor takes the comma that *follows* it (so the cut runs to where
+/// the next item's own whitespace begins), while the whole trailing run after
+/// the last survivor is one cut that takes the comma *preceding* it.
+///
+/// With no survivors at all the container is emptied — the caller normally
+/// escalates instead of asking for that, so it is a safe default rather than
+/// a path in the cascade.
+fn cut_spans(raw: &str, items: &[Span], dead: &[bool], open: usize, close: usize) -> Vec<Span> {
+    let Some(last_survivor) = (0..items.len()).rev().find(|i| !dead[*i]) else {
+        return vec![(open + 1, close)];
+    };
+    let mut cuts = Vec::new();
+    for index in 0..last_survivor {
+        if dead[index] {
+            cuts.push((
+                item_start(raw, items[index].0),
+                item_start(raw, items[index + 1].0),
+            ));
+        }
+    }
+    if last_survivor + 1 < items.len() {
+        cuts.push((items[last_survivor].1, items[items.len() - 1].1));
+    }
+    cuts
+}
+
+/// Appends one item to an object or array, in its existing siblings' style.
+///
+/// The separator is copied verbatim from the last sibling's own leading
+/// whitespace, so the new item lands at exactly that indentation — and a
+/// single-line container stays single-line, since a separator with no newline
+/// in it means the value is rendered compact. Only an empty container has no
+/// style to copy, and there the value is opened out one level in from the
+/// container's own line.
+fn insert_last(
+    raw: &str,
+    open: usize,
+    close: usize,
+    items: &[Span],
+    key: Option<&str>,
+    value: &serde_json::Value,
+) -> String {
+    let render = |indent: &str, multiline: bool| {
+        let body = if multiline {
+            reindent(&pretty(value), indent)
+        } else {
+            value.to_string()
+        };
+        match key {
+            Some(k) => format!("{}: {body}", serde_json::Value::String(k.to_string())),
+            None => body,
+        }
+    };
+    let Some(last) = items.last() else {
+        // An empty container has no sibling to copy, so it inherits the one
+        // thing it does say about itself: whether it is written across lines.
+        // An inline `[]` stays inline; a container already opened out gets
+        // its new item one level in from its own line.
+        if !raw[open..close].contains('\n') {
+            return format!("{}{}{}", &raw[..=open], render("", false), &raw[close..]);
+        }
+        let outer = line_indent(raw, open);
+        let inner = format!("{outer}  ");
+        let text = render(&inner, true);
+        return format!("{}\n{inner}{text}\n{outer}{}", &raw[..=open], &raw[close..]);
+    };
+    let separator = &raw[item_start(raw, last.0)..last.0];
+    let indent = separator.rsplit('\n').next().unwrap_or("");
+    let text = render(indent, separator.contains('\n'));
+    format!("{},{separator}{text}{}", &raw[..last.1], &raw[last.1..])
+}
+
+/// Whether a located value is the literal `null`. `parse_settings` accepts a
+/// null `hooks` as an empty one, so both splices have to agree with it rather
+/// than refusing a file mesa's own parser calls fine.
+fn is_null_value(raw: &str, value: Span) -> bool {
+    raw[value.0..value.1].trim() == "null"
+}
+
+/// Replaces one value span, in its container's style — the same choice
+/// [`insert_last`] makes for an empty container: a single-line object keeps
+/// its new value compact, a container already opened out gets it
+/// pretty-printed at the holding key's own indentation.
+fn replace_value(
+    raw: &str,
+    value: Span,
+    open: usize,
+    close: usize,
+    replacement: &serde_json::Value,
+) -> String {
+    let body = if raw[open..close].contains('\n') {
+        reindent(&pretty(replacement), line_indent(raw, value.0))
+    } else {
+        replacement.to_string()
+    };
+    format!("{}{body}{}", &raw[..value.0], &raw[value.1..])
+}
+
+/// A group's matcher read straight from the raw text, defaulting to `*` — an
+/// absent `matcher` key means "everything", so it is the same group as an
+/// explicit `"*"`.
+fn raw_group_matcher(raw: &str, entries: &[ObjEntry]) -> String {
+    entries
+        .iter()
+        .find(|e| e.key == "matcher")
+        .and_then(|e| serde_json::from_str::<String>(&raw[e.value.0..e.value.1]).ok())
+        .unwrap_or_else(|| DEFAULT_HOOK_MATCHER.to_string())
+}
+
+/// The `command` string of one entry in a group's `hooks` array.
+fn raw_command(raw: &str, span: Span) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(&raw[span.0..span.1]).ok()?;
+    Some(value.get("command")?.as_str()?.to_string())
+}
+
+/// Confirms a located value really opens with the bracket its shape requires.
+/// [`parse_settings`] has already checked all of this on the parsed document;
+/// this is the raw-text side saying so again before it cuts anything.
+fn expect_open(raw: &str, at: usize, want: u8, what: &str) -> Result<usize, String> {
+    if raw.as_bytes().get(at) == Some(&want) {
+        Ok(at)
+    } else {
+        Err(format!("{what} is not a {}", want as char))
+    }
+}
+
+fn pretty(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).expect("a json value always serializes")
+}
+
+/// The leading whitespace of the line `at` sits on, whatever else is on it.
+fn line_indent(raw: &str, at: usize) -> &str {
+    let line_start = raw[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line = &raw[line_start..];
+    let end = line
+        .find(|c: char| c != ' ' && c != '\t')
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
+/// Re-indents a pretty-printed value so its continuation lines sit under the
+/// item that holds it. The first line is left alone — it follows a separator
+/// that already placed it.
+fn reindent(pretty: &str, indent: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in pretty.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(indent);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Where an item's text begins, counting the whitespace separating it from
+/// the `{`, `[` or `,` before it — so cutting between two neighbours'
+/// `item_start`s removes one whole line, indentation included.
+fn item_start(raw: &str, at: usize) -> usize {
+    raw[..at]
+        .rfind(|c: char| !c.is_ascii_whitespace())
+        .map_or(0, |i| i + 1)
+}
+
+/// The outermost object: `(open, close, entries)`.
+fn top_level_object(raw: &str) -> Result<(usize, usize, Vec<ObjEntry>), String> {
+    let open = skip_ws(raw.as_bytes(), 0);
+    if raw.as_bytes().get(open) != Some(&b'{') {
+        return Err("the top level is not an object".into());
+    }
+    let (close, entries) = object_entries(raw, open)?;
+    Ok((open, close, entries))
+}
+
+/// Every entry of the object opening at `open`, plus that object's closing
+/// brace.
+///
+/// This and its siblings only ever run on text `serde_json` has already
+/// parsed (see [`parse_settings`]), so they may assume well-formed JSON;
+/// every error below is a defensive one, and every one of them aborts the
+/// write rather than guessing.
+fn object_entries(raw: &str, open: usize) -> Result<(usize, Vec<ObjEntry>), String> {
+    let b = raw.as_bytes();
+    let mut i = open + 1;
+    let mut entries = Vec::new();
+    loop {
+        i = skip_ws(b, i);
+        match b.get(i) {
+            None => return Err("an object is unterminated".into()),
+            Some(b'}') => return Ok((i, entries)),
+            Some(b'"') => {}
+            Some(c) => {
+                return Err(format!(
+                    "unexpected {:?} where a key was expected",
+                    *c as char
+                ));
+            }
+        }
+        let key_start = i;
+        let key_end = string_end(b, key_start)?;
+        let key: String = serde_json::from_str(&raw[key_start..key_end])
+            .map_err(|e| format!("unreadable key: {e}"))?;
+        i = skip_ws(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return Err(format!("no ':' after key {key:?}"));
+        }
+        let value_start = skip_ws(b, i + 1);
+        let value_end = value_end(b, value_start)?;
+        entries.push(ObjEntry {
+            key,
+            span: (key_start, value_end),
+            value: (value_start, value_end),
+        });
+        i = skip_ws(b, value_end);
+        match b.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => return Ok((i, entries)),
+            _ => return Err("an object is unterminated".into()),
+        }
+    }
+}
+
+/// Every element of the array opening at `open`, plus that array's closing
+/// bracket.
+fn array_elements(raw: &str, open: usize) -> Result<(usize, Vec<Span>), String> {
+    let b = raw.as_bytes();
+    let mut i = open + 1;
+    let mut items = Vec::new();
+    loop {
+        i = skip_ws(b, i);
+        match b.get(i) {
+            None => return Err("an array is unterminated".into()),
+            Some(b']') => return Ok((i, items)),
+            _ => {}
+        }
+        let end = value_end(b, i)?;
+        items.push((i, end));
+        i = skip_ws(b, end);
+        match b.get(i) {
+            Some(b',') => i += 1,
+            Some(b']') => return Ok((i, items)),
+            _ => return Err("an array is unterminated".into()),
+        }
+    }
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the closing quote of the string starting at `start`.
+fn string_end(b: &[u8], start: usize) -> Result<usize, String> {
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Ok(i + 1),
+            _ => i += 1,
+        }
+    }
+    Err("unterminated string".into())
+}
+
+/// Index just past the JSON value starting at `start`.
+fn value_end(b: &[u8], start: usize) -> Result<usize, String> {
+    match b.get(start) {
+        None => Err("a value was expected".into()),
+        Some(b'"') => string_end(b, start),
+        Some(&c @ (b'{' | b'[')) => {
+            let close = if c == b'{' { b'}' } else { b']' };
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    i = string_end(b, i)?;
+                    continue;
+                }
+                if b[i] == c {
+                    depth += 1;
+                } else if b[i] == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(i + 1);
+                    }
+                }
+                i += 1;
+            }
+            Err("unterminated value".into())
+        }
+        // A number, `true`, `false` or `null` — everything up to the first
+        // character that can end it.
+        Some(_) => {
+            let mut i = start;
+            while i < b.len() && !matches!(b[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                i += 1;
+            }
+            Ok(i)
+        }
     }
 }
 
@@ -2473,5 +3480,680 @@ mod tests {
         assert_eq!(results[0].status, "failed");
         assert!(results[0].error.is_some());
         assert_eq!(results[1].status, "created");
+    }
+
+    // ---- hook registration in `.claude/settings.json` (mesa task 1115) ----
+
+    fn hook_item(store: &mut Store, pid: i64, name: &str) -> LibraryItem {
+        store
+            .create_library_item(
+                LibraryKind::Hook,
+                LibraryScope::Project,
+                Some(pid),
+                name,
+                "#!/bin/sh\necho hi\n",
+                None,
+            )
+            .unwrap()
+    }
+
+    /// Stands in for `command_runs_hook` in the raw-text splice tests, which
+    /// have no `Store` and no `HookTarget` — the splice only ever asks "is
+    /// this command string ours?", so that is the whole of what it needs.
+    fn ours(command: &str) -> bool {
+        command.contains(".claude/hooks/stop-notify.sh")
+    }
+
+    const MINE: &str = "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh";
+
+    fn enable(raw: &str, event: &str, matcher: &str) -> String {
+        splice_register(raw, event, matcher, MINE, &ours)
+            .unwrap()
+            .expect("this registration is not already present")
+    }
+
+    fn disable_all(raw: &str) -> String {
+        splice_unregister(raw, None, None, &ours)
+            .unwrap()
+            .expect("there was something to remove")
+    }
+
+    #[test]
+    fn enabling_under_one_event_leaves_another_events_span_byte_identical() {
+        let other = "    \"PreToolUse\": [\n      {\"matcher\": \"Bash\", \"hooks\": \
+                     [{\"type\": \"command\", \"command\": \"guard.py\"}]}\n    ]";
+        let raw = format!(
+            "{{\n  \"model\": \"opus\",\n  \"hooks\": {{\n{other},\n    \"Stop\": [\n      \
+             {{\"matcher\": \"*\", \"hooks\": [{{\"type\": \"command\", \"command\": \
+             \"other.sh\"}}]}}\n    ]\n  }}\n}}\n"
+        );
+        let out = enable(&raw, "Stop", "*");
+
+        assert!(
+            out.contains(other),
+            "the untouched event must not move a byte:\n{out}"
+        );
+        assert!(
+            out.starts_with("{\n  \"model\": \"opus\",\n  \"hooks\": {\n"),
+            "{out}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["hooks"]["Stop"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn disabling_one_entry_leaves_its_siblings_byte_identical() {
+        // Deliberately non-standard: `command` before `type`, odd spacing, and
+        // no `matcher` key at all. None of it may be normalized.
+        let first = "{ \"command\":\"first.sh\",   \"type\":\"command\" }";
+        let third = "{\"type\":\"command\",\"command\":\"third.sh\",\"timeout\":5}";
+        let raw = format!(
+            "{{\n  \"hooks\": {{\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          \
+             {first},\n          {{\"type\": \"command\", \"command\": \"{MINE}\"}},\n          \
+             {third}\n        ]\n      }}\n    ]\n  }}\n}}\n"
+        );
+        let out = disable_all(&raw);
+
+        assert!(out.contains(first), "sibling reformatted:\n{out}");
+        assert!(out.contains(third), "sibling reformatted:\n{out}");
+        assert!(!out.contains("stop-notify"), "{out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let commands = parsed["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1]["timeout"], 5);
+    }
+
+    #[test]
+    fn an_existing_groups_key_order_survives_an_unrelated_enable() {
+        // `matcher` before `hooks` — the opposite of the order mesa writes,
+        // and of the alphabetical order a reserialization would impose.
+        let group = "{\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", \
+                     \"command\": \"guard.py\"}]}";
+        let raw =
+            format!("{{\n  \"hooks\": {{\n    \"PreToolUse\": [\n      {group}\n    ]\n  }}\n}}\n");
+        let out = enable(&raw, "Stop", "*");
+
+        assert!(
+            out.contains(group),
+            "an unrelated group must keep its own key order:\n{out}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn enable_then_disable_returns_the_file_byte_identical() {
+        // The acceptance property, at all three depths a registration can be
+        // introduced: into an existing group, as a new group under an
+        // existing event, and as a new event under an existing `hooks` key —
+        // plus the case where the `hooks` key itself has to be created.
+        let with_hooks = "{\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"Stop\": [\n      \
+                          {\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", \
+                          \"command\": \"other.sh\"}]}\n    ]\n  },\n  \"env\": {\"FOO\": \
+                          \"bar\"}\n}\n";
+        for (raw, event, matcher) in [
+            // Into the existing group.
+            (with_hooks, "Stop", "Bash"),
+            // A new group under the existing event.
+            (with_hooks, "Stop", "*"),
+            // A new event under the existing `hooks` key.
+            (with_hooks, "SessionStart", "*"),
+            // A whole new `hooks` key.
+            ("{\n  \"model\": \"opus\"\n}\n", "Stop", "*"),
+            // And a single-line file, where the splice must not open it out.
+            (
+                "{\"model\":\"opus\",\"hooks\":{\"Stop\":[{\"matcher\":\"*\",\"hooks\":                 [{\"type\":\"command\",\"command\":\"other.sh\"}]}]}}",
+                "Stop",
+                "*",
+            ),
+        ] {
+            let enabled = enable(raw, event, matcher);
+            assert_ne!(enabled, raw, "enable did nothing for {event}/{matcher}");
+            let back = disable_all(&enabled);
+            assert_eq!(
+                back, raw,
+                "enable({event}, {matcher}) then disable must be a round trip\n\
+                 after enable:\n{enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_that_was_already_empty_does_not_survive_the_round_trip() {
+        // The one shape where enable-then-disable is NOT byte-identical, and
+        // deliberately so: a group whose command list was *already* empty.
+        // Disabling drops a group it empties, and within a single call it
+        // cannot tell "empty because mesa just removed its last command" from
+        // "empty before mesa ever touched it" — the two have identical input
+        // state. Cleaning up the vacuous group is the documented behaviour and
+        // the more useful one, so the round trip yields to it here.
+        let raw = "{\"hooks\":{\"Stop\":[{\"matcher\":\"*\",\"hooks\":[]}]}}";
+        let back = disable_all(&enable(raw, "Stop", "*"));
+        assert_eq!(back, "{}", "the emptied group, event and hooks key all go");
+    }
+
+    #[test]
+    fn a_single_line_container_stays_on_one_line() {
+        let raw = "{\"hooks\":{\"Stop\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\
+                   \"command\":\"other.sh\"}]}]}}";
+        let out = enable(raw, "Stop", "*");
+        assert!(
+            !out.contains('\n'),
+            "a one-line file must stay one line:\n{out}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["hooks"]["Stop"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_cut_escalates_only_as_far_as_it_must() {
+        // A group holding only our command loses the group, not its contents.
+        let raw = format!(
+            "{{\n  \"model\": \"opus\",\n  \"hooks\": {{\n    \"Stop\": [\n      \
+             {{\"matcher\": \"Bash\", \"hooks\": [{{\"type\": \"command\", \"command\": \
+             \"other.sh\"}}]}},\n      {{\"matcher\": \"*\", \"hooks\": [{{\"type\": \
+             \"command\", \"command\": \"{MINE}\"}}]}}\n    ]\n  }},\n  \"env\": 1\n}}\n"
+        );
+        let out = disable_all(&raw);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert!(out.contains("{\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", \"command\": \"other.sh\"}]}"), "{out}");
+
+        // The last event under `hooks` losing its last group takes the whole
+        // `hooks` key with it, and nothing else in the file moves.
+        let raw = "{\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"Stop\": [\n      \
+                   {\"matcher\": \"*\", \"hooks\": [{\"type\": \"command\", \"command\": \
+                   \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh\"}]}\n    ]\n  },\n  \
+                   \"env\": 1\n}\n";
+        assert_eq!(
+            disable_all(raw),
+            "{\n  \"model\": \"opus\",\n  \"env\": 1\n}\n"
+        );
+
+        // Hooks as the only top-level key collapses the object.
+        let raw = "{\n  \"hooks\": {\"Stop\": [{\"matcher\": \"*\", \"hooks\": [{\"type\": \
+                   \"command\", \"command\": \".claude/hooks/stop-notify.sh\"}]}]}\n}\n";
+        assert_eq!(disable_all(raw), "{}\n");
+    }
+
+    #[test]
+    fn the_scanner_walks_past_braces_and_commas_inside_strings() {
+        // The locator tracks string state, so a `}` or a literal `"hooks"`
+        // inside a value never terminates the entry it sits in.
+        let greeting = "  \"greeting\": \"} , \\\"hooks\\\": no\"";
+        let raw = format!("{{\n{greeting},\n  \"model\": \"opus\"\n}}\n");
+        let out = enable(&raw, "Stop", "*");
+        assert!(out.contains(greeting), "{out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["greeting"], "} , \"hooks\": no");
+        assert_eq!(parsed["model"], "opus");
+        assert!(parsed["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn an_empty_or_absent_file_gets_a_fresh_document() {
+        // The one shape with no bytes to preserve.
+        for raw in ["", "   \n"] {
+            let out = enable(raw, "Stop", "*");
+            let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(parsed.as_object().unwrap().len(), 1, "{out}");
+            assert_eq!(parsed["hooks"]["Stop"][0]["hooks"][0]["command"], MINE);
+            assert_eq!(splice_unregister(raw, None, None, &ours).unwrap(), None);
+        }
+        // `{}` still goes through the splice: the braces are real bytes, and
+        // an inline container stays inline.
+        let out = enable("{}\n", "Stop", "*");
+        assert!(!out.trim_end().contains('\n'), "{out}");
+        assert_eq!(disable_all(&out), "{}\n");
+        // A container already opened out keeps its shape instead.
+        let out = enable("{\n}\n", "Stop", "*");
+        assert!(out.starts_with("{\n  \"hooks\": {"), "{out}");
+    }
+
+    #[test]
+    fn a_registration_already_present_is_not_written_twice() {
+        let raw = format!(
+            "{{\"hooks\":{{\"Stop\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\
+             \"command\":\"bash {MINE} --quiet\"}}]}}]}}}}"
+        );
+        // A hand-written command naming this hook counts as registered, so
+        // there is nothing to add.
+        assert_eq!(
+            splice_register(&raw, "Stop", "*", MINE, &ours).unwrap(),
+            None
+        );
+        // And removing something that is not there changes nothing.
+        assert_eq!(
+            splice_unregister("{\"model\": 1}", None, None, &ours).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_settings_file_mesa_cannot_parse_is_refused_rather_than_clobbered() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+
+        for bad in [
+            "{ not json",
+            "[1, 2, 3]",
+            "{\"hooks\": \"nope\"}",
+            "{\"hooks\": {\"Stop\": 7}}",
+        ] {
+            fs::write(&settings, bad).unwrap();
+            let err = register_hook(&store, &item, "Stop", None).unwrap_err();
+            assert!(
+                matches!(err, Error::Validation(ref m) if m.contains("settings.json")),
+                "{bad:?} produced {err:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&settings).unwrap(),
+                bad,
+                "a file mesa could not understand must be left exactly as it was"
+            );
+        }
+    }
+
+    #[test]
+    fn registering_is_idempotent_and_does_not_rewrite_the_file() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+
+        let status = register_hook(&store, &item, "Stop", None).unwrap();
+        assert!(status.registered);
+        assert_eq!(status.registrations.len(), 1);
+        assert_eq!(status.registrations[0].event, "Stop");
+        assert_eq!(status.registrations[0].matcher, "*");
+        assert_eq!(
+            status.command,
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh"
+        );
+        // `resolve` canonicalizes, so compare canonical to canonical (macOS
+        // resolves a temp dir through `/private`).
+        assert_eq!(
+            fs::canonicalize(&status.settings_path).unwrap(),
+            fs::canonicalize(&settings).unwrap()
+        );
+        let first = fs::read_to_string(&settings).unwrap();
+
+        let again = register_hook(&store, &item, "Stop", None).unwrap();
+        assert_eq!(again.registrations.len(), 1, "no duplicate entry");
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            first,
+            "a registration that changes nothing must not rewrite the file"
+        );
+
+        // And the read agrees with what the write reported.
+        let read = hook_registrations(&store, &item).unwrap();
+        assert_eq!(read.registrations, again.registrations);
+        assert_eq!(
+            read.events,
+            HOOK_EVENTS
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn registering_appends_into_an_existing_group_with_the_same_matcher() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            "{\n  \"hooks\": {\n    \"Stop\": [\n      {\"matcher\": \"*\", \"hooks\": \
+             [{\"type\": \"command\", \"command\": \"someone-elses.sh\"}]}\n    ]\n  }\n}\n",
+        )
+        .unwrap();
+
+        register_hook(&store, &item, "Stop", None).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let groups = parsed["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "one matcher means one group: {parsed:#}");
+        let commands = groups[0]["hooks"].as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["command"], "someone-elses.sh");
+        assert_eq!(
+            commands[1]["command"],
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh"
+        );
+
+        // A different matcher IS a second group.
+        register_hook(&store, &item, "Stop", Some("Bash")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(parsed["hooks"]["Stop"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn disabling_cleans_up_the_group_the_event_and_the_hooks_key() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "{\n  \"model\": \"opus\"\n}\n").unwrap();
+
+        register_hook(&store, &item, "Stop", None).unwrap();
+        register_hook(&store, &item, "SessionStart", Some("startup")).unwrap();
+        assert_eq!(
+            hook_registrations(&store, &item)
+                .unwrap()
+                .registrations
+                .len(),
+            2
+        );
+
+        // Narrowed to one event: the other survives, the emptied event key goes.
+        let status = unregister_hook(&store, &item, Some("Stop"), None).unwrap();
+        assert_eq!(status.registrations.len(), 1);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(parsed["hooks"].get("Stop").is_none(), "{parsed:#}");
+        assert!(parsed["hooks"].get("SessionStart").is_some());
+
+        // The last one: the `hooks` key itself goes, and `model` is untouched.
+        let status = unregister_hook(&store, &item, None, None).unwrap();
+        assert!(!status.registered);
+        assert!(status.registrations.is_empty());
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            "{\n  \"model\": \"opus\"\n}\n",
+            "the file must come back to exactly what it was"
+        );
+
+        // Disabling something that was never registered is a no-op success.
+        let status = unregister_hook(&store, &item, None, None).unwrap();
+        assert!(!status.registered);
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            "{\n  \"model\": \"opus\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn disabling_keeps_a_group_that_still_holds_someone_elses_command() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            "{\"hooks\": {\"Stop\": [{\"matcher\": \"*\", \"hooks\": \
+             [{\"type\": \"command\", \"command\": \"someone-elses.sh\"}]}]}}",
+        )
+        .unwrap();
+
+        register_hook(&store, &item, "Stop", None).unwrap();
+        unregister_hook(&store, &item, None, None).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        let commands = parsed["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["command"], "someone-elses.sh");
+    }
+
+    #[test]
+    fn an_unknown_event_is_validation_and_writes_nothing() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+
+        for bad in ["SessionStarted", "stop", ""] {
+            let err = register_hook(&store, &item, bad, None).unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{bad:?} -> {err:?}");
+        }
+        assert!(
+            !settings.exists(),
+            "a refused call must not create the file"
+        );
+
+        // A matcher with a newline, and an over-long one, are refused too.
+        assert!(matches!(
+            register_hook(&store, &item, "Stop", Some("a\nb")).unwrap_err(),
+            Error::Validation(_)
+        ));
+        let long = "x".repeat(HOOK_MATCHER_MAX + 1);
+        assert!(matches!(
+            register_hook(&store, &item, "Stop", Some(&long)).unwrap_err(),
+            Error::Validation(_)
+        ));
+        assert!(!settings.exists());
+    }
+
+    #[test]
+    fn only_a_hook_item_has_a_registration() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let agent = store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(pid),
+                "reviewer",
+                "body",
+                None,
+            )
+            .unwrap();
+        for err in [
+            hook_registrations(&store, &agent).unwrap_err(),
+            register_hook(&store, &agent, "Stop", None).unwrap_err(),
+            unregister_hook(&store, &agent, None, None).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, Error::Validation(ref m) if m.contains("only a hook")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_scope_hook_with_no_local_path_says_so() {
+        let (mut store, _dir) = temp_store();
+        let pid = store
+            .create_project("nowhere", None, None, None, None)
+            .unwrap()
+            .id;
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let err = hook_registrations(&store, &item).unwrap_err();
+        assert!(
+            matches!(err, Error::Validation(ref m) if m.contains("local path")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_is_this_hooks_only_at_a_path_boundary() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "oo.sh");
+        let target = hook_target(&store, &item).unwrap();
+
+        // Exact, wrapped in a shell line, and the absolute path all count.
+        assert!(command_runs_hook(
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/oo.sh",
+            &target
+        ));
+        assert!(command_runs_hook(
+            "bash $CLAUDE_PROJECT_DIR/.claude/hooks/oo.sh --quiet",
+            &target
+        ));
+        assert!(command_runs_hook(&target.absolute, &target));
+
+        // A longer filename that merely *ends* with this one does not.
+        assert!(!command_runs_hook(
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/foo.sh",
+            &target
+        ));
+        // Nor does a suffixed one.
+        assert!(!command_runs_hook(
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/oo.sh.bak",
+            &target
+        ));
+        // Nor an unrelated directory that happens to end in the same chars.
+        assert!(!command_runs_hook("my.claude/hooks/oo.sh", &target));
+        assert!(!command_runs_hook("echo done", &target));
+    }
+
+    #[test]
+    fn a_hand_written_command_naming_this_hook_reads_as_registered() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            "{\"hooks\": {\"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \
+             \"bash .claude/hooks/stop-notify.sh --quiet\"}]}]}}",
+        )
+        .unwrap();
+
+        let status = hook_registrations(&store, &item).unwrap();
+        assert!(status.registered);
+        // A group with no `matcher` key is reported (and matched) as `*`.
+        assert_eq!(status.registrations[0].matcher, "*");
+        assert_eq!(
+            status.registrations[0].command,
+            "bash .claude/hooks/stop-notify.sh --quiet"
+        );
+
+        // Which means enabling it again appends nothing, and disabling
+        // removes the hand-written line.
+        register_hook(&store, &item, "Stop", None).unwrap();
+        assert_eq!(
+            hook_registrations(&store, &item)
+                .unwrap()
+                .registrations
+                .len(),
+            1
+        );
+        let status = unregister_hook(&store, &item, None, None).unwrap();
+        assert!(!status.registered);
+    }
+
+    #[test]
+    fn a_null_hooks_value_is_treated_as_an_absent_one() {
+        // `parse_settings` reads `"hooks": null` as an empty map, so a splice
+        // that refused it would make a file mesa's own parser calls valid
+        // permanently un-editable — and would turn the documented no-op
+        // success of an unnecessary disable into exit 1.
+        for raw in [
+            "{\"hooks\": null, \"model\": \"opus\"}",
+            "{\n  \"hooks\": null,\n  \"model\": \"opus\"\n}\n",
+        ] {
+            assert_eq!(
+                splice_unregister(raw, None, None, &ours).unwrap(),
+                None,
+                "a null hooks holds no registration to cut"
+            );
+            let out = enable(raw, "Stop", "*");
+            let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(parsed["model"], "opus", "{out}");
+            assert_eq!(parsed["hooks"]["Stop"][0]["hooks"][0]["command"], MINE);
+            // And the round trip still holds: what was written is removable.
+            let back = disable_all(&out);
+            let parsed: serde_json::Value = serde_json::from_str(&back).unwrap();
+            assert_eq!(parsed["model"], "opus", "{back}");
+            assert!(parsed.get("hooks").is_none(), "{back}");
+        }
+    }
+
+    #[test]
+    fn enabling_seeds_the_hook_script_when_it_is_not_on_disk_and_never_overwrites() {
+        // A library row — a built-in or a fork — reaches the disk only when
+        // the user runs a sync, so without the seed the registration would
+        // name a file that does not exist and Claude Code would fail the hook
+        // every session.
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let script = base.join(".claude/hooks/stop-notify.sh");
+        assert!(!script.exists());
+
+        register_hook(&store, &item, "Stop", None).unwrap();
+        assert_eq!(fs::read_to_string(&script).unwrap(), item.body);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&script).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "a hook is a script, not a document");
+        }
+
+        // After the first seed the file belongs to the sync flow, exactly as
+        // `ensure_agent_file`'s does.
+        fs::write(&script, "#!/bin/sh\n# edited by hand\n").unwrap();
+        unregister_hook(&store, &item, None, None).unwrap();
+        register_hook(&store, &item, "SessionEnd", None).unwrap();
+        assert_eq!(
+            fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\n# edited by hand\n"
+        );
+    }
+
+    #[test]
+    fn unregister_narrows_to_a_matcher_register_would_have_refused() {
+        // On the unregister path the matcher is a filter naming what to cut,
+        // never text mesa writes — so a matcher already in the file, however
+        // it got there, stays reachable. The web UI's per-row disable button
+        // posts `reg.matcher` verbatim, straight from the file.
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let item = hook_item(&mut store, pid, "stop-notify.sh");
+        let settings = base.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let long = "x".repeat(HOOK_MATCHER_MAX + 50);
+        fs::write(
+            &settings,
+            format!(
+                "{{\"hooks\":{{\"Stop\":[{{\"matcher\":\"{long}\",\"hooks\":                 [{{\"type\":\"command\",\"command\":\"{}\"}}]}}]}}}}",
+                "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh"
+            ),
+        )
+        .unwrap();
+
+        let status = unregister_hook(&store, &item, Some("Stop"), Some(&long)).unwrap();
+        assert!(!status.registered, "{status:?}");
+        // The same value on the way *in* is still refused: that rule is about
+        // what mesa writes.
+        assert!(matches!(
+            register_hook(&store, &item, "Stop", Some(&long)),
+            Err(Error::Validation(_))
+        ));
     }
 }

@@ -58,8 +58,18 @@
 #      re-import (skip leaves bodies untouched, replace overwrites), an
 #      unknown bundle version refusing the whole import with nothing written,
 #      `--output` refusing to clobber an existing path, `--quiet` rejected on
-#      both commands, and the two new routes added to the gate sweeps (now
-#      eleven routes) in both serve modes.
+#      both commands, and the two new routes added to the gate sweeps in both
+#      serve modes;
+#  11. hook registration in `.claude/settings.json` (mesa task 1115):
+#      status -> enable -> status sees it -> disable, against a settings file
+#      that already holds somebody else's settings and somebody else's hook,
+#      which must come back BYTE-IDENTICAL; enabling seeding the hook's own
+#      script to disk (executable, never overwritten) so the registration
+#      never names a file that does not exist; a null `hooks` treated as an
+#      absent one on both verbs; a second disable as a no-op success;
+#      `--quiet` rejected (exit 2, empty stdout) on all three subcommands;
+#      and the three routes joining the gate sweeps (now fourteen routes) in
+#      both serve modes.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -831,6 +841,13 @@ raw POST /api/library/sync -H "Host: evil.example" -H 'Content-Type: application
 raw POST /api/library/import -H "Host: evil.example" -H 'Content-Type: application/json' \
   -d '{"bundle":{"version":1,"exported_at":"x","items":[]}}'
 [ "$STATUS" = "403" ] || fail "default: import with a foreign Host must be 403"
+raw GET "/api/library/$GATE_ID/hook" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "default: GET .../hook with a foreign Host must be 403"
+raw POST "/api/library/$GATE_ID/hook" -H "Host: evil.example" -H 'Content-Type: application/json' \
+  -d '{"event":"Stop"}'
+[ "$STATUS" = "403" ] || fail "default: POST .../hook with a foreign Host must be 403"
+raw DELETE "/api/library/$GATE_ID/hook" -H "Host: evil.example" -H 'Content-Type: application/json'
+[ "$STATUS" = "403" ] || fail "default: DELETE .../hook with a foreign Host must be 403"
 api 200 GET "/api/library/$GATE_ID"
 [ "$(jqb .body)" = "x" ] || fail "default: a refused authoring request must write nothing"
 ok "default mode: every mutating route AND both sync routes reject a foreign Host, writing nothing"
@@ -913,7 +930,7 @@ LIS=$(lan_req POST /api/library/import "127.0.0.1:$LAN_PORT" '' '{"bundle":{"ver
   fail "--lan: importing from this machine's own local Host must still work (the flag never locks the owner out)"
 ok "--lan: authoring (incl. import) from a loopback peer with a local Host still works (the flag never locks the owner out)"
 
-# All ELEVEN routes: a DNS-name Host (rebinding) and a foreign Origin
+# All FOURTEEN routes: a DNS-name Host (rebinding) and a foreign Origin
 # (cross-site) are each refused — reads exactly as strictly as mutations, the
 # two sync routes and the two bundle routes, since every one of them shares
 # `require_agent_access`.
@@ -929,6 +946,9 @@ for CASE in \
   "POST|/api/library/sync|{\"resolutions\":[]}" \
   "GET|/api/library/export|" \
   "POST|/api/library/import|{\"bundle\":{\"version\":1,\"exported_at\":\"x\",\"items\":[]}}" \
+  "GET|/api/library/$GATE_ID/hook|" \
+  "POST|/api/library/$GATE_ID/hook|{\"event\":\"Stop\"}" \
+  "DELETE|/api/library/$GATE_ID/hook|{}" \
 ; do
   IFS='|' read -r METHOD PATH_ BODY_ <<<"$CASE"
   S=$(lan_req "$METHOD" "$PATH_" "evil.example:$LAN_PORT" '' "$BODY_")
@@ -938,7 +958,7 @@ for CASE in \
   [ "$S" = "403" ] ||
     fail "--lan: $METHOD $PATH_ from a foreign Origin must be 403, got $S"
 done
-ok "--lan: all eleven library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
+ok "--lan: all fourteen library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
 
 api2() { # api2 <expected-status> <method> <path> [json-body] — against LAN_PORT, local Host
   local expected=$1 method=$2 path=$3 body=${4:-}
@@ -1241,6 +1261,132 @@ run 1 "$MESA" library import "$TMP/malformed.json"
 ok "import of an unparseable bundle: exit 1 validation"
 
 echo "== library-check: section 10 (import/export) passed ($CHECKS checks so far) =="
+
+# ================= 11. hook registration (mesa task 1115) =================
+# A hook file does nothing until `.claude/settings.json` names it under an
+# event. mesa does not own that file, so the acceptance property is that an
+# enable followed by a disable gives it back byte for byte — asserted against
+# a settings file that already holds somebody else's settings AND somebody
+# else's hook registration.
+
+HOOK_SETTINGS="$HOME/.claude/settings.json"
+HOOK_SCRIPT="$HOME/.claude/hooks/gate-hook.sh"
+mkdir -p "$HOME/.claude"
+cat > "$HOOK_SETTINGS" <<'JSON'
+{
+  "model": "opus",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{"type": "command", "command": "somebody-elses-guard.py"}] }
+    ]
+  },
+  "env": {"FOO": "bar"}
+}
+JSON
+cp "$HOOK_SETTINGS" "$TMP/settings.before"
+
+run 0 "$MESA" library create hook gate-hook.sh 'echo hooked'
+HOOK_ID=$(jqs .id)
+
+run 0 "$MESA" library hook status gate-hook.sh
+[ "$(jqs .item_id)" = "$HOOK_ID" ] || fail "hook status: item_id"
+[ "$(jqs .name)" = "gate-hook.sh" ] || fail "hook status: name"
+[ "$(jqs .registered)" = "false" ] || fail "hook status: a fresh hook is not registered"
+[ "$(jqs '.registrations | length')" = "0" ] || fail "hook status: no registrations yet"
+[ "$(jqs .settings_path)" = "$HOME_REAL/.claude/settings.json" ] ||
+  fail "hook status: settings_path follows the item's scope, got $(jqs .settings_path)"
+[ "$(jqs .command)" = "$HOME_REAL/.claude/hooks/gate-hook.sh" ] ||
+  fail "hook status: a user-scope hook is registered by absolute path, got $(jqs .command)"
+[ "$(jqs '.events | length')" = "9" ] || fail "hook status: the event vocabulary rides along"
+ok "CLI library hook status: an unregistered hook reports its settings file, its command and the event vocabulary"
+
+# `--quiet` is rejected on all three: a status is not a record and has no
+# unbounded field to drop.
+for SUB in status enable disable; do
+  run 2 "$MESA" library hook "$SUB" gate-hook.sh --quiet --event Stop
+  [ -z "$STDOUT" ] || fail "library hook $SUB --quiet: stdout must be empty, got $STDOUT"
+  [ "$(jqe .error.code)" = "usage" ] || fail "library hook $SUB --quiet: expected usage, got $STDERR"
+done
+ok "CLI library hook status/enable/disable reject --quiet: exit 2, empty stdout, usage on stderr"
+
+# The hook's own script is not on disk — a built-in is code and a row is a db
+# row, and nothing writes either until a sync. A registration naming a file
+# that does not exist fires and errors every session, so enabling seeds it.
+[ ! -e "$HOOK_SCRIPT" ] || fail "fixture: the hook script must not be on disk before the enable"
+
+run 0 "$MESA" library hook enable gate-hook.sh --event Stop
+[ "$(jqs .registered)" = "true" ] || fail "hook enable: registered"
+[ "$(jqs '.registrations | length')" = "1" ] || fail "hook enable: exactly one registration"
+[ "$(jqs '.registrations[0].event')" = "Stop" ] || fail "hook enable: event"
+[ "$(jqs '.registrations[0].matcher')" = "*" ] || fail "hook enable: the matcher defaults to *"
+[ "$(jqs '.registrations[0].command')" = "$HOME_REAL/.claude/hooks/gate-hook.sh" ] ||
+  fail "hook enable: the registered command is what status said it would be"
+[ -f "$HOOK_SCRIPT" ] || fail "hook enable: the hook's own script must be seeded to disk"
+[ "$(cat "$HOOK_SCRIPT")" = "echo hooked" ] || fail "hook enable: the seeded script is the item's body"
+[ -x "$HOOK_SCRIPT" ] || fail "hook enable: a hook is a script Claude Code runs; it must be executable"
+ok "CLI library hook enable: registers under one event AND seeds the hook's own executable script to disk"
+
+# Somebody else's settings and somebody else's hook are still there, and the
+# registration is genuinely readable by an ordinary JSON parser.
+[ "$(jq -r .model "$HOOK_SETTINGS")" = "opus" ] || fail "hook enable: an unrelated top-level key must survive"
+[ "$(jq -r '.env.FOO' "$HOOK_SETTINGS")" = "bar" ] || fail "hook enable: an unrelated block must survive"
+[ "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOOK_SETTINGS")" = "somebody-elses-guard.py" ] ||
+  fail "hook enable: somebody else's hook must survive"
+[ "$(jq -r '.hooks.Stop[0].hooks[0].command' "$HOOK_SETTINGS")" = "$HOME_REAL/.claude/hooks/gate-hook.sh" ] ||
+  fail "hook enable: the registration must be readable as ordinary JSON"
+ok "hook enable: every unrelated setting and somebody else's own hook survive the splice"
+
+run 0 "$MESA" library hook status gate-hook.sh
+[ "$(jqs .registered)" = "true" ] || fail "hook status after enable: registered"
+[ "$(jqs '.registrations[0].event')" = "Stop" ] || fail "hook status after enable: event"
+ok "CLI library hook status: a fresh read of the file reports the registration the enable wrote"
+
+# Never overwritten: after the first seed the file belongs to the sync flow.
+printf 'edited by hand\n' > "$HOOK_SCRIPT"
+run 0 "$MESA" library hook enable gate-hook.sh --event SessionEnd
+[ "$(cat "$HOOK_SCRIPT")" = "edited by hand" ] ||
+  fail "hook enable: a script already on disk must never be overwritten"
+run 0 "$MESA" library hook disable gate-hook.sh --event SessionEnd
+ok "CLI library hook enable: a hook script already on disk is never overwritten"
+
+run 0 "$MESA" library hook disable gate-hook.sh
+[ "$(jqs .registered)" = "false" ] || fail "hook disable: registered"
+[ "$(jqs '.registrations | length')" = "0" ] || fail "hook disable: no registrations left"
+cmp -s "$HOOK_SETTINGS" "$TMP/settings.before" ||
+  fail "hook disable: the settings file must come back BYTE-IDENTICAL:\n$(diff "$TMP/settings.before" "$HOOK_SETTINGS" || true)"
+ok "CLI library hook disable: removes the registration and gives the settings file back byte-identical"
+
+run 0 "$MESA" library hook disable gate-hook.sh
+[ "$(jqs .registered)" = "false" ] || fail "hook disable (again): registered"
+cmp -s "$HOOK_SETTINGS" "$TMP/settings.before" || fail "hook disable (again): must not touch the file"
+ok "CLI library hook disable on a hook that was never registered: no-op success, file untouched"
+
+# `"hooks": null` is valid JSON, and mesa's own parser reads it as an empty
+# map — so both verbs must too, rather than refusing a file mesa says is fine.
+printf '{"hooks": null, "model": "opus"}\n' > "$HOOK_SETTINGS"
+cp "$HOOK_SETTINGS" "$TMP/settings.null"
+run 0 "$MESA" library hook disable gate-hook.sh
+[ "$(jqs .registered)" = "false" ] || fail "hook disable on a null hooks: registered"
+cmp -s "$HOOK_SETTINGS" "$TMP/settings.null" || fail "hook disable on a null hooks: must touch nothing"
+run 0 "$MESA" library hook enable gate-hook.sh --event Stop
+[ "$(jqs .registered)" = "true" ] || fail "hook enable on a null hooks: registered"
+[ "$(jq -r .model "$HOOK_SETTINGS")" = "opus" ] || fail "hook enable on a null hooks: the sibling key must survive"
+[ "$(jq -r '.hooks.Stop[0].hooks[0].command' "$HOOK_SETTINGS")" = "$HOME_REAL/.claude/hooks/gate-hook.sh" ] ||
+  fail "hook enable on a null hooks: the registration must be there"
+ok "a \"hooks\": null settings file is read as an empty one by both verbs, not refused"
+
+run 0 "$MESA" library hook disable gate-hook.sh
+run 1 "$MESA" library hook enable gate-hook.sh --event Nope
+[ "$(jqe .error.code)" = "validation" ] || fail "hook enable with a bad event: error.code"
+case "$STDERR" in *SubagentStop*) ;; *) fail "hook enable with a bad event: must name the vocabulary" ;; esac
+run 0 "$MESA" library create prompt hook-nonhook-probe 'not a hook'
+run 1 "$MESA" library hook status hook-nonhook-probe
+[ "$(jqe .error.code)" = "validation" ] || fail "hook status on a non-hook item: error.code"
+run 1 "$MESA" library hook status no-such-hook.sh
+[ "$(jqe .error.code)" = "not_found" ] || fail "hook status on an unknown item: error.code"
+ok "CLI library hook: a mistyped event, a non-hook item and an unknown item are each an error, exit 1"
+
+echo "== library-check: section 11 (hook registration) passed ($CHECKS checks so far) =="
 
 echo
 echo "library-check: $CHECKS checks passed"

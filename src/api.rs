@@ -1402,8 +1402,9 @@ fn router(state: AppState) -> Router {
         // Library: agent definitions, skills, hooks, commands, the live
         // prompt and CLAUDE.md files, each mirrored onto disk under
         // `.claude/`. A row becomes code mesa or Claude Code executes, so all
-        // eleven routes — reads, authoring, the sync pair that touches the
-        // disk side, and the export/import bundle pair — share ONE gate,
+        // fourteen routes — reads, authoring, the sync pair that touches the
+        // disk side, the export/import bundle pair, and the hook-registration
+        // trio that edits `.claude/settings.json` — share ONE gate,
         // `require_agent_access`, the agents'/terminal's/scripts' gate
         // (mesa task 1004, replacing the loopback-only `LIBRARY_LOOPBACK`
         // that used to sit here). Default mode is strictly stronger than
@@ -1422,6 +1423,12 @@ fn router(state: AppState) -> Router {
                 .delete(delete_library),
         )
         .route("/api/library/{id}/versions", get(list_library_versions))
+        .route(
+            "/api/library/{id}/hook",
+            get(library_hook_status)
+                .post(register_library_hook)
+                .delete(unregister_library_hook),
+        )
         .route(
             "/api/library/builtins/{builtin_id}/fork",
             post(fork_library_builtin),
@@ -4134,6 +4141,90 @@ async fn list_library_versions(
     require_agent_access(&state, &addr, &headers)?;
     let store = state.store.lock().unwrap();
     Ok(Json(store.list_library_versions(id)?).into_response())
+}
+
+#[derive(Deserialize)]
+struct LibraryHookBody {
+    event: String,
+    #[serde(default)]
+    matcher: Option<String>,
+}
+
+/// `DELETE` carries its narrowing in the query string rather than a body:
+/// mesa has no DELETE-with-body route anywhere else, and both fields here are
+/// short scalars — `?event=Stop&matcher=Bash`. Neither is required; with no
+/// `event` every registration of this hook is removed.
+#[derive(Deserialize)]
+struct LibraryHookQuery {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    matcher: Option<String>,
+}
+
+/// Where a `hook` item is wired into `.claude/settings.json` (mesa task
+/// 1115). Same [`require_agent_access`] gate as every other library route —
+/// and it earns it twice over here, since the answer names a path under the
+/// user's home directory and the write it pairs with decides what Claude Code
+/// executes on every session.
+///
+/// An unshadowed built-in has no numeric id, so it is not reachable on this
+/// route at all; editing it in the library forks it into a real row first,
+/// which is the same order the rest of this surface imposes.
+async fn library_hook_status(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    let item = store.get_library_item(id)?;
+    Ok(Json(library::hook_registrations(&store, &item)?).into_response())
+}
+
+/// Registers a hook under one event. Idempotent, and answers the same status
+/// object the `GET` does, so the caller reads the file's new state rather
+/// than assuming its request landed.
+async fn register_library_hook(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<LibraryHookBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let store = state.store.lock().unwrap();
+    let item = store.get_library_item(id)?;
+    Ok(Json(library::register_hook(
+        &store,
+        &item,
+        &body.event,
+        body.matcher.as_deref(),
+    )?)
+    .into_response())
+}
+
+/// Removes this hook's registrations — all of them, or only those the query
+/// narrows to. Idempotent, same status object.
+async fn unregister_library_hook(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<LibraryHookQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    let item = store.get_library_item(id)?;
+    Ok(Json(library::unregister_hook(
+        &store,
+        &item,
+        q.event.as_deref(),
+        q.matcher.as_deref(),
+    )?)
+    .into_response())
 }
 
 /// Editing a built-in forks it: the id must name a real built-in (404

@@ -1356,6 +1356,9 @@ EXAMPLES
         /// Library item id or name
         item: String,
     },
+    /// Register a hook item in `.claude/settings.json`, or ask where it is
+    #[command(subcommand)]
+    Hook(LibraryHookCmd),
     /// Compare mesa's library against the files on disk, and reconcile
     #[command(subcommand)]
     Sync(LibrarySyncCmd),
@@ -1396,6 +1399,61 @@ EXAMPLES
         /// skip|replace an existing row at the same (kind, scope, project, name)
         #[arg(long, default_value = "skip")]
         on_conflict: String,
+    },
+}
+
+/// `mesa library hook status|enable|disable` — mesa task 1115.
+///
+/// A hook *file* under `.claude/hooks/` does nothing until Claude Code is
+/// told to run it, which is a `hooks` entry in `.claude/settings.json` naming
+/// an event and a matcher. This group is the only thing in mesa that reads or
+/// writes that file, and it splices at the span of the one entry it is adding
+/// or removing — every other byte of the user's settings, somebody else's
+/// hooks included, comes through untouched, and a settings file mesa cannot
+/// parse is refused rather than rewritten. `enable` also seeds the hook's own
+/// script to disk when nothing has written it yet, never overwriting one that
+/// is already there.
+///
+/// Which settings file follows the item's own scope: `~/.claude/settings.json`
+/// for a `user` hook, the project's `local_path` for a `project` one. All
+/// three print the same [`crate::core::LibraryHookStatus`] object, and none of
+/// them takes `--quiet` — a status is not a record and has no unbounded field
+/// to drop.
+#[derive(Subcommand)]
+enum LibraryHookCmd {
+    /// Print where this hook is registered, and what mesa would register it as
+    Status {
+        /// Library item id or name; must be a `hook`
+        item: String,
+    },
+    /// Register this hook under one event; idempotent
+    #[command(after_help = "\
+EXAMPLES
+  mesa library hook enable stop-notify.sh --event Stop
+  mesa library hook enable poll-guard.py --event PreToolUse --matcher Bash")]
+    Enable {
+        /// Library item id or name; must be a `hook`
+        item: String,
+        /// PreToolUse|PostToolUse|Notification|UserPromptSubmit|Stop|SubagentStop|PreCompact|SessionStart|SessionEnd
+        #[arg(long)]
+        event: String,
+        /// Tool/source pattern for this registration (default: `*`)
+        #[arg(long)]
+        matcher: Option<String>,
+    },
+    /// Remove this hook's registrations; idempotent
+    ///
+    /// With no `--event`, every registration of this hook is removed,
+    /// whatever event or matcher it sits under.
+    Disable {
+        /// Library item id or name; must be a `hook`
+        item: String,
+        /// Only remove registrations under this event
+        #[arg(long)]
+        event: Option<String>,
+        /// Only remove registrations carrying this matcher
+        #[arg(long)]
+        matcher: Option<String>,
     },
 }
 
@@ -4949,6 +5007,7 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                 None => print_json(&Vec::<crate::core::LibraryVersion>::new()),
             }
         }
+        LibraryCmd::Hook(hook_cmd) => run_library_hook_cmd(&store, hook_cmd)?,
         LibraryCmd::Sync(sync_cmd) => run_library_sync_cmd(&mut store, sync_cmd)?,
         LibraryCmd::Export {
             project_pos,
@@ -4976,6 +5035,46 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                 .map_err(|e| Error::Validation(format!("not a valid library bundle: {e}")))?;
             let results = library::import(&mut store, &bundle, &on_conflict)?;
             print_json(&results);
+        }
+    }
+    Ok(())
+}
+
+/// `mesa library hook status|enable|disable` — the settings.json half of the
+/// library (mesa task 1115). Every arm answers the same status object, so
+/// `enable`/`disable` report the file's state *after* their write rather than
+/// echoing what was asked for.
+fn run_library_hook_cmd(store: &Store, cmd: LibraryHookCmd) -> Result<()> {
+    match cmd {
+        LibraryHookCmd::Status { item } => {
+            let item = resolve_library(store, &item)?;
+            print_json(&library::hook_registrations(store, &item)?);
+        }
+        LibraryHookCmd::Enable {
+            item,
+            event,
+            matcher,
+        } => {
+            let item = resolve_library(store, &item)?;
+            print_json(&library::register_hook(
+                store,
+                &item,
+                &event,
+                matcher.as_deref(),
+            )?);
+        }
+        LibraryHookCmd::Disable {
+            item,
+            event,
+            matcher,
+        } => {
+            let item = resolve_library(store, &item)?;
+            print_json(&library::unregister_hook(
+                store,
+                &item,
+                event.as_deref(),
+                matcher.as_deref(),
+            )?);
         }
     }
     Ok(())

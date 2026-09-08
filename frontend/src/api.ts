@@ -2,6 +2,11 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
+// The one runtime import here: the unregister query is a decision (which
+// of the two fields narrow the call), tested in `libraryHooks.test.ts`,
+// so it is not rebuilt inline.
+import { unregisterHookQuery } from './libraryHooks'
+
 import type { AgentSession } from './types/AgentSession'
 import type { AgentSpawned } from './types/AgentSpawned'
 import type { AnchorSide } from './types/AnchorSide'
@@ -40,6 +45,7 @@ import type { GitFileDiff } from './types/GitFileDiff'
 import type { InboxItem } from './types/InboxItem'
 import type { InboxKind } from './types/InboxKind'
 import type { LibraryBundle } from './types/LibraryBundle'
+import type { LibraryHookStatus } from './types/LibraryHookStatus'
 import type { LibraryImportResult } from './types/LibraryImportResult'
 import type { LibraryItem } from './types/LibraryItem'
 import type { LibraryKind } from './types/LibraryKind'
@@ -1560,4 +1566,34 @@ export function importLibrary(
   onConflict: 'skip' | 'replace',
 ): Promise<LibraryImportResult[]> {
   return request('/api/library/import', jsonInit('POST', { bundle, on_conflict: onConflict }))
+}
+
+/** Where one `hook` item stands in its scope's `.claude/settings.json`, and
+ * what mesa would write to register it (mesa task 1115). Only a stored `hook`
+ * row is reachable here — an unshadowed built-in has no numeric id. */
+export function getLibraryHook(id: number): Promise<LibraryHookStatus> {
+  return request(`/api/library/${id}/hook`)
+}
+
+/** Registers this hook under one event. Idempotent, and answers the same
+ * status object the read does — so the page renders the file's new state
+ * rather than assuming the write landed. An omitted `matcher` lets the server
+ * apply its own default (`*`, every tool). */
+export function registerLibraryHook(
+  id: number,
+  event: string,
+  matcher?: string,
+): Promise<LibraryHookStatus> {
+  return request(`/api/library/${id}/hook`, jsonInit('POST', { event, matcher }))
+}
+
+/** Removes this hook's registrations — all of them, or only those the query
+ * narrows to. The narrowing rides in the query string, not a body: mesa has
+ * no DELETE-with-body route anywhere. Same status object back. */
+export function unregisterLibraryHook(
+  id: number,
+  event?: string,
+  matcher?: string,
+): Promise<LibraryHookStatus> {
+  return request(`/api/library/${id}/hook${unregisterHookQuery(event, matcher)}`, jsonDelete())
 }

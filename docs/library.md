@@ -229,6 +229,161 @@ an absolute path passed as the relative one, and `..` climbing through
 directories that do not yet exist (the case a create-file write hits, since
 the target's parent may not exist on disk yet).
 
+## Registering a hook in `.claude/settings.json`
+
+A hook *file* under `.claude/hooks/` does nothing on its own. Claude Code
+runs it only when `.claude/settings.json` says so, under an event name, in a
+group carrying a matcher and a list of commands:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh" }]
+      }
+    ]
+  }
+}
+```
+
+mesa task 1115 makes that wiring a first-class part of the library:
+`core::library::hook_registrations` (read), `register_hook` and
+`unregister_hook`, each answering the same `LibraryHookStatus`
+(`item_id`, `name`, `settings_path`, `command`, `registered`,
+`registrations[]`, `events[]`) so a caller reads the file's resulting state
+rather than assuming its request landed. `events` is
+`core::library::HOOK_EVENTS` carried on the wire, so an editor's event list
+is the same list the server validates against and cannot drift from it.
+
+**Only a `hook` item has a registration.** Every other kind is read by Claude
+Code because of *where it sits* — an agent definition is found by being in
+`.claude/agents/`, a CLAUDE.md by being at the repo root — so there is
+nothing to wire up, and asking about one is `validation` (exit 1 / 422)
+rather than an empty answer.
+
+**Which settings file follows the item's own scope**, exactly as its body's
+path does: `user` → `<home>/.claude/settings.json`, `project` → the
+project's `local_path`. A project-scope hook whose project has no
+`local_path` recorded is `validation` saying so — the same condition
+`sync_status` reports by simply having no base to scan. The path goes
+through `core::library::resolve`, the same traversal chokepoint the bodies
+take; nothing here opens a second path-joining route.
+
+**The command mesa writes** is `$CLAUDE_PROJECT_DIR/.claude/hooks/<name>` for
+a `project`-scope hook — Claude Code's own variable for the repo it is
+running in, so the registration stays portable across clones and worktrees —
+and the absolute `<home>/.claude/hooks/<name>` for a `user`-scope one, which
+has no such anchor.
+
+**The matching rule.** A command in settings.json is arbitrary shell, so
+"is this hook registered" cannot be string equality against what mesa would
+have written: `bash $CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh --quiet`
+is plainly the same hook. A command counts as this hook's iff it is exactly
+the absolute path, **or** it contains the relative path
+`.claude/hooks/<name>` at a **path boundary on both sides** — the character
+before and after the match may not itself be a filename character
+(`[A-Za-z0-9._-]`). The boundary is the whole of the rule's safety: it is
+what keeps `.claude/hooks/foo.sh` from reading as the hook named `oo.sh`,
+and `…/foo.sh.bak` from reading as `foo.sh`. It errs toward *not* claiming a
+command mesa is unsure about, since the cost of a false positive is
+unregistering someone else's line.
+
+**Enabling** ensures a group under the chosen event whose command list holds
+this hook. A group with the same matcher is **appended into** rather than
+duplicated (two groups with one matcher fire on exactly the same events, so a
+second one is noise the user would have to reconcile by hand); a group with
+no `matcher` key at all is read as `*`, since that is what Claude Code does
+with it. Enabling something already registered for that `(event, matcher)`
+is a **no-op success** — not a duplicate, and not even an mtime change,
+because a write that would change nothing is skipped outright. The matcher
+defaults to `*`, is capped at `HOOK_MATCHER_MAX` (200) characters and may not
+contain a newline. An event outside `HOOK_EVENTS` — `PreToolUse`,
+`PostToolUse`, `Notification`, `UserPromptSubmit`, `Stop`, `SubagentStop`,
+`PreCompact`, `SessionStart`, `SessionEnd` — is `validation`, because a
+mistyped event silently never fires and looks exactly like a broken hook.
+
+**Enabling also seeds the hook's script**, if it is not on disk already:
+a built-in hook is code and a fork is a database row, so neither reaches
+`.claude/hooks/<name>` until the user runs a sync — and a registration
+naming a file that does not exist is worse than a mistyped event, because it
+fires and errors on every session. So `register_hook` writes the item's body
+there first, creating the parent directory and setting the executable bit
+(a hook is a script Claude Code runs, not a file it reads). It **never
+overwrites**: this is deliberately `core::live::ensure_agent_definition`'s
+posture, for the same reason — a spawn there and a registration here may not
+depend on something the user has to run first, but after the first seed the
+file belongs to the sync flow, where a difference between disk and mesa is a
+row the user resolves.
+
+**Disabling** removes every command matching this hook, then cleans up
+upward: a group whose command list empties is dropped, an event whose group
+list empties is dropped, and a `hooks` key that empties is **removed from the
+file** rather than left behind as `{}`. It can be narrowed to one `event`
+and/or one `matcher`; with neither, every registration of that hook goes.
+Disabling something that was never registered is a no-op success, the mirror
+of enabling's idempotence — including on a file whose `hooks` is `null`,
+which both the parser and both splices read as an empty one rather than as
+something mesa refuses to touch.
+
+The matcher rules above are **input** rules, and a disable's matcher is not
+an input: it is a filter naming which existing registrations to cut, and
+nothing is written from it. So it is passed through unvalidated — the 200-byte
+cap and the newline rule do not apply, an empty string means the group
+actually named `""` rather than `*`, and a matcher already hand-written into
+the file stays reachable however it got there. (The web UI's per-row disable
+button posts `reg.matcher` verbatim, straight from the file, so any other
+reading would make that button permanently broken for such a row.)
+
+### The write is a splice, not a round trip
+
+mesa does not own `.claude/settings.json` — the user's model, environment,
+permissions and everything else live beside the `hooks` key — so a
+parse-and-reserialize round trip would silently reformat a file mesa merely
+edits one key of. Instead `splice_register` and `splice_unregister` navigate the raw text with
+a small hand-written scanner (it walks an object or array tracking string
+state, escapes and brace/bracket depth, and only ever runs on text
+`serde_json` has already parsed, so it may assume well-formed input) and cut
+or insert at the span of **the one entry being added or removed** — not the
+`hooks` value, and not even the event under it.
+
+A register writes only the innermost structure that does not exist yet: an
+existing group gains one command entry; a missing group, event or `hooks`
+key is introduced whole, but spliced in beside its siblings rather than
+replacing them, at their own indentation and comma style. A new key is
+**appended after its existing siblings**, not inserted at the top. An
+unregister escalates the same way in reverse — a group whose command list
+would empty is cut instead of its commands, an event whose group list would
+empty is cut instead of its groups, and a `hooks` key that would empty is cut
+from the file rather than left behind as `{}`.
+
+**Every byte mesa did not semantically change comes through byte-identical** —
+a sibling command, another group, another event, key order, indentation,
+blank lines and every setting mesa knows nothing about. Directly unit-tested
+at each depth an entry can be introduced or removed, including a removal from
+the first, middle or last position (taking exactly one separating comma with
+it and leaving its neighbours' indentation intact).
+
+Two consequences worth stating:
+
+- Inside **the newly-introduced fragment alone** — never in anything that was
+  already there — keys come out **alphabetical**. `serde_json::Map` is a
+  `BTreeMap`, and mesa deliberately does not enable the `preserve_order`
+  feature: its reach is the whole product, and the CLI's documented `--quiet`
+  contract (`CLAUDE.md`) says a rebuilt `serde_json::Value` payload has
+  alphabetical keys. One settings key's ordering is not worth changing that.
+- The **one** case that does not preserve bytes is a file with no top-level
+  entries at all — `{}`, empty, or whitespace only. There is nothing to
+  preserve, so a fresh pretty-printed document is written (and the parent
+  directory created if needed).
+
+**A settings file mesa cannot understand is refused, never rewritten.**
+Invalid JSON, a top level that is not an object, a `hooks` that is not an
+object, an event whose value is not an array — each is `validation` naming
+the file, with the file left exactly as it was. A best-effort repair would
+destroy configuration mesa did not write and cannot reconstruct.
+
 ## The sync model
 
 Sync compares three strings per path: the **mesa body** (M, from the item's
@@ -408,13 +563,17 @@ somewhere else.
 | `PATCH /api/library/{id}` | 200 | `require_agent_access` |
 | `DELETE /api/library/{id}` | 200, destroyed record | `require_agent_access` |
 | `GET /api/library/{id}/versions` | 200, bare array | `require_agent_access` |
+| `GET /api/library/{id}/hook` | 200, the `LibraryHookStatus` | `require_agent_access` |
+| `POST /api/library/{id}/hook` (`{"event", "matcher"?}`) | 200, the status after the write | `require_agent_access` |
+| `DELETE /api/library/{id}/hook` (`?event=&matcher=`) | 200, the status after the write | `require_agent_access` |
 | `POST /api/library/builtins/{builtin_id}/fork` | 201 | `require_agent_access` |
 | `GET /api/library/sync` (`?project=<id>`) | 200, bare array | `require_agent_access` |
 | `POST /api/library/sync` | 200, results array | `require_agent_access` |
 | `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_agent_access` |
 | `POST /api/library/import` | 200, results array | `require_agent_access` |
 
-**All eleven routes are `require_agent_access`** (mesa task 1004) — the same
+**All fourteen routes are `require_agent_access`** (mesa task 1004; the
+hook-registration trio joined them in mesa task 1115) — the same
 gate the agents, terminal and scripts-run routes carry. This is not a
 read/write split: unlike scripts (`docs/scripts.md`'s "the read/write
 asymmetry is the point", where a LAN peer may *trigger* a stored script but
@@ -473,7 +632,7 @@ loopback-connected `curl` makes the relaxed and strict gates identical. So
 `scripts/library-check.sh` proves only the *portable* half — a DNS-name
 `Host` (rebinding) and a foreign `Origin` (cross-site) refused under `--lan`,
 a foreign `Host` and a foreign `Origin` refused in default mode, on all
-eleven routes. The genuinely remote-peer case — does a LAN device now get
+fourteen routes. The genuinely remote-peer case — does a LAN device now get
 *in*, and does a rebound one still get turned away — can only be proved with
 a forged non-loopback `SocketAddr`, which a shell script driving a real
 `curl` cannot produce. That is a Rust unit test,
@@ -491,7 +650,7 @@ nothing.
 
 ## The CLI
 
-`mesa library {create,list,show,update,delete,versions,sync}` (`show` also
+`mesa library {create,list,show,update,delete,versions,hook,sync}` (`show` also
 answers to `get`). An `ITEM` argument, everywhere one appears, is a numeric id
 or a name — a built-in resolves by name too, since its name and its
 `builtin_id` are the same string in the starter set
@@ -522,6 +681,13 @@ or a name — a built-in resolves by name too, since its name and its
   `--resolve PATH=mesa|disk|skip` flags or one of `--all-mesa`/`--all-disk`
   (resolve every non-`in-sync` row toward one side at once) — the three are
   mutually exclusive — and prints the resulting `LibrarySyncResult[]`.
+- `hook status ITEM`, `hook enable ITEM --event EVENT [--matcher M]` and
+  `hook disable ITEM [--event EVENT] [--matcher M]` read and write the
+  `.claude/settings.json` registration described above; all three print the
+  same `LibraryHookStatus` object, so `enable`/`disable` report the file's
+  state *after* their write. `ITEM` must be a `hook`; anything else is
+  `validation`. `disable` with no `--event` removes every registration of
+  that hook.
 - `export [PROJECT] [--project P] [--output PATH]` prints the `LibraryBundle`
   JSON to stdout by default; `--output PATH` writes it there instead (refusing
   to clobber an existing path, mirroring `backup`) and prints
@@ -535,10 +701,11 @@ or a name — a built-in resolves by name too, since its name and its
 `--quiet` follows the house rule (`CLAUDE.md`): accepted on `create`,
 `update`, `delete` and `show`/`get`, dropping `body` and `synced_body`
 (`QUIET_DROP_LIBRARY`) while keeping `name`, `kind`, `scope` and the derived
-`path`; **not defined at all** on `list`, `versions`, either `sync`
+`path`; **not defined at all** on `list`, `versions`, any `hook` or `sync`
 subcommand, or `export`/`import`, so passing it there is clap's
-unknown-argument error, exit 2 — those commands answer with a bundle or a
-results array, not a record, so there is nothing for `--quiet` to project.
+unknown-argument error, exit 2 — those commands answer with a bundle, a
+results array or a status, not a record, so there is nothing for `--quiet` to
+project.
 On `update` it sits outside the required field `ArgGroup`, so `--quiet` alone,
 with no field flag, is still the usage error rather than a legal no-op call.
 
@@ -605,7 +772,7 @@ place, so there is nothing here for an old `config.json` to leave behind.
 
 ## Gate
 
-`scripts/library-check.sh` (95 checks) covers, over both the CLI and the
+`scripts/library-check.sh` (114 checks) covers, over both the CLI and the
 API:
 
 - **CRUD**: create (positional and flag forms, `--body-file`, the name-rule
@@ -637,11 +804,11 @@ API:
   row's `mesa` re-creates the file and its `disk` deletes the row; a
   `both-changed` row shows both bodies, and `skip` leaves both sides and the
   status untouched on the next scan).
-- **The API DTOs and status codes** for all eleven routes, a malformed JSON
+- **The API DTOs and status codes** for all fourteen routes, a malformed JSON
   body as 422 (never a 500), and every mutating route (create, update,
   delete, fork, sync apply, import) refusing a request with no JSON
   `Content-Type` as 415.
-- **The `require_agent_access` gate, on all eleven routes, reads included**,
+- **The `require_agent_access` gate, on all fourteen routes, reads included**,
   in both `default` and `--lan` serve modes: in default mode a foreign `Host`
   and a foreign `Origin` are each refused (a request with no `Origin` at all —
   curl, or a same-origin browser GET — is fine); under `--lan`, a DNS-name
@@ -673,6 +840,19 @@ API:
   it forks it (`builtin_id: mesa-live`, `id` no longer null); and the prompt that
   `mesa live start` spawns the stub `claude` with carries the session line
   only — never the loop text, which now travels as the definition.
+- **Hook registration**: `status` on a fresh hook reporting its settings
+  file, its command and the nine-event vocabulary; `enable` registering it
+  under one event **and seeding the hook's own script to disk**, executable,
+  where nothing had written it — and never overwriting one that is already
+  there; a following `status`, reading the file back, seeing it; `disable`
+  removing it and giving the settings file back **byte-identical**, asserted
+  with `cmp` against a copy taken before the enable of a file that already
+  held an unrelated top-level key, an unrelated block and somebody else's own
+  `PreToolUse` hook (each of which survives the enable); a second `disable`
+  as a no-op success touching nothing; a `"hooks": null` file read as an
+  empty one by both verbs rather than refused; a mistyped event naming the
+  vocabulary, a non-hook item and an unknown item each exit 1; and `--quiet`
+  rejected on all three subcommands (usage, exit 2, empty stdout).
 
 The same pairing `api-check.sh` holds for tasks and `config-check.sh` holds
 for the config-write routes. The "a configured prompt replaces the built-in

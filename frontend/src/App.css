@@ -10126,3 +10126,69 @@ button:focus-visible,
   padding: 0;
   font-size: 0.8rem;
 }
+
+/* Hook registrations (mesa task 1115). The badge carries event names, so it
+   is the one badge on this page that keeps its own casing — `Stop` and
+   `PreToolUse` are Claude Code's spelling and uppercasing them would make
+   them look like something else. */
+.library-hook-badge {
+  text-transform: none;
+  color: var(--cyan);
+}
+
+/* Where the hook is wired in, opened below the row exactly as the history and
+   the built-in diff are. */
+.library-hooks {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.library-hooks p {
+  margin: 0 0 0.5rem;
+  font-size: 0.75rem;
+}
+
+.library-hook-regs {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0;
+}
+
+/* One registration per line: what fires it, then what it narrows to, then the
+   command actually in the file — which need not be the one mesa would have
+   written, so it is shown rather than assumed. */
+.library-hook-reg {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.2rem 0;
+}
+
+.library-hook-event {
+  font-family: var(--font-mono);
+  color: var(--cyan);
+  flex: 0 0 auto;
+}
+
+.library-hook-command {
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.library-hook-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.library-hook-form input {
+  flex: 1 1 12rem;
+  min-width: 0;
+}

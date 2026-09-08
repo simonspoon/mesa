@@ -1884,6 +1884,50 @@ pub struct LibraryVersion {
     pub created_at: String,
 }
 
+/// One place a `hook` library item is wired into `.claude/settings.json`
+/// (mesa task 1115) — a hook file on disk does nothing until Claude Code is
+/// told to run it, and this is that instruction.
+///
+/// Named `LibraryHook*` rather than `Hook*` because mesa has an unrelated
+/// hooks feature of its own (`core::hooks`, [`HookRun`], `~/.mesa/hooks.json`
+/// and the `task-execute` event); these two share a word and nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryHookRegistration {
+    /// A Claude Code hook event — one of `core::library::HOOK_EVENTS`.
+    pub event: String,
+    /// The tool/source pattern the group carries; `*` when it names none.
+    pub matcher: String,
+    /// The command string exactly as it appears in the settings file, which
+    /// need not be the one mesa would have written (a hand-edited
+    /// `bash …/stop-notify.sh --quiet` still counts as this hook).
+    pub command: String,
+}
+
+/// Where one `hook` library item stands in its scope's
+/// `.claude/settings.json`, and what mesa would write to register it. The
+/// same shape answers the read, the register and the unregister, so a caller
+/// reads the outcome rather than inferring it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryHookStatus {
+    /// Null for an unshadowed built-in, exactly as on [`LibraryItem`].
+    #[ts(type = "number | null")]
+    pub item_id: Option<i64>,
+    pub name: String,
+    /// The settings file this item's scope registers into — `$HOME` for
+    /// `user`, the project's `local_path` for `project`.
+    pub settings_path: String,
+    /// The command mesa writes when it registers this hook.
+    pub command: String,
+    /// Derived: true iff `registrations` is non-empty.
+    pub registered: bool,
+    pub registrations: Vec<LibraryHookRegistration>,
+    /// `core::library::HOOK_EVENTS`, carried so the editor's event list is
+    /// the same list the server validates against and cannot drift from it.
+    pub events: Vec<String>,
+}
+
 /// How a synced path's mesa body (M) compares to the file on disk (D) against
 /// the last-agreed baseline (B) — `core::library::classify`'s result, and the
 /// one decision table `mesa library sync status` reports.

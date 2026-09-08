@@ -5,17 +5,28 @@ import {
   deleteLibraryItem,
   exportLibrary,
   forkLibraryItem,
+  getLibraryHook,
   getLibrarySync,
   importLibrary,
   listLibrary,
   listLibraryVersions,
   listProjects,
+  registerLibraryHook,
+  unregisterLibraryHook,
   updateLibraryItem,
 } from '../api'
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { bundleFilename, parseBundle, summarizeImport } from '../libraryBundle'
 import { historyEntries } from '../libraryHistory'
+import {
+  displayRegistrations,
+  enableError,
+  hookBadgeLabel,
+  hookIdsFor,
+  matcherPayload,
+  offersHooks,
+} from '../libraryHooks'
 import { diffLines, foldOverrides, itemKey } from '../libraryOverride'
 import {
   LIBRARY_KINDS,
@@ -44,6 +55,7 @@ import {
   statusLabel,
   summarize,
 } from '../librarySync'
+import type { LibraryHookStatus } from '../types/LibraryHookStatus'
 import type { LibraryItem } from '../types/LibraryItem'
 import type { LibrarySyncResult } from '../types/LibrarySyncResult'
 import type { LibrarySyncRow } from '../types/LibrarySyncRow'
@@ -341,6 +353,143 @@ function LibraryVersions({
   )
 }
 
+/**
+ * Every stored hook row's registration state, read in one pass so the list can
+ * badge each row without each row owning a fetch of its own.
+ *
+ * A row whose status cannot be read is simply **absent** from the result
+ * rather than failing the batch: an unparseable `settings.json` in one project
+ * must not cost the whole page its badges. An array rather than a `Map`
+ * because `useFetch` drops a no-op poll by serializing the result, and every
+ * `Map` serializes to the same `{}` — which would make a refetch after a write
+ * invisible.
+ */
+function loadHookStatuses(ids: number[]): Promise<LibraryHookStatus[]> {
+  return Promise.all(
+    ids.map((id) =>
+      getLibraryHook(id).then(
+        (status) => status,
+        () => null,
+      ),
+    ),
+  ).then((all) => all.filter((s): s is LibraryHookStatus => s !== null))
+}
+
+/**
+ * Where one hook item is wired into `.claude/settings.json`, and the controls
+ * that wire it (mesa task 1115): a hook file on disk does nothing until Claude
+ * Code is told to run it.
+ *
+ * Every write answers with the whole status, and the panel reads its state off
+ * the list's own refetch rather than the response — so what it renders is what
+ * the settings file now says, never what the request asked for. Both writes
+ * are idempotent on the server, which is why nothing here guards against
+ * enabling something twice.
+ */
+function LibraryHookPanel({
+  itemId,
+  status,
+  onChanged,
+}: {
+  itemId: number
+  status: LibraryHookStatus
+  onChanged: () => void
+}) {
+  // The event opens on no choice rather than the first of the nine: which
+  // event a hook belongs to is the whole decision, and a pre-picked one is a
+  // decision the form made for the reader.
+  const [event, setEvent] = useState('')
+  const [matcher, setMatcher] = useState('')
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const invalid = enableError(event, matcher)
+  const registrations = displayRegistrations(status)
+
+  function run(write: Promise<unknown>, done?: () => void) {
+    setPending(true)
+    setError(null)
+    write.then(
+      () => {
+        setPending(false)
+        done?.()
+        onChanged()
+      },
+      (err: unknown) => {
+        setPending(false)
+        setError(err instanceof Error ? err.message : String(err))
+      },
+    )
+  }
+
+  function enable(e: React.FormEvent) {
+    e.preventDefault()
+    if (invalid !== null) return
+    run(registerLibraryHook(itemId, event, matcherPayload(matcher)), () => {
+      setEvent('')
+      setMatcher('')
+    })
+  }
+
+  return (
+    <div className="library-hooks">
+      <p className="muted">
+        Registered in <code>{status.settings_path}</code> as{' '}
+        <code>{status.command}</code>
+      </p>
+
+      {registrations.length === 0 ? (
+        <p className="muted">
+          Not registered — the file is in your library, but Claude Code never
+          runs it.
+        </p>
+      ) : (
+        <ul className="library-hook-regs">
+          {registrations.map((reg, i) => (
+            <li key={`${reg.event}-${reg.matcher}-${i}`} className="library-hook-reg">
+              <span className="library-hook-event">{reg.event}</span>
+              <span className="muted library-meta">matcher {reg.matcher}</span>
+              <code className="library-hook-command">{reg.command}</code>
+              <button
+                type="button"
+                disabled={pending}
+                onClick={() => run(unregisterLibraryHook(itemId, reg.event, reg.matcher))}
+              >
+                disable
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <form className="library-hook-form" onSubmit={enable}>
+        <label>
+          Event{' '}
+          <select value={event} onChange={(e) => setEvent(e.target.value)}>
+            <option value="">choose an event…</option>
+            {status.events.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <input
+          type="text"
+          value={matcher}
+          placeholder="matcher — blank for every tool"
+          onChange={(e) => setMatcher(e.target.value)}
+        />
+        <button type="submit" disabled={pending || invalid !== null}>
+          {pending ? 'saving…' : 'enable'}
+        </button>
+      </form>
+      {invalid !== null && event !== '' && <span className="error">{invalid}</span>}
+      {error !== null && <span className="error">{error}</span>}
+    </div>
+  )
+}
+
 /** One resolvable row inside the Sync modal: the status badge, an explainer
  * sentence, when the two sides last changed, the diff (or the whole bodies,
  * for a one-sided row), and the mesa/disk/skip picker. */
@@ -553,7 +702,52 @@ export function LibraryView() {
   const [editing, setEditing] = useState<string | 'new' | null>(null)
   const [showingVersions, setShowingVersions] = useState<string | null>(null)
   const [showingDiff, setShowingDiff] = useState<string | null>(null)
+  const [showingHooks, setShowingHooks] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
+
+  // Hook registrations (mesa task 1115) — one read per stored hook row, in a
+  // single batch keyed on the ids, so the badge is on the row before anything
+  // is opened. Refetched after every register/unregister: the page renders the
+  // settings file's state, never the request's.
+  const hookIds = hookIdsFor(items)
+  const { data: hookStatuses, refetch: refetchHooks } = useFetch(
+    () => loadHookStatuses(hookIds),
+    `library-hooks-${hookIds.join(',')}`,
+  )
+  const hookStatusById = new Map((hookStatuses ?? []).map((h) => [h.item_id, h]))
+  // The row being forked so its panel can open, by `itemKey` — the shipped
+  // `stop-notify` is an unshadowed built-in with no id, and the route needs
+  // one, so pressing `hooks` on it forks it exactly as editing it would and
+  // opens the panel against the row that creates (whose key is a different
+  // one, hence `itemKey(created)` rather than the key pressed).
+  const [forkingHooks, setForkingHooks] = useState<string | null>(null)
+  // Keyed by the row it was pressed from, so a failure is reported on that row
+  // rather than on every built-in hook in the list.
+  const [hookForkError, setHookForkError] = useState<{ key: string; message: string } | null>(null)
+
+  function toggleHooks(item: LibraryItem, key: string) {
+    setHookForkError(null)
+    if (showingHooks === key) {
+      setShowingHooks(null)
+      return
+    }
+    if (item.id !== null) {
+      setShowingHooks(key)
+      return
+    }
+    setForkingHooks(key)
+    forkLibraryItem(item.builtin_id!, item.body).then(
+      (created) => {
+        setForkingHooks(null)
+        setShowingHooks(itemKey(created))
+        refetch()
+      },
+      (err: unknown) => {
+        setForkingHooks(null)
+        setHookForkError({ key, message: err instanceof Error ? err.message : String(err) })
+      },
+    )
+  }
 
   // Export/import (mesa task 963). The page itself is unscoped (there is no
   // page-level project picker — `listLibrary()` above already reads only
@@ -690,6 +884,7 @@ export function LibraryView() {
               {g.items.map((item) => {
                 const key = itemKey(item)
                 const overridden = folded.overriddenBody.get(key)
+                const hookStatus = item.id !== null ? hookStatusById.get(item.id) : undefined
                 return (
                   <li key={key} className="library-item">
                     <div className="library-item-row">
@@ -708,6 +903,11 @@ export function LibraryView() {
                         {overridden !== undefined && (
                           <span className="library-badge">overrides built-in</span>
                         )}
+                        {hookStatus !== undefined && (
+                          <span className="library-badge library-hook-badge">
+                            {hookBadgeLabel(hookStatus)}
+                          </span>
+                        )}
                       </div>
                       <div className="library-actions">
                         <button
@@ -716,6 +916,19 @@ export function LibraryView() {
                         >
                           {editing === key ? 'close' : 'edit'}
                         </button>
+                        {offersHooks(item) && (
+                          <button
+                            type="button"
+                            disabled={forkingHooks === key}
+                            onClick={() => toggleHooks(item, key)}
+                          >
+                            {forkingHooks === key
+                              ? 'forking…'
+                              : showingHooks === key
+                                ? 'hide hooks'
+                                : 'hooks'}
+                          </button>
+                        )}
                         {item.id !== null && (
                           <>
                             <button
@@ -734,6 +947,7 @@ export function LibraryView() {
                                 {showingDiff === key ? 'hide diff' : 'diff vs built-in'}
                               </button>
                             )}
+
                             <ConfirmDelete
                               label="delete"
                               message={
@@ -778,6 +992,22 @@ export function LibraryView() {
                     {showingVersions === key && item.id !== null && (
                       <LibraryVersions itemId={item.id} onRestored={refetch} />
                     )}
+                    {hookForkError?.key === key && <p className="error">{hookForkError.message}</p>}
+                    {showingHooks === key &&
+                      item.id !== null &&
+                      (hookStatus !== undefined ? (
+                        <LibraryHookPanel
+                          itemId={item.id}
+                          status={hookStatus}
+                          onChanged={refetchHooks}
+                        />
+                      ) : (
+                        <p className="muted">
+                          {hookStatuses === null
+                            ? 'Loading…'
+                            : 'The registration for this hook could not be read.'}
+                        </p>
+                      ))}
                   </li>
                 )
               })}

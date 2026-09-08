@@ -77,6 +77,11 @@ fn language_of(ext: &str) -> Option<&'static str> {
         "cpp" | "hpp" | "cc" => "cpp",
         "cs" => "csharp",
         "sql" => "sql",
+        // Tabular data files. Two tags rather than one, because the frontend's
+        // table view derives its delimiter from the tag — see
+        // `frontend/src/fileCsv.ts`.
+        "csv" => "csv",
+        "tsv" => "tsv",
         // Kusto queries ship under two extensions — .kql and Azure Data
         // Explorer's own .csl — and both are the same language.
         "kql" | "csl" => "kql",
@@ -1678,6 +1683,25 @@ mod tests {
         assert_eq!(language_of("sql"), Some("sql"));
         assert_eq!(language_of("kql"), Some("kql"));
         assert_eq!(language_of("csl"), Some("kql"));
+    }
+
+    #[test]
+    fn language_of_tags_tabular_data() {
+        assert_eq!(language_of("csv"), Some("csv"));
+        assert_eq!(language_of("tsv"), Some("tsv"));
+    }
+
+    #[test]
+    fn read_file_tags_uppercase_csv_as_csv() {
+        // `language_of` is only ever fed the lowercased extension
+        // (`extension_of`), which is what makes the tag case-insensitive from a
+        // caller's point of view.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("Rows.CSV"), "a,b\n1,2\n").unwrap();
+
+        let v = read_file(root, "Rows.CSV").unwrap();
+        assert_eq!(v.language.as_deref(), Some("csv"));
     }
 
     #[test]

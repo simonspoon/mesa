@@ -103,7 +103,7 @@ The code is the source of truth. These are the invariants you must not break:
   (jsdom) over `frontend/src/*.test.ts` — no React testing library, no component
   rendering. The subject is the side-effect-free modules the components import
   (`agentChat`, `agentProject`, `agentRow`, `agentSidebarWidth`, `artifactDraft`, `boardView`, `clipboardFiles`,
-  `editorInput`, `editorStatus`, `fileDirty`, `fileFind`, `fileImage`,
+  `editorInput`, `editorStatus`, `fileCsv`, `fileDirty`, `fileFind`, `fileImage`,
   `fileSearch`, `fileTabs`, `filesTreeWidth`, `inboxFilter`, `inboxKind`, `inboxOrigin`, `inboxQueue`, `inboxRead`,
   `keyboardScope`, `keymap`, `keymapDraft`,
   `lastView`, `layout`, `libraryBundle`, `libraryDraft`, `librarySync`, `listenDraft`, `liveAudio`, `liveBand`, `liveBoard`, `liveBoardWidth`, `liveCapture`, `liveContext`, `liveDevices`, `liveHead`, `liveIndicator`, `livePromptDraft`,

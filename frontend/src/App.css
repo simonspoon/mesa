@@ -5448,6 +5448,22 @@ body.live-board-resizing {
   outline: none;
 }
 
+/* The one branch that has to be *bounded* rather than merely at least as tall
+   as the scrollport (mesa task 1110). The table view scrolls in its own box so
+   that its sticky `<thead>` pins — and `flex: 1` on that box fills a bounded
+   flex container, which the rule above is deliberately not: `min-height: 100%`
+   with no maximum grows to the content, so the wrap grew with it, never
+   scrolled, and .files-pane-body stayed the real scroller with the header
+   riding off the top of a long file. A definite `height: 100%` (of the pane
+   body's own flex-resolved height) is what the wrap fills against; `min-height`
+   is dropped back to 0 so the two do not fight. Scoped to this class rather
+   than changed on .files-content, which the editor, markdown, code, image and
+   binary branches all share and none of which wants a bound. */
+.files-content.is-table {
+  height: 100%;
+  min-height: 0;
+}
+
 .files-content-top {
   position: sticky;
   top: 0;
@@ -6301,6 +6317,66 @@ body.live-board-resizing {
     0 8px,
     8px -8px,
     -8px 0;
+}
+
+/* A delimited file shown as a table (mesa task 1110). The wrapper is the
+   scroller — both ways: sideways for a wide file, the twin of
+   .files-content-image-wrap, and vertically because a sticky header is clamped
+   to its own scroll container. If the pane scrolls instead, the header leaves
+   the top of the table on the way down a long file.
+
+   `flex: 1; min-height: 0` is what makes that true, and it is the same
+   mechanism .files-content > .files-editor-stack uses above: .files-content is
+   a flex column with only a `min-height`, so a percentage `max-height` here
+   resolves to `none` and the box grows to its content — leaving nothing for
+   `overflow` to clamp and handing the scroll back to .files-pane-body. A
+   flex-resolved height is definite; `min-height: 0` is what lets it shrink
+   below the table's own size.
+
+   Cells are monospace like every other rendering of file bytes on this tab, and
+   never wrap: a cell that grew to three lines would put the row below it off
+   the reader's line of sight, and the value is still reachable by scrolling.
+   Colours come from the theme's own tokens, as everywhere else here. */
+.files-content-csv-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  /* No padding at the TOP: a scroll container's top padding is scrollable
+     content, and the sticky header pins below it — so a 0.5rem band of scrolled
+     rows showed above the pinned header, a sliver of the wrong row that moves as
+     you scroll. The column's own 0.5rem `gap` is what separates the table from
+     the header block above it. */
+  padding: 0 0 0.5rem;
+}
+
+.files-content-csv {
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.files-content-csv th,
+.files-content-csv td {
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  white-space: pre;
+  vertical-align: top;
+}
+
+.files-content-csv thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.files-content-csv-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
 }
 
 /* Rendered markdown prose (task 281) — same react-markdown output as

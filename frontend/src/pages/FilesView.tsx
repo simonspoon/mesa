@@ -74,6 +74,7 @@ import { FindLayer } from '../components/FindLayer'
 import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
+import { delimiterFor, parseDelimited, type DelimitedTable } from '../fileCsv'
 import { isImagePath } from '../fileImage'
 import { resolveMarkdownImageSrc } from '../markdownAssets'
 import { newFilePath } from '../newFile'
@@ -154,6 +155,8 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   cc: 'cpp',
   cs: 'csharp',
   sql: 'sql',
+  csv: 'csv',
+  tsv: 'tsv',
   kql: 'kql',
   csl: 'kql',
   xml: 'xml',
@@ -187,6 +190,8 @@ const LANGUAGE_ACCENT: Record<string, string> = {
   toml: 'amber',
   markdown: 'amber',
   sql: 'amber',
+  csv: 'amber',
+  tsv: 'amber',
   kql: 'amber',
 }
 
@@ -309,6 +314,13 @@ interface FindState {
  * not re-scroll on every render for as long as the landing is active. */
 const MAX_LANDING_REVEALS = 3
 
+/** How many data rows of a delimited file the table view renders (mesa task
+ * 1110). A file capped at `FILE_CONTENT_CAP` can still hold tens of thousands
+ * of rows, and every one of them is a live DOM row; past this the view renders
+ * the first `MAX_CSV_ROWS` and says how many it is short of. Download is how
+ * the whole file is read. */
+const MAX_CSV_ROWS = 1000
+
 const BLANK_FIND: FindState = {
   open: false,
   query: '',
@@ -420,12 +432,30 @@ function ContentPane({
   // key is deliberately left to the browser's own find, which works on exactly
   // what is painted. In edit mode a markdown file is source again, so it is
   // findable like anything else.
+  // The delimiter this file's language tag calls for, or null when it is not
+  // one of the tabular kinds — server-derived, never sniffed (`fileCsv.ts`).
+  const csvDelimiter = delimiterFor(data?.language ?? null)
+  /**
+   * The parsed table, or null when this file is not rendered as one — either it
+   * is not tabular, or the text has no table in it (`parseDelimited`'s
+   * degenerate cases), in which case the pane falls back to the plain text
+   * render below. Computed here rather than inside `CsvBody` because two
+   * things need the answer: which branch of `body` runs, and whether the find
+   * bar has offsets to point at.
+   */
+  const csvTable = useMemo(
+    () =>
+      csvDelimiter === null || data == null || data.is_binary
+        ? null
+        : parseDelimited(data.content, csvDelimiter, MAX_CSV_ROWS),
+    [csvDelimiter, data],
+  )
   const findable =
     data != null &&
     !data.is_binary &&
     !isImagePath(data.path) &&
     ui.selectedCommit === null &&
-    (ui.editing || data.language !== 'markdown')
+    (ui.editing || (data.language !== 'markdown' && csvTable === null))
   /**
    * A project-search result the user clicked, still waiting to be shown
    * (task 813): the pane is displaying the file, the reader is looking for the
@@ -973,6 +1003,13 @@ function ContentPane({
       content={data.content}
       wrap={wrap}
     />
+  ) : csvTable !== null ? (
+    // A table is the *read* view of a delimited file. Edit mode is the branch
+    // above, so pressing Edit on a .csv still gives the raw text editor and
+    // saving or cancelling comes back here — there is no cell editing, and
+    // `editable` is untouched. A file `parseDelimited` finds no table in falls
+    // through to `FileCode` below, exactly as it did before this branch.
+    <CsvBody table={csvTable} fileTruncated={data.truncated} />
   ) : (
     <FileCode
       content={data.content}
@@ -987,7 +1024,14 @@ function ContentPane({
   return (
     // `tabIndex={-1}`: not in the tab order, but a place `closeFind` can put
     // focus back when the bar it was in disappears (see there).
-    <div className="files-content" ref={contentRef} tabIndex={-1}>
+    // `is-table` only where the table branch renders: that view's own box is
+    // the scroller (so its sticky header pins), and it needs a *bounded* column
+    // to fill. See the class's rule in App.css.
+    <div
+      className={`files-content${csvTable !== null ? ' is-table' : ''}`}
+      ref={contentRef}
+      tabIndex={-1}
+    >
       {/* Header and find bar in one sticky block, so the bar cannot scroll
           away from the file it is searching — two independently sticky rows
           would have to agree on each other's height to stack. */}
@@ -1461,6 +1505,68 @@ function FileImageBody({
         alt={basename(path)}
         onError={() => setFailed(true)}
       />
+    </div>
+  )
+}
+
+/** A delimited file rendered as a table (mesa task 1110). The parse is the
+ * parent's — see `csvTable` in `ContentPane` — so this component is the DOM
+ * alone: a sticky header row over monospace cells, in a wrapper that scrolls
+ * sideways rather than stretching the pane, the same treatment
+ * `.files-content-image-wrap` gives an image.
+ *
+ * Ragged rows are padded and clipped to the header's width HERE rather than in
+ * the parser: a `<tr>` shorter than the header slides every cell after it under
+ * the wrong column, and a longer one widens the table past its own header.
+ *
+ * The note says what the view is short of — but only what is TRUE. `table.total`
+ * counts the rows in the text this pane was given, and the content route caps
+ * that at `FILE_CONTENT_CAP`: on a `truncated` file it is the row count of the
+ * first 256 KiB, not of the file, so naming it would state a number that is
+ * simply wrong. There the note claims the rendered count alone and says the
+ * bytes ran out. */
+function CsvBody({
+  table,
+  fileTruncated,
+}: {
+  table: DelimitedTable
+  /** `FileContentView.truncated` — the file was longer than the read cap. */
+  fileTruncated: boolean
+}) {
+  const width = table.header.length
+  return (
+    <div className="files-content-csv-wrap">
+      <table className="files-content-csv">
+        <thead>
+          <tr>
+            {table.header.map((cell, i) => (
+              <th key={i}>{cell}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {table.rows.map((row, r) => (
+            <tr key={r}>
+              {Array.from({ length: width }, (_, c) => (
+                <td key={c}>{row[c] ?? ''}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {fileTruncated ? (
+        <p className="muted files-content-csv-note">
+          Showing the first {table.rows.length.toLocaleString()} rows; the file
+          was truncated before it was read.
+        </p>
+      ) : (
+        table.truncated && (
+          <p className="muted files-content-csv-note">
+            Showing first {table.rows.length.toLocaleString()} of{' '}
+            {table.total.toLocaleString()} rows.
+          </p>
+        )
+      )}
     </div>
   )
 }

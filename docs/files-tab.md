@@ -1612,3 +1612,89 @@ a whole directory, the split collapse, emptying both panes of a split without
 stranding one, and the no-op). Everything left — the reveal-on-hover, the
 preselected basename, the prompt's focus routing — is khora's, per CLAUDE.md's
 standing split.
+
+## Delimited files as tables (mesa task 1110)
+
+A `.csv` or `.tsv` opens as a **table** rather than as raw text — the third file
+kind whose content view is not the bytes, after rendered markdown and an inline
+image, and like both of those it is a *rendering* decision only: no route, no
+`src/core/files.rs` read path and no store change.
+
+**The delimiter is server-derived, never sniffed.** `language_of` gained two
+tags, `csv` and `tsv` — two rather than one precisely so the character that
+separates the fields comes from the same extension table that already decides
+every other thing about how a file is displayed, and `frontend/src/fileCsv.ts`'s
+`delimiterFor` maps the tag onto `,` or a tab. A file mesa tags neither way is
+never tabulated, whatever its content looks like.
+
+The parsing lives in that module, with `fileCsv.test.ts` beside it (CLAUDE.md's
+frontend-test invariant — the same rule that produced `newFile.ts` and
+`fileTabs.ts`): `parseDelimited` is one pass over the text, RFC4180-ish, so a
+quoted field may hold the delimiter, a doubled `""` or a newline, CRLF and LF
+both end a record, and a trailing newline produces no phantom final row. Two of
+its rules are there because the obvious version of each is a silent
+data-corrupter:
+
+- **Only a `"` at the start of a field opens quoting.** "Any quote opens
+  quoting" turns one inch mark or one unescaped apostrophe-style quote into a
+  quoted field that runs to the end of the file — every remaining row collapsed
+  into a single cell, with nothing on screen to say so. Elsewhere a `"` is an
+  ordinary character, so `He said "hi" today` keeps its quotes. A quoted field
+  still open at EOF ends there with what it had.
+- **A first record that is a single empty field answers `null`.** That is what a
+  file with a leading blank line looks like, and taking it as the header would
+  demote the real header to a data row and clip every row to one column.
+
+`null` — with no records at all, the other degenerate case — is what makes the
+pane fall through to the ordinary highlighted-text render it always had, so a
+file that is not really delimited never renders as a one-column table. Ragged
+rows are kept exactly as parsed and padded/clipped to the header's width by the
+component, since a short `<tr>` slides every cell after it under the wrong
+column.
+
+Two limits are deliberate:
+
+- **The table is the read view; editing still shows raw text.** The `editing`
+  branch wins first in the content pane's ternary, so pressing Edit on a `.csv`
+  gives the same textarea, syntax colouring and Save/Cancel as any other text
+  file, and saving or cancelling comes back to the table. There is no cell
+  editing, and `editable` (`!is_binary && !truncated`) is unchanged. A table
+  that could be typed into is a different feature with its own questions —
+  quoting on write, what a ragged row means, what happens to a file the parse
+  disagreed with.
+- **1000 data rows are rendered.** Every row is live DOM, and a file capped at
+  `FILE_CONTENT_CAP` can still hold tens of thousands; past the cap the view
+  renders the first 1000 and a muted note, so a capped view says what it is
+  short of instead of quietly ending. Download is how the whole file is read.
+
+  The note **claims only what is true**, which is why `CsvBody` takes
+  `FileContentView.truncated` as well as the table. The parser's `total` counts
+  the rows in the text this pane was handed, and on a file over
+  `FILE_CONTENT_CAP` that text is the first 256 KiB — so `Showing first 1,000 of
+  13,717 rows.` on a 20,000-row file is not a rounding error but a wrong number.
+  A `truncated` file therefore gets `Showing the first 1,000 rows; the file was
+  truncated before it was read.` and no total at all; an untruncated one keeps
+  `Showing first 1,000 of 24,318 rows.`, where the count is the whole file's.
+
+One layout rule is load-bearing, and it is the reason the content element
+carries an **`is-table` modifier class** on this branch alone. A sticky
+`<thead>` is clamped to *its own* scroller, so `.files-content-csv-wrap` has to
+be it (`flex: 1; min-height: 0`) rather than `.files-pane-body`. But `flex: 1`
+fills a *bounded* container, and `.files-content` is deliberately unbounded —
+`min-height: 100%` with no maximum, which is what the status bar's pinning needs
+— so the wrap simply grew to the table's full 23,754px, never scrolled, and the
+header rode off the top of a long file. `.files-content.is-table` gives that one
+branch a definite `height: 100%` (of the pane body's own flex-resolved height)
+and drops the `min-height` back to 0. Scoped to the class rather than changed on
+`.files-content`, which the editor, markdown, code, image and binary branches
+all share and none of which wants a bound.
+
+The wrap also carries **no top padding**: a scroll container's top padding is
+scrollable content and the sticky header pins below it, which left a 0.5rem band
+of the *scrolled* row visible above the pinned header, moving as you scroll. The
+column's own `gap` is what separates the table from the header block above it.
+
+The find bar is **not** offered over the table, the same exclusion markdown
+already carries and for the same reason: it matches offsets into `data.content`
+and reveals them by line, and a table shows no lines. In edit mode the file is
+source again and is findable like anything else.

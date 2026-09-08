@@ -752,6 +752,28 @@ const MIGRATIONS: &[&str] = &[
         created_at   TEXT NOT NULL
     );
     CREATE INDEX idx_live_boards_session ON live_boards(session_id);",
+    // Task 1114: a hook's library name now carries its whole filename,
+    // extension included, so `.claude/hooks` holds a `.py` guard as readily
+    // as a `.sh` one and `core::library::relative_path` appends nothing.
+    // Every existing hook row was named after its file's stem and its path
+    // was that stem plus `.sh`, so appending `.sh` is exactly "keep the path
+    // this row already had" — including for a name that already contains a
+    // dot, whose old path was equally `<name>.sh`. `synced_body`/`synced_at`
+    // are untouched: the sync baseline is about the file's contents, and the
+    // file is not moving.
+    //
+    // Two statements, not one, because SQLite applies an `UPDATE` row by row
+    // against the table's *live* state: a db holding both `foo` and `foo.sh`
+    // would see the first row become `foo.sh` and collide with the second
+    // mid-statement, failing `library_items_identity` and — since `Store::open`
+    // runs migrations unconditionally — bricking mesa's startup outright. The
+    // end state was never in doubt (appending a constant to distinct strings
+    // is injective); only the in-flight ordering was. Parking every hook name
+    // on a marker containing a space first fixes that, the space being a
+    // character `validate_library_name`'s charset cannot produce, so no
+    // half-migrated name can equal another row's unmigrated one.
+    "UPDATE library_items SET name = name || ' TMP1114' WHERE kind = 'hook';
+     UPDATE library_items SET name = replace(name, ' TMP1114', '.sh') WHERE kind = 'hook';",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1376,6 +1398,14 @@ const LIBRARY_NAME_MAX: usize = 100;
 /// larger than a script's, but still bounded: nothing about this feature
 /// should be able to write an unbounded blob to disk on sync.
 const LIBRARY_BODY_MAX: usize = 1024 * 1024;
+
+/// Whether a name would survive [`validate_library_name`] — the filter
+/// `core::library::scan_disk` needs, since a hook is named after its whole
+/// filename and a file mesa could not store is one it could not round-trip
+/// back onto disk (mesa task 1114).
+pub fn library_name_is_valid(name: &str) -> bool {
+    validate_library_name(name).is_ok()
+}
 
 /// A library name is half a filename (`core::library::relative_path` builds a
 /// path out of it directly), so this is the one traversal chokepoint on the
@@ -10925,15 +10955,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            52,
-            "a fresh db should report user_version 52"
+            53,
+            "a fresh db should report user_version 53"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
     }
 
     /// Pins the artifacts migration (mesa task 974) at index 50, the position
@@ -10948,6 +10978,71 @@ mod tests {
             "migration {ARTIFACTS} is no longer the artifacts migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
+    }
+
+    /// Pins the hook-rename migration (mesa task 1114) at index 52, and
+    /// checks the one thing about it that matters: it renames *every* hook
+    /// row, because every hook's old derived path was its name plus `.sh`.
+    #[test]
+    fn the_hook_name_rename_arrives_at_migration_52() {
+        const HOOK_RENAME: usize = 52;
+        let sql = MIGRATIONS[HOOK_RENAME];
+        assert!(
+            sql.contains("UPDATE library_items SET name") && sql.contains("'.sh'"),
+            "migration {HOOK_RENAME} is no longer the hook rename — a shipped \
+             migration was edited or reordered, which is never allowed"
+        );
+        assert!(
+            sql.contains("WHERE kind = 'hook'") && !sql.contains("instr("),
+            "the rename must cover every hook row: a name that already held a \
+             dot had the same `<name>.sh` path as one that did not"
+        );
+        assert_eq!(
+            sql.matches("UPDATE library_items").count(),
+            2,
+            "the rename goes via a marker in two statements — one blanket \
+             append collides with library_items_identity mid-statement \
+             (`the_hook_rename_survives_names_that_already_collide`)"
+        );
+    }
+
+    /// The in-flight half of that migration: a db holding both `foo` and
+    /// `foo.sh` must still open. A single `UPDATE ... name || '.sh'` fails
+    /// `library_items_identity` partway through — SQLite updates row by row
+    /// against the live table — and `Store::open` runs migrations
+    /// unconditionally, so that failure is mesa refusing to start at all.
+    #[test]
+    fn the_hook_rename_survives_names_that_already_collide() {
+        const HOOK_RENAME: usize = 52;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..HOOK_RENAME] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", HOOK_RENAME as i64)
+                .unwrap();
+            for name in ["foo", "foo.sh", "foo.sh.sh"] {
+                conn.execute(
+                    "INSERT INTO library_items (kind, scope, name, body, created_at, updated_at)                      VALUES ('hook', 'user', ?1, 'echo hi', datetime('now'), datetime('now'))",
+                    [name],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(&path).unwrap();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT name FROM library_items WHERE kind = 'hook' ORDER BY id")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names, vec!["foo.sh", "foo.sh.sh", "foo.sh.sh.sh"]);
     }
 
     /// Every shape rule `add_live_board` owns, in one place: the session must

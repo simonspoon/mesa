@@ -93,7 +93,7 @@ following on purpose.
     },
     Builtin {
         id: "stop-notify",
-        name: "stop-notify",
+        name: "stop-notify.sh",
         kind: LibraryKind::Hook,
         scope: LibraryScope::User,
         body: "\
@@ -115,11 +115,16 @@ pub fn builtin(id: &str) -> Option<&'static Builtin> {
 /// `Prompt` has no path — the live-conversation prompt is mesa-internal, not
 /// a file Claude Code reads, which is the whole reason `prompt` and `command`
 /// are separate kinds.
+///
+/// A [`LibraryKind::Hook`] appends nothing: a hook is any script the user
+/// cares to drop in — `.sh`, `.py`, or no extension at all — so its *name*
+/// carries the whole filename and the extension travels with the item
+/// (mesa task 1114). Every other kind owns its extension.
 pub fn relative_path(kind: LibraryKind, scope: LibraryScope, name: &str) -> Option<PathBuf> {
     match kind {
         LibraryKind::Agent => Some(PathBuf::from(format!(".claude/agents/{name}.md"))),
         LibraryKind::Skill => Some(PathBuf::from(format!(".claude/skills/{name}/SKILL.md"))),
-        LibraryKind::Hook => Some(PathBuf::from(format!(".claude/hooks/{name}.sh"))),
+        LibraryKind::Hook => Some(PathBuf::from(format!(".claude/hooks/{name}"))),
         LibraryKind::Command => Some(PathBuf::from(format!(".claude/commands/{name}.md"))),
         LibraryKind::ClaudeMd => Some(match scope {
             LibraryScope::User => PathBuf::from(".claude/CLAUDE.md"),
@@ -304,8 +309,9 @@ const SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// scope `base` is for and so which of the two CLAUDE.md hits is the real
 /// one; scanning both costs nothing since at most one is ever present in
 /// practice. Bounded on purpose: it skips anything over [`SCAN_MAX_BYTES`],
-/// skips non-UTF-8 files, and does not recurse arbitrarily — agents,
-/// commands and hooks are one level of `.md`/`.sh` files, skills is exactly
+/// skips non-UTF-8 files, and does not recurse arbitrarily — agents and
+/// commands are one level of `.md` files, hooks one level of files of *any*
+/// extension (each named after its whole filename), skills is exactly
 /// one level of `<name>/SKILL.md`.
 ///
 /// Every directory this walks — `.claude` itself, each leaf under it, and
@@ -326,7 +332,12 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String
 
     let safe_dir = |rel: &str| -> Option<PathBuf> { resolve(base, Path::new(rel)).ok() };
 
-    let leaf_dir = |sub: &str, kind: LibraryKind, ext: &str, found: &mut Vec<_>| {
+    // `ext` is `Some` for the kinds whose file mesa names itself — agents and
+    // commands are `.md`, and the item is named after the stem — and `None`
+    // for hooks, which are whatever script the user dropped in, named after
+    // the whole filename so the extension travels with the item
+    // (mesa task 1114).
+    let leaf_dir = |sub: &str, kind: LibraryKind, ext: Option<&str>, found: &mut Vec<_>| {
         let Some(dir) = safe_dir(&format!(".claude/{sub}")) else {
             return;
         };
@@ -341,21 +352,35 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String
             if !file_type.is_file() {
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some(ext) {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let name = match ext {
+                Some(ext) => {
+                    if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+                        continue;
+                    }
+                    path.file_stem().and_then(|s| s.to_str())
+                }
+                // A file mesa cannot *name* is one it could not round-trip
+                // back onto disk, so it is skipped silently rather than
+                // failing the scan — which also drops the dotfiles an editor
+                // and the OS leave behind, since the charset rule requires an
+                // alphanumeric first character.
+                None => path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|n| crate::core::store::library_name_is_valid(n)),
+            };
+            let Some(name) = name else {
                 continue;
             };
             if let Some((body, mtime)) = read_bounded_with_mtime(&path) {
-                found.push((kind, stem.to_string(), body, mtime));
+                found.push((kind, name.to_string(), body, mtime));
             }
         }
     };
 
-    leaf_dir("agents", LibraryKind::Agent, "md", &mut found);
-    leaf_dir("commands", LibraryKind::Command, "md", &mut found);
-    leaf_dir("hooks", LibraryKind::Hook, "sh", &mut found);
+    leaf_dir("agents", LibraryKind::Agent, Some("md"), &mut found);
+    leaf_dir("commands", LibraryKind::Command, Some("md"), &mut found);
+    leaf_dir("hooks", LibraryKind::Hook, None, &mut found);
 
     if let Some(skills_dir) = safe_dir(".claude/skills")
         && let Ok(entries) = fs::read_dir(&skills_dir)
@@ -1255,13 +1280,15 @@ mod tests {
             relative_path(LibraryKind::Skill, LibraryScope::Project, "dataviz"),
             Some(PathBuf::from(".claude/skills/dataviz/SKILL.md"))
         );
+        // A hook's name carries its own extension, so the path appends
+        // nothing — which is what lets a `.py` guard live here too.
         assert_eq!(
-            relative_path(LibraryKind::Hook, LibraryScope::User, "stop-notify"),
+            relative_path(LibraryKind::Hook, LibraryScope::User, "stop-notify.sh"),
             Some(PathBuf::from(".claude/hooks/stop-notify.sh"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Hook, LibraryScope::Project, "stop-notify"),
-            Some(PathBuf::from(".claude/hooks/stop-notify.sh"))
+            relative_path(LibraryKind::Hook, LibraryScope::Project, "poll-guard.py"),
+            Some(PathBuf::from(".claude/hooks/poll-guard.py"))
         );
         assert_eq!(
             relative_path(LibraryKind::Command, LibraryScope::User, "refine"),
@@ -1467,6 +1494,11 @@ mod tests {
         fs::write(base.join(".claude/agents/reviewer.md"), "reviewer body").unwrap();
         fs::write(base.join(".claude/commands/refine.md"), "refine body").unwrap();
         fs::write(base.join(".claude/hooks/stop-notify.sh"), "#!/bin/sh\n").unwrap();
+        // A hook is any script, whatever its extension — and a name mesa
+        // could not store is skipped without failing the scan.
+        fs::write(base.join(".claude/hooks/poll-guard.py"), "# guard\n").unwrap();
+        fs::write(base.join(".claude/hooks/warm"), "# no extension\n").unwrap();
+        fs::write(base.join(".claude/hooks/.DS_Store"), "litter").unwrap();
         fs::write(base.join(".claude/skills/dataviz/SKILL.md"), "dataviz body").unwrap();
         fs::write(base.join(".claude/CLAUDE.md"), "claude md body").unwrap();
         // A non-matching extension in an agents dir must not be picked up.
@@ -1486,9 +1518,25 @@ mod tests {
         )));
         assert!(found.contains(&(
             LibraryKind::Hook,
-            "stop-notify".to_string(),
+            "stop-notify.sh".to_string(),
             "#!/bin/sh\n".to_string()
         )));
+        assert!(found.contains(&(
+            LibraryKind::Hook,
+            "poll-guard.py".to_string(),
+            "# guard\n".to_string()
+        )));
+        assert!(found.contains(&(
+            LibraryKind::Hook,
+            "warm".to_string(),
+            "# no extension\n".to_string()
+        )));
+        assert!(
+            !found
+                .iter()
+                .any(|(k, n, _)| *k == LibraryKind::Hook && n.starts_with('.')),
+            "a dotfile is not a name mesa can store, so it is skipped: {found:?}"
+        );
         assert!(found.contains(&(
             LibraryKind::Skill,
             "dataviz".to_string(),
@@ -1499,7 +1547,8 @@ mod tests {
             "CLAUDE".to_string(),
             "claude md body".to_string()
         )));
-        assert_eq!(found.len(), 5);
+        // Five kinds plus the two extra hooks — the `.DS_Store` is not here.
+        assert_eq!(found.len(), 7);
     }
 
     #[test]

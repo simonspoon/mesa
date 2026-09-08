@@ -113,7 +113,7 @@ The starter set is deliberately tiny — five rows:
 | `supervisor` | `agent` | `user` | The agent definition an auto-dispatched `/execute-todo` run is supervised as — literally `core::supervisor::SUPERVISOR_DEFINITION` (mesa task 1075), seeded to `~/.claude/agents/supervisor.md` by `core::supervisor::ensure_agent_definition` before the `todo-watcher` spawn |
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
-| `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops |
+| `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops — its *name* is `stop-notify.sh`, since a hook's name carries its own extension |
 
 `mesa-live`'s body being the literal `AGENT_DEFINITION` constant (and
 `live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
@@ -177,10 +177,22 @@ base** — the home directory for `user`, a project's `local_path` for
 | --- | --- | --- |
 | `agent` | `.claude/agents/<name>.md` | `.claude/agents/<name>.md` |
 | `skill` | `.claude/skills/<name>/SKILL.md` | `.claude/skills/<name>/SKILL.md` |
-| `hook` | `.claude/hooks/<name>.sh` | `.claude/hooks/<name>.sh` |
+| `hook` | `.claude/hooks/<name>` | `.claude/hooks/<name>` |
 | `command` | `.claude/commands/<name>.md` | `.claude/commands/<name>.md` |
 | `claude-md` | `.claude/CLAUDE.md` | `CLAUDE.md` (the repo root — where Claude Code actually reads it) |
 | `prompt` | **none** | **none** |
+
+`hook` is the one kind that appends nothing (mesa task 1114): a hook is
+whatever script the user drops in — `poll-guard.py` as readily as
+`stop-notify.sh`, or no extension at all — so its **name is the whole
+filename** and the extension travels with the item, which is what lets an
+imported hook land back on disk as the file it came from. `scan_disk` lists
+every regular file in `.claude/hooks/` regardless of extension, silently
+skipping any whose filename `Store`'s name rule would reject (a file mesa
+cannot name is one it could not round-trip) — dotfiles included, since that
+rule requires an alphanumeric first character. Migration index 52 appended
+`.sh` to every pre-existing hook row's name, which is exactly the path it
+already had.
 
 `prompt` is mesa-internal: the live-conversation prompt is not a file Claude
 Code reads, so it has no path at all, and the sync scanner (`scan_disk`) skips

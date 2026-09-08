@@ -332,7 +332,7 @@ ok "CLI library create: '../evil', 'a/b', '..', '.', and an empty name are each 
 # section 7, once it is up.
 
 # ================= 4. built-ins: fork / restore =================
-# `stop-notify` is the fixture for this section, leaving `mesa-live`
+# `stop-notify.sh` is the fixture for this section, leaving `mesa-live`
 # untouched for section 9.
 
 run 0 "$MESA" library list
@@ -341,13 +341,13 @@ run 0 "$MESA" library list
 BUILTIN_BODY=$(jqs '.[] | select(.builtin_id=="stop-notify") | .body')
 ok "fixture: stop-notify is an unshadowed built-in before this section touches it"
 
-run 0 "$MESA" library update stop-notify --body 'echo custom hook'
+run 0 "$MESA" library update stop-notify.sh --body 'echo custom hook'
 [ "$(jqs .id)" != "null" ] || fail "editing a built-in must fork it into a real row"
 [ "$(jqs .builtin_id)" = "stop-notify" ] || fail "the fork must carry its builtin_id"
 [ "$(jqs .builtin)" = "false" ] || fail "the fork itself is not the built-in anymore"
 [ "$(jqs .body)" = "echo custom hook" ] || fail "the fork must carry the new body"
 STOP_FORK=$(jqs .id)
-ok "editing an unshadowed built-in (library update stop-notify) forks it into a real row"
+ok "editing an unshadowed built-in (library update stop-notify.sh) forks it into a real row"
 
 run 0 "$MESA" library list
 [ "$(jqs 'map(select(.builtin_id=="stop-notify" and .id==null)) | length')" = "0" ] ||
@@ -363,7 +363,7 @@ run 0 "$MESA" library list
   fail "the restored built-in must be back to its original body"
 ok "deleting the fork restores the built-in unshadowed, with its original body"
 
-run 1 "$MESA" library delete stop-notify
+run 1 "$MESA" library delete stop-notify.sh
 [ "$(jqe .error.code)" = "validation" ] || fail "deleting an unshadowed built-in: expected validation"
 ok "deleting an unshadowed built-in (nothing to delete): exit 1 validation"
 
@@ -497,30 +497,56 @@ run 0 "$MESA" library show adopted
 [ "$(jqs .project_id)" = "null" ] || fail "sync apply disk on disk-new: adopted is user-scope"
 ok "sync apply (disk) on a disk-new row adopts the file into a new library row"
 
+# A hook is any script the user drops in, not only a `*.sh` one, and its
+# name carries the extension so it round-trips back to the same file
+# (mesa task 1114).
+mkdir -p "$CLAUDE_DIR/hooks"
+printf '# python guard' > "$CLAUDE_DIR/hooks/poll-guard.py"
+run 0 "$MESA" library sync status
+ROW=$(jqs '.[] | select(.name=="poll-guard.py" and .kind=="hook")')
+[ "$(jq -r .status <<<"$ROW")" = "disk-new" ] ||
+  fail "sync status: a .py hook must be discovered as disk-new, got $ROW"
+[ "$(jq -r .path <<<"$ROW")" = ".claude/hooks/poll-guard.py" ] ||
+  fail "sync status: a .py hook's path must keep its extension, got $ROW"
+ok "a non-.sh hook file is discovered by sync status with its extension intact"
+
+run 0 "$MESA" library sync apply --resolve '.claude/hooks/poll-guard.py=disk'
+[ "$(jqs '.[0].applied')" = "true" ] || fail "sync apply disk on a .py hook: must apply"
+run 0 "$MESA" library show poll-guard.py
+[ "$(jqs .kind)" = "hook" ] || fail "the adopted .py hook's kind"
+[ "$(jqs .body)" = "# python guard" ] || fail "the adopted .py hook's body"
+run 0 "$MESA" library update poll-guard.py --body '# edited guard'
+run 0 "$MESA" library sync apply --resolve '.claude/hooks/poll-guard.py=mesa'
+[ "$(cat "$CLAUDE_DIR/hooks/poll-guard.py")" = "# edited guard" ] ||
+  fail "a .py hook must write back to its own filename, not a .sh one"
+[ ! -e "$CLAUDE_DIR/hooks/poll-guard.py.sh" ] ||
+  fail "a hook's name must not have an extension appended to it a second time"
+ok "a .py hook round-trips: adopted from disk, edited in mesa, written back to poll-guard.py"
+
 # ---- disk-deleted: the file vanished since the last sync, resolved both ways ----
 
-run 0 "$MESA" library create hook wontdelete '#!/bin/sh
+run 0 "$MESA" library create hook wontdelete.sh '#!/bin/sh
 echo hi'
 run 0 "$MESA" library sync apply --resolve '.claude/hooks/wontdelete.sh=mesa'
 [ -f "$CLAUDE_DIR/hooks/wontdelete.sh" ] || fail "fixture: wontdelete.sh must exist after the initial sync"
 rm "$CLAUDE_DIR/hooks/wontdelete.sh"
 run 0 "$MESA" library sync status
-ROW=$(jqs '.[] | select(.name=="wontdelete" and .kind=="hook")')
+ROW=$(jqs '.[] | select(.name=="wontdelete.sh" and .kind=="hook")')
 [ "$(jq -r .status <<<"$ROW")" = "disk-deleted" ] || fail "sync status: expected disk-deleted, got $ROW"
 run 0 "$MESA" library sync apply --resolve '.claude/hooks/wontdelete.sh=mesa'
 [ -f "$CLAUDE_DIR/hooks/wontdelete.sh" ] || fail "sync apply mesa on disk-deleted: must recreate the file"
-run 0 "$MESA" library show wontdelete
+run 0 "$MESA" library show wontdelete.sh
 [ "$(cat "$CLAUDE_DIR/hooks/wontdelete.sh")" = "$(jqs .body)" ] ||
   fail "sync apply mesa on disk-deleted: recreated file must hold the mesa body"
 ok "sync apply (mesa) on a disk-deleted row recreates the file with the mesa body"
 
-run 0 "$MESA" library create hook willvanish 'content'
+run 0 "$MESA" library create hook willvanish.sh 'content'
 run 0 "$MESA" library sync apply --resolve '.claude/hooks/willvanish.sh=mesa'
 [ -f "$CLAUDE_DIR/hooks/willvanish.sh" ] || fail "fixture: willvanish.sh must exist after the initial sync"
 rm "$CLAUDE_DIR/hooks/willvanish.sh"
 run 0 "$MESA" library sync apply --resolve '.claude/hooks/willvanish.sh=disk'
 [ "$(jqs '.[0].applied')" = "true" ] || fail "sync apply disk on disk-deleted: must apply"
-run 1 "$MESA" library show willvanish
+run 1 "$MESA" library show willvanish.sh
 [ "$(jqe .error.code)" = "not_found" ] || fail "sync apply disk on disk-deleted: the mesa row must be gone"
 [ ! -e "$CLAUDE_DIR/hooks/willvanish.sh" ] || fail "sync apply disk on disk-deleted: no file must be created"
 ok "sync apply (disk) on a disk-deleted row deletes the mesa row (the disk side won, and the disk side is absence)"

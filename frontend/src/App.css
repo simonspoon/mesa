@@ -9818,13 +9818,48 @@ button:focus-visible,
   flex: 0 0 auto;
 }
 
+/* Three depths where there used to be one (mesa task 1117): the page, the
+   card, and the well its open panel sits in. A card with something open under
+   it climbs a step — the raised panel and the bright rule the rest of the app
+   already means by "this is the live surface", plus a cyan edge naming which
+   one it is. The 2px the thicker edge takes comes back off the padding, so the
+   text stays in the same column as every collapsed row above it.
+
+   No drop shadow: `.card-list li`'s `clip-path: var(--cut)` clips at the
+   border box, so an outer shadow renders nothing at all (which is also why the
+   `:hover` glow on these cards has never shown). The lift is carried by the
+   contrast against the dimmed siblings below instead. */
+.library-item.open {
+  background: var(--panel-raised);
+  /* The three sides the cyan edge does not own, as longhands rather than one
+     `border-color`: a shorthand carrying a `var()` leaves a pending
+     substitution on all four sides, which resolves at computed-value time and
+     beats the `border-left` written after it — the left edge came out
+     `--border-bright` like the rest of the card. */
+  border-top-color: var(--border-bright);
+  border-right-color: var(--border-bright);
+  border-bottom-color: var(--border-bright);
+  border-left: 3px solid var(--cyan);
+  padding-left: calc(0.75rem - 2px);
+}
+
+/* While one card is open the rest stand down, so what is on screen belongs to
+   exactly one item. Page-wide rather than per group: the four panels are one
+   page-level selection, and a card two sections down is as much a distraction
+   as the one next to it. */
+.library-list.has-open .library-item:not(.open) {
+  opacity: 0.6;
+}
+
 /* The built-in a row overrode, opened below it — the sync modal's own diff
-   renderer, off the two bodies the page already holds. Ruled off the row
-   above it exactly as `.library-form` is. */
+   renderer, off the two bodies the page already holds. Recessed into the open
+   card exactly as `.library-form` is. */
 .library-override-diff {
   margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border);
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.45);
 }
 
 .library-override-diff p {
@@ -9833,12 +9868,15 @@ button:focus-visible,
 }
 
 /* The editor opens inside the row it belongs to, exactly like `.script-form`
-   — a rule off the card above it keeps the form and the list item from
-   reading as one block. */
+   — a well sunk into the card (the page's own black, a hairline and an inset
+   shadow) keeps the form and the list item from reading as one block, where a
+   rule between two panels the same colour did not (mesa task 1117). */
 .library-form {
   margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border);
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.45);
 }
 
 .library-form h2 {
@@ -9857,24 +9895,28 @@ button:focus-visible,
 /* The body is a program or a document, never plain prose, so it gets the
    shared syntax-highlighting editor and a border fencing it off from the
    plain fields around it — the same treatment `.script-body-editor` gives a
-   script's body. */
+   script's body, sunk into the same well as the form around it. */
 .library-body-editor .files-editor-stack {
   height: 18rem;
   border: 1px solid var(--border);
   padding: 0.25rem;
+  background: var(--bg);
+  box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.45);
 }
 
 /* History opens as two columns under the row: every version as one line on
-   the left, and what that version actually changed on the right. Ruled off
-   the row above it exactly as `.library-form` and `.library-override-diff`
+   the left, and what that version actually changed on the right. Recessed
+   into the open card exactly as `.library-form` and `.library-override-diff`
    are. */
 .library-history {
   display: grid;
   grid-template-columns: 16rem minmax(0, 1fr);
   gap: 0.75rem;
   margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border);
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.45);
 }
 
 .library-history-list {
@@ -10145,11 +10187,13 @@ button:focus-visible,
 }
 
 /* Where the hook is wired in, opened below the row exactly as the history and
-   the built-in diff are. */
+   the built-in diff are — and recessed into the open card with them. */
 .library-hooks {
   margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border);
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.45);
 }
 
 .library-hooks p {

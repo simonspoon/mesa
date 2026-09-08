@@ -817,6 +817,18 @@ export function LibraryView() {
     items: folded.items.filter((i) => i.kind === kind),
   })).filter((g) => g.items.length > 0)
 
+  // Which cards have something open under them (mesa task 1117). The card
+  // carries the class rather than CSS deriving it with `:has()`, because the
+  // four panels are four independent pieces of state the page already holds —
+  // and the dimming of the rest is page-wide, which no ancestor selector
+  // reaches anyway. `editing === 'new'` opens the create form above the list,
+  // not a card, so it opens nothing here.
+  const openKeys = new Set(
+    [editing === 'new' ? null : editing, showingVersions, showingDiff, showingHooks].filter(
+      (k): k is string => k !== null,
+    ),
+  )
+
   return (
     <div className="library-page">
       <h1>Library</h1>
@@ -885,13 +897,20 @@ export function LibraryView() {
         grouped.map((g) => (
           <section key={g.kind} className="library-group">
             <h2 className="library-group-title">{kindLabel(g.kind)}</h2>
-            <ul className="card-list library-list">
+            <ul
+              className={
+                openKeys.size > 0 ? 'card-list library-list has-open' : 'card-list library-list'
+              }
+            >
               {g.items.map((item) => {
                 const key = itemKey(item)
                 const overridden = folded.overriddenBody.get(key)
                 const hookStatus = item.id !== null ? hookStatusById.get(item.id) : undefined
                 return (
-                  <li key={key} className="library-item">
+                  <li
+                    key={key}
+                    className={openKeys.has(key) ? 'library-item open' : 'library-item'}
+                  >
                     <div className="library-item-row">
                       <div className="library-item-head">
                         <span className="library-name">{item.name}</span>

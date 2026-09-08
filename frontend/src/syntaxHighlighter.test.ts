@@ -13,6 +13,14 @@ describe('prismGrammar', () => {
     expect(prismGrammar('C#')).toBe('csharp')
   })
 
+  it('resolves both query languages, however they are spelled', () => {
+    expect(prismGrammar('sql')).toBe('sql')
+    // The server tags Kusto "kql"; Prism registers the grammar as "kusto".
+    expect(prismGrammar('kql')).toBe('kusto')
+    expect(prismGrammar('kusto')).toBe('kusto')
+    expect(prismGrammar('csl')).toBe('kusto')
+  })
+
   it('is undefined for an unknown or absent token', () => {
     // The caller's cue to render a plain, uncoloured block instead.
     expect(prismGrammar('brainfuck')).toBeUndefined()

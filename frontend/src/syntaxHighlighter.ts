@@ -8,11 +8,13 @@ import go from 'react-syntax-highlighter/dist/esm/languages/prism/go'
 import javascript from 'react-syntax-highlighter/dist/esm/languages/prism/javascript'
 import json from 'react-syntax-highlighter/dist/esm/languages/prism/json'
 import jsx from 'react-syntax-highlighter/dist/esm/languages/prism/jsx'
+import kusto from 'react-syntax-highlighter/dist/esm/languages/prism/kusto'
 import markdown from 'react-syntax-highlighter/dist/esm/languages/prism/markdown'
 import markup from 'react-syntax-highlighter/dist/esm/languages/prism/markup'
 import python from 'react-syntax-highlighter/dist/esm/languages/prism/python'
 import ruby from 'react-syntax-highlighter/dist/esm/languages/prism/ruby'
 import rust from 'react-syntax-highlighter/dist/esm/languages/prism/rust'
+import sql from 'react-syntax-highlighter/dist/esm/languages/prism/sql'
 import toml from 'react-syntax-highlighter/dist/esm/languages/prism/toml'
 import tsx from 'react-syntax-highlighter/dist/esm/languages/prism/tsx'
 import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typescript'
@@ -35,11 +37,13 @@ SyntaxHighlighter.registerLanguage('go', go)
 SyntaxHighlighter.registerLanguage('javascript', javascript)
 SyntaxHighlighter.registerLanguage('json', json)
 SyntaxHighlighter.registerLanguage('jsx', jsx)
+SyntaxHighlighter.registerLanguage('kusto', kusto)
 SyntaxHighlighter.registerLanguage('markdown', markdown)
 SyntaxHighlighter.registerLanguage('markup', markup)
 SyntaxHighlighter.registerLanguage('python', python)
 SyntaxHighlighter.registerLanguage('ruby', ruby)
 SyntaxHighlighter.registerLanguage('rust', rust)
+SyntaxHighlighter.registerLanguage('sql', sql)
 SyntaxHighlighter.registerLanguage('toml', toml)
 SyntaxHighlighter.registerLanguage('tsx', tsx)
 SyntaxHighlighter.registerLanguage('typescript', typescript)
@@ -92,6 +96,12 @@ const PRISM_GRAMMAR: Record<string, string> = {
   cs: 'csharp',
   'c#': 'csharp',
   dotnet: 'csharp',
+  sql: 'sql',
+  // The server tags Kusto "kql" (the extension people write), but Prism's
+  // grammar is registered under its own name — this pair is the bridge.
+  kql: 'kusto',
+  kusto: 'kusto',
+  csl: 'kusto',
 }
 
 /** Resolve a free-form language token to a registered Prism grammar name, or

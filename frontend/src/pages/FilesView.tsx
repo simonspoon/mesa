@@ -153,6 +153,9 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   hpp: 'cpp',
   cc: 'cpp',
   cs: 'csharp',
+  sql: 'sql',
+  kql: 'kql',
+  csl: 'kql',
   xml: 'xml',
   csproj: 'xml',
   xaml: 'xml',
@@ -183,6 +186,8 @@ const LANGUAGE_ACCENT: Record<string, string> = {
   yaml: 'amber',
   toml: 'amber',
   markdown: 'amber',
+  sql: 'amber',
+  kql: 'amber',
 }
 
 /** Extension-derived language tag for a filename, or null when unrecognized

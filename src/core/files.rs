@@ -76,6 +76,10 @@ fn language_of(ext: &str) -> Option<&'static str> {
         "c" | "h" => "c",
         "cpp" | "hpp" | "cc" => "cpp",
         "cs" => "csharp",
+        "sql" => "sql",
+        // Kusto queries ship under two extensions — .kql and Azure Data
+        // Explorer's own .csl — and both are the same language.
+        "kql" | "csl" => "kql",
         // .NET project and UI files are XML documents under a bespoke
         // extension — tagging them "xml" is what gets them markup colouring
         // (task 823).
@@ -1667,6 +1671,13 @@ mod tests {
     #[test]
     fn language_of_tags_svg() {
         assert_eq!(language_of("svg"), Some("svg"));
+    }
+
+    #[test]
+    fn language_of_tags_query_languages() {
+        assert_eq!(language_of("sql"), Some("sql"));
+        assert_eq!(language_of("kql"), Some("kql"));
+        assert_eq!(language_of("csl"), Some("kql"));
     }
 
     #[test]

@@ -25,6 +25,7 @@ import {
   hookBadgeLabel,
   hookIdsFor,
   matcherPayload,
+  matcherText,
   offersHooks,
 } from '../libraryHooks'
 import { diffLines, foldOverrides, itemKey } from '../libraryOverride'
@@ -448,8 +449,12 @@ function LibraryHookPanel({
           {registrations.map((reg, i) => (
             <li key={`${reg.event}-${reg.matcher}-${i}`} className="library-hook-reg">
               <span className="library-hook-event">{reg.event}</span>
-              <span className="muted library-meta">matcher {reg.matcher}</span>
-              <code className="library-hook-command">{reg.command}</code>
+              <span className="muted library-meta library-hook-matcher" title={reg.matcher}>
+                matcher {matcherText(reg.matcher) ?? reg.matcher}
+              </span>
+              <code className="library-hook-command" title={reg.command}>
+                {reg.command}
+              </code>
               <button
                 type="button"
                 disabled={pending}
@@ -904,7 +909,10 @@ export function LibraryView() {
                           <span className="library-badge">overrides built-in</span>
                         )}
                         {hookStatus !== undefined && (
-                          <span className="library-badge library-hook-badge">
+                          <span
+                            className="library-badge library-hook-badge"
+                            title={hookBadgeLabel(hookStatus)}
+                          >
                             {hookBadgeLabel(hookStatus)}
                           </span>
                         )}

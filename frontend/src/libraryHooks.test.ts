@@ -7,6 +7,7 @@ import {
   hookBadgeLabel,
   hookIdsFor,
   matcherError,
+  matcherText,
   matcherPayload,
   offersHooks,
   registrationLabel,
@@ -112,10 +113,31 @@ describe('registrationLabel', () => {
     expect(registrationLabel(reg())).toBe('Stop')
   })
 
+  it('names an empty matcher instead of showing empty parentheses', () => {
+    expect(registrationLabel(reg({ matcher: '' }))).toBe('Stop (no matcher)')
+  })
+
   it('names a narrowing matcher', () => {
     expect(registrationLabel(reg({ event: 'PreToolUse', matcher: 'Bash' }))).toBe(
       'PreToolUse (Bash)',
     )
+  })
+})
+
+describe('matcherText', () => {
+  it('says nothing for the default matcher', () => {
+    expect(matcherText(DEFAULT_HOOK_MATCHER)).toBeNull()
+  })
+
+  // mesa never writes one, but a hand-edited settings file may hold it, and it
+  // rendered as an empty pair of parentheses.
+  it('names an empty matcher rather than rendering blank', () => {
+    expect(matcherText('')).toBe('no matcher')
+    expect(matcherText('  ')).toBe('no matcher')
+  })
+
+  it('is the matcher itself otherwise', () => {
+    expect(matcherText('Bash')).toBe('Bash')
   })
 })
 
@@ -167,6 +189,12 @@ describe('hookBadgeLabel', () => {
     expect(hookBadgeLabel(status([reg({ event: 'SessionEnd' }), reg()]))).toBe(
       'registered: Stop, SessionEnd',
     )
+  })
+
+  it('reads sensibly when one event carries two matchers', () => {
+    expect(
+      hookBadgeLabel(status([reg({ event: 'SessionStart', matcher: '' }), reg({ event: 'SessionStart' })])),
+    ).toBe('registered: SessionStart (no matcher), SessionStart')
   })
 
   it('shows a narrowing matcher and hides the default one', () => {

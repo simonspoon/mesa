@@ -10134,6 +10134,14 @@ button:focus-visible,
 .library-hook-badge {
   text-transform: none;
   color: var(--cyan);
+  /* A matcher may be 200 bytes, so the badge is bounded and truncates like
+     `.library-path` does — an unbounded one overflowed the row and painted on
+     top of the buttons. The whole label stays available on hover. */
+  max-width: 24rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Where the hook is wired in, opened below the row exactly as the history and
@@ -10168,6 +10176,22 @@ button:focus-visible,
 .library-hook-event {
   font-family: var(--font-mono);
   color: var(--cyan);
+  flex: 0 0 auto;
+}
+
+/* The matcher is caller-written and bounded only by `HOOK_MATCHER_MAX`, so it
+   truncates too: a long one used to push `disable` clean out of the viewport,
+   where no mouse could reach it. */
+.library-hook-matcher {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 40%;
+  flex: 0 1 auto;
+}
+
+/* Whatever the two text fields hold, the control keeps its place. */
+.library-hook-reg button {
   flex: 0 0 auto;
 }
 

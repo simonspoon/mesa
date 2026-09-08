@@ -62,10 +62,22 @@ export function hookIdsFor(items: LibraryItem[] | null): number[] {
   return out
 }
 
+/**
+ * How one matcher reads in a sentence: `null` for the ones that say nothing —
+ * the default `*` (every tool, the unremarkable case) and a hand-edited empty
+ * string, which mesa never writes but a settings file may hold and which
+ * rendered as an empty pair of parentheses.
+ */
+export function matcherText(matcher: string): string | null {
+  if (matcher === DEFAULT_HOOK_MATCHER) return null
+  return matcher.trim() === '' ? 'no matcher' : matcher
+}
+
 /** How one registration reads: the event alone, or the event and the matcher
- * that narrows it. The default matcher is not shown — it says nothing. */
+ * that narrows it. */
 export function registrationLabel(reg: LibraryHookRegistration): string {
-  return reg.matcher === DEFAULT_HOOK_MATCHER ? reg.event : `${reg.event} (${reg.matcher})`
+  const matcher = matcherText(reg.matcher)
+  return matcher === null ? reg.event : `${reg.event} (${matcher})`
 }
 
 /**

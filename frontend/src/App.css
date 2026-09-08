@@ -9766,20 +9766,39 @@ button:focus-visible,
   color: var(--muted);
 }
 
+/* One row per item (mesa task 1111): the item's identity on the left, its
+   buttons right-aligned on the same line — with ~10 agents beside the skills
+   and commands, a second line of buttons per item was most of the page. The
+   path is the one part that may truncate; the name and the actions stay
+   whole. */
+.library-item-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
 .library-item-head {
   display: flex;
   gap: 0.5rem;
   align-items: baseline;
-  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .library-name {
   font-family: var(--font-mono);
   color: var(--cyan);
+  flex: 0 0 auto;
 }
 
 .library-meta {
   font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.library-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .library-badge {
@@ -9796,8 +9815,21 @@ button:focus-visible,
   display: flex;
   gap: 0.5rem;
   align-items: center;
-  flex-wrap: wrap;
-  margin-top: 0.5rem;
+  flex: 0 0 auto;
+}
+
+/* The built-in a row overrode, opened below it — the sync modal's own diff
+   renderer, off the two bodies the page already holds. Ruled off the row
+   above it exactly as `.library-form` is. */
+.library-override-diff {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.library-override-diff p {
+  margin: 0;
+  font-size: 0.75rem;
 }
 
 /* The editor opens inside the row it belongs to, exactly like `.script-form`

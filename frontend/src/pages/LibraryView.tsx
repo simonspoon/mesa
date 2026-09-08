@@ -15,6 +15,7 @@ import {
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { bundleFilename, parseBundle, summarizeImport } from '../libraryBundle'
+import { diffLines, foldOverrides, itemKey } from '../libraryOverride'
 import {
   LIBRARY_KINDS,
   LIBRARY_SCOPES,
@@ -47,13 +48,6 @@ import type { LibrarySyncResult } from '../types/LibrarySyncResult'
 import type { LibrarySyncRow } from '../types/LibrarySyncRow'
 import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
-
-/** Identifies one row in the list regardless of whether it is a stored item
- * or an unshadowed built-in (`id: null`) — the key the editing/versions
- * state is keyed by, since a plain numeric id cannot name a built-in. */
-function itemKey(item: LibraryItem): string {
-  return item.id !== null ? `id:${item.id}` : `builtin:${item.builtin_id}`
-}
 
 /** Prism grammar for the body editor: a hook is shell, everything else on
  * this surface — agent/skill/command/prompt bodies and a CLAUDE.md — is
@@ -456,6 +450,7 @@ export function LibraryView() {
   // item (`itemKey`, since a built-in has no numeric id).
   const [editing, setEditing] = useState<string | 'new' | null>(null)
   const [showingVersions, setShowingVersions] = useState<string | null>(null)
+  const [showingDiff, setShowingDiff] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
 
   // Export/import (mesa task 963). The page itself is unscoped (there is no
@@ -512,9 +507,13 @@ export function LibraryView() {
     })
   }
 
+  // A user row that collides by name with a built-in is the one the file on
+  // disk answers to — the built-in behind it folds into a badge on that row
+  // rather than a second row saying the same name.
+  const folded = foldOverrides(items ?? [])
   const grouped = LIBRARY_KINDS.map((kind) => ({
     kind,
-    items: (items ?? []).filter((i) => i.kind === kind),
+    items: folded.items.filter((i) => i.kind === kind),
   })).filter((g) => g.items.length > 0)
 
   return (
@@ -588,48 +587,80 @@ export function LibraryView() {
             <ul className="card-list library-list">
               {g.items.map((item) => {
                 const key = itemKey(item)
+                const overridden = folded.overriddenBody.get(key)
                 return (
                   <li key={key} className="library-item">
-                    <div className="library-item-head">
-                      <span className="library-name">{item.name}</span>
-                      <span className="muted library-meta">
-                        {scopeLabel(item.scope)}
-                        {item.scope === 'project' &&
-                          item.project_id !== null &&
-                          ` · ${projects?.find((p) => p.id === item.project_id)?.name ?? `project ${item.project_id}`}`}
-                        {item.path !== null && ` · ${item.path}`}
-                      </span>
-                      {item.builtin && <span className="library-badge">built-in</span>}
+                    <div className="library-item-row">
+                      <div className="library-item-head">
+                        <span className="library-name">{item.name}</span>
+                        <span className="muted library-meta">
+                          {scopeLabel(item.scope)}
+                          {item.scope === 'project' &&
+                            item.project_id !== null &&
+                            ` · ${projects?.find((p) => p.id === item.project_id)?.name ?? `project ${item.project_id}`}`}
+                        </span>
+                        {item.path !== null && (
+                          <span className="muted library-meta library-path">{item.path}</span>
+                        )}
+                        {item.builtin && <span className="library-badge">built-in</span>}
+                        {overridden !== undefined && (
+                          <span className="library-badge">overrides built-in</span>
+                        )}
+                      </div>
+                      <div className="library-actions">
+                        <button
+                          type="button"
+                          onClick={() => setEditing(editing === key ? null : key)}
+                        >
+                          {editing === key ? 'close' : 'edit'}
+                        </button>
+                        {item.id !== null && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowingVersions(showingVersions === key ? null : key)
+                              }
+                            >
+                              {showingVersions === key ? 'hide history' : 'history'}
+                            </button>
+                            {overridden !== undefined && (
+                              <button
+                                type="button"
+                                onClick={() => setShowingDiff(showingDiff === key ? null : key)}
+                              >
+                                {showingDiff === key ? 'hide diff' : 'diff vs built-in'}
+                              </button>
+                            )}
+                            <ConfirmDelete
+                              label="delete"
+                              message={
+                                item.builtin_id !== null
+                                  ? 'Delete this fork? The built-in reappears unshadowed.'
+                                  : 'Delete this library item?'
+                              }
+                              onDelete={() => deleteLibraryItem(item.id!).then(refetch)}
+                            />
+                          </>
+                        )}
+                      </div>
                     </div>
-                    <div className="library-actions">
-                      <button
-                        type="button"
-                        onClick={() => setEditing(editing === key ? null : key)}
-                      >
-                        {editing === key ? 'close' : 'edit'}
-                      </button>
-                      {item.id !== null && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setShowingVersions(showingVersions === key ? null : key)
-                            }
-                          >
-                            {showingVersions === key ? 'hide history' : 'history'}
-                          </button>
-                          <ConfirmDelete
-                            label="delete"
-                            message={
-                              item.builtin_id !== null
-                                ? 'Delete this fork? The built-in reappears unshadowed.'
-                                : 'Delete this library item?'
-                            }
-                            onDelete={() => deleteLibraryItem(item.id!).then(refetch)}
-                          />
-                        </>
-                      )}
-                    </div>
+                    {showingDiff === key && overridden !== undefined && (
+                      <div className="library-override-diff">
+                        <p className="muted">
+                          <span className="library-diff-mesa">-</span> your copy{' · '}
+                          <span className="library-diff-disk">+</span> the built-in
+                        </p>
+                        <pre className="library-sync-difflines">
+                          {diffLines(item.body, overridden).map((line, i) => (
+                            <div key={i} className={diffLineClass(line)}>
+                              <span className="library-diff-mark">{diffMark(line)}</span>
+                              {line.text}
+                            </div>
+                          ))}
+                        </pre>
+                      </div>
+                    )}
                     {editing === key && (
                       <LibraryForm
                         key={item.updated_at ?? 'builtin'}

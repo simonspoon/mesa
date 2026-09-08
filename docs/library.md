@@ -121,6 +121,37 @@ The starter set is deliberately tiny — five rows:
 each built-in and its constant are the same text, never two copies that could
 drift.
 
+### A name collision folds into the row that owns the file
+
+`effective_items` shadows a built-in **only** by `builtin_id` — a fork. A db
+row that merely collides by `(kind, scope, name)` — one adopted from disk by
+a sync, say — is a different row as far as the store is concerned, so both
+come back and the list showed the same name twice. Only one of them can be
+the file on disk, so the page folds them (mesa task 1111,
+`frontend/src/libraryOverride.ts::foldOverrides`): the built-in drops out of
+the list and the user's row wears an **overrides built-in** badge. The match
+is exact on `kind`, `scope` and `name`, case-sensitively — the triple the
+store's own uniqueness rule is stated in — and applies only where the user
+row's `builtin_id` is null. A **fork** is untouched: its built-in is already
+absent from the list, so there is nothing to fold.
+
+A folded row also offers **diff vs built-in**, an inline panel below the row
+rendering `libraryOverride.ts::diffLines(userBody, builtinBody)` through the
+sync modal's own `diffLineClass`/`diffMark` markup. That function is a
+deliberate **second implementation** of `core::library::diff_lines`, and the
+one place the "no second implementation" rule below is knowingly broken: both
+bodies are already in the browser (they arrive on the list `GET /api/library`
+answers), so a server-side diff would mean a new gated route for data the page
+already holds. It is a faithful port — the same line-splitting semantics, the
+same tie-break, the same `DIFF_MAX_CELLS`/`DIFF_MAX_LINES` bounds degrading to
+the same marker line — and the two must stay in step; `libraryOverride.test.ts`
+pins the shape.
+
+Everything else about a row is one line now: name, scope (and project), path
+(the one part that truncates) and any badges on the left, `edit · history ·
+diff vs built-in · delete` right-aligned on the same line, with the edit form,
+the version history and the diff all opening below it as before.
+
 ## Where a row lives on disk
 
 `core::library::relative_path(kind, scope, name)`, relative to the **scope
@@ -222,8 +253,9 @@ every read, nothing stored:
 
 `core::library::diff_lines` computes the diff: a hand-rolled line-level LCS,
 no crate and no new route — the row already carries both bodies, so the diff
-rides back with them and the web UI never runs a second implementation of its
-own. Each line is `{kind, mesa_line, disk_line, text}` with `kind` one of
+rides back with them and the *sync modal* never runs a second implementation
+of its own (the item list's override diff does, deliberately and for a
+different pair of bodies — see above). Each line is `{kind, mesa_line, disk_line, text}` with `kind` one of
 `context | mesa-only | disk-only`; line numbers are 1-based and set only on
 the side the line exists in, so a mesa-only line has a null `disk_line`. A
 replaced line is exactly one `mesa-only` and one `disk-only` — there is no

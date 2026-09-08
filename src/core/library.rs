@@ -528,14 +528,32 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
     // scope), and its wire string is just as unique a key.
     let mut claimed: HashSet<(&'static str, String)> = HashSet::new();
 
-    for item in &items {
+    // Two *items* can resolve to one path too, which `claimed` did not used to
+    // catch (mesa task 1116): `effective_items` folds a built-in away only when
+    // some db row carries its `builtin_id` — a fork — so a db row that merely
+    // collides with a built-in on `(kind, scope, name)` leaves both in the
+    // list, and `relative_path` gives them the same file. `claude-md` can do it
+    // between two db rows as well, its path not depending on its name at all.
+    // Whichever pair it is, the second row is unreachable: `sync_apply`
+    // resolves a submitted path with the *first* row carrying it, so every
+    // resolution lands on that one and the other re-appears, unchanged, on the
+    // next scan forever. Rank decides which row survives — a stored row
+    // outranks a virtual built-in, since the db row is the one a user edited —
+    // so the two ranks are walked in order rather than trusting whatever order
+    // `effective_items` happened to sort them into.
+    let (stored, builtins): (Vec<&LibraryItem>, Vec<&LibraryItem>) =
+        items.iter().partition(|i| i.id.is_some());
+
+    for item in stored.into_iter().chain(builtins) {
         if item.kind == LibraryKind::Prompt {
             continue;
         }
         let Some(rel) = item.path.as_ref().map(PathBuf::from) else {
             continue;
         };
-        claimed.insert((item.scope.as_str(), rel.to_string_lossy().into_owned()));
+        if !claimed.insert((item.scope.as_str(), rel.to_string_lossy().into_owned())) {
+            continue;
+        }
 
         let base = match item.scope {
             LibraryScope::User => user_base.clone(),
@@ -3239,6 +3257,121 @@ mod tests {
             }
             assert!(rows.iter().all(|r| r.kind != LibraryKind::Prompt));
         });
+    }
+
+    // ---- item-vs-item path-dedup regression (mesa task 1116: a db row that
+    // shadows a built-in by name, not by `builtin_id`, must not leave the
+    // built-in claiming the same file) ----
+
+    /// A db row sharing a built-in's `(kind, scope, name)` with no
+    /// `builtin_id` is an *override*, not a fork, so `effective_items` still
+    /// reports both — and both resolve to one path. Exactly one sync row may
+    /// come out of that, and the loop must actually settle: `sync_apply`
+    /// resolves a path against the first row carrying it, so a second row for
+    /// the same file is unreachable and re-appears on every scan forever.
+    #[test]
+    fn sync_status_folds_a_builtin_a_db_row_overrides_by_name() {
+        with_home_dir(|home| {
+            let agents = home.join(".claude/agents");
+            fs::create_dir_all(&agents).unwrap();
+            fs::write(agents.join("supervisor.md"), "a body on disk").unwrap();
+
+            let (mut store, _dir) = temp_store();
+            let overriding = store
+                .create_library_item(
+                    LibraryKind::Agent,
+                    LibraryScope::User,
+                    None,
+                    // The built-in's own name, with no `builtin_id`: an
+                    // override adopted from disk by a sync, never a fork.
+                    crate::core::supervisor::SUPERVISOR_AGENT_BUILTIN,
+                    "the overriding body",
+                    None,
+                )
+                .unwrap();
+            assert_eq!(overriding.builtin_id, None);
+            // The premise: the built-in is still in the catalogue, since
+            // nothing carries its id. Folding happens in the sync layer alone,
+            // so the Library page keeps both rows to fold client-side.
+            let items = effective_items(&store, None).unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|i| i.name == crate::core::supervisor::SUPERVISOR_AGENT_BUILTIN)
+                    .count(),
+                2,
+            );
+
+            let path = ".claude/agents/supervisor.md";
+            let rows = sync_status(&store, None).unwrap();
+            let matches: Vec<_> = rows.iter().filter(|r| r.path == path).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one row for {path}, got {matches:?}"
+            );
+            assert_eq!(
+                matches[0].item_id, overriding.id,
+                "the stored row outranks the built-in it overrides"
+            );
+            assert_eq!(matches[0].status, LibrarySyncStatus::BothChanged);
+
+            // ...and the loop settles: one resolution reaches the one row.
+            let results =
+                sync_apply(&mut store, None, &[(path.to_string(), "mesa".to_string())]).unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(results[0].applied, "{:?}", results[0].error);
+
+            for pass in 1..=2 {
+                let rows = sync_status(&store, None).unwrap();
+                let matches: Vec<_> = rows.iter().filter(|r| r.path == path).collect();
+                assert_eq!(matches.len(), 1, "pass {pass}: {matches:?}");
+                assert_eq!(
+                    matches[0].status,
+                    LibrarySyncStatus::InSync,
+                    "pass {pass}: the sync never settled"
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(agents.join("supervisor.md")).unwrap(),
+                "the overriding body"
+            );
+        });
+    }
+    /// The same defect between two *stored* rows, needing no built-in at all:
+    /// a `claude-md`'s path does not depend on its name (`relative_path`), so
+    /// any two of them in one scope resolve to the same file. Whichever row
+    /// wins, exactly one may reach the sync table.
+    #[test]
+    fn sync_status_folds_two_claude_md_rows_sharing_one_path() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        for name in ["CLAUDE", "AGENTS"] {
+            store
+                .create_library_item(
+                    LibraryKind::ClaudeMd,
+                    LibraryScope::Project,
+                    Some(pid),
+                    name,
+                    &format!("{name} body"),
+                    None,
+                )
+                .unwrap();
+        }
+        fs::write(base.join("CLAUDE.md"), "a different body on disk").unwrap();
+
+        let rows = sync_status(&store, Some(pid)).unwrap();
+        let matches: Vec<_> = rows.iter().filter(|r| r.path == "CLAUDE.md").collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one row for CLAUDE.md, got {matches:?}"
+        );
+        // Both are stored rows, so rank does not separate them and
+        // `effective_items`' own order — kind, then name case-insensitively —
+        // decides, deterministically.
+        assert_eq!(matches[0].name, "AGENTS");
     }
 
     // ---- export / import (mesa task 963) ----

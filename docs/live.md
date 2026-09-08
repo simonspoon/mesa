@@ -564,6 +564,11 @@ board. Both are browser-side and route-free, exactly as the close button is: a
 picture put away, or looked at closer, is not a write. Escape restores a
 maximised board and, once it is back at its own width, closes the panel — one
 press should never do both.
+A panel put away is brought back by a `show the whiteboard` press beside the
+conversation toggle in the header, offered only while the conversation has a
+board and the panel is hidden (mesa task 1113): it opens the panel without
+touching `seen`, so the rule that only a *newer* board opens it on its own is
+unchanged.
 
 The unset default is the stylesheet's own `min(40rem, 50vw)` and stays that
 way: nothing is written to the inline custom property until the person drags,

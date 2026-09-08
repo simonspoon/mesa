@@ -27,7 +27,13 @@ import {
   wavFromFrames,
   type CapturedFrame,
 } from '../liveAudio'
-import { boardPanelFor, closedBoardPanel, type BoardPanel } from '../liveBoard'
+import {
+  boardPanelFor,
+  closedBoardPanel,
+  openBoardPanel,
+  showsBoardReopen,
+  type BoardPanel,
+} from '../liveBoard'
 import {
   autoSendIdleMs,
   isEditableTarget,
@@ -207,6 +213,26 @@ function LiveMark() {
       focusable="false"
     >
       <polygon points="1,12 1,7 3,7 3,2 13,2 13,7 15,7 15,12 5,12 2,15 2,12" />
+    </svg>
+  )
+}
+
+/**
+ * The whiteboard, as a silhouette: a board on an easel. Deliberately not a
+ * variant of `LiveMark` — the two sit side by side in the header, so what
+ * separates them has to be the outline, not a detail inside it.
+ */
+function BoardMark() {
+  return (
+    <svg
+      className="live-mark"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <rect x="1" y="2" width="14" height="9" rx="1" />
+      <polygon points="7,11 9,11 11,15 9,15 8,13 7,15 5,15" />
     </svg>
   )
 }
@@ -2154,6 +2180,24 @@ export function LiveHub({
           }}
         >
           <LiveMark />
+        </button>
+      )}
+      {/* Bringing the whiteboard back (mesa task 1113). `boardPanelFor` only
+          ever *opens* on a board newer than `seen`, so hiding the panel used
+          to be one-way: short of the agent re-pushing identical content there
+          was nothing that showed it again (session 83). */}
+      {showsBoardReopen(nextBoardPanel, boards) && (
+        <button
+          type="button"
+          className="live-toggle live-panel-toggle"
+          aria-label="show the whiteboard"
+          onClick={() => {
+            setBoardPanel(openBoardPanel)
+            // A press on mesa's own controls hands the keyboard back to mesa.
+            reclaim('hub-press', armed.current)
+          }}
+        >
+          <BoardMark />
         </button>
       )}
       {/* The header keeps only the presses that *begin* a conversation —

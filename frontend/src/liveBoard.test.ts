@@ -9,6 +9,8 @@ import {
   closedBoardPanel,
   emptyBoardView,
   newestBoardId,
+  openBoardPanel,
+  showsBoardReopen,
   stepBoard,
 } from './liveBoard'
 import type { LiveBoardSummary } from './types/LiveBoardSummary'
@@ -222,5 +224,41 @@ describe('boardPanelFor', () => {
       seen: null,
       open: false,
     })
+  })
+})
+
+describe('openBoardPanel', () => {
+  it('reopens a panel the person hid, without moving `seen`', () => {
+    // Reopening is not a push: touching `seen` here would make the next poll
+    // treat the same board as new and re-open the panel on its own.
+    expect(openBoardPanel({ seen: 7, open: false })).toEqual({ seen: 7, open: true })
+  })
+
+  it('answers by identity when the panel is already open', () => {
+    const open = { seen: 7, open: true }
+    expect(openBoardPanel(open)).toBe(open)
+  })
+
+  it('leaves the seen-once rule intact for the polls that follow', () => {
+    // The regression this guards: hide, reopen, and the two-second poll still
+    // carries the same newest board — it must go on changing nothing, so a
+    // later hide stays a hide.
+    const reopened = openBoardPanel({ seen: 7, open: false })
+    expect(boardPanelFor(reopened, [board(4), board(7)])).toBe(reopened)
+    const hiddenAgain = { seen: 7, open: false }
+    expect(boardPanelFor(hiddenAgain, [board(4), board(7)])).toBe(hiddenAgain)
+  })
+})
+
+describe('showsBoardReopen', () => {
+  it('is offered only while a hidden panel has something to show', () => {
+    expect(showsBoardReopen({ seen: 7, open: false }, [board(7)])).toBe(true)
+  })
+
+  it('is absent with no boards, and while the panel is up', () => {
+    // A conversation that has pushed nothing has no whiteboard at all, so the
+    // control is missing rather than dead.
+    expect(showsBoardReopen(closedBoardPanel(), [])).toBe(false)
+    expect(showsBoardReopen({ seen: 7, open: true }, [board(7)])).toBe(false)
   })
 })

@@ -211,3 +211,30 @@ export function boardPanelFor(
   if (panel.seen === null || newest > panel.seen) return { seen: newest, open: true }
   return panel
 }
+
+/**
+ * Bringing back a panel the person put away (mesa task 1113).
+ *
+ * `boardPanelFor` only ever *opens* on a board newer than `seen`, which is
+ * what keeps a hidden panel hidden for the rest of the conversation — so
+ * reopening cannot go through it, and it must leave `seen` exactly as it was
+ * or the next poll would re-open the panel all over again. Returns the state
+ * it was handed, by identity, when the panel is already open: the caller
+ * holds this in `useState` and a fresh object for a press that changed
+ * nothing is a render for nothing, `boardPanelFor`'s own discipline.
+ */
+export function openBoardPanel(panel: BoardPanel): BoardPanel {
+  return panel.open ? panel : { seen: panel.seen, open: true }
+}
+
+/**
+ * Whether the header offers that press. A conversation that has pushed
+ * nothing has no whiteboard to show, so the control is absent rather than
+ * dead — and while the panel is up there is nothing to reopen.
+ */
+export function showsBoardReopen(
+  panel: BoardPanel,
+  boards: readonly LiveBoardSummary[],
+): boolean {
+  return boards.length > 0 && !panel.open
+}

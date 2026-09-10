@@ -11,6 +11,9 @@
 # deliberately longer than the stored 200-char preview (the difference IS the
 # assertion) plus its three-way validation/not_found/unavailable split.
 # `cc live` stays a direct file parse (no db) and is checked last.
+# `cc errors` gets a synthetic tree of its OWN (`$TMP/etree`), because every
+# count above is pinned to the main tree's exact line set and an `is_error`
+# fixture there would red a dozen unrelated assertions.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -1187,5 +1190,129 @@ echo "api cc: subscription window -> 502 unavailable ok"
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 unset SERVER_PID
+
+# ---- cc errors: what FAILED, over its own tree ----
+#
+# Its own tree and its own db, deliberately: every count above is pinned to the
+# exact line set of the main tree, so an `is_error` fixture added there would
+# red a dozen assertions that have nothing to do with failures.
+mkdir -p "$TMP/etree/-err-project"
+cat > "$TMP/etree/-err-project/e.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"e1","sessionId":"e","timestamp":"2026-06-15T02:00:00.000Z","cwd":"/home/me/err","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"eu_1","name":"Bash","input":{"command":"cd /repo && sed -n '1p' gone.txt"}},{"type":"tool_use","id":"eu_2","name":"Read","input":{"file_path":"/home/me/err/nope.rs"}},{"type":"tool_use","id":"eu_3","name":"Bash","input":{"command":"git push origin main"}},{"type":"tool_use","id":"eu_4","name":"Bash","input":{"command":"ls -la /home/me/err"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"e2","sessionId":"e","timestamp":"2026-06-15T02:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_4","content":"total 0"}]},"toolUseResult":{"stdout":"total 0","interrupted":false}}
+{"type":"assistant","uuid":"e3","sessionId":"e","timestamp":"2026-06-15T02:00:02.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"still working"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"e4","sessionId":"e","timestamp":"2026-06-15T02:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_1","is_error":true,"content":"sed: gone.txt: No such file or directory"}]},"toolUseResult":"a bare string this time, deliberately not read"}
+{"type":"user","uuid":"e5","sessionId":"e","timestamp":"2026-06-15T02:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_2","is_error":true,"content":[{"type":"text","text":"File does not exist."}]}]}}
+{"type":"user","uuid":"e6","sessionId":"e","timestamp":"2026-06-15T02:00:05.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_3","is_error":true,"content":"PreToolUse:Bash hook error: Blocked `git push origin main`: nothing is pushed unless the user asks"}]}}
+{"type":"user","uuid":"e7","sessionId":"e","timestamp":"2026-06-15T02:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_orphan","is_error":true,"content":"a result whose call line was never ingested"}]}}
+{"type":"assistant","uuid":"e10","sessionId":"e","timestamp":"2026-06-15T02:00:07.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"eu_6","name":"Bash","input":{"command":"set -e; cargo test && git push origin main"}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"e11","sessionId":"e","timestamp":"2026-06-15T02:00:08.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_6","is_error":true,"content":"PreToolUse:Bash hook error: Blocked `git push origin main`: nothing is pushed unless the user asks"}]}}
+{"type":"assistant","uuid":"e12","sessionId":"e","timestamp":"2026-06-15T02:00:09.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"eu_7","name":"Bash","input":{"command":"grep -rn TODO --include=*.rs"}},{"type":"tool_use","id":"eu_8","name":"Bash","input":{"command":"grep -rn TODO src/**/*.md"}},{"type":"tool_use","id":"eu_9","name":"Bash","input":{"command":"grep -rn TODO ."}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"e13","sessionId":"e","timestamp":"2026-06-15T02:00:10.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_7","is_error":true,"content":"Exit code 1\n(eval):1: no matches found: --include=*.rs"}]}}
+{"type":"user","uuid":"e14","sessionId":"e","timestamp":"2026-06-15T02:00:11.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_8","is_error":true,"content":"Exit code 2\nzsh: no matches found: src/**/*.md"}]}}
+{"type":"user","uuid":"e15","sessionId":"e","timestamp":"2026-06-15T02:00:12.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_9","is_error":true,"content":"Exit code 2\ngrep: Permission denied"}]}}
+{"type":"assistant","uuid":"e16","sessionId":"e","timestamp":"2026-06-15T02:00:13.000Z","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"eu_10","name":"Bash","input":{"command":"rm -rf build"}},{"type":"tool_use","id":"eu_11","name":"Edit","input":{"file_path":"/home/me/err/main.rs"}},{"type":"tool_use","id":"eu_12","name":"Bash","input":{"command":"chmod 777 /etc/hosts"}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"e17","sessionId":"e","timestamp":"2026-06-15T02:00:14.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_10","is_error":true,"content":"Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier. If you have other tasks, continue on those."}]}}
+{"type":"user","uuid":"e18","sessionId":"e","timestamp":"2026-06-15T02:00:15.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_11","is_error":true,"content":"Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier. If you have other tasks, continue on those."}]}}
+{"type":"user","uuid":"e19","sessionId":"e","timestamp":"2026-06-15T02:00:16.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_12","is_error":true,"content":"PreToolUse:Bash hook error: Blocked `chmod 777 /etc/hosts`: Blocked by classifier. If you have other tasks, continue on those."}]}}
+JSONL
+mkdir -p "$TMP/etree/-err-project/e/subagents"
+cat > "$TMP/etree/-err-project/e/subagents/y.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"e8","isSidechain":true,"sessionId":"e","agentId":"y1","timestamp":"2026-06-15T02:01:00.000Z","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"eu_5","name":"Bash","input":{"command":"sed -e bad-expression file"}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"e9","isSidechain":true,"sessionId":"e","agentId":"y1","timestamp":"2026-06-15T02:01:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"eu_5","is_error":true,"content":"sed: -e expression #1, char 1: unknown command"}]}}
+JSONL
+
+MESA_CC_PROJECTS_DIR="$TMP/etree" MESA_DB="$TMP/errors.db" \
+  "$BIN" cc errors --window all | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for k in ["generated_at_unix","window","since","total","by_tool","by_command","by_message","denials"]:
+    assert k in d, f"missing key {k}"
+assert d["window"]=="all" and d["since"] is None, d
+# Five failures: the `ls` that SUCCEEDED is not one, and neither is the
+# `toolUseResult` object/string on either line — `content[].is_error` is the
+# only signal read.
+t=d["total"]
+assert t=={"errors":12,"sidechain":1,"top_level":11,"denials":5}, t
+assert t["sidechain"]+t["top_level"]==t["errors"], t
+# The correlation is by tool_use_id across four intervening lines, never by
+# position: `unknown` is the orphan whose tool_use line is absent entirely.
+by_tool={x["name"]:(x["errors"],x["sidechain"],x["top_level"]) for x in d["by_tool"]}
+assert by_tool=={"Bash":(9,1,8),"Edit":(1,0,1),"Read":(1,0,1),"unknown":(1,0,1)}, d["by_tool"]
+assert [x["errors"] for x in d["by_tool"]]==sorted((x["errors"] for x in d["by_tool"]),reverse=True), d["by_tool"]
+# Bash only, leading `cd` dropped, `git` keeping its second word.
+by_cmd={x["prefix"]:(x["errors"],x["sidechain"]) for x in d["by_command"]}
+assert by_cmd=={"grep":(3,0),"sed":(2,1),"chmod":(1,0),"git push":(1,0),"rm":(1,0),"set":(1,0)}, d["by_command"]
+# by_message groups on the normalized FAILURE MESSAGE — the only grouping
+# that answers *why*. The two glob failures above differ in their shell prefix
+# ((eval):1: vs zsh:), their exit code, and the glob that did not match, and
+# `by_command` cannot tell them apart from the third grep at all — all three
+# are `grep`. They are ONE signature of 2; the third is its own.
+by_msg={x["signature"]:(x["errors"],x["sidechain"],x["top_level"]) for x in d["by_message"]}
+assert by_msg.get("no matches found: <arg>")==(2,0,2), d["by_message"]
+assert by_msg.get("grep: Permission denied")==(1,0,1), d["by_message"]
+assert "no matches found: --include=*.rs" not in by_msg, "the glob was not masked"
+# A stack trace never becomes a signature, and the `Exit code N` header line
+# Claude Code writes on every failed Bash result is never one either.
+assert not any(s.startswith("Exit code") for s in by_msg), d["by_message"]
+assert [x["errors"] for x in d["by_message"]]==sorted((x["errors"] for x in d["by_message"]),reverse=True), d["by_message"]
+# Sums to the population it groups: every error has a signature here.
+assert sum(x["errors"] for x in d["by_message"])==t["errors"], d["by_message"]
+# Denials group on (KIND, REASON) — never on the command, never on the tool.
+# There are TWO refusal mechanisms and they are never merged: a user-authored
+# PreToolUse hook, and the auto mode classifier Claude Code runs itself.
+den={(x["kind"],x["reason"]):x for x in d["denials"]}
+assert len(den)==len(d["denials"])==3, d["denials"]
+# (1) The two hook refusals came off two unrelated command lines (`git push …`
+# and `set -e; cargo test && git push …`, which `by_command` correctly counts
+# as `git push` and `set`) and quote the same rule, so they are ONE row of 2 —
+# the recurring class this view exists to rank first, not two rows of 1 ranked
+# joint-last. What is reported is what the HOOK named, backticks and all.
+push=den[("hook","nothing is pushed unless the user asks")]
+assert push["count"]==2 and push["command_prefixes"]==["git push"], push
+assert push["tools"]==["Bash"], push
+# (2) The classifier refused a Bash call and an Edit call for the same reason.
+# The TOOL is not in the key either — that is one verdict fired twice, and the
+# tools are reported alongside instead.
+CLS="Blocked by classifier. If you have other tasks, continue on those."
+cls=den[("classifier",CLS)]
+assert cls["count"]==2, cls
+assert cls["tools"]==["Bash","Edit"], cls
+# A classifier verdict names no command of its own, so the prefix comes from
+# the call it blocked; the Edit call has none at all.
+assert cls["command_prefixes"]==["rm"], cls
+# (3) A HOOK whose reason string is byte-identical to that classifier verdict
+# is still a separate row: different mechanism, different fact.
+hook_same=den[("hook",CLS)]
+assert hook_same["count"]==1 and hook_same["command_prefixes"]==["chmod"], hook_same
+assert [x["count"] for x in d["denials"]]==sorted((x["count"] for x in d["denials"]),reverse=True), d["denials"]
+# A classifier refusal is in `denials` AND in `by_message` — two projections
+# of the same errors, exactly as a Bash failure is in by_tool and by_command.
+assert by_msg.get("Permission for this action was denied by the Claude Code auto mode classifier. Reason: "+CLS)==(2,0,2), d["by_message"]
+print("cc errors ok")
+' || fail "cc errors shape/counts"
+
+# The window is the ordinary one, and an empty one is a zero-state, not an error.
+MESA_CC_PROJECTS_DIR="$TMP/etree" MESA_DB="$TMP/errors.db" \
+  "$BIN" cc errors --window 7d | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["window"]=="7d" and d["since"] is not None, d
+assert d["total"]=={"errors":0,"sidechain":0,"top_level":0,"denials":0}, d
+assert d["by_tool"]==[] and d["by_command"]==[] and d["by_message"]==[] and d["denials"]==[], d
+print("cc errors: out-of-window is a zero state ok")
+' || fail "cc errors --window 7d did not answer a zero state"
+
+# `--quiet` is rejected on every cc verb, this one included.
+ERC=0
+MESA_CC_PROJECTS_DIR="$TMP/etree" MESA_DB="$TMP/errors.db" \
+  "$BIN" cc errors --quiet >/dev/null 2>"$TMP/errors-quiet" || ERC=$?
+[ "$ERC" = "2" ] || fail "cc errors --quiet expected exit 2, got $ERC"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/errors-quiet"))
+assert d["error"]["code"]=="usage", d
+' || fail "cc errors --quiet did not print a usage error"
+echo "cc errors: --quiet rejected (exit 2) ok"
 
 echo "ok: cc-check passed"

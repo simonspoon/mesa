@@ -4,8 +4,8 @@ An **analytics surface** over Claude Code's own session transcripts — the
 newline-delimited JSON under `~/.claude/projects/**/*.jsonl` (including
 subagent transcripts in `<session>/subagents/*.jsonl`). Transcripts are
 **ingested** into `cc_*` tables (sessions, agent runs, messages, tool calls,
-prompts, per-file cursors — migration 12, plus `cc_prompts` at 31 and
-`cc_node_files` at 34) through `Store` — the single-write-path
+prompts, per-file cursors — migration 12, plus `cc_prompts` at 31,
+`cc_node_files` at 34 and `cc_tool_errors` at 54) through `Store` — the single-write-path
 invariant holds here too — and **the dashboard reads only the db**, never the
 files, so history survives Claude Code's own transcript cleanup and nothing is
 ever double-counted. The parsing/aggregation lives in `src/core/cc.rs` so the
@@ -60,6 +60,146 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   A tool whose input has no listed key (`advisor`'s `{}`, `StructuredOutput`'s
   caller-defined payload) simply gets `NULL`, as does one whose input failed
   upstream parsing (`{"__unparsedToolInput": …}`) or is not an object at all.
+- **Which calls FAILED is its own table, written off the result line**
+  (`cc_tool_errors`, migration 54 — mesa task 1132, read by `mesa cc errors`).
+  A failure is knowable only from the `user` line that carries a tool's output
+  back: a `tool_result` content-array element with `"is_error": true`. It is
+  read off **that element**, never off the same line's top-level
+  `toolUseResult`, which is inconsistently typed across Claude Code releases
+  (an object on some lines, a bare string on others) — classifying off it
+  silently misses whole releases' worth of failures, which is how the task's
+  own headline figures came out ~10× too high.
+
+  The row is a **sibling table rather than a column on `cc_tool_calls`** for
+  the same reason ingest is incremental: a batch can end between the
+  `tool_use` line and the `tool_result` answering it, so a column patched onto
+  the call's row would need a second write against a row a later batch may
+  never revisit, and every straddling failure would be lost. Keyed on
+  `tool_use_id` and written from the result line alone, the row lands whether
+  or not its call's did, and the read path LEFT JOINs `cc_tool_calls` for the
+  name and the command — an error whose call line is missing is reported under
+  `unknown` rather than dropped. The result line carries **neither** the tool
+  name nor the command, so that join is the only correlation there is;
+  `parentUuid` is not enough, because one turn fires several calls in
+  parallel. `sidechain` is on the row because it is nowhere else: the line's
+  `isSidechain` is otherwise folded only into the session-level
+  `cc_sessions.used_subagent`, which answers "did this session use a
+  subagent", not "was this call one" — and over half of all failures are a
+  subagent's, which is why every count in the view is split.
+
+  `by_command` groups `Bash` failures — over 90% of the population — on the
+  **normalized head** of the command, derived at read time from the `target`
+  the call row already holds (for a `Bash` call `tool_target` lifts
+  `input.command`, so no command of mesa's own is stored a second time).
+  `cc::command_prefix` is that one pure function: `&&`/`;` split, leading `cd `
+  segments dropped, cut at the first `|`/`<`/`>`, lowercased, first token —
+  plus a second token for a multiplexer (`git push`, `mesa live`, `cargo
+  test`), since `git push` and `git status` fail for unrelated reasons. A line
+  that is **nothing but** `cd`s groups under `cd` rather than dropping out of
+  the view: a stored command has had its newlines collapsed by
+  `sanitize_capped`, so a multi-line `cd …` script arrives as one segment with
+  no separator left to split on, and answering nothing would silently lose ~3%
+  of real Bash failures.
+
+  `by_message` is the grouping that answers **why** rather than what, and the
+  reason a failure message is stored at all. `cc::failure_signature` takes the
+  **first meaningful line** of the output — skipping the bare `Exit code <n>`
+  header Claude Code writes on line 1 of every failed `Bash` result — strips
+  the shell's own location prefix (`(eval):1:`, `zsh:`, `bash: line 4:`), and
+  masks every per-invocation token: anything holding a path separator, a glob
+  character or a long hex run becomes `<arg>` (adjacent ones collapsing to
+  one), then digit runs become `N`. So `(eval):1: no matches found:
+  --include=*.rs` and `zsh: no matches found: src/**/*.md` are one signature,
+  `Command timed out after 28m 20s` is `Command timed out after Nm Ns`, and a
+  Python traceback signs as `Traceback (most recent call last):` rather than
+  dragging its whole body along. It errs deliberately toward
+  **under-merging**: two causes wrongly merged is a wrong answer, one cause
+  split across two adjacent rows merely a less useful one, so only visibly
+  volatile tokens are masked and the words are left alone. The list is the one
+  grouping that is **cut** (`MESSAGE_GROUP_LIMIT`), because signatures have a
+  long tail by construction — ~860 distinct over 2,118 real failures, most
+  seen once — while a recurring cause is near the top by definition.
+
+  It is computed at **ingest**, off the full result text, and stored as
+  `cc_tool_errors.signature`; it is *not* derivable from `excerpt`, which is
+  the same text after `sanitize_capped` has collapsed its newlines away and
+  cut it at 200 characters — the line structure the rule reads is gone by
+  then, and a quarter of the corpus's glob failures fall past the cut. Frozen
+  once written like every other derived `cc_*` column: changing the rule means
+  `cc sync --rebuild`.
+
+  One thing it deliberately does not do is read past that first line, and the
+  cost is worth stating. Over the author's corpus 72 failures *mention* the
+  zsh glob complaint somewhere in their output, but only 33 have it as their
+  first meaningful line; the other 39 are failures with a different primary
+  cause — most often a 28-minute timeout — whose stderr happens to also carry
+  glob noise. `by_message` reports 33, because that is how many failures the
+  glob actually *was*. Signing an error under every line it contains was
+  measured as the alternative: it lifts the glob row to 61 (still not 72) and
+  fills the top of the ranking with the interior lines of Python tracebacks
+  (`}`, `return _default_decoder.decode(s)`), which is not a view of anything.
+
+  A **denial** is the separate population where nothing ran, and there are
+  **two mechanisms**, deliberately never merged into one "denied" bucket —
+  `CcDenialKind` is part of every group's key, because one is the user's own
+  configuration refusing them and the other is Claude Code's, and a reader can
+  act on only one of those:
+
+  - `hook` — a user-authored `PreToolUse` hook: ``PreToolUse:<Tool> hook
+    error: Blocked `<command>`: <reason>``. The tool is captured from the
+    message rather than assumed to be `Bash` (a hook may guard any tool) and
+    stored on the row, so such a denial is attributable even when its call
+    line is not.
+  - `classifier` — Claude Code's own auto mode classifier: "Permission for
+    this action was denied by the Claude Code auto mode classifier. Reason:
+    <reason>". It names neither tool nor command, so both come from the joined
+    call row. A verdict that introduces itself some other way than `Reason:`
+    still counts, with the whole message as its reason — the same fallback the
+    prose-shaped hook refusals take.
+
+  Both are still counted as errors: `denials` is a subset of `errors`, not a
+  fourth split. An interactive rejection ("The user doesn't want to proceed…")
+  is a person, not a mechanism, and is deliberately **not** a denial.
+
+  Denials group on the **`(kind, reason)` pair — never on the command, and
+  never on the tool**, and that is the whole point of the grouping. Both of
+  those vary *underneath* a rule that is firing repeatedly, and both were
+  measured against the real corpus doing exactly that: the same hook fires
+  from unrelated command lines (`git push` is routinely one clause of
+  `set -e; …` or `mesa task update … && git push`), and the one classifier
+  verdict that accounts for 83 refusals blocked `Bash`, `Edit`, `Agent` and
+  `Write` alike. Keying on either splits the recurring class into rows of one
+  and ranks it joint-last — 83 becomes 70/5/5/3 on the tool, and the push rule
+  became three separate `count: 1` rows on the command.
+
+  What varied is reported alongside instead, so nothing is lost. Each row
+  carries `command_prefixes` and `tools`: the distinct heads and tool names
+  seen under that reason, sorted and capped at `DENIAL_PREFIX_LIMIT`. The
+  command is the one the **message itself named** between the backticks
+  (`parse_denial` keeps it, and it is stored as `cc_tool_errors.denial_command`
+  precisely so the two sources cannot be confused), falling back to the
+  containing call's prefix — which is all a classifier verdict ever has, and
+  all a hook refusal that spelled its command into its prose has either
+  (``Blocked a no-op command (`echo done`), which …``; such a message is
+  per-invocation unique and groups with nothing anyway).
+
+  A denial appears in **both** `denials` and `by_message` — the classifier's
+  83 are `by_message`'s third-largest group. That is two projections of the
+  same errors, exactly as a `Bash` failure appears in both `by_tool` and
+  `by_command`, and not double-counting: `total.errors` counts each failure
+  once. Do not "fix" it by suppressing one.
+
+  Over the author's own 1.2 GB corpus the whole rule set answers 2,123
+  failures (1,193 subagent), Bash 1,927 / Read 71 / Edit 56, and **93
+  denials in seven rows** — 83 + 3 + 1 from the classifier, 3 + 1 + 1 + 1 from
+  hooks.
+
+  Like every derived `cc_*` column, this only exists for lines ingested since
+  the table shipped: `mesa cc sync --rebuild` clears the cursors and backfills
+  the history in one re-walk. There is deliberately **no HTTP route and no web
+  view** — it is a CLI verb, `mesa cc errors [--window …]`, taking the same
+  windows `cc summary` does (subscription windows included) and rejecting
+  `--quiet` like every other `cc` subcommand.
 - **One API response is several transcript lines, and usage is counted once per
   response.** Claude Code writes a single assistant response as a *line per
   content-block group* — typically a `thinking` line, then the

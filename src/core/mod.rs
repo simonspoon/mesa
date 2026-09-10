@@ -28,8 +28,8 @@ pub use store::{
 };
 pub use types::{
     ARTIFACT_CONTENT_TYPES, AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactSummary,
-    Attachment, CcAgentStat, CcDashboard, CcDayPoint, CcLiveSession, CcModelStat, CcOverview,
-    CcProjectStat, CcSessionBucket, CcSessionDetail, CcSessionModelStat, CcSessionRow,
+    Attachment, CcAgentStat, CcDashboard, CcDayPoint, CcErrors, CcLiveSession, CcModelStat,
+    CcOverview, CcProjectStat, CcSessionBucket, CcSessionDetail, CcSessionModelStat, CcSessionRow,
     CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat, CcTokens, CcUsage,
     CcUsageExtra, CcUsageWindow, ConfigCommand, ConfigPrice, DEFAULT_ARTIFACT_CONTENT_TYPE,
     Dependency, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat, DirEntry, DirListing,

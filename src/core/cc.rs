@@ -55,15 +55,16 @@ use serde::{Deserialize, Serialize};
 use super::config::PriceTable;
 use super::store::{
     CcAgentRunUpsert, CcFileBatch, CcFileCursor, CcMessageRow, CcNodeFilePair, CcPromptRow,
-    CcSessionRecord, CcSessionUpsert, CcToolCallRow, Error, Result, Store,
+    CcSessionRecord, CcSessionUpsert, CcToolCallRow, CcToolErrorRow, Error, Result, Store,
 };
 use super::types::{
     CcAgentStat, CcChatAsk, CcChatOption, CcChatQuestion, CcChatTurn, CcChatTurnKind, CcDashboard,
-    CcDayPoint, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive, CcLiveSession, CcLiveSubagent,
-    CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview, CcProjectStat, CcRepeat,
-    CcSessionBucket, CcSessionChat, CcSessionDetail, CcSessionGraph, CcSessionModelStat,
-    CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat, CcSkillStat,
-    CcTokens, CcToolStat, CcUsage,
+    CcDayPoint, CcDenialKind, CcErrorCommandStat, CcErrorDenial, CcErrorMessageStat,
+    CcErrorToolStat, CcErrorTotals, CcErrors, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
+    CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview,
+    CcProjectStat, CcRepeat, CcSessionBucket, CcSessionChat, CcSessionDetail, CcSessionGraph,
+    CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat,
+    CcSkillStat, CcTokens, CcToolStat, CcUsage,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -214,6 +215,33 @@ impl RawMessage {
             .collect()
     }
 
+    /// The `(tool_use_id, result_text)` of every `tool_result` block in this
+    /// message that came back **failed**.
+    ///
+    /// `is_error` is read off the content-array element itself, never off the
+    /// line's top-level `toolUseResult`: that key is inconsistently typed
+    /// across Claude Code versions (an object on some lines, a bare string on
+    /// others), so classifying off it silently misses whole releases' worth of
+    /// failures. The block is authoritative and has been on every shape
+    /// observed.
+    ///
+    /// The result line carries neither the tool's name nor its command; both
+    /// come from the `tool_use` block this pairs back to by `tool_use_id`.
+    fn tool_errors(&self) -> Vec<(String, String)> {
+        let Some(blocks) = self.content.as_ref().and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .filter(|b| b.get("is_error").and_then(|e| e.as_bool()) == Some(true))
+            .filter_map(|b| {
+                let id = b.get("tool_use_id")?.as_str()?;
+                Some((id.to_string(), result_text(b.get("content"))))
+            })
+            .collect()
+    }
+
     /// The `(tool_use_id, result_bytes)` of every `tool_result` block in this
     /// message — the `user` line that carries a tool's output back into the
     /// conversation. `result_bytes` is how long that output is: a string
@@ -312,6 +340,32 @@ impl RawMessage {
         } else {
             Some(joined)
         }
+    }
+}
+
+/// What a `tool_result` block's `content` actually said, flattened to one
+/// string — the sibling of [`result_len`], which asks the same value only how
+/// long it is. A string block is itself, an array of blocks is their `text`
+/// joined by a newline (any block without one contributing its compact JSON),
+/// anything else its compact JSON.
+///
+/// Read only by [`RawMessage::tool_errors`], and everything it returns passes
+/// through [`sanitize_capped`] before it can be stored: a failing tool's
+/// output is untrusted and unbounded, so the flattening exists to be *cut*,
+/// never to be kept whole.
+fn result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .map(|b| match b.get("text").and_then(|t| t.as_str()) {
+                Some(text) => text.to_string(),
+                None => b.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
     }
 }
 
@@ -423,6 +477,312 @@ pub fn sanitize_capped(raw: &str) -> Option<String> {
         chars += 1;
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// What one refusal was, or `None` when this is an ordinary failure.
+///
+/// A denial is still an error: this only decides whether it is *also* filed
+/// under `denials`, never whether it counts.
+#[derive(Debug, PartialEq, Eq)]
+struct Denial {
+    kind: CcDenialKind,
+    /// The tool the *message* named. `None` for a classifier verdict, which
+    /// names none — the joined call row answers for those.
+    tool: Option<String>,
+    /// The command the message named, where it named one.
+    command: Option<String>,
+    reason: Option<String>,
+}
+
+/// Reads the two refusal shapes the corpus actually contains, in order.
+///
+/// **A user-authored `PreToolUse` hook**: ``PreToolUse:<Tool> hook error:
+/// Blocked `<cmd>`: <reason>``. Only `Bash` has been observed, but the tool is
+/// captured rather than assumed — a hook may guard any tool, and a rule that
+/// hard-codes `Bash` would misfile the first one that does not.
+///
+/// The **blocked command is the one between the backticks**, not the command
+/// the call ran. They are routinely different: `git push` is one clause of a
+/// longer line, so the containing call's own `target` reports whatever that
+/// line happened to start with (`set`, `mesa task`, `cd`) and three refusals
+/// of the same rule look like three unrelated things. What the hook named is
+/// what the hook refused. Not every refusal names one — some spell the
+/// command into their prose instead (``Blocked a no-op command (`echo
+/// done`), which …``). Those fall through with the whole remainder as the
+/// reason and no command, which is right: such a message is per-invocation
+/// unique and groups with nothing.
+///
+/// **Claude Code's own auto mode classifier**: "Permission for this action was
+/// denied by the Claude Code auto mode classifier. Reason: <reason>". It names
+/// neither tool nor command, so both come from the joined call row. The two
+/// are kept apart by [`CcDenialKind`] rather than merged into one "denied"
+/// bucket: one is the user's configuration refusing them, the other is Claude
+/// Code's, and a reader can act on only one of those.
+fn parse_denial(text: &str) -> Option<Denial> {
+    const HOOK_PREFIX: &str = "PreToolUse:";
+    const HOOK_MID: &str = " hook error: Blocked ";
+    const CLASSIFIER: &str =
+        "Permission for this action was denied by the Claude Code auto mode classifier.";
+    const CLASSIFIER_REASON: &str = "Reason:";
+
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix(CLASSIFIER) {
+        let rest = rest.trim_start();
+        // `Reason:` is how every observed verdict introduces itself; a future
+        // one that does not still counts, with the whole message as its
+        // reason — the same fallback the prose-shaped hook refusals take.
+        let reason = rest.strip_prefix(CLASSIFIER_REASON).unwrap_or(rest);
+        return Some(Denial {
+            kind: CcDenialKind::Classifier,
+            tool: None,
+            command: None,
+            reason: sanitize_capped(reason),
+        });
+    }
+
+    let rest = text.strip_prefix(HOOK_PREFIX)?;
+    let at = rest.find(HOOK_MID)?;
+    let tool = &rest[..at];
+    // The `\w+` of the shape: anything else means this is a message that
+    // merely begins the same way, not a refusal mesa can attribute.
+    if tool.is_empty() || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let after = &rest[at + HOOK_MID.len()..];
+    let (command, reason) = match after.strip_prefix('`').and_then(|r| r.split_once("`:")) {
+        Some((command, reason)) => (sanitize_capped(command), reason),
+        None => (None, after),
+    };
+    Some(Denial {
+        kind: CcDenialKind::Hook,
+        tool: Some(tool.to_string()),
+        command,
+        reason: sanitize_capped(reason),
+    })
+}
+
+/// The stored name of a denial kind, and its inverse. Kept next to each other
+/// so the column and the enum cannot drift; an unrecognised stored value reads
+/// as `Hook`, the shape that shipped first.
+fn denial_kind_name(kind: CcDenialKind) -> &'static str {
+    match kind {
+        CcDenialKind::Hook => "hook",
+        CcDenialKind::Classifier => "classifier",
+    }
+}
+
+fn denial_kind_from(name: &str) -> CcDenialKind {
+    match name {
+        "classifier" => CcDenialKind::Classifier,
+        _ => CcDenialKind::Hook,
+    }
+}
+
+/// How many distinct command prefixes one denial reason reports.
+///
+/// A bound, not a policy — the same job [`REPEAT_ID_MEMORY`] does. A rule
+/// guards a handful of shapes; anything past this is a reason so generic that
+/// listing more commands says nothing, and the `count` still counts them all.
+const DENIAL_PREFIX_LIMIT: usize = 8;
+
+/// Shell words that are a family of commands rather than a command, so the
+/// second word is what says what actually ran. `git push` and `git status`
+/// fail for unrelated reasons; grouping both under `git` says nothing.
+const COMMAND_MULTIPLEXERS: &[&str] = &[
+    "git",
+    "cargo",
+    "npm",
+    "mesa",
+    "python3",
+    "gh",
+    "docker",
+    "xcodebuild",
+];
+
+/// The normalized head of a `Bash` command — what `by_command` groups on.
+///
+/// A whole command line is unique per invocation, so counting them verbatim
+/// produces one group per failure and no view at all. The head is the part
+/// that repeats. The rules, in order and each one validated against the real
+/// corpus:
+///
+/// * split on `&&` and `;`, because a chain's *first real* command is the one
+///   the line is about;
+/// * drop leading `cd …` segments — every agent's command line starts with
+///   one and it is never what failed. A bare `cd` with nothing after it is
+///   **not** dropped: then the `cd` is the command;
+/// * cut at the first `|`, `<` or `>`, so a redirect is not read as an
+///   argument;
+/// * lowercase, then take the first whitespace token;
+/// * keep a second token for a [multiplexer](COMMAND_MULTIPLEXERS).
+///
+/// `None` when nothing survives — an empty or whitespace-only command.
+pub fn command_prefix(command: &str) -> Option<String> {
+    // `&&` folded onto `;` first: a two-character separator is not a `split`
+    // pattern, and the two mean the same thing to this rule.
+    let chained = command.replace("&&", ";");
+    let segments: Vec<&str> = chained
+        .split(';')
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty())
+        .collect();
+    let segment = segments
+        .iter()
+        .copied()
+        .find(|seg| !(seg.starts_with("cd ") || seg.starts_with("cd\t")))
+        // Nothing but `cd`s. Then `cd` is what ran, and it gets its own group
+        // rather than none: a stored command has had its whitespace collapsed
+        // (`sanitize_capped`), so a multi-line `cd …\n<command>` reaches here
+        // as one segment with no separator to split on, and answering `None`
+        // would drop ~3% of real Bash failures out of `by_command` silently.
+        .unwrap_or(*segments.first()?);
+    let head = segment
+        .split(['|', '<', '>'])
+        .next()
+        .unwrap_or(segment)
+        .to_lowercase();
+    let mut words = head.split_whitespace();
+    let first = words.next()?;
+    if COMMAND_MULTIPLEXERS.contains(&first)
+        && let Some(second) = words.next()
+    {
+        return Some(format!("{first} {second}"));
+    }
+    Some(first.to_string())
+}
+
+/// How many `by_message` groups the view returns.
+///
+/// A bound, not a policy — [`DENIAL_PREFIX_LIMIT`]'s job. Signatures have a
+/// long tail by construction (the author's own corpus yields ~860 distinct
+/// ones over 2,118 failures, most seen once), and a recurring cause is by
+/// definition near the top; `total.errors` still counts every failure.
+const MESSAGE_GROUP_LIMIT: usize = 20;
+
+/// Where the *shell* said something, as opposed to what it said. Stripped so
+/// `(eval):1: no matches found: …` and `zsh: no matches found: …` are one
+/// signature rather than two.
+const SHELL_LOCATIONS: &[&str] = &["(eval):", "zsh:", "bash: line ", "sh: line "];
+
+/// The normalized failure signature of a tool's output — what `by_message`
+/// groups on, and the only reason a failure message is worth storing at all.
+///
+/// Computed at **ingest**, off the full result text, and not derivable from
+/// the stored `excerpt`: `sanitize_capped` collapses newlines, so by the time
+/// text reaches that column the line structure this rule reads is gone and
+/// the whole of a stack trace has been concatenated onto its first line.
+/// Frozen once written, like every other derived `cc_*` column — changing the
+/// rule means `cc sync --rebuild`.
+///
+/// The rule, in order:
+///
+/// * take the **first meaningful line** — the first non-blank one that is not
+///   a bare `Exit code <n>` header, which is what Claude Code puts on line 1
+///   of every failed `Bash` result and which says nothing about the cause. A
+///   body that is *only* that header signs as it, rather than as nothing;
+/// * strip a [shell location](SHELL_LOCATIONS) prefix;
+/// * mask every volatile token — anything holding a path separator, a glob
+///   character or a long hex run becomes `<arg>`, and runs of them collapse to
+///   one — then mask digit runs to `N`;
+/// * `sanitize_capped`, the same 200-character policy every stored
+///   transcript-derived string gets.
+///
+/// It errs toward **under-merging**: two causes wrongly merged is a wrong
+/// answer, while one cause split across two adjacent rows is merely a less
+/// useful one. So only tokens that are visibly per-invocation are masked, and
+/// the words of the message are left alone.
+///
+/// One thing it deliberately does not do is read past that first line. A
+/// failure whose output *mentions* a recurring complaint further down —
+/// a 28-minute timeout whose stderr also holds four glob complaints — signs
+/// as the timeout, because that is what went wrong. Signing an error under
+/// every line it contains was measured and rejected: it fills the ranking
+/// with the interior lines of Python tracebacks.
+pub fn failure_signature(text: &str) -> Option<String> {
+    let line = first_meaningful_line(text)?;
+    let mut out: Vec<String> = Vec::new();
+    for token in strip_shell_location(line).split_whitespace() {
+        let masked = if is_volatile(token) {
+            "<arg>".to_string()
+        } else {
+            mask_digits(token)
+        };
+        // A path followed by a glob followed by another path says nothing
+        // more than one `<arg>` does.
+        if masked == "<arg>" && out.last().map(String::as_str) == Some("<arg>") {
+            continue;
+        }
+        out.push(masked);
+    }
+    sanitize_capped(&out.join(" "))
+}
+
+/// The first line worth signing: non-blank, and not the bare `Exit code <n>`
+/// header. A body made of nothing else falls back to that header, since "it
+/// exited 2 and said nothing" is a real and recognisable failure.
+fn first_meaningful_line(text: &str) -> Option<&str> {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.clone().find(|l| !is_exit_code_line(l));
+    first.or_else(|| lines.next())
+}
+
+/// `Exit code 137` and nothing else.
+fn is_exit_code_line(line: &str) -> bool {
+    line.strip_prefix("Exit code ")
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn strip_shell_location(line: &str) -> &str {
+    for prefix in SHELL_LOCATIONS {
+        let Some(rest) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 {
+            if let Some(tail) = rest[digits..].strip_prefix(':') {
+                return tail.trim_start();
+            }
+        } else if prefix.ends_with(':') {
+            // `zsh: no matches found: …` — the prefix carried its own colon.
+            return rest.trim_start();
+        }
+    }
+    line
+}
+
+/// A token that is per-invocation rather than part of the message: a path, a
+/// glob, or a long hex run (a sha, a uuid, an address).
+fn is_volatile(token: &str) -> bool {
+    if token.contains('/') || token.contains('\\') || token.contains('*') || token.contains('?') {
+        return true;
+    }
+    let mut hex = 0usize;
+    for c in token.chars() {
+        hex = if c.is_ascii_hexdigit() { hex + 1 } else { 0 };
+        if hex >= 8 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every run of digits in `token` collapsed to a single `N`, so a line number,
+/// a byte count and a duration stop being part of the identity.
+fn mask_digits(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut in_digits = false;
+    for c in token.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('N');
+                in_digits = true;
+            }
+        } else {
+            out.push(c);
+            in_digits = false;
+        }
+    }
+    out
 }
 
 /// Text prefixes that mark a `user` line as machinery rather than a human
@@ -609,6 +969,186 @@ struct RawIteration {
 // (`core::config::PriceTable`, mesa task 692), matched on a model-family
 // prefix. It is loaded ONCE per request and threaded down: these are
 // per-message loops, so a per-row file read would be a real cost.
+
+/// The failure view for `window` — `mesa cc errors`.
+///
+/// Db-backed like [`collect`] rather than a live transcript read like
+/// [`live`]: the question is what has been going wrong *over a window*, and a
+/// transcript Claude Code has since deleted still counts.
+pub fn errors(store: &Store, window: &str) -> Result<CcErrors> {
+    errors_inner(store, window, None)
+}
+
+/// [`errors`] with a caller-supplied cutoff, for the reason [`collect_since`]
+/// has one: a subscription window's start comes from the live usage endpoint,
+/// not the clock.
+pub fn errors_since(store: &Store, window: &str, since: i64) -> Result<CcErrors> {
+    errors_inner(store, window, Some(since))
+}
+
+fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErrors> {
+    let now = now_unix();
+    if since.is_none() {
+        reject_usage_window(window)?;
+    }
+    let cutoff = since.or_else(|| window_cutoff(window, now));
+
+    let rows = store.cc_read_tool_errors(cutoff)?;
+    let mut total = CcErrorTotals {
+        errors: 0,
+        sidechain: 0,
+        top_level: 0,
+        denials: 0,
+    };
+    // `(errors, sidechain)` per group; `top_level` is the difference, so the
+    // three can never disagree.
+    let mut by_tool: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut by_command: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut by_message: HashMap<String, (i64, i64)> = HashMap::new();
+    // Keyed on `(kind, reason)` and on neither the command nor the tool: one
+    // rule refusing the same thing repeatedly is the news this view exists to
+    // carry, and both of those vary underneath it — a hook fires from
+    // different containing command lines, a classifier verdict blocks four
+    // different tools. Each is collected alongside instead, deduped and
+    // ordered by its `BTreeSet`.
+    type DenialAcc = (i64, BTreeSet<String>, BTreeSet<String>);
+    let mut denials: HashMap<(CcDenialKind, String), DenialAcc> = HashMap::new();
+
+    for r in &rows {
+        total.errors += 1;
+        if r.sidechain {
+            total.sidechain += 1;
+        } else {
+            total.top_level += 1;
+        }
+        // An error whose `tool_use` line has not been ingested is counted, not
+        // dropped: the two rows come off two transcript lines a batch
+        // boundary can fall between, and a silently missing failure is worse
+        // than an unattributed one.
+        let name = r.name.clone().unwrap_or_else(|| "unknown".to_string());
+        let is_bash = name == "Bash";
+        let e = by_tool.entry(name).or_default();
+        e.0 += 1;
+        e.1 += i64::from(r.sidechain);
+
+        // `target` for a `Bash` call *is* its command — `tool_target` lifts
+        // `input.command` — so the prefixes are derived at read time and no
+        // command of mesa's own is stored a second time.
+        let prefix = if is_bash {
+            r.target.as_deref().and_then(command_prefix)
+        } else {
+            None
+        };
+        if let Some(prefix) = prefix.clone() {
+            let e = by_command.entry(prefix).or_default();
+            e.0 += 1;
+            e.1 += i64::from(r.sidechain);
+        }
+        if let Some(signature) = r.signature.clone() {
+            let e = by_message.entry(signature).or_default();
+            e.0 += 1;
+            e.1 += i64::from(r.sidechain);
+        }
+        if let Some(kind) = r.denial_kind.as_deref().map(denial_kind_from) {
+            total.denials += 1;
+            let reason = r.denial_reason.clone().unwrap_or_default();
+            let d = denials.entry((kind, reason)).or_default();
+            d.0 += 1;
+            // What the message named, else what the call ran. A refusal that
+            // spelled its command into its prose, and every classifier
+            // verdict, still has a real call behind it.
+            if let Some(prefix) = r
+                .denial_command
+                .as_deref()
+                .and_then(command_prefix)
+                .or(prefix)
+                && d.1.len() < DENIAL_PREFIX_LIMIT
+            {
+                d.1.insert(prefix);
+            }
+            if let Some(tool) = r.denial_tool.clone().or_else(|| r.name.clone())
+                && d.2.len() < DENIAL_PREFIX_LIMIT
+            {
+                d.2.insert(tool);
+            }
+        }
+    }
+
+    let mut by_tool: Vec<CcErrorToolStat> = by_tool
+        .into_iter()
+        .map(|(name, (errors, sidechain))| CcErrorToolStat {
+            name,
+            errors,
+            sidechain,
+            top_level: errors - sidechain,
+        })
+        .collect();
+    // Most failures first, ties broken by name so the output is stable across
+    // runs — a `HashMap` has no order of its own.
+    by_tool.sort_by(|a, b| b.errors.cmp(&a.errors).then_with(|| a.name.cmp(&b.name)));
+
+    let mut by_command: Vec<CcErrorCommandStat> = by_command
+        .into_iter()
+        .map(|(prefix, (errors, sidechain))| CcErrorCommandStat {
+            prefix,
+            errors,
+            sidechain,
+            top_level: errors - sidechain,
+        })
+        .collect();
+    by_command.sort_by(|a, b| {
+        b.errors
+            .cmp(&a.errors)
+            .then_with(|| a.prefix.cmp(&b.prefix))
+    });
+
+    let mut by_message: Vec<CcErrorMessageStat> = by_message
+        .into_iter()
+        .map(|(signature, (errors, sidechain))| CcErrorMessageStat {
+            signature,
+            errors,
+            sidechain,
+            top_level: errors - sidechain,
+        })
+        .collect();
+    by_message.sort_by(|a, b| {
+        b.errors
+            .cmp(&a.errors)
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
+    // Unlike the two groupings above, this one has a long tail by
+    // construction — most signatures are seen once — so it is the only one
+    // that is cut. A recurring cause is near the top by definition.
+    by_message.truncate(MESSAGE_GROUP_LIMIT);
+
+    let mut denials: Vec<CcErrorDenial> = denials
+        .into_iter()
+        .map(|((kind, reason), (count, prefixes, tools))| CcErrorDenial {
+            kind,
+            reason,
+            command_prefixes: prefixes.into_iter().collect(),
+            tools: tools.into_iter().collect(),
+            count,
+        })
+        .collect();
+    denials.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.reason.cmp(&b.reason))
+    });
+
+    Ok(CcErrors {
+        generated_at_unix: now,
+        window: window.to_string(),
+        since: cutoff.map(fmt_date),
+        total,
+        by_tool,
+        by_command,
+        by_message,
+        denials,
+    })
+}
 
 /// The merged price table, or the store's error type — a config file that
 /// exists but can't be read is surfaced, never silently priced at the
@@ -1246,6 +1786,26 @@ fn fold_line(
             session_id: sid.clone(),
             ts,
             preview,
+        });
+    }
+    // Failures are read off the *result* line, so they are their own rows in
+    // their own table — see the `cc_tool_errors` migration. `sidechain` is
+    // taken from this line because it is the only place it appears.
+    for (tool_use_id, text) in msg.tool_errors() {
+        let denial = parse_denial(&text);
+        batch.tool_errors.push(CcToolErrorRow {
+            tool_use_id,
+            session_id: sid.clone(),
+            ts,
+            sidechain: raw.is_sidechain == Some(true),
+            denial_kind: denial
+                .as_ref()
+                .map(|d| denial_kind_name(d.kind).to_string()),
+            denial_tool: denial.as_ref().and_then(|d| d.tool.clone()),
+            denial_command: denial.as_ref().and_then(|d| d.command.clone()),
+            denial_reason: denial.and_then(|d| d.reason),
+            signature: failure_signature(&text),
+            excerpt: sanitize_capped(&text),
         });
     }
     for (tool_use_id, name, caller, target) in msg.tool_uses() {
@@ -5599,6 +6159,7 @@ mod tests {
                     }],
                     messages: vec![msg("u1", None, 1000, 200), msg("u2", Some("a1"), 1400, 20)],
                     tool_calls,
+                    tool_errors: Vec::new(),
                     prompts: Vec::new(),
                     node_files: Vec::new(),
                 },
@@ -6374,5 +6935,374 @@ mod tests {
             "a session with no transcript on disk is silent, not an error"
         );
         assert_eq!(bogus, SessionPulse::default());
+    }
+
+    #[test]
+    fn command_prefix_groups_the_head_of_a_command() {
+        // Each case is a rule of `command_prefix`, in the order it applies.
+        for (command, want) in [
+            ("sed -n '1,20p' src/core/cc.rs", Some("sed")),
+            // A chain: the first real command is what the line is about.
+            ("cargo fmt && cargo clippy", Some("cargo fmt")),
+            ("mkdir -p x; cd x; ls", Some("mkdir")),
+            // Leading `cd` segments are dropped, however many.
+            ("cd /repo && cd frontend && npm run build", Some("npm run")),
+            // ...but a line that is nothing *but* `cd`s groups under `cd`,
+            // rather than dropping out of the view altogether. A stored
+            // command has had its newlines collapsed to spaces, so this is
+            // also where a multi-line `cd …` script lands.
+            ("cd", Some("cd")),
+            ("cd -", Some("cd")),
+            ("cd /repo cat > out.txt <<'EOF'", Some("cd")),
+            // A redirect or a pipe is not an argument.
+            ("grep -rn foo | head -5", Some("grep")),
+            ("cat <<'EOF' > /tmp/x", Some("cat")),
+            // A leading env assignment is NOT skipped: there is no such rule,
+            // and the group it makes is at least honest about what ran.
+            ("GIT_PAGER=cat git push origin main", Some("git_pager=cat")),
+            // Multiplexers keep their second word; everything else does not.
+            ("git push origin main", Some("git push")),
+            ("mesa live say hello", Some("mesa live")),
+            ("Ls -LA", Some("ls")),
+            ("git", Some("git")),
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(
+                command_prefix(command).as_deref(),
+                want,
+                "command_prefix({command:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_signature_folds_the_volatile_parts_of_the_first_real_line() {
+        // The line-1 `Exit code <n>` header Claude Code writes on every failed
+        // Bash result is skipped, the shell's own location prefix is stripped,
+        // and the glob that varied is masked — so these are ONE signature.
+        let glob = failure_signature("Exit code 1\n(eval):1: no matches found: --include=*.rs");
+        assert_eq!(glob.as_deref(), Some("no matches found: <arg>"));
+        assert_eq!(
+            failure_signature("zsh: no matches found: src/**/*.md"),
+            glob,
+            "the same complaint from a differently-spelled shell prefix"
+        );
+        assert_eq!(
+            failure_signature("Exit code 2\n(eval):14: no matches found: /tmp/x-9f2a/*.json"),
+            glob
+        );
+
+        // A stack trace does not become the signature: only its first line.
+        assert_eq!(
+            failure_signature(
+                "Exit code 1\nTraceback (most recent call last):\n  File \"/a/b.py\", line 7\n    boom()"
+            )
+            .as_deref(),
+            Some("Traceback (most recent call last):")
+        );
+        // Line numbers, durations and shas are not identity.
+        assert_eq!(
+            failure_signature("Exit code 143\nCommand timed out after 28m 20s").as_deref(),
+            Some("Command timed out after Nm Ns")
+        );
+        assert_eq!(
+            failure_signature("fatal: bad object 4f9a2c1e8b7d6503").as_deref(),
+            Some("fatal: bad object <arg>")
+        );
+        // A body that is nothing BUT the header still signs as something:
+        // "exited 2 and said nothing" is a recognisable failure.
+        assert_eq!(
+            failure_signature("Exit code 2").as_deref(),
+            Some("Exit code N")
+        );
+        assert_eq!(failure_signature(""), None);
+        assert_eq!(failure_signature("   \n\n  "), None);
+
+        // Under-merging is the safe direction: two genuinely different
+        // complaints stay apart, even sharing most of their words.
+        assert_ne!(
+            failure_signature("error: unexpected argument '--quiet' found"),
+            failure_signature("error: unexpected argument '--window' found"),
+        );
+        assert_ne!(
+            failure_signature("Exit code 1\nNo such file or directory"),
+            failure_signature("Exit code 1\nPermission denied"),
+        );
+    }
+
+    #[test]
+    fn parse_denial_reads_both_refusal_shapes_and_nothing_else() {
+        let hook =
+            parse_denial("PreToolUse:Bash hook error: Blocked `git push`: pushes are manual")
+                .expect("the observed hook shape");
+        assert_eq!(hook.kind, CcDenialKind::Hook);
+        assert_eq!(hook.tool.as_deref(), Some("Bash"));
+        // The command the HOOK named, which is not what the call ran.
+        assert_eq!(hook.command.as_deref(), Some("git push"));
+        assert_eq!(hook.reason.as_deref(), Some("pushes are manual"));
+
+        // The tool is captured, not assumed to be Bash.
+        assert_eq!(
+            parse_denial("PreToolUse:Write hook error: Blocked `x`: nope").and_then(|d| d.tool),
+            Some("Write".to_string())
+        );
+        // No backticked command: the whole remainder is the reason, and there
+        // is no command to report.
+        let prose = parse_denial(
+            "PreToolUse:Bash hook error: Blocked a no-op command (`echo done`), which wastes a turn",
+        )
+        .expect("a refusal that spells its command into its prose");
+        assert_eq!(prose.command, None);
+        assert!(prose.reason.unwrap().starts_with("a no-op command"));
+        assert_eq!(
+            parse_denial("PreToolUse:Bash hook error: Blocked outright")
+                .and_then(|d| d.reason)
+                .as_deref(),
+            Some("outright")
+        );
+
+        // The classifier shape: a different mechanism, so a different kind. It
+        // names neither tool nor command — the joined call row answers for
+        // both — and `Reason:` introduces what it said.
+        let classifier = parse_denial(
+            "Permission for this action was denied by the Claude Code auto mode classifier. \
+             Reason: Blocked by classifier. If you have other tasks, continue on those.",
+        )
+        .expect("the observed classifier shape");
+        assert_eq!(classifier.kind, CcDenialKind::Classifier);
+        assert_eq!(classifier.tool, None);
+        assert_eq!(classifier.command, None);
+        assert_eq!(
+            classifier.reason.as_deref(),
+            Some("Blocked by classifier. If you have other tasks, continue on those.")
+        );
+        // A verdict that introduces itself some other way still counts, with
+        // the whole message as its reason.
+        assert_eq!(
+            parse_denial(
+                "Permission for this action was denied by the Claude Code auto mode \
+                 classifier. it just said this"
+            )
+            .and_then(|d| d.reason)
+            .as_deref(),
+            Some("it just said this")
+        );
+
+        // An ordinary failure, and a message that merely begins the same way.
+        assert_eq!(parse_denial("sed: no such file"), None);
+        assert_eq!(
+            parse_denial("PreToolUse:two words hook error: Blocked `x`: y"),
+            None
+        );
+        assert_eq!(
+            parse_denial("The user doesn't want to proceed with this tool use"),
+            None,
+            "an interactive rejection is a person, not a hook"
+        );
+    }
+
+    #[test]
+    fn folds_failed_tool_results_into_the_errors_view() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-some-project");
+        fs::create_dir_all(&proj).unwrap();
+        write_jsonl(
+            &proj,
+            "sess.jsonl",
+            &[
+                // Three calls dispatched in one turn, so the results below can
+                // only pair back by `tool_use_id` — `parentUuid` cannot tell
+                // them apart.
+                r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/w","message":{"model":"claude-opus-5","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"cd /repo && sed -n 1p missing"}},{"type":"tool_use","id":"tu2","name":"Read","input":{"file_path":"/gone"}},{"type":"tool_use","id":"tu3","name":"Bash","input":{"command":"git push origin main"}}]}}"#,
+                // The successful one, and prose, in between — the failing
+                // results are several lines away from their call.
+                r#"{"type":"user","uuid":"r0","sessionId":"s1","timestamp":"2026-06-15T01:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu2","content":"ok"}]}}"#,
+                r#"{"type":"assistant","uuid":"a2","sessionId":"s1","timestamp":"2026-06-15T01:00:02.000Z","message":{"model":"claude-opus-5","content":[{"type":"text","text":"thinking"}]}}"#,
+                r#"{"type":"user","uuid":"r1","sessionId":"s1","timestamp":"2026-06-15T01:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","is_error":true,"content":"sed: missing: No such file"}]},"toolUseResult":"a bare string, deliberately not read"}"#,
+                r#"{"type":"user","uuid":"r3","sessionId":"s1","timestamp":"2026-06-15T01:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu3","is_error":true,"content":"PreToolUse:Bash hook error: Blocked `git push origin main`: pushes are manual"}]}}"#,
+                // A subagent's own failure, on the same session.
+                r#"{"type":"assistant","uuid":"a3","isSidechain":true,"agentId":"ag1","sessionId":"s1","timestamp":"2026-06-15T01:01:00.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"tu4","name":"Bash","input":{"command":"sed -e bad"}}]}}"#,
+                r#"{"type":"user","uuid":"r4","isSidechain":true,"agentId":"ag1","sessionId":"s1","timestamp":"2026-06-15T01:01:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu4","is_error":true,"content":[{"type":"text","text":"sed: -e expression #1"}]}]}}"#,
+            ],
+        );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+        let e = errors(&store, "all").unwrap();
+
+        assert_eq!(e.total.errors, 3, "the successful tu2 result is not one");
+        assert_eq!(e.total.sidechain, 1);
+        assert_eq!(e.total.top_level, 2);
+        assert_eq!(e.total.denials, 1);
+
+        assert_eq!(
+            e.by_tool
+                .iter()
+                .map(|t| (t.name.as_str(), t.errors, t.sidechain, t.top_level))
+                .collect::<Vec<_>>(),
+            vec![("Bash", 3, 1, 2)],
+            "Read succeeded, so it is absent rather than zero"
+        );
+        assert_eq!(
+            e.by_command
+                .iter()
+                .map(|c| (c.prefix.as_str(), c.errors, c.sidechain))
+                .collect::<Vec<_>>(),
+            vec![("sed", 2, 1), ("git push", 1, 0)],
+            "the leading `cd` is dropped and `git` keeps its second word"
+        );
+        // Every failure carries a signature: the `Exit code` header is gone,
+        // the digit in `#1` is masked, and the sidechain flag rides along.
+        // These three said genuinely different things, so they stay three.
+        assert_eq!(
+            e.by_message
+                .iter()
+                .map(|m| (m.signature.as_str(), m.errors, m.sidechain))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "PreToolUse:Bash hook error: Blocked `git push origin main`: pushes are manual",
+                    1,
+                    0
+                ),
+                ("sed: -e expression #N", 1, 1),
+                ("sed: missing: No such file", 1, 0),
+            ]
+        );
+
+        assert_eq!(e.denials.len(), 1);
+        assert_eq!(e.denials[0].kind, CcDenialKind::Hook);
+        assert_eq!(e.denials[0].reason, "pushes are manual");
+        assert_eq!(e.denials[0].command_prefixes, vec!["git push".to_string()]);
+        assert_eq!(e.denials[0].tools, vec!["Bash".to_string()]);
+        assert_eq!(e.denials[0].count, 1);
+
+        // Re-ingesting the same file adds nothing: the rows insert on their
+        // `tool_use_id`, like every other cc row.
+        let again = errors(&store, "all").unwrap();
+        assert_eq!(again.total.errors, e.total.errors);
+    }
+
+    /// The acceptance criterion the first cut missed: one rule refusing the
+    /// same thing repeatedly must rank as one row of three, not three of one.
+    /// The three refusals below reach mesa from three unrelated command lines,
+    /// which is exactly what keying on the command got wrong.
+    #[test]
+    fn one_denial_reason_is_one_row_however_many_commands_tripped_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        let calls = [
+            "set -e; git push origin main",
+            "mesa task update 1 && git push",
+            "git push",
+        ];
+        let mut batch = CcFileBatch::default();
+        for (i, command) in calls.iter().enumerate() {
+            let id = format!("d{i}");
+            batch.tool_calls.push(CcToolCallRow {
+                tool_use_id: id.clone(),
+                message_uuid: format!("m{i}"),
+                session_id: "s1".into(),
+                agent_id: None,
+                name: "Bash".into(),
+                caller: None,
+                ts: 1_781_000_000,
+                target: Some((*command).to_string()),
+            });
+            let text = "PreToolUse:Bash hook error: Blocked `git push`: pushes are manual";
+            let denial = parse_denial(text).unwrap();
+            batch.tool_errors.push(CcToolErrorRow {
+                tool_use_id: id,
+                session_id: "s1".into(),
+                ts: 1_781_000_000,
+                sidechain: false,
+                denial_kind: Some(denial_kind_name(denial.kind).to_string()),
+                denial_tool: denial.tool,
+                denial_command: denial.command,
+                denial_reason: denial.reason,
+                signature: failure_signature(text),
+                excerpt: sanitize_capped(text),
+            });
+        }
+        store
+            .cc_ingest_file(
+                "/nowhere.jsonl",
+                &CcFileCursor {
+                    mtime: 0,
+                    size: 0,
+                    byte_offset: 0,
+                },
+                &batch,
+            )
+            .unwrap();
+
+        let e = errors(&store, "all").unwrap();
+        assert_eq!(e.total.denials, 3);
+        assert_eq!(e.denials.len(), 1, "one reason is one row: {:?}", e.denials);
+        assert_eq!(e.denials[0].count, 3);
+        assert_eq!(
+            e.denials[0].command_prefixes,
+            vec!["git push".to_string()],
+            "the hook named `git push` every time; the containing lines \
+             (`set`, `mesa task`, `git push`) are not what it refused"
+        );
+        // `by_command` still groups on what actually ran, and is unaffected.
+        assert_eq!(
+            e.by_command
+                .iter()
+                .map(|c| (c.prefix.as_str(), c.errors))
+                .collect::<Vec<_>>(),
+            vec![("git push", 1), ("mesa task", 1), ("set", 1)]
+        );
+    }
+
+    #[test]
+    fn an_error_whose_call_line_is_missing_is_counted_unattributed() {
+        // The batch boundary case the separate table exists for: only the
+        // result line has been ingested, so there is no tool name and no
+        // command — and the failure must still count.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        store
+            .cc_ingest_file(
+                "/nowhere.jsonl",
+                &CcFileCursor {
+                    mtime: 0,
+                    size: 0,
+                    byte_offset: 0,
+                },
+                &CcFileBatch {
+                    tool_errors: vec![CcToolErrorRow {
+                        tool_use_id: "orphan".into(),
+                        session_id: "s1".into(),
+                        ts: 1_781_000_000,
+                        sidechain: false,
+                        denial_kind: None,
+                        denial_tool: None,
+                        denial_command: None,
+                        denial_reason: None,
+                        signature: Some("boom".into()),
+                        excerpt: Some("boom".into()),
+                    }],
+                    ..CcFileBatch::default()
+                },
+            )
+            .unwrap();
+        let e = errors(&store, "all").unwrap();
+        assert_eq!(e.total.errors, 1);
+        assert_eq!(e.by_tool.len(), 1);
+        assert_eq!(e.by_tool[0].name, "unknown");
+        assert!(
+            e.by_command.is_empty(),
+            "no call row means no command to group on"
+        );
     }
 }

@@ -2093,6 +2093,31 @@ EXAMPLES
         #[arg(long, default_value_t = crate::core::cc::CHAT_TURN_LIMIT)]
         limit: usize,
     },
+    /// Print what FAILED as one JSON object (totals + three breakdowns)
+    ///
+    /// A tool call counts as failed when the `tool_result` carrying its output
+    /// back came with `is_error`. Every count is split sidechain vs. top level
+    /// — over half of all failures are a subagent's. `by_command` groups the
+    /// normalized head of a `Bash` command (`git push`, `sed`), since Bash is
+    /// over 90% of failures and its name alone says nothing about which.
+    /// `denials`
+    /// are the separate population a `PreToolUse` hook refused outright, where
+    /// nothing ran at all.
+    ///
+    /// Only failures whose result line has been ingested since mesa learned to
+    /// read one are counted — `mesa cc sync --rebuild` backfills the history.
+    #[command(after_help = "\
+EXAMPLES
+  mesa cc errors                  # last 30 days
+  mesa cc errors --window 7d
+  mesa cc errors --window all")]
+    Errors {
+        /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
+        /// falls back to 30d), or cc-5h | cc-7d for the currently-open Claude
+        /// Code subscription window (needs the live usage endpoint)
+        #[arg(long, default_value = "30d")]
+        window: String,
+    },
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
         /// Time window: 7d | 30d | 90d | all | <n>d (n >= 1; anything else
@@ -3932,6 +3957,21 @@ fn cc_collect(store: &Store, window: &str) -> Result<crate::core::CcDashboard> {
     crate::core::cc::collect_since(store, window, since)
 }
 
+/// [`cc_collect`]'s twin for `cc errors`, which reads its own rows rather than
+/// the dashboard's. The window handling is identical — including the
+/// subscription windows, whose cutoff only the live usage endpoint knows — and
+/// exists twice because the two views build different objects, not because
+/// they take different windows.
+fn cc_errors(store: &Store, window: &str) -> Result<crate::core::CcErrors> {
+    if !crate::core::cc::is_usage_window(window) {
+        return crate::core::cc::errors(store, window);
+    }
+    let usage = crate::core::usage::fetch().map_err(Error::Unavailable)?;
+    let since = crate::core::cc::usage_window_start(window, &usage)
+        .ok_or_else(|| Error::Unavailable(format!("no open {window} usage window to report on")))?;
+    crate::core::cc::errors_since(store, window, since)
+}
+
 /// Dashboard reads (`summary`/`sessions`/`skills`) auto-ingest new transcript
 /// lines first (`cc::sync`) and are then served from the persisted `cc_*`
 /// tables, so they open the database like every other handler; `live`/`usage`
@@ -3998,6 +4038,11 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
             // reads the transcript directly (like `cc live`), which is what
             // makes it answer for a session that has never been ingested.
             print_json(&crate::core::cc::session_chat(&session_id, limit)?)
+        }
+        CcCmd::Errors { window } => {
+            let mut store = Store::open_default()?;
+            crate::core::cc::sync(&mut store, false)?;
+            print_json(&cc_errors(&store, &window)?)
         }
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;

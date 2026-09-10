@@ -2736,6 +2736,146 @@ pub struct CcDashboard {
     pub sessions: Vec<CcSessionRow>,
 }
 
+/// What failed, over a window — `mesa cc errors`.
+///
+/// One object rather than a bare array because there are three groupings of
+/// one population, and every count is split sidechain vs. top level: over half
+/// of all failures are a subagent's, so a single number answers neither "is my
+/// own work going wrong" nor "are my agents".
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcErrors {
+    /// Unix seconds at which this snapshot was computed.
+    #[ts(type = "number")]
+    pub generated_at_unix: i64,
+    /// The requested window token, as `CcDashboard::window`.
+    pub window: String,
+    /// Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
+    pub since: Option<String>,
+    pub total: CcErrorTotals,
+    /// Most failures first. `name` is `unknown` for an error whose own
+    /// `tool_use` line has not been ingested.
+    pub by_tool: Vec<CcErrorToolStat>,
+    /// `Bash` only, most failures first — the normalized head of the command
+    /// (see `core::cc::command_prefix`), since over 90% of all failures are Bash
+    /// and the tool name alone says nothing about which of them.
+    pub by_command: Vec<CcErrorCommandStat>,
+    /// What the failures actually *said*, most failures first and capped at
+    /// `core::cc::MESSAGE_GROUP_LIMIT` — the only grouping that answers
+    /// **why** rather than what. `by_tool` and `by_command` name the thing
+    /// that failed; a recurring cause is spread across several commands and
+    /// visible in none of them.
+    pub by_message: Vec<CcErrorMessageStat>,
+    /// Calls a `PreToolUse` hook refused, most refusals first. A different
+    /// population from the rest: nothing ran.
+    pub denials: Vec<CcErrorDenial>,
+}
+
+/// The window's failures in total. `sidechain + top_level == errors`;
+/// `denials` is a subset of `errors`, not a fourth split.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcErrorTotals {
+    #[ts(type = "number")]
+    pub errors: i64,
+    #[ts(type = "number")]
+    pub sidechain: i64,
+    #[ts(type = "number")]
+    pub top_level: i64,
+    #[ts(type = "number")]
+    pub denials: i64,
+}
+
+/// Failures rolled up by tool name.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcErrorToolStat {
+    pub name: String,
+    #[ts(type = "number")]
+    pub errors: i64,
+    #[ts(type = "number")]
+    pub sidechain: i64,
+    #[ts(type = "number")]
+    pub top_level: i64,
+}
+
+/// Failures rolled up by their normalized message signature
+/// (`core::cc::failure_signature`).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcErrorMessageStat {
+    /// The first meaningful line of what the tool said, with paths, globs,
+    /// hex runs and digits masked. Untrusted text, sanitized and capped at
+    /// ingest like every other stored transcript-derived string.
+    pub signature: String,
+    #[ts(type = "number")]
+    pub errors: i64,
+    #[ts(type = "number")]
+    pub sidechain: i64,
+    #[ts(type = "number")]
+    pub top_level: i64,
+}
+
+/// Failures rolled up by the normalized head of a `Bash` command.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcErrorCommandStat {
+    pub prefix: String,
+    #[ts(type = "number")]
+    pub errors: i64,
+    #[ts(type = "number")]
+    pub sidechain: i64,
+    #[ts(type = "number")]
+    pub top_level: i64,
+}
+
+/// Which mechanism refused a call. Two of them, deliberately never merged:
+/// one is the user's own configuration, the other is Claude Code's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum CcDenialKind {
+    /// A user-authored `PreToolUse` hook (``PreToolUse:<Tool> hook error:
+    /// Blocked `<command>`: <reason>``).
+    Hook,
+    /// Claude Code's own auto mode classifier ("Permission for this action was
+    /// denied by the Claude Code auto mode classifier. Reason: …").
+    Classifier,
+}
+
+/// One `(kind, reason)` a refusal mechanism gave, and how often.
+///
+/// Grouped on the **reason**, deliberately not on the command and not on the
+/// tool. Both were tried against the real corpus and both fragment a
+/// recurring rule into rows of one: the same hook fires from unrelated
+/// command lines (`git push` is one clause of a longer one), and the same
+/// classifier verdict blocks `Bash`, `Edit`, `Agent` and `Write` alike. What
+/// varied is reported alongside instead, so nothing is lost.
+///
+/// `kind` **is** in the key: a hook is the user's own configuration and the
+/// classifier is Claude Code's, so a shared reason string would still be two
+/// different facts.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcErrorDenial {
+    pub kind: CcDenialKind,
+    /// What the refusal said, sanitized and capped like every stored
+    /// transcript-derived string.
+    pub reason: String,
+    /// The distinct normalized command heads seen under this reason, sorted
+    /// and capped (`core::cc::DENIAL_PREFIX_LIMIT`) — the hook's own named
+    /// command where it gave one, else the containing call's. Empty when
+    /// neither is known. `count` counts every refusal regardless.
+    pub command_prefixes: Vec<String>,
+    /// The distinct tools refused under this reason, sorted and capped the
+    /// same way — the tool the hook named, else the joined call row's. A
+    /// classifier verdict names no tool of its own, so for those this is
+    /// entirely the call row's.
+    pub tools: Vec<String>,
+    #[ts(type = "number")]
+    pub count: i64,
+}
+
 /// One subagent (sidechain) currently running under a live session — surfaced as
 /// a concise line under the session's card. Keyed by the transcript `agentId`;
 /// `agent`/`skill` come from its `attributionAgent`/`attributionSkill`.

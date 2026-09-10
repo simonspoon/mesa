@@ -774,6 +774,38 @@ const MIGRATIONS: &[&str] = &[
     // half-migrated name can equal another row's unmigrated one.
     "UPDATE library_items SET name = name || ' TMP1114' WHERE kind = 'hook';
      UPDATE library_items SET name = replace(name, ' TMP1114', '.sh') WHERE kind = 'hook';",
+    // Task 1132: which tool calls FAILED, in their own table rather than as a
+    // column on `cc_tool_calls`.
+    //
+    // A failure is only knowable from the *result* line, and ingest is
+    // incremental with a per-file byte cursor: a batch can end between the
+    // `tool_use` line and the `tool_result` answering it. A column patched
+    // onto the call's row would then need a second write against a row a
+    // later batch may never revisit, and every such straddling failure would
+    // be lost. Keyed on `tool_use_id` and written from the result line alone,
+    // this row lands whether or not its call's row did — the read path LEFT
+    // JOINs `cc_tool_calls` for the name and the command, and reports an
+    // error whose call it cannot name rather than dropping it.
+    //
+    // `sidechain` is on this row because it is nowhere else: the transcript's
+    // `isSidechain` is parsed but only ever folded into the session-level
+    // `cc_sessions.used_subagent`, which answers "did this session use a
+    // subagent", not "was this call one". Over half of all failures are a
+    // subagent's, so the split is the point of the view.
+    "CREATE TABLE cc_tool_errors (
+        tool_use_id   TEXT PRIMARY KEY,
+        session_id    TEXT NOT NULL,
+        ts            INTEGER NOT NULL,
+        sidechain     INTEGER NOT NULL DEFAULT 0,
+        denial_kind   TEXT,
+        denial_tool   TEXT,
+        denial_command TEXT,
+        denial_reason TEXT,
+        signature     TEXT,
+        excerpt       TEXT
+    );
+    CREATE INDEX idx_cc_tool_errors_session ON cc_tool_errors(session_id);
+    CREATE INDEX idx_cc_tool_errors_ts      ON cc_tool_errors(ts);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -2012,6 +2044,10 @@ pub struct CcFileBatch {
     pub agent_runs: Vec<CcAgentRunUpsert>,
     pub messages: Vec<CcMessageRow>,
     pub tool_calls: Vec<CcToolCallRow>,
+    /// Every `tool_result` block in this file that came back `is_error: true`.
+    /// Written from the result line alone — see the `cc_tool_errors`
+    /// migration for why it is not a column on `tool_calls`.
+    pub tool_errors: Vec<CcToolErrorRow>,
     pub prompts: Vec<CcPromptRow>,
     /// Every `(session_id, agent_id)` pair whose lines this file carries —
     /// `agent_id` empty for the main thread. The pointer back to the
@@ -2139,6 +2175,73 @@ pub struct CcToolCallRow {
     /// already sanitized and length-capped by [`crate::core::cc::tool_target`].
     /// `None` when the tool has no meaningful target, or when its input was
     /// unparseable.
+    pub target: Option<String>,
+}
+
+/// One failed tool call, keyed by the `tool_use_id` of the `tool_result` block
+/// that reported it. Re-inserting is a no-op, like every other cc row.
+///
+/// Deliberately carries nothing the joined `cc_tool_calls` row already holds:
+/// no tool name and no command, both of which the result line does not have
+/// anyway. What is here is what only this line knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcToolErrorRow {
+    pub tool_use_id: String,
+    pub session_id: String,
+    pub ts: i64,
+    /// True when the failing call was a subagent's (`isSidechain`).
+    pub sidechain: bool,
+    /// Which *refusal* this is — the call never ran — or `None` for an
+    /// ordinary failure. Two mechanisms, deliberately not merged: `hook` is a
+    /// user-authored `PreToolUse` hook, `classifier` is Claude Code's own auto
+    /// mode classifier. Stored as its serialized name; the one column also
+    /// answers "is this a denial at all", so the two can never drift.
+    pub denial_kind: Option<String>,
+    /// The tool the refusing hook named (`PreToolUse:<tool>`). Read off the
+    /// message rather than the joined call row so a hook denial can be
+    /// reported even when its `tool_use` line is outside this batch. `None`
+    /// for an ordinary failure, and for a `classifier` denial — that verdict
+    /// names no tool, so the joined call row answers for it.
+    pub denial_tool: Option<String>,
+    /// The command the refusing hook itself named, between the backticks of
+    /// ``Blocked `<command>`:`` — `None` for an ordinary failure, and for a
+    /// denial whose message names none (every `classifier` verdict, and a hook
+    /// refusal that spelled its command into its prose). What the *hook*
+    /// refused, which is not the same thing as what the call ran: `git push`
+    /// is routinely one clause of a longer line.
+    pub denial_command: Option<String>,
+    /// Why the call was refused, `None` unless `denial_kind` is set.
+    pub denial_reason: Option<String>,
+    /// The normalized failure signature of what the tool said — its first
+    /// meaningful line with the volatile parts masked
+    /// ([`crate::core::cc::failure_signature`]). Computed at **ingest**, off
+    /// the full result text, because `excerpt` has already lost the line
+    /// structure the rule reads (`sanitize_capped` collapses newlines) and is
+    /// cut at 200 characters. `None` when the tool said nothing.
+    pub signature: Option<String>,
+    /// The first of what the tool said, sanitized and capped by
+    /// [`crate::core::cc::sanitize_capped`] like every other stored
+    /// transcript-derived string.
+    pub excerpt: Option<String>,
+}
+
+/// One `cc_tool_errors` row as read back for `mesa cc errors`, already LEFT
+/// JOINed to its `cc_tool_calls` row. `name`/`target` are `None` when that
+/// call's own line has not been ingested — the join is outer precisely so an
+/// error is never dropped for want of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcToolErrorRecord {
+    pub tool_use_id: String,
+    pub sidechain: bool,
+    pub denial_kind: Option<String>,
+    pub denial_tool: Option<String>,
+    pub denial_command: Option<String>,
+    pub denial_reason: Option<String>,
+    pub signature: Option<String>,
+    /// The tool's name, from the joined call row.
+    pub name: Option<String>,
+    /// What the call acted on, from the joined call row — for a `Bash` call
+    /// that is the command itself (`cc::tool_target` lifts `input.command`).
     pub target: Option<String>,
 }
 
@@ -5554,8 +5657,8 @@ impl Store {
     }
 
     /// Purges ALL persisted Claude Code telemetry — every row of `cc_messages`,
-    /// `cc_prompts`, `cc_tool_calls`, `cc_agent_runs`, `cc_sessions` and the
-    /// `cc_files` cursors — in one transaction, so a crash leaves either the whole index
+    /// `cc_prompts`, `cc_tool_calls`, `cc_tool_errors`, `cc_agent_runs`,
+    /// `cc_sessions` and the `cc_files` cursors — in one transaction, so a crash leaves either the whole index
     /// or none of it. The corrective counterpart to `cc_clear_cursors`, which
     /// is additive-only: re-ingest can never *change* an existing row's values
     /// (task 693's usage dedupe), so fixing already-stored rows means deleting
@@ -5568,6 +5671,7 @@ impl Store {
             "cc_messages",
             "cc_prompts",
             "cc_tool_calls",
+            "cc_tool_errors",
             "cc_agent_runs",
             "cc_sessions",
             "cc_node_files",
@@ -5739,6 +5843,34 @@ impl Store {
                 }
             }
 
+            // No backfill twin and no `DO UPDATE`: every column of this row
+            // comes off the one line that carries it, so a conflicting row
+            // already holds exactly what this insert would supply. Uncounted
+            // in `CcIngestCounts` for the reason prompts are — a new field
+            // there would ripple into the TS type and cc-check's assertions
+            // for a number no reader reports.
+            let mut err = tx.prepare(
+                "INSERT INTO cc_tool_errors \
+                     (tool_use_id, session_id, ts, sidechain, denial_kind, denial_tool, \
+                      denial_command, denial_reason, signature, excerpt) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(tool_use_id) DO NOTHING",
+            )?;
+            for e in &batch.tool_errors {
+                err.execute((
+                    &e.tool_use_id,
+                    &e.session_id,
+                    e.ts,
+                    e.sidechain,
+                    &e.denial_kind,
+                    &e.denial_tool,
+                    &e.denial_command,
+                    &e.denial_reason,
+                    &e.signature,
+                    &e.excerpt,
+                ))?;
+            }
+
             // Prompts need no backfill twin: `preview` is NOT NULL and is the
             // only non-key column, so a conflicting row already holds the one
             // value this insert could supply. Deliberately uncounted in
@@ -5854,6 +5986,36 @@ impl Store {
                 caller: r.get(5)?,
                 ts: r.get(6)?,
                 target: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Failed tool calls with `ts >= cutoff` (`None` = all), each already LEFT
+    /// JOINed to its `cc_tool_calls` row for the tool's name and what it acted
+    /// on. The join is **outer**: an error whose call line has not been
+    /// ingested still counts, it is just unattributed — the two rows are
+    /// written from two different transcript lines that a byte-cursor batch
+    /// boundary may fall between.
+    pub fn cc_read_tool_errors(&self, cutoff: Option<i64>) -> Result<Vec<CcToolErrorRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.tool_use_id, e.sidechain, e.denial_kind, e.denial_tool, \
+                    e.denial_command, e.denial_reason, e.signature, c.name, c.target \
+             FROM cc_tool_errors e \
+             LEFT JOIN cc_tool_calls c ON c.tool_use_id = e.tool_use_id \
+             WHERE ?1 IS NULL OR e.ts >= ?1",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| {
+            Ok(CcToolErrorRecord {
+                tool_use_id: r.get(0)?,
+                sidechain: r.get::<_, i64>(1)? != 0,
+                denial_kind: r.get(2)?,
+                denial_tool: r.get(3)?,
+                denial_command: r.get(4)?,
+                denial_reason: r.get(5)?,
+                signature: r.get(6)?,
+                name: r.get(7)?,
+                target: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -10955,15 +11117,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            53,
-            "a fresh db should report user_version 53"
+            54,
+            "a fresh db should report user_version 54"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 53);
+        assert_eq!(version, 54);
     }
 
     /// Pins the artifacts migration (mesa task 974) at index 50, the position
@@ -12215,6 +12377,18 @@ mod tests {
                 ts: 1500,
                 target: Some("ls -la".into()),
             }],
+            tool_errors: vec![CcToolErrorRow {
+                tool_use_id: "toolu-1".into(),
+                session_id: "sess-1".into(),
+                ts: 1500,
+                sidechain: false,
+                denial_kind: None,
+                denial_tool: None,
+                denial_command: None,
+                denial_reason: None,
+                signature: Some("ls: no such file".into()),
+                excerpt: Some("ls: no such file".into()),
+            }],
             prompts: vec![CcPromptRow {
                 uuid: "uuid-0".into(),
                 session_id: "sess-1".into(),
@@ -12355,6 +12529,7 @@ mod tests {
         assert_eq!(cc_count(&store, "cc_agent_runs"), 1);
         assert_eq!(cc_count(&store, "cc_messages"), 2);
         assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
+        assert_eq!(cc_count(&store, "cc_tool_errors"), 1);
         assert_eq!(cc_count(&store, "cc_files"), 1);
         // One pointer row per thread the file carried — main plus subagent.
         assert_eq!(cc_count(&store, "cc_node_files"), 2);
@@ -12366,6 +12541,7 @@ mod tests {
         assert_eq!(cc_count(&store, "cc_agent_runs"), 1);
         assert_eq!(cc_count(&store, "cc_messages"), 2);
         assert_eq!(cc_count(&store, "cc_tool_calls"), 1);
+        assert_eq!(cc_count(&store, "cc_tool_errors"), 1);
         assert_eq!(cc_count(&store, "cc_files"), 1);
         // The pointer upserts on its composite key, so a re-walk rewrites the
         // same two rows rather than accumulating one pair per sync.

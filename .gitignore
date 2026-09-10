@@ -2,3 +2,5 @@
 node_modules/
 dist/
 .DS_Store
+.mesa-screens/
+khora-screenshot.png

@@ -45,6 +45,12 @@ import {
 } from '../keymapDraft'
 import { publishKeymap } from '../keymapStore'
 import {
+  SETTINGS_TABS,
+  settingsTabHref,
+  settingsTabLabel,
+  type SettingsTab,
+} from '../settingsTab'
+import {
   clampPct,
   formatBytes,
   formatUptime,
@@ -216,8 +222,12 @@ function SettingsHeader() {
  *
  * The file is read fresh on every spawn, so a save takes effect immediately —
  * no server restart, which the page states so nobody goes looking for one.
+ *
+ * The page is five tabs (mesa task 1140), the active one named by the hash
+ * route (`settingsTab.ts`); this component is the shell and the Hooks tab's
+ * own form.
  */
-export function SettingsView() {
+export function SettingsView({ tab }: { tab: SettingsTab }) {
   const { data: commands, error, refetch } = useFetch(() => getConfig(), 'config')
   // The whole page is one subject — the config file — so the page is the whole
   // report (mesa task 888).
@@ -290,59 +300,86 @@ export function SettingsView() {
         a change takes effect on the next dispatch, with no server restart.
       </p>
 
-      <h2>Hooks</h2>
-      <p className="muted">
-        The hook mesa runs to start a coding agent. Leave a box empty to use
-        the built-in default. There are two modes, chosen by what you type:
-      </p>
-      <ul className="muted settings-modes">
-        <li>
-          <strong>One line is argv, not a shell command</strong>: no pipes,
-          redirection, <code>$VAR</code> or <code>~</code>. Quote an argument
-          that contains spaces, and write values as <code>{'{}'}</code>{' '}
-          placeholders.
-        </li>
-        <li>
-          <strong>More than one line is a bash script</strong>, run as{' '}
-          <code>bash -c</code> in the same folder — so you can <code>cd</code>,{' '}
-          <code>export</code>, or pick a binary first. The same{' '}
-          <code>{'{}'}</code> placeholders work here: each becomes a reference
-          to the <code>MESA_*</code> variable its value travels in, quoted to
-          suit where you put it. Anywhere works except inside{' '}
-          <code>'…'</code> or backticks, where nothing expands — those are
-          refused when you save. The variables are still there to read directly,
-          which is how a script tells a value with nothing to say on this run
-          (left unset) from an empty one.
-        </li>
-      </ul>
-
-      <PromptPlaceholderList />
-
-      {commands.map((c) => (
-        <CommandRow
-          key={c.action}
-          command={c}
-          draft={seeded}
-          onEdit={(value) => edit(c.action, value)}
-        />
-      ))}
-
-      <div className="settings-actions">
-        <button type="button" disabled={!dirty || saving} onClick={save}>
-          {saving ? 'saving…' : 'save'}
-        </button>
-        {dirty && !saving && <span className="muted">unsaved changes</span>}
-        {saved && !dirty && <span className="settings-saved">saved</span>}
+      <div className="tabs">
+        {SETTINGS_TABS.map((t) => (
+          <button
+            key={t}
+            className={t === tab ? 'active' : ''}
+            onClick={() => {
+              if (t !== tab) window.location.hash = settingsTabHref(t)
+            }}
+          >
+            {settingsTabLabel(t)}
+          </button>
+        ))}
       </div>
-      {saveError && <p className="error">{saveError}</p>}
 
-      <WatchersSection />
-      <KeymapSection />
-      <LivePromptSection />
-      <SpeechSection />
-      <ListenSection />
-      <PricingSection />
-      <SystemSection />
+      {/* Every tab's sections stay mounted and are merely hidden when
+          inactive: each holds its draft in component-local state, so
+          unmounting on a tab switch would silently discard an unsaved edit. */}
+      <div hidden={tab !== 'hooks'}>
+        <h2>Hooks</h2>
+        <p className="muted">
+          The hook mesa runs to start a coding agent. Leave a box empty to use
+          the built-in default. There are two modes, chosen by what you type:
+        </p>
+        <ul className="muted settings-modes">
+          <li>
+            <strong>One line is argv, not a shell command</strong>: no pipes,
+            redirection, <code>$VAR</code> or <code>~</code>. Quote an argument
+            that contains spaces, and write values as <code>{'{}'}</code>{' '}
+            placeholders.
+          </li>
+          <li>
+            <strong>More than one line is a bash script</strong>, run as{' '}
+            <code>bash -c</code> in the same folder — so you can <code>cd</code>,{' '}
+            <code>export</code>, or pick a binary first. The same{' '}
+            <code>{'{}'}</code> placeholders work here: each becomes a reference
+            to the <code>MESA_*</code> variable its value travels in, quoted to
+            suit where you put it. Anywhere works except inside{' '}
+            <code>'…'</code> or backticks, where nothing expands — those are
+            refused when you save. The variables are still there to read directly,
+            which is how a script tells a value with nothing to say on this run
+            (left unset) from an empty one.
+          </li>
+        </ul>
+
+        <PromptPlaceholderList />
+
+        {commands.map((c) => (
+          <CommandRow
+            key={c.action}
+            command={c}
+            draft={seeded}
+            onEdit={(value) => edit(c.action, value)}
+          />
+        ))}
+
+        <div className="settings-actions">
+          <button type="button" disabled={!dirty || saving} onClick={save}>
+            {saving ? 'saving…' : 'save'}
+          </button>
+          {dirty && !saving && <span className="muted">unsaved changes</span>}
+          {saved && !dirty && <span className="settings-saved">saved</span>}
+        </div>
+        {saveError && <p className="error">{saveError}</p>}
+
+        <WatchersSection />
+      </div>
+      <div hidden={tab !== 'keyboard'}>
+        <KeymapSection />
+      </div>
+      <div hidden={tab !== 'voice'}>
+        <LivePromptSection />
+        <SpeechSection />
+        <ListenSection />
+      </div>
+      <div hidden={tab !== 'pricing'}>
+        <PricingSection />
+      </div>
+      <div hidden={tab !== 'system'}>
+        <SystemSection />
+      </div>
     </div>
   )
 }

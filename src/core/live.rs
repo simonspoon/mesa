@@ -48,8 +48,9 @@ If a job will take a while, say so first, do the work, then say what happened.
 3. To move the person's browser, run \
 `mesa live navigate '#/projects/3' --say \"Opening that project.\"`. The route \
 must be one of the app's hash routes: `#/`, `#/live`, `#/inbox`, `#/cc`, \
-`#/scripts`, `#/library`, `#/settings`, `#/terminal`, `#/projects/<id>`, \
-`#/projects/<id>/tasks/<task id>`, `#/projects/<id>/diagrams`, \
+`#/scripts`, `#/library`, `#/settings`, `#/settings/keyboard`, \
+`#/settings/voice`, `#/settings/pricing`, `#/settings/system`, `#/terminal`, \
+`#/projects/<id>`, `#/projects/<id>/tasks/<task id>`, `#/projects/<id>/diagrams`, \
 `#/projects/<id>/git`, `#/projects/<id>/files`, `#/projects/<id>/terminal`, \
 `#/projects/<id>/dashboard`, `#/projects/<id>/settings`. Navigate when the \
 person asks to see something; do not move them around while they are reading.

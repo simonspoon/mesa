@@ -116,7 +116,7 @@ The code is the source of truth. These are the invariants you must not break:
   `markdownAssets`, `modalDrag`, `navCollapse`, `navOrder`,
   `navWidth`, `newFile`, `openFiles`, `pricingDraft`, `projectPanes`,
   `projectTree`, `promptPlaceholders`, `scriptDraft`, `sessionDetail`, `sessionGraph`,
-  `sessionTimeline`, `settingsDraft`, `shapeBox`, `shapePalette`, `speechDraft`,
+  `sessionTimeline`, `settingsDraft`, `settingsTab`, `shapeBox`, `shapePalette`, `speechDraft`,
   `speechPlayback`,
   `syntaxHighlighter`, `systemMeter`,
   `time`, `usageMeter`, `watchersDraft`, `wavStream`, `wordWrap`) —

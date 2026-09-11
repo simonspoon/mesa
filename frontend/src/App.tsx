@@ -20,6 +20,7 @@ import { LiveHub } from './components/LiveHub'
 import { ProjectTasksPage } from './pages/ProjectTasksPage'
 import { ScriptsView } from './pages/ScriptsView'
 import { SettingsView } from './pages/SettingsView'
+import { settingsTabFromPath } from './settingsTab'
 import { TerminalPage } from './pages/TerminalPage'
 import { isPhone, onPhoneTierChange } from './phoneTier'
 import { useSpatialNav } from './spatialNav'
@@ -233,8 +234,10 @@ function App() {
   const inboxMatch = /^\/inbox(?:\/(read|archived))?$/.exec(path)
   const inboxFilter = inboxMatch ? inboxFilterFor(inboxMatch[1]) : null
   // Settings: global, above projects like the Inbox — the config file it edits
-  // is per-machine, not per-project.
-  const settingsMatch = /^\/settings$/.exec(path)
+  // is per-machine, not per-project. The optional segment is the page's tab
+  // (`settingsTab.ts`, mesa task 1140); anchored, so `/projects/<id>/settings`
+  // below is never mistaken for it.
+  const settingsMatch = /^\/settings(?:\/([^/]+))?$/.exec(path)
   // Scripts: global too. A script may bind a project (whose `local_path` is
   // then the run's cwd), but it is not a project tab — an unbound one runs in
   // $HOME and belongs to no project at all.
@@ -328,7 +331,7 @@ function App() {
   let page
   if (settingsMatch) {
     // ~/.mesa/config.json editor: no project frame, no active project.
-    page = <SettingsView />
+    page = <SettingsView tab={settingsTabFromPath(path)} />
   } else if (scriptsMatch) {
     // Stored shell scripts + their run forms: global, so no project frame and
     // no active project, exactly like the inbox below.

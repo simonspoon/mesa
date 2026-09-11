@@ -1,13 +1,13 @@
-//! User config: the command lines mesa uses when it starts a coding agent,
-//! and the per-model price table the CC Dashboard estimates cost from.
+//! User config: the hook mesa runs when it starts a coding agent, and the
+//! per-model price table the CC Dashboard estimates cost from.
 //!
 //! mesa spawns an agent from exactly five places — the todo-watcher's
 //! dispatch, the inbox-watcher's triage, the Agents surface's "add agent"
 //! button, the live conversation's agent, and the short-lived agent that
 //! writes a live conversation's memory once it ends (mesa task 921). Each
 //! used to be a hardcoded `claude --bg …` argv, so swapping the binary, the
-//! persona, or the slash command meant a rebuild. Each is now a **command
-//! template** in `~/.mesa/config.json`:
+//! persona, or the slash command meant a rebuild. Each is now a **hook** in
+//! `~/.mesa/config.json`:
 //!
 //! ```json
 //! {
@@ -21,62 +21,53 @@
 //! }
 //! ```
 //!
-//! A single-line template is **argv, not a shell command** — tokenized here
-//! and handed to `Command` directly, with no `sh -c` anywhere. That is
-//! load-bearing, not stylistic: the watchers pass a task name / inbox body
-//! (untrusted free text) as the session `--name`, and what makes that safe is
-//! that it reaches the agent as one `Command::arg`. Placeholders are
-//! substituted *after* tokenization, so a value can never split into extra
-//! argv entries or be reinterpreted as flags — see [`expand`].
+//! ## One mode: every hook is a bash script
 //!
-//! ## Script mode
+//! A value is a **bash script**, run as `bash -c <script>` (mesa task 1143).
+//! One line or many — there is no second mode, no newline rule, and a
+//! one-line value is simply a one-line script, which is why the defaults
+//! above read as the command lines they are and why `cd`, `export`, a pipe
+//! or a conditional binary all just work.
 //!
-//! A value whose trimmed text contains a **newline** is instead a bash script,
-//! run as `bash -c <script>` ([`is_script`], [`resolve`]). That buys a `cd`, an
-//! `export`, a conditional binary — the things a single program call can't do.
+//! Each `{placeholder}` is replaced, at the slot it occupies, by its **value
+//! shell-quoted for the context it sits in** ([`substitute_script`],
+//! [`Ctx::quoted`]): single-quoted in a word position, backslash-escaped
+//! inside `"…"` and in an unquoted heredoc body. What bash reads at every slot
+//! is therefore a string literal, never syntax — the watchers pass a task
+//! name or an inbox body (untrusted free text) as the session `--name`, and a
+//! name of `"; rm -rf / #` becomes `'"; rm -rf / #'`, one argument. Wherever
+//! bash performs word expansion it does not re-read the result looking for
+//! syntax, so a value inside a quoted literal cannot run. There are no
+//! `MESA_*` environment variables any more (a saved script that still reads
+//! one is migrated on read, [`migrate_env_references`], and refused on save);
+//! an absent value is the empty string, since free-form shell text has no
+//! token to drop.
 //!
-//! `{placeholder}`s work here too (mesa task 1137) — one vocabulary, both
-//! modes, and nobody has to reach for an environment variable by hand. What is
-//! spliced into the script text is a **reference, never a value**:
-//! [`substitute_script`] replaces `{name}` with `"${MESA_NAME-}"`, and the
-//! value itself reaches the child through [`script_env`] exactly as it always
-//! did. So `echo "{name}"`, `echo {name}` and `cd $(dirname {name})` all work,
-//! and the safety property is the *same one the `MESA_*` variables have*, which
-//! is the strongest one available here: everywhere bash performs **word
-//! expansion** it does not re-read what an expansion produced looking for
-//! metacharacters, so a task name of `"; rm -rf / #` is inert.
+//! **Arithmetic evaluation is a second parser** and is the exception.
+//! `$(( ))`, `(( ))`, `let "…"`, `[[ x -gt y ]]` and an array subscript all
+//! re-read what they are given, and an array subscript inside arithmetic is
+//! itself expanded, so `a[$(cmd)]` runs the command however it was quoted on
+//! the way in. [`scan_script`] refuses the two spellings it can cheaply see
+//! (`$((`, `((`), wherever they are on the context stack; the rest are
+//! documented sharp edges in `docs/config.md`, because teaching this lexer
+//! bash's arithmetic is a trap.
 //!
-//! **Arithmetic evaluation is a second parser** and is the exception. `$(( ))`,
-//! `(( ))`, `let "…"`, `[[ x -gt y ]]` and an array subscript all re-read the
-//! expansion's result, where `a[$(cmd)]` runs the command — exactly as a
-//! hand-written `[[ "$MESA_NAME" -gt 0 ]]` has always done. A placeholder is
-//! therefore precisely as safe as the variable it references, never safer.
-//! [`scan_script`] refuses the two spellings it can cheaply see (`$((`, `((`);
-//! the rest are documented sharp edges in `docs/config.md`, because teaching
-//! this lexer the rest of bash's arithmetic is the trap this design walked away
-//! from.
-//!
-//! That is why [`scan_script`] is **not** a security boundary. It picks between
-//! two inert forms — quoted, or bare where quotes would be literal text — so
-//! getting a context wrong costs a word split or a glob, never execution. The one thing
-//! it must get right is the single-quote family (`'…'`, `$'…'`, a quoted
-//! heredoc delimiter), where no expansion happens at all and there is therefore
-//! nothing correct to emit; those are refused at save time, as is a `` `…` ``,
-//! whose quoting rules differ from `$(…)`'s just enough not to guess at.
-//!
-//! A first draft of this substituted the **value**, shell-quoted per context. A
-//! security review put three command-execution escapes through its lexer in one
-//! pass — `$'…'` is not `'…'`, a subshell's `)` closed a `$(` that was never
-//! opened, and `#` starts a comment after `)` — every one of them a
-//! *classification* error rather than a bad encoder. The review's own remedy
-//! was to substitute only where the stack is exactly `[Plain]` and refuse every
-//! quoted context; substituting a reference is strictly stronger than that (a
-//! reference is inert in *every* context, so there is no classification left to
-//! get wrong) and it keeps `echo "{name}"` working, which that remedy gives
-//! up.
+//! [`scan_script`] is a deliberately coarse lexer, and it is worth being
+//! precise about what its mistakes cost now that it decides the bytes bash
+//! sees. Every form it emits is inert in every context that expands anything,
+//! so a mis-classified context costs a *mangled value* — a single-quoted
+//! string read where bash wanted double-quote escaping has stray quote
+//! characters in it; an escaped one read as a bare word splits on spaces —
+//! never execution. The two contexts where a wrong guess *could* reach
+//! execution are not guessed at: the single-quote family (`'…'`, `$'…'`, a
+//! quoted heredoc delimiter), where a `'` in the value would close the run,
+//! is refused at save time, as is a `` `…` `` (write `$(…)`) and arithmetic.
+//! So the lexer is still not asked to be a full bash grammar; it is asked to
+//! tell those contexts apart, and the tests pin the shapes a security review
+//! once broke an earlier value-substituting draft with.
 //!
 //! Unlike `hooks.json` (a genuine `sh -c` string, [`crate::core::hooks`]) no
-//! value mesa holds is ever interpolated into a string a shell parses.
+//! value mesa holds ever reaches a shell unquoted.
 //!
 //! ## Pricing
 //!
@@ -357,7 +348,7 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
     Ok(config
         .commands
         .get(action)
-        .map(|s| migrate_retired_placeholders(s.trim()))
+        .map(|s| migrate_env_references(&migrate_retired_placeholders(s.trim())))
         .filter(|s| !s.is_empty()))
 }
 
@@ -371,13 +362,15 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
 /// spawn failure; the Settings page shows the already-migrated literal text,
 /// so the user's next Save writes the literal form and the file heals itself;
 /// and a template *saved anew* with either token is refused by the ordinary
-/// unsupported-placeholder rule ([`Vars::lookup`], [`check_script`]), because
+/// unsupported-placeholder rule ([`check_key`]), because
 /// the vocabulary no longer offers them — a path the UI can no longer reach,
 /// since it never shows those tokens.
 ///
 /// Substring replacement is exact on the braced form, so `{bin: 1}` or a
-/// `{prompt:bin}` name is untouched, and the same rewrite serves both modes:
-/// in a script `"{bin}"` becomes `"claude"`, which is what `MESA_BIN` held.
+/// `{prompt:bin}` name is untouched; in a script `"{bin}"` becomes
+/// `"claude"`, which is what `MESA_BIN` held. Its sibling
+/// [`migrate_env_references`] rewrites the `MESA_*` variables mesa task 1143
+/// retired the same way.
 pub fn migrate_retired_placeholders(template: &str) -> String {
     template
         .replace("{bin}", "claude")
@@ -404,10 +397,6 @@ fn settings_in(path: &Path) -> Result<Vec<ConfigCommand>, String> {
                 value: command_in(path, action)?,
                 default: default_command(action).unwrap_or_default().to_string(),
                 placeholders: offered_placeholders(action)
-                    .iter()
-                    .map(|p| (*p).to_string())
-                    .collect(),
-                env_vars: offered_env_vars(action)
                     .iter()
                     .map(|p| (*p).to_string())
                     .collect(),
@@ -528,102 +517,49 @@ fn write_atomically(path: &Path, body: &str) -> Result<(), SaveError> {
 ///
 /// The point is *when* the failure lands: at save time, in the editor, rather
 /// than at the next dispatch, in a watcher log the user isn't reading.
+/// Rejects a template the spawn path would fail on later — a `MESA_*`
+/// variable reference mesa no longer sets, a placeholder this action doesn't
+/// offer, one sitting where no substitution could go, an unknown library
+/// prompt, or a bash syntax error. Every value is supplied, so only
+/// template-shaped mistakes are caught here.
+///
+/// The point is *when* the failure lands: at save time, in the editor, rather
+/// than at the next dispatch, in a watcher log the user isn't reading.
 pub fn validate(action: &str, template: &str, prompts: &Prompts) -> Result<(), String> {
-    if is_script(template) {
-        let script = template.trim();
-        check_script(action, script, prompts)?;
-        // Parse what `bash` will actually be handed — placeholders already
-        // replaced by their `${MESA_…-}` references — rather than the template
-        // with braces still in it, so the syntax check covers the real shape.
-        return bash_syntax_check(action, &substitute_script(action, script, prompts)?);
-    }
+    let script = template.trim();
+    refuse_env_references(action, script)?;
+    check_script(action, script, prompts)?;
     let vars = Vars {
         id: Some(1),
         name: Some("name"),
         prompt: Some("prompt"),
         prompts: Some(prompts),
     };
-    expand(action, template, &vars).map(|_| ())
+    // Parse what `bash` will actually be handed — placeholders already
+    // replaced by quoted values — rather than the template with braces still
+    // in it, so the syntax check covers the real shape.
+    bash_syntax_check(action, &substitute_script(action, script, &vars)?)
 }
 
-/// True when this value is a **script** rather than an argv template: its
-/// trimmed text spans more than one line.
-///
-/// Mode is chosen by the value, not by a second config key — a JSON string
-/// already carries `\n` and the Settings box is already a `<textarea>`, so
-/// there is nothing to migrate and every existing (single-line) template keeps
-/// its exact behavior. Trimming first is deliberate: surrounding blank lines
-/// are whitespace, and whitespace alone must not silently switch modes.
-pub fn is_script(template: &str) -> bool {
-    template.trim().contains('\n')
+/// Resolves one action's configured (or default) `template` into the script
+/// `bash -c` runs: the trimmed text with every `{placeholder}` replaced by its
+/// value, shell-quoted for the context it sits in ([`substitute_script`]).
+/// One mode, one function — the spawn path and the Settings preview can never
+/// disagree about what will run.
+pub fn resolve(action: &str, template: &str, vars: &Vars) -> Result<String, String> {
+    let script = template.trim();
+    check_script(action, script, vars.prompts())?;
+    substitute_script(action, script, vars)
 }
 
-/// How a resolved command will actually be run — the two modes, decided by
-/// [`is_script`] and produced by [`resolve`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum Spawn {
-    /// A tokenized argv, run directly with no shell (the original mode).
-    Argv(Vec<String>),
-    /// A bash script, run as `bash -c <script>` with `env` set on the child.
-    /// The script text has had its placeholders replaced by `${MESA_…-}`
-    /// **references** ([`substitute_script`]); the values themselves travel in
-    /// `env`, so what reaches `bash` holds no untrusted text at all.
-    Script {
-        script: String,
-        env: Vec<(String, String)>,
-    },
-}
-
-/// Resolves one action's configured (or default) `template` into the thing to
-/// run. The mode split lives here so both surfaces — the spawn path and the
-/// Settings preview — can never disagree about which one applies.
-pub fn resolve(action: &str, template: &str, vars: &Vars) -> Result<Spawn, String> {
-    if is_script(template) {
-        let script = template.trim();
-        check_script(action, script, vars.prompts())?;
-        return Ok(Spawn::Script {
-            script: substitute_script(action, script, vars.prompts())?,
-            env: script_env(action, script, vars),
-        });
-    }
-    Ok(Spawn::Argv(expand(action, template, vars)?))
-}
-
-/// Every placeholder name, paired with the environment variable a script reads
-/// instead. The one mapping, shared by the env handoff, the save-time error and
-/// the vocabulary the Settings page advertises.
-const PLACEHOLDER_ENV: [(&str, &str); 3] = [
-    ("id", "MESA_ID"),
-    ("name", "MESA_NAME"),
-    ("prompt", "MESA_PROMPT"),
-];
-
-/// The environment variable names `action` offers a script, in the same order
-/// [`offered_placeholders`] lists their `{}` twins. Public so the Settings page
-/// can only ever advertise variables the handoff actually sets.
-pub fn offered_env_vars(action: &str) -> &'static [&'static str] {
-    match action {
-        AGENT_SPAWN => &["MESA_PROMPT"],
-        LIVE_AGENT | LIVE_SUMMARY => &["MESA_ID", "MESA_NAME", "MESA_PROMPT"],
-        _ => &["MESA_ID", "MESA_NAME"],
-    }
-}
-
-/// Every variable script mode ever sets, offered or not — the list
-/// [`crate::core::agents`] explicitly *removes* from the child before setting
-/// the ones that apply, so "not offered" and "no value on this call" are both
-/// genuinely **unset** rather than inherited from mesa's own environment.
-pub const ALL_ENV_VARS: [&str; 3] = ["MESA_ID", "MESA_NAME", "MESA_PROMPT"];
+/// The three built-in placeholder names. Per-call data, so each is offered to
+/// a subset of the actions ([`offered_placeholders`]); the library's
+/// `{prompt:<name>}` form is orthogonal and offered everywhere.
+const BUILTIN_PLACEHOLDERS: [&str; 3] = ["id", "name", "prompt"];
 
 /// The `{prompt:<name>}` form's prefix — the one thing that keeps it from
 /// colliding with the built-in `{prompt}`, which has no colon.
 const PROMPT_PREFIX: &str = "prompt:";
-
-/// The prefix of the environment variable a script reads a library prompt
-/// through. `{prompt:stop-notify}` becomes `MESA_PROMPT_STOP_NOTIFY`, which can
-/// never collide with the built-in `MESA_PROMPT` — a name is non-empty, so the
-/// trailing `_` is always followed by something.
-const PROMPT_ENV_PREFIX: &str = "MESA_PROMPT_";
 
 /// The library's `prompt` items, keyed for placeholder resolution — the table
 /// `{prompt:<name>}` resolves against (mesa task 1138).
@@ -695,45 +631,46 @@ fn prompt_name(key: &str) -> Option<&str> {
     (head && tail).then_some(name)
 }
 
-/// The environment variable a script reads this prompt through — uppercased,
-/// `-` folded to `_`. `None` when the name holds a character an environment
-/// variable cannot, which a library name may (`.`).
-fn prompt_env_var(name: &str) -> Option<String> {
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-        .then(|| {
-            format!(
-                "{PROMPT_ENV_PREFIX}{}",
-                name.to_ascii_uppercase().replace('-', "_")
-            )
-        })
+/// True when `key` is shaped like a placeholder *name* — letters, digits, `-`
+/// and `_`, nothing else. That is what makes `{tsak}` an error while `{id: 1}`,
+/// `{ …; }` and `cp a{,.bak}` stay the bash text they obviously are: a brace
+/// holding only name characters is nothing to bash (brace expansion needs a
+/// `,` or `..`), so it can only have been meant as one of mesa's.
+fn is_placeholder_shaped(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
-/// The variable name for `{prompt:<name>}`, or the reason this template cannot
-/// have it — the one place both modes ask the two questions a prompt
-/// placeholder can fail on, so argv and script mode offer exactly the same
-/// vocabulary.
-///
-/// The env-var charset is checked in **both** modes even though argv mode sets
-/// no variables: a `{prompt:my.name}` that worked in a one-line template and
-/// failed the moment the author added a second line would be a worse surprise
-/// than a name they have to rename once.
-fn prompt_resolution(action: &str, name: &str, prompts: &Prompts) -> Result<String, String> {
-    let Some(var) = prompt_env_var(name) else {
-        return Err(format!(
-            "library prompt {{prompt:{name}}} in the {action} command cannot be used as a \
-             placeholder: a script reads it as an environment variable, and {name:?} holds a \
-             character a variable name cannot — rename it to letters, digits, \"_\" and \"-\""
-        ));
-    };
-    if prompts.body(name).is_none() {
-        return Err(format!(
+/// The body of `{prompt:<name>}`, or the "unknown prompt" error naming what
+/// the library does offer.
+fn prompt_body<'p>(action: &str, name: &str, prompts: &'p Prompts) -> Result<&'p str, String> {
+    prompts.body(name).ok_or_else(|| {
+        format!(
             "unknown library prompt {{prompt:{name}}} in the {action} command; \
              the library offers {}",
             prompts.offered()
-        ));
+        )
+    })
+}
+
+/// Rejects a placeholder `key` this action cannot resolve: an unknown library
+/// prompt, or a built-in (or a typo shaped like one) the action does not
+/// offer. The one rule, asked by [`check_script`] on both the save path and the
+/// spawn path and by [`Vars::lookup`] when the value is fetched.
+fn check_key(action: &str, key: &str, prompts: &Prompts) -> Result<(), String> {
+    if let Some(name) = prompt_name(key) {
+        return prompt_body(action, name, prompts).map(|_| ());
     }
-    Ok(var)
+    if offered_placeholders(action).contains(&format!("{{{key}}}").as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported placeholder {{{key}}} in the {action} command; \
+         {action} offers {}",
+        offered_list(action)
+    ))
 }
 
 /// One pass over a resolved prompt body, no recursion: the built-in
@@ -745,10 +682,8 @@ fn prompt_resolution(action: &str, name: &str, prompts: &Prompts) -> Result<Stri
 /// or a person wrote, not a template the config author reviewed, so a stray
 /// brace in it must not break a hook. The one pass is what bounds it — the
 /// text this produces is never rescanned, so a body holding `{prompt:x}`
-/// cannot expand, recurse or loop.
-///
-/// In script mode this runs on the *value* that travels in the environment,
-/// which no shell ever parses, so the untrusted-input invariant is untouched.
+/// cannot expand, recurse or loop. The result is then quoted as one value like
+/// any other ([`Ctx::quoted`]), so nothing in it is ever parsed as shell.
 fn expand_body(action: &str, body: &str, vars: &Vars) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -762,9 +697,8 @@ fn expand_body(action: &str, body: &str, vars: &Vars) -> String {
         let key = &from_brace[1..close];
         // Only the three built-in names are ever looked up here, so this cannot
         // reach `{prompt:…}` and cannot recurse.
-        match PLACEHOLDER_ENV
-            .iter()
-            .any(|(k, _)| *k == key)
+        match BUILTIN_PLACEHOLDERS
+            .contains(&key)
             .then(|| vars.lookup(key, action))
         {
             Some(Ok(Some(value))) => out.push_str(&value),
@@ -776,51 +710,12 @@ fn expand_body(action: &str, body: &str, vars: &Vars) -> String {
     out
 }
 
-/// The variables to set for one script call: the action's own vocabulary,
-/// minus any value that is absent on this call.
-///
-/// That omission is the script-mode analogue of [`expand`]'s drop rule — an
-/// absent value leaves its variable **unset**, never set to `""`, so `set -u`
-/// fires and `${MESA_PROMPT:-}` reads as "no prompt" rather than "empty
-/// prompt".
-pub fn script_env(action: &str, script: &str, vars: &Vars) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = PLACEHOLDER_ENV
-        .iter()
-        .filter_map(|(key, var)| {
-            let value = vars.lookup(key, action).ok()??;
-            Some(((*var).to_string(), value))
-        })
-        .collect();
-    // The library prompts this script names, one variable each. Which ones
-    // those are is a property of the *script*, not of the action — every
-    // action offers every prompt — so the script has to be read to find them.
-    // `check_script` has already refused an unknown name and a collision, so
-    // on the spawn path each of these resolves; a missing one would leave its
-    // variable unset, which `${MESA_PROMPT_X-}` reads as empty.
-    let mut seen = std::collections::BTreeSet::new();
-    for slot in scan_script(script) {
-        let Some(name) = prompt_name(slot.key) else {
-            continue;
-        };
-        let Some(var) = prompt_env_var(name) else {
-            continue;
-        };
-        let Some(body) = vars.prompts().body(name) else {
-            continue;
-        };
-        if seen.insert(var.clone()) {
-            env.push((var, expand_body(action, body, vars)));
-        }
-    }
-    env
-}
-
 /// Rejects a script the spawn path would refuse later: an empty body, a
-/// `{placeholder}` this action does not offer, or one sitting somewhere no
-/// parameter expansion could reach.
+/// `{placeholder}` this action does not offer or a `{prompt:<name>}` the
+/// library does not hold, or one sitting somewhere mesa cannot put a value.
 ///
 /// Runs on **both** the save path and the spawn path, so a hand-edited config
-/// fails these three the same way the editor would have. Its sibling
+/// fails these the same way the editor would have. Its sibling
 /// [`bash_syntax_check`] does **not**: `bash -n` is save-time only, so a
 /// hand-edited file may hold a script that parses badly, and that surfaces as a
 /// failed spawn. Deliberate — a `bash` subprocess on every dispatch would cost
@@ -829,39 +724,9 @@ fn check_script(action: &str, script: &str, prompts: &Prompts) -> Result<(), Str
     if script.is_empty() {
         return Err(format!("the {action} command is empty"));
     }
-    // A prompt travels in one variable of its own, so two names that fold onto
-    // the same variable (`a-b` and `a_b`) have to be stopped here: there is one
-    // slot and two bodies, and silently keeping either would be a guess.
-    let mut prompt_vars: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
     for slot in scan_script(script) {
         let key = slot.key;
-        if let Some(name) = prompt_name(key) {
-            let var = prompt_resolution(action, name, prompts)?;
-            let canonical = name.to_lowercase();
-            if let Some(other) = prompt_vars.insert(var.clone(), canonical.clone())
-                && other != canonical
-            {
-                return Err(format!(
-                    "{{prompt:{other}}} and {{prompt:{canonical}}} in the {action} command \
-                     both become ${var}; a script reads a prompt through that one variable, \
-                     so rename one of them"
-                ));
-            }
-        } else {
-            let var = PLACEHOLDER_ENV
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| *v)
-                .unwrap_or_default();
-            if !offered_env_vars(action).contains(&var) {
-                return Err(format!(
-                    "unsupported placeholder {{{key}}} in the {action} command; \
-                     {action} offers {}",
-                    offered_list(action)
-                ));
-            }
-        }
+        check_key(action, key, prompts)?;
         // Asked of the whole stack, and asked *first*: a placeholder nested
         // inside arithmetic wears whatever context encloses it most closely,
         // and that context on its own looks perfectly substitutable.
@@ -869,98 +734,199 @@ fn check_script(action: &str, script: &str, prompts: &Prompts) -> Result<(), Str
             && let Some((place, fix)) = Ctx::Arith.refusal()
         {
             return Err(format!(
-                "{{{key}}} in the {action} command sits {place}, where mesa has \
-                 nothing it could substitute — {fix}",
-                key = slot.key
+                "{{{key}}} in the {action} command sits {place}, where mesa \
+                 will not put a value — {fix}"
             ));
         }
         if let Some((place, fix)) = slot.ctx.refusal() {
             return Err(format!(
-                "{{{key}}} in the {action} command sits {place}, where mesa has \
-                 nothing it could substitute — {fix}"
+                "{{{key}}} in the {action} command sits {place}, where mesa \
+                 will not put a value — {fix}"
             ));
         }
     }
     Ok(())
 }
 
-/// The shell context a `{placeholder}` sits in — which of the two inert forms
-/// [`substitute_script`] emits there, or whether it can emit anything at all.
+/// The three variable names a script used to read its values through, before
+/// mesa task 1143, and the placeholder each one is now.
+const RETIRED_ENV: [(&str, &str); 3] = [
+    ("MESA_ID", "{id}"),
+    ("MESA_NAME", "{name}"),
+    ("MESA_PROMPT", "{prompt}"),
+];
+
+/// The prefix of the variable a script used to read a library prompt through
+/// (`{prompt:stop-notify}` travelled as `MESA_PROMPT_STOP_NOTIFY`).
+const RETIRED_PROMPT_ENV_PREFIX: &str = "MESA_PROMPT_";
+
+/// The reference to a retired `MESA_*` variable starting at byte `at` of
+/// `text` (which must be a `$`), as `(placeholder, end)`: `$MESA_ID`,
+/// `${MESA_ID}`, `${MESA_ID-}` and `$MESA_PROMPT_<NAME>` in the same three
+/// forms. `None` for any other `$`. A bare `$MESA_ID` must end where an
+/// identifier would — `$MESA_IDX` is some other variable.
+fn retired_env_reference(text: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let braced = bytes.get(at + 1) == Some(&b'{');
+    let start = if braced { at + 2 } else { at + 1 };
+    let mut end = start;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    let var = &text[start..end];
+    let placeholder = if let Some((_, p)) = RETIRED_ENV.iter().find(|(v, _)| *v == var) {
+        (*p).to_string()
+    } else {
+        let name = var.strip_prefix(RETIRED_PROMPT_ENV_PREFIX)?;
+        if name.is_empty() {
+            return None;
+        }
+        format!("{{prompt:{}}}", name.to_ascii_lowercase().replace('_', "-"))
+    };
+    if braced {
+        if bytes.get(end) == Some(&b'-') {
+            end += 1;
+        }
+        if bytes.get(end) != Some(&b'}') {
+            return None;
+        }
+        end += 1;
+    }
+    Some((placeholder, end))
+}
+
+/// Rewrites the `MESA_*` variable references a script saved before mesa task
+/// 1143 read its values through — `$MESA_ID`, `${MESA_ID}`, `${MESA_ID-}`,
+/// each optionally wrapped in `"…"`, and the `MESA_PROMPT_<NAME>` forms — into
+/// the `{placeholder}` each one meant, with the prompt name lowercased and
+/// `_` folded to `-`.
 ///
-/// **This enum is not a security boundary.** Every context mesa substitutes in
-/// gets a *reference* to a variable, never a value, and wherever bash performs
-/// word expansion it does not re-read what the expansion produced. So a context
-/// this lexer gets wrong costs at worst a stray word split, an unwanted glob,
-/// or a literal quote in some output — never execution. (Arithmetic evaluation
-/// is the exception, which is why [`Ctx::Arith`] is a refusal rather than a
-/// choice of form, and why that refusal is asked of the whole stack — see
-/// [`ScriptSlot::in_arith`].) That is the whole point of the design: a
-/// hand-rolled bash lexer cannot be trusted with bash's grammar (arithmetic,
-/// `${var/…/…}`, process substitution, `case`), and here it does not have to
-/// be. The one distinction it must get right is "is this inside a
-/// single-quote-family run", where no expansion happens at all, and that is a
-/// far smaller question than the rest of bash.
+/// Applied on **read**, in memory, exactly like [`migrate_retired_placeholders`]
+/// and for the same reason: mesa no longer sets those variables, so a script
+/// left reading them would read empty strings and silently start an agent
+/// with no id, no name and no instructions. The enclosing `"…"` is consumed
+/// because the placeholder arrives quoted already; a bare `$MESA_ID` becomes a
+/// bare `{id}`, which is quoted for wherever it sits. A migrated prompt name
+/// the library no longer holds fails the spawn with the ordinary unknown-prompt
+/// error rather than starting anything.
+pub fn migrate_env_references(template: &str) -> String {
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$'
+            && let Some((placeholder, mut end)) = retired_env_reference(template, i)
+        {
+            if out.ends_with('"') && bytes.get(end) == Some(&b'"') {
+                out.pop();
+                end += 1;
+            }
+            out.push_str(&placeholder);
+            i = end;
+            continue;
+        }
+        let ch = template[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Refuses a template that still reads one of the retired `MESA_*` variables
+/// — the save-time half of [`migrate_env_references`]. A hand-typed
+/// `"$MESA_NAME"` would otherwise save fine and read as the empty string on
+/// every spawn, which is exactly the silent failure the read-time migration
+/// exists to prevent for the files that already hold it.
+fn refuse_env_references(action: &str, script: &str) -> Result<(), String> {
+    let mut i = 0;
+    while let Some(off) = script[i..].find('$') {
+        let at = i + off;
+        if let Some((placeholder, end)) = retired_env_reference(script, at) {
+            return Err(format!(
+                "the {action} command reads {}, but mesa no longer sets MESA_* \
+                 variables; write {placeholder} instead — a {{placeholder}} arrives \
+                 quoted for wherever it sits",
+                &script[at..end]
+            ));
+        }
+        i = at + 1;
+    }
+    Ok(())
+}
+
+/// The shell context a `{placeholder}` sits in — which quoting
+/// [`substitute_script`] gives the value there, or whether it can put a value
+/// there at all.
+///
+/// A value is spliced into the script **quoted for its context**, so what
+/// bash reads is a string literal, never syntax. That makes this lexer's
+/// verdict matter: getting a context wrong means quoting for the wrong one.
+/// What that costs is bounded, and worth stating plainly. The forms mesa
+/// emits are all *inert in every context that expands anything*: a
+/// single-quoted value read where bash expected double-quote escaping is a
+/// value with stray quote characters in it, and a backslash-escaped value read
+/// in a plain-word position is one that word-splits — a mangled string, never
+/// execution. The two ways a mis-lex *could* reach execution are ruled out by
+/// construction: the single-quote family (`'…'`, `$'…'`, a quoted heredoc
+/// delimiter) is refused rather than guessed at, since a value that happened
+/// to hold a `'` would close the run; and arithmetic is refused wherever it
+/// is on the stack, since it re-parses what it is given. So the lexer is
+/// still not a security boundary a bash grammar has to be trusted to — the
+/// refusals are — but the contexts it does classify now change the bytes bash
+/// sees, which the earlier reference-substituting design could shrug at.
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Ctx {
     /// Ordinary script text.
     Plain,
     /// Inside `(…)`. Tracked only so its `)` cannot close a `$(` that is not
     /// there — the bug that made `"$( (uname) ; … {name} )"` come out
-    /// mis-typed under the previous, value-substituting design.
+    /// mis-typed under an earlier, value-substituting draft.
     Subshell,
     /// Inside `$(…)` — a fresh command context, not a continuation of whatever
     /// encloses it, which is why `"$(echo {name})"` is not double-quoted.
     CmdSub,
     /// Inside `$((…))` or `((…))` arithmetic. **Refused**, because arithmetic
-    /// evaluation is a *second parser*: it re-reads what an expansion produced,
-    /// and an array subscript inside it is itself expanded, so `a[$(cmd)]` in
-    /// the value runs the command. That is true of a hand-written
-    /// `$(( $MESA_ID ))` too — but a placeholder must not be the thing that
-    /// makes it look safe. The two spellings the lexer can cheaply see are
-    /// refused; `[[ x -gt y ]]`, `let "…"` and `${x[…]}` are not lexically
-    /// bracketed in any way this deliberately coarse lexer should model, and
-    /// stay documented sharp edges (`docs/config.md`).
-    ///
-    /// Nobody loses the capability. mesa refuses to *emit* a placeholder into a
-    /// second parser; an author who means to do sums stays free to write
-    /// `$(( ${MESA_ID-} + 1 ))` by hand — their own deliberate act, exactly like
-    /// `eval "$MESA_NAME"`. They just have to ask for it in so many words.
+    /// evaluation is a *second parser*: it re-reads what it is given, and an
+    /// array subscript inside it is itself expanded, so a value of
+    /// `a[$(cmd)]` runs the command — however it was quoted on the way in.
+    /// The two spellings the lexer can cheaply see are refused; `[[ x -gt y ]]`,
+    /// `let "…"` and `${x[…]}` are not lexically bracketed in any way this
+    /// deliberately coarse lexer should model, and stay documented sharp edges
+    /// (`docs/config.md`).
     Arith,
-    /// Inside `"…"`, and also `$"…"`, where the expansion needs no quotes of
-    /// its own.
+    /// Inside `"…"`, and also `$"…"`: the value is backslash-escaped rather
+    /// than wrapped in quotes of its own.
     Double,
-    /// Inside `'…'` — no expansion of any kind happens here.
+    /// Inside `'…'` — refused: a `'` in the value would end the run.
     Single,
     /// Inside `$'…'`, bash's **ANSI-C quoting**, where `\n`/`\x41` are
     /// interpreted and `\'` does not close the run. Lexically it is not `'…'`
-    /// at all; conflating the two is what let a value escape before.
+    /// at all; conflating the two is what let a value escape in an earlier
+    /// draft. Refused.
     AnsiC,
-    /// Inside `` `…` ``.
+    /// Inside `` `…` ``. Refused — its quoting rules differ from `$(…)`'s just
+    /// enough not to guess, and `$(…)` is right there.
     Backtick,
-    /// After an unquoted `#`, to the end of the line.
+    /// After an unquoted `#`, to the end of the line. Nothing here is read, so
+    /// the one thing that matters is that the value cannot *leave* the comment:
+    /// its newlines are folded ([`Ctx::quoted`]).
     Comment,
     /// A heredoc body whose delimiter was unquoted: expansions happen, quotes
-    /// are literal text.
+    /// are literal text, and only `\`, `$` and `` ` `` can be escaped.
     Heredoc,
-    /// A heredoc body whose delimiter was quoted (`<<'EOF'`): nothing expands.
+    /// A heredoc body whose delimiter was quoted (`<<'EOF'`): nothing expands
+    /// and nothing escapes, so there is no way to put a value there. Refused.
     HeredocQuoted,
     /// The **delimiter word** of a heredoc — `cat <<{name}`. Not a place a
     /// value could go at all: the word is a label bash matches the closing line
     /// against. It is a context only so that this one spot errors like every
-    /// other impossible one, instead of silently leaving the braces in place
-    /// (the review's finding 6).
+    /// other impossible one, instead of silently leaving the braces in place.
     HeredocDelimiter,
 }
 
 impl Ctx {
-    /// `Some((where it is, what to do))` for a context mesa cannot substitute
-    /// into — the phrase the save-time error names it by, and the fix.
-    ///
-    /// These are **correctness** refusals now, not security ones: a parameter
-    /// expansion simply does not happen inside single quotes, so there is no
-    /// right thing to emit there. Backticks are refused for the same kind of
-    /// reason — their quoting rules differ from `$(…)`'s just enough that mesa
-    /// would be guessing which form is right — and `$(…)` is right there.
+    /// `Some((where it is, what to do))` for a context mesa will not put a
+    /// value into — the phrase the save-time error names it by, and the fix.
     fn refusal(self) -> Option<(&'static str, &'static str)> {
         match self {
             Ctx::Single => Some((
@@ -978,8 +944,8 @@ impl Ctx {
             Ctx::Backtick => Some(("inside `…` command substitution", "write $(…) instead")),
             Ctx::Arith => Some((
                 "inside $(( )) arithmetic",
-                "arithmetic re-parses what an expansion produced; write the \
-                 matching MESA_* variable yourself if you mean to do sums on it",
+                "arithmetic re-parses what it is given, so a value there could \
+                 run a command however it was quoted; mesa will not put one there",
             )),
             Ctx::HeredocDelimiter => Some((
                 "in a heredoc's delimiter word",
@@ -990,18 +956,76 @@ impl Ctx {
         }
     }
 
-    /// The reference to emit for `var` here. Two inert forms, and the only
-    /// thing riding on telling them apart is word splitting:
-    /// - **bare** where quotes would be wrong — already inside `"…"`, or in a
-    ///   heredoc body where a `"` is literal text rather than syntax;
-    /// - **double-quoted** everywhere else, so a value with spaces stays one
-    ///   word and a value with `*` or `?` never globs.
-    fn reference(self, var: &str) -> String {
+    /// `value`, quoted so that bash reads it here as exactly that string:
+    /// - **single-quoted** in a word position (`Plain`, a subshell, a `$(…)`),
+    ///   with a `'` in the value spelled `'\''` — nothing else is special
+    ///   inside `'…'`, newlines included, so a value with spaces stays one word
+    ///   and a `*` never globs;
+    /// - **backslash-escaped** inside `"…"` — `\`, `"`, `$` and `` ` `` are the
+    ///   four characters that mean anything there (history expansion is off in
+    ///   a non-interactive shell, so `!` is not one);
+    /// - **backslash-escaped** in an unquoted heredoc body too, where only `\`,
+    ///   `$` and `` ` `` can be escaped and a `"` is literal text. One shape a
+    ///   heredoc cannot carry as text is a value holding a **newline**: bash
+    ///   reads the body line by line for its delimiter *before* any of it is
+    ///   expanded, so a line of the value equal to `EOF` would end the heredoc
+    ///   and hand the rest to the parser. Such a value (and one starting with
+    ///   a tab, which `<<-` would strip) rides in through `$(printf '%s' $'…')`
+    ///   instead — one line of body, the newlines as `\n` inside ANSI-C
+    ///   quoting, so no line of it can match anything. The one cost is that
+    ///   `$(…)` drops trailing newlines;
+    /// - in a **comment**, the value with its newlines folded to spaces: it is
+    ///   never read, and the one thing that must not happen is a second line
+    ///   of it leaving the comment.
+    ///
+    /// The refused contexts never reach here — [`check_script`] refuses them
+    /// on both paths — so they quote as a word position; failing safe rather
+    /// than emitting nothing.
+    fn quoted(self, value: &str) -> String {
         match self {
-            Ctx::Double | Ctx::Heredoc => format!("${{{var}-}}"),
-            _ => format!("\"${{{var}-}}\""),
+            Ctx::Double => backslash_escaped(value, &['\\', '"', '$', '`']),
+            Ctx::Heredoc if value.contains('\n') || value.starts_with('\t') => {
+                format!("$(printf '%s' {})", ansi_c_quoted(value))
+            }
+            Ctx::Heredoc => backslash_escaped(value, &['\\', '$', '`']),
+            Ctx::Comment => single_quoted(&value.replace('\n', " ")),
+            _ => single_quoted(value),
         }
     }
+}
+
+/// `'…'` with every `'` in the value spelled `'\''`.
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `value` with a backslash before each character in `specials`.
+fn backslash_escaped(value: &str, specials: &[char]) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if specials.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `$'…'` — bash's ANSI-C quoting — carrying `value` with no literal newline
+/// in it: `\` as `\\`, `'` as `\'`, a newline as `\n`. Everything else is
+/// literal inside `$'…'`.
+fn ansi_c_quoted(value: &str) -> String {
+    let mut out = String::from("$'");
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// One `{placeholder}` a script body holds: the byte span of `{…}`, the name,
@@ -1023,17 +1047,18 @@ struct ScriptSlot<'a> {
 /// Every `{placeholder}` in a script, in order, each tagged with its [`Ctx`].
 ///
 /// A coarse, deliberately approximate lexer over bash's quoting forms — see
-/// [`Ctx`] for why approximate is safe here. It tracks a **stack**, because
+/// [`Ctx`] for what approximate costs here. It tracks a **stack**, because
 /// `"…"` and `'…'` nest inside `$(…)` and vice versa and only the innermost one
-/// decides what can be emitted.
+/// decides how a value is quoted.
 ///
-/// Only the five known names count, and only when the `{` is not preceded by
-/// `$` — a script's own `${MESA_NAME}` is a parameter expansion bash owns.
-/// Anything else — `{foo}`, `cp a{,.bak}`, `{ …; }`, `{id: 1}` — is not a
-/// placeholder at all and passes through literally. That is deliberately unlike
-/// argv mode, where an unknown `{foo}` is an error: an argv token is mesa's own
-/// syntax, while a script body is bash source in which braces are ordinary
-/// text.
+/// A slot is a brace holding a placeholder-shaped name
+/// ([`is_placeholder_shaped`]) or a `{prompt:<name>}`, and only when the `{`
+/// is not preceded by `$` — a script's own `${HOME}` is a parameter expansion
+/// bash owns. Anything else — `cp a{,.bak}`, `{ …; }`, `{id: 1}` — is not a
+/// placeholder at all and passes through literally, because a script body is
+/// bash source in which braces are ordinary text. A placeholder-shaped name
+/// mesa does not know (`{tsak}`) is a slot, and therefore an error: bash has
+/// no use for `{tsak}` either, so it can only be a typo.
 fn scan_script(script: &str) -> Vec<ScriptSlot<'_>> {
     let bytes = script.as_bytes();
     let len = bytes.len();
@@ -1178,15 +1203,15 @@ fn scan_script(script: &str) -> Vec<ScriptSlot<'_>> {
                 }
             }
             // An unquoted heredoc body performs no command parsing, but it
-            // does perform arithmetic expansion — the one thing that can turn
-            // a value there into a command.
+            // does perform command and arithmetic expansion — the latter the
+            // one thing that can turn a value there into a command.
             Ctx::Heredoc => {
                 if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
                     // `$((` first — it is the longer match, and the one that
                     // matters. `$(` is an ordinary command context, so a
-                    // placeholder inside it gets the quoted form and keeps the
-                    // no-word-split, no-glob promise that a heredoc body's bare
-                    // form could not make there.
+                    // placeholder inside it gets the single-quoted form and
+                    // keeps the no-word-split, no-glob promise that a heredoc
+                    // body's escaped form could not make there.
                     if bytes.get(i + 2) == Some(&b'(') {
                         stack.push(Ctx::Arith);
                         i += 3;
@@ -1212,14 +1237,12 @@ fn slot_at(script: &str, open: usize, ctx: Ctx, in_arith: bool) -> Option<Script
     let rest = &script[open + 1..];
     let close = rest.find('}')?;
     let key = &rest[..close];
-    (PLACEHOLDER_ENV.iter().any(|(k, _)| *k == key) || prompt_name(key).is_some()).then(|| {
-        ScriptSlot {
-            open,
-            end: open + 1 + close + 1,
-            key,
-            ctx,
-            in_arith,
-        }
+    (is_placeholder_shaped(key) || prompt_name(key).is_some()).then(|| ScriptSlot {
+        open,
+        end: open + 1 + close + 1,
+        key,
+        ctx,
+        in_arith,
     })
 }
 
@@ -1258,7 +1281,8 @@ fn read_heredoc<'a>(
     }
     let raw = &script[start..j];
     // The word is consumed here rather than by the main loop, so a placeholder
-    // written as a delimiter would otherwise be neither expanded nor refused.
+    // written as a delimiter would otherwise be neither substituted nor
+    // refused.
     for (at, _) in raw.match_indices('{') {
         if let Some(mut slot) = slot_at(script, start + at, Ctx::Plain, false) {
             slot.ctx = Ctx::HeredocDelimiter;
@@ -1276,27 +1300,23 @@ fn read_heredoc<'a>(
     j
 }
 
-/// Replaces a script's `{placeholder}`s with **references to the `MESA_*`
-/// variables the values travel in** — never with the values themselves.
+/// Replaces a script's `{placeholder}`s with their **values, shell-quoted for
+/// the context each sits in** ([`Ctx::quoted`]) — the one place a value mesa
+/// holds meets text a shell will parse.
 ///
-/// This is the whole safety property of script mode, and it is the same one
-/// argv mode has: *no value mesa holds is ever interpolated into a string a
-/// shell parses*. A value reaches the child through [`script_env`] and the
-/// `env_remove` sweep, exactly as it did before placeholders worked here at
-/// all; wherever bash performs word expansion it does not re-read what the
-/// expansion produced, so a name of `"; rm -rf / #` is inert however hostile it
-/// is. Arithmetic evaluation re-reads it and is the exception — see [`Ctx`],
-/// which refuses the spellings of it this lexer can see.
-/// Which is why this function does not take a [`Vars`] at all — it has no use
-/// for a value, only for the name of the variable holding it.
+/// What bash is handed is therefore a string literal at every slot: a task
+/// name of `"; rm -rf / #` becomes `'"; rm -rf / #'` in a word position and
+/// `\"; rm -rf / #` inside `"…"`, and arrives at the program as that one
+/// argument. Wherever bash performs word expansion it does not re-read the
+/// result looking for syntax, so once the value is inside a quoted literal
+/// nothing in it can run. Arithmetic evaluation *does* re-read it and is the
+/// exception — see [`Ctx`], which refuses the spellings of it this lexer can
+/// see.
 ///
-/// The `-` in `${MESA_NAME-}` keeps the other rule this mode has: an offered
-/// placeholder with no value on this call is the empty string, even under
-/// `set -u`. Argv's drop-the-token-and-its-preceding-flag rule has nothing to
-/// work with in free-form shell text. A script that must tell "absent" from
-/// "blank" reads `${MESA_NAME+set}`, since the variable itself is genuinely
-/// *unset* in that case.
-fn substitute_script(action: &str, script: &str, prompts: &Prompts) -> Result<String, String> {
+/// An offered placeholder with no value on this call is the **empty string**
+/// (`''` in a word position, nothing inside quotes): free-form shell text has
+/// no token to drop, and a value is a value.
+fn substitute_script(action: &str, script: &str, vars: &Vars) -> Result<String, String> {
     let mut out = String::with_capacity(script.len());
     let mut cursor = 0;
     for slot in scan_script(script) {
@@ -1305,45 +1325,21 @@ fn substitute_script(action: &str, script: &str, prompts: &Prompts) -> Result<St
         // must *fail*, not fall through leaving `{name}` in text bash parses.
         if slot.in_arith {
             return Err(format!(
-                "the {action} command has {{{key}}} inside arithmetic, which \
-                 mesa cannot substitute",
+                "the {action} command has {{{key}}} inside arithmetic, where \
+                 mesa will not put a value",
                 key = slot.key
             ));
         }
         if let Some((place, _)) = slot.ctx.refusal() {
             return Err(format!(
-                "the {action} command has {{{key}}} {place}, which mesa cannot \
-                 substitute",
+                "the {action} command has {{{key}}} {place}, where mesa will \
+                 not put a value",
                 key = slot.key
             ));
         }
-        // Both of the next two are unreachable for the same reason and fail
-        // the same way: `slot_at` only ever records one of the five known
-        // names or a `{prompt:<name>}`, and `check_script` has already refused
-        // a name this action does not offer and a prompt this library does not
-        // hold. Neither may fall through — leaving `{name}` in text bash parses
-        // is the one outcome this function exists to prevent.
-        let var = if let Some(name) = prompt_name(slot.key) {
-            prompt_resolution(action, name, prompts)?
-        } else {
-            let Some((_, var)) = PLACEHOLDER_ENV.iter().find(|(k, _)| *k == slot.key) else {
-                return Err(format!(
-                    "the {action} command has an unknown placeholder {{{key}}}",
-                    key = slot.key
-                ));
-            };
-            if !offered_env_vars(action).contains(var) {
-                return Err(format!(
-                    "unsupported placeholder {{{key}}} in the {action} command; \
-                     {action} offers {}",
-                    offered_list(action),
-                    key = slot.key
-                ));
-            }
-            (*var).to_string()
-        };
+        let value = vars.lookup(slot.key, action)?.unwrap_or_default();
         out.push_str(&script[cursor..slot.open]);
-        out.push_str(&slot.ctx.reference(&var));
+        out.push_str(&slot.ctx.quoted(&value));
         cursor = slot.end;
     }
     out.push_str(&script[cursor..]);
@@ -1351,7 +1347,8 @@ fn substitute_script(action: &str, script: &str, prompts: &Prompts) -> Result<St
 }
 
 /// Parses the script with `bash -n` — a syntax check that executes nothing —
-/// so an unbalanced `fi` lands in the editor rather than in a watcher log.
+/// so an unbalanced `fi` or an unterminated quote lands in the editor rather
+/// than in a watcher log.
 ///
 /// A machine with no `bash` on PATH skips the check rather than failing the
 /// save: mesa can't prove the script is wrong there, and refusing to store a
@@ -1381,9 +1378,9 @@ fn bash_syntax_check(action: &str, script: &str) -> Result<(), String> {
 }
 
 /// The values a template's placeholders may resolve to. A `None` field is
-/// "not available for this call" — see [`expand`]'s drop rule. The program
-/// and the agent are not here: since mesa task 1141 a template names both
-/// literally (`claude --bg --agent swe …`), so there is nothing to fill.
+/// "not available for this call" and substitutes as the empty string. The
+/// program and the agent are not here: since mesa task 1141 a template names
+/// both literally (`claude --bg --agent swe …`), so there is nothing to fill.
 #[derive(Debug, Default, Clone)]
 pub struct Vars<'a> {
     pub id: Option<i64>,
@@ -1409,45 +1406,31 @@ impl<'a> Vars<'a> {
 impl Vars<'_> {
     /// `Some(value)` if this placeholder is available, `None` if it is a
     /// recognized placeholder with no value on this call. `Err` for a name
-    /// this action doesn't offer at all.
+    /// this action doesn't offer, or a library prompt that isn't there.
     fn lookup(&self, key: &str, action: &str) -> Result<Option<String>, String> {
+        check_key(action, key, self.prompts())?;
         // `{prompt:<name>}` is orthogonal to the per-action vocabulary below:
         // every action offers it, and an unknown name is an error rather than
-        // a dropped token, because a hook that silently lost its instructions
+        // an empty string, because a hook that silently lost its instructions
         // is worse than one that refuses to start.
         if let Some(name) = prompt_name(key) {
-            // The same two refusals script mode makes — an unknown name and a
-            // name no environment variable could hold — so the vocabulary is
-            // identical in both modes even though argv sets no variables.
-            prompt_resolution(action, name, self.prompts())?;
-            // `prompt_resolution` has already established the body is there.
+            // `check_key` has already established the body is there.
             let body = self.prompts().body(name).unwrap_or_default();
             return Ok(Some(expand_body(action, body, self)));
         }
-        let (offered, value) = match key {
-            "id" => (action != AGENT_SPAWN, self.id.map(|i| i.to_string())),
-            "name" => (action != AGENT_SPAWN, self.name.map(str::to_string)),
-            "prompt" => (
-                action == AGENT_SPAWN || action == LIVE_AGENT || action == LIVE_SUMMARY,
-                self.prompt.map(str::to_string),
-            ),
-            _ => (false, None),
-        };
-        if !offered {
-            return Err(format!(
-                "unsupported placeholder {{{key}}} in the {action} command; \
-                 {action} offers {}",
-                offered_list(action)
-            ));
-        }
-        Ok(value)
+        Ok(match key {
+            "id" => self.id.map(|i| i.to_string()),
+            "name" => self.name.map(str::to_string),
+            "prompt" => self.prompt.map(str::to_string),
+            _ => None,
+        })
     }
 }
 
 /// The placeholder names `action` offers, `{}`-delimited and in doc order.
-/// Shared by the "unsupported placeholder" error below and by [`settings`],
-/// so the Settings page can only ever advertise placeholders [`Vars::lookup`]
-/// actually accepts.
+/// Shared by the "unsupported placeholder" error and by [`settings`], so the
+/// Settings page can only ever advertise placeholders [`check_key`] actually
+/// accepts.
 pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
     match action {
         AGENT_SPAWN => &["{prompt}"],
@@ -1460,131 +1443,6 @@ pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
 
 fn offered_list(action: &str) -> String {
     offered_placeholders(action).join(", ")
-}
-
-/// Expands `template` into an argv for `action`.
-///
-/// Two passes, in this order — the order is the safety property:
-/// 1. [`tokenize`] splits the template on whitespace, honoring quotes, so the
-///    token count is fixed by the *template* alone.
-/// 2. Each token's `{placeholder}`s are replaced in place. A substituted value
-///    is never re-split or re-quoted, so untrusted text (a task name, an
-///    inbox body) lands as exactly one argv entry.
-///
-/// A token holding a placeholder that has no value is **dropped**, along with
-/// an immediately preceding token that starts with `-`. That one rule is what
-/// makes the defaults reproduce today's behavior: with no `--name` available
-/// `--name {name}` disappears as a pair (rather than leaving a dangling flag
-/// that would swallow the next argument), and with no prompt `-- {prompt}`
-/// goes too.
-pub fn expand(action: &str, template: &str, vars: &Vars) -> Result<Vec<String>, String> {
-    let tokens = tokenize(template)
-        .map_err(|e| format!("cannot parse the {action} command {template:?}: {e}"))?;
-    let mut argv: Vec<String> = Vec::with_capacity(tokens.len());
-    for token in &tokens {
-        match substitute(action, token, vars)? {
-            Some(arg) => argv.push(arg),
-            None => {
-                if argv.last().is_some_and(|prev| prev.starts_with('-')) {
-                    argv.pop();
-                }
-            }
-        }
-    }
-    if argv.is_empty() {
-        return Err(format!(
-            "the {action} command {template:?} expands to nothing"
-        ));
-    }
-    Ok(argv)
-}
-
-/// `Ok(None)` = this token must be dropped (an available-but-unset
-/// placeholder). A `{` that opens no valid placeholder is a literal brace.
-fn substitute(action: &str, token: &str, vars: &Vars) -> Result<Option<String>, String> {
-    let mut out = String::with_capacity(token.len());
-    let mut rest = token;
-    while let Some(open) = rest.find('{') {
-        let (before, from_brace) = rest.split_at(open);
-        out.push_str(before);
-        let Some(close) = from_brace.find('}') else {
-            out.push_str(from_brace);
-            return Ok(Some(out));
-        };
-        let key = &from_brace[1..close];
-        match vars.lookup(key, action)? {
-            Some(value) => out.push_str(&value),
-            None => return Ok(None),
-        }
-        rest = &from_brace[close + 1..];
-    }
-    out.push_str(rest);
-    Ok(Some(out))
-}
-
-/// Splits a command template into tokens: whitespace-separated, with `'…'`
-/// (literal) and `"…"` (backslash-escapable) quoting, so a template can carry
-/// an argument containing spaces. Quotes are removed; an empty quoted string
-/// is a real, empty token. `Err` on an unterminated quote or a trailing
-/// backslash — a typo the user should see, not a silently mangled argv.
-///
-/// Not `shell_words`-complete on purpose: no expansion, no substitution, no
-/// operators. `|`, `>`, `&&`, `$VAR` are ordinary characters here, because
-/// nothing downstream is a shell.
-pub fn tokenize(s: &str) -> Result<Vec<String>, String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut started = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            c if c.is_whitespace() => {
-                if started {
-                    tokens.push(std::mem::take(&mut cur));
-                    started = false;
-                }
-            }
-            '\'' => {
-                started = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(c) => cur.push(c),
-                        None => return Err("unterminated single quote".to_string()),
-                    }
-                }
-            }
-            '"' => {
-                started = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(esc) => cur.push(esc),
-                            None => return Err("trailing backslash".to_string()),
-                        },
-                        Some(c) => cur.push(c),
-                        None => return Err("unterminated double quote".to_string()),
-                    }
-                }
-            }
-            '\\' => {
-                started = true;
-                match chars.next() {
-                    Some(esc) => cur.push(esc),
-                    None => return Err("trailing backslash".to_string()),
-                }
-            }
-            c => {
-                started = true;
-                cur.push(c);
-            }
-        }
-    }
-    if started {
-        tokens.push(cur);
-    }
-    Ok(tokens)
 }
 
 // ---- pricing (mesa task 692) -------------------------------------------
@@ -3651,7 +3509,7 @@ mod tests {
     }
 
     /// `save_commands_in` with an empty prompt library — what every test that
-    /// is not about `{prompt:<name>}` wants. The two that *are* call the real
+    /// is not about `{prompt:<name>}` wants. The ones that *are* call the real
     /// one with a table of their own.
     fn save_in(path: &Path, updates: &HashMap<String, String>) -> Result<(), SaveError> {
         save_commands_in(path, updates, &Prompts::default())
@@ -3662,10 +3520,10 @@ mod tests {
         validate(action, template, &Prompts::default())
     }
 
-    /// [`script_env`] over a script with no `{prompt:<name>}` in it, so the
-    /// pre-1138 two-argument shape still reads at a glance.
-    fn script_env_(action: &str, vars: &Vars) -> Vec<(String, String)> {
-        script_env(action, "", vars)
+    /// [`resolve`] for the todo-watcher, unwrapped — most of the script tests
+    /// only care what the text became.
+    fn resolved(template: &str, vars: &Vars) -> String {
+        resolve(TODO_WATCHER, template, vars).unwrap()
     }
 
     fn update(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -3691,7 +3549,7 @@ mod tests {
         assert_eq!(settings[1].action, INBOX_WATCHER);
         assert_eq!(settings[1].value, None);
         assert_eq!(settings[1].default, DEFAULT_INBOX_WATCHER);
-        // The placeholder vocabulary is per-action, matching `Vars::lookup`.
+        // The placeholder vocabulary is per-action, matching `check_key`.
         assert_eq!(settings[0].placeholders, ["{id}", "{name}"]);
         assert_eq!(settings[2].action, AGENT_SPAWN);
         assert_eq!(settings[2].placeholders, ["{prompt}"]);
@@ -3758,6 +3616,11 @@ mod tests {
         assert!(written["commands"].get(TODO_WATCHER).is_none());
         assert_eq!(written["commands"]["agent-spawn"], "mytool");
         assert_eq!(command_in(&path, TODO_WATCHER).unwrap(), None);
+        // …and a multi-line blank is blank too.
+        save_in(&path, &update(&[(AGENT_SPAWN, "\n  \n")])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written["commands"].get(AGENT_SPAWN).is_none());
     }
 
     #[test]
@@ -3771,10 +3634,10 @@ mod tests {
             matches!(&err, SaveError::Validation(m) if m.contains("unsupported placeholder")),
             "{err:?}"
         );
-        // …an unterminated quote…
+        // …an unterminated quote, which `bash -n` refuses…
         let err = save_in(&path, &update(&[(AGENT_SPAWN, "mytool \"oops")])).unwrap_err();
         assert!(
-            matches!(&err, SaveError::Validation(m) if m.contains("unterminated")),
+            matches!(&err, SaveError::Validation(m) if m.contains("not valid bash")),
             "{err:?}"
         );
         // …and a key mesa doesn't configure.
@@ -3817,7 +3680,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_templates_expand_as_written() {
+    fn saved_templates_resolve_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         save_in(
@@ -3831,40 +3694,20 @@ mod tests {
             name: Some("a b"),
             ..Vars::default()
         };
+        // A word-position value is single-quoted; one inside `"…"` is escaped
+        // in place, so the template's own quotes still close where they did.
         assert_eq!(
-            expand(TODO_WATCHER, &template, &vars).unwrap(),
-            ["mytool", "--name", "a b", "--", "/go 7"]
+            resolved(&template, &vars),
+            r#"mytool --name 'a b' -- "/go 7""#
         );
-    }
-
-    #[test]
-    fn tokenize_splits_on_whitespace_and_honors_quotes() {
-        assert_eq!(tokenize("claude --bg").unwrap(), ["claude", "--bg"]);
-        assert_eq!(tokenize("  a\t b \n").unwrap(), ["a", "b"]);
-        assert_eq!(
-            tokenize(r#"a "two words" 'and more'"#).unwrap(),
-            ["a", "two words", "and more"]
-        );
-        // Quotes join, they don't separate: adjacent runs are one token.
-        assert_eq!(tokenize(r#"--name="a b""#).unwrap(), ["--name=a b"]);
-        assert_eq!(tokenize(r#"a "" b"#).unwrap(), ["a", "", "b"]);
-        assert_eq!(tokenize(r#""a\"b" c\ d"#).unwrap(), [r#"a"b"#, "c d"]);
-        // No shell downstream, so operators are literal characters.
-        assert_eq!(tokenize("a | b > c").unwrap(), ["a", "|", "b", ">", "c"]);
-        assert_eq!(tokenize("$HOME").unwrap(), ["$HOME"]);
-    }
-
-    #[test]
-    fn tokenize_rejects_unterminated_quotes_and_backslash() {
-        assert!(tokenize(r#"a "b"#).unwrap_err().contains("double quote"));
-        assert!(tokenize("a 'b").unwrap_err().contains("single quote"));
-        assert!(tokenize("a b\\").unwrap_err().contains("backslash"));
     }
 
     #[test]
     fn default_templates_reproduce_the_pre_config_argv() {
-        // The exact argv mesa hardcoded before this config existed. If any of
-        // these three change, the check scripts' stub-argv assertions and the
+        // The exact argv mesa hardcoded before this config existed, as the
+        // script bash is handed: every value quoted, so bash's own word
+        // splitting reproduces the argv `Command::args` used to build. If any
+        // of these change, the check scripts' stub-argv assertions and the
         // agent CLI contract change with them.
         let vars = Vars {
             id: Some(731),
@@ -3872,13 +3715,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            expand(TODO_WATCHER, DEFAULT_TODO_WATCHER, &vars).unwrap(),
+            resolve(TODO_WATCHER, DEFAULT_TODO_WATCHER, &vars).unwrap(),
+            // Literal since mesa task 1075: the run is supervised by the
+            // `supervisor` agent definition.
+            r#"claude --bg --agent supervisor --name 'mesa: do the thing' -- "/execute-mesa-task 731""#
+        );
+        assert_eq!(
+            resolve(INBOX_WATCHER, DEFAULT_INBOX_WATCHER, &vars).unwrap(),
+            r#"claude --bg --agent swe --name 'mesa: do the thing' -- "/inbox-triage 731""#
+        );
+        let spawn = Vars {
+            prompt: Some("look at the tests"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &spawn).unwrap(),
+            "claude --bg --agent swe -- 'look at the tests'"
+        );
+        // The live agent takes both halves: a named session id *and* the
+        // prompt mesa supplies. The prompt is one argument however long or
+        // hostile its text. Its agent is the literal `mesa-live` definition
+        // (mesa task 1068).
+        let live = Vars {
+            id: Some(12),
+            name: Some("mesa live 12"),
+            prompt: Some("listen; then say \"hi\""),
+            prompts: None,
+        };
+        assert_eq!(
+            resolve(LIVE_AGENT, DEFAULT_LIVE_AGENT, &live).unwrap(),
+            r#"claude --bg --agent mesa-live --name 'mesa live 12' -- 'listen; then say "hi"'"#
+        );
+        // …and a real bash agrees about the argv each of those makes.
+        assert_eq!(
+            argv_of(&resolve(TODO_WATCHER, DEFAULT_TODO_WATCHER, &vars).unwrap()),
             [
                 "claude",
                 "--bg",
                 "--agent",
-                // Literal since mesa task 1075: the run is supervised by the
-                // `supervisor` agent definition.
                 "supervisor",
                 "--name",
                 "mesa: do the thing",
@@ -3887,45 +3761,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            expand(INBOX_WATCHER, DEFAULT_INBOX_WATCHER, &vars).unwrap(),
-            [
-                "claude",
-                "--bg",
-                "--agent",
-                "swe",
-                "--name",
-                "mesa: do the thing",
-                "--",
-                "/inbox-triage 731",
-            ]
-        );
-        let spawn = Vars {
-            prompt: Some("look at the tests"),
-            ..Default::default()
-        };
-        assert_eq!(
-            expand(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &spawn).unwrap(),
-            [
-                "claude",
-                "--bg",
-                "--agent",
-                "swe",
-                "--",
-                "look at the tests"
-            ]
-        );
-        // The live agent takes both halves: a named session id *and* the
-        // prompt mesa supplies. The prompt is one argv entry however long or
-        // hostile its text — it is never re-split after substitution. Its
-        // agent is the literal `mesa-live` definition (mesa task 1068).
-        let live = Vars {
-            id: Some(12),
-            name: Some("mesa live 12"),
-            prompt: Some("listen; then say \"hi\""),
-            prompts: None,
-        };
-        assert_eq!(
-            expand(LIVE_AGENT, DEFAULT_LIVE_AGENT, &live).unwrap(),
+            argv_of(&resolve(LIVE_AGENT, DEFAULT_LIVE_AGENT, &live).unwrap()),
             [
                 "claude",
                 "--bg",
@@ -3939,55 +3775,65 @@ mod tests {
         );
     }
 
+    /// The argv a resolved script makes, as a real bash splits it: the
+    /// script's first word is swapped for a `printf` that writes one argument
+    /// per line. Only for scripts whose first line is a plain command.
+    fn argv_of(script: &str) -> Vec<String> {
+        let (program, rest) = script.split_once(' ').unwrap_or((script, ""));
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' '{program}' {rest}"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
-    fn absent_value_drops_the_token_and_its_flag() {
-        // No prompt → `-- {prompt}` vanishes as a pair; no name → so does
-        // `--name {name}`. Both are today's behavior.
-        let vars = Vars {
-            ..Default::default()
-        };
+    fn an_absent_value_is_the_empty_string() {
+        // No token is dropped and no flag goes with it: a placeholder with no
+        // value on this call is `''` in a word position and nothing inside
+        // quotes, so a promptless spawn hands its program an empty prompt.
+        let vars = Vars::default();
         assert_eq!(
-            expand(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &vars).unwrap(),
-            ["claude", "--bg", "--agent", "swe"]
+            resolve(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &vars).unwrap(),
+            "claude --bg --agent swe -- ''"
+        );
+        assert_eq!(
+            argv_of(&resolve(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &vars).unwrap()),
+            ["claude", "--bg", "--agent", "swe", "--", ""]
         );
         let named = Vars {
             id: Some(7),
             ..Default::default()
         };
         assert_eq!(
-            expand(TODO_WATCHER, DEFAULT_TODO_WATCHER, &named).unwrap(),
-            [
-                "claude",
-                "--bg",
-                "--agent",
-                "supervisor",
-                "--",
-                "/execute-mesa-task 7"
-            ]
+            resolve(TODO_WATCHER, DEFAULT_TODO_WATCHER, &named).unwrap(),
+            r#"claude --bg --agent supervisor --name '' -- "/execute-mesa-task 7""#
         );
-        // A dropped token only takes a *flag* with it, never a positional.
-        let vars = Vars {
-            id: Some(1),
-            ..Default::default()
-        };
-        assert_eq!(
-            expand(TODO_WATCHER, "t run {name}", &vars).unwrap(),
-            ["t", "run"]
-        );
+        assert_eq!(resolved("t run \"{name}\" {id}", &named), "t run \"\" '7'");
     }
 
     #[test]
-    fn untrusted_values_stay_one_argv_token() {
-        // The whole point of substituting after tokenizing: a name full of
-        // spaces, quotes and shell metacharacters is one argument, and the
-        // argv length is fixed by the template.
+    fn untrusted_values_stay_one_argument() {
+        // The whole point of quoting at the slot: a name full of spaces,
+        // quotes and shell metacharacters is one argument, and the argv length
+        // is fixed by the template.
         let hostile = r#"drop "; rm -rf / #' --dangerously-skip-permissions"#;
         let vars = Vars {
             id: Some(1),
             name: Some(hostile),
             ..Default::default()
         };
-        let argv = expand(TODO_WATCHER, DEFAULT_TODO_WATCHER, &vars).unwrap();
+        let argv = argv_of(&resolve(TODO_WATCHER, DEFAULT_TODO_WATCHER, &vars).unwrap());
         assert_eq!(argv.len(), 8);
         assert_eq!(argv[5], hostile);
     }
@@ -4000,256 +3846,200 @@ mod tests {
             ..Default::default()
         };
         // agent-spawn has no mesa record behind it, so no {id}/{name}…
-        let err = expand(AGENT_SPAWN, "claude {id}", &vars).unwrap_err();
+        let err = resolve(AGENT_SPAWN, "claude {id}", &vars).unwrap_err();
         assert!(err.contains("{id}"), "{err}");
         assert!(err.contains("agent-spawn offers {prompt}"), "{err}");
         // …and the watchers' prompt is theirs to write, not mesa's to inject.
-        let err = expand(TODO_WATCHER, "claude {prompt}", &vars).unwrap_err();
+        let err = resolve(TODO_WATCHER, "claude {prompt}", &vars).unwrap_err();
         assert!(err.contains("{prompt}"), "{err}");
         assert!(err.contains("todo-watcher offers {id}, {name}"), "{err}");
-        let err = expand(TODO_WATCHER, "claude {nope}", &vars).unwrap_err();
+        // A placeholder-shaped name mesa does not know is a typo, not text:
+        // bash has no use for `{nope}` either.
+        let err = resolve(TODO_WATCHER, "claude {nope}", &vars).unwrap_err();
         assert!(err.contains("{nope}"), "{err}");
         // The two placeholders mesa task 1141 retired are unknown names now,
         // refused exactly like `{nope}` — a template saved anew with either
         // is a validation error, not a silent literal.
         for retired in ["claude --bg --agent {agent} -- {id}", "{bin} --bg -- {id}"] {
-            let err = expand(TODO_WATCHER, retired, &vars).unwrap_err();
+            let err = resolve(TODO_WATCHER, retired, &vars).unwrap_err();
             assert!(err.contains("unsupported placeholder"), "{err}");
-        }
-    }
-
-    #[test]
-    fn expand_handles_braces_that_are_not_placeholders() {
-        let vars = Vars {
-            id: Some(5),
-            ..Default::default()
-        };
-        // An unclosed brace is literal text, and a placeholder can sit inside
-        // a larger token (`mesa-{id}` is one argument).
-        assert_eq!(
-            expand(TODO_WATCHER, "t a{b mesa-{id}", &vars).unwrap(),
-            ["t", "a{b", "mesa-5"]
-        );
-    }
-
-    #[test]
-    fn expand_rejects_a_template_that_yields_no_argv() {
-        let vars = Vars::default();
-        assert!(
-            expand(TODO_WATCHER, "   ", &vars)
-                .unwrap_err()
-                .contains("nothing")
-        );
-        assert!(
-            expand(TODO_WATCHER, "{name}", &vars)
-                .unwrap_err()
-                .contains("nothing")
-        );
-        assert!(
-            expand(TODO_WATCHER, r#"a "b"#, &vars)
-                .unwrap_err()
-                .contains("double quote")
-        );
-    }
-
-    // ---- script mode (mesa task 667) ------------------------------------
-
-    #[test]
-    fn is_script_is_decided_by_a_newline_in_the_trimmed_value() {
-        assert!(!is_script(DEFAULT_TODO_WATCHER));
-        assert!(!is_script("mytool run {id}"));
-        // Surrounding blank lines are whitespace, not a second line.
-        assert!(!is_script("\n\n  mytool run {id}  \n\n"));
-        assert!(is_script("cd /repo\nmytool run"));
-        assert!(is_script("mytool \\\n  run"));
-    }
-
-    #[test]
-    fn resolve_returns_argv_for_a_single_line_and_a_script_for_many() {
-        let vars = Vars {
-            id: Some(7),
-            name: Some("n"),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve(TODO_WATCHER, "claude run {id}", &vars).unwrap(),
-            Spawn::Argv(vec!["claude".into(), "run".into(), "7".into()])
-        );
-        // The stored body is trimmed, and the env is the action's vocabulary
-        // minus what has no value on this call.
-        assert_eq!(
-            resolve(TODO_WATCHER, "\n cd /repo\n exec claude \n", &vars).unwrap(),
-            Spawn::Script {
-                script: "cd /repo\n exec claude".to_string(),
-                env: vec![
-                    ("MESA_ID".to_string(), "7".to_string()),
-                    ("MESA_NAME".to_string(), "n".to_string()),
-                ],
-            }
-        );
-    }
-
-    #[test]
-    fn script_env_is_scoped_per_action_and_omits_absent_values() {
-        // agent-spawn gets a prompt and never an id/name…
-        let spawn = Vars {
-            id: Some(7),
-            name: Some("n"),
-            prompt: Some("p"),
-            ..Default::default()
-        };
-        assert_eq!(
-            script_env_(AGENT_SPAWN, &spawn),
-            [("MESA_PROMPT".to_string(), "p".to_string())]
-        );
-        // …and an absent value is omitted entirely rather than set empty —
-        // the script-mode analogue of the argv drop rule.
-        let bare = Vars {
-            ..Default::default()
-        };
-        assert!(script_env_(TODO_WATCHER, &bare).is_empty());
-        assert!(script_env_(AGENT_SPAWN, &bare).is_empty());
-    }
-
-    #[test]
-    fn a_supported_placeholder_in_a_script_is_substituted_as_a_variable_reference() {
-        // The rule mesa task 1137 replaced: `{}` is one vocabulary, both modes.
-        // What lands in the script is a reference; the value travels in `env`.
-        let vars = Vars {
-            name: Some("fix the parser"),
-            id: Some(7),
-            ..Default::default()
-        };
-        let script = "cd /repo\nexec claude --name {name} -- \"work on {id}\"";
-        let Spawn::Script { script, env } = resolve(TODO_WATCHER, script, &vars).unwrap() else {
-            panic!("expected a script");
-        };
-        assert_eq!(
-            script,
-            "cd /repo\nexec claude --name \"${MESA_NAME-}\" -- \"work on ${MESA_ID-}\""
-        );
-        // Already inside `"…"`, so `{id}` got the bare form; everywhere else
-        // the quoted one, so a value with spaces stays one word.
-        assert_eq!(
-            env.iter()
-                .find(|(v, _)| v == "MESA_NAME")
-                .map(|(_, v)| v.as_str()),
-            Some("fix the parser")
-        );
-        assert_eq!(
-            validate_(TODO_WATCHER, "cd /repo\nexec claude --name {name}"),
-            Ok(())
-        );
-        // A placeholder this action doesn't offer is still a save-time error,
-        // on both the editor's path and the spawn path.
-        let err = validate_(TODO_WATCHER, "cd /repo\nclaude -- {prompt}").unwrap_err();
-        assert!(err.contains("unsupported placeholder"), "{err}");
-        let err = resolve(TODO_WATCHER, "cd /repo\nclaude -- {prompt}", &vars).unwrap_err();
-        assert!(err.contains("unsupported placeholder"), "{err}");
-    }
-
-    #[test]
-    fn a_hostile_value_substituted_into_a_script_is_one_literal_string() {
-        // The strongest form of the claim: none of these ever appears in the
-        // script text at all, whatever the template did with the placeholder.
-        // A value cannot be parsed as syntax by a shell that never sees it.
-        for hostile in [
-            "\"; rm -rf / #",
-            "`id`",
-            "$(id)",
-            "it's fine",
-            "line one\nrm -rf /",
-            "'; touch /tmp/pwned; '",
-            "$'\\x41'",
-        ] {
-            let vars = Vars {
-                name: Some(hostile),
-                ..Default::default()
-            };
-            for template in [
-                "set -eu\necho {name}",
-                "set -eu\necho \"{name}\"",
-                "set -eu\necho \"$(printf '%s' {name})\"",
-                "set -eu\ncat <<EOF\n{name}\nEOF",
-            ] {
-                let Spawn::Script { script, env } = resolve(TODO_WATCHER, template, &vars).unwrap()
-                else {
-                    panic!("expected a script");
-                };
-                assert!(
-                    !script.contains(hostile),
-                    "the value reached the shell source: {script}"
-                );
-                assert!(script.contains("${MESA_NAME-}"), "{script}");
-                assert_eq!(
-                    env.iter()
-                        .find(|(v, _)| v == "MESA_NAME")
-                        .map(|(_, v)| v.as_str()),
-                    Some(hostile)
-                );
-            }
+            assert!(validate_(TODO_WATCHER, retired).is_err(), "{retired}");
         }
     }
 
     #[test]
     fn a_scripts_own_shell_syntax_is_not_mistaken_for_a_placeholder() {
         // `${VAR}`, brace expansion, `{ …; }` grouping and jq's object syntax
-        // all contain braces; only a bare, known placeholder name is one.
+        // all contain braces; only a placeholder-shaped name is one.
         for script in [
-            "cd /repo\nexec \"$CLAUDE_BIN\" --name \"${MESA_NAME}\"",
+            "cd /repo\nexec \"$CLAUDE_BIN\" --name \"${HOME}\"",
             "cd /repo\ncp a.txt{,.bak}\n{ echo one; echo two; }",
             "cd /repo\necho '{id: 1}' | tee out.json",
-            "cd /repo\necho {foo} {bin: 1}",
+            "cd /repo\necho {bin: 1} {1..3} a{b mesa-{}",
         ] {
             assert_eq!(validate_(TODO_WATCHER, script), Ok(()), "{script}");
-            let Spawn::Script { script: out, .. } =
-                resolve(TODO_WATCHER, script, &Vars::default()).unwrap()
-            else {
-                panic!("expected a script");
-            };
-            assert_eq!(out, script.trim(), "{script}");
+            assert_eq!(
+                resolved(script, &Vars::default()),
+                script.trim(),
+                "{script}"
+            );
         }
+        // A placeholder can sit inside a larger word: `mesa-{id}` is one
+        // argument, `{name}{id}` one word.
+        let vars = Vars {
+            id: Some(5),
+            name: Some("n"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved("t mesa-{id} {name}{id}", &vars),
+            "t mesa-'5' 'n''5'"
+        );
+        assert_eq!(
+            argv_of(&resolved("t mesa-{id} {name}{id}", &vars)),
+            ["t", "mesa-5", "n5"]
+        );
     }
 
     #[test]
     fn a_dollar_before_a_brace_is_bashs_own_parameter_expansion() {
         // `${name}` is a parameter expansion bash owns, left alone; the two
-        // placeholders beside it are mesa's and become references.
+        // placeholders beside it are mesa's and become quoted values.
         let vars = Vars {
             name: Some("foo$"),
             id: Some(9),
             ..Default::default()
         };
-        let Spawn::Script { script, .. } = resolve(
-            TODO_WATCHER,
-            "true\nprintf '%s' ${name} $ {name}{id}",
-            &vars,
-        )
-        .unwrap() else {
-            panic!("expected a script");
-        };
         assert_eq!(
-            script,
-            "true\nprintf '%s' ${name} $ \"${MESA_NAME-}\"\"${MESA_ID-}\""
+            resolved("true\nprintf '%s' ${name} $ {name}{id}", &vars),
+            "true\nprintf '%s' ${name} $ 'foo$''9'"
         );
     }
 
-    /// Runs a resolved script through a real bash with the spawn's own `env`,
-    /// the `env_remove` sweep included, and answers what it wrote.
-    fn run_resolved(template: &str, vars: &Vars, log: &std::path::Path) -> String {
-        let Spawn::Script { script, env } = resolve(TODO_WATCHER, template, vars).unwrap() else {
-            panic!("expected a script");
+    #[test]
+    fn command_in_migrates_mesa_variable_references_on_read() {
+        // A script saved before mesa task 1143 read its values as `MESA_*`
+        // variables, which mesa no longer sets. Read back, every spelling of
+        // such a reference is the placeholder it meant — the enclosing `"…"`
+        // consumed, since a placeholder arrives quoted — while the file itself
+        // is left byte-identical, exactly like the `{bin}`/`{agent}` rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let before = serde_json::json!({"commands": {
+            "todo-watcher": "cd /repo\nexec claude --name \"$MESA_NAME\" -- \"work on ${MESA_ID}\" ${MESA_ID-} $MESA_NAME",
+            "agent-spawn": "printf '%s' \"${MESA_PROMPT-}\" $MESA_PROMPT_NIGHTLY_BRIEF \"${MESA_PROMPT_A_B}\"",
+        }})
+        .to_string();
+        let path = write_config(dir.path(), &before);
+        assert_eq!(
+            command_in(&path, TODO_WATCHER).unwrap().as_deref(),
+            Some("cd /repo\nexec claude --name {name} -- \"work on {id}\" {id} {name}")
+        );
+        assert_eq!(
+            command_in(&path, AGENT_SPAWN).unwrap().as_deref(),
+            Some("printf '%s' {prompt} {prompt:nightly-brief} {prompt:a-b}")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // Only mesa's own three names and the prompt prefix are rewritten; an
+        // identifier that merely starts with one is some other variable, a
+        // quote that does not pair up stays, and `$MESA_DB` is untouched.
+        assert_eq!(
+            migrate_env_references("$MESA_IDX ${MESA_NAMES} \"$MESA_ID $MESA_DB\" $MESA_PROMPT_"),
+            "$MESA_IDX ${MESA_NAMES} \"{id} $MESA_DB\" $MESA_PROMPT_"
+        );
+        // A migrated hook resolves like one written with placeholders.
+        let vars = Vars {
+            id: Some(4),
+            name: Some("a b"),
+            ..Default::default()
         };
+        assert_eq!(
+            resolved(&command_in(&path, TODO_WATCHER).unwrap().unwrap(), &vars),
+            "cd /repo\nexec claude --name 'a b' -- \"work on 4\" '4' 'a b'"
+        );
+    }
+
+    #[test]
+    fn save_refuses_a_mesa_variable_reference() {
+        // The other half of the migration: a hand-typed `$MESA_NAME` must not
+        // save and then silently read as empty on every spawn.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (template, spelling, fix) in [
+            ("claude --name \"$MESA_NAME\"", "$MESA_NAME", "{name}"),
+            ("cd /repo\nclaude -- ${MESA_ID}", "${MESA_ID}", "{id}"),
+            (
+                "claude -- \"${MESA_PROMPT-}\"",
+                "${MESA_PROMPT-}",
+                "{prompt}",
+            ),
+            (
+                "claude -- $MESA_PROMPT_STOP_NOTIFY",
+                "$MESA_PROMPT_STOP_NOTIFY",
+                "{prompt:stop-notify}",
+            ),
+        ] {
+            let err = save_in(&path, &update(&[(LIVE_AGENT, template)])).unwrap_err();
+            let SaveError::Validation(message) = &err else {
+                panic!("{template}: {err:?}");
+            };
+            assert!(message.contains(spelling), "{template}: {message}");
+            assert!(message.contains(fix), "{template}: {message}");
+            assert!(message.contains("no longer sets"), "{template}: {message}");
+        }
+        assert!(!path.exists(), "a refused save wrote the file");
+        // A variable mesa reads but never set for a hook is not one of these.
+        save_in(
+            &path,
+            &update(&[(LIVE_AGENT, "echo \"$MESA_DB\" $MESA_IDX")]),
+        )
+        .unwrap();
+    }
+
+    // ---- quoting at the slot (mesa task 1143) ---------------------------
+
+    #[test]
+    fn a_value_is_quoted_for_the_context_it_sits_in() {
+        let vars = Vars {
+            name: Some("it's \"a\" $b `c` \\d"),
+            id: Some(7),
+            ..Default::default()
+        };
+        // A word position: single-quoted, `'` spelled `'\''`.
+        assert_eq!(
+            resolved("echo {name}", &vars),
+            "echo 'it'\\''s \"a\" $b `c` \\d'"
+        );
+        // Inside `"…"`: escaped in place, the four characters that mean
+        // anything there — no quotes of mesa's own.
+        assert_eq!(
+            resolved("echo \"x {name} y\"", &vars),
+            "echo \"x it's \\\"a\\\" \\$b \\`c\\` \\\\d y\""
+        );
+        // `$(…)` is a fresh word position even inside `"…"`.
+        assert_eq!(
+            resolved("echo \"$(printf %s {name})\"", &vars),
+            "echo \"$(printf %s 'it'\\''s \"a\" $b `c` \\d')\""
+        );
+        // A heredoc body: only `\`, `$` and `` ` `` can be escaped, and a `"`
+        // is literal text there.
+        assert_eq!(
+            resolved("cat <<EOF\n{name}\nEOF", &vars),
+            "cat <<EOF\nit's \"a\" \\$b \\`c\\` \\\\d\nEOF"
+        );
+        // A comment: quoted like a word, and never read.
+        assert_eq!(resolved("true # {id}", &vars), "true # '7'");
+    }
+
+    /// Runs a resolved script through a real bash and answers what it wrote.
+    fn run_resolved(template: &str, vars: &Vars, log: &std::path::Path) -> String {
+        let script = resolved(template, vars);
         let _ = std::fs::remove_file(log);
-        let mut command = Command::new("bash");
-        command.arg("-c").arg(&script);
-        for var in ALL_ENV_VARS {
-            command.env_remove(var);
-        }
-        for (var, value) in &env {
-            command.env(var, value);
-        }
-        let out = command.output().expect("bash");
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .output()
+            .expect("bash");
         assert!(
             out.status.success(),
             "{script}\n{}",
@@ -4270,6 +4060,7 @@ mod tests {
         let payload = format!("\"; touch {}; \"", pwned.display());
         let quoted_payload = format!("'; touch {}; '", pwned.display());
         let ansi_payload = format!("x'; touch {}; :'", pwned.display());
+        let heredoc_payload = format!("x\nEOF\ntouch {}\ncat <<EOF\n", pwned.display());
         let log_arg = log.display().to_string();
         for body in [
             "true\nprintf '%s' {name} > LOG",
@@ -4277,6 +4068,7 @@ mod tests {
             "true\nprintf '%s' \"$(printf '%s' {name})\" > LOG",
             "true\nprintf '%s' \"$( (true) ; printf %s {name} )\" > LOG",
             "true\ncat > LOG <<EOF\n{name}\nEOF",
+            "true\ncat > LOG <<EOF\npre {name} post\nEOF",
         ] {
             let template = body.replace("LOG", &log_arg);
             let heredoc = body.contains("<<EOF");
@@ -4284,50 +4076,103 @@ mod tests {
                 payload.as_str(),
                 quoted_payload.as_str(),
                 ansi_payload.as_str(),
+                heredoc_payload.as_str(),
                 "$(id)",
                 "`id`",
                 "\\",
                 "back\\slash \"and\" 'quotes'",
-                "$MESA_NAME ${MESA_NAME} !ref",
+                "$MESA_NAME ${MESA_NAME} !ref \\$x \\\\",
                 "two words",
                 "* ? [a-z]",
+                "line one\nline two",
+                "\ttabbed\n\tlines",
             ] {
-                // A heredoc body always ends in a newline, and `$(…)` strips
-                // trailing ones — so only compare what each can carry.
-                if heredoc && hostile.contains('\n') {
-                    continue;
-                }
                 let vars = Vars {
                     name: Some(hostile),
                     ..Default::default()
                 };
                 let got = run_resolved(&template, &vars, &log);
-                let got = if heredoc {
-                    got.strip_suffix('\n').unwrap_or(&got).to_string()
+                // A heredoc body always ends in a newline, and `$(…)` strips
+                // trailing ones — a value with newlines rides through one in
+                // a heredoc too — so compare what each can carry.
+                let expected = if heredoc {
+                    let value = hostile.trim_end_matches('\n');
+                    if body.contains("pre ") {
+                        format!("pre {value} post\n")
+                    } else {
+                        format!("{value}\n")
+                    }
+                } else if body.contains("$(") {
+                    hostile.trim_end_matches('\n').to_string()
                 } else {
-                    got
+                    hostile.to_string()
                 };
-                assert_eq!(got, hostile, "{template} with {hostile:?}");
-                assert!(!pwned.exists(), "the injected command ran: {template}");
+                assert_eq!(got, expected, "{template} with {hostile:?}");
+                assert!(
+                    !pwned.exists(),
+                    "the injected command ran: {template} with {hostile:?}"
+                );
             }
         }
     }
 
     #[test]
-    fn the_three_lexer_holes_that_broke_value_substitution_are_inert_now() {
-        // The security review's three proofs of concept against the previous,
-        // value-substituting design, kept verbatim as regressions. Under
-        // reference substitution none of them can work, because none of them
-        // puts the value in the script at all — which is the point: these were
-        // *lexer* bugs, and the lexer no longer decides whether a value is
-        // safe. (2) was a confirmed RCE; (1) and (3) were mis-lexings that
-        // reached bad shell text.
+    fn a_value_with_a_newline_cannot_end_a_heredoc_or_a_comment() {
+        // Bash finds a heredoc's delimiter line by line *before* expanding the
+        // body, and a comment ends at a newline — the two contexts where a
+        // newline in a value would put its next line in front of the parser.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let pwned = dir.path().join("pwned");
+        let hostile = format!("x\nEOF\ntouch {}\ncat <<EOF\ny", pwned.display());
+        let vars = Vars {
+            name: Some(&hostile),
+            ..Default::default()
+        };
+        let template = format!("true\ncat > {} <<EOF\n{{name}}\nEOF", log.display());
+        // The body is one line of `$(printf '%s' $'…')`, so no line of it can
+        // match `EOF`.
+        assert!(
+            resolved(&template, &vars).contains("$(printf '%s' $'x\\nEOF\\ntouch "),
+            "{}",
+            resolved(&template, &vars)
+        );
+        assert_eq!(run_resolved(&template, &vars, &log), format!("{hostile}\n"));
+        assert!(!pwned.exists(), "the heredoc was ended early");
+        // `<<-` strips a leading tab from each body line before expansion, so
+        // a value starting with one rides the same way.
+        let tabbed = "\tkeep my tab";
+        let vars = Vars {
+            name: Some(tabbed),
+            ..Default::default()
+        };
+        let template = format!("true\ncat > {} <<-EOF\n\t{{name}}\n\tEOF", log.display());
+        assert_eq!(run_resolved(&template, &vars, &log), format!("{tabbed}\n"));
+        // A comment folds the value's newlines: the second line is still
+        // inside the comment.
+        let hostile = format!("note\ntouch {}", pwned.display());
+        let vars = Vars {
+            name: Some(&hostile),
+            ..Default::default()
+        };
+        let template = format!("true # {{name}}\nprintf '%s' done > {}", log.display());
+        assert!(!resolved(&template, &vars).contains("\ntouch"));
+        assert_eq!(run_resolved(&template, &vars, &log), "done");
+        assert!(!pwned.exists(), "the comment was ended early");
+    }
+
+    #[test]
+    fn the_three_lexer_holes_that_broke_an_earlier_draft_stay_closed() {
+        // A security review's three proofs of concept against an earlier
+        // value-substituting draft, kept as regressions now that values are
+        // substituted again. (2) was a confirmed RCE; (1) and (3) were
+        // mis-lexings that reached bad shell text.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("out");
         let pwned = dir.path().join("pwned");
         let log_arg = log.display().to_string();
-        // (1) `$'…'` is ANSI-C quoting, not a single-quoted string. It is now a
-        // refusal, since no expansion happens there at all.
+        // (1) `$'…'` is ANSI-C quoting, not a single-quoted string. Refused:
+        // a `'` in the value would close the run, and `\n` would be read.
         let poc1 = format!("true\nprintf '%s' $'{{name}}' > {log_arg}");
         let err = validate_(TODO_WATCHER, &poc1).unwrap_err();
         assert!(err.contains("ANSI-C"), "{err}");
@@ -4336,25 +4181,24 @@ mod tests {
             "{poc1}"
         );
         // (2) a `)` that closed a `$(` which was never opened, mis-typing
-        // everything after it as `"…"`. The subshell is tracked now, and the
-        // value never reaches the text either way.
+        // everything after it as `"…"` — so the value was escaped for `"…"`
+        // while actually sitting in a word position, where a `"` in it
+        // opened a string. The subshell is tracked now.
         let poc2 = format!("true\nprintf '%s' \"$( (uname) ; printf %s {{name}} )\" > {log_arg}");
+        let hostile = format!("x\"; touch {}; \"", pwned.display());
         let vars = Vars {
-            name: Some(&format!("x\"; touch {}; \"", pwned.display())),
+            name: Some(&hostile),
             ..Default::default()
         };
         let got = run_resolved(&poc2, &vars, &log);
         // `uname`'s own output leads; what matters is that the value follows it
         // as literal text (so nothing in it ran) — asserted without pinning the
         // platform this test happens to run on.
-        assert!(
-            got.ends_with(&format!("x\"; touch {}; \"", pwned.display())),
-            "{got:?}"
-        );
+        assert!(got.ends_with(&hostile), "{got:?}");
         assert!(!pwned.exists(), "PoC 2 still executes");
-        // (3) bash starts a comment after `)`, which the old predecessor set
-        // omitted. A comment is an ordinary substitution context now — the
-        // reference is simply never expanded, being commented out.
+        // (3) bash starts a comment after `)`, which an earlier predecessor
+        // set omitted, so the value was read as code. A comment is a context
+        // of its own now, and the value stays inside it.
         let poc3 = format!("true\n(true)# note {{name}}\nprintf '%s' done > {log_arg}");
         let vars = Vars {
             name: Some(&format!("x\ntouch {}", pwned.display())),
@@ -4366,7 +4210,6 @@ mod tests {
 
     #[test]
     fn a_substituted_value_never_globs_and_never_word_splits() {
-        // The one thing riding on the lexer picking the right inert form.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("out");
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
@@ -4375,14 +4218,16 @@ mod tests {
         for body in [
             "true\ncd DIR\nprintf '[%s]' {name} > LOG",
             "true\ncd DIR\nprintf '[%s]' \"{name}\" > LOG",
+            "true\ncd DIR\nprintf '[%s]' \"$(printf %s {name})\" > LOG",
         ] {
             let template = body.replace("LOG", &log_arg).replace("DIR", &dir_arg);
-            for hostile in ["two words", "*", "a.tx?", "  spaced  "] {
+            for hostile in ["two words", "*", "a.tx?", "  spaced  ", "~", "$HOME"] {
                 let vars = Vars {
                     name: Some(hostile),
                     ..Default::default()
                 };
-                // One `[…]` means one word: no splitting, no globbing.
+                // One `[…]` means one word: no splitting, no globbing, no
+                // tilde or parameter expansion.
                 assert_eq!(
                     run_resolved(&template, &vars, &log),
                     format!("[{hostile}]"),
@@ -4393,10 +4238,11 @@ mod tests {
     }
 
     #[test]
-    fn a_placeholder_is_refused_where_no_expansion_could_reach_it() {
-        // The single-quote family: nothing expands there, so there is nothing
-        // mesa could emit. A correctness refusal, not a security one — plus
-        // backticks, whose rules differ from `$(…)`'s just enough not to guess.
+    fn a_placeholder_is_refused_where_no_value_could_go() {
+        // The single-quote family: a `'` in the value would end the run, and
+        // inside `$'…'` its backslashes would be read — so nothing mesa could
+        // emit there is right. Plus backticks, whose rules differ from
+        // `$(…)`'s just enough not to guess.
         for (script, place) in [
             ("set -eu\necho '{name}'", "single quotes"),
             ("set -eu\nprintf '%s' $'{name}'", "ANSI-C"),
@@ -4424,37 +4270,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_placeholder_in_a_script_becomes_the_empty_string() {
-        // The one place the two modes genuinely differ: free-form shell text
-        // has no token to drop, so an absent value is empty — and the `-`
-        // default is what makes that hold under `set -u` too. The `MESA_*`
-        // variable stays genuinely unset, which is how a script tells the two
-        // apart.
-        let vars = Vars {
-            ..Default::default()
-        };
-        let Spawn::Script { script, env } =
-            resolve(TODO_WATCHER, "set -eu\nexec claude --name {name}", &vars).unwrap()
-        else {
-            panic!("expected a script");
-        };
-        assert_eq!(script, "set -eu\nexec claude --name \"${MESA_NAME-}\"");
-        assert!(!env.iter().any(|(var, _)| var == "MESA_NAME"), "{env:?}");
-        // …and a real bash agrees, under `set -u`.
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("out");
-        let template = format!(
-            "set -eu\nprintf '[%s][%s]' {{name}} \"${{MESA_NAME+set}}\" > {}",
-            log.display()
-        );
-        assert_eq!(run_resolved(&template, &vars, &log), "[][]");
-    }
-
-    #[test]
     fn a_placeholder_as_a_heredoc_delimiter_is_refused_not_ignored() {
-        // The review's finding 6: `read_heredoc` eats the delimiter word before
-        // the main loop sees the `{`, so this used to be the one spot where a
-        // placeholder neither expanded nor errored — it just stayed as braces.
+        // `read_heredoc` eats the delimiter word before the main loop sees the
+        // `{`, so this used to be the one spot where a placeholder neither
+        // substituted nor errored — it just stayed as braces.
         let script = "true\ncat <<{name}\nhello\n{name}";
         let err = validate_(TODO_WATCHER, script).unwrap_err();
         assert!(err.contains("{name}"), "{err}");
@@ -4478,17 +4297,16 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_is_refused_because_it_re_parses_what_an_expansion_produced() {
-        // The second audit's part 2: arithmetic evaluation is a *second*
-        // parser, and an array subscript inside it is itself expanded, so a
-        // value of `a[$(cmd)]` runs the command. Both spellings the lexer can
-        // cheaply see are refused, on the save path and the spawn path alike.
+    fn arithmetic_is_refused_because_it_re_parses_what_it_is_given() {
+        // Arithmetic evaluation is a *second* parser, and an array subscript
+        // inside it is itself expanded, so a value of `a[$(cmd)]` runs the
+        // command however it was quoted. Both spellings the lexer can cheaply
+        // see are refused, on the save path and the spawn path alike.
         for script in [
             "true\nn=$(( {id} + 1 ))",
             "true\n(( n = {id} ))",
             "true\nif (( {id} > 0 )); then echo yes; fi",
-            // …including the one the audit reached through a heredoc body,
-            // where the bare form would otherwise have gone in.
+            // …including the one reached through a heredoc body.
             "true\ncat <<EOF\n$(( {id} ))\nEOF",
         ] {
             let err = validate_(TODO_WATCHER, script).unwrap_err();
@@ -4500,39 +4318,31 @@ mod tests {
             );
         }
         // `( (` with a space is a subshell, not arithmetic — bash reads it that
-        // way and so does mesa, so the audit's own PoC-2 shape still works.
+        // way and so does mesa, so the PoC-2 shape still works.
         let vars = Vars {
             name: Some("v"),
             ..Default::default()
         };
-        let Spawn::Script { script, .. } = resolve(
-            TODO_WATCHER,
-            "true\necho \"$( (true) ; printf %s {name} )\"\nm=$(( (2) * 3 ))",
-            &vars,
-        )
-        .unwrap() else {
-            panic!("expected a script");
-        };
         assert_eq!(
-            script,
-            "true\necho \"$( (true) ; printf %s \"${MESA_NAME-}\" )\"\nm=$(( (2) * 3 ))"
+            resolved(
+                "true\necho \"$( (true) ; printf %s {name} )\"\nm=$(( (2) * 3 ))",
+                &vars
+            ),
+            "true\necho \"$( (true) ; printf %s 'v' )\"\nm=$(( (2) * 3 ))"
         );
     }
 
     #[test]
     fn arithmetic_refusal_is_inherited_by_every_nested_context() {
-        // The third audit's one live RCE: `Ctx::Arith` is a stack-*top* test,
-        // and a nested `$(…)` pushes `CmdSub` on top of it — but arithmetic
-        // re-reads that substitution's **output**, so the subscript gadget
-        // fires there too. The refusal is asked of the whole stack.
+        // `Ctx::Arith` is a stack-*top* test, and a nested `$(…)` pushes
+        // `CmdSub` on top of it — but arithmetic re-reads that substitution's
+        // **output**, so the subscript gadget fires there too. The refusal is
+        // asked of the whole stack.
         for script in [
             "true\necho $(( $(echo {name}) ))",
             "true\ncat <<EOF\n$(( $(echo {name}) ))\nEOF",
-            // The two that used to survive only on bash disliking a quote in
-            // an arithmetic operand — luck, not design.
             "true\necho $(( (1+{name}) ))",
             "true\necho $(( \"{name}\" ))",
-            // …and nested two deep, and through a subshell.
             "true\necho $(( $(echo $(echo {name})) ))",
             "true\n(( n = $( (echo {name}) ) ))",
         ] {
@@ -4550,42 +4360,26 @@ mod tests {
             validate_(TODO_WATCHER, "true\nn=$(( 1 + 1 ))\necho {name}"),
             Ok(())
         );
+        // The refusal names no variable: there are none to name.
+        let err = validate_(TODO_WATCHER, "true\necho $(( {id} ))").unwrap_err();
+        assert!(!err.contains("MESA_"), "{err}");
     }
 
     #[test]
-    fn the_arithmetic_refusal_names_no_particular_variable() {
-        // Every other refusal is variable-agnostic; this one used to advise
-        // `$MESA_ID` whichever placeholder tripped it.
-        for (script, wrong) in [
-            ("true\necho $(( {name} ))", "MESA_ID"),
-            ("true\necho $(( {id} ))", "MESA_NAME"),
-        ] {
-            let err = validate_(TODO_WATCHER, script).unwrap_err();
-            assert!(!err.contains(wrong), "{script}: {err}");
-            assert!(err.contains("MESA_*"), "{script}: {err}");
-        }
-    }
-
-    #[test]
-    fn a_command_substitution_in_a_heredoc_body_gets_the_quoted_form() {
+    fn a_command_substitution_in_a_heredoc_body_is_a_word_position() {
         // `$(…)` inside a heredoc body is an ordinary command context, so the
-        // bare form the body itself calls for would word-split and glob there.
-        // (This is *not* what closes the nested-arithmetic hole — `$((` is.)
+        // escaped form the body itself calls for would word-split and glob
+        // there; the value is single-quoted instead.
         let vars = Vars {
             name: Some("two words"),
             ..Default::default()
         };
-        let Spawn::Script { script, .. } = resolve(
-            TODO_WATCHER,
-            "true\ncat <<EOF\n$(printf '[%s]' {name})\n{name}\nEOF",
-            &vars,
-        )
-        .unwrap() else {
-            panic!("expected a script");
-        };
         assert_eq!(
-            script,
-            "true\ncat <<EOF\n$(printf '[%s]' \"${MESA_NAME-}\")\n${MESA_NAME-}\nEOF"
+            resolved(
+                "true\ncat <<EOF\n$(printf '[%s]' {name})\n{name}\nEOF",
+                &vars
+            ),
+            "true\ncat <<EOF\n$(printf '[%s]' 'two words')\ntwo words\nEOF"
         );
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("out");
@@ -4601,7 +4395,7 @@ mod tests {
         // `a[$(cmd)]` is the gadget that makes arithmetic a second parser: the
         // subscript is itself expanded. Arithmetic is refused, so the question
         // this test answers is the complement — that the payload is inert in
-        // every position mesa *does* accept, bare form and quoted form alike.
+        // every position mesa *does* accept.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("out");
         let pwned = dir.path().join("pwned");
@@ -4624,7 +4418,7 @@ mod tests {
             let got = run_resolved(&template, &vars, &log);
             let got = got.strip_suffix('\n').unwrap_or(&got).to_string();
             // The comment case writes a fixed marker, not the value — it is
-            // here to prove the commented reference runs nothing either.
+            // here to prove the commented value runs nothing either.
             let expected = if template.contains("# note") {
                 "a[$]".to_string()
             } else {
@@ -4656,7 +4450,7 @@ mod tests {
     fn the_shell_forms_the_review_found_correct_stay_correct() {
         // The review's "could not break" list, pinned so a later lexer edit
         // cannot quietly regress it. Each of these must leave a following
-        // placeholder in an ordinary (substituting) position.
+        // placeholder in a word position, where it is single-quoted.
         for script in [
             // `$"…"` locale quoting, `${#var}`, `$#`, `#` that starts no comment
             "true\necho $\"text\" {name}",
@@ -4682,38 +4476,28 @@ mod tests {
             "true\necho ümläut \\é {name} ✓",
         ] {
             assert_eq!(validate_(TODO_WATCHER, script), Ok(()), "{script}");
-            let Spawn::Script { script: out, .. } = resolve(
-                TODO_WATCHER,
+            let out = resolved(
                 script,
                 &Vars {
-                    name: Some("v"),
+                    name: Some("v w"),
                     ..Default::default()
                 },
-            )
-            .unwrap() else {
-                panic!("expected a script");
-            };
-            assert!(out.contains("\"${MESA_NAME-}\""), "{script} became {out}");
+            );
+            assert!(out.contains("'v w'"), "{script} became {out}");
         }
         // CRLF: the `\r` rides along in both the recorded delimiter and the
         // line compared against it, so the heredoc closes where it looks like
-        // it closes and a later placeholder is an ordinary one. (The review
-        // predicted the delimiter would never match, refusing every later
-        // placeholder — it fails *safe* either way, but measured, it works.)
+        // it closes and a later placeholder is an ordinary one.
         let crlf = "true\r\ncat <<EOF\r\nhi\r\nEOF\r\necho {name}";
         assert_eq!(validate_(TODO_WATCHER, crlf), Ok(()));
-        let Spawn::Script { script: out, .. } = resolve(
-            TODO_WATCHER,
+        let out = resolved(
             crlf,
             &Vars {
                 name: Some("v"),
                 ..Default::default()
             },
-        )
-        .unwrap() else {
-            panic!("expected a script");
-        };
-        assert!(out.ends_with("echo \"${MESA_NAME-}\""), "{out}");
+        );
+        assert!(out.ends_with("echo 'v'"), "{out}");
     }
 
     #[test]
@@ -4730,44 +4514,11 @@ mod tests {
             "{err:?}"
         );
         assert!(!path.exists(), "a rejected save must write nothing");
-        // A well-formed script round-trips and stays a script on the way back.
-        let script = "cd /repo\nexec \"$CLAUDE_BIN\" --bg -- \"work on $MESA_ID\"";
+        // A well-formed script round-trips verbatim.
+        let script = "cd /repo\nexec \"$CLAUDE_BIN\" --bg -- \"work on {id}\"";
         save_in(&path, &update(&[(TODO_WATCHER, script)])).unwrap();
-        let stored = command_in(&path, TODO_WATCHER).unwrap().unwrap();
-        assert_eq!(stored, script);
-        assert!(is_script(&stored));
+        assert_eq!(command_in(&path, TODO_WATCHER).unwrap().unwrap(), script);
     }
-
-    #[test]
-    fn a_blank_value_still_clears_the_key_in_either_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            dir.path(),
-            r#"{"commands": {"todo-watcher": "cd /repo\nexec claude"}}"#,
-        );
-        save_in(&path, &update(&[(TODO_WATCHER, "\n  \n")])).unwrap();
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(written["commands"].get(TODO_WATCHER).is_none());
-    }
-
-    #[test]
-    fn settings_reports_the_script_mode_vocabulary_beside_the_placeholders() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), r#"{"commands": {}}"#);
-        let settings = settings_in(&path).unwrap();
-        assert_eq!(settings[0].env_vars, ["MESA_ID", "MESA_NAME"]);
-        assert_eq!(settings[2].env_vars, ["MESA_PROMPT"]);
-        assert_eq!(
-            settings[3].env_vars,
-            ["MESA_ID", "MESA_NAME", "MESA_PROMPT"]
-        );
-        // The two vocabularies line up one-for-one, in the same order.
-        for row in &settings {
-            assert_eq!(row.placeholders.len(), row.env_vars.len(), "{}", row.action);
-        }
-    }
-
     // ---- pricing (mesa task 692) ----------------------------------------
 
     fn price(pairs: &[(&str, Option<ModelRates>)]) -> HashMap<String, Option<ModelRates>> {
@@ -5904,14 +5655,10 @@ mod tests {
     }
 
     #[test]
-    fn a_hostile_prompt_body_never_reaches_the_shell() {
-        // The test that matters most, and the whole reason a prompt body is
-        // not spliced into a template: a library body is free text somebody
-        // else wrote, and it is exactly the shape task 1137's invariant has to
-        // survive. Argv mode: one argument, byte-identical. Script mode: the
-        // script text holds only the `${MESA_PROMPT_*-}` reference and not one
-        // byte of the body, and the body reaches the child's environment
-        // unchanged.
+    fn a_hostile_prompt_body_never_runs_as_shell() {
+        // The test that matters most: a library body is free text somebody
+        // else wrote, and it is exactly the shape the quoting has to survive.
+        // Every position, through a real bash, the body coming straight back.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("out");
         let pwned = dir.path().join("pwned");
@@ -5920,6 +5667,7 @@ mod tests {
             format!("'; touch {}; '", pwned.display()),
             format!("$(touch {})", pwned.display()),
             format!("`touch {}`", pwned.display()),
+            format!("x\nEOF\ntouch {}\ncat <<EOF\n", pwned.display()),
             "$((1+1)) ${HOME} $HOME".to_string(),
             "a literal \\n escape".to_string(),
             "line one\nline two\nline three".to_string(),
@@ -5927,44 +5675,25 @@ mod tests {
         ];
         for body in &bodies {
             let table = prompts(&[("brief", body)]);
-
-            // argv: one argument, byte-identical.
             let vars = Vars {
                 prompts: Some(&table),
                 ..Default::default()
             };
-            assert_eq!(
-                expand(AGENT_SPAWN, "claude -- {prompt:brief}", &vars).unwrap(),
-                vec!["claude".to_string(), "--".to_string(), body.clone()],
-                "argv mode mangled {body:?}"
-            );
-
-            // script: the reference, never the value — and a real bash run
-            // that gives the body straight back.
-            let template = format!("true\nprintf '%s' {{prompt:brief}} > {}", log.display());
-            let Spawn::Script { script, env } = resolve(TODO_WATCHER, &template, &vars).unwrap()
-            else {
-                panic!("expected a script");
-            };
-            assert!(
-                script.contains("\"${MESA_PROMPT_BRIEF-}\""),
-                "the reference is missing: {script}"
-            );
-            for line in body.lines().filter(|l| !l.is_empty()) {
-                assert!(
-                    !script.contains(line),
-                    "the body reached the shell source: {script}"
-                );
+            for template in [
+                "true\nprintf '%s' {prompt:brief} > LOG",
+                "true\nprintf '%s' \"{prompt:brief}\" > LOG",
+                "true\ncat > LOG <<EOF\n{prompt:brief}\nEOF",
+            ] {
+                let template = template.replace("LOG", &log.display().to_string());
+                let got = run_resolved(&template, &vars, &log);
+                let expected = if template.contains("<<EOF") {
+                    format!("{}\n", body.trim_end_matches('\n'))
+                } else {
+                    body.clone()
+                };
+                assert_eq!(got, expected, "{template} with {body:?}");
+                assert!(!pwned.exists(), "the injected command ran: {body:?}");
             }
-            assert_eq!(
-                env.iter()
-                    .find(|(v, _)| v == "MESA_PROMPT_BRIEF")
-                    .map(|(_, v)| v.as_str()),
-                Some(body.as_str()),
-                "the env handoff mangled {body:?}"
-            );
-            assert_eq!(&run_resolved(&template, &vars, &log), body);
-            assert!(!pwned.exists(), "the injected command ran: {body:?}");
         }
     }
 
@@ -5979,43 +5708,41 @@ mod tests {
         };
         for written in ["Nightly-Brief", "nightly-brief", "NIGHTLY-BRIEF"] {
             assert_eq!(
-                expand(
+                resolve(
                     AGENT_SPAWN,
                     &format!("claude -- {{prompt:{written}}}"),
                     &vars
                 )
                 .unwrap(),
-                ["claude", "--", "read the board"],
+                "claude -- 'read the board'",
                 "{written}"
             );
         }
+        // A name may hold a `.` — it is a library name, and nothing else has
+        // to be able to hold it any more.
+        let table = prompts(&[("my.brief", "text")]);
+        let vars = Vars {
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(AGENT_SPAWN, "claude -- {prompt:my.brief}", &vars).unwrap(),
+            "claude -- 'text'"
+        );
     }
 
     #[test]
-    fn an_empty_prompt_body_resolves_to_nothing_rather_than_failing() {
+    fn an_empty_prompt_body_resolves_to_the_empty_string_rather_than_failing() {
         // An empty body is a legal library row, so it is a legal placeholder:
-        // the empty string, in argv as one (empty) argument and in script mode
-        // as an empty variable. It is *not* the argv drop rule — that belongs
-        // to a value this call does not have, and this call has one.
+        // one empty argument.
         let table = prompts(&[("blank", "")]);
         let vars = Vars {
             prompts: Some(&table),
             ..Default::default()
         };
         assert_eq!(
-            expand(AGENT_SPAWN, "claude -- {prompt:blank}", &vars).unwrap(),
-            ["claude", "--", ""]
-        );
-        let Spawn::Script { env, .. } =
-            resolve(TODO_WATCHER, "true\necho {prompt:blank}", &vars).unwrap()
-        else {
-            panic!("expected a script");
-        };
-        assert_eq!(
-            env.iter()
-                .find(|(v, _)| v == "MESA_PROMPT_BLANK")
-                .map(|(_, v)| v.as_str()),
-            Some("")
+            resolve(AGENT_SPAWN, "claude -- {prompt:blank}", &vars).unwrap(),
+            "claude -- ''"
         );
     }
 
@@ -6045,11 +5772,9 @@ mod tests {
             prompts: Some(&prompts(&[])),
             ..Default::default()
         };
-        let err = expand(TODO_WATCHER, "claude -- {prompt:nightly}", &vars).unwrap_err();
+        let err = resolve(TODO_WATCHER, "claude -- {prompt:nightly}", &vars).unwrap_err();
         assert!(err.contains("{prompt:nightly}"), "{err}");
         assert!(err.contains("no prompts"), "{err}");
-        let err = resolve(TODO_WATCHER, "true\necho {prompt:nightly}", &vars).unwrap_err();
-        assert!(err.contains("{prompt:nightly}"), "{err}");
     }
 
     #[test]
@@ -6058,7 +5783,7 @@ mod tests {
         // is replaced; a nested `{prompt:…}`, a placeholder this action does
         // not offer and an unknown brace are all left literal — a library body
         // is data somebody wrote, not a template the config author reviewed, so
-        // it must never break a hook.
+        // it must never break a hook. The result is then quoted as one value.
         let table = prompts(&[
             (
                 "brief",
@@ -6073,80 +5798,10 @@ mod tests {
             prompts: Some(&table),
         };
         // todo-watcher offers {id}/{name} but not {prompt}.
-        let argv = expand(TODO_WATCHER, "claude -- {prompt:brief}", &vars).unwrap();
         assert_eq!(
-            argv,
-            [
-                "claude",
-                "--",
-                "task 7 (A: do it) — {prompt:other} {prompt} {nope}",
-            ]
+            resolve(TODO_WATCHER, "claude -- {prompt:brief}", &vars).unwrap(),
+            "claude -- 'task 7 (A: do it) — {prompt:other} {prompt} {nope}'"
         );
-        // Script mode expands in the env var's *value*, which no shell parses.
-        let Spawn::Script { script, env } =
-            resolve(TODO_WATCHER, "true\necho {prompt:brief}", &vars).unwrap()
-        else {
-            panic!("expected a script");
-        };
-        assert!(script.contains("\"${MESA_PROMPT_BRIEF-}\""), "{script}");
-        assert_eq!(
-            env.iter()
-                .find(|(v, _)| v == "MESA_PROMPT_BRIEF")
-                .map(|(_, v)| v.as_str()),
-            Some("task 7 (A: do it) — {prompt:other} {prompt} {nope}")
-        );
-    }
-
-    #[test]
-    fn two_prompt_names_that_fold_onto_one_variable_are_refused_at_save_time() {
-        // A script reads a prompt through one variable, and `a-b` and `a_b`
-        // both name `MESA_PROMPT_A_B`. Two bodies, one slot — mesa refuses
-        // rather than guessing which the author meant.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        let table = prompts(&[("a-b", "dash"), ("a_b", "under")]);
-        let err = save_commands_in(
-            &path,
-            &update(&[(TODO_WATCHER, "true\necho {prompt:a-b} {prompt:a_b}")]),
-            &table,
-        )
-        .unwrap_err();
-        let SaveError::Validation(message) = &err else {
-            panic!("{err:?}");
-        };
-        assert!(message.contains("{prompt:a-b}"), "{message}");
-        assert!(message.contains("{prompt:a_b}"), "{message}");
-        assert!(message.contains("$MESA_PROMPT_A_B"), "{message}");
-        assert!(!path.exists(), "a refused save wrote the file");
-
-        // The same name twice — including in two spellings of the same case —
-        // is one variable and perfectly fine.
-        save_commands_in(
-            &path,
-            &update(&[(TODO_WATCHER, "true\necho {prompt:a-b} {prompt:A-B}")]),
-            &table,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn a_prompt_name_no_environment_variable_could_hold_is_refused() {
-        // A library name may hold a `.`; an environment variable may not. The
-        // refusal is the same in both modes, so a one-line template and the
-        // two-line one it grows into offer the same vocabulary.
-        let table = prompts(&[("my.brief", "text")]);
-        let vars = Vars {
-            prompts: Some(&table),
-            ..Default::default()
-        };
-        for template in [
-            "claude -- {prompt:my.brief}",
-            "true\necho {prompt:my.brief}",
-        ] {
-            let err = resolve(TODO_WATCHER, template, &vars).unwrap_err();
-            assert!(err.contains("my.brief"), "{err}");
-            assert!(err.contains("environment variable"), "{err}");
-        }
     }
 
     #[test]
@@ -6165,8 +5820,8 @@ mod tests {
         };
         for action in ACTIONS {
             assert_eq!(
-                expand(action, "claude -- {prompt:brief}", &vars).unwrap(),
-                ["claude", "--", "read the board"],
+                resolve(action, "claude -- {prompt:brief}", &vars).unwrap(),
+                "claude -- 'read the board'",
                 "{action}"
             );
             assert!(
@@ -6175,14 +5830,14 @@ mod tests {
             );
         }
         // And a colon-free `{prompt}` keeps its own per-action scoping.
-        let err = expand(TODO_WATCHER, "claude {prompt}", &vars).unwrap_err();
+        let err = resolve(TODO_WATCHER, "claude {prompt}", &vars).unwrap_err();
         assert!(err.contains("{prompt}"), "{err}");
     }
 
     #[test]
     fn a_prompt_placeholder_obeys_every_shell_refusal_the_builtins_do() {
-        // Not special-cased: the contexts a value cannot be substituted into
-        // refuse a `{prompt:…}` exactly as they refuse a `{name}`.
+        // Not special-cased: the contexts a value cannot go into refuse a
+        // `{prompt:…}` exactly as they refuse a `{name}`.
         let table = prompts(&[("brief", "text")]);
         let vars = Vars {
             prompts: Some(&table),
@@ -6217,14 +5872,7 @@ mod tests {
             prompts: Some(&prompts(&[])),
             ..Default::default()
         };
-        let Spawn::Script { script, .. } = resolve(
-            TODO_WATCHER,
-            "true\necho '{prompt: see below}' ${prompt:-x}",
-            &vars,
-        )
-        .unwrap() else {
-            panic!("expected a script");
-        };
+        let script = resolved("true\necho '{prompt: see below}' ${prompt:-x}", &vars);
         assert!(script.contains("{prompt: see below}"), "{script}");
         assert!(script.contains("${prompt:-x}"), "{script}");
     }

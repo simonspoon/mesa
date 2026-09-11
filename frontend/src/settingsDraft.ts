@@ -11,11 +11,11 @@ import type { ConfigCommand } from './types/ConfigCommand'
  * reports a pristine form as dirty forever, or sends a no-op save that rewrites
  * the file for nothing.
  *
- * The second thing modelled here is the server's **mode rule** (mesa task 667,
- * `config::is_script`): a value with a newline in it is a bash script rather
- * than an argv template, which changes both what will actually run and which
- * vocabulary applies. The page has to say so *while typing*, before a save,
- * so the rule is mirrored here rather than waiting for a round trip.
+ * The second thing modelled here is the server's placeholder vocabulary
+ * (`config::check_key`): every hook is a bash script and every `{placeholder}`
+ * is substituted shell-quoted (mesa task 1143), but which names an action
+ * offers is per action, and the page says so *while typing*, before a save,
+ * rather than waiting for a round trip.
  */
 
 /** One textarea's text per action. Blank = "fall back to the default". */
@@ -35,61 +35,33 @@ export function effectiveCommand(command: ConfigCommand, draft: Draft): string {
 }
 
 /**
- * True when this value runs as a `bash -c` script rather than as an argv
- * template. Mirrors `config::is_script`: trim first, then look for a newline,
- * so surrounding blank lines don't silently switch modes.
- */
-export function isScript(value: string): boolean {
-  return value.trim().includes('\n')
-}
-
-/** Which mode this row will actually run in, drafted value or default. */
-export function effectiveMode(
-  command: ConfigCommand,
-  draft: Draft,
-): 'argv' | 'script' {
-  return isScript(effectiveCommand(command, draft)) ? 'script' : 'argv'
-}
-
-/** Every placeholder mesa knows, paired with the variable a script reads. */
-const PLACEHOLDER_ENV: Record<string, string> = {
-  '{id}': 'MESA_ID',
-  '{name}': 'MESA_NAME',
-  '{prompt}': 'MESA_PROMPT',
-}
-
-/**
- * The save-time error this row would earn for naming a placeholder in a script
- * that its action does not offer, or `null` if it wouldn't — the client-side
- * twin of `config::check_script`'s first rule, so the mistake is named as it is
- * typed rather than only after a failed PUT.
+ * The save-time error this row would earn for naming a placeholder its action
+ * does not offer, or `null` if it wouldn't — the client-side twin of
+ * `config::check_key`'s scope rule, so the mistake is named as it is typed
+ * rather than only after a failed PUT.
  *
- * Since mesa task 1137 a *supported* placeholder is fine in a script: it
- * becomes a reference to the same `MESA_*` variable, wherever it sits. Only the
- * out-of-scope name is still refused, for the reason it always was — there is
- * no variable to point at. The server's other script rule (single quotes,
- * `$'…'` and a quoted heredoc delimiter expand nothing, so nothing can be
- * emitted there) has no twin here, like the `bash -n` check beside it: both
- * need a shell lexer, and the PUT names the context it found.
- *
- * A `{` preceded by `$` is skipped, exactly as the server skips it: a script's
- * own `${MESA_NAME}` is bash's parameter expansion, not mesa's placeholder.
+ * What counts as a placeholder mirrors the server's `scan_script`: a brace
+ * holding only name characters (`{id}`, `{tsak}`), or a `{prompt:<name>}`,
+ * and only when the `{` is not preceded by `$` — a script's own `${HOME}` is
+ * bash's parameter expansion, not mesa's placeholder. Anything else
+ * (`cp a{,.bak}`, `{ …; }`, jq's `{id: 1}`) is bash text and is left alone. A
+ * `{prompt:<name>}` is offered to every action, so it is never an error here;
+ * whether the library holds that name is the server's call (it has the list).
+ * The server's other rules (single quotes, `$'…'`, backticks and arithmetic
+ * refuse a placeholder; `bash -n`) have no twin here — each needs a shell
+ * lexer, and the PUT names the context it found.
  */
-export function scriptPlaceholderError(
+export function placeholderError(
   command: ConfigCommand,
   draft: Draft,
 ): string | null {
   const value = effectiveCommand(command, draft)
-  if (!isScript(value)) return null
-  for (const [placeholder, variable] of Object.entries(PLACEHOLDER_ENV)) {
-    if (command.env_vars.includes(variable)) continue
-    let at = value.indexOf(placeholder)
-    while (at !== -1) {
-      if (at === 0 || value[at - 1] !== '$') {
-        return `${placeholder} is not offered to ${command.action}`
-      }
-      at = value.indexOf(placeholder, at + 1)
-    }
+  const brace = /\{([A-Za-z0-9_-]+|prompt:[A-Za-z0-9][A-Za-z0-9._-]*)\}/g
+  for (const m of value.matchAll(brace)) {
+    if (m.index > 0 && value[m.index - 1] === '$') continue
+    if (m[1].startsWith('prompt:')) continue
+    if (command.placeholders.includes(m[0])) continue
+    return `${m[0]} is not offered to ${command.action}`
   }
   return null
 }

@@ -22,13 +22,8 @@ default: string,
 /**
  * The `{}`-delimited placeholders this action offers. Any other one is a
  * save-time error, so the editor can list these as the whole vocabulary.
- * Substituted in single-line (argv) mode only.
+ * Each is substituted in the script shell-quoted for where it sits, and
+ * one with no value on a given call is the empty string. The library's
+ * `{prompt:<name>}` form is offered to every action and is not listed.
  */
-placeholders: Array<string>, 
-/**
- * The environment variables this action sets when the value is a
- * **multi-line script** (`bash -c`), positionally matching
- * `placeholders` — a script reads `$MESA_NAME`, never `{name}`. A
- * variable with no value on a given call is left unset.
- */
-env_vars: Array<string>, };
+placeholders: Array<string>, };

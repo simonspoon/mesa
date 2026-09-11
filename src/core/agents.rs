@@ -243,36 +243,32 @@ fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
     live
 }
 
-/// Resolves what to run for one spawn `action` (`config::TODO_WATCHER`,
-/// `INBOX_WATCHER` or `AGENT_SPAWN`): the user's `~/.mesa/config.json`
-/// template if it configures that action, else the built-in default. Both go
-/// through the same resolver, so a missing config file yields exactly the argv
-/// mesa hardcoded before the file existed.
+/// Resolves the script to run for one spawn `action` (`config::TODO_WATCHER`,
+/// `INBOX_WATCHER` or `AGENT_SPAWN`): the user's `~/.mesa/config.json` hook
+/// if it configures that action, else the built-in default. Both go through
+/// the same resolver, so a missing config file yields exactly the command
+/// line mesa hardcoded before the file existed.
 ///
 /// The one thing the two paths do not share is the `MESA_CLAUDE_BIN` seam:
-/// only a **default** template has its `claude` swapped for [`claude_bin`]
-/// ([`with_default_bin`]). mesa wrote that program name itself, so it may
-/// stand in for it; a configured template is the user's text and is run as
-/// written — the env var must never be where a hook's binary silently comes
-/// from (mesa task 1141).
-///
-/// A single-line value comes back as [`config::Spawn::Argv`]; a multi-line one
-/// as [`config::Spawn::Script`], carrying the `MESA_*` environment the script
-/// reads in place of placeholders (`docs/config.md`).
+/// only a **default** template has its leading `claude` swapped for
+/// [`claude_bin`] ([`with_default_bin`]). mesa wrote that program name itself,
+/// so it may stand in for it; a configured template is the user's text and is
+/// run as written — the env var must never be where a hook's binary silently
+/// comes from (mesa task 1141).
 fn spawn_for(
     action: &str,
     id: Option<i64>,
     name: Option<&str>,
     prompt: Option<&str>,
     prompts: &config::Prompts,
-) -> Result<config::Spawn, String> {
+) -> Result<String, String> {
     let configured = config::command_for(action)?;
     let template = match &configured {
         Some(t) => t.as_str(),
         None => config::default_command(action)
             .ok_or_else(|| format!("no default command for {action}"))?,
     };
-    let spawn = config::resolve(
+    let script = config::resolve(
         action,
         template,
         &config::Vars {
@@ -283,30 +279,28 @@ fn spawn_for(
         },
     )?;
     Ok(if configured.is_none() {
-        with_default_bin(spawn, &claude_bin())
+        with_default_bin(script, &claude_bin())
     } else {
-        spawn
+        script
     })
 }
 
 /// The `MESA_CLAUDE_BIN` test seam for a **built-in default** template: the
-/// `claude` every default starts with becomes `bin`. Every default is argv
-/// mode and names `claude` first, so a script or any other program name is
-/// left alone — this only ever rewrites what mesa itself wrote.
-fn with_default_bin(spawn: config::Spawn, bin: &str) -> config::Spawn {
-    match spawn {
-        config::Spawn::Argv(mut argv) => {
-            if argv.first().is_some_and(|program| program == "claude") {
-                argv[0] = bin.to_string();
-            }
-            config::Spawn::Argv(argv)
+/// `claude` word every default starts with becomes `bin`, single-quoted so a
+/// path with a space or a `'` in it is still one word. Every default names
+/// `claude` first, so any other first word is left alone — this only ever
+/// rewrites what mesa itself wrote.
+fn with_default_bin(script: String, bin: &str) -> String {
+    match script.strip_prefix("claude") {
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            format!("'{}'{rest}", bin.replace('\'', "'\\''"))
         }
-        script => script,
+        _ => script,
     }
 }
 
 /// Starts a detached background session in `dir` and returns its short job id,
-/// running the command [`spawn_for`] resolves for `action` — by default
+/// running the script [`spawn_for`] resolves for `action` — by default
 /// `claude --bg …`, or whatever `~/.mesa/config.json` puts there.
 ///
 /// `id`/`name` (the watchers) and `prompt` (the Agents surface) are the values
@@ -338,10 +332,7 @@ pub fn spawn_bg(
     prompt: Option<&str>,
     prompts: &config::Prompts,
 ) -> Result<Option<String>, String> {
-    match spawn_for(action, id, name, prompt, prompts)? {
-        config::Spawn::Argv(argv) => spawn_argv(&argv, dir),
-        config::Spawn::Script { script, env } => spawn_script(&script, &env, dir),
-    }
+    run_script(&spawn_for(action, id, name, prompt, prompts)?, dir)
 }
 
 /// Stops the background session with short job id `job_id`
@@ -431,74 +422,29 @@ fn stop_session(bin: &str, job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The argv is threaded in rather than resolved here so tests pin a whole
-/// command line without mutating process-global env state.
-fn spawn_argv(argv: &[String], dir: &str) -> Result<Option<String>, String> {
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| "empty spawn command".to_string())?;
-    let mut command = Command::new(program);
-    command.args(args);
-    run_spawn(command, program, dir)
-}
-
-/// Runs a configured **script** as `bash -c <script>`, with `env` set on the
-/// child and every other `MESA_*` spawn variable explicitly removed.
+/// Runs a resolved hook script as `bash -c <script>` in `dir`, with stdin
+/// closed, a nonzero exit the only failure, and an optional
+/// `backgrounded · <id>` receipt lifted off stdout.
 ///
-/// Two properties this function exists to hold:
-/// - The script text is handed to `bash` as one argument, and **no value is
-///   ever substituted into it**. Its `{placeholder}`s were replaced upstream by
-///   `config::substitute_script` with *references* — `{name}` becomes
-///   `"${MESA_NAME-}"` — so the value travels in `env` below, out of band, and
-///   a task name of `"; rm -rf / #` is a string a script may read, never syntax
-///   a shell parses: wherever bash performs word expansion it does not re-read
-///   what the expansion produced. Arithmetic evaluation does re-read it, and is
-///   the documented exception — a placeholder is exactly as safe as the
-///   variable it references, which is the most any scheme here can offer
-///   (`docs/config.md`).
-/// - A variable this action doesn't offer, or that has no value on this call,
-///   is *removed* rather than left inherited or set empty — the script-mode
-///   analogue of the argv drop rule, and the only way a script can tell an
-///   absent value from an empty one, since `{placeholder}`'s own `${…-}` form
-///   reads an unset variable as empty (`docs/config.md`).
-fn spawn_script(
-    script: &str,
-    env: &[(String, String)],
-    dir: &str,
-) -> Result<Option<String>, String> {
-    let mut command = Command::new("bash");
-    command.arg("-c").arg(script);
-    for var in config::ALL_ENV_VARS {
-        command.env_remove(var);
-    }
-    // …and the `MESA_PROMPT_<NAME>` variables a `{prompt:<name>}` placeholder
-    // adds, which are named by the template rather than by this list (mesa
-    // task 1138). Every one of them is set again below — `config::check_script`
-    // refuses a prompt it cannot resolve — so this is belt to that braces: a
-    // variable mesa's own environment happens to hold must never be what a
-    // hook reads a prompt out of.
-    for (var, _) in env {
-        command.env_remove(var);
-    }
-    for (var, value) in env {
-        command.env(var, value);
-    }
-    run_spawn(command, "bash", dir)
-}
-
-/// The half both modes share: run in `dir` with stdin closed, treat a nonzero
-/// exit as the only failure, and lift an optional `backgrounded · <id>` receipt
-/// off stdout. Identical either way, deliberately — a script owes mesa exactly
-/// what an argv does.
-fn run_spawn(mut command: Command, program: &str, dir: &str) -> Result<Option<String>, String> {
-    let out = command
+/// The script is handed to `bash` as one argument, and every value it carries
+/// was placed there by `config::substitute_script` **shell-quoted for the
+/// context it sits in** — a task name of `"; rm -rf / #` arrives as the
+/// string literal `'"; rm -rf / #'`, one argument to whatever the script runs.
+/// Nothing is set in the environment: there are no `MESA_*` variables any more
+/// (mesa task 1143), so nothing has to be removed either. The script is threaded
+/// in rather than resolved here so tests pin a whole command line without
+/// mutating process-global env state.
+fn run_script(script: &str, dir: &str) -> Result<Option<String>, String> {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
         .current_dir(dir)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("failed to run {program}: {e}"))?;
+        .map_err(|e| format!("failed to run bash: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "{program} failed: {}",
+            "bash failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -801,31 +747,27 @@ JSON"#,
         assert_eq!(filtered, vec!["aaaaaaaa", "bbbbbbbb"]);
     }
 
-    /// `spawn_for` in argv mode. Every built-in default is single-line, so the
-    /// tests below that pin an argv assert the mode too, by construction.
-    fn argv_for(
+    /// `spawn_for` with an empty prompt library — the resolved script.
+    fn script_for(
         action: &str,
         id: Option<i64>,
         name: Option<&str>,
         prompt: Option<&str>,
-    ) -> Result<Vec<String>, String> {
-        match spawn_for(action, id, name, prompt, &config::Prompts::default())? {
-            config::Spawn::Argv(argv) => Ok(argv),
-            other => panic!("expected argv mode, got {other:?}"),
-        }
+    ) -> Result<String, String> {
+        spawn_for(action, id, name, prompt, &config::Prompts::default())
     }
 
-    /// Expands one action's *default* template the way `spawn_bg` would, with
+    /// Resolves one action's *default* template the way `spawn_bg` would, with
     /// the binary pinned to `bin` instead of read from `MESA_CLAUDE_BIN` —
     /// through the same [`with_default_bin`] seam the real path uses.
-    fn default_argv(
+    fn default_script(
         action: &str,
         bin: &str,
         id: Option<i64>,
         name: Option<&str>,
         prompt: Option<&str>,
-    ) -> Vec<String> {
-        let argv = config::expand(
+    ) -> String {
+        let script = config::resolve(
             action,
             config::default_command(action).unwrap(),
             &config::Vars {
@@ -836,10 +778,7 @@ JSON"#,
             },
         )
         .unwrap();
-        match with_default_bin(config::Spawn::Argv(argv), bin) {
-            config::Spawn::Argv(argv) => argv,
-            other => panic!("expected argv mode, got {other:?}"),
-        }
+        with_default_bin(script, bin)
     }
 
     #[test]
@@ -849,8 +788,8 @@ JSON"#,
             dir.path(),
             r#"[ "$1" = "--bg" ] || exit 1; echo "backgrounded · deadbeef (idle — send a prompt to start)""#,
         );
-        let argv = default_argv(config::AGENT_SPAWN, &bin, None, None, None);
-        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        let script = default_script(config::AGENT_SPAWN, &bin, None, None, None);
+        let id = run_script(&script, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("deadbeef"));
     }
 
@@ -860,11 +799,30 @@ JSON"#,
         // succeeds; only its exit code is load-bearing.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(dir.path(), r#"echo "started, no receipt for you""#);
-        let argv = vec![bin.clone()];
-        assert_eq!(spawn_argv(&argv, dir.path().to_str().unwrap()), Ok(None));
+        assert_eq!(run_script(&bin, dir.path().to_str().unwrap()), Ok(None));
         let failing = stub_claude(dir.path(), r#"echo "nope" >&2; exit 4"#);
-        let err = spawn_argv(&[failing], dir.path().to_str().unwrap()).unwrap_err();
+        let err = run_script(&failing, dir.path().to_str().unwrap()).unwrap_err();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn the_default_bin_seam_rewrites_only_a_defaults_leading_claude() {
+        // Quoted, so a stub path with a space in it is one word; and only the
+        // word `claude` at the very front — a configured first word, or a
+        // `claude` that is a prefix of something else, is left alone.
+        assert_eq!(
+            with_default_bin("claude --bg -- 'p'".into(), "/tmp/my stub/claude"),
+            "'/tmp/my stub/claude' --bg -- 'p'"
+        );
+        assert_eq!(with_default_bin("claude".into(), "/s/c"), "'/s/c'");
+        assert_eq!(
+            with_default_bin("claude-two --bg".into(), "/s/c"),
+            "claude-two --bg"
+        );
+        assert_eq!(
+            with_default_bin("mytool claude".into(), "/s/c"),
+            "mytool claude"
+        );
     }
 
     #[test]
@@ -877,19 +835,20 @@ JSON"#,
             dir.path(),
             r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "supervisor" ] &&
               [ "$4" = "--name" ] && [ "$5" = "n" ] && [ "$6" = "--" ] &&
-              [ "$7" = "/execute-mesa-task 9" ] ||
+              [ "$7" = "/execute-mesa-task 9" ] && [ "$#" = 7 ] ||
               { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · 5we00000 · n""#,
         );
-        let argv = default_argv(config::TODO_WATCHER, &bin, Some(9), Some("n"), None);
-        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        let script = default_script(config::TODO_WATCHER, &bin, Some(9), Some("n"), None);
+        let id = run_script(&script, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("5we00000"));
     }
 
     #[test]
     fn spawn_bg_runs_a_configured_command_instead_of_claude() {
-        // The end-to-end seam: a config file with its own template, expanded
-        // and executed. A replacement command names its own program.
+        // The end-to-end seam: a config file with its own hook, resolved and
+        // executed. A replacement command names its own program, and a name
+        // with spaces is one argument to it.
         let _guard = crate::core::attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -920,17 +879,14 @@ echo "backgrounded · 5we00000 · n""#,
             &config::Prompts::default(),
         );
         // Untouched actions still fall through to the built-in default.
-        let fallback = argv_for(config::INBOX_WATCHER, Some(7), Some("n"), None).unwrap();
+        let fallback = script_for(config::INBOX_WATCHER, Some(7), Some("n"), None).unwrap();
         unsafe { std::env::remove_var("MESA_CONFIG_FILE") };
         assert_eq!(spawned, Ok(None));
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "dispatch\n--task\n42\n--label\nmesa: a name with spaces\n"
         );
-        assert!(
-            fallback.iter().any(|a| a == "/inbox-triage 7"),
-            "{fallback:?}"
-        );
+        assert!(fallback.contains("\"/inbox-triage 7\""), "{fallback:?}");
     }
 
     #[test]
@@ -942,13 +898,13 @@ echo "backgrounded · 5we00000 · n""#,
         let config_file = dir.path().join("config.json");
         std::fs::write(&config_file, "{ not json").unwrap();
         unsafe { std::env::set_var("MESA_CONFIG_FILE", &config_file) };
-        let broken = argv_for(config::TODO_WATCHER, Some(1), Some("n"), None);
+        let broken = script_for(config::TODO_WATCHER, Some(1), Some("n"), None);
         std::fs::write(
             &config_file,
             r#"{"commands": {"todo-watcher": "tool {oops}"}}"#,
         )
         .unwrap();
-        let bad_placeholder = argv_for(config::TODO_WATCHER, Some(1), Some("n"), None);
+        let bad_placeholder = script_for(config::TODO_WATCHER, Some(1), Some("n"), None);
         unsafe { std::env::remove_var("MESA_CONFIG_FILE") };
         assert!(
             broken.unwrap_err().contains("malformed mesa config"),
@@ -966,13 +922,12 @@ echo "backgrounded · 5we00000 · n""#,
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
-            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] && [ "$4" = "--" ] ||
-              { echo "bad argv: $*" >&2; exit 1; }
-echo "backgrounded · abc00000"
-echo "prompt was: $5" >&2"#,
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] && [ "$4" = "--" ] &&
+              [ "$5" = "--resume" ] || { echo "bad argv: $*" >&2; exit 1; }
+echo "backgrounded · abc00000""#,
         );
-        let argv = default_argv(config::AGENT_SPAWN, &bin, None, None, Some("--resume"));
-        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        let script = default_script(config::AGENT_SPAWN, &bin, None, None, Some("--resume"));
+        let id = run_script(&script, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("abc00000"));
     }
 
@@ -989,40 +944,42 @@ echo "prompt was: $5" >&2"#,
               { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · cf0c3945 · proj: do the thing""#,
         );
-        let argv = default_argv(
+        let script = default_script(
             config::TODO_WATCHER,
             &bin,
             Some(1),
             Some("proj: do the thing"),
             None,
         );
-        let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
+        let id = run_script(&script, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("cf0c3945"));
     }
 
     #[test]
-    fn spawn_script_runs_bash_with_the_env_handoff() {
+    fn a_hook_runs_under_bash_with_its_values_in_place() {
         // A multi-line value runs under bash — so `cd`, `export` and a
-        // conditional all work — and reads its values as MESA_* variables.
+        // conditional all work — with each `{placeholder}` already quoted
+        // into the text.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("script.log");
-        let script = format!(
+        let template = format!(
             "set -euo pipefail\n\
-             printf '%s|%s|%s\\n' \"$MESA_ID\" \"$MESA_NAME\" \"$(pwd)\" > {}\n\
-             echo \"backgrounded · 5c819700 · $MESA_NAME\"",
+             printf '%s|%s|%s\\n' {{id}} {{name}} \"$(pwd)\" > {}\n\
+             echo \"backgrounded · 5c819700 · {{name}}\"",
             log.display()
         );
-        let env = config::script_env(
+        let script = config::resolve(
             config::TODO_WATCHER,
-            &script,
+            &template,
             &config::Vars {
                 id: Some(9),
                 name: Some("A: do the thing"),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let dir_path = std::fs::canonicalize(dir.path()).unwrap();
-        let id = spawn_script(&script, &env, dir_path.to_str().unwrap()).unwrap();
+        let id = run_script(&script, dir_path.to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("5c819700"));
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
@@ -1032,11 +989,10 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
 
     #[test]
     fn spawn_script_never_parses_an_untrusted_value_as_shell() {
-        // The whole safety claim of script mode, and it is argv mode's: the
-        // value never enters the script text at all. A `{name}` placeholder
-        // becomes a reference, the value travels in the environment, and bash
-        // does not re-parse what a parameter expansion produced. Every one of
-        // these runs through a real `bash -c`.
+        // The whole safety claim: the value *is* in the script text now, but
+        // as a quoted string literal, and it reaches the program as exactly
+        // one argument with nothing in it executed. Every one of these runs
+        // through a real `bash -c`, in the two positions a hook author writes.
         let dir = tempfile::tempdir().unwrap();
         let pwned = dir.path().join("pwned");
         for hostile in [
@@ -1045,7 +1001,9 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
             format!("$(touch {})", pwned.display()),
             format!("'; touch {}; '", pwned.display()),
             "it's a name".to_string(),
+            "a name with spaces and a \"quote\"".to_string(),
             format!("one line\ntouch {}", pwned.display()),
+            "trailing backslash \\".to_string(),
         ] {
             let log = dir.path().join("name.log");
             let vars = config::Vars {
@@ -1053,77 +1011,58 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
                 name: Some(&hostile),
                 ..Default::default()
             };
-            let template = format!("set -eu\nprintf '%s' {{name}} > {}", log.display());
-            let config::Spawn::Script { script, env } =
-                config::resolve(config::TODO_WATCHER, &template, &vars).unwrap()
-            else {
-                panic!("expected a script");
-            };
-            assert!(
-                !script.contains(&hostile),
-                "the value reached the shell source: {script}"
-            );
-            spawn_script(&script, &env, dir.path().to_str().unwrap()).unwrap();
-            assert!(!pwned.exists(), "the injected command ran: {hostile:?}");
-            assert_eq!(std::fs::read_to_string(&log).unwrap(), hostile);
-            // …and the env handoff is what carried it, unchanged.
-            assert_eq!(
-                env.iter()
-                    .find(|(v, _)| v == "MESA_NAME")
-                    .map(|(_, v)| v.as_str()),
-                Some(hostile.as_str())
-            );
+            for position in ["{name}", "\"{name}\""] {
+                let template = format!("set -eu\nprintf '%s' {position} > {}", log.display());
+                let script = config::resolve(config::TODO_WATCHER, &template, &vars).unwrap();
+                run_script(&script, dir.path().to_str().unwrap()).unwrap();
+                assert!(!pwned.exists(), "the injected command ran: {hostile:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&log).unwrap(),
+                    hostile,
+                    "{position}"
+                );
+            }
         }
     }
 
     #[test]
-    fn spawn_script_leaves_an_absent_value_unset_not_empty() {
-        // `set -u` is the test: an unavailable value must be *unset*, and a
-        // variable the action never offers must not leak in from mesa's own
-        // environment either.
-        let _guard = crate::core::attachments::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("MESA_PROMPT", "leaked from mesa's own env") };
+    fn spawn_script_reads_an_absent_value_as_the_empty_string() {
+        // No name on this call, and todo-watcher never offers a prompt at
+        // all: the slot is `''`, one empty argument, under `set -u` too.
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("unset.log");
-        let script = format!(
-            "set -u\nprintf '%s|%s\\n' \"${{MESA_NAME:-<unset>}}\" \
-             \"${{MESA_PROMPT:-<unset>}}\" > {}",
+        let log = dir.path().join("empty.log");
+        let template = format!(
+            "set -u\nprintf '[%s][%s]' {{name}} \"{{name}}\" > {}",
             log.display()
         );
-        // No name — and todo-watcher never offers a prompt at all.
-        let env = config::script_env(
+        let script = config::resolve(
             config::TODO_WATCHER,
-            &script,
+            &template,
             &config::Vars {
                 id: Some(1),
                 ..Default::default()
             },
-        );
-        let spawned = spawn_script(&script, &env, dir.path().to_str().unwrap());
-        unsafe { std::env::remove_var("MESA_PROMPT") };
-        spawned.unwrap();
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), "<unset>|<unset>\n");
+        )
+        .unwrap();
+        assert!(script.contains("printf '[%s][%s]' '' \"\""), "{script}");
+        run_script(&script, dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "[][]");
     }
 
     #[test]
-    fn spawn_script_reports_no_receipt_and_a_nonzero_exit_like_argv() {
+    fn spawn_script_reports_no_receipt_and_a_nonzero_exit_like_a_one_liner() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        assert_eq!(
-            spawn_script("echo starting\necho done", &[], path),
-            Ok(None)
-        );
-        let err = spawn_script("echo nope >&2\nexit 4", &[], path).unwrap_err();
+        assert_eq!(run_script("echo starting\necho done", path), Ok(None));
+        let err = run_script("echo nope >&2\nexit 4", path).unwrap_err();
         assert!(err.contains("nope"), "{err}");
     }
 
     #[test]
     fn spawn_bg_runs_a_configured_script() {
         // End to end through the config file: a multi-line agent-spawn value
-        // is detected, run under bash, and its receipt parsed exactly as an
-        // argv command's would be.
+        // is run under bash, and its receipt parsed exactly as a one-line
+        // command's would be.
         let _guard = crate::core::attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1135,7 +1074,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
             serde_json::json!({
                 "commands": {
                     "agent-spawn": format!(
-                        "cd \"$(pwd)\"\nexport PICKED=yes\nprintf '%s|%s\\n' \"$PICKED\" \"$MESA_PROMPT\" > {}\necho 'backgrounded · 5c819701'",
+                        "cd \"$(pwd)\"\nexport PICKED=yes\nprintf '%s|%s\\n' \"$PICKED\" \"{{prompt}}\" > {}\necho 'backgrounded · 5c819701'",
                         log.display()
                     ),
                 }

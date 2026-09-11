@@ -3,11 +3,9 @@ import {
   changedCommands,
   draftFrom,
   effectiveCommand,
-  effectiveMode,
   isDirty,
   isRowChanged,
-  isScript,
-  scriptPlaceholderError,
+  placeholderError,
 } from './settingsDraft'
 import type { ConfigCommand } from './types/ConfigCommand'
 
@@ -17,8 +15,6 @@ function cmd(action: string, value: string | null): ConfigCommand {
     value,
     default: `claude --bg -- ${action}`,
     placeholders: action === 'agent-spawn' ? ['{prompt}'] : ['{id}', '{name}'],
-    env_vars:
-      action === 'agent-spawn' ? ['MESA_PROMPT'] : ['MESA_ID', 'MESA_NAME'],
   }
 }
 
@@ -66,50 +62,43 @@ describe('isRowChanged / isDirty', () => {
   })
 })
 
-describe('isScript / effectiveMode', () => {
-  it('switches mode on a newline, not on whitespace (config::is_script)', () => {
-    expect(isScript('mytool {id}')).toBe(false)
-    expect(isScript('\n\n  mytool {id}  \n\n')).toBe(false)
-    expect(isScript('cd /repo\nmytool')).toBe(true)
-  })
-
-  it('reads the mode off whatever will actually run, default included', () => {
-    // A blank box falls back to the default, and every default is one line.
-    expect(effectiveMode(COMMANDS[1], draftFrom(COMMANDS))).toBe('argv')
-    expect(effectiveMode(COMMANDS[0], draftFrom(COMMANDS))).toBe('argv')
+describe('placeholderError', () => {
+  it('accepts a supported placeholder, on one line or many', () => {
+    expect(placeholderError(COMMANDS[0], draftFrom(COMMANDS))).toBeNull()
     expect(
-      effectiveMode(COMMANDS[0], { 'todo-watcher': 'cd /repo\nexec claude' }),
-    ).toBe('script')
-  })
-})
-
-describe('scriptPlaceholderError', () => {
-  it('says nothing about `{}` while the row is still an argv template', () => {
-    expect(scriptPlaceholderError(COMMANDS[0], draftFrom(COMMANDS))).toBeNull()
-  })
-
-  it('accepts a supported placeholder in a script — it is substituted there too', () => {
-    expect(
-      scriptPlaceholderError(COMMANDS[0], {
-        'todo-watcher': 'cd /repo\nclaude --name {name}',
+      placeholderError(COMMANDS[0], {
+        'todo-watcher': 'cd /repo\nclaude --name {name} -- "task {id}"',
       }),
     ).toBeNull()
   })
 
-  it('leaves a script’s own ${VAR} alone', () => {
+  it('leaves a script’s own ${VAR} and bash braces alone', () => {
     expect(
-      scriptPlaceholderError(COMMANDS[0], {
-        'todo-watcher': 'cd /repo\nexec "$CLAUDE_BIN" --name "${MESA_NAME}"',
+      placeholderError(COMMANDS[0], {
+        'todo-watcher':
+          'cd /repo\nexec "$CLAUDE_BIN" --name "${HOME}"\ncp a{,.bak}\n{ echo x; }\necho \'{id: 1}\'',
+      }),
+    ).toBeNull()
+  })
+
+  it('never questions a library prompt — every action offers those', () => {
+    expect(
+      placeholderError(COMMANDS[0], {
+        'todo-watcher': 'claude -- {prompt:nightly-brief} {prompt:my.brief}',
       }),
     ).toBeNull()
   })
 
   it('reports a placeholder this action never offered as out of scope', () => {
-    const error = scriptPlaceholderError(COMMANDS[0], {
+    const error = placeholderError(COMMANDS[0], {
       'todo-watcher': 'cd /repo\nclaude -- {prompt}',
     })
-    expect(error).toContain('not offered')
-    expect(error).not.toContain('$MESA_PROMPT')
+    expect(error).toContain('{prompt} is not offered to todo-watcher')
+    // A name mesa does not know is shaped like a placeholder and is a typo,
+    // not bash text — the server refuses it, so the page says so first.
+    expect(placeholderError(COMMANDS[1], { 'agent-spawn': 'claude {tsak}' })).toContain(
+      '{tsak}',
+    )
   })
 })
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { promptEnvVar, promptPlaceholders } from './promptPlaceholders'
+import { promptPlaceholders } from './promptPlaceholders'
 import type { LibraryItem } from './types/LibraryItem'
 
 function item(overrides: Partial<LibraryItem> = {}): LibraryItem {
@@ -22,20 +22,6 @@ function item(overrides: Partial<LibraryItem> = {}): LibraryItem {
   }
 }
 
-describe('promptEnvVar', () => {
-  it('uppercases and folds a dash, mirroring config::prompt_env_var', () => {
-    expect(promptEnvVar('nightly-brief')).toBe('MESA_PROMPT_NIGHTLY_BRIEF')
-    expect(promptEnvVar('Brief')).toBe('MESA_PROMPT_BRIEF')
-    expect(promptEnvVar('a_b')).toBe('MESA_PROMPT_A_B')
-  })
-
-  it('refuses a name no environment variable could hold', () => {
-    // A library name may contain `.`; a variable name may not.
-    expect(promptEnvVar('my.brief')).toBeNull()
-    expect(promptEnvVar('')).toBeNull()
-  })
-})
-
 describe('promptPlaceholders', () => {
   it('offers only prompt items, as their placeholder form', () => {
     expect(
@@ -44,14 +30,7 @@ describe('promptPlaceholders', () => {
         item({ name: 'supervisor', kind: 'agent' }),
         item({ name: 'stop-notify.sh', kind: 'hook' }),
       ]),
-    ).toEqual([
-      {
-        name: 'nightly-brief',
-        placeholder: '{prompt:nightly-brief}',
-        envVar: 'MESA_PROMPT_NIGHTLY_BRIEF',
-        usable: true,
-      },
-    ])
+    ).toEqual([{ name: 'nightly-brief', placeholder: '{prompt:nightly-brief}' }])
   })
 
   it('sorts by name case-insensitively', () => {
@@ -75,16 +54,11 @@ describe('promptPlaceholders', () => {
     ).toEqual(['Brief'])
   })
 
-  it('lists an impossible name but marks it unusable', () => {
-    // Hiding it would read as "the library lost it"; this says what a save
-    // would say.
+  it('offers any library name, a dot included', () => {
+    // Since mesa task 1143 a prompt body is quoted into the script like every
+    // other value, so a name no longer has to fit an environment variable.
     expect(promptPlaceholders([item({ name: 'my.brief' })])).toEqual([
-      {
-        name: 'my.brief',
-        placeholder: '{prompt:my.brief}',
-        envVar: '',
-        usable: false,
-      },
+      { name: 'my.brief', placeholder: '{prompt:my.brief}' },
     ])
   })
 

@@ -10,8 +10,8 @@
 //!
 //! The prompt lives here, in `core`, rather than in the CLI or the API,
 //! because both spawn sites hand the same text to the same
-//! `agents::spawn_bg` chokepoint. It is passed as **one** `Command::arg` (or
-//! as `$MESA_PROMPT` in script mode), never spliced into a shell string.
+//! `agents::spawn_bg` chokepoint, which quotes it into the hook script as one
+//! string literal (`config::substitute_script`) — it is never parsed as shell.
 
 /// The loop a live agent works, as a macro so it can be `concat!`ed into
 /// [`AGENT_DEFINITION`] while staying a `&'static str` of its own. Prose, not

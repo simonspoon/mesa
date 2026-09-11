@@ -79,10 +79,9 @@ import {
   changedCommands,
   draftFrom,
   effectiveCommand,
-  effectiveMode,
   isDirty,
   isRowChanged,
-  scriptPlaceholderError,
+  placeholderError,
   type Draft,
 } from '../settingsDraft'
 import {
@@ -211,14 +210,13 @@ function SettingsHeader() {
  *
  * - **Blank means "use the built-in default"**, not "run nothing". Every row
  *   shows the default it would fall back to, and clearing a box is the reset.
- * - **One line is argv, never a shell string.** The help text says so, since
- *   a GUI invites typing `foo | bar` at it. Bad templates are rejected by the
- *   server at save time (unknown placeholder, unbalanced quote) rather than
- *   failing silently at the next dispatch, and the message lands here.
- * - **A second line makes it a bash script**, run as `bash -c` with the values
- *   arriving as `MESA_*` environment variables instead of `{}` placeholders
- *   (mesa task 667). Each row states which mode it is in and what will run, so
- *   the newline rule is never a surprise the user discovers at dispatch time.
+ * - **Every hook is a bash script** (mesa task 1143), one line or many, and
+ *   each `{placeholder}` is substituted shell-quoted so a value is never
+ *   re-parsed as shell. The help text says so once, above the rows. Bad
+ *   templates are rejected by the server at save time (a placeholder the
+ *   action does not offer, a placeholder inside single quotes or arithmetic,
+ *   a bash syntax error) rather than failing silently at the next dispatch,
+ *   and the message lands here.
  *
  * The file is read fresh on every spawn, so a save takes effect immediately —
  * no server restart, which the page states so nobody goes looking for one.
@@ -321,28 +319,15 @@ export function SettingsView({ tab }: { tab: SettingsTab }) {
         <h2>Hooks</h2>
         <p className="muted">
           The hook mesa runs to start a coding agent. Leave a box empty to use
-          the built-in default. There are two modes, chosen by what you type:
+          the built-in default. Every hook is a bash script, one line or many,
+          run as <code>bash -c</code> in the project folder — so <code>cd</code>,{' '}
+          <code>export</code>, a pipe or a conditional binary all work. Each{' '}
+          <code>{'{}'}</code> placeholder is replaced by its value, quoted for
+          where you put it, so the value is never re-parsed as shell; a value
+          with nothing to say on this run is the empty string. A placeholder
+          inside <code>'…'</code>, <code>$'…'</code>, backticks or arithmetic
+          is refused when you save.
         </p>
-        <ul className="muted settings-modes">
-          <li>
-            <strong>One line is argv, not a shell command</strong>: no pipes,
-            redirection, <code>$VAR</code> or <code>~</code>. Quote an argument
-            that contains spaces, and write values as <code>{'{}'}</code>{' '}
-            placeholders.
-          </li>
-          <li>
-            <strong>More than one line is a bash script</strong>, run as{' '}
-            <code>bash -c</code> in the same folder — so you can <code>cd</code>,{' '}
-            <code>export</code>, or pick a binary first. The same{' '}
-            <code>{'{}'}</code> placeholders work here: each becomes a reference
-            to the <code>MESA_*</code> variable its value travels in, quoted to
-            suit where you put it. Anywhere works except inside{' '}
-            <code>'…'</code> or backticks, where nothing expands — those are
-            refused when you save. The variables are still there to read directly,
-            which is how a script tells a value with nothing to say on this run
-            (left unset) from an empty one.
-          </li>
-        </ul>
 
         <PromptPlaceholderList />
 
@@ -1217,25 +1202,14 @@ function PromptPlaceholderList() {
   return (
     <div className="settings-prompt-placeholders">
       <p className="muted">
-        This library's prompts, usable as placeholders in either mode — the
-        body is substituted as one argument in argv mode, and travels in the
-        named variable in script mode, so its text is never parsed as shell.
-        Edit them on <code>#/library</code>.
+        This library's prompts, usable as placeholders in any hook — the body
+        is quoted in as one value, so its text is never parsed as shell. Edit
+        them on <code>#/library</code>.
       </p>
       <ul className="muted settings-prompt-list">
         {prompts.map((p) => (
           <li key={p.name}>
-            <code>{p.placeholder}</code>{' '}
-            {p.usable ? (
-              <span className="muted">
-                → <code>${p.envVar}</code>
-              </span>
-            ) : (
-              <span className="error">
-                cannot be used: a script reads a prompt through an environment
-                variable, and this name holds a character one cannot
-              </span>
-            )}
+            <code>{p.placeholder}</code>
           </li>
         ))}
       </ul>
@@ -1255,8 +1229,7 @@ function CommandRow({
   const copy = COPY[command.action]
   const text = draft[command.action] ?? ''
   const usingDefault = text.trim() === ''
-  const mode = effectiveMode(command, draft)
-  const placeholderError = scriptPlaceholderError(command, draft)
+  const scopeError = placeholderError(command, draft)
   // Grow with the script so a multi-line value isn't edited through a slot.
   const rows = Math.min(16, Math.max(2, text.split('\n').length + 1))
   return (
@@ -1278,15 +1251,8 @@ function CommandRow({
         onChange={(e) => onEdit(e.target.value)}
       />
       <div className="settings-command-meta">
-        {/* A script has both vocabularies since mesa task 1137 — the
-            placeholders, which become references to these very variables, and
-            the variables themselves, still the only way to tell an absent value
-            from an empty one. An argv template never sees the variables. */}
         <span className="settings-placeholders">
-          {(mode === 'script'
-            ? [...command.placeholders, ...command.env_vars.map((v) => `$${v}`)]
-            : command.placeholders
-          ).map((p) => (
+          {command.placeholders.map((p) => (
             <code key={p}>{p}</code>
           ))}
         </span>
@@ -1305,24 +1271,14 @@ function CommandRow({
         <span className="muted">
           {usingDefault ? 'default in use:' : 'will run:'}
         </span>{' '}
-        {mode === 'script' ? (
-          <>
-            <code>bash -c</code>{' '}
-            <span className="muted">
-              with {command.env_vars.map((v) => `$${v}`).join(', ')} set
-            </span>
-            <code className="settings-effective-script">
-              {effectiveCommand(command, draft)}
-            </code>
-          </>
-        ) : (
-          <code>{effectiveCommand(command, draft)}</code>
-        )}
+        <code className="settings-effective-script">
+          {effectiveCommand(command, draft)}
+        </code>
         {isRowChanged(command, draft) && (
           <span className="settings-pending"> (unsaved)</span>
         )}
       </p>
-      {placeholderError && <p className="error">{placeholderError}</p>}
+      {scopeError && <p className="error">{scopeError}</p>}
     </section>
   )
 }

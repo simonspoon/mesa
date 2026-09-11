@@ -77,79 +77,134 @@ re-prompted forever. `config::workspace_dir()` creates it on demand and is
 deliberately **independent of `MESA_CONFIG_FILE`**: that override moves the
 config *file*, not mesa's home.
 
-A value has **two modes**, chosen by the value itself: one line is an argv
-template (below), more than one is a bash script
-([Script mode](#script-mode)). There is no mode key and nothing to migrate —
-every template that exists today is one line and behaves byte-for-byte as it
-always has.
+## One mode: every hook is a bash script
 
-## Argv, not a shell
+A value is a **bash script**, run as `bash -c <script>` from the project folder
+(or `~/.mesa/workspace` for an unbound spawn). One line or many — there is no
+second mode, no mode key and no newline rule (mesa task 1143 retired the
+one-line-is-argv / two-lines-is-a-script split of tasks 667 and 1137). A
+one-line value is a one-line script, which is why the defaults above are the
+plain command lines they look like, and why `cd`, `export`, a pipe, a
+redirection or a conditional binary all simply work, on one line or several:
 
-A single-line template is **tokenized and executed directly** — there is no
-`sh -c` anywhere on this path, unlike `hooks.json` (`docs/hooks.md`), which
-genuinely is a shell string.
+```json
+{
+  "commands": {
+    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/{id}\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\""
+  }
+}
+```
 
-That is load-bearing. Every watcher passes untrusted free text as the session
-name: a task's derived name, or an inbox item's first line. What makes that
-safe is that the text arrives as one `Command::arg`. So substitution happens **after**
-tokenization: the argv length is fixed by the template alone, and no value can
-split into extra arguments or be re-read as a flag. A name of
-`"; rm -rf / #` is just a long, silly session name.
+More legibly, that value is:
 
-Script mode does **not** weaken this. It runs `bash`, but no mesa value is ever
-spliced into the script text: the values arrive out-of-band, in the child's
-environment, and the most a script body ever carries is a **reference** to one
-of them — a `{placeholder}` there becomes `"${MESA_NAME-}"`
-(`config::substitute_script`, mesa task 1137). Wherever bash performs **word
-expansion** it does not re-read what the expansion produced looking for
-metacharacters, so the reference is inert there whatever the value holds.
-Arithmetic evaluation is the one exception — it re-reads it — which is why
-mesa refuses a placeholder in arithmetic outright; see
-[the box below](#placeholders-here-are-references-to-those-variables). The
-invariant was never "mesa runs no shell" — it is
-**mesa never interpolates a value into a string a shell parses**, and both modes
-hold it.
+```bash
+set -euo pipefail
+cd "$HOME/src/checkouts/{id}" 2>/dev/null || cd "$HOME/src"
+export CLAUDE_PROJECT=mesa
+exec claude --bg --agent swe --name {name} -- "/execute-mesa-task {id}"
+```
 
-The consequences of having no shell:
-
-- `|`, `>`, `&&`, `$VAR`, `~` are ordinary characters. No pipes, no
-  redirection, no environment expansion, no globbing. Write absolute paths.
-- Quote an argument that contains spaces: `'…'` (literal) or `"…"`
-  (backslash-escapable). **The prompt in both watcher defaults is quoted
-  for exactly this reason** — `-- "/execute-mesa-task {id}"` is one argument;
-  unquoted, it would be two and the id would be lost.
-- An unterminated quote or a trailing backslash is an error, not a
-  silently-mangled argv.
-- Need a shell? Write a second line — see script mode below. (`sh -c "…"` as a
-  one-line template also works, but then the quoting of untrusted values is
-  yours to get right; script mode hands them to you already safe.)
+This *is* a shell, unlike the argv mode it replaces, and the untrusted-input
+line CLAUDE.md draws is held by **quoting, at the slot**: every `{placeholder}`
+is replaced by its value shell-quoted for the context it sits in, so what bash
+reads there is a string literal and never syntax. The invariant was never
+"mesa runs no shell" — it is **no value mesa holds ever reaches a shell
+unquoted**.
 
 ## Placeholders
 
-`{}`-delimited, substituted per token. Which ones a command may use depends on
-what that spawn actually knows about:
+`{}`-delimited. Which ones a hook may use depends on what that spawn actually
+knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
 | `{id}` | watchers, `live-agent`, `live-summary` | the task id / inbox item id / live session id |
 | `{name}` | watchers, `live-agent`, `live-summary` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), or the live session's own name |
-| `{prompt}` | `agent-spawn`, `live-agent`, `live-summary` | the POST body's `prompt` (`agent-spawn`; unavailable when omitted) / the live agent's or summariser's instruction block, always present |
+| `{prompt}` | `agent-spawn`, `live-agent`, `live-summary` | the POST body's `prompt` (`agent-spawn`; absent when omitted) / the live agent's or summariser's instruction block, always present |
 
-Two rules cover the edges:
+### Quoted for where it sits
 
-- **A placeholder the command isn't offered is an error**, named in the
-  message (`{id}` in `agent-spawn`, `{prompt}` in a watcher, a typo like
-  `{tsak}`) — raised before anything runs, rather than passing a literal
-  `{tsak}` to a program.
-- **A placeholder that is offered but has no value on this call drops its
-  token, plus an immediately preceding token starting with `-`.** So
-  `--name {name}` and `-- {prompt}` vanish as pairs rather than leaving a
-  dangling flag to swallow the next argument. This is what makes the defaults
-  reproduce mesa's pre-config behavior exactly: a promptless spawn drops
-  `-- {prompt}` and starts an idle session.
+What mesa splices in is the **value**, quoted so that bash reads it as exactly
+that string (`config::substitute_script`, `Ctx::quoted`):
 
-A `{` that opens nothing is a literal brace, and a placeholder may sit inside a
-larger token (`--name mesa-{id}`).
+| You write | Value `it's "a" $b` becomes | Why |
+| --- | --- | --- |
+| `--name {name}` | `--name 'it'\''s "a" $b'` | a word position is single-quoted — nothing is special inside `'…'` but `'` itself, spelled `'\''`; a value with spaces stays one word and a `*` never globs |
+| `-- "task {name}"` | `-- "task it's \"a\" \$b"` | already inside `"…"`, so the four characters that mean anything there — `\`, `"`, `$`, `` ` `` — are escaped in place; no quotes of mesa's own, so yours still close where they did |
+| `cd $(dirname {name})` | `cd $(dirname 'it'\''s "a" $b')` | `$(…)` is a fresh word position, even inside `"…"` |
+| `cat <<EOF` … `{name}` … | `it's "a" \$b` | an unquoted heredoc body expands `$`, `` ` `` and `\` and nothing else; a `"` is literal text there |
+| `# see {name}` | `# see 'it'\''s "a" $b'` | never read; its newlines are folded so no second line can leave the comment |
+
+Two shapes need a word more. A value holding a **newline** is fine in `'…'`
+and `"…"` (both span lines) but not as heredoc text: bash finds a heredoc's
+delimiter line by line *before* expanding the body, so a line of the value
+equal to `EOF` would end the heredoc and hand the rest to the parser. Such a
+value (and one starting with a tab, which `<<-` would strip) rides in through
+`$(printf '%s' $'…')` instead — one line of body with the newlines spelled
+`\n`, so no line of it can match anything; the one cost is that `$(…)` drops
+trailing newlines. And a value can sit inside a larger word: `mesa-{id}` is
+`mesa-'7'`, one argument.
+
+Wherever bash performs **word expansion** it does not re-read the result
+looking for syntax, so once a value is inside a quoted literal nothing in it can
+run. A task name of `"; rm -rf / #` is `'"; rm -rf / #'` — a long, silly session
+name.
+
+> **The exception: arithmetic is a second parser.** `$(( ))`, `(( ))`,
+> `let "…"`, `[[ x -gt y ]]` and an array subscript all *re-read* what they
+> are given, and an array subscript inside arithmetic is itself expanded — so a
+> value of `a[$(cmd)]` runs the command however it was quoted on the way in.
+> mesa **refuses** a placeholder in the two spellings it can see (`$((…))` and
+> `((…))`, including inside a heredoc body and however deeply nested inside
+> them) at save time; `[[ … ]]`, `let "…"` and `${x[…]}` are not lexically
+> bracketed in any way mesa's deliberately coarse lexer should model, and are
+> yours to avoid — POSIX `[ x -gt y ]` does **no** arithmetic evaluation and is
+> safe, `[[ x -gt y ]]` is not. `eval "{name}"` and `bash -c "{name}"` are the
+> same category and equally yours: they ask bash to parse the value as a
+> program, and no quoting can make that safe.
+
+**Refused at save time**, each naming the context it found:
+
+| Where | Why |
+| --- | --- |
+| `'…'` | a `'` in the value would end the run |
+| `$'…'` | ANSI-C quoting: the same, **and** a `\n` or `\x41` in the value would be *interpreted* |
+| `<<'EOF'` body | a quoted delimiter means nothing expands and nothing escapes, so there is no way to put a value there |
+| `` `…` `` | write `$(…)`, whose rules mesa does model |
+| `cat <<{name}` | a delimiter is a label bash matches the closing line against, not text it expands |
+| `$((…))`, `((…))` | arithmetic re-parses what it is given — see the box above |
+
+The code that classifies a slot's context (`config::scan_script`) is a coarse
+lexer over bash's quoting forms, and since it now decides the bytes bash sees
+it is worth saying exactly what a wrong classification costs. Every form mesa
+emits is inert in every context that expands anything, so a mis-lex costs a
+**mangled value** — a single-quoted string read where bash wanted double-quote
+escaping has stray quote characters in it; an escaped one read as a bare word
+splits on spaces — never execution. The two contexts where a wrong guess
+*could* reach execution are the ones above that are refused rather than
+guessed at. (An earlier draft of this feature substituted values too, and a
+security review put three holes in its lexer in one pass — `$'…'` read as
+`'…'`, a subshell's `)` closing a `$(` that was never opened, `#` starting a
+comment after `)`. All three are tracked now and pinned by tests; the refusals
+are what make the remaining lexer mistakes cheap.)
+
+### Absent values, unknown braces
+
+- **A placeholder the hook isn't offered is an error**, named in the message
+  (`{id}` in `agent-spawn`, `{prompt}` in a watcher, a typo like `{tsak}`) —
+  raised at save time and again before anything runs. A brace holding only
+  name characters (`[A-Za-z0-9_-]`) is a placeholder as far as mesa is
+  concerned, since bash has no use for `{tsak}` either. Every other brace —
+  `cp a{,.bak}`, `{ …; }`, jq's `{id: 1}`, `{1..3}` — is bash text and passes
+  through **literally**, and a `{` preceded by `$` is bash's own parameter
+  expansion (`${HOME}`).
+- **A placeholder that is offered but has no value on this call is the empty
+  string** — `''` in a word position, nothing inside quotes. Free-form shell
+  text has no token to drop, so the old argv rule (drop the token and its
+  flag) is gone with the argv mode: a promptless
+  `POST /api/projects/{id}/agents` runs `claude --bg --agent swe -- ''`, an
+  empty prompt. There is no `MESA_*` variable to tell "absent" from "blank"
+  any more; a hook that must tell them apart tests `[ -n {name} ]`.
 
 ### Retired placeholders: `{bin}` and `{agent}`
 
@@ -174,10 +229,38 @@ gone, and the defaults name `claude` and their agent literally.
   `claude` mesa uses for everything that is *not* a template — listing
   sessions, `claude stop`, the attach bridge, the terminal pane — and on the
   spawn path it stands in for the leading `claude` of a **built-in default**
-  only, so the check scripts' stub binary keeps working. A template the user
-  configured is run exactly as written, byte for byte: the env var is never
-  where a hook's binary silently comes from. `MESA_CLAUDE_AGENT` is deleted
-  outright.
+  only (single-quoted into the script, so a stub path with a space in it is
+  still one word), so the check scripts' stub binary keeps working. A template
+  the user configured is run exactly as written, byte for byte: the env var is
+  never where a hook's binary silently comes from. `MESA_CLAUDE_AGENT` is
+  deleted outright.
+
+### Retired variables: `$MESA_ID`, `$MESA_NAME`, `$MESA_PROMPT`
+
+Until mesa task 1143 a multi-line value read its values as environment
+variables — `MESA_ID`, `MESA_NAME`, `MESA_PROMPT`, and `MESA_PROMPT_<NAME>` for
+a library prompt — and a `{placeholder}` in a script was rewritten to a
+reference to one (`"${MESA_NAME-}"`). mesa sets none of them now; a value is
+quoted straight into the script.
+
+- **A saved hook that still reads them is migrated on read**, the same way as
+  `{bin}`/`{agent}` (`config::migrate_env_references`): `$MESA_ID`,
+  `${MESA_ID}` and `${MESA_ID-}`, each optionally wrapped in `"…"`, become
+  `{id}` (likewise `{name}` and `{prompt}`), and `$MESA_PROMPT_NIGHTLY_BRIEF`
+  in the same forms becomes `{prompt:nightly-brief}` — the name lowercased with
+  `_` folded to `-`. The enclosing `"…"` is consumed because the placeholder
+  arrives quoted already. The file is never rewritten; Settings shows the
+  migrated text and the next Save writes it. A migrated prompt name the
+  library no longer holds (or one whose real name had a `_`) fails the next
+  spawn with the ordinary unknown-prompt error, naming it, rather than starting
+  an agent with no instructions. Only those names are touched: `$MESA_DB` or
+  `$MESA_IDX` in a script is some other variable and is left alone — as is a
+  `$MESA_ID` written inside `'…'`, which was literal text before and, being
+  migrated to `{id}` in single quotes, is now a refused spawn; unquote it.
+- **Saving a hook that reads one of them anew is refused** — 422 `validation`
+  naming the reference and the placeholder to write instead — so a hand-typed
+  `"$MESA_NAME"` can never save and then silently read as the empty string on
+  every dispatch.
 
 ### `{prompt:<name>}` — a library prompt
 
@@ -193,213 +276,54 @@ once and exported byte-identical. The Settings page lists this install's prompts
 placeholder vocabulary, live.
 
 It cannot collide with the built-in `{prompt}`, which has no colon. Unlike the
-five above it is **not** scoped to a subset of the actions: those are per-call
+three above it is **not** scoped to a subset of the actions: those are per-call
 data a given spawn may not have, while a library prompt is static text any spawn
 may quote.
 
 - **Name matching is case-insensitive exact** — `{prompt:Nightly-Brief}` and
   `{prompt:nightly-brief}` are the same prompt, the rule
-  `mesa project resolve` already uses for a project name.
+  `mesa project resolve` already uses for a project name. Any library name is
+  usable, a `.` included: nothing but the library has to hold it any more.
 - **An unknown name is an error, never an empty string.** At save time
   (`PUT /api/config`, the Settings page) that is a `validation` / 422 naming the
   missing prompt and listing the ones the library has — library names are known
   then, so the failure belongs in the editor. If the row is deleted *after* the
   save, the next spawn fails the same way rather than starting an agent with its
   instructions silently missing.
-- **An empty body is legal** and resolves to the empty string. An empty body is
-  a real library row, so it is a real value — this is *not* the drop rule above,
-  which is about a value this call does not have.
+- **An empty body is legal** and resolves to the empty string — one empty
+  argument.
 - **A prompt body may itself hold placeholders, expanded exactly one pass.**
-  Within the resolved body the five built-ins are replaced with their values for
+  Within the resolved body the three built-ins are replaced with their values for
   this call — but only those the action offers and has a value for. Anything
   else is left **literal and is never an error**: an unknown `{foo}`, a
   placeholder the action does not offer, and a nested `{prompt:other}` all come
   through as written. A library body is data somebody wrote, not a template the
   config author reviewed, so a stray brace in it must never break a hook; one
   pass is what makes recursion impossible.
-- **In argv mode the body is one argument**, substituted after tokenization
-  exactly like every other placeholder — however many lines, quotes or
-  backticks it holds.
-- **In script mode the body travels in the environment**, like every built-in:
-  `{prompt:nightly-brief}` becomes a reference to `${MESA_PROMPT_NIGHTLY_BRIEF-}`,
-  quoted to suit where you put it, and the body is set on the child. The
-  variable name is `MESA_PROMPT_` + the name uppercased with `-` folded to `_`.
-  Every refusal script mode already makes — `'…'`, `$'…'`, a quoted heredoc
-  delimiter, backticks, arithmetic, a heredoc's delimiter word — applies to this
-  form identically; it is not special-cased.
-- **Two names that fold onto one variable are a save-time error.** `a-b` and
-  `a_b` both become `MESA_PROMPT_A_B`; there is one slot and two bodies, so mesa
-  refuses rather than guessing. The same name written in two cases is one
-  variable and is fine.
-- **A name no environment variable could hold is refused**, in *both* modes. A
-  library name may contain `.`; a variable name may not. The refusal is the same
-  in argv mode even though it sets no variables, so a one-line template and the
-  two-line one it grows into offer the same vocabulary.
+- **The body is then quoted like any other value** — however many lines,
+  quotes or backticks it holds, it reaches the program as one argument, and
+  every refusal above (`'…'`, `$'…'`, a quoted heredoc delimiter, backticks,
+  arithmetic, a heredoc's delimiter word) applies to this form identically; it
+  is not special-cased.
 
 Anything that is not a name the library could hold is not a placeholder at all,
 so `{prompt: see below}` in a script body is the literal prose it looks like.
 
-## Script mode
-
-**A value whose trimmed text contains a newline is a bash script**, run as
-`bash -c <script>` from the same folder the argv would have run in. That is the
-whole switch: no new key, no flag. Surrounding blank lines are whitespace and
-do not by themselves make a value a script.
-
-It exists because a single program call cannot `cd`, export an env var, pick a
-binary conditionally, or run a setup step first.
-
-```json
-{
-  "commands": {
-    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/$MESA_ID\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec claude --bg --agent swe --name \"$MESA_NAME\" -- \"/execute-mesa-task $MESA_ID\""
-  }
-}
-```
-
-More legibly, that value is:
-
-```bash
-set -euo pipefail
-cd "$HOME/src/checkouts/$MESA_ID" 2>/dev/null || cd "$HOME/src"
-export CLAUDE_PROJECT=mesa
-exec claude --bg --agent swe --name "$MESA_NAME" -- "/execute-mesa-task $MESA_ID"
-```
-
-### Placeholders here are references to those variables
-
-**Placeholders work here too** (mesa task 1137) — one vocabulary, both modes,
-and nobody has to reach for `$MESA_NAME` by hand. What mesa splices into the
-script is a **reference, never a value**:
-
-| You write | mesa emits | Why |
-| --- | --- | --- |
-| `echo {name}` | `echo "${MESA_NAME-}"` | quoted, so a value with spaces stays one word and a `*` never globs |
-| `echo "{name}"` | `echo ${MESA_NAME-}` | already inside `"…"`; quotes of mesa's own would be wrong there |
-| `cd $(dirname {name})` | `cd $(dirname "${MESA_NAME-}")` | `$(…)` is a fresh command context |
-| `cat <<EOF` … `{name}` … | `${MESA_NAME-}` | a heredoc body expands, but a `"` in it is literal text |
-
-The value itself never appears. That is the whole safety property, and it makes
-a `{placeholder}` **exactly as safe as the `MESA_*` variable it references** —
-which is the most any substitution scheme can offer here. Wherever bash performs
-**word expansion**, it does not re-read what the expansion produced looking for
-metacharacters, so a task name of `"; rm -rf / #` is inert.
-
-> **The exception: arithmetic is a second parser.** `$(( ))`, `(( ))`,
-> `let "…"`, `[[ x -gt y ]]` and an array subscript all *re-read* what an
-> expansion produced, and an array subscript inside arithmetic is itself
-> expanded — so a value of `a[$(cmd)]` runs the command. This is not new and not
-> specific to placeholders: a hand-written `[[ "$MESA_NAME" -gt 0 ]]` has had it
-> since script mode shipped. mesa **refuses** the two spellings it can see
-> (`$((…))` and `((…))`, including inside a heredoc body) at save time; `[[ … ]]`,
-> `let "…"` and `${x[…]}` are not lexically bracketed in any way mesa's
-> deliberately coarse lexer should model, and are yours to avoid. Note that
-> POSIX `[ x -gt y ]` does **no** arithmetic evaluation and is safe, while
-> `[[ x -gt y ]]` is not.
->
-> **Nobody loses the capability.** mesa refuses to *emit* a placeholder into a
-> second parser; you stay free to write `$(( ${MESA_ID-} + 1 ))` by hand. That
-> is your own deliberate act — you asked for it in so many words — exactly like
-> `eval "$MESA_NAME"`. Which is the same category, and equally yours: a template
-> that writes `eval "{name}"` or `bash -c "{name}"` asks bash to parse the value
-> as a program, and no substitution scheme can make that safe, in this mode or
-> any other.
-
-It also means the code that decides *which* form to emit is **not a security
-boundary**. Both forms are inert, so a context mesa's coarse lexer gets wrong
-costs a stray word split or an unwanted glob at worst — never execution. (An earlier draft of this
-feature substituted the *value*, shell-quoted per context; a security review put
-three holes in its lexer in one pass, which is what settled the design. Bash's
-grammar — arithmetic, `${var/…/…}`, process substitution, `case` — is not
-something a hand-rolled lexer gets to be trusted with.)
-
-**Refused at save time**, each naming the context it found:
-
-| Where | Why |
-| --- | --- |
-| `'…'` | nothing expands inside single quotes, so there is nothing to emit |
-| `$'…'` | ANSI-C quoting: nothing expands there either, **and** a `\n` or `\x41` in the value would be *interpreted*, so even a correct emission would corrupt it |
-| `<<'EOF'` body | a quoted delimiter means the body expands nothing |
-| `` `…` `` | write `$(…)`, whose rules mesa does model |
-| `cat <<{name}` | a delimiter is a label bash matches the closing line against, not text it expands |
-| `$((…))`, `((…))` | arithmetic re-parses what an expansion produced — see the box above |
-
-All but the last are **correctness** refusals, not security ones: the value
-never reaches the script in any case.
-
-`$MESA_NAME` is still there, and is still exactly what `{name}` expands to.
-
-### The variables
-
-Each placeholder has one variable, offered on exactly the commands its `{}` twin
-is:
-
-| Placeholder | Variable | Where |
-| --- | --- | --- |
-| `{id}` | `MESA_ID` | watchers, `live-agent`, `live-summary` |
-| `{name}` | `MESA_NAME` | watchers, `live-agent`, `live-summary` |
-| `{prompt}` | `MESA_PROMPT` | `agent-spawn`, `live-agent`, `live-summary` |
-
-Two rules mirror the argv ones:
-
-- **A variable this command doesn't offer is not set** — a watcher script never
-  sees `MESA_PROMPT`, an `agent-spawn` script never sees `MESA_ID`/`MESA_NAME`.
-  A `live-agent` script sees all three, since that spawn knows all three.
-  mesa explicitly *removes* all three before setting the ones that apply, so a
-  variable can't leak in from the environment `mesa serve` was started with.
-  A placeholder this command doesn't offer is a save-time error, as it always
-  was — there is no variable to point at. `PUT /api/config` answers 422
-  `validation` and the file is left byte-identical.
-- **A value with nothing to say on this call leaves its variable unset**, not
-  empty — the analogue of the drop rule. A promptless
-  `POST /api/projects/{id}/agents` means no `MESA_PROMPT`. So `set -u` fires and `${MESA_PROMPT:-}` reads as "no prompt"
-  rather than "empty prompt".
-
-  A `{placeholder}` reads that case as **empty**, because its emitted form
-  carries the `-` default (`${MESA_NAME-}`) — argv's drop-the-token-and-its-flag
-  rule has nothing to work with in free-form shell text, and the `-` is also
-  what keeps the reference safe under `set -u`. A script that must tell "absent"
-  from "blank" reads `${MESA_NAME+set}`, or the variable directly.
-
-Quote your own uses of the variables (`"$MESA_NAME"`), as in any bash script — a
-task name has spaces in it. A `{placeholder}` needs no thought **about quoting**
-— it is emitted with whatever quoting its position calls for. It does still need
-the one thought above: a value used as a *number* is re-parsed by bash's
-arithmetic evaluator, exactly as `"$MESA_NAME"` would be.
-
-### Which braces are placeholders
-
-Only the five known names, and only when the `{` is not preceded by `$` — a
-script's own `${MESA_NAME}` is bash's parameter expansion and is left alone.
-Anything else — `{foo}`, jq's `{id: 1}`, `{ …; }` grouping, `cp a{,.bak}` brace
-expansion — passes through **literally**. That is deliberately unlike argv mode,
-where an unknown `{foo}` is an error: an argv token is mesa's own syntax, while
-a script body is bash source in which braces are ordinary text.
-
 ### Also refused at save time
 
-- An **empty** script, exactly as an empty template is. (Blank still *clears*
-  the key back to the built-in default — that is the same rule in both modes,
-  and it wins: a whitespace-only value is a reset, not an error.)
+- An **empty** script. (Blank still *clears* the key back to the built-in
+  default, and it wins: a whitespace-only value is a reset, not an error.)
 - A **bash syntax error**, checked with `bash -n` — which parses and executes
-  nothing. It runs over the script *with the placeholders already replaced by
-  their `${MESA_…-}` references*, so it sees the shape bash will really be
-  handed. A machine with no `bash` on PATH skips the check rather than failing
-  the save; mesa can't prove a script is wrong there, and such a machine can't
-  run it either.
+  nothing — over the script *with the placeholders already replaced by sample
+  values*, so it sees the shape bash will really be handed; an unterminated
+  quote is caught here. A machine with no `bash` on PATH skips the check
+  rather than failing the save; mesa can't prove a script is wrong there, and
+  such a machine can't run it either.
 
   Unlike the refusals above, this one is **save-time only** — the spawn path
   does not re-run `bash -n`, so a hand-edited config may hold a script that
   parses badly, and that shows up as a failed spawn. Deliberate: a `bash`
   subprocess on every dispatch would cost more than it catches.
-
-### What is unchanged
-
-Everything on the far side of the spawn. A script is read fresh on every spawn
-(no caching, no restart), only its **exit code** matters, and a
-`backgrounded · <id>` line on stdout is still parsed as the optional receipt —
-see "What a replacement command owes mesa" below. The watchers' revert/retry
-paths don't know which mode ran.
 
 ## Resolution and failure
 
@@ -411,8 +335,8 @@ paths don't know which mode ran.
   where the spawn happens (the watcher logs it and releases its claim; the API
   answers 502 `unavailable`). A broken config must never read as
   "unconfigured" — same rule as `hooks.json`.
-- The defaults are template strings run through the same expander as a user's,
-  so there is one code path. The one difference is the `MESA_CLAUDE_BIN` test
+- The defaults are templates run through the same resolver as a user's, so
+  there is one code path. The one difference is the `MESA_CLAUDE_BIN` test
   seam, which stands in for a **default's** leading `claude` only (see *Retired
   placeholders*); a configured template runs exactly as written.
 
@@ -420,7 +344,8 @@ paths don't know which mode ran.
 
 Only its **exit code**. Nonzero is a failed spawn (the todo-watcher reverts the
 task to `todo`; the inbox-watcher drops the id from its
-in-memory dispatched set, so a later tick retries).
+in-memory dispatched set, so a later tick retries). The script runs with stdin
+closed and nothing set in its environment beyond what `mesa serve` inherited.
 
 Printing `backgrounded · <id>` is optional. mesa parses that line when it is
 there and `POST /api/projects/{id}/agents` returns the id; with no such line
@@ -438,12 +363,12 @@ they just won't appear in, or be attachable from, the Agents sidebar.
 ## The Settings page
 
 The same file is editable from the web UI: **Settings**, pinned to the bottom
-of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). It is a form
-over `commands` — a text box per action, the built-in default shown as the
-box's placeholder, the action's placeholder vocabulary listed under it, and the
-argv that will actually run spelled out beneath — followed by one section per
-other part of the file (Watchers, Keyboard shortcuts, Live conversation,
-Speech, Model pricing).
+of the left nav (`#/settings`, `SettingsView.tsx`, mesa task 654). Its Hooks
+tab is a form over `commands` — a text box per action, the built-in default
+shown as the box's placeholder, the action's placeholder vocabulary listed
+under it, and the script that will actually run spelled out beneath — and the
+other tabs hold one section each for the rest of the file (Watchers, Keyboard
+shortcuts, Live conversation, Speech, Model pricing).
 **Each section has
 its own endpoint, draft and save button**: they are separate writes, so one
 form's rejection must never strand another's edits.
@@ -456,31 +381,30 @@ the unreadable-config error: a restart must stay reachable exactly when the
 page's own data won't load. Nothing about the config needs it — a save is live
 on the next dispatch — so the two never interact.
 
-Two behaviors it exists to make legible, both of them the file's semantics
+Three behaviors it exists to make legible, all of them the file's semantics
 rather than presentation:
 
 - **A blank box is the built-in default**, not an empty command — so *reset* is
   literally "clear the box", and a saved blank **removes the key** rather than
   storing `""`.
 - **A bad template is refused at save time**, with the same message the spawn
-  path would have produced later (`{tsak}`, an unbalanced quote, an unknown
-  key; in script mode a `{placeholder}` or a bash syntax error). Validation runs
-  over the whole batch before anything is written, so a rejected save leaves the
-  file byte-identical.
-- **The mode is visible while typing.** Each row's "will run" line switches to
-  `bash -c` plus the variables that will be set the moment the box holds a
-  second line, and the vocabulary listed under the box switches with it —
-  `{}` placeholders in argv mode, `$MESA_*` in script mode, never both, since
-  showing both invites the mistake the server rejects. A `{placeholder}` typed
-  into a script is named inline, before the save.
+  path would have produced later (`{tsak}`, a placeholder in single quotes or
+  arithmetic, a `$MESA_NAME`, an unknown key, a bash syntax error).
+  Validation runs over the whole batch before anything is written, so a
+  rejected save leaves the file byte-identical.
+- **The vocabulary is visible while typing.** One short note above the rows
+  says what every hook is — a bash script, its placeholders quoted in — and a
+  `{placeholder}` the action does not offer is named inline
+  (`settingsDraft.ts::placeholderError`), before the save. The other refusals
+  need a shell lexer and are the PUT's, which names the context it found.
 
 Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
 `save_commands`):
 
 - `GET` returns one row per action —
-  `{action, value, default, placeholders, env_vars}`, where `value` is `null`
-  when the action is falling back and the two vocabularies line up one-for-one
-  (`{id}` ↔ `MESA_ID`), so the editor can name whichever mode applies. A file that exists
+  `{action, value, default, placeholders}`, where `value` is `null` when the
+  action is falling back (already migrated: a stored `{bin}` or `$MESA_NAME`
+  reads back as its placeholder). A file that exists
   but can't be parsed is **502 `unavailable`** here exactly as it is on a spawn:
   the page says the config is broken rather than rendering an empty editor a
   save would then write over the wreckage.
@@ -749,8 +673,8 @@ to be is unchanged in spirit, it has just moved: a configured prompt still
 from its text, the same "start from the built-in" idea the old editor offered
 as a button), mesa still appends only the session line —
 `You are driving mesa live session <id>.` — and the text is still never
-parsed by a shell, reaching the agent as one `Command::arg` or as
-`$MESA_PROMPT` in [script mode](#script-mode). Rewriting it is how a live
+parsed by a shell, quoted into the `live-agent` hook as one value
+([Placeholders](#placeholders)). Rewriting it is how a live
 conversation changes character, but the loop it describes is what makes the
 feature work at all — a prompt that never mentions `mesa live listen` produces
 an agent that hears nothing. `docs/live.md` is the contract the text has to
@@ -1024,17 +948,22 @@ Settings that mesa's own Rust reads nothing from.
 
 ## Gate
 
-`scripts/config-check.sh` — all three commands driven by a configured template
-(placeholders, quoting, the drop rule), the built-in argv proven unused while
+`scripts/config-check.sh` — all three commands driven by a configured hook
+(placeholders, a quoted template token, a name with spaces as one argument,
+an absent value as the empty string), the built-in argv proven unused while
 they are set and byte-for-byte unchanged when they aren't, the `id: null`
 no-receipt path, hot reload with no restart, and the malformed /
 unsupported-placeholder failures — plus `GET`/`PUT /api/config`: the round
 trip, the blank-clears-the-key rule, untouched keys and unknown sections
 preserved, a just-saved template driving the very next spawn, and the 422/502
-refusals leaving the file byte-identical — and, for script mode, a script
-driving each of the three actions, the per-action variables present/absent, the
-unset-not-empty rule, a hostile `{name}` proven not to reach a shell, and the
-422s for `{}`-in-a-script and a bash syntax error. It writes a real
+refusals leaving the file byte-identical — and, for multi-line hooks, a script
+driving each of the three actions, a hostile `{name}`/`{prompt}` (quotes,
+backticks, `$()`, a trailing backslash, a newline) arriving byte-identical in
+a word position, inside `"…"`, inside `$( (…) )` and in a heredoc body while
+executing nothing, a configured hook whose value holds a space and a quote
+reaching the stub as **one** argument, the `$MESA_*` read-time migration and
+save-time refusal, and the 422s for an out-of-scope placeholder, one in single
+or `$'…'` quotes, a heredoc delimiter, arithmetic, and a bash syntax error. It writes a real
 `~/.mesa/config.json` under a throwaway `HOME` rather than using
 `MESA_CONFIG_FILE`, so the default path resolution is covered too. For
 watchers it also covers the round trip (`GET` reporting the default with a

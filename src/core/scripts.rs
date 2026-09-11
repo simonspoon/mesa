@@ -12,10 +12,13 @@
 //! * by environment: `MESA_ARG_<NAME>` (upper-cased, `-`→`_`).
 //!
 //! so a value of `; rm -rf / #` is a string the script may read and never
-//! syntax. `agents.rs::spawn_script` holds the same line the same way, and the
-//! `env_remove`-then-`env` sweep is copied from it: a declared argument with no
-//! value on this call is genuinely *unset*, so `set -u` fires instead of the
-//! body silently reading a stale or empty value.
+//! syntax. (The agent hooks in `config.rs` hold the same line the other way
+//! round — quoting each value into the script text — because there the
+//! *template* is the user's and the values are mesa's; here the body is the
+//! user's and the values are typed in at run time, so they stay out of band.)
+//! The `env_remove`-then-`env` sweep makes a declared argument with no value
+//! on this call genuinely *unset*, so `set -u` fires instead of the body
+//! silently reading a stale or empty value.
 //!
 //! Runs are capture-and-return: all three stdio piped, no timeout (matching
 //! hooks and agents), output capped. A nonzero exit is **data** — the only
@@ -138,8 +141,8 @@ pub fn run(
         cmd.arg(resolved.get(&arg.name).map(String::as_str).unwrap_or(""));
     }
     // Remove every variable this feature can set, then set only the ones this
-    // call actually has — copied from `agents.rs::spawn_script`, and the whole
-    // reason `${MESA_ARG_X-UNSET}` can tell "not supplied" from "empty".
+    // call actually has — the whole reason `${MESA_ARG_X-UNSET}` can tell
+    // "not supplied" from "empty".
     for var in env_var_names(&script.args) {
         cmd.env_remove(var);
     }

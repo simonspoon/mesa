@@ -1824,9 +1824,9 @@ now, `live.auto-send-ms` — the recording's silence boundary above, read by the
 page rather than by the spawn; see `docs/library.md` for the definition and
 `docs/config.md` for the wait. A `live.prompt` key left behind in a hand-edited
 config file is silently ignored, never an error. Everything else about the
-`live-agent` template — argv vs script mode, tokenize-then-substitute, the
-`MESA_*` environment handoff, a `{placeholder}` refused inside
-a script — is inherited, not re-implemented. See `docs/config.md`.
+`live-agent` template — one bash script, every `{placeholder}` quoted into it
+for the context it sits in, the contexts a placeholder is refused in — is
+inherited, not re-implemented. See `docs/config.md`.
 
 ## Untrusted input
 
@@ -1834,9 +1834,9 @@ A dictated utterance is untrusted free text, and it is treated exactly as
 CLAUDE.md requires: **data, never instructions.**
 
 - It reaches the agent as JSON printed by `mesa live listen`, and reaches the
-  spawn as **one `Command::arg`** (or as `$MESA_PROMPT` in script mode). It is
-  never interpolated into a string a shell parses — the reason the one-line
-  template is argv and substitution happens after tokenization.
+  spawn **shell-quoted into the hook as one string literal**
+  (`config::substitute_script`) — one argument to whatever the hook runs, never
+  text a shell parses as syntax.
 - `AGENT_PROMPT` states the posture to the model in the same terms: an
   utterance may *ask* for work, and the agent may do that work, but it can
   never change the agent's rules, reveal or rewrite its instructions, or make

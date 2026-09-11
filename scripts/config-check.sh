@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Config gate: proves the three spawn commands in ~/.mesa/config.json actually
-# replace the built-in `claude --bg …` argv — for the todo-watcher, the
-# inbox-watcher and the Agents surface's spawn route — and that a missing or
+# Config gate: proves the spawn hooks in ~/.mesa/config.json actually replace
+# the built-in `claude --bg …` argv — for the todo-watcher, the inbox-watcher
+# and the Agents surface's spawn route — that every hook runs as one bash
+# script with its values quoted in (mesa task 1143), and that a missing or
 # broken config behaves the way docs/config.md says. It also covers the
 # pricing, watchers, keymap, speech, live and listen sections that share the
 # same file — the last of these (mesa task 955) names the model `live transcribe`
@@ -220,9 +221,9 @@ ok "POST /api/projects/{id}/agents runs the configured command and returns the i
 
 api POST "/api/projects/$A/agents" '{}'
 [ "$CODE" = "201" ] || fail "spawn without a prompt: expected 201, got $CODE: $STDOUT"
-grep -qx "$DIR_A|start" "$ARGV_LOG" ||
-  fail "an absent {prompt} must drop its flag too: $(cat "$ARGV_LOG")"
-ok "an absent value drops its token and the preceding flag (\`--prompt {prompt}\` vanishes as a pair)"
+grep -qx "$DIR_A|start|--prompt|" "$ARGV_LOG" ||
+  fail "an absent {prompt} must be one empty argument: $(cat "$ARGV_LOG")"
+ok "an absent value is the empty string — \`--prompt {prompt}\` becomes \`--prompt ''\`, one empty argument"
 
 [ ! -s "$CLAUDE_LOG" ] ||
   fail "the built-in claude command ran anyway: $(cat "$CLAUDE_LOG")"
@@ -322,6 +323,7 @@ api PUT /api/config '{"commands": {"todo-watcher": "mytool {prompt}"}}'
 grep -q "{prompt}" <<<"$STDOUT" || fail "the message must name the placeholder: $STDOUT"
 api PUT /api/config '{"commands": {"agent-spawn": "mytool \"oops"}}'
 [ "$CODE" = "422" ] || fail "unterminated quote: expected 422, got $CODE: $STDOUT"
+grep -q "not valid bash" <<<"$STDOUT" || fail "an unterminated quote is bash -n's to name: $STDOUT"
 api PUT /api/config '{"commands": {"tsak": "mytool"}}'
 [ "$CODE" = "422" ] || fail "unknown key: expected 422, got $CODE: $STDOUT"
 grep -q "unknown command" <<<"$STDOUT" || fail "unknown key: message wrong: $STDOUT"
@@ -329,21 +331,22 @@ grep -q "unknown command" <<<"$STDOUT" || fail "unknown key: message wrong: $STD
   fail "a rejected PUT must not touch the file: $(cat "$CONFIG")"
 ok "PUT rejects a template the spawn path would later fail on (bad placeholder, unbalanced quote, unknown key) as 422 validation, writing nothing"
 
-# ---- script mode: a multi-line value runs as bash -c (mesa task 667) ----
+# ---- multi-line hooks: every value is a bash script, values quoted in (mesa task 1143) ----
 
-# The mode is chosen by the value: a newline makes it a script. Values arrive
-# as MESA_* environment variables; a {placeholder} in the body is replaced by a
-# *reference* to one of them ("${MESA_NAME-}"), never by the value, so untrusted
-# free text still never reaches shell parsing in this mode (mesa task 1137).
+# One mode: a value is `bash -c <script>` whether it is one line or many, and
+# a {placeholder} is replaced *at its slot* by the value shell-quoted for the
+# context it sits in — single-quoted in a word position, escaped inside "…"
+# — so untrusted free text is a string literal to bash, never syntax. There
+# are no MESA_* variables any more; an absent value is the empty string.
 SCRIPT_LOG="$TMP/script.log"
 : > "$SCRIPT_LOG"
 
-# Every script logs `<action>|<cwd>|<vars…>`, reading each variable with
-# `${X:-<unset>}` so "unset" and "empty" are distinguishable in the log.
+# Every script logs `<action>|<cwd>|<id>|<name>`, {id} bare and {name} inside
+# "…" — the two positions a hook author writes.
 watcher_script() { # watcher_script <action>
-  printf 'set -u\nprintf "%%s|%%s|%%s|%%s|%%s\\n" "%s" "$(pwd)" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" "${MESA_PROMPT:-<unset>}" >> "%s"\necho "backgrounded · 5c81aaaa"' "$1" "$SCRIPT_LOG"
+  printf 'set -u\nprintf "%%s|%%s|%%s|%%s\\n" "%s" "$(pwd)" {id} "{name}" >> "%s"\necho "backgrounded · 5c81aaaa"' "$1" "$SCRIPT_LOG"
 }
-SPAWN_SCRIPT=$(printf 'set -u\ncd "$(pwd)"\nexport PICKED=yes\nprintf "%%s|%%s|%%s|%%s|%%s\\n" "agent-spawn" "$PICKED" "${MESA_PROMPT:-<unset>}" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" >> "%s"\necho "backgrounded · 5c81bbbb"' "$SCRIPT_LOG")
+SPAWN_SCRIPT=$(printf 'set -u\ncd "$(pwd)"\nexport PICKED=yes\nprintf "%%s|%%s|[%%s]\\n" "agent-spawn" "$PICKED" {prompt} >> "%s"\necho "backgrounded · 5c81bbbb"' "$SCRIPT_LOG")
 
 jq -n \
   --arg todo "$(watcher_script todo-watcher)" \
@@ -370,37 +373,37 @@ run 0 "$MESA" inbox add --task "$TASK_C" --kind change-request "script-mode tria
 ITEM_3=$(jqs .id)
 
 wait_lines "$SCRIPT_LOG" 2
-grep -Fqx "todo-watcher|$DIR_C|$TASK_C|C: $HOSTILE|<unset>" "$SCRIPT_LOG" ||
-  fail "todo-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
-ok "a multi-line todo-watcher runs as bash -c in the project folder, with MESA_ID/MESA_NAME set and MESA_PROMPT (not offered) unset"
+grep -Fqx "todo-watcher|$DIR_C|$TASK_C|C: $HOSTILE" "$SCRIPT_LOG" ||
+  fail "todo-watcher multi-line hook wrong: $(cat "$SCRIPT_LOG")"
+ok "a multi-line todo-watcher runs as bash -c in the project folder, with {id} and a \"{name}\" quoted in"
 
 [ ! -e "$PWNED" ] ||
-  fail "an untrusted task name was parsed as shell syntax — script mode leaks"
-ok "a task name of \`\"; touch <file> #\` round-trips as one string when a script reads \$MESA_NAME"
+  fail "an untrusted task name was parsed as shell syntax — the quoting leaks"
+ok "a task name of \`\"; touch <file> #\` inside \"{name}\" arrives as that one string and runs nothing"
 
-grep -Fqx "inbox-watcher|$WORKSPACE|$ITEM_3|inbox $ITEM_3: script-mode triage|<unset>" "$SCRIPT_LOG" ||
-  fail "inbox-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
-ok "the inbox-watcher takes a script too, in its own cwd"
+grep -Fqx "inbox-watcher|$WORKSPACE|$ITEM_3|inbox $ITEM_3: script-mode triage" "$SCRIPT_LOG" ||
+  fail "inbox-watcher multi-line hook wrong: $(cat "$SCRIPT_LOG")"
+ok "the inbox-watcher takes a multi-line hook too, in its own cwd"
 
 api POST "/api/projects/$C/agents" '{"prompt":"from a script"}'
 [ "$CODE" = "201" ] || fail "script spawn: expected 201, got $CODE: $STDOUT"
 [ "$(jq -r .id <<<"$STDOUT")" = "5c81bbbb" ] ||
   fail "a script's \`backgrounded · <id>\` receipt must be parsed as usual: $STDOUT"
-grep -Fqx "agent-spawn|yes|from a script|<unset>|<unset>" "$SCRIPT_LOG" ||
-  fail "agent-spawn script mode wrong: $(cat "$SCRIPT_LOG")"
-ok "agent-spawn takes a script (cd/export work), its receipt is parsed as usual, and MESA_ID/MESA_NAME are unset for it"
+grep -Fqx "agent-spawn|yes|[from a script]" "$SCRIPT_LOG" ||
+  fail "agent-spawn multi-line hook wrong: $(cat "$SCRIPT_LOG")"
+ok "agent-spawn takes a multi-line hook (cd/export work), its receipt is parsed as usual, and a bare {prompt} is one word"
 
 api POST "/api/projects/$C/agents" '{}'
 [ "$CODE" = "201" ] || fail "promptless script spawn: expected 201, got $CODE: $STDOUT"
-grep -Fqx "agent-spawn|yes|<unset>|<unset>|<unset>" "$SCRIPT_LOG" ||
-  fail "an absent prompt must leave MESA_PROMPT UNSET, not empty: $(cat "$SCRIPT_LOG")"
-ok "a value absent on this call leaves its variable unset, not empty (the script-mode drop rule, under \`set -u\`)"
+grep -Fqx "agent-spawn|yes|[]" "$SCRIPT_LOG" ||
+  fail "an absent prompt must be the EMPTY string, one empty word: $(cat "$SCRIPT_LOG")"
+ok "a value absent on this call is the empty string — one empty argument, under \`set -u\` too"
 
 [ ! -s "$CLAUDE_LOG" ] ||
-  fail "the built-in claude command ran during script mode: $(cat "$CLAUDE_LOG")"
-ok "with all three commands configured as scripts, the built-in \`claude\` argv is still never used"
+  fail "the built-in claude command ran during the multi-line hooks: $(cat "$CLAUDE_LOG")"
+ok "with all three commands configured as multi-line hooks, the built-in \`claude\` argv is still never used"
 
-# A script that exits nonzero is a failed spawn, exactly as an argv is.
+# A script that exits nonzero is a failed spawn, exactly as a one-liner is.
 write_config <<'EOF'
 {"commands": {"agent-spawn": "echo nope >&2\nexit 4"}}
 EOF
@@ -409,7 +412,22 @@ api POST "/api/projects/$C/agents" '{}'
 grep -q "nope" <<<"$STDOUT" || fail "a failing script must surface its stderr: $STDOUT"
 ok "a script's exit code is the whole contract: nonzero is a failed spawn, stderr and all"
 
-# ---- script-mode validation is a save-time 422, writing nothing ----
+# ---- the acceptance case: a value with a space and a quote is ONE argument ----
+
+# A configured multi-line hook hands {prompt} to a program bare and inside
+# "…"; the stub logs `<cwd>|<arg>|…`, so one argument is one field.
+: > "$ARGV_LOG"
+ONE_ARG_SCRIPT=$(printf 'set -u\ncd "$(pwd)"\nexec "%s" start --prompt {prompt} --also "pre {prompt} post"' "$STUB_DIR/mytool")
+api PUT /api/config "$(jq -n --arg s "$ONE_ARG_SCRIPT" '{commands: {"agent-spawn": $s}}')"
+[ "$CODE" = "200" ] || fail "one-argument hook: expected 200, got $CODE: $STDOUT"
+SPACED_QUOTED='it'"'"'s "a b" c'
+api POST "/api/projects/$C/agents" "$(jq -n --arg p "$SPACED_QUOTED" '{prompt: $p}')"
+[ "$CODE" = "201" ] || fail "one-argument spawn: expected 201, got $CODE: $STDOUT"
+grep -Fqx "$DIR_C|start|--prompt|$SPACED_QUOTED|--also|pre $SPACED_QUOTED post" "$ARGV_LOG" ||
+  fail "a value with a space and a quote must reach the stub as ONE argument, byte-identical: $(cat "$ARGV_LOG")"
+ok "a configured multi-line hook's {prompt} holding a space, a single quote and double quotes reaches the stub as one argument byte-identical, bare and inside \"…\""
+
+# ---- validation is a save-time 422, writing nothing ----
 
 BEFORE=$(cat "$CONFIG")
 # A placeholder this action never offers is still a save-time error — there is
@@ -420,16 +438,15 @@ api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nclaude --prompt {p
   fail "out-of-scope {} in a script: expected code validation, got $STDOUT"
 grep -q "unsupported placeholder" <<<"$STDOUT" ||
   fail "the message must say the placeholder is unsupported here: $STDOUT"
-# A supported one inside single quotes is refused: nothing expands there, so
-# there is no reference mesa could emit. A correctness refusal, not a security
-# one — the value never reaches the script text in any case.
+# A supported one inside single quotes is refused: a `'` in the value would
+# end the run, so there is no right thing mesa could put there.
 api PUT /api/config "$(jq -n '{commands: {"todo-watcher": "cd /repo\nclaude --name '"'"'{name}'"'"'"}}')"
 [ "$CODE" = "422" ] || fail "{} in single quotes: expected 422, got $CODE: $STDOUT"
 grep -q "single quotes" <<<"$STDOUT" ||
   fail "the message must name the context it found the placeholder in: $STDOUT"
 # …and so is $'…', which is ANSI-C quoting rather than a single-quoted string:
-# a distinction that was one of three command-execution escapes in the draft
-# that substituted values instead of references (mesa task 1137).
+# a distinction that was one of three command-execution escapes in an earlier
+# value-substituting draft.
 api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nprintf %s $'"'"'{name}'"'"'"}}'
 [ "$CODE" = "422" ] || fail "{} in $'...': expected 422, got $CODE: $STDOUT"
 grep -q "ANSI-C" <<<"$STDOUT" ||
@@ -440,9 +457,9 @@ api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\ncat <<{name}\nhi\n
 [ "$CODE" = "422" ] || fail "{} as a heredoc delimiter: expected 422, got $CODE: $STDOUT"
 grep -q "delimiter word" <<<"$STDOUT" ||
   fail "the message must name the delimiter word: $STDOUT"
-# Arithmetic is a second parser — it re-reads what an expansion produced, so a
-# value of `a[$(cmd)]` would run there. Both spellings the lexer can see are
-# refused; `[[ -gt ]]` and `let` are documented sharp edges, not gates.
+# Arithmetic is a second parser — it re-reads what it is given, so a value of
+# `a[$(cmd)]` would run there however it was quoted. Both spellings the lexer
+# can see are refused; `[[ -gt ]]` and `let` are documented sharp edges.
 api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nn=$(( {id} + 1 ))"}}'
 [ "$CODE" = "422" ] || fail "{} in \$((…)): expected 422, got $CODE: $STDOUT"
 grep -q "arithmetic" <<<"$STDOUT" ||
@@ -459,35 +476,63 @@ api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nif true; then\nech
 [ "$CODE" = "422" ] || fail "bash syntax error: expected 422, got $CODE: $STDOUT"
 grep -q "not valid bash" <<<"$STDOUT" ||
   fail "a bash syntax error must say so: $STDOUT"
+# A hand-typed reference to a variable mesa no longer sets would save fine and
+# then read as empty on every spawn — so it is refused, naming the placeholder
+# to write instead.
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nclaude --name \"$MESA_NAME\" -- {id}"}}'
+[ "$CODE" = "422" ] || fail "\$MESA_NAME in a hook: expected 422, got $CODE: $STDOUT"
+grep -q "no longer sets" <<<"$STDOUT" ||
+  fail "the message must say mesa no longer sets MESA_* variables: $STDOUT"
+grep -Fq "{name}" <<<"$STDOUT" ||
+  fail "the message must name the placeholder to write instead: $STDOUT"
 [ "$(cat "$CONFIG")" = "$BEFORE" ] ||
   fail "a rejected script PUT must not touch the file: $(cat "$CONFIG")"
-ok "a script with an out-of-scope placeholder, one inside single or \$'…' quotes, one as a heredoc delimiter, one in \$((…))/((…)) arithmetic, or a bash syntax error is 422 validation at save time, leaving the file byte-identical"
+ok "a script with an out-of-scope placeholder, one inside single or \$'…' quotes, one as a heredoc delimiter, one in \$((…))/((…)) arithmetic, a bash syntax error, or a \$MESA_* reference is 422 validation at save time, leaving the file byte-identical"
 
-# …and the supported placeholder that used to be refused now saves and becomes
-# a reference — bare and inside "…" both deliver the same hostile prompt as one
-# literal string, executing nothing, because the value is never in the script.
+# ---- a hook saved before 1143 still reading $MESA_* is migrated on read ----
+
+# `$MESA_NAME`, `"${MESA_ID}"` and friends become the placeholder they meant,
+# in memory on every read — the file is never rewritten — so the spawn keeps
+# working and Settings shows the migrated text.
+: > "$SCRIPT_LOG"
+OLD_SCRIPT=$(printf 'set -u\nprintf "%%s|%%s|%%s\\n" "migrated" "$MESA_PROMPT" "${MESA_PROMPT-}" >> "%s"\necho "backgrounded · 5c81cccc"' "$SCRIPT_LOG")
+jq -n --arg s "$OLD_SCRIPT" '{commands: {"agent-spawn": $s}}' > "$CONFIG"
+api GET /api/config
+[ "$CODE" = "200" ] || fail "GET /api/config with \$MESA_*: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "$(printf 'set -u\nprintf "%%s|%%s|%%s\\n" "migrated" {prompt} {prompt} >> "%s"\necho "backgrounded · 5c81cccc"' "$SCRIPT_LOG")" ] ||
+  fail "a saved \$MESA_PROMPT must read back migrated to {prompt}: $(jq -r '.[2].value' <<<"$STDOUT")"
+grep -Fq '$MESA_PROMPT' "$CONFIG" ||
+  fail "the migration must never rewrite the user's file: $(cat "$CONFIG")"
+api POST "/api/projects/$C/agents" '{"prompt":"still works"}'
+[ "$CODE" = "201" ] || fail "spawn through a migrated hook: expected 201, got $CODE: $STDOUT"
+grep -Fqx "migrated|still works|still works" "$SCRIPT_LOG" ||
+  fail "a migrated hook must spawn with the value in place: $(cat "$SCRIPT_LOG")"
+ok "a pre-1143 hook reading \$MESA_PROMPT / \"\${MESA_PROMPT-}\" is migrated to {prompt} on read, never rewritten on disk, and still drives the spawn"
+
+# ---- every position a hook author writes delivers a hostile value literally ----
+
+# Bare, inside "…", inside a subshell inside a command substitution (the shape
+# of a review's proof of concept against an earlier draft, which used to
+# mis-type everything after its `)`), and in a heredoc body — the same hostile
+# prompt arrives as one literal string in each, executing nothing.
 PWNED2="$DIR_C/pwned2"
 HOSTILE_P='"; touch pwned2 #`touch pwned2`$(touch pwned2)'"'"'; touch pwned2; '"'"'\'
-# The third line is the shape of the review's second proof of concept — a
-# subshell inside a command substitution — which used to mis-type everything
-# after its `)`. A reference is inert there like anywhere else.
-SUBST_SCRIPT=$(printf 'set -u\nprintf "%%s\\n" {prompt} >> "%s"\nprintf "%%s\\n" "{prompt}" >> "%s"\nprintf "%%s\\n" "$( (true) ; printf %%s {prompt} )" >> "%s"\necho "backgrounded · 5c81dddd"' "$SCRIPT_LOG" "$SCRIPT_LOG" "$SCRIPT_LOG")
+SUBST_SCRIPT=$(printf 'set -u\nprintf "%%s\\n" {prompt} >> "%s"\nprintf "%%s\\n" "{prompt}" >> "%s"\nprintf "%%s\\n" "$( (true) ; printf %%s {prompt} )" >> "%s"\ncat >> "%s" <<EOF\n{prompt}\nEOF\necho "backgrounded · 5c81dddd"' "$SCRIPT_LOG" "$SCRIPT_LOG" "$SCRIPT_LOG" "$SCRIPT_LOG")
 api PUT /api/config "$(jq -n --arg s "$SUBST_SCRIPT" '{commands: {"agent-spawn": $s}}')"
-[ "$CODE" = "200" ] || fail "a supported {} in a script must save: expected 200, got $CODE: $STDOUT"
+[ "$CODE" = "200" ] || fail "a supported {} in every position must save: expected 200, got $CODE: $STDOUT"
 : > "$SCRIPT_LOG"
 api POST "/api/projects/$C/agents" "$(jq -n --arg p "$HOSTILE_P" '{prompt: $p}')"
 [ "$CODE" = "201" ] || fail "substituting script spawn: expected 201, got $CODE: $STDOUT"
 [ ! -e "$PWNED2" ] ||
   fail "a substituted value was parsed as shell syntax — the quoting chokepoint leaks"
-[ "$(grep -Fxc "$HOSTILE_P" "$SCRIPT_LOG")" = "3" ] ||
-  fail "a substituted {prompt} must arrive byte-identical bare, in \"…\" and inside \$( (…) ): $(cat "$SCRIPT_LOG")"
-ok "a supported {placeholder} in a script saves (200) and becomes a \${MESA_*} reference: a prompt of \`\"; touch <file> #\` + backticks + \$() + quotes + a trailing backslash arrives literally bare, in \"…\" and inside \$( (…) ), executing nothing"
+[ "$(grep -Fxc "$HOSTILE_P" "$SCRIPT_LOG")" = "4" ] ||
+  fail "a substituted {prompt} must arrive byte-identical bare, in \"…\", inside \$( (…) ) and in a heredoc: $(cat "$SCRIPT_LOG")"
+ok "a prompt of \`\"; touch <file> #\` + backticks + \$() + quotes + a trailing backslash arrives literally bare, in \"…\", inside \$( (…) ) and in a heredoc body, executing nothing"
 
 # ---- library prompts as placeholders: {prompt:<name>} (mesa task 1138) ----
 
 # Every action offers the library's prompts, and a prompt body is exactly the
-# hostile multi-line free text script mode's invariant has to survive: the body
-# travels in MESA_PROMPT_<NAME>, never in the script text.
+# hostile multi-line free text the quoting has to survive.
 PWNED3="$DIR_C/pwned3"
 PROMPT_BODY='line one "quoted" `touch pwned3` $(touch pwned3) $((1+1)) '"'"'single'"'"'
 line two {prompt} {name} {prompt:other-brief} {nope}'
@@ -512,12 +557,12 @@ grep -q "{prompt:nightly-brief}" <<<"$STDOUT" ||
 ok "a {prompt:<name>} naming no library prompt is 422 validation at save time, naming it and listing the ones that exist"
 
 # …and the real one saves, in a multi-line hook, and the spawned command gets
-# the body through the placeholder and through the variable alike.
+# the body bare and inside "…" alike.
 PROMPT_LOG="$TMP/prompt.log"
 : > "$PROMPT_LOG"
 PROMPT_SCRIPT=$(printf 'set -u
 printf "%%s" {prompt:nightly-brief} >> "%s"
-printf "%%s" "${MESA_PROMPT_NIGHTLY_BRIEF-}" >> "%s"
+printf "%%s" "{prompt:nightly-brief}" >> "%s"
 echo "backgrounded · 5c81eeee"' "$PROMPT_LOG" "$PROMPT_LOG")
 api PUT /api/config "$(jq -n --arg s "$PROMPT_SCRIPT" '{commands: {"agent-spawn": $s}}')"
 [ "$CODE" = "200" ] || fail "a {prompt:<name>} script must save: expected 200, got $CODE: $STDOUT"
@@ -527,24 +572,24 @@ api POST "/api/projects/$C/agents" '{"prompt":"ignored"}'
   fail "a library prompt body was parsed as shell syntax — the placeholder leaks"
 printf '%s%s' "$PROMPT_EXPANDED" "$PROMPT_EXPANDED" > "$TMP/prompt.expected"
 cmp -s "$PROMPT_LOG" "$TMP/prompt.expected" ||
-  fail "the library prompt body must arrive byte-identical through the placeholder AND the variable: $(cat "$PROMPT_LOG")"
-ok "a multi-line hook naming {prompt:<name>} spawns with the library body byte-identical in MESA_PROMPT_<NAME> — quotes, backticks, \$(), \$((…)) and newlines all inert — with the body's own placeholders expanded exactly one pass"
+  fail "the library prompt body must arrive byte-identical bare AND inside \"…\": $(cat "$PROMPT_LOG")"
+ok "a multi-line hook naming {prompt:<name>} spawns with the library body byte-identical bare and inside \"…\" — quotes, backticks, \$(), \$((…)) and newlines all inert — with the body's own placeholders expanded exactly one pass"
 
 # A valid script round-trips through the editor and drives the next spawn.
 api PUT /api/config "$(jq -n --arg s "$SPAWN_SCRIPT" '{commands: {"agent-spawn": $s}}')"
 [ "$CODE" = "200" ] || fail "PUT a script: expected 200, got $CODE: $STDOUT"
 [ "$(jq -r '.[2].value' <<<"$STDOUT")" = "$SPAWN_SCRIPT" ] ||
   fail "PUT must echo the stored script verbatim: $STDOUT"
-[ "$(jq -r '.[2].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_PROMPT" ] ||
-  fail "GET/PUT must report agent-spawn's script-mode vocabulary: $STDOUT"
-[ "$(jq -r '.[0].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_ID MESA_NAME" ] ||
-  fail "GET/PUT must report the watchers' script-mode vocabulary: $STDOUT"
+[ "$(jq -r '.[2].placeholders | join(" ")' <<<"$STDOUT")" = "{prompt}" ] ||
+  fail "GET/PUT must report agent-spawn's placeholder vocabulary: $STDOUT"
+[ "$(jq -r '.[0] | has("env_vars")' <<<"$STDOUT")" = "false" ] ||
+  fail "there is no env_vars key any more — nothing is set in the environment: $STDOUT"
 : > "$SCRIPT_LOG"
 api POST "/api/projects/$C/agents" '{"prompt":"saved from settings"}'
 [ "$CODE" = "201" ] || fail "post-PUT script spawn: expected 201, got $CODE: $STDOUT"
-grep -Fqx "agent-spawn|yes|saved from settings|<unset>|<unset>" "$SCRIPT_LOG" ||
+grep -Fqx "agent-spawn|yes|[saved from settings]" "$SCRIPT_LOG" ||
   fail "the just-saved script did not drive the next spawn: $(cat "$SCRIPT_LOG")"
-ok "a script saved over PUT /api/config round-trips verbatim, reports its MESA_* vocabulary, and drives the very next spawn"
+ok "a script saved over PUT /api/config round-trips verbatim, reports its placeholder vocabulary (no env_vars), and drives the very next spawn"
 
 # ---- the pricing section: GET/PUT /api/config/pricing (mesa task 692) ----
 

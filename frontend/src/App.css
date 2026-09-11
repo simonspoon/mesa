@@ -9773,7 +9773,8 @@ button:focus-visible,
 /* One row per item (mesa task 1111): the item's identity on the left, its
    buttons right-aligned on the same line — with ~10 agents beside the skills
    and commands, a second line of buttons per item was most of the page. The
-   path is the one part that may truncate; the name and the actions stay
+   name and the path may truncate (mesa task 1127: a long name used to refuse
+   to shrink and painted over the buttons at narrow widths); the actions stay
    whole. */
 .library-item-row {
   display: flex;
@@ -9792,7 +9793,10 @@ button:focus-visible,
 .library-name {
   font-family: var(--font-mono);
   color: var(--cyan);
-  flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .library-meta {
@@ -9800,9 +9804,15 @@ button:focus-visible,
   white-space: nowrap;
 }
 
+/* The path gives way before the name (mesa task 1127): a zero basis means
+   the path only ever takes the room left after the name and the badges, so a
+   shortfall eats the path first and reaches the name only once the path is
+   gone — a shrink weight would still leak a fraction of a pixel onto the
+   name, enough to put an ellipsis on a name that fits. */
 .library-path {
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1 1 0;
 }
 
 /* A prompt row's `{prompt:<name>}` (mesa task 1139): selectable text, so it

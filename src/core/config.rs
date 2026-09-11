@@ -508,15 +508,6 @@ fn write_atomically(path: &Path, body: &str) -> Result<(), SaveError> {
     })
 }
 
-/// Rejects a template the spawn path would fail on later — an unterminated
-/// quote, a placeholder this action doesn't offer, or one that expands to an
-/// empty argv; in script mode, a `{placeholder}` (which a script never gets)
-/// or a bash syntax error. Every value is supplied, so only template-shaped
-/// mistakes are caught here; the per-call drop rule stays [`expand`]'s
-/// business.
-///
-/// The point is *when* the failure lands: at save time, in the editor, rather
-/// than at the next dispatch, in a watcher log the user isn't reading.
 /// Rejects a template the spawn path would fail on later — a `MESA_*`
 /// variable reference mesa no longer sets, a placeholder this action doesn't
 /// offer, one sitting where no substitution could go, an unknown library
@@ -808,7 +799,11 @@ fn retired_env_reference(text: &str, at: usize) -> Option<(String, usize)> {
 /// because the placeholder arrives quoted already; a bare `$MESA_ID` becomes a
 /// bare `{id}`, which is quoted for wherever it sits. A migrated prompt name
 /// the library no longer holds fails the spawn with the ordinary unknown-prompt
-/// error rather than starting anything.
+/// error rather than starting anything. One caveat: the old encoding folded
+/// `_` to `_` and `-` to `_` alike and uppercased, so it cannot be undone
+/// exactly — a prompt really named `a_b` or `A-B` migrates to `{prompt:a-b}`,
+/// and that spawn fails with the same unknown-prompt error until the hook is
+/// edited to name it.
 pub fn migrate_env_references(template: &str) -> String {
     let bytes = template.as_bytes();
     let mut out = String::with_capacity(template.len());

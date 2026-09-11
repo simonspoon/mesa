@@ -174,8 +174,8 @@ api 201 POST "/api/projects/$P/agents" '{"prompt":"do the thing"}'
 [ "$(jqb .id)" = "deadbeef" ] || fail "POST agents with prompt: parsed job id"
 ok "POST /api/projects/{id}/agents starts a --bg session (with/without prompt)"
 
-# Every session mesa starts runs under an agent persona (default `swe`,
-# MESA_CLAUDE_AGENT overrides, empty disables) — the flag must sit between
+# Every session mesa starts runs under an agent persona (`swe`, literal in the
+# default template since mesa task 1141) — the flag must sit between
 # `--bg` and the `--` separator or a prompt-leading `-` swallows it.
 ARGV=$(cat "$STUB_DIR/last-bg-argv")
 case "$ARGV" in

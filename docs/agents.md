@@ -12,17 +12,18 @@ touches the mesa store only to read `local_path`. There is deliberately no
 `agents::spawn_bg` is the single spawn chokepoint (the two watchers, this POST
 route and `mesa live start` all go through it) and runs the template
 `~/.mesa/config.json` gives for that action; this route's key is
-**`agent-spawn`**, defaulting to `{bin} --bg --agent {agent} -- {prompt}`. The
+**`agent-spawn`**, defaulting to `claude --bg --agent swe -- {prompt}`. The
 sections below describe that default. A replacement command owes mesa only its
 exit code; see the `POST` route below on the `id: null` case.
 
 **Every session mesa *starts* runs under an agent persona** by default:
 `--agent <name>`, **`swe`** — mesa auto-dispatches engineering work, and the
-generic assistant persona is the wrong front door for it.
-`MESA_CLAUDE_AGENT` overrides the name; set it **empty** to drop the flag and
-get a plain session (an unknown agent name is a hard startup failure in the
-claude CLI, not a warning, so a machine without a `swe` agent needs this escape
-hatch). The flag is placed after `--bg` and before the `--` prompt separator.
+generic assistant persona is the wrong front door for it. The name is a
+literal in the template (mesa task 1141, replacing the old `MESA_CLAUDE_AGENT`
+env var): to use another agent, or none — an unknown agent name is a hard
+startup failure in the claude CLI, not a warning, so a machine without a `swe`
+agent needs to drop the flag — edit the `agent-spawn` line in Settings. The
+flag is placed after `--bg` and before the `--` prompt separator.
 `claude agents --json` and the attach bridge don't start a session, so neither
 takes it — and neither is affected by the templates, so a template pointing at
 a different tool yields sessions the sidebar can't list or attach to.

@@ -1808,14 +1808,14 @@ conversation") working with no backend change.
 ## Config
 
 The spawn is the fourth configurable command: **`live-agent`**, defaulting to
-`{bin} --bg --agent mesa-live --name {name} -- {prompt}` — the union of the two
+`claude --bg --agent mesa-live --name {name} -- {prompt}` — the union of the two
 existing shapes, since a live session is a mesa record (so it has an `{id}` and
 a `{name}`) *and* carries a prompt mesa supplies. That prompt is
 `live::agent_prompt`, so the feature works with **no user configuration**. The
-agent is named **literally** here rather than through `{agent}` (mesa task
-1068): the conversation runs as the `mesa-live` agent definition, which is
-where its instructions live. `{agent}` stays in the placeholder vocabulary this
-action offers, so an override may still use it. The instructions used to be the
+agent is named **literally** here (mesa task 1068): the conversation runs as
+the `mesa-live` agent definition, which is where its instructions live, and a
+user who wants another edits the name (since mesa task 1141 every default
+spells its program and agent out; `docs/config.md`). The instructions used to be the
 config file's fifth section, `live.prompt` (mesa task 867); as of mesa task 919
 they live in the library instead, and as of mesa task 1068 as an agent
 definition rather than a prompt — forking it **replaces** the built-in, the

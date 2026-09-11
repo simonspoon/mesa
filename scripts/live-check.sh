@@ -535,7 +535,7 @@ S3=$(jqs .id)
 ok "live start <PROJECT>: resolves a project by name and binds the spawn receipt"
 
 # The argv the built-in `live-agent` template produces:
-#   {bin} --bg --agent mesa-live --name {name} -- {prompt}
+#   claude --bg --agent mesa-live --name {name} -- {prompt}
 # The agent is named literally (mesa task 1068): the conversation runs as the
 # `mesa-live` agent definition, which is where its instructions live now.
 [ "$(cat "$STUB_DIR/last-argc")" = "7" ] ||

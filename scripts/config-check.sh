@@ -286,9 +286,9 @@ api GET /api/config
   fail "GET /api/config: configured value wrong: $STDOUT"
 [ "$(jq -r '.[1].value' <<<"$STDOUT")" = "null" ] ||
   fail "an unconfigured action must report value: null, got $STDOUT"
-[ "$(jq -r '.[1].default' <<<"$STDOUT")" = '{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"' ] ||
+[ "$(jq -r '.[1].default' <<<"$STDOUT")" = 'claude --bg --agent swe --name {name} -- "/inbox-triage {id}"' ] ||
   fail "GET /api/config: built-in default wrong: $STDOUT"
-[ "$(jq -r '.[2].placeholders | join(" ")' <<<"$STDOUT")" = "{bin} {agent} {prompt}" ] ||
+[ "$(jq -r '.[2].placeholders | join(" ")' <<<"$STDOUT")" = "{prompt}" ] ||
   fail "GET /api/config: agent-spawn's placeholder vocabulary wrong: $STDOUT"
 ok "GET /api/config reports each command's configured value (null when unset), its built-in default and the placeholders it offers"
 
@@ -341,7 +341,7 @@ SCRIPT_LOG="$TMP/script.log"
 # Every script logs `<action>|<cwd>|<vars…>`, reading each variable with
 # `${X:-<unset>}` so "unset" and "empty" are distinguishable in the log.
 watcher_script() { # watcher_script <action>
-  printf 'set -u\nprintf "%%s|%%s|%%s|%%s|%%s|%%s\\n" "%s" "$(pwd)" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" "${MESA_AGENT:-<unset>}" "${MESA_PROMPT:-<unset>}" >> "%s"\necho "backgrounded · 5c81aaaa"' "$1" "$SCRIPT_LOG"
+  printf 'set -u\nprintf "%%s|%%s|%%s|%%s|%%s\\n" "%s" "$(pwd)" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" "${MESA_PROMPT:-<unset>}" >> "%s"\necho "backgrounded · 5c81aaaa"' "$1" "$SCRIPT_LOG"
 }
 SPAWN_SCRIPT=$(printf 'set -u\ncd "$(pwd)"\nexport PICKED=yes\nprintf "%%s|%%s|%%s|%%s|%%s\\n" "agent-spawn" "$PICKED" "${MESA_PROMPT:-<unset>}" "${MESA_ID:-<unset>}" "${MESA_NAME:-<unset>}" >> "%s"\necho "backgrounded · 5c81bbbb"' "$SCRIPT_LOG")
 
@@ -370,7 +370,7 @@ run 0 "$MESA" inbox add --task "$TASK_C" --kind change-request "script-mode tria
 ITEM_3=$(jqs .id)
 
 wait_lines "$SCRIPT_LOG" 2
-grep -Fqx "todo-watcher|$DIR_C|$TASK_C|C: $HOSTILE|swe|<unset>" "$SCRIPT_LOG" ||
+grep -Fqx "todo-watcher|$DIR_C|$TASK_C|C: $HOSTILE|<unset>" "$SCRIPT_LOG" ||
   fail "todo-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
 ok "a multi-line todo-watcher runs as bash -c in the project folder, with MESA_ID/MESA_NAME set and MESA_PROMPT (not offered) unset"
 
@@ -378,7 +378,7 @@ ok "a multi-line todo-watcher runs as bash -c in the project folder, with MESA_I
   fail "an untrusted task name was parsed as shell syntax — script mode leaks"
 ok "a task name of \`\"; touch <file> #\` round-trips as one string when a script reads \$MESA_NAME"
 
-grep -Fqx "inbox-watcher|$WORKSPACE|$ITEM_3|inbox $ITEM_3: script-mode triage|swe|<unset>" "$SCRIPT_LOG" ||
+grep -Fqx "inbox-watcher|$WORKSPACE|$ITEM_3|inbox $ITEM_3: script-mode triage|<unset>" "$SCRIPT_LOG" ||
   fail "inbox-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
 ok "the inbox-watcher takes a script too, in its own cwd"
 
@@ -535,9 +535,9 @@ api PUT /api/config "$(jq -n --arg s "$SPAWN_SCRIPT" '{commands: {"agent-spawn":
 [ "$CODE" = "200" ] || fail "PUT a script: expected 200, got $CODE: $STDOUT"
 [ "$(jq -r '.[2].value' <<<"$STDOUT")" = "$SPAWN_SCRIPT" ] ||
   fail "PUT must echo the stored script verbatim: $STDOUT"
-[ "$(jq -r '.[2].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_BIN MESA_AGENT MESA_PROMPT" ] ||
+[ "$(jq -r '.[2].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_PROMPT" ] ||
   fail "GET/PUT must report agent-spawn's script-mode vocabulary: $STDOUT"
-[ "$(jq -r '.[0].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_BIN MESA_AGENT MESA_ID MESA_NAME" ] ||
+[ "$(jq -r '.[0].env_vars | join(" ")' <<<"$STDOUT")" = "MESA_ID MESA_NAME" ] ||
   fail "GET/PUT must report the watchers' script-mode vocabulary: $STDOUT"
 : > "$SCRIPT_LOG"
 api POST "/api/projects/$C/agents" '{"prompt":"saved from settings"}'
@@ -1333,7 +1333,7 @@ api POST "/api/projects/$A/agents" '{"prompt":"/execute-mesa-task 1"}'
   fail "default fallback: expected the claude stub's id, got $STDOUT"
 grep -qx "$DIR_A|--agent|swe|--|/execute-mesa-task 1" "$CLAUDE_LOG" ||
   fail "the built-in default argv changed: $(cat "$CLAUDE_LOG")"
-ok "an action absent from the config uses the built-in \`claude --bg --agent swe -- <prompt>\` argv (MESA_CLAUDE_BIN still feeds {bin})"
+ok "an action absent from the config uses the built-in \`claude --bg --agent swe -- <prompt>\` argv (MESA_CLAUDE_BIN stands in for a default template's \`claude\` only)"
 
 # The other two actions fall back the same way — proven on a fresh project, so
 # the todo-watcher's one-agent-per-project cap doesn't hide it.
@@ -1356,20 +1356,55 @@ grep -qx "$WORKSPACE|--agent|swe|--name|inbox $ITEM_2: loki: find exits 0 on no 
   fail "the built-in inbox-watcher argv changed: $(cat "$CLAUDE_LOG")"
 ok "the unconfigured inbox-watcher keeps its built-in \`--name inbox <id>: <body> -- /inbox-triage <id>\` argv"
 
-# ---- MESA_CLAUDE_AGENT still disables --agent through the default template ----
+# ---- a saved template still holding the retired {bin}/{agent} (mesa task 1141) ----
 
+# A config written before 1141 may carry `{bin}`/`{agent}`. They are migrated
+# on every read — `{bin}` → `claude`, `{agent}` → `swe`, in memory — so the
+# spawn still works and Settings shows the literal form; the file itself is
+# never rewritten. Saving either token anew is refused, since the vocabulary
+# no longer offers them. And a *configured* template is run exactly as
+# written: MESA_CLAUDE_BIN stands in for `claude` only in a built-in default,
+# so this one resolves to a real `claude` on PATH — a stub of that name on the
+# front of PATH is what a user who wanted a different binary would write in.
+mkdir -p "$TMP/onpath"
+cat >"$TMP/onpath/claude" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$TMP/onpath.log"
+echo "backgrounded · 5c81eeee"
+EOF
+chmod +x "$TMP/onpath/claude"
+: > "$TMP/onpath.log"
+write_config <<'EOF'
+{"commands": {"agent-spawn": "{bin} --bg --agent {agent} -- {prompt}"}}
+EOF
+api GET /api/config
+[ "$CODE" = "200" ] || fail "GET /api/config with a retired placeholder: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "claude --bg --agent swe -- {prompt}" ] ||
+  fail "a saved {bin}/{agent} must read back migrated to the literal form: $STDOUT"
+grep -Fq '{bin} --bg --agent {agent} -- {prompt}' "$CONFIG" ||
+  fail "the migration must never rewrite the user's file: $(cat "$CONFIG")"
 kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
-: > "$CLAUDE_LOG"
-HOME="$FAKE_HOME" MESA_CLAUDE_BIN="$STUB_DIR/claude" MESA_CLAUDE_AGENT="" \
-  MESA_WATCH_TODO_TICK_MS=150 \
-  "$MESA" serve --port "$PORT" --watch-todo >/dev/null 2>&1 &
+HOME="$FAKE_HOME" PATH="$TMP/onpath:$PATH" MESA_CLAUDE_BIN="$STUB_DIR/claude" \
+  "$MESA" serve --port "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 wait_for_server
-api POST "/api/projects/$A/agents" '{"prompt":"no persona"}'
-[ "$CODE" = "201" ] || fail "empty MESA_CLAUDE_AGENT: expected 201, got $CODE: $STDOUT"
-grep -qx "$DIR_A|--|no persona" "$CLAUDE_LOG" ||
-  fail "an empty MESA_CLAUDE_AGENT must drop \`--agent\` entirely: $(cat "$CLAUDE_LOG")"
-ok "MESA_CLAUDE_AGENT='' still omits --agent (the default template's {agent} is unavailable, so the pair drops)"
+: > "$CLAUDE_LOG"
+api POST "/api/projects/$A/agents" '{"prompt":"still spawns"}'
+[ "$CODE" = "201" ] || fail "spawn through a migrated template: expected 201, got $CODE: $STDOUT"
+[ "$(jq -r .id <<<"$STDOUT")" = "5c81eeee" ] ||
+  fail "a configured template must run the \`claude\` it names, not MESA_CLAUDE_BIN: $STDOUT"
+grep -Fqx -- "--bg --agent swe -- still spawns" "$TMP/onpath.log" ||
+  fail "the migrated template's argv is wrong: $(cat "$TMP/onpath.log")"
+[ ! -s "$CLAUDE_LOG" ] ||
+  fail "MESA_CLAUDE_BIN must not be substituted into a configured template: $(cat "$CLAUDE_LOG")"
+api PUT /api/config '{"commands": {"agent-spawn": "{bin} --bg -- {prompt}"}}'
+[ "$CODE" = "422" ] || fail "saving {bin} anew: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] || fail "saving {bin} anew: expected validation, got $STDOUT"
+api PUT /api/config '{"commands": {"agent-spawn": "claude --bg --agent {agent} -- {prompt}"}}'
+[ "$CODE" = "422" ] || fail "saving {agent} anew: expected 422, got $CODE: $STDOUT"
+grep -Fq '{bin} --bg --agent {agent} -- {prompt}' "$CONFIG" ||
+  fail "a refused save must leave the file untouched: $(cat "$CONFIG")"
+ok "a pre-1141 template holding {bin}/{agent} is migrated on read (claude/swe), never rewritten on disk, runs the \`claude\` it names rather than MESA_CLAUDE_BIN, and neither token can be saved anew"
 
 echo
 echo "config-check: $CHECKS checks passed"

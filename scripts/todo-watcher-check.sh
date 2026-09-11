@@ -161,8 +161,8 @@ LINE=$(head -1 "$BG_LOG")
 ok "watch_todo on: dispatches next actionable task, prompt is /execute-mesa-task <id>, session named '<project>: <name>', claims in_progress"
 
 # Auto-dispatched sessions run as the `supervisor` agent definition (mesa task
-# 1075) — named literally in the todo-watcher default rather than through
-# `{agent}`, so this is not the generic persona the other watchers use. The
+# 1075) — named literally in the todo-watcher default, so this is not the
+# generic `swe` persona the other watchers use. The
 # stub records whatever `--agent` value arrived ahead of --name/--.
 [ "$(cat "$STUB_DIR/last-agent")" = "supervisor" ] ||
   fail "dispatch must pass --agent supervisor, got '$(cat "$STUB_DIR/last-agent")'"

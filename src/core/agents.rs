@@ -18,36 +18,16 @@ use crate::core::types::AgentSession;
 /// (pointing at a stub), mirroring `MESA_CC_*` in cc.rs/usage.rs. Public so
 /// the API's attach bridge spawns the same binary.
 ///
-/// This feeds `{bin}` in the spawn command templates
-/// ([`crate::core::config`]) — which the built-in defaults use, so the env
-/// seam keeps working untouched. A user template that hardcodes a program
-/// name instead has simply opted out of it; the attach bridge, which starts
-/// no session, always uses this.
+/// Used directly by everything that is **not** a spawn template — listing
+/// sessions, `claude stop`, the job lookup, the attach bridge and the terminal
+/// pane. On the spawn path it is a **test seam, not a user lever** (mesa task
+/// 1141): [`spawn_for`] substitutes it for the leading `claude` of a
+/// **built-in default** template only ([`with_default_bin`]), so the check
+/// scripts' stub binary keeps working, while a template the user configured
+/// runs exactly as written, byte for byte. A user who wants a different binary
+/// edits the line in Settings.
 pub fn claude_bin() -> String {
     std::env::var("MESA_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
-}
-
-/// Default agent persona for sessions mesa spawns (`claude --agent <name>`).
-/// mesa auto-dispatches engineering work (todo-watcher, inbox-watcher) and the
-/// generic assistant persona is the wrong front door for it.
-const DEFAULT_CLAUDE_AGENT: &str = "swe";
-
-/// The agent to spawn sessions under. `MESA_CLAUDE_AGENT` overrides it; set it
-/// **empty** to omit `--agent` entirely and get a plain `claude` session (the
-/// escape hatch for a machine with no `swe` agent installed — an unknown agent
-/// name is a hard startup failure in the claude CLI, not a warning).
-/// Read-only sessions (`claude agents --json`) and the attach bridge don't
-/// start a session, so neither takes this flag.
-///
-/// This feeds `{agent}` in the spawn command templates; empty ⇒ unavailable
-/// ⇒ the default templates' `--agent {agent}` pair drops out
-/// ([`crate::core::config::expand`]).
-pub fn claude_agent() -> Option<String> {
-    match std::env::var("MESA_CLAUDE_AGENT") {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v),
-        Err(_) => Some(DEFAULT_CLAUDE_AGENT.to_string()),
-    }
 }
 
 /// Lists live Claude Code sessions started under `dir`. Filtered here in
@@ -267,8 +247,14 @@ fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
 /// `INBOX_WATCHER` or `AGENT_SPAWN`): the user's `~/.mesa/config.json`
 /// template if it configures that action, else the built-in default. Both go
 /// through the same resolver, so a missing config file yields exactly the argv
-/// mesa hardcoded before the file existed. `{bin}`/`{agent}` are filled here,
-/// from the env seams, rather than by callers.
+/// mesa hardcoded before the file existed.
+///
+/// The one thing the two paths do not share is the `MESA_CLAUDE_BIN` seam:
+/// only a **default** template has its `claude` swapped for [`claude_bin`]
+/// ([`with_default_bin`]). mesa wrote that program name itself, so it may
+/// stand in for it; a configured template is the user's text and is run as
+/// written — the env var must never be where a hook's binary silently comes
+/// from (mesa task 1141).
 ///
 /// A single-line value comes back as [`config::Spawn::Argv`]; a multi-line one
 /// as [`config::Spawn::Script`], carrying the `MESA_*` environment the script
@@ -286,20 +272,37 @@ fn spawn_for(
         None => config::default_command(action)
             .ok_or_else(|| format!("no default command for {action}"))?,
     };
-    let bin = claude_bin();
-    let agent = claude_agent();
-    config::resolve(
+    let spawn = config::resolve(
         action,
         template,
         &config::Vars {
-            bin: Some(&bin),
-            agent: agent.as_deref(),
             id,
             name,
             prompt,
             prompts: Some(prompts),
         },
-    )
+    )?;
+    Ok(if configured.is_none() {
+        with_default_bin(spawn, &claude_bin())
+    } else {
+        spawn
+    })
+}
+
+/// The `MESA_CLAUDE_BIN` test seam for a **built-in default** template: the
+/// `claude` every default starts with becomes `bin`. Every default is argv
+/// mode and names `claude` first, so a script or any other program name is
+/// left alone — this only ever rewrites what mesa itself wrote.
+fn with_default_bin(spawn: config::Spawn, bin: &str) -> config::Spawn {
+    match spawn {
+        config::Spawn::Argv(mut argv) => {
+            if argv.first().is_some_and(|program| program == "claude") {
+                argv[0] = bin.to_string();
+            }
+            config::Spawn::Argv(argv)
+        }
+        script => script,
+    }
 }
 
 /// Starts a detached background session in `dir` and returns its short job id,
@@ -813,28 +816,30 @@ JSON"#,
     }
 
     /// Expands one action's *default* template the way `spawn_bg` would, with
-    /// `bin`/`agent` pinned instead of read from the env.
+    /// the binary pinned to `bin` instead of read from `MESA_CLAUDE_BIN` —
+    /// through the same [`with_default_bin`] seam the real path uses.
     fn default_argv(
         action: &str,
         bin: &str,
-        agent: Option<&str>,
         id: Option<i64>,
         name: Option<&str>,
         prompt: Option<&str>,
     ) -> Vec<String> {
-        config::expand(
+        let argv = config::expand(
             action,
             config::default_command(action).unwrap(),
             &config::Vars {
-                bin: Some(bin),
-                agent,
                 id,
                 name,
                 prompt,
                 ..Default::default()
             },
         )
-        .unwrap()
+        .unwrap();
+        match with_default_bin(config::Spawn::Argv(argv), bin) {
+            config::Spawn::Argv(argv) => argv,
+            other => panic!("expected argv mode, got {other:?}"),
+        }
     }
 
     #[test]
@@ -844,7 +849,7 @@ JSON"#,
             dir.path(),
             r#"[ "$1" = "--bg" ] || exit 1; echo "backgrounded · deadbeef (idle — send a prompt to start)""#,
         );
-        let argv = default_argv(config::AGENT_SPAWN, &bin, None, None, None, None);
+        let argv = default_argv(config::AGENT_SPAWN, &bin, None, None, None);
         let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("deadbeef"));
     }
@@ -866,8 +871,7 @@ JSON"#,
     fn spawn_bg_passes_agent_before_name_and_prompt() {
         // `--agent` must land after `--bg` and before the `--` separator, or a
         // prompt-leading `-` swallows it. The stub asserts the full argv. The
-        // agent is the literal `supervisor` since mesa task 1075, so the
-        // `Some("swe")` below is deliberately not what lands in argv.
+        // agent is the literal `supervisor` since mesa task 1075.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
@@ -877,14 +881,7 @@ JSON"#,
               { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · 5we00000 · n""#,
         );
-        let argv = default_argv(
-            config::TODO_WATCHER,
-            &bin,
-            Some("swe"),
-            Some(9),
-            Some("n"),
-            None,
-        );
+        let argv = default_argv(config::TODO_WATCHER, &bin, Some(9), Some("n"), None);
         let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("5we00000"));
     }
@@ -892,8 +889,7 @@ echo "backgrounded · 5we00000 · n""#,
     #[test]
     fn spawn_bg_runs_a_configured_command_instead_of_claude() {
         // The end-to-end seam: a config file with its own template, expanded
-        // and executed. `{bin}`/`{agent}` are deliberately unused here — a
-        // replacement command names its own program.
+        // and executed. A replacement command names its own program.
         let _guard = crate::core::attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -963,51 +959,28 @@ echo "backgrounded · 5we00000 · n""#,
     }
 
     #[test]
-    fn claude_agent_defaults_to_swe_and_empty_disables() {
-        // Env-driven; `MESA_CLAUDE_AGENT` is process-global. Takes the
-        // crate-wide lock, not a private one — api.rs's watcher test reads the
-        // same var through `spawn_bg`, so a second mutex would let these two
-        // run concurrently and flake.
-        let _guard = crate::core::attachments::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("MESA_CLAUDE_AGENT") };
-        assert_eq!(claude_agent().as_deref(), Some("swe"));
-        unsafe { std::env::set_var("MESA_CLAUDE_AGENT", "reviewer") };
-        assert_eq!(claude_agent().as_deref(), Some("reviewer"));
-        unsafe { std::env::set_var("MESA_CLAUDE_AGENT", "  ") };
-        assert_eq!(claude_agent(), None);
-        unsafe { std::env::remove_var("MESA_CLAUDE_AGENT") };
-    }
-
-    #[test]
     fn spawn_bg_passes_dash_prompt_after_separator() {
         // A prompt beginning with `-` must reach claude as a positional, not a
-        // flag: the stub asserts `--bg -- <prompt>` and echoes the prompt back.
+        // flag: the stub asserts `--bg --agent swe -- <prompt>` and echoes the
+        // prompt back.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
-            r#"[ "$1" = "--bg" ] && [ "$2" = "--" ] || { echo "bad argv: $*" >&2; exit 1; }
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] && [ "$4" = "--" ] ||
+              { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · abc00000"
-echo "prompt was: $3" >&2"#,
+echo "prompt was: $5" >&2"#,
         );
-        let argv = default_argv(
-            config::AGENT_SPAWN,
-            &bin,
-            None,
-            None,
-            None,
-            Some("--resume"),
-        );
+        let argv = default_argv(config::AGENT_SPAWN, &bin, None, None, Some("--resume"));
         let id = spawn_argv(&argv, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(id.as_deref(), Some("abc00000"));
     }
 
     #[test]
     fn spawn_bg_passes_name_flag_before_prompt_separator() {
-        // No `{agent}` value is supplied, but the todo-watcher default names
-        // its agent literally (mesa task 1075), so `--agent supervisor` is
-        // still there; what this pins is `--name` landing before the `--`.
+        // The todo-watcher default names its agent literally (mesa task
+        // 1075), so `--agent supervisor` is there; what this pins is `--name`
+        // landing before the `--`.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
@@ -1019,7 +992,6 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         let argv = default_argv(
             config::TODO_WATCHER,
             &bin,
-            None,
             Some(1),
             Some("proj: do the thing"),
             None,
@@ -1044,8 +1016,6 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
             config::TODO_WATCHER,
             &script,
             &config::Vars {
-                bin: Some("claude"),
-                agent: Some("swe"),
                 id: Some(9),
                 name: Some("A: do the thing"),
                 ..Default::default()
@@ -1118,12 +1088,11 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("unset.log");
         let script = format!(
-            "set -u\nprintf '%s|%s|%s\\n' \"${{MESA_AGENT:-<unset>}}\" \
-             \"${{MESA_NAME:-<unset>}}\" \"${{MESA_PROMPT:-<unset>}}\" > {}",
+            "set -u\nprintf '%s|%s\\n' \"${{MESA_NAME:-<unset>}}\" \
+             \"${{MESA_PROMPT:-<unset>}}\" > {}",
             log.display()
         );
-        // No agent (MESA_CLAUDE_AGENT=""), no name — and todo-watcher never
-        // offers a prompt at all.
+        // No name — and todo-watcher never offers a prompt at all.
         let env = config::script_env(
             config::TODO_WATCHER,
             &script,
@@ -1135,10 +1104,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         let spawned = spawn_script(&script, &env, dir.path().to_str().unwrap());
         unsafe { std::env::remove_var("MESA_PROMPT") };
         spawned.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            "<unset>|<unset>|<unset>\n"
-        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "<unset>|<unset>\n");
     }
 
     #[test]

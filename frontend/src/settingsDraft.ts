@@ -53,8 +53,6 @@ export function effectiveMode(
 
 /** Every placeholder mesa knows, paired with the variable a script reads. */
 const PLACEHOLDER_ENV: Record<string, string> = {
-  '{bin}': 'MESA_BIN',
-  '{agent}': 'MESA_AGENT',
   '{id}': 'MESA_ID',
   '{name}': 'MESA_NAME',
   '{prompt}': 'MESA_PROMPT',

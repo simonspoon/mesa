@@ -15,7 +15,7 @@
 //!     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
 //!     "inbox-watcher":  "claude --bg --agent swe --name {name} -- \"/inbox-triage {id}\"",
 //!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
-//!     "live-agent":     "claude --bg --agent swe --name {name} -- {prompt}",
+//!     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
 //!     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}"
 //!   }
 //! }
@@ -214,46 +214,56 @@ pub const ACTIONS: [&str; 5] = [
 ];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
-/// config file existed, spelled as a template. `{bin}` carries the
-/// pre-existing `MESA_CLAUDE_BIN` env seam.
+/// config file existed, spelled as a template.
 ///
-/// The agent is named **literally** rather than through `{agent}` (mesa task
-/// 1075): the run happens as the `supervisor` agent definition
-/// (`core::supervisor::SUPERVISOR_DEFINITION`, seeded to
+/// The program and the agent are both **literal** (mesa task 1141): the
+/// defaults are plain, editable command lines, and a user who wants a
+/// different binary or a different agent edits the line in Settings rather
+/// than reaching for an environment variable mesa never showed them.
+/// (`{bin}` and `{agent}` used to stand here; they are no longer placeholders
+/// at all — see [`migrate_retired_placeholders`] for what happens to a saved
+/// template that still holds them.) The one seam left is
+/// `agents::claude_bin`, which substitutes `MESA_CLAUDE_BIN` for the leading
+/// `claude` of a **default** template only, so the check scripts' stub binary
+/// keeps working; a configured template runs exactly as written.
+///
+/// The run happens as the `supervisor` agent definition (mesa task 1075,
+/// `core::supervisor::SUPERVISOR_DEFINITION`, seeded to
 /// `~/.claude/agents/supervisor.md` by
 /// `core::supervisor::ensure_agent_definition`), which is where the
-/// supervising rules now live. `{agent}` is still offered on this action, so
-/// an override may go back to mesa's generic agent name.
+/// supervising rules live.
 ///
 /// Note the quotes around the prompt: a slash command and its argument are
 /// **one** argv entry (`claude` takes the prompt as a single positional), and
 /// tokenization is by whitespace. Unquoted, `/execute-mesa-task {id}` would
 /// arrive as two arguments and the id would be lost.
 pub const DEFAULT_TODO_WATCHER: &str =
-    r#"{bin} --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}""#;
-/// Built-in default for [`INBOX_WATCHER`]; see [`DEFAULT_TODO_WATCHER`].
+    r#"claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}""#;
+/// Built-in default for [`INBOX_WATCHER`]; see [`DEFAULT_TODO_WATCHER`]. The
+/// triage runs as mesa's generic engineering agent, `swe`, named literally.
 pub const DEFAULT_INBOX_WATCHER: &str =
-    r#"{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}""#;
+    r#"claude --bg --agent swe --name {name} -- "/inbox-triage {id}""#;
 /// Built-in default for [`AGENT_SPAWN`]. No `{id}`/`{name}`: this spawn is
 /// driven by a request body, not a mesa record, and the prompt is optional —
-/// absent, the `-- {prompt}` pair drops out and the session starts idle.
-pub const DEFAULT_AGENT_SPAWN: &str = "{bin} --bg --agent {agent} -- {prompt}";
+/// absent, the `-- {prompt}` pair drops out and the session starts idle. The
+/// agent is the literal `swe`.
+pub const DEFAULT_AGENT_SPAWN: &str = "claude --bg --agent swe -- {prompt}";
 /// Built-in default for [`LIVE_AGENT`]. The union of the two shapes above: a
 /// live session is a mesa record (so it has an `{id}` and a `{name}`) *and*
 /// carries a prompt mesa supplies — `core::live::agent_prompt`, the session
 /// line and any recalled memory — so the feature works with no user
-/// configuration. The agent is named **literally** rather than through
-/// `{agent}` (mesa task 1068): the conversation runs as the `mesa-live` agent
-/// definition (`core::live::AGENT_DEFINITION`, seeded to
+/// configuration. The conversation runs as the `mesa-live` agent definition
+/// (mesa task 1068, `core::live::AGENT_DEFINITION`, seeded to
 /// `~/.claude/agents/mesa-live.md` by `core::live::ensure_agent_definition`),
-/// which is where its instructions now live. `{agent}` is still offered on
-/// this action, so an override may go back to mesa's generic agent name.
-pub const DEFAULT_LIVE_AGENT: &str = "{bin} --bg --agent mesa-live --name {name} -- {prompt}";
+/// which is where its instructions live; a user who wants another agent edits
+/// the name here.
+pub const DEFAULT_LIVE_AGENT: &str = "claude --bg --agent mesa-live --name {name} -- {prompt}";
 /// Built-in default for [`LIVE_SUMMARY`] — identical in shape to
 /// [`DEFAULT_LIVE_AGENT`]: the summariser is also a mesa record (a session
 /// id and a name) carrying a prompt mesa supplies
 /// (`core::live::summary_prompt`), so it works with no user configuration.
-pub const DEFAULT_LIVE_SUMMARY: &str = "{bin} --bg --agent {agent} --name {name} -- {prompt}";
+/// It runs as the literal `swe`.
+pub const DEFAULT_LIVE_SUMMARY: &str = "claude --bg --agent swe --name {name} -- {prompt}";
 
 /// The built-in template for `action`, or `None` if `action` isn't one of
 /// [`ACTIONS`]. Public so the docs check and the API can report the shipped
@@ -347,8 +357,31 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
     Ok(config
         .commands
         .get(action)
-        .map(|s| s.trim().to_string())
+        .map(|s| migrate_retired_placeholders(s.trim()))
         .filter(|s| !s.is_empty()))
+}
+
+/// Rewrites the two placeholders mesa task 1141 retired — `{bin}` and
+/// `{agent}` — into the literal values they always resolved to by default,
+/// `claude` and `swe`.
+///
+/// Applied to a template **as it is read** from the config file, every read,
+/// in memory: the user's file is never rewritten behind their back. An
+/// upgraded install's saved template therefore keeps working with no silent
+/// spawn failure; the Settings page shows the already-migrated literal text,
+/// so the user's next Save writes the literal form and the file heals itself;
+/// and a template *saved anew* with either token is refused by the ordinary
+/// unsupported-placeholder rule ([`Vars::lookup`], [`check_script`]), because
+/// the vocabulary no longer offers them — a path the UI can no longer reach,
+/// since it never shows those tokens.
+///
+/// Substring replacement is exact on the braced form, so `{bin: 1}` or a
+/// `{prompt:bin}` name is untouched, and the same rewrite serves both modes:
+/// in a script `"{bin}"` becomes `"claude"`, which is what `MESA_BIN` held.
+pub fn migrate_retired_placeholders(template: &str) -> String {
+    template
+        .replace("{bin}", "claude")
+        .replace("{agent}", "swe")
 }
 
 /// Every action's current setting, for the Settings page
@@ -505,8 +538,6 @@ pub fn validate(action: &str, template: &str, prompts: &Prompts) -> Result<(), S
         return bash_syntax_check(action, &substitute_script(action, script, prompts)?);
     }
     let vars = Vars {
-        bin: Some("claude"),
-        agent: Some("swe"),
         id: Some(1),
         name: Some("name"),
         prompt: Some("prompt"),
@@ -561,9 +592,7 @@ pub fn resolve(action: &str, template: &str, vars: &Vars) -> Result<Spawn, Strin
 /// Every placeholder name, paired with the environment variable a script reads
 /// instead. The one mapping, shared by the env handoff, the save-time error and
 /// the vocabulary the Settings page advertises.
-const PLACEHOLDER_ENV: [(&str, &str); 5] = [
-    ("bin", "MESA_BIN"),
-    ("agent", "MESA_AGENT"),
+const PLACEHOLDER_ENV: [(&str, &str); 3] = [
     ("id", "MESA_ID"),
     ("name", "MESA_NAME"),
     ("prompt", "MESA_PROMPT"),
@@ -574,15 +603,9 @@ const PLACEHOLDER_ENV: [(&str, &str); 5] = [
 /// can only ever advertise variables the handoff actually sets.
 pub fn offered_env_vars(action: &str) -> &'static [&'static str] {
     match action {
-        AGENT_SPAWN => &["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"],
-        LIVE_AGENT | LIVE_SUMMARY => &[
-            "MESA_BIN",
-            "MESA_AGENT",
-            "MESA_ID",
-            "MESA_NAME",
-            "MESA_PROMPT",
-        ],
-        _ => &["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"],
+        AGENT_SPAWN => &["MESA_PROMPT"],
+        LIVE_AGENT | LIVE_SUMMARY => &["MESA_ID", "MESA_NAME", "MESA_PROMPT"],
+        _ => &["MESA_ID", "MESA_NAME"],
     }
 }
 
@@ -590,13 +613,7 @@ pub fn offered_env_vars(action: &str) -> &'static [&'static str] {
 /// [`crate::core::agents`] explicitly *removes* from the child before setting
 /// the ones that apply, so "not offered" and "no value on this call" are both
 /// genuinely **unset** rather than inherited from mesa's own environment.
-pub const ALL_ENV_VARS: [&str; 5] = [
-    "MESA_BIN",
-    "MESA_AGENT",
-    "MESA_ID",
-    "MESA_NAME",
-    "MESA_PROMPT",
-];
+pub const ALL_ENV_VARS: [&str; 3] = ["MESA_ID", "MESA_NAME", "MESA_PROMPT"];
 
 /// The `{prompt:<name>}` form's prefix — the one thing that keeps it from
 /// colliding with the built-in `{prompt}`, which has no colon.
@@ -743,7 +760,7 @@ fn expand_body(action: &str, body: &str, vars: &Vars) -> String {
             return out;
         };
         let key = &from_brace[1..close];
-        // Only the five built-in names are ever looked up here, so this cannot
+        // Only the three built-in names are ever looked up here, so this cannot
         // reach `{prompt:…}` and cannot recurse.
         match PLACEHOLDER_ENV
             .iter()
@@ -1364,17 +1381,16 @@ fn bash_syntax_check(action: &str, script: &str) -> Result<(), String> {
 }
 
 /// The values a template's placeholders may resolve to. A `None` field is
-/// "not available for this call" — see [`expand`]'s drop rule. `bin`/`agent`
-/// are filled from the env seams by `agents::argv_for`, not by callers.
+/// "not available for this call" — see [`expand`]'s drop rule. The program
+/// and the agent are not here: since mesa task 1141 a template names both
+/// literally (`claude --bg --agent swe …`), so there is nothing to fill.
 #[derive(Debug, Default, Clone)]
 pub struct Vars<'a> {
-    pub bin: Option<&'a str>,
-    pub agent: Option<&'a str>,
     pub id: Option<i64>,
     pub name: Option<&'a str>,
     pub prompt: Option<&'a str>,
     /// The library's prompts, for `{prompt:<name>}` (mesa task 1138). Unlike
-    /// the five above this is not per-call data but static library text, so
+    /// the three above this is not per-call data but static library text, so
     /// every action offers it — which is why it sits beside them rather than
     /// in any of [`offered_placeholders`]'s per-action subsets. `None` is an
     /// empty library: every `{prompt:…}` is then an unknown name, an error,
@@ -1409,8 +1425,6 @@ impl Vars<'_> {
             return Ok(Some(expand_body(action, body, self)));
         }
         let (offered, value) = match key {
-            "bin" => (true, self.bin.map(str::to_string)),
-            "agent" => (true, self.agent.map(str::to_string)),
             "id" => (action != AGENT_SPAWN, self.id.map(|i| i.to_string())),
             "name" => (action != AGENT_SPAWN, self.name.map(str::to_string)),
             "prompt" => (
@@ -1436,11 +1450,11 @@ impl Vars<'_> {
 /// actually accepts.
 pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
     match action {
-        AGENT_SPAWN => &["{bin}", "{agent}", "{prompt}"],
+        AGENT_SPAWN => &["{prompt}"],
         // The union: a live session (and its summariser) is a mesa record
         // *and* carries a prompt.
-        LIVE_AGENT | LIVE_SUMMARY => &["{bin}", "{agent}", "{id}", "{name}", "{prompt}"],
-        _ => &["{bin}", "{agent}", "{id}", "{name}"],
+        LIVE_AGENT | LIVE_SUMMARY => &["{id}", "{name}", "{prompt}"],
+        _ => &["{id}", "{name}"],
     }
 }
 
@@ -3569,6 +3583,55 @@ mod tests {
     }
 
     #[test]
+    fn command_in_migrates_the_retired_bin_and_agent_placeholders_on_read() {
+        // A template saved before mesa task 1141 may still hold `{bin}` /
+        // `{agent}`. Read back, it is the literal form — so it resolves to
+        // exactly the argv the literal template does — while the file itself
+        // is left byte-identical: the rewrite is in memory, every read.
+        let dir = tempfile::tempdir().unwrap();
+        let before = concat!(
+            r#"{"commands": {"#,
+            r#""todo-watcher": "{bin} --bg --agent {agent} --name {name} -- \"/execute-mesa-task {id}\"", "#,
+            r#""agent-spawn": "cd /repo\nexec \"{bin}\" --agent {agent} -- {prompt}""#,
+            r#"}}"#
+        );
+        let path = write_config(dir.path(), before);
+        let literal = r#"claude --bg --agent swe --name {name} -- "/execute-mesa-task {id}""#;
+        assert_eq!(
+            command_in(&path, TODO_WATCHER).unwrap().as_deref(),
+            Some(literal)
+        );
+        let vars = Vars {
+            id: Some(4),
+            name: Some("n"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(TODO_WATCHER, literal, &vars).unwrap(),
+            resolve(
+                TODO_WATCHER,
+                &migrate_retired_placeholders(
+                    r#"{bin} --bg --agent {agent} --name {name} -- "/execute-mesa-task {id}""#
+                ),
+                &vars
+            )
+            .unwrap()
+        );
+        // Script mode too: the reference-substitution rules never see the
+        // retired names, so a script that used them still runs as written.
+        assert_eq!(
+            command_in(&path, AGENT_SPAWN).unwrap().as_deref(),
+            Some("cd /repo\nexec \"claude\" --agent swe -- {prompt}")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // Only the exact braced tokens are rewritten.
+        assert_eq!(
+            migrate_retired_placeholders("{bin: 1} {prompt:bin} {agent}"),
+            "{bin: 1} {prompt:bin} swe"
+        );
+    }
+
+    #[test]
     fn command_in_treats_blank_and_missing_section_as_unconfigured() {
         let dir = tempfile::tempdir().unwrap();
         // A blank value falls back to the default rather than expanding to an
@@ -3629,27 +3692,18 @@ mod tests {
         assert_eq!(settings[1].value, None);
         assert_eq!(settings[1].default, DEFAULT_INBOX_WATCHER);
         // The placeholder vocabulary is per-action, matching `Vars::lookup`.
-        assert_eq!(
-            settings[0].placeholders,
-            ["{bin}", "{agent}", "{id}", "{name}"]
-        );
+        assert_eq!(settings[0].placeholders, ["{id}", "{name}"]);
         assert_eq!(settings[2].action, AGENT_SPAWN);
-        assert_eq!(settings[2].placeholders, ["{bin}", "{agent}", "{prompt}"]);
+        assert_eq!(settings[2].placeholders, ["{prompt}"]);
         // The live agent offers the union of the two shapes: it is a mesa
         // record with an id and a name, and mesa supplies its prompt.
         assert_eq!(settings[3].action, LIVE_AGENT);
         assert_eq!(settings[3].default, DEFAULT_LIVE_AGENT);
-        assert_eq!(
-            settings[3].placeholders,
-            ["{bin}", "{agent}", "{id}", "{name}", "{prompt}"]
-        );
+        assert_eq!(settings[3].placeholders, ["{id}", "{name}", "{prompt}"]);
         // The summariser offers the same union, for the same reason.
         assert_eq!(settings[4].action, LIVE_SUMMARY);
         assert_eq!(settings[4].default, DEFAULT_LIVE_SUMMARY);
-        assert_eq!(
-            settings[4].placeholders,
-            ["{bin}", "{agent}", "{id}", "{name}", "{prompt}"]
-        );
+        assert_eq!(settings[4].placeholders, ["{id}", "{name}", "{prompt}"]);
     }
 
     #[test]
@@ -3813,8 +3867,6 @@ mod tests {
         // these three change, the check scripts' stub-argv assertions and the
         // agent CLI contract change with them.
         let vars = Vars {
-            bin: Some("claude"),
-            agent: Some("swe"),
             id: Some(731),
             name: Some("mesa: do the thing"),
             ..Default::default()
@@ -3826,7 +3878,7 @@ mod tests {
                 "--bg",
                 "--agent",
                 // Literal since mesa task 1075: the run is supervised by the
-                // `supervisor` agent definition, not by `{agent}`.
+                // `supervisor` agent definition.
                 "supervisor",
                 "--name",
                 "mesa: do the thing",
@@ -3848,8 +3900,6 @@ mod tests {
             ]
         );
         let spawn = Vars {
-            bin: Some("claude"),
-            agent: Some("swe"),
             prompt: Some("look at the tests"),
             ..Default::default()
         };
@@ -3867,11 +3917,8 @@ mod tests {
         // The live agent takes both halves: a named session id *and* the
         // prompt mesa supplies. The prompt is one argv entry however long or
         // hostile its text — it is never re-split after substitution. Its
-        // agent is the literal `mesa-live` definition (mesa task 1068), so
-        // `{agent}` is ignored here even when a value is available.
+        // agent is the literal `mesa-live` definition (mesa task 1068).
         let live = Vars {
-            bin: Some("claude"),
-            agent: Some("swe"),
             id: Some(12),
             name: Some("mesa live 12"),
             prompt: Some("listen; then say \"hi\""),
@@ -3894,18 +3941,16 @@ mod tests {
 
     #[test]
     fn absent_value_drops_the_token_and_its_flag() {
-        // No agent (MESA_CLAUDE_AGENT="") → `--agent {agent}` vanishes as a
-        // pair; no prompt → so does `-- {prompt}`. Both are today's behavior.
+        // No prompt → `-- {prompt}` vanishes as a pair; no name → so does
+        // `--name {name}`. Both are today's behavior.
         let vars = Vars {
-            bin: Some("claude"),
             ..Default::default()
         };
         assert_eq!(
             expand(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &vars).unwrap(),
-            ["claude", "--bg"]
+            ["claude", "--bg", "--agent", "swe"]
         );
         let named = Vars {
-            bin: Some("claude"),
             id: Some(7),
             ..Default::default()
         };
@@ -3922,12 +3967,11 @@ mod tests {
         );
         // A dropped token only takes a *flag* with it, never a positional.
         let vars = Vars {
-            bin: Some("t"),
             id: Some(1),
             ..Default::default()
         };
         assert_eq!(
-            expand(TODO_WATCHER, "{bin} run {name}", &vars).unwrap(),
+            expand(TODO_WATCHER, "t run {name}", &vars).unwrap(),
             ["t", "run"]
         );
     }
@@ -3939,8 +3983,6 @@ mod tests {
         // argv length is fixed by the template.
         let hostile = r#"drop "; rm -rf / #' --dangerously-skip-permissions"#;
         let vars = Vars {
-            bin: Some("claude"),
-            agent: Some("swe"),
             id: Some(1),
             name: Some(hostile),
             ..Default::default()
@@ -3953,33 +3995,39 @@ mod tests {
     #[test]
     fn placeholders_are_scoped_to_the_action() {
         let vars = Vars {
-            bin: Some("claude"),
             id: Some(1),
             prompt: Some("p"),
             ..Default::default()
         };
         // agent-spawn has no mesa record behind it, so no {id}/{name}…
-        let err = expand(AGENT_SPAWN, "{bin} {id}", &vars).unwrap_err();
+        let err = expand(AGENT_SPAWN, "claude {id}", &vars).unwrap_err();
         assert!(err.contains("{id}"), "{err}");
-        assert!(err.contains("{bin}, {agent}, {prompt}"), "{err}");
+        assert!(err.contains("agent-spawn offers {prompt}"), "{err}");
         // …and the watchers' prompt is theirs to write, not mesa's to inject.
-        let err = expand(TODO_WATCHER, "{bin} {prompt}", &vars).unwrap_err();
+        let err = expand(TODO_WATCHER, "claude {prompt}", &vars).unwrap_err();
         assert!(err.contains("{prompt}"), "{err}");
-        let err = expand(TODO_WATCHER, "{bin} {nope}", &vars).unwrap_err();
+        assert!(err.contains("todo-watcher offers {id}, {name}"), "{err}");
+        let err = expand(TODO_WATCHER, "claude {nope}", &vars).unwrap_err();
         assert!(err.contains("{nope}"), "{err}");
+        // The two placeholders mesa task 1141 retired are unknown names now,
+        // refused exactly like `{nope}` — a template saved anew with either
+        // is a validation error, not a silent literal.
+        for retired in ["claude --bg --agent {agent} -- {id}", "{bin} --bg -- {id}"] {
+            let err = expand(TODO_WATCHER, retired, &vars).unwrap_err();
+            assert!(err.contains("unsupported placeholder"), "{err}");
+        }
     }
 
     #[test]
     fn expand_handles_braces_that_are_not_placeholders() {
         let vars = Vars {
-            bin: Some("t"),
             id: Some(5),
             ..Default::default()
         };
         // An unclosed brace is literal text, and a placeholder can sit inside
         // a larger token (`mesa-{id}` is one argument).
         assert_eq!(
-            expand(TODO_WATCHER, "{bin} a{b mesa-{id}", &vars).unwrap(),
+            expand(TODO_WATCHER, "t a{b mesa-{id}", &vars).unwrap(),
             ["t", "a{b", "mesa-5"]
         );
     }
@@ -4019,14 +4067,12 @@ mod tests {
     #[test]
     fn resolve_returns_argv_for_a_single_line_and_a_script_for_many() {
         let vars = Vars {
-            bin: Some("claude"),
-            agent: Some("swe"),
             id: Some(7),
             name: Some("n"),
             ..Default::default()
         };
         assert_eq!(
-            resolve(TODO_WATCHER, "{bin} run {id}", &vars).unwrap(),
+            resolve(TODO_WATCHER, "claude run {id}", &vars).unwrap(),
             Spawn::Argv(vec!["claude".into(), "run".into(), "7".into()])
         );
         // The stored body is trimmed, and the env is the action's vocabulary
@@ -4036,8 +4082,6 @@ mod tests {
             Spawn::Script {
                 script: "cd /repo\n exec claude".to_string(),
                 env: vec![
-                    ("MESA_BIN".to_string(), "claude".to_string()),
-                    ("MESA_AGENT".to_string(), "swe".to_string()),
                     ("MESA_ID".to_string(), "7".to_string()),
                     ("MESA_NAME".to_string(), "n".to_string()),
                 ],
@@ -4049,7 +4093,6 @@ mod tests {
     fn script_env_is_scoped_per_action_and_omits_absent_values() {
         // agent-spawn gets a prompt and never an id/name…
         let spawn = Vars {
-            bin: Some("claude"),
             id: Some(7),
             name: Some("n"),
             prompt: Some("p"),
@@ -4057,22 +4100,15 @@ mod tests {
         };
         assert_eq!(
             script_env_(AGENT_SPAWN, &spawn),
-            [
-                ("MESA_BIN".to_string(), "claude".to_string()),
-                ("MESA_PROMPT".to_string(), "p".to_string()),
-            ]
+            [("MESA_PROMPT".to_string(), "p".to_string())]
         );
         // …and an absent value is omitted entirely rather than set empty —
         // the script-mode analogue of the argv drop rule.
         let bare = Vars {
-            bin: Some("claude"),
             ..Default::default()
         };
-        assert_eq!(
-            script_env_(TODO_WATCHER, &bare),
-            [("MESA_BIN".to_string(), "claude".to_string())]
-        );
-        assert_eq!(script_env_(AGENT_SPAWN, &bare).len(), 1);
+        assert!(script_env_(TODO_WATCHER, &bare).is_empty());
+        assert!(script_env_(AGENT_SPAWN, &bare).is_empty());
     }
 
     #[test]
@@ -4080,18 +4116,17 @@ mod tests {
         // The rule mesa task 1137 replaced: `{}` is one vocabulary, both modes.
         // What lands in the script is a reference; the value travels in `env`.
         let vars = Vars {
-            bin: Some("claude"),
             name: Some("fix the parser"),
             id: Some(7),
             ..Default::default()
         };
-        let script = "cd /repo\nexec {bin} --name {name} -- \"work on {id}\"";
+        let script = "cd /repo\nexec claude --name {name} -- \"work on {id}\"";
         let Spawn::Script { script, env } = resolve(TODO_WATCHER, script, &vars).unwrap() else {
             panic!("expected a script");
         };
         assert_eq!(
             script,
-            "cd /repo\nexec \"${MESA_BIN-}\" --name \"${MESA_NAME-}\" -- \"work on ${MESA_ID-}\""
+            "cd /repo\nexec claude --name \"${MESA_NAME-}\" -- \"work on ${MESA_ID-}\""
         );
         // Already inside `"…"`, so `{id}` got the bare form; everywhere else
         // the quoted one, so a value with spaces stays one word.
@@ -4102,7 +4137,7 @@ mod tests {
             Some("fix the parser")
         );
         assert_eq!(
-            validate_(TODO_WATCHER, "cd /repo\nexec {bin} --name {name}"),
+            validate_(TODO_WATCHER, "cd /repo\nexec claude --name {name}"),
             Ok(())
         );
         // A placeholder this action doesn't offer is still a save-time error,
@@ -4161,7 +4196,7 @@ mod tests {
         // `${VAR}`, brace expansion, `{ …; }` grouping and jq's object syntax
         // all contain braces; only a bare, known placeholder name is one.
         for script in [
-            "cd /repo\nexec \"$MESA_BIN\" --name \"${MESA_NAME}\"",
+            "cd /repo\nexec \"$CLAUDE_BIN\" --name \"${MESA_NAME}\"",
             "cd /repo\ncp a.txt{,.bak}\n{ echo one; echo two; }",
             "cd /repo\necho '{id: 1}' | tee out.json",
             "cd /repo\necho {foo} {bin: 1}",
@@ -4396,18 +4431,14 @@ mod tests {
         // variable stays genuinely unset, which is how a script tells the two
         // apart.
         let vars = Vars {
-            bin: Some("claude"),
             ..Default::default()
         };
         let Spawn::Script { script, env } =
-            resolve(TODO_WATCHER, "set -eu\nexec {bin} --name {name}", &vars).unwrap()
+            resolve(TODO_WATCHER, "set -eu\nexec claude --name {name}", &vars).unwrap()
         else {
             panic!("expected a script");
         };
-        assert_eq!(
-            script,
-            "set -eu\nexec \"${MESA_BIN-}\" --name \"${MESA_NAME-}\""
-        );
+        assert_eq!(script, "set -eu\nexec claude --name \"${MESA_NAME-}\"");
         assert!(!env.iter().any(|(var, _)| var == "MESA_NAME"), "{env:?}");
         // …and a real bash agrees, under `set -u`.
         let dir = tempfile::tempdir().unwrap();
@@ -4700,7 +4731,7 @@ mod tests {
         );
         assert!(!path.exists(), "a rejected save must write nothing");
         // A well-formed script round-trips and stays a script on the way back.
-        let script = "cd /repo\nexec \"$MESA_BIN\" --bg -- \"work on $MESA_ID\"";
+        let script = "cd /repo\nexec \"$CLAUDE_BIN\" --bg -- \"work on $MESA_ID\"";
         save_in(&path, &update(&[(TODO_WATCHER, script)])).unwrap();
         let stored = command_in(&path, TODO_WATCHER).unwrap().unwrap();
         assert_eq!(stored, script);
@@ -4725,23 +4756,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), r#"{"commands": {}}"#);
         let settings = settings_in(&path).unwrap();
-        assert_eq!(
-            settings[0].env_vars,
-            ["MESA_BIN", "MESA_AGENT", "MESA_ID", "MESA_NAME"]
-        );
-        assert_eq!(
-            settings[2].env_vars,
-            ["MESA_BIN", "MESA_AGENT", "MESA_PROMPT"]
-        );
+        assert_eq!(settings[0].env_vars, ["MESA_ID", "MESA_NAME"]);
+        assert_eq!(settings[2].env_vars, ["MESA_PROMPT"]);
         assert_eq!(
             settings[3].env_vars,
-            [
-                "MESA_BIN",
-                "MESA_AGENT",
-                "MESA_ID",
-                "MESA_NAME",
-                "MESA_PROMPT"
-            ]
+            ["MESA_ID", "MESA_NAME", "MESA_PROMPT"]
         );
         // The two vocabularies line up one-for-one, in the same order.
         for row in &settings {
@@ -5911,12 +5930,11 @@ mod tests {
 
             // argv: one argument, byte-identical.
             let vars = Vars {
-                bin: Some("claude"),
                 prompts: Some(&table),
                 ..Default::default()
             };
             assert_eq!(
-                expand(AGENT_SPAWN, "{bin} -- {prompt:brief}", &vars).unwrap(),
+                expand(AGENT_SPAWN, "claude -- {prompt:brief}", &vars).unwrap(),
                 vec!["claude".to_string(), "--".to_string(), body.clone()],
                 "argv mode mangled {body:?}"
             );
@@ -5956,7 +5974,6 @@ mod tests {
         // types a name, and case is not what it meant to say.
         let table = prompts(&[("Nightly-Brief", "read the board")]);
         let vars = Vars {
-            bin: Some("claude"),
             prompts: Some(&table),
             ..Default::default()
         };
@@ -5964,7 +5981,7 @@ mod tests {
             assert_eq!(
                 expand(
                     AGENT_SPAWN,
-                    &format!("{{bin}} -- {{prompt:{written}}}"),
+                    &format!("claude -- {{prompt:{written}}}"),
                     &vars
                 )
                 .unwrap(),
@@ -5982,12 +5999,11 @@ mod tests {
         // to a value this call does not have, and this call has one.
         let table = prompts(&[("blank", "")]);
         let vars = Vars {
-            bin: Some("claude"),
             prompts: Some(&table),
             ..Default::default()
         };
         assert_eq!(
-            expand(AGENT_SPAWN, "{bin} -- {prompt:blank}", &vars).unwrap(),
+            expand(AGENT_SPAWN, "claude -- {prompt:blank}", &vars).unwrap(),
             ["claude", "--", ""]
         );
         let Spawn::Script { env, .. } =
@@ -6026,11 +6042,10 @@ mod tests {
         // …but a row deleted since the save must be a hard error on the spawn
         // path too, never a silently empty prompt.
         let vars = Vars {
-            bin: Some("claude"),
             prompts: Some(&prompts(&[])),
             ..Default::default()
         };
-        let err = expand(TODO_WATCHER, "{bin} -- {prompt:nightly}", &vars).unwrap_err();
+        let err = expand(TODO_WATCHER, "claude -- {prompt:nightly}", &vars).unwrap_err();
         assert!(err.contains("{prompt:nightly}"), "{err}");
         assert!(err.contains("no prompts"), "{err}");
         let err = resolve(TODO_WATCHER, "true\necho {prompt:nightly}", &vars).unwrap_err();
@@ -6052,15 +6067,13 @@ mod tests {
             ("other", "NEVER"),
         ]);
         let vars = Vars {
-            bin: Some("claude"),
             id: Some(7),
             name: Some("A: do it"),
             prompt: Some("ignored"),
             prompts: Some(&table),
-            ..Default::default()
         };
         // todo-watcher offers {id}/{name} but not {prompt}.
-        let argv = expand(TODO_WATCHER, "{bin} -- {prompt:brief}", &vars).unwrap();
+        let argv = expand(TODO_WATCHER, "claude -- {prompt:brief}", &vars).unwrap();
         assert_eq!(
             argv,
             [
@@ -6123,11 +6136,13 @@ mod tests {
         // two-line one it grows into offer the same vocabulary.
         let table = prompts(&[("my.brief", "text")]);
         let vars = Vars {
-            bin: Some("claude"),
             prompts: Some(&table),
             ..Default::default()
         };
-        for template in ["{bin} -- {prompt:my.brief}", "true\necho {prompt:my.brief}"] {
+        for template in [
+            "claude -- {prompt:my.brief}",
+            "true\necho {prompt:my.brief}",
+        ] {
             let err = resolve(TODO_WATCHER, template, &vars).unwrap_err();
             assert!(err.contains("my.brief"), "{err}");
             assert!(err.contains("environment variable"), "{err}");
@@ -6143,16 +6158,14 @@ mod tests {
         // and it is *not* advertised in `offered_placeholders`.
         let table = prompts(&[("brief", "read the board")]);
         let vars = Vars {
-            bin: Some("claude"),
             id: Some(1),
             name: Some("n"),
             prompt: Some("p"),
             prompts: Some(&table),
-            ..Default::default()
         };
         for action in ACTIONS {
             assert_eq!(
-                expand(action, "{bin} -- {prompt:brief}", &vars).unwrap(),
+                expand(action, "claude -- {prompt:brief}", &vars).unwrap(),
                 ["claude", "--", "read the board"],
                 "{action}"
             );
@@ -6162,7 +6175,7 @@ mod tests {
             );
         }
         // And a colon-free `{prompt}` keeps its own per-action scoping.
-        let err = expand(TODO_WATCHER, "{bin} {prompt}", &vars).unwrap_err();
+        let err = expand(TODO_WATCHER, "claude {prompt}", &vars).unwrap_err();
         assert!(err.contains("{prompt}"), "{err}");
     }
 

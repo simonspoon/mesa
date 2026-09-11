@@ -9997,7 +9997,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 "expected exactly one dispatch (the unarchived project), got: {log:?}"
             );
             // Auto-dispatch spawns as the `supervisor` agent definition (mesa
-            // task 1075, literal in the template rather than `{agent}`) —
+            // task 1075, a literal in the template) —
             // asserted here because the watcher path is the one that must never
             // regress to a generic session.
             let agent =

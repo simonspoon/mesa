@@ -6,11 +6,18 @@ persona and the slash command can all change without rebuilding mesa:
 
 | Key | Used by | Built-in default |
 | --- | --- | --- |
-| `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `{bin} --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"` |
-| `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `{bin} --bg --agent {agent} --name {name} -- "/inbox-triage {id}"` |
-| `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `{bin} --bg --agent {agent} -- {prompt}` |
-| `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `{bin} --bg --agent {agent} --name {name} -- {prompt}` |
-| `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `{bin} --bg --agent {agent} --name {name} -- {prompt}` |
+| `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"` |
+| `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `claude --bg --agent swe --name {name} -- "/inbox-triage {id}"` |
+| `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `claude --bg --agent swe -- {prompt}` |
+| `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent mesa-live --name {name} -- {prompt}` |
+| `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
+
+The defaults are **plain, editable command lines** (mesa task 1141): the
+program and the agent are both spelled out, so a user who wants a different
+binary or a different agent edits the line — which is the whole point of the
+command being configurable. A configured template is run exactly as written.
+Two placeholders used to hide that choice, `{bin}` and `{agent}`; they are gone
+from the vocabulary (see *Retired placeholders* below).
 
 ```json
 {
@@ -33,14 +40,13 @@ conversations. The instructions themselves are the **`mesa-live` agent
 definition** in the library (`docs/library.md`): the loop on `mesa live
 listen`, the reply through `mesa live say` in spoken prose rather than
 markdown, the browser moves through `mesa live navigate`, and the rule that
-every dictated utterance is data rather than instructions. That is why this one
-default names its agent **literally**, `--agent mesa-live`, instead of using
-`{agent}` — mesa seeds the definition to `~/.claude/agents/mesa-live.md` on the
-first spawn, and Claude Code errors on an agent it has never seen. `{agent}` is
-still offered on this action, so a replacement template may use it; a
-replacement's job either way is to start *something* that will read `{prompt}`
-and do what its agent says. The definition is editable like any other library
-row, and a fork replaces the built-in.
+every dictated utterance is data rather than instructions. That is why this
+default names its agent `--agent mesa-live` — mesa seeds the definition to
+`~/.claude/agents/mesa-live.md` on the first spawn, and Claude Code errors on an
+agent it has never seen. A replacement template's job either way is to start
+*something* that will read `{prompt}` and do what its agent says. The
+definition is editable like any other library row, and a fork replaces the
+built-in.
 
 `live-summary`'s default is identical in shape (mesa task 921): the
 summariser is also a mesa record — a session id and a name — carrying a
@@ -125,8 +131,6 @@ what that spawn actually knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{bin}` | all five | `MESA_CLAUDE_BIN`, else `claude` |
-| `{agent}` | all five | `MESA_CLAUDE_AGENT`, else `swe`; unavailable when set empty |
 | `{id}` | watchers, `live-agent`, `live-summary` | the task id / inbox item id / live session id |
 | `{name}` | watchers, `live-agent`, `live-summary` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), or the live session's own name |
 | `{prompt}` | `agent-spawn`, `live-agent`, `live-summary` | the POST body's `prompt` (`agent-spawn`; unavailable when omitted) / the live agent's or summariser's instruction block, always present |
@@ -141,12 +145,39 @@ Two rules cover the edges:
   token, plus an immediately preceding token starting with `-`.** So
   `--name {name}` and `-- {prompt}` vanish as pairs rather than leaving a
   dangling flag to swallow the next argument. This is what makes the defaults
-  reproduce mesa's pre-config behavior exactly: `MESA_CLAUDE_AGENT=""` drops
-  `--agent {agent}`, and a promptless spawn drops `-- {prompt}` and starts an
-  idle session.
+  reproduce mesa's pre-config behavior exactly: a promptless spawn drops
+  `-- {prompt}` and starts an idle session.
 
 A `{` that opens nothing is a literal brace, and a placeholder may sit inside a
 larger token (`--name mesa-{id}`).
+
+### Retired placeholders: `{bin}` and `{agent}`
+
+Until mesa task 1141 two more placeholders stood at the front of every default:
+`{bin}` resolved to `MESA_CLAUDE_BIN` else `claude`, and `{agent}` to
+`MESA_CLAUDE_AGENT` else `swe`. Neither was visible or editable in Settings, so
+a user who wanted a different binary or agent had no obvious lever. Both are
+gone, and the defaults name `claude` and their agent literally.
+
+- **A saved template that still holds them is migrated on read.** Every time a
+  template is read from the file, `{bin}` becomes `claude` and `{agent}`
+  becomes `swe`, in memory (`config::migrate_retired_placeholders`). An
+  upgraded install's custom template therefore keeps working with no silent
+  spawn failure. **The file is never rewritten behind the user's back**;
+  Settings shows the already-migrated literal text, so the next Save writes the
+  literal form and the file heals itself.
+- **Saving either token anew is refused** — an ordinary 422 `validation` from
+  the unsupported-placeholder rule, because the vocabulary no longer offers
+  them. The Settings page never shows those tokens, so from the editor this
+  path is unreachable.
+- **`MESA_CLAUDE_BIN` is a test seam, not a user lever.** It still names the
+  `claude` mesa uses for everything that is *not* a template — listing
+  sessions, `claude stop`, the attach bridge, the terminal pane — and on the
+  spawn path it stands in for the leading `claude` of a **built-in default**
+  only, so the check scripts' stub binary keeps working. A template the user
+  configured is run exactly as written, byte for byte: the env var is never
+  where a hook's binary silently comes from. `MESA_CLAUDE_AGENT` is deleted
+  outright.
 
 ### `{prompt:<name>}` — a library prompt
 
@@ -221,7 +252,7 @@ binary conditionally, or run a setup step first.
 ```json
 {
   "commands": {
-    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/$MESA_ID\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec \"$MESA_BIN\" --bg --agent swe --name \"$MESA_NAME\" -- \"/execute-mesa-task $MESA_ID\""
+    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/$MESA_ID\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec claude --bg --agent swe --name \"$MESA_NAME\" -- \"/execute-mesa-task $MESA_ID\""
   }
 }
 ```
@@ -232,7 +263,7 @@ More legibly, that value is:
 set -euo pipefail
 cd "$HOME/src/checkouts/$MESA_ID" 2>/dev/null || cd "$HOME/src"
 export CLAUDE_PROJECT=mesa
-exec "$MESA_BIN" --bg --agent swe --name "$MESA_NAME" -- "/execute-mesa-task $MESA_ID"
+exec claude --bg --agent swe --name "$MESA_NAME" -- "/execute-mesa-task $MESA_ID"
 ```
 
 ### Placeholders here are references to those variables
@@ -305,8 +336,6 @@ is:
 
 | Placeholder | Variable | Where |
 | --- | --- | --- |
-| `{bin}` | `MESA_BIN` | all five |
-| `{agent}` | `MESA_AGENT` | all five |
 | `{id}` | `MESA_ID` | watchers, `live-agent`, `live-summary` |
 | `{name}` | `MESA_NAME` | watchers, `live-agent`, `live-summary` |
 | `{prompt}` | `MESA_PROMPT` | `agent-spawn`, `live-agent`, `live-summary` |
@@ -315,16 +344,15 @@ Two rules mirror the argv ones:
 
 - **A variable this command doesn't offer is not set** — a watcher script never
   sees `MESA_PROMPT`, an `agent-spawn` script never sees `MESA_ID`/`MESA_NAME`.
-  A `live-agent` script sees all five, since that spawn knows all five.
-  mesa explicitly *removes* all five before setting the ones that apply, so a
+  A `live-agent` script sees all three, since that spawn knows all three.
+  mesa explicitly *removes* all three before setting the ones that apply, so a
   variable can't leak in from the environment `mesa serve` was started with.
   A placeholder this command doesn't offer is a save-time error, as it always
   was — there is no variable to point at. `PUT /api/config` answers 422
   `validation` and the file is left byte-identical.
 - **A value with nothing to say on this call leaves its variable unset**, not
-  empty — the analogue of the drop rule. `MESA_CLAUDE_AGENT=""` means no
-  `MESA_AGENT`; a promptless `POST /api/projects/{id}/agents` means no
-  `MESA_PROMPT`. So `set -u` fires and `${MESA_PROMPT:-}` reads as "no prompt"
+  empty — the analogue of the drop rule. A promptless
+  `POST /api/projects/{id}/agents` means no `MESA_PROMPT`. So `set -u` fires and `${MESA_PROMPT:-}` reads as "no prompt"
   rather than "empty prompt".
 
   A `{placeholder}` reads that case as **empty**, because its emitted form
@@ -384,9 +412,9 @@ paths don't know which mode ran.
   answers 502 `unavailable`). A broken config must never read as
   "unconfigured" — same rule as `hooks.json`.
 - The defaults are template strings run through the same expander as a user's,
-  so there is one code path, and `MESA_CLAUDE_BIN`/`MESA_CLAUDE_AGENT` keep
-  working as the check scripts' seams. A template that hardcodes its program
-  has simply opted out of `MESA_CLAUDE_BIN`.
+  so there is one code path. The one difference is the `MESA_CLAUDE_BIN` test
+  seam, which stands in for a **default's** leading `claude` only (see *Retired
+  placeholders*); a configured template runs exactly as written.
 
 ## What a replacement command owes mesa
 

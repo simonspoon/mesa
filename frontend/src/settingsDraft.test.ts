@@ -15,12 +15,10 @@ function cmd(action: string, value: string | null): ConfigCommand {
   return {
     action,
     value,
-    default: `{bin} --bg -- ${action}`,
-    placeholders: ['{bin}'],
+    default: `claude --bg -- ${action}`,
+    placeholders: action === 'agent-spawn' ? ['{prompt}'] : ['{id}', '{name}'],
     env_vars:
-      action === 'agent-spawn'
-        ? ['MESA_BIN', 'MESA_AGENT', 'MESA_PROMPT']
-        : ['MESA_BIN', 'MESA_AGENT', 'MESA_ID', 'MESA_NAME'],
+      action === 'agent-spawn' ? ['MESA_PROMPT'] : ['MESA_ID', 'MESA_NAME'],
   }
 }
 
@@ -38,11 +36,11 @@ describe('draftFrom', () => {
 describe('effectiveCommand', () => {
   it('falls back to the built-in default while the box is blank', () => {
     const draft = draftFrom(COMMANDS)
-    expect(effectiveCommand(COMMANDS[1], draft)).toBe('{bin} --bg -- agent-spawn')
+    expect(effectiveCommand(COMMANDS[1], draft)).toBe('claude --bg -- agent-spawn')
     expect(effectiveCommand(COMMANDS[0], draft)).toBe('mytool {id}')
     // Whitespace-only is blank, the same way the server trims before storing.
     expect(effectiveCommand(COMMANDS[0], { 'todo-watcher': '   ' })).toBe(
-      '{bin} --bg -- todo-watcher',
+      'claude --bg -- todo-watcher',
     )
   })
 })
@@ -101,7 +99,7 @@ describe('scriptPlaceholderError', () => {
   it('leaves a script’s own ${VAR} alone', () => {
     expect(
       scriptPlaceholderError(COMMANDS[0], {
-        'todo-watcher': 'cd /repo\nexec "$MESA_BIN" --name "${MESA_NAME}"',
+        'todo-watcher': 'cd /repo\nexec "$CLAUDE_BIN" --name "${MESA_NAME}"',
       }),
     ).toBeNull()
   })

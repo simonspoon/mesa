@@ -1,12 +1,16 @@
-# Library (agents, skills, hooks, commands, prompts, CLAUDE.md)
+# Library (agents, skills, hooks, prompts, CLAUDE.md)
 
-mesa stores Claude Code's agent definitions, skills, hooks, commands, and
-CLAUDE.md files as first-class records — the library — and syncs them
-file-by-file against `.claude` (and a project's root `CLAUDE.md`), with the
-user picking a winner per file (mesa task 919). It also absorbs a fifth kind
-mesa itself uses: the live-conversation summariser's prompt, which used to be a
-`~/.mesa/config.json` key (`docs/config.md`) — as did the live agent's own
-instructions, now the `mesa-live` **agent definition** (mesa task 1068) — see
+mesa stores Claude Code's agent definitions, skills, hooks and CLAUDE.md
+files as first-class records — the library — and syncs them file-by-file
+against `.claude` (and a project's root `CLAUDE.md`), with the user picking a
+winner per file (mesa task 919). It also holds a fifth kind, **prompts**:
+text mesa itself reads — the live-conversation summariser's prompt, which used
+to be a `~/.mesa/config.json` key (`docs/config.md`), and anything a hook
+template splices in as `{prompt:<name>}` (mesa task 1138) — each of which may
+*also* be exported to `.claude/commands/<name>.md` as a slash command (mesa
+task 1139, see [Prompts that are also slash
+commands](#prompts-that-are-also-slash-commands)). The live agent's own
+instructions are the `mesa-live` **agent definition** (mesa task 1068) — see
 [Where the live prompt went](#where-the-live-prompt-went).
 
 ## The record
@@ -17,13 +21,14 @@ Table `library_items` (migration index 47, resulting `user_version` 48):
 | --- | --- | --- |
 | `id` | INTEGER PK | |
 | `name` | TEXT NOT NULL | `^[A-Za-z0-9][A-Za-z0-9._-]*$`, no `/`, `\` or `..` — it is half a filename |
-| `kind` | TEXT NOT NULL | `agent \| skill \| hook \| command \| prompt \| claude-md` |
+| `kind` | TEXT NOT NULL | `agent \| skill \| hook \| prompt \| claude-md` — `command` until migration index 54 folded it into `prompt` |
 | `scope` | TEXT NOT NULL | `user \| project` |
 | `project_id` | INTEGER NULL | FK `ON DELETE CASCADE`; required iff `scope = project`, must be NULL iff `scope = user` |
 | `body` | TEXT NOT NULL | the file's contents; may be empty |
 | `builtin_id` | TEXT NULL, UNIQUE | the built-in this row forked from, or NULL for a purely user-authored row |
 | `synced_body` | TEXT NULL | the last body mesa and the disk agreed on — the sync baseline |
 | `synced_at` | TEXT NULL | when that agreement was recorded |
+| `export_command` | INTEGER NOT NULL DEFAULT 0 | a prompt's "also a slash command" flag (migration index 54, mesa task 1139); `validation` when set on any other kind |
 | `created_at` / `updated_at` | TEXT NOT NULL | |
 
 `(kind, scope, project_id, name)` is unique at the schema level too — two
@@ -169,18 +174,18 @@ edit, and restoring the newest version changes nothing and writes nothing.
 
 ## Where a row lives on disk
 
-`core::library::relative_path(kind, scope, name)`, relative to the **scope
-base** — the home directory for `user`, a project's `local_path` for
-`project` (`core::library::scope_base`):
+`core::library::relative_path(kind, scope, name, export_command)`, relative
+to the **scope base** — the home directory for `user`, a project's
+`local_path` for `project` (`core::library::scope_base`):
 
 | kind | user scope | project scope |
 | --- | --- | --- |
 | `agent` | `.claude/agents/<name>.md` | `.claude/agents/<name>.md` |
 | `skill` | `.claude/skills/<name>/SKILL.md` | `.claude/skills/<name>/SKILL.md` |
 | `hook` | `.claude/hooks/<name>` | `.claude/hooks/<name>` |
-| `command` | `.claude/commands/<name>.md` | `.claude/commands/<name>.md` |
 | `claude-md` | `.claude/CLAUDE.md` | `CLAUDE.md` (the repo root — where Claude Code actually reads it) |
-| `prompt` | **none** | **none** |
+| `prompt`, `export_command` on | `.claude/commands/<name>.md` | `.claude/commands/<name>.md` |
+| `prompt`, `export_command` off | **none** | **none** |
 
 `hook` is the one kind that appends nothing (mesa task 1114): a hook is
 whatever script the user drops in — `poll-guard.py` as readily as
@@ -194,12 +199,75 @@ rule requires an alphanumeric first character. Migration index 52 appended
 `.sh` to every pre-existing hook row's name, which is exactly the path it
 already had.
 
-`prompt` is mesa-internal: the live-conversation prompt is not a file Claude
-Code reads, so it has no path at all, and the sync scanner (`scan_disk`) skips
-it entirely by construction — it is never one of the kinds a directory walk
-produces. This is the entire reason `prompt` is its own kind rather than a
-`command` — a slash command has a path and syncs; the live prompt does
-neither.
+## Prompts that are also slash commands
+
+Until mesa task 1139 there were two kinds for what is one thing: a `command`
+(text under `.claude/commands/`, reachable only by typing `/<name>` at
+Claude) and a `prompt` (text mesa reads — the summariser's instructions, and
+since mesa task 1138 anything a hook template names as `{prompt:<name>}`).
+The same paragraph could not be both. Now there is **one kind, `prompt`**,
+and a per-row flag, **`export_command`**, saying whether it is *also* written
+to Claude's commands folder: one source of truth in mesa, two consumption
+paths. A prompt with the flag off is mesa-internal exactly as before — no
+path, invisible to `scan_disk` and `sync_status` by construction — and one
+with it on owns `.claude/commands/<name>.md` and syncs like an agent or a
+skill. The three rows that were `command`s (`execute-todo`,
+`execute-refine`, `execute-triage-inbox`) migrated to prompts with the flag
+on — same id, so their version history came along untouched, same path and
+body, so their sync baseline still holds — and are reachable from a hook
+template as `{prompt:execute-todo}` etc. with nothing else done.
+
+**The stored body is canonical and the export is byte-identical.** No YAML
+frontmatter is synthesised from the item's description, no `{placeholder}` is
+rewritten to `$ARGUMENTS`, no argument translation of any kind. The task
+floated a translation as a leaning; it is rejected because `classify` (below)
+compares three plain strings — mesa body, disk body, baseline — so any
+transform on the way out is a permanent `both-changed` conflict on every
+row, and the whole requirement is that a sync right after an export sees no
+diff. The migrated items already carry `$ARGS`/`$ARGUMENTS` prose and keep
+working as slash commands unchanged; a prompt that wants frontmatter writes
+it into its body. The flag is a prompt's alone — `Store` answers
+`validation` for `export_command: true` on any other kind, since every other
+kind already owns a path — and a **built-in** carries no flag (a built-in is
+code, and `live-summary-prompt` has no business in `.claude/commands`);
+forking one gives it a row, and the row may set the flag like any other.
+
+**Turning the flag off removes the file** — the one write to disk outside
+the sync flow, made by `core::library::update_item`, the wrapper both `mesa
+library update` and `PATCH /api/library/{id}` go through instead of
+`Store::update_library_item` directly (the store never opens the
+filesystem). A file left behind would still be a slash command Claude Code
+offers while mesa no longer knew about it. It is removed **only while it is
+still mesa's own**: its bytes equal the row's body as it was before the
+patch, or the sync baseline (an edit made in mesa but not yet pushed leaves
+the disk file equal to the baseline, and that file is still mesa's). A file
+the user hand-edited since is left where it is, and the next `sync status`
+reports it `disk-new` — the row the user resolves. Either way
+`synced_body`/`synced_at` are cleared (`Store::clear_library_synced`): the
+baseline describes a file the row no longer claims, and kept, it would read
+the row as `disk-deleted` the moment it exported again. The removal is
+best-effort — a filesystem failure never fails the update, whose row is
+already written. The path goes through `resolve` like every other; it is the
+one the row had *before* the patch, so a rename in the same call gives up the
+old file. Turning the flag **on** writes nothing: the row is `mesa-new` on
+the next scan and the sync writes it, so a mistaken tick costs no file.
+
+The `command` kind is **removed outright**, not aliased: `mesa library create
+command …` and `{"kind": "command"}` on the API are `validation`, and
+`LibraryKind::parse` does not know the word. The one legacy shim is the
+**bundle**: a `LibraryBundleItem` deserializes `"kind": "command"` as a
+prompt with `export_command` on (a hand-written `Deserialize` in `types.rs`,
+mirrored by `libraryBundle.ts::parseBundle`), so an export taken before 1139
+still imports as the row the migration would have made. A bundle carries the
+flag from then on, absent reading as off.
+
+On `#/library` the flag is the **also a slash command** box a prompt's form
+offers (and only a prompt's — `libraryDraft.ts::offersExport`; a tick left
+behind after the kind is changed away is folded off in `payloadFor`, since
+the server would refuse it), a `slash command` badge on the row, and beside
+every prompt's name its `{prompt:<name>}` form as selectable text
+(`promptPlaceholders.ts::promptPlaceholder`, the one spelling the Settings
+list uses too).
 
 ## The traversal chokepoint, held twice
 
@@ -404,10 +472,13 @@ pure, total function deciding a status from the three:
 
 `core::library::sync_status` assembles this per project: it starts from
 `effective_items` (so a sync scan sees forks *and* unshadowed built-ins),
-skips `prompt` items outright (they have no path), resolves each item's file
-through `resolve`, classifies it, and then walks `scan_disk` over both scope
-bases to find `disk-new` files — anything on disk that no item's path already
-claimed.
+skips every item with no `path` (a prompt whose `export_command` is off),
+resolves each item's file through `resolve`, classifies it, and then walks
+`scan_disk` over both scope bases to find `disk-new` files — anything on disk
+that no item's path already claimed. A `.claude/commands` file found there
+adopts as a prompt with the flag **on** — a sync row exists only for a path,
+and a prompt has one only while it exports, so `apply_disk` needs no separate
+flag on the row.
 
 **The claimed-path set is keyed by resolved *path*, not by
 `(scope, kind, name)`.** `claude-md`'s path does not depend on its name at
@@ -504,8 +575,10 @@ holds. `Store::pull_library_body` (the `disk` choice's write) does move
 A library can travel between mesa instances as one downloadable **bundle** —
 a JSON document holding the library's *contents*, not its identity. Three new
 ts-rs types carry it: `LibraryBundleItem` (`name`, `kind`, `scope`, an
-optional `project` **name** — present iff `scope` is `project` — `body`, and
-an optional `builtin_id`), `LibraryBundle` (`version`, `exported_at`, and a
+optional `project` **name** — present iff `scope` is `project` — `body`, an
+optional `builtin_id`, and `export_command`, absent in a pre-1139 bundle and
+read as off — see [Prompts that are also slash
+commands](#prompts-that-are-also-slash-commands) for the `command` shim), `LibraryBundle` (`version`, `exported_at`, and a
 `Vec<LibraryBundleItem>`), and `LibraryImportResult` (the per-item outcome of
 an import, the same posture as `LibrarySyncResult`).
 
@@ -661,11 +734,14 @@ or a name — a built-in resolves by name too, since its name and its
   third way to supply the body — the same three-way choice a task's
   `--description-file` offers. `--scope` is `user|project`, defaulting to
   `user`; `--project <id-or-name>` is required iff `--scope project`.
+  `--export-command` sets a prompt's flag (`validation` on any other kind).
 - `update ITEM` requires at least one of `--name`, `--body`,
-  `--body-file` (an `ArgGroup`, so no field flag is `usage`, exit 2); both
-  `--name` and `--body` are replace-only, mirroring `script update`. Updating
-  an unshadowed built-in **forks** it rather than failing — a new db row
-  appears carrying its `builtin_id`.
+  `--body-file`, `--export-command`, `--no-export-command` (an `ArgGroup`,
+  so no field flag is `usage`, exit 2; the last two conflict); both `--name`
+  and `--body` are replace-only, mirroring `script update`. Updating an
+  unshadowed built-in **forks** it rather than failing — a new db row appears
+  carrying its `builtin_id`, with the flag as given.
+
 - `delete ITEM` has no confirmation and echoes the destroyed record — the
   recoverable transcript that stands in for the prompt mesa doesn't have.
   Deleting the fork of a built-in restores it unshadowed; deleting an
@@ -700,8 +776,8 @@ or a name — a built-in resolves by name too, since its name and its
 
 `--quiet` follows the house rule (`CLAUDE.md`): accepted on `create`,
 `update`, `delete` and `show`/`get`, dropping `body` and `synced_body`
-(`QUIET_DROP_LIBRARY`) while keeping `name`, `kind`, `scope` and the derived
-`path`; **not defined at all** on `list`, `versions`, any `hook` or `sync`
+(`QUIET_DROP_LIBRARY`) while keeping `name`, `kind`, `scope`, the bounded
+`export_command` flag and the derived `path`; **not defined at all** on `list`, `versions`, any `hook` or `sync`
 subcommand, or `export`/`import`, so passing it there is clap's
 unknown-argument error, exit 2 — those commands answer with a bundle, a
 results array or a status, not a record, so there is nothing for `--quiet` to
@@ -759,7 +835,8 @@ read from — because the struct simply has no field for it any more.
 `live-summary-prompt` (mesa task 921) is still a `prompt`: nothing spawns the
 summariser *by name*, so it has no reason to be an agent definition, and —
 being mesa-internal — it has no on-disk path either (`relative_path` answers
-`None` for every `prompt` row). `core::live::summary_prompt(store,
+`None` for a prompt whose `export_command` is off, which a built-in's always
+is). `core::live::summary_prompt(store,
 session_id)` resolves it the way the live agent's block used to be resolved: a
 fork of `live-summary-prompt` if one exists, else `core::live::SUMMARY_PROMPT`.
 **A store error resolving the fork also falls back to the built-in** rather
@@ -772,7 +849,7 @@ place, so there is nothing here for an old `config.json` to leave behind.
 
 ## Gate
 
-`scripts/library-check.sh` (114 checks) covers, over both the CLI and the
+`scripts/library-check.sh` (123 checks) covers, over both the CLI and the
 API:
 
 - **CRUD**: create (positional and flag forms, `--body-file`, the name-rule
@@ -853,6 +930,19 @@ API:
   empty one by both verbs rather than refused; a mistyped event naming the
   vocabulary, a non-hook item and an unknown item each exit 1; and `--quiet`
   rejected on all three subcommands (usage, exit 2, empty stdout).
+- **The command kind folded into prompt** (mesa task 1139): a db wound back
+  to the pre-1139 schema with `sqlite3` and holding a `command` row with two
+  versions opens as a prompt with `export_command` on — same id, path, body,
+  baseline and history, no `command` row surviving, listed under `--kind
+  prompt`; `--export-command` on a non-prompt and `create command` are each
+  `validation` (422 over the API, the retired kind included); an exporting
+  prompt's file is **byte-identical** to its body (`cmp`) and `sync status`
+  reads `in-sync` on the very next scan; a prompt with the flag off has no
+  path and is absent from the scan; `--no-export-command` removes the file
+  mesa wrote and clears the baseline, but leaves a hand-edited one for the
+  scan to report `disk-new`; `--quiet` keeps the flag; `PATCH` carries it;
+  and a bundle still saying `"kind": "command"` imports as an exporting
+  prompt while a fresh export carries the flag.
 
 The same pairing `api-check.sh` holds for tasks and `config-check.sh` holds
 for the config-write routes. The "a configured prompt replaces the built-in

@@ -155,7 +155,10 @@ larger token (`--name mesa-{id}`).
 named `<name>` — the same view `mesa library list` and `#/library` show, so a db
 row, an unshadowed built-in and a **fork overriding** a built-in all work, and
 editing the prompt on that page changes what the next spawn runs with no config
-edit at all. The Settings page lists this install's prompts beside the
+edit at all. Since mesa task 1139 that includes every prompt that is *also* a
+slash command (`export_command` on, `docs/library.md`): `{prompt:execute-todo}`
+splices in exactly the text `/execute-todo` types, since the body is stored
+once and exported byte-identical. The Settings page lists this install's prompts beside the
 placeholder vocabulary, live.
 
 It cannot collide with the built-in `{prompt}`, which has no colon. Unlike the

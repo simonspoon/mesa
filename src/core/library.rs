@@ -1,10 +1,11 @@
 //! The library's built-ins, disk layout and sync decision table (mesa task
 //! 919), plus the portable import/export bundle (mesa task 963).
 //!
-//! A library row is an agent definition, a skill, a hook script, a slash
-//! command, the live-conversation prompt, or a CLAUDE.md — stored in
-//! `library_items` (`Store`) and, for every kind but `prompt`, mirrored onto a
-//! file under `.claude/` (or a repo's root `CLAUDE.md`). This module holds
+//! A library row is an agent definition, a skill, a hook script, a prompt,
+//! or a CLAUDE.md — stored in `library_items` (`Store`) and mirrored onto a
+//! file under `.claude/` (or a repo's root `CLAUDE.md`); a prompt only when
+//! its `export_command` flag says it is also a slash command (mesa task 1139,
+//! which folded the old `command` kind into `prompt`). This module holds
 //! everything that does not touch the database: the built-in catalogue
 //! (`BUILTINS`), the pure mapping from a row to its path (`relative_path`),
 //! the traversal chokepoint that keeps a resolved path under its scope base
@@ -114,24 +115,35 @@ pub fn builtin(id: &str) -> Option<&'static Builtin> {
 
 /// Where a `(kind, scope, name)` lives on disk, relative to that scope's
 /// base (the home dir for `user`, a project's `local_path` for `project`).
-/// `Prompt` has no path — the live-conversation prompt is mesa-internal, not
-/// a file Claude Code reads, which is the whole reason `prompt` and `command`
-/// are separate kinds.
+/// A `Prompt` has a path only when `export_command` is on (mesa task 1139):
+/// a prompt is mesa-internal text a hook template reads, and the flag says
+/// it is *also* offered to Claude Code as the slash command
+/// `.claude/commands/<name>.md` — the directory the old `command` kind used
+/// to own. Off, it is `None`, and the sync flow never sees it. The flag is
+/// meaningless on every other kind, and ignored here rather than checked —
+/// `Store` refuses it at write time.
 ///
 /// A [`LibraryKind::Hook`] appends nothing: a hook is any script the user
 /// cares to drop in — `.sh`, `.py`, or no extension at all — so its *name*
 /// carries the whole filename and the extension travels with the item
 /// (mesa task 1114). Every other kind owns its extension.
-pub fn relative_path(kind: LibraryKind, scope: LibraryScope, name: &str) -> Option<PathBuf> {
+pub fn relative_path(
+    kind: LibraryKind,
+    scope: LibraryScope,
+    name: &str,
+    export_command: bool,
+) -> Option<PathBuf> {
     match kind {
         LibraryKind::Agent => Some(PathBuf::from(format!(".claude/agents/{name}.md"))),
         LibraryKind::Skill => Some(PathBuf::from(format!(".claude/skills/{name}/SKILL.md"))),
         LibraryKind::Hook => Some(PathBuf::from(format!(".claude/hooks/{name}"))),
-        LibraryKind::Command => Some(PathBuf::from(format!(".claude/commands/{name}.md"))),
         LibraryKind::ClaudeMd => Some(match scope {
             LibraryScope::User => PathBuf::from(".claude/CLAUDE.md"),
             LibraryScope::Project => PathBuf::from("CLAUDE.md"),
         }),
+        LibraryKind::Prompt if export_command => {
+            Some(PathBuf::from(format!(".claude/commands/{name}.md")))
+        }
         LibraryKind::Prompt => None,
     }
 }
@@ -257,7 +269,7 @@ pub fn ensure_agent_file(
         .flatten()
         .map(|item| item.body)
         .unwrap_or_else(|| fallback.to_string());
-    let rel = relative_path(LibraryKind::Agent, LibraryScope::User, builtin_id)
+    let rel = relative_path(LibraryKind::Agent, LibraryScope::User, builtin_id, false)
         .ok_or_else(|| format!("{builtin_id} has no path"))?;
     let base = scope_base(LibraryScope::User, None)
         .ok_or_else(|| format!("cannot seed the {builtin_id} agent definition: no HOME"))?;
@@ -305,9 +317,11 @@ const SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// CLAUDE.md locations (`.claude/CLAUDE.md`, the `user`-scope convention, and
 /// `CLAUDE.md` at `base`'s root, the `project`-scope one —
 /// [`relative_path`]'s two answers for [`LibraryKind::ClaudeMd`]), returning
-/// `(kind, name, body, mtime)` for every file found — the mtime read off the
-/// same metadata the body was, so a `disk-new` row reports its date without a
-/// second stat. The caller already knows which
+/// `(kind, export_command, name, body, mtime)` for every file found — the
+/// mtime read off the same metadata the body was, so a `disk-new` row reports
+/// its date without a second stat, and `export_command` true for exactly the
+/// `.claude/commands` hits, which adopt as prompts that export (mesa task
+/// 1139). The caller already knows which
 /// scope `base` is for and so which of the two CLAUDE.md hits is the real
 /// one; scanning both costs nothing since at most one is ever present in
 /// practice. Bounded on purpose: it skips anything over [`SCAN_MAX_BYTES`],
@@ -329,7 +343,7 @@ const SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// directory canonicalizes to somewhere outside `base_canon`, `resolve`
 /// refuses it, and the scan silently skips it exactly as it already does for
 /// a directory that does not exist.
-pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String>)> {
+pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, bool, String, String, Option<String>)> {
     let mut found = Vec::new();
 
     let safe_dir = |rel: &str| -> Option<PathBuf> { resolve(base, Path::new(rel)).ok() };
@@ -338,51 +352,59 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String
     // commands are `.md`, and the item is named after the stem — and `None`
     // for hooks, which are whatever script the user dropped in, named after
     // the whole filename so the extension travels with the item
-    // (mesa task 1114).
-    let leaf_dir = |sub: &str, kind: LibraryKind, ext: Option<&str>, found: &mut Vec<_>| {
-        let Some(dir) = safe_dir(&format!(".claude/{sub}")) else {
-            return;
-        };
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+    // (mesa task 1114). `export` is the flag a hit adopts with: on for the
+    // commands directory alone, whose files are prompts that export.
+    let leaf_dir =
+        |sub: &str, kind: LibraryKind, export: bool, ext: Option<&str>, found: &mut Vec<_>| {
+            let Some(dir) = safe_dir(&format!(".claude/{sub}")) else {
+                return;
             };
-            if !file_type.is_file() {
-                continue;
-            }
-            let name = match ext {
-                Some(ext) => {
-                    if path.extension().and_then(|e| e.to_str()) != Some(ext) {
-                        continue;
-                    }
-                    path.file_stem().and_then(|s| s.to_str())
+            let Ok(entries) = fs::read_dir(&dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() {
+                    continue;
                 }
-                // A file mesa cannot *name* is one it could not round-trip
-                // back onto disk, so it is skipped silently rather than
-                // failing the scan — which also drops the dotfiles an editor
-                // and the OS leave behind, since the charset rule requires an
-                // alphanumeric first character.
-                None => path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .filter(|n| crate::core::store::library_name_is_valid(n)),
-            };
-            let Some(name) = name else {
-                continue;
-            };
-            if let Some((body, mtime)) = read_bounded_with_mtime(&path) {
-                found.push((kind, name.to_string(), body, mtime));
+                let name = match ext {
+                    Some(ext) => {
+                        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+                            continue;
+                        }
+                        path.file_stem().and_then(|s| s.to_str())
+                    }
+                    // A file mesa cannot *name* is one it could not round-trip
+                    // back onto disk, so it is skipped silently rather than
+                    // failing the scan — which also drops the dotfiles an editor
+                    // and the OS leave behind, since the charset rule requires an
+                    // alphanumeric first character.
+                    None => path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .filter(|n| crate::core::store::library_name_is_valid(n)),
+                };
+                let Some(name) = name else {
+                    continue;
+                };
+                if let Some((body, mtime)) = read_bounded_with_mtime(&path) {
+                    found.push((kind, export, name.to_string(), body, mtime));
+                }
             }
-        }
-    };
+        };
 
-    leaf_dir("agents", LibraryKind::Agent, Some("md"), &mut found);
-    leaf_dir("commands", LibraryKind::Command, Some("md"), &mut found);
-    leaf_dir("hooks", LibraryKind::Hook, None, &mut found);
+    leaf_dir("agents", LibraryKind::Agent, false, Some("md"), &mut found);
+    leaf_dir(
+        "commands",
+        LibraryKind::Prompt,
+        true,
+        Some("md"),
+        &mut found,
+    );
+    leaf_dir("hooks", LibraryKind::Hook, false, None, &mut found);
 
     if let Some(skills_dir) = safe_dir(".claude/skills")
         && let Ok(entries) = fs::read_dir(&skills_dir)
@@ -399,7 +421,7 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String
             };
             let skill_md = entry.path().join("SKILL.md");
             if let Some((body, mtime)) = read_bounded_with_mtime(&skill_md) {
-                found.push((LibraryKind::Skill, name, body, mtime));
+                found.push((LibraryKind::Skill, false, name, body, mtime));
             }
         }
     }
@@ -411,7 +433,13 @@ pub fn scan_disk(base: &Path) -> Vec<(LibraryKind, String, String, Option<String
             continue;
         };
         if let Some((body, mtime)) = read_bounded_with_mtime(&path) {
-            found.push((LibraryKind::ClaudeMd, "CLAUDE".to_string(), body, mtime));
+            found.push((
+                LibraryKind::ClaudeMd,
+                false,
+                "CLAUDE".to_string(),
+                body,
+                mtime,
+            ));
         }
     }
 
@@ -455,7 +483,11 @@ pub fn effective_items(store: &Store, project: Option<i64>) -> StoreResult<Vec<L
         if shadowed.contains(b.id) {
             continue;
         }
-        let path = relative_path(b.kind, b.scope, b.name).map(|p| p.to_string_lossy().into_owned());
+        // A built-in is code and carries no flag: `live-summary-prompt` is
+        // mesa's own and has no business in `.claude/commands`. Forking it
+        // gives it a row, and the row may set the flag like any other.
+        let path =
+            relative_path(b.kind, b.scope, b.name, false).map(|p| p.to_string_lossy().into_owned());
         items.push(LibraryItem {
             id: None,
             name: b.name.to_string(),
@@ -465,6 +497,7 @@ pub fn effective_items(store: &Store, project: Option<i64>) -> StoreResult<Vec<L
             body: b.body.to_string(),
             builtin_id: Some(b.id.to_string()),
             builtin: true,
+            export_command: false,
             path,
             synced_body: None,
             synced_at: None,
@@ -499,6 +532,50 @@ pub fn prompts(store: &Store) -> StoreResult<config::Prompts> {
             .filter(|item| item.kind == LibraryKind::Prompt)
             .map(|item| (item.name, item.body)),
     ))
+}
+
+/// The one write path for a library row's edit, over `Store::update_library_item`
+/// — both `mesa library update` and `PATCH /api/library/{id}` come through
+/// here rather than calling the store directly, because one patch has a
+/// disk-side consequence the store cannot carry out: a prompt whose
+/// `export_command` goes **off** stops owning `.claude/commands/<name>.md`,
+/// and a file left behind would still be a slash command Claude Code offers
+/// while mesa no longer knows about it (mesa task 1139).
+///
+/// The file is removed only while it is still mesa's own — its bytes equal
+/// the row's body as it was before this patch, or the sync baseline. A file
+/// the user hand-edited since is left where it is, and the next `sync status`
+/// reports it as `disk-new`, the row the user resolves. Either way the
+/// baseline is cleared (`Store::clear_library_synced`): it describes a file
+/// the row no longer claims, and kept it would read the row as
+/// `disk-deleted` the moment it exported again. The removal is best-effort —
+/// a filesystem failure is not a failed update; the row is already written,
+/// and the worst case is the same orphan a hand edit leaves.
+///
+/// The path is the one the row had *before* the patch (its old name), since
+/// that is the file it owned; a rename in the same patch does not change
+/// which file is being given up.
+pub fn update_item(store: &mut Store, id: i64, patch: LibraryPatch) -> StoreResult<LibraryItem> {
+    let before = store.get_library_item(id)?;
+    let updated = store.update_library_item(id, patch)?;
+    let stopped_exporting = before.export_command && !updated.export_command;
+    if !stopped_exporting {
+        return Ok(updated);
+    }
+    if let Some(rel) = before.path.as_deref().map(Path::new) {
+        let project_local_path = match before.project_id {
+            Some(pid) => store.get_project(pid)?.local_path.map(PathBuf::from),
+            None => None,
+        };
+        if let Some(base) = scope_base(before.scope, project_local_path.as_deref())
+            && let Ok(full) = resolve(&base, rel)
+            && let Ok(disk) = fs::read_to_string(&full)
+            && (disk == before.body || Some(disk.as_str()) == before.synced_body.as_deref())
+        {
+            let _ = fs::remove_file(&full);
+        }
+    }
+    store.clear_library_synced(id)
 }
 
 /// A file over this size, when read for a sync comparison, is treated as
@@ -565,10 +642,10 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
     let (stored, builtins): (Vec<&LibraryItem>, Vec<&LibraryItem>) =
         items.iter().partition(|i| i.id.is_some());
 
+    // A prompt that does not export has no `path` and drops out here — the
+    // one exporting has `.claude/commands/<name>.md` and syncs like any
+    // other kind (mesa task 1139).
     for item in stored.into_iter().chain(builtins) {
-        if item.kind == LibraryKind::Prompt {
-            continue;
-        }
         let Some(rel) = item.path.as_ref().map(PathBuf::from) else {
             continue;
         };
@@ -626,8 +703,8 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
     ] {
         let Some(base) = base else { continue };
         let mut seen: HashSet<String> = HashSet::new();
-        for (kind, name, body, disk_mtime) in scan_disk(&base) {
-            let Some(path) = relative_path(kind, scope, &name) else {
+        for (kind, export_command, name, body, disk_mtime) in scan_disk(&base) {
+            let Some(path) = relative_path(kind, scope, &name, export_command) else {
                 continue;
             };
             let path_key = path.to_string_lossy().into_owned();
@@ -916,6 +993,11 @@ fn apply_disk(store: &mut Store, row: &LibrarySyncRow) -> StoreResult<()> {
             let body = row.disk_body.as_ref().ok_or_else(|| {
                 Error::Validation(format!("{} has no disk body to adopt", row.path))
             })?;
+            // A sync row exists only for a path, and a prompt has one only
+            // while it exports (`relative_path`), so a `disk-new` prompt is a
+            // `.claude/commands` file and adopts with the flag on — the row
+            // carries no separate flag because that is the only way a prompt
+            // reaches this table.
             let created = store.create_library_item(
                 row.kind,
                 row.scope,
@@ -923,6 +1005,7 @@ fn apply_disk(store: &mut Store, row: &LibrarySyncRow) -> StoreResult<()> {
                 &row.name,
                 body,
                 None,
+                row.kind == LibraryKind::Prompt,
             )?;
             let id = created.id.expect("a created item always has an id");
             store.set_library_synced(id, body)?;
@@ -945,6 +1028,7 @@ fn apply_disk(store: &mut Store, row: &LibrarySyncRow) -> StoreResult<()> {
                         &row.name,
                         body,
                         Some(builtin_id),
+                        false,
                     )?;
                     created.id.expect("a created item always has an id")
                 }
@@ -989,6 +1073,7 @@ pub fn export(store: &Store, project: Option<i64>) -> StoreResult<LibraryBundle>
             },
             body: item.body,
             builtin_id: item.builtin_id,
+            export_command: item.export_command,
         })
         .collect();
     Ok(LibraryBundle {
@@ -1090,6 +1175,7 @@ fn import_one(
             &item.name,
             &item.body,
             item.builtin_id.as_deref(),
+            item.export_command,
         ) {
             Ok(created) => LibraryImportResult {
                 name: item.name.clone(),
@@ -1194,7 +1280,7 @@ fn hook_target(store: &Store, item: &LibraryItem) -> StoreResult<HookTarget> {
             item.kind.as_str()
         )));
     }
-    let rel = relative_path(LibraryKind::Hook, item.scope, &item.name)
+    let rel = relative_path(LibraryKind::Hook, item.scope, &item.name, false)
         .ok_or_else(|| Error::Validation(format!("{:?} has no path", item.name)))?;
     let project_local_path = match item.project_id {
         Some(id) => store.get_project(id)?.local_path,
@@ -2179,7 +2265,7 @@ mod tests {
     fn scanned(base: &Path) -> Vec<(LibraryKind, String, String)> {
         scan_disk(base)
             .into_iter()
-            .map(|(kind, name, body, _)| (kind, name, body))
+            .map(|(kind, _, name, body, _)| (kind, name, body))
             .collect()
     }
 
@@ -2311,52 +2397,76 @@ mod tests {
     #[test]
     fn relative_path_covers_every_kind_and_scope() {
         assert_eq!(
-            relative_path(LibraryKind::Agent, LibraryScope::User, "reviewer"),
+            relative_path(LibraryKind::Agent, LibraryScope::User, "reviewer", false),
             Some(PathBuf::from(".claude/agents/reviewer.md"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Agent, LibraryScope::Project, "reviewer"),
+            relative_path(LibraryKind::Agent, LibraryScope::Project, "reviewer", false),
             Some(PathBuf::from(".claude/agents/reviewer.md"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Skill, LibraryScope::User, "dataviz"),
+            relative_path(LibraryKind::Skill, LibraryScope::User, "dataviz", false),
             Some(PathBuf::from(".claude/skills/dataviz/SKILL.md"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Skill, LibraryScope::Project, "dataviz"),
+            relative_path(LibraryKind::Skill, LibraryScope::Project, "dataviz", false),
             Some(PathBuf::from(".claude/skills/dataviz/SKILL.md"))
         );
         // A hook's name carries its own extension, so the path appends
         // nothing — which is what lets a `.py` guard live here too.
         assert_eq!(
-            relative_path(LibraryKind::Hook, LibraryScope::User, "stop-notify.sh"),
+            relative_path(
+                LibraryKind::Hook,
+                LibraryScope::User,
+                "stop-notify.sh",
+                false
+            ),
             Some(PathBuf::from(".claude/hooks/stop-notify.sh"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Hook, LibraryScope::Project, "poll-guard.py"),
+            relative_path(
+                LibraryKind::Hook,
+                LibraryScope::Project,
+                "poll-guard.py",
+                false
+            ),
             Some(PathBuf::from(".claude/hooks/poll-guard.py"))
         );
+        // mesa task 1139: the commands directory belongs to a prompt with
+        // `export_command` on — the old `command` kind is gone.
         assert_eq!(
-            relative_path(LibraryKind::Command, LibraryScope::User, "refine"),
+            relative_path(LibraryKind::Prompt, LibraryScope::User, "refine", true),
             Some(PathBuf::from(".claude/commands/refine.md"))
         );
         assert_eq!(
-            relative_path(LibraryKind::Command, LibraryScope::Project, "refine"),
+            relative_path(LibraryKind::Prompt, LibraryScope::Project, "refine", true),
             Some(PathBuf::from(".claude/commands/refine.md"))
         );
+        // The flag is a prompt's alone: on any other kind it changes nothing.
         assert_eq!(
-            relative_path(LibraryKind::ClaudeMd, LibraryScope::User, "CLAUDE"),
+            relative_path(LibraryKind::Agent, LibraryScope::User, "reviewer", true),
+            Some(PathBuf::from(".claude/agents/reviewer.md"))
+        );
+        assert_eq!(
+            relative_path(LibraryKind::ClaudeMd, LibraryScope::User, "CLAUDE", false),
             Some(PathBuf::from(".claude/CLAUDE.md"))
         );
         assert_eq!(
-            relative_path(LibraryKind::ClaudeMd, LibraryScope::Project, "CLAUDE"),
+            relative_path(
+                LibraryKind::ClaudeMd,
+                LibraryScope::Project,
+                "CLAUDE",
+                false
+            ),
             Some(PathBuf::from("CLAUDE.md"))
         );
+        // A prompt that does not export has no file at all.
         assert_eq!(
             relative_path(
                 LibraryKind::Prompt,
                 LibraryScope::User,
-                "live-summary-prompt"
+                "live-summary-prompt",
+                false
             ),
             None
         );
@@ -2364,7 +2474,8 @@ mod tests {
             relative_path(
                 LibraryKind::Prompt,
                 LibraryScope::Project,
-                "live-summary-prompt"
+                "live-summary-prompt",
+                false
             ),
             None
         );
@@ -2372,7 +2483,7 @@ mod tests {
         // definition now, so unlike the prompt they used to be they have a
         // path and the sync flow carries them.
         assert_eq!(
-            relative_path(LibraryKind::Agent, LibraryScope::User, "mesa-live"),
+            relative_path(LibraryKind::Agent, LibraryScope::User, "mesa-live", false),
             Some(PathBuf::from(".claude/agents/mesa-live.md"))
         );
     }
@@ -2558,10 +2669,17 @@ mod tests {
             "reviewer body".to_string()
         )));
         assert!(found.contains(&(
-            LibraryKind::Command,
+            LibraryKind::Prompt,
             "refine".to_string(),
             "refine body".to_string()
         )));
+        // A commands hit is the one place the scan says "exports" — the
+        // flag the adopted row is created with (mesa task 1139).
+        assert!(
+            scan_disk(base)
+                .iter()
+                .all(|(kind, export, ..)| { *export == (*kind == LibraryKind::Prompt) })
+        );
         assert!(found.contains(&(
             LibraryKind::Hook,
             "stop-notify.sh".to_string(),
@@ -2631,7 +2749,7 @@ mod tests {
         assert!(
             found
                 .iter()
-                .all(|(kind, _, _)| *kind == LibraryKind::Command)
+                .all(|(kind, _, _)| *kind == LibraryKind::Prompt)
         );
         let names: std::collections::BTreeSet<&str> =
             found.iter().map(|(_, name, _)| name.as_str()).collect();
@@ -2769,6 +2887,7 @@ mod tests {
                 "mesa-live",
                 "a custom definition",
                 Some("mesa-live"),
+                false,
             )
             .unwrap();
         let items = effective_items(&store, None).unwrap();
@@ -2794,6 +2913,7 @@ mod tests {
                 "nightly-brief",
                 "read the board and report",
                 None,
+                false,
             )
             .unwrap();
         // …and an item of another kind, which must not be offered as a prompt.
@@ -2805,6 +2925,7 @@ mod tests {
                 "not-a-prompt",
                 "skill body",
                 None,
+                false,
             )
             .unwrap();
 
@@ -2833,12 +2954,331 @@ mod tests {
                 "live-summary-prompt",
                 "my own summary instructions",
                 Some("live-summary-prompt"),
+                false,
             )
             .unwrap();
         assert_eq!(
             prompts(&store).unwrap().body("live-summary-prompt"),
             Some("my own summary instructions")
         );
+    }
+
+    /// mesa task 1139: an exporting prompt is a `.claude/commands/<name>.md`
+    /// file, written byte-identical to the stored body — no frontmatter, no
+    /// placeholder rewrite — so the very next scan reads `in-sync`. Any
+    /// transform on the way out would make every export a permanent
+    /// `both-changed` row, since `classify` compares three plain strings.
+    #[test]
+    fn an_exporting_prompt_syncs_byte_identical_and_reads_in_sync_at_once() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let body = "---\ndescription: refine\n---\nRefine mesa task $ARGUMENTS {id}\n";
+        let item = store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::Project,
+                Some(pid),
+                "refine",
+                body,
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(item.path.as_deref(), Some(".claude/commands/refine.md"));
+
+        let rows = sync_status(&store, Some(pid)).unwrap();
+        let row = rows.iter().find(|r| r.name == "refine").unwrap();
+        assert_eq!(row.kind, LibraryKind::Prompt);
+        assert_eq!(row.status, LibrarySyncStatus::MesaNew);
+        let results = sync_apply(
+            &mut store,
+            Some(pid),
+            &[(row.path.clone(), "mesa".to_string())],
+        )
+        .unwrap();
+        assert!(results[0].applied, "{results:?}");
+        assert_eq!(
+            fs::read_to_string(base.join(".claude/commands/refine.md")).unwrap(),
+            body
+        );
+        let rows = sync_status(&store, Some(pid)).unwrap();
+        let row = rows.iter().find(|r| r.name == "refine").unwrap();
+        assert_eq!(row.status, LibrarySyncStatus::InSync, "{row:?}");
+
+        // A prompt that does not export is not in the scan at all.
+        store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::Project,
+                Some(pid),
+                "internal",
+                "mesa's own",
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(
+            sync_status(&store, Some(pid))
+                .unwrap()
+                .iter()
+                .all(|r| r.name != "internal")
+        );
+    }
+
+    /// A `.claude/commands` file mesa has never seen adopts as a prompt that
+    /// exports — the row the file already is — not as a prompt with no path,
+    /// which would leave the file `disk-new` forever.
+    #[test]
+    fn a_commands_file_adopts_as_an_exporting_prompt() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        fs::create_dir_all(base.join(".claude/commands")).unwrap();
+        fs::write(base.join(".claude/commands/todo.md"), "todo body").unwrap();
+
+        let rows = sync_status(&store, Some(pid)).unwrap();
+        let row = rows.iter().find(|r| r.name == "todo").unwrap();
+        assert_eq!(row.status, LibrarySyncStatus::DiskNew);
+        assert_eq!(row.kind, LibraryKind::Prompt);
+        sync_apply(
+            &mut store,
+            Some(pid),
+            &[(row.path.clone(), "disk".to_string())],
+        )
+        .unwrap();
+        let adopted = store
+            .find_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::Project,
+                Some(pid),
+                "todo",
+            )
+            .unwrap()
+            .expect("adopted");
+        assert!(adopted.export_command);
+        assert_eq!(adopted.path.as_deref(), Some(".claude/commands/todo.md"));
+        assert_eq!(
+            sync_status(&store, Some(pid))
+                .unwrap()
+                .iter()
+                .find(|r| r.name == "todo")
+                .unwrap()
+                .status,
+            LibrarySyncStatus::InSync
+        );
+    }
+
+    /// Turning `export_command` off removes the file the prompt owned — but
+    /// only while it is still what mesa wrote (the body, or the baseline). A
+    /// hand-edited file is left alone and comes back as `disk-new`.
+    #[test]
+    fn turning_export_off_removes_mesas_own_file_but_keeps_a_hand_edited_one() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        let file = base.join(".claude/commands/refine.md");
+        let off = LibraryPatch {
+            export_command: Some(false),
+            ..Default::default()
+        };
+
+        // Exported, untouched on disk: the file goes and the baseline with it.
+        let item = store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::Project,
+                Some(pid),
+                "refine",
+                "v1",
+                None,
+                true,
+            )
+            .unwrap();
+        let id = item.id.unwrap();
+        sync_apply(
+            &mut store,
+            Some(pid),
+            &[(".claude/commands/refine.md".to_string(), "mesa".to_string())],
+        )
+        .unwrap();
+        assert!(file.exists());
+        let updated = update_item(&mut store, id, off.clone()).unwrap();
+        assert!(!updated.export_command);
+        assert_eq!(updated.path, None);
+        assert_eq!(updated.synced_body, None);
+        assert_eq!(updated.synced_at, None);
+        assert!(!file.exists(), "the file mesa wrote must be removed");
+        assert!(
+            sync_status(&store, Some(pid))
+                .unwrap()
+                .iter()
+                .all(|r| r.name != "refine"),
+            "a prompt that stopped exporting is out of the scan entirely"
+        );
+
+        // Exported, then edited in mesa but not yet pushed: the disk file
+        // still equals the *baseline*, so it is still mesa's own and goes.
+        update_item(
+            &mut store,
+            id,
+            LibraryPatch {
+                export_command: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sync_apply(
+            &mut store,
+            Some(pid),
+            &[(".claude/commands/refine.md".to_string(), "mesa".to_string())],
+        )
+        .unwrap();
+        store
+            .update_library_item(
+                id,
+                LibraryPatch {
+                    body: Some("v2".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+        update_item(&mut store, id, off.clone()).unwrap();
+        assert!(
+            !file.exists(),
+            "a file equal to the baseline is still mesa's"
+        );
+
+        // Hand-edited on disk: left where it is, reported as disk-new.
+        update_item(
+            &mut store,
+            id,
+            LibraryPatch {
+                export_command: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sync_apply(
+            &mut store,
+            Some(pid),
+            &[(".claude/commands/refine.md".to_string(), "mesa".to_string())],
+        )
+        .unwrap();
+        fs::write(&file, "someone else's edit").unwrap();
+        update_item(&mut store, id, off).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "someone else's edit",
+            "a hand-edited file is never deleted"
+        );
+        let rows = sync_status(&store, Some(pid)).unwrap();
+        let row = rows.iter().find(|r| r.name == "refine").unwrap();
+        assert_eq!(row.status, LibrarySyncStatus::DiskNew, "{row:?}");
+        assert_eq!(row.item_id, None);
+
+        // A rename in the same patch gives up the file under the OLD name.
+        update_item(
+            &mut store,
+            id,
+            LibraryPatch {
+                export_command: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::write(&file, "v2").unwrap();
+        update_item(
+            &mut store,
+            id,
+            LibraryPatch {
+                name: Some("refined".to_string()),
+                export_command: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!file.exists());
+
+        // The flag is a prompt's alone.
+        let agent = store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(pid),
+                "reviewer",
+                "body",
+                None,
+                false,
+            )
+            .unwrap();
+        let err = update_item(
+            &mut store,
+            agent.id.unwrap(),
+            LibraryPatch {
+                export_command: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err:?}");
+    }
+
+    /// The point of mesa task 1139: what used to be a `command` is a prompt,
+    /// so a hook template reaches it as `{prompt:<name>}` — the same text a
+    /// slash command types — with nothing translated on either path.
+    #[test]
+    fn an_exporting_prompt_is_reachable_as_a_prompt_placeholder() {
+        let (mut store, _dir) = temp_store();
+        store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "execute-todo",
+                "## Initialize\nClaim the task $ARGS",
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            prompts(&store).unwrap().body("execute-todo"),
+            Some("## Initialize\nClaim the task $ARGS")
+        );
+    }
+
+    /// A bundle exported before mesa task 1139 says `"kind": "command"`. It
+    /// imports as a prompt that exports — the only place the old word is
+    /// still read; `LibraryKind::parse` itself no longer knows it.
+    #[test]
+    fn a_legacy_bundle_command_imports_as_an_exporting_prompt() {
+        let (mut store, _dir) = temp_store();
+        let bundle: LibraryBundle = serde_json::from_str(
+            r#"{"version":1,"exported_at":"2026-01-01T00:00:00","items":[
+                {"name":"refine","kind":"command","scope":"user","project":null,
+                 "body":"refine body","builtin_id":null},
+                {"name":"note","kind":"prompt","scope":"user","project":null,
+                 "body":"note body","builtin_id":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(bundle.items[0].kind, LibraryKind::Prompt);
+        assert!(bundle.items[0].export_command);
+        assert_eq!(bundle.items[1].kind, LibraryKind::Prompt);
+        assert!(!bundle.items[1].export_command, "absent reads as off");
+
+        let results = import(&mut store, &bundle, "skip").unwrap();
+        assert!(results.iter().all(|r| r.status == "created"), "{results:?}");
+        let refine = store.get_library_item(results[0].item_id.unwrap()).unwrap();
+        assert!(refine.export_command);
+        assert_eq!(refine.path.as_deref(), Some(".claude/commands/refine.md"));
+        assert_eq!(LibraryKind::parse("command"), None);
+
+        // And a fresh export carries the flag, so the round trip holds.
+        let exported = export(&store, None).unwrap();
+        let item = exported.items.iter().find(|i| i.name == "refine").unwrap();
+        assert!(item.export_command);
+        assert_eq!(item.kind, LibraryKind::Prompt);
     }
 
     #[test]
@@ -2858,6 +3298,7 @@ mod tests {
                 "case-mesa-new",
                 "new body",
                 None,
+                false,
             )
             .unwrap();
 
@@ -2870,6 +3311,7 @@ mod tests {
                 "case-disk-deleted",
                 "same body",
                 None,
+                false,
             )
             .unwrap();
         store
@@ -2885,6 +3327,7 @@ mod tests {
                 "case-mesa-changed",
                 "baseline body",
                 None,
+                false,
             )
             .unwrap();
         fs::write(agents_dir.join("case-mesa-changed.md"), "baseline body").unwrap();
@@ -2910,6 +3353,7 @@ mod tests {
                 "case-disk-changed",
                 "baseline body 2",
                 None,
+                false,
             )
             .unwrap();
         fs::write(agents_dir.join("case-disk-changed.md"), "baseline body 2").unwrap();
@@ -2927,6 +3371,7 @@ mod tests {
                 "case-both-changed",
                 "baseline body 3",
                 None,
+                false,
             )
             .unwrap();
         fs::write(agents_dir.join("case-both-changed.md"), "baseline body 3").unwrap();
@@ -2953,6 +3398,7 @@ mod tests {
                 "case-in-sync",
                 "same content",
                 None,
+                false,
             )
             .unwrap();
         fs::write(agents_dir.join("case-in-sync.md"), "same content").unwrap();
@@ -3006,6 +3452,7 @@ mod tests {
                 "reviewer",
                 "reviewer body",
                 None,
+                false,
             )
             .unwrap();
 
@@ -3040,6 +3487,7 @@ mod tests {
                 "reviewer",
                 "baseline body",
                 None,
+                false,
             )
             .unwrap();
         fs::write(agents_dir.join("reviewer.md"), "baseline body").unwrap();
@@ -3080,6 +3528,7 @@ mod tests {
                 "reviewer",
                 "same body",
                 None,
+                false,
             )
             .unwrap();
         store
@@ -3113,6 +3562,7 @@ mod tests {
                 "reviewer",
                 "reviewer body",
                 None,
+                false,
             )
             .unwrap();
 
@@ -3148,6 +3598,7 @@ mod tests {
                 "reviewer",
                 "reviewer body",
                 None,
+                false,
             )
             .unwrap();
 
@@ -3211,6 +3662,7 @@ mod tests {
                     "CLAUDE",
                     "a custom claude.md",
                     Some("starter-claude-md"),
+                    false,
                 )
                 .unwrap();
 
@@ -3242,6 +3694,7 @@ mod tests {
                 "CLAUDE",
                 "project claude.md body",
                 None,
+                false,
             )
             .unwrap();
         fs::write(base.join("CLAUDE.md"), "a different body on disk").unwrap();
@@ -3304,6 +3757,7 @@ mod tests {
                     "reviewer",
                     "reviewer body",
                     None,
+                    false,
                 )
                 .unwrap();
             fs::write(base.join(".claude/agents/reviewer.md"), "reviewer body").unwrap();
@@ -3315,6 +3769,7 @@ mod tests {
                     "CLAUDE",
                     "project claude.md",
                     None,
+                    false,
                 )
                 .unwrap();
             fs::write(base.join(".claude/agents/stray-project.md"), "stray").unwrap();
@@ -3326,6 +3781,7 @@ mod tests {
                     "live-summary-prompt",
                     "a forked prompt",
                     Some("live-summary-prompt"),
+                    false,
                 )
                 .unwrap();
 
@@ -3371,6 +3827,7 @@ mod tests {
                     crate::core::supervisor::SUPERVISOR_AGENT_BUILTIN,
                     "the overriding body",
                     None,
+                    false,
                 )
                 .unwrap();
             assert_eq!(overriding.builtin_id, None);
@@ -3440,6 +3897,7 @@ mod tests {
                     name,
                     &format!("{name} body"),
                     None,
+                    false,
                 )
                 .unwrap();
         }
@@ -3471,6 +3929,7 @@ mod tests {
                 "mesa-live",
                 "a custom definition",
                 Some("mesa-live"),
+                false,
             )
             .unwrap();
 
@@ -3506,6 +3965,7 @@ mod tests {
                 "reviewer",
                 "mesa body",
                 None,
+                false,
             )
             .unwrap();
         // Diverge the baseline from the mesa body to prove it never leaks in
@@ -3533,6 +3993,7 @@ mod tests {
                 "reviewer",
                 "reviewer body",
                 None,
+                false,
             )
             .unwrap();
         store
@@ -3543,6 +4004,7 @@ mod tests {
                 "my-hook",
                 "hook body",
                 None,
+                false,
             )
             .unwrap();
 
@@ -3575,6 +4037,7 @@ mod tests {
             project: None,
             body: "original body".to_string(),
             builtin_id: None,
+            export_command: false,
         }]);
 
         let results = import(&mut store, &bundle, "skip").unwrap();
@@ -3609,6 +4072,7 @@ mod tests {
                 project: Some("no-such-project".to_string()),
                 body: "reviewer body".to_string(),
                 builtin_id: None,
+                export_command: false,
             },
             LibraryBundleItem {
                 name: "my-hook".to_string(),
@@ -3617,6 +4081,7 @@ mod tests {
                 project: None,
                 body: "hook body".to_string(),
                 builtin_id: None,
+                export_command: false,
             },
         ]);
 
@@ -3637,6 +4102,7 @@ mod tests {
             project: None,
             body: "hook body".to_string(),
             builtin_id: None,
+            export_command: false,
         }]);
         let mut unknown_version = bundle;
         unknown_version.version = 99;
@@ -3663,6 +4129,7 @@ mod tests {
             project: None,
             body: "hook body".to_string(),
             builtin_id: None,
+            export_command: false,
         }]);
 
         let err = import(&mut store, &bundle, "merge").unwrap_err();
@@ -3681,6 +4148,7 @@ mod tests {
                 project: None,
                 body: "evil body".to_string(),
                 builtin_id: None,
+                export_command: false,
             },
             LibraryBundleItem {
                 name: "my-hook".to_string(),
@@ -3689,6 +4157,7 @@ mod tests {
                 project: None,
                 body: "hook body".to_string(),
                 builtin_id: None,
+                export_command: false,
             },
         ]);
 
@@ -3710,6 +4179,7 @@ mod tests {
                 name,
                 "#!/bin/sh\necho hi\n",
                 None,
+                false,
             )
             .unwrap()
     }
@@ -4181,6 +4651,7 @@ mod tests {
                 "reviewer",
                 "body",
                 None,
+                false,
             )
             .unwrap();
         for err in [

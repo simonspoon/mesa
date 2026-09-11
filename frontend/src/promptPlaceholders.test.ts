@@ -13,6 +13,7 @@ function item(overrides: Partial<LibraryItem> = {}): LibraryItem {
     builtin_id: null,
     builtin: false,
     path: null,
+    export_command: false,
     synced_body: null,
     synced_at: null,
     created_at: null,

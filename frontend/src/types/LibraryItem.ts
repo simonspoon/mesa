@@ -3,9 +3,9 @@ import type { LibraryKind } from "./LibraryKind";
 import type { LibraryScope } from "./LibraryScope";
 
 /**
- * One library record — an agent definition, a skill, a hook script, a slash
- * command, the live-conversation prompt, or a CLAUDE.md, stored in mesa and
- * (for every kind but `prompt`) synced against a file on disk.
+ * One library record — an agent definition, a skill, a hook script, a
+ * prompt, or a CLAUDE.md, stored in mesa and synced against a file on disk
+ * (a prompt only when it `export_command`s).
  *
  * `id` is `null` for an unshadowed built-in (`core::library::BUILTINS`) —
  * there is no db row yet, `builtin` is `true`, and `builtin_id` names which
@@ -37,8 +37,19 @@ builtin_id: string | null,
  */
 builtin: boolean, 
 /**
- * Derived from `kind`/`scope`/`name` via `core::library::relative_path`;
- * null for `prompt`, which has no file.
+ * `prompt` only (mesa task 1139): whether this prompt is *also* written
+ * to `.claude/commands/<name>.md`, so Claude Code offers it as the slash
+ * command `/<name>`. The stored body is what is exported, byte for byte
+ * — no frontmatter is synthesised and no `{placeholder}` is rewritten,
+ * because the sync compares three plain strings and any transform would
+ * read as a permanent conflict. Always `false` on every other kind and
+ * on an unshadowed built-in (a built-in is code and carries no flag).
+ */
+export_command: boolean, 
+/**
+ * Derived from `kind`/`scope`/`name`/`export_command` via
+ * `core::library::relative_path`; null for a prompt that is not exported
+ * as a command, which has no file.
  */
 path: string | null, 
 /**

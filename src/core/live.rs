@@ -376,6 +376,7 @@ mod tests {
                     LIVE_AGENT_BUILTIN,
                     "---\nname: mesa-live\n---\n\nTalk like a pirate.",
                     Some(LIVE_AGENT_BUILTIN),
+                    false,
                 )
                 .unwrap();
 
@@ -454,6 +455,7 @@ mod tests {
                 "live-summary-prompt",
                 "Just say thanks.",
                 Some("live-summary-prompt"),
+                false,
             )
             .unwrap();
         let prompt = summary_prompt(&store, 6);

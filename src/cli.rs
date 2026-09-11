@@ -108,7 +108,7 @@ enum Command {
     /// written HTML/SVG/markdown pages)
     #[command(subcommand)]
     Artifact(ArtifactCmd),
-    /// Agent definitions, skills, hooks, commands, prompts and CLAUDE.md
+    /// Agent definitions, skills, hooks, prompts and CLAUDE.md
     /// files, synced against `.claude/`
     #[command(subcommand)]
     Library(LibraryCmd),
@@ -1236,9 +1236,10 @@ EXAMPLES
     },
 }
 
-/// Agent definitions, skills, hooks, commands, prompts and CLAUDE.md files,
-/// stored in mesa and (for every kind but `prompt`) synced against a file
-/// under `.claude/` (or a repo's root `CLAUDE.md`) — mesa task 919.
+/// Agent definitions, skills, hooks, prompts and CLAUDE.md files, stored in
+/// mesa and synced against a file under `.claude/` (or a repo's root
+/// `CLAUDE.md`) — mesa task 919; a prompt only while it `--export-command`s
+/// (mesa task 1139).
 ///
 /// `core::library::BUILTINS` seeds a tiny starter set that `list`/`show`
 /// report even with no db row (`id: null`, `builtin: true`); editing one
@@ -1253,7 +1254,7 @@ EXAMPLES
   mesa library create prompt my-note --body 'remember this'
   mesa library create agent reviewer --body-file reviewer.md --scope project --project mesa")]
     Create {
-        /// agent|skill|hook|command|prompt|claude-md
+        /// agent|skill|hook|prompt|claude-md
         #[arg(value_name = "KIND", required_unless_present = "kind")]
         kind_pos: Option<String>,
         /// Kind (flag form of KIND)
@@ -1283,6 +1284,10 @@ EXAMPLES
         /// Bind to this project, by id or name; required iff --scope project
         #[arg(long)]
         project: Option<String>,
+        /// Also write this prompt to `.claude/commands/<NAME>.md` on sync, so
+        /// Claude Code offers it as the slash command `/<NAME>` (prompts only)
+        #[arg(long)]
+        export_command: bool,
         /// Print the item without `body`/`synced_body` instead of in full
         #[arg(long)]
         quiet: bool,
@@ -1330,6 +1335,15 @@ EXAMPLES
         /// Read the new body from a file (`-` = stdin); conflicts with --body
         #[arg(long, value_name = "PATH", group = "fields", conflicts_with = "body")]
         body_file: Option<String>,
+        /// Start exporting this prompt to `.claude/commands/<name>.md` (the
+        /// next `sync apply` writes the file); prompts only
+        #[arg(long, group = "fields", conflicts_with = "no_export_command")]
+        export_command: bool,
+        /// Stop exporting this prompt: the file under `.claude/commands` is
+        /// removed if it still holds what mesa wrote, left for `sync status`
+        /// to report as disk-new if it was hand-edited
+        #[arg(long, group = "fields")]
+        no_export_command: bool,
         /// Print the item without `body`/`synced_body` instead of in full
         ///
         /// Deliberately outside the `fields` group: it is a modifier, so
@@ -2591,7 +2605,7 @@ fn parse_inbox_kind(s: &str) -> std::result::Result<InboxKind, String> {
 
 fn parse_library_kind(s: &str) -> std::result::Result<LibraryKind, String> {
     LibraryKind::parse(s)
-        .ok_or_else(|| format!("'{s}' is not one of agent|skill|hook|command|prompt|claude-md"))
+        .ok_or_else(|| format!("'{s}' is not one of agent|skill|hook|prompt|claude-md"))
 }
 
 fn parse_library_scope(s: &str) -> std::result::Result<LibraryScope, String> {
@@ -4961,6 +4975,7 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
             body_file,
             scope,
             project,
+            export_command,
             quiet,
         } => {
             // clap guarantees exactly one of each positional/flag pair, and
@@ -4988,7 +5003,15 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                 }
             };
             print_library_item(
-                &store.create_library_item(kind, scope, project_id, &name, &body, None)?,
+                &store.create_library_item(
+                    kind,
+                    scope,
+                    project_id,
+                    &name,
+                    &body,
+                    None,
+                    export_command,
+                )?,
                 quiet,
             );
         }
@@ -5012,10 +5035,18 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
             name,
             body,
             body_file,
+            export_command,
+            no_export_command,
             quiet,
         } => {
             let mut stdin_used = false;
             let body = resolve_field(body, body_file, &mut stdin_used)?;
+            // clap refuses both flags at once; neither means "leave it".
+            let export_command = match (export_command, no_export_command) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
             let current = resolve_library(&store, &item)?;
             let updated = match current.id {
                 Some(id) => {
@@ -5025,8 +5056,11 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                         kind: None,
                         scope: None,
                         project_id: None,
+                        export_command,
                     };
-                    store.update_library_item(id, patch)?
+                    // Through `library::update_item`, not the store directly:
+                    // a prompt whose flag goes off gives up its file.
+                    library::update_item(&mut store, id, patch)?
                 }
                 // An unshadowed built-in has no row to update: editing it
                 // forks it into one, carrying its built-in id.
@@ -5044,6 +5078,7 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                         &name,
                         &body,
                         Some(&builtin_id),
+                        export_command.unwrap_or(false),
                     )?
                 }
             };
@@ -5390,6 +5425,7 @@ mod tests {
             body: "# reviewer\n".into(),
             builtin_id: Some("mesa-live".into()),
             builtin: false,
+            export_command: false,
             path: Some(".claude/agents/reviewer.md".into()),
             synced_body: Some("# reviewer\n".into()),
             synced_at: Some("2026-01-02 00:00:00".into()),
@@ -5755,6 +5791,9 @@ mod tests {
                 "body",
                 "builtin_id",
                 "builtin",
+                // A bounded flag, kept in the quiet shape (mesa task 1139):
+                // it is what says whether the row is also a slash command.
+                "export_command",
                 "path",
                 "synced_body",
                 "synced_at",

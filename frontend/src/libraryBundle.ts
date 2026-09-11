@@ -28,11 +28,17 @@ export function bundleFilename(now: Date): string {
 
 export type ParsedBundle = { bundle: LibraryBundle } | { error: string }
 
+/** The one kind word a bundle may carry that `LIBRARY_KINDS` no longer has:
+ * a bundle exported before mesa task 1139 says `command` for what is now a
+ * prompt with `export_command` on. Mirrors the server's own read of it
+ * (`core::library::import`), so an old export still imports from the page. */
+const LEGACY_COMMAND_KIND = 'command'
+
 /** One item's shape complaint, or `null` if it passes — checked against the
  * required fields `LibraryBundleItem` carries on the wire (`name`, `kind`,
- * `scope`, `body`); `project`/`builtin_id` are optional-shaped (nullable)
- * so a missing or wrongly-typed value there is just treated as absent
- * rather than rejecting the whole file. */
+ * `scope`, `body`); `project`/`builtin_id`/`export_command` are
+ * optional-shaped so a missing or wrongly-typed value there is just treated
+ * as absent rather than rejecting the whole file. */
 function itemError(item: unknown, index: number): string | null {
   if (typeof item !== 'object' || item === null || Array.isArray(item)) {
     return `Item ${index} is not an object.`
@@ -41,7 +47,10 @@ function itemError(item: unknown, index: number): string | null {
   if (typeof it.name !== 'string' || it.name === '') {
     return `Item ${index} is missing a "name".`
   }
-  if (typeof it.kind !== 'string' || !LIBRARY_KINDS.includes(it.kind as LibraryKind)) {
+  if (
+    typeof it.kind !== 'string' ||
+    (it.kind !== LEGACY_COMMAND_KIND && !LIBRARY_KINDS.includes(it.kind as LibraryKind))
+  ) {
     return `Item ${index} ("${it.name}") has a missing or unrecognized "kind".`
   }
   if (typeof it.scope !== 'string' || !LIBRARY_SCOPES.includes(it.scope as LibraryScope)) {
@@ -92,11 +101,12 @@ export function parseBundle(text: string): ParsedBundle {
 
   const items: LibraryBundleItem[] = (obj.items as Record<string, unknown>[]).map((it) => ({
     name: it.name as string,
-    kind: it.kind as LibraryKind,
+    kind: it.kind === LEGACY_COMMAND_KIND ? 'prompt' : (it.kind as LibraryKind),
     scope: it.scope as LibraryScope,
     project: typeof it.project === 'string' ? it.project : null,
     body: it.body as string,
     builtin_id: typeof it.builtin_id === 'string' ? it.builtin_id : null,
+    export_command: it.kind === LEGACY_COMMAND_KIND || it.export_command === true,
   }))
 
   return {

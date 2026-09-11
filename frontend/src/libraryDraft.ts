@@ -12,22 +12,21 @@ import type { LibraryScope } from './types/LibraryScope'
  * happens once, on the way out, in `payloadFor`.
  *
  * `kind`, `scope` and `project_id` are set at creation and never change
- * afterward — the PATCH contract only ever carries `name`/`body` — so once an
- * item exists, `isDirty`/`payloadFor` only need to track those two fields.
- * The rules mirror `Store`'s validators for `library_items`
+ * afterward — the PATCH contract carries `name`/`body`/`export_command` —
+ * so once an item exists, `isDirty`/`payloadFor` only need to track those
+ * three fields. The rules mirror `Store`'s validators for `library_items`
  * (`.scratch/library-design.md`): the name charset/length and the 1 MiB body
  * bound.
+ *
+ * `exportCommand` is a prompt's "also a slash command" flag (mesa task 1139,
+ * which folded the old `command` kind into `prompt`): on, the prompt is also
+ * written to `.claude/commands/<name>.md` on sync. It is only ever sent for a
+ * prompt — the server refuses it on any other kind — so `payloadFor` folds it
+ * to `false` elsewhere rather than trusting a stale checkbox.
  */
 
-/** The six kinds, in the order the authoring form offers them. */
-export const LIBRARY_KINDS: LibraryKind[] = [
-  'agent',
-  'skill',
-  'hook',
-  'command',
-  'prompt',
-  'claude-md',
-]
+/** The five kinds, in the order the authoring form offers them. */
+export const LIBRARY_KINDS: LibraryKind[] = ['agent', 'skill', 'hook', 'prompt', 'claude-md']
 
 /** The two scopes, in the order the authoring form offers them. */
 export const LIBRARY_SCOPES: LibraryScope[] = ['user', 'project']
@@ -48,11 +47,12 @@ export interface LibraryDraft {
   projectId: string
   name: string
   body: string
+  exportCommand: boolean
 }
 
 /** A blank form for the "new item" button. */
 export function emptyDraft(): LibraryDraft {
-  return { kind: 'agent', scope: 'user', projectId: '', name: '', body: '' }
+  return { kind: 'agent', scope: 'user', projectId: '', name: '', body: '', exportCommand: false }
 }
 
 /** The editable text for a stored item (or an unshadowed built-in, which
@@ -64,7 +64,27 @@ export function draftFrom(item: LibraryItem): LibraryDraft {
     projectId: item.project_id === null ? '' : String(item.project_id),
     name: item.name,
     body: item.body,
+    exportCommand: item.export_command,
   }
+}
+
+/** Whether the form offers the "also a slash command" switch: a prompt's
+ * alone, since every other kind already owns a path. */
+export function offersExport(kind: LibraryKind): boolean {
+  return kind === 'prompt'
+}
+
+/** The `export_command` a save sends: the switch as set, but only where it is
+ * offered — a kind changed away from `prompt` after the box was ticked must
+ * not carry the tick along, since the server refuses it there. */
+export function exportCommandFor(draft: LibraryDraft): boolean {
+  return offersExport(draft.kind) && draft.exportCommand
+}
+
+/** Where an exporting prompt lands on disk, for the form's hint — the same
+ * `.claude/commands/<name>.md` the server derives (`relative_path`). */
+export function commandPath(name: string): string {
+  return `.claude/commands/${name.trim()}.md`
 }
 
 /** Display label for a kind, as offered in the picker and shown on a card. */
@@ -76,8 +96,6 @@ export function kindLabel(kind: LibraryKind): string {
       return 'Skill'
     case 'hook':
       return 'Hook'
-    case 'command':
-      return 'Command'
     case 'prompt':
       return 'Prompt'
     case 'claude-md':
@@ -154,6 +172,7 @@ export function payloadFor(draft: LibraryDraft): {
   project_id: number | null
   name: string
   body: string
+  export_command: boolean
 } {
   return {
     kind: draft.kind,
@@ -162,20 +181,25 @@ export function payloadFor(draft: LibraryDraft): {
       draft.scope === 'project' && draft.projectId !== '' ? Number(draft.projectId) : null,
     name: draft.name.trim(),
     body: draft.body,
+    export_command: exportCommandFor(draft),
   }
 }
 
 /**
  * True when the form differs from what the server last reported. For an
- * existing item this only ever compares `name`/`body` — `kind`/`scope`/
- * `project_id` cannot be edited once an item exists, so a stale mismatch on
- * those fields (there is none — `draftFrom` seeds them from `item`) would
- * never be user-editable input anyway.
+ * existing item this only ever compares `name`/`body`/`export_command` —
+ * `kind`/`scope`/`project_id` cannot be edited once an item exists, so a
+ * stale mismatch on those fields (there is none — `draftFrom` seeds them from
+ * `item`) would never be user-editable input anyway.
  */
 export function isDirty(item: LibraryItem | null, draft: LibraryDraft): boolean {
   const payload = payloadFor(draft)
   if (item === null) {
-    return payload.name !== '' || payload.body !== ''
+    return payload.name !== '' || payload.body !== '' || payload.export_command
   }
-  return payload.name !== item.name || payload.body !== item.body
+  return (
+    payload.name !== item.name ||
+    payload.body !== item.body ||
+    payload.export_command !== item.export_command
+  )
 }

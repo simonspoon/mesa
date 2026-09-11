@@ -1484,11 +1484,15 @@ export interface LibraryCreate {
   project_id: number | null
   name: string
   body: string
+  /** A prompt's "also a slash command" flag (mesa task 1139); the server
+   * refuses it on any other kind. */
+  export_command?: boolean
 }
 
 export interface LibraryPatch {
   name?: string
   body?: string
+  export_command?: boolean
 }
 
 /** Every library item — the db rows plus every built-in not shadowed by one
@@ -1529,8 +1533,15 @@ export function listLibraryVersions(id: number): Promise<LibraryVersion[]> {
 
 /** Editing a built-in forks it: this creates the db row carrying
  * `builtin_id`, rather than PATCHing something that does not exist yet. */
-export function forkLibraryItem(builtinId: string, body: string): Promise<LibraryItem> {
-  return request(`/api/library/builtins/${builtinId}/fork`, jsonInit('POST', { body }))
+export function forkLibraryItem(
+  builtinId: string,
+  body: string,
+  exportCommand = false,
+): Promise<LibraryItem> {
+  return request(
+    `/api/library/builtins/${builtinId}/fork`,
+    jsonInit('POST', { body, export_command: exportCommand }),
+  )
 }
 
 /** The sync scan: one row per path, comparing the stored body, the file on

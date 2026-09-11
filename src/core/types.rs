@@ -1750,19 +1750,26 @@ impl From<&Artifact> for ArtifactSummary {
     }
 }
 
-// ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+// ---- library (agents, skills, hooks, prompts, CLAUDE.md) ----
 //
-// mesa task 919: agents, skills, hooks, commands, the live-conversation
-// prompt, and CLAUDE.md files are first-class records — `library_items`, with
-// a `library_versions` history — synced file-by-file against the `.claude`
-// directory a user or a project checkout actually reads. A row's `kind`
-// decides where on disk it lives (`core::library::relative_path`); `prompt`
-// alone has no path, because the live-conversation prompt is mesa-internal,
-// not a file Claude Code reads.
+// mesa task 919: agents, skills, hooks, prompts and CLAUDE.md files are
+// first-class records — `library_items`, with a `library_versions` history —
+// synced file-by-file against the `.claude` directory a user or a project
+// checkout actually reads. A row's `kind` decides where on disk it lives
+// (`core::library::relative_path`); a `prompt` has a path only when its
+// `export_command` flag is on (mesa task 1139), because a prompt is
+// mesa-internal text — a `{prompt:<name>}` a hook template reads — that may
+// *also* be offered to Claude Code as a slash command under
+// `.claude/commands/`. The separate `command` kind that used to own that
+// directory is gone: every such row is now a prompt with the flag on.
 
-/// What a [`LibraryItem`] is. Six kinds, and the wire value is the exact word
+/// What a [`LibraryItem`] is. Five kinds, and the wire value is the exact word
 /// Claude Code (or mesa, for `prompt`) uses for the thing — `kebab-case`
-/// keeps `claude-md` readable rather than `claude_md`.
+/// keeps `claude-md` readable rather than `claude_md`. The `command` kind
+/// mesa task 919 shipped was folded into `prompt` by mesa task 1139; the one
+/// place the old word is still read is a library bundle
+/// (`core::library::import`), so an export taken before that change still
+/// imports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "kebab-case")]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -1770,7 +1777,6 @@ pub enum LibraryKind {
     Agent,
     Skill,
     Hook,
-    Command,
     Prompt,
     ClaudeMd,
 }
@@ -1781,7 +1787,6 @@ impl LibraryKind {
             LibraryKind::Agent => "agent",
             LibraryKind::Skill => "skill",
             LibraryKind::Hook => "hook",
-            LibraryKind::Command => "command",
             LibraryKind::Prompt => "prompt",
             LibraryKind::ClaudeMd => "claude-md",
         }
@@ -1792,7 +1797,6 @@ impl LibraryKind {
             "agent" => Some(LibraryKind::Agent),
             "skill" => Some(LibraryKind::Skill),
             "hook" => Some(LibraryKind::Hook),
-            "command" => Some(LibraryKind::Command),
             "prompt" => Some(LibraryKind::Prompt),
             "claude-md" => Some(LibraryKind::ClaudeMd),
             _ => None,
@@ -1827,9 +1831,9 @@ impl LibraryScope {
     }
 }
 
-/// One library record — an agent definition, a skill, a hook script, a slash
-/// command, the live-conversation prompt, or a CLAUDE.md, stored in mesa and
-/// (for every kind but `prompt`) synced against a file on disk.
+/// One library record — an agent definition, a skill, a hook script, a
+/// prompt, or a CLAUDE.md, stored in mesa and synced against a file on disk
+/// (a prompt only when it `export_command`s).
 ///
 /// `id` is `null` for an unshadowed built-in (`core::library::BUILTINS`) —
 /// there is no db row yet, `builtin` is `true`, and `builtin_id` names which
@@ -1856,8 +1860,17 @@ pub struct LibraryItem {
     /// Derived, never stored: true iff this row has no db id (an unshadowed
     /// built-in reported in its place).
     pub builtin: bool,
-    /// Derived from `kind`/`scope`/`name` via `core::library::relative_path`;
-    /// null for `prompt`, which has no file.
+    /// `prompt` only (mesa task 1139): whether this prompt is *also* written
+    /// to `.claude/commands/<name>.md`, so Claude Code offers it as the slash
+    /// command `/<name>`. The stored body is what is exported, byte for byte
+    /// — no frontmatter is synthesised and no `{placeholder}` is rewritten,
+    /// because the sync compares three plain strings and any transform would
+    /// read as a permanent conflict. Always `false` on every other kind and
+    /// on an unshadowed built-in (a built-in is code and carries no flag).
+    pub export_command: bool,
+    /// Derived from `kind`/`scope`/`name`/`export_command` via
+    /// `core::library::relative_path`; null for a prompt that is not exported
+    /// as a command, which has no file.
     pub path: Option<String>,
     /// The last body mesa and the file on disk agreed on — the sync
     /// baseline. Null until the first sync.
@@ -2058,7 +2071,14 @@ pub struct LibrarySyncResult {
 // fork on the far side too.
 
 /// One library row as it travels between mesa instances.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+///
+/// `Deserialize` is written by hand rather than derived (`impl` below)
+/// because a bundle exported before mesa task 1139 carries `"kind":
+/// "command"`, a word [`LibraryKind`] no longer has: it is read as a prompt
+/// with `export_command` on — the same row the migration made of every stored
+/// command — so an old export still imports. Nothing else in mesa reads the
+/// old word.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct LibraryBundleItem {
     pub name: String,
@@ -2071,6 +2091,55 @@ pub struct LibraryBundleItem {
     pub body: String,
     /// The built-in this row forked from, so a fork imports as a fork.
     pub builtin_id: Option<String>,
+    /// [`LibraryItem::export_command`]; absent in a bundle older than mesa
+    /// task 1139, which reads as `false`.
+    pub export_command: bool,
+}
+
+/// The wire shape [`LibraryBundleItem`] is read through: `kind` as the raw
+/// word, so the legacy `command` can be mapped before it is an enum.
+#[derive(Deserialize)]
+struct LibraryBundleItemWire {
+    name: String,
+    kind: String,
+    scope: LibraryScope,
+    #[serde(default)]
+    project: Option<String>,
+    body: String,
+    #[serde(default)]
+    builtin_id: Option<String>,
+    #[serde(default)]
+    export_command: bool,
+}
+
+impl<'de> Deserialize<'de> for LibraryBundleItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = LibraryBundleItemWire::deserialize(deserializer)?;
+        let (kind, export_command) = match wire.kind.as_str() {
+            // mesa task 1139: a pre-1139 bundle's `command` is a prompt that
+            // exports — exactly what migration index 54 made of the stored
+            // rows.
+            "command" => (LibraryKind::Prompt, true),
+            other => (
+                LibraryKind::parse(other).ok_or_else(|| {
+                    serde::de::Error::unknown_variant(
+                        other,
+                        &["agent", "skill", "hook", "prompt", "claude-md", "command"],
+                    )
+                })?,
+                wire.export_command,
+            ),
+        };
+        Ok(LibraryBundleItem {
+            name: wire.name,
+            kind,
+            scope: wire.scope,
+            project: wire.project,
+            body: wire.body,
+            builtin_id: wire.builtin_id,
+            export_command,
+        })
+    }
 }
 
 /// A downloadable bundle of a library's contents (`core::library::export`),

@@ -15,6 +15,7 @@ const validItem = {
   project: null,
   body: 'do the thing',
   builtin_id: null,
+  export_command: false,
 }
 
 function bundleText(overrides: Record<string, unknown> = {}, items: unknown[] = [validItem]): string {
@@ -114,6 +115,33 @@ describe('parseBundle', () => {
     delete rest.kind
     const result = parseBundle(bundleText({}, [rest]))
     expect(result).toEqual({ error: expect.stringContaining('"kind"') })
+  })
+
+  it('reads a pre-1139 bundle\'s command as a prompt that exports, like the server', () => {
+    const result = parseBundle(
+      bundleText({}, [{ ...validItem, name: 'refine', kind: 'command' }, validItem]),
+    )
+    expect('bundle' in result).toBe(true)
+    if ('bundle' in result) {
+      expect(result.bundle.items[0].kind).toBe('prompt')
+      expect(result.bundle.items[0].export_command).toBe(true)
+      expect(result.bundle.items[1].export_command).toBe(false)
+    }
+  })
+
+  it('defaults a missing export_command to false and keeps a true one', () => {
+    const { name, kind, scope, body } = validItem
+    const result = parseBundle(
+      bundleText({}, [
+        { name, kind, scope, body },
+        { name, kind: 'prompt', scope, body, export_command: true },
+      ]),
+    )
+    expect('bundle' in result).toBe(true)
+    if ('bundle' in result) {
+      expect(result.bundle.items[0].export_command).toBe(false)
+      expect(result.bundle.items[1].export_command).toBe(true)
+    }
   })
 
   it('rejects an item with an unrecognized kind', () => {

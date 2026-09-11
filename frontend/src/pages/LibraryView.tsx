@@ -32,16 +32,19 @@ import { diffLines, foldOverrides, itemKey } from '../libraryOverride'
 import {
   LIBRARY_KINDS,
   LIBRARY_SCOPES,
+  commandPath,
   draftError,
   draftFrom,
   emptyDraft,
   isDirty,
   isSavable,
   kindLabel,
+  offersExport,
   payloadFor,
   scopeLabel,
   type LibraryDraft,
 } from '../libraryDraft'
+import { promptPlaceholder } from '../promptPlaceholders'
 import {
   changeDatesLabel,
   defaultChoice,
@@ -64,8 +67,7 @@ import type { Project } from '../types/Project'
 import { useFetch } from '../useFetch'
 
 /** Prism grammar for the body editor: a hook is shell, everything else on
- * this surface — agent/skill/command/prompt bodies and a CLAUDE.md — is
- * markdown. */
+ * this surface — agent/skill/prompt bodies and a CLAUDE.md — is markdown. */
 function bodyLanguage(kind: LibraryItem['kind']): string {
   return kind === 'hook' ? 'sh' : 'md'
 }
@@ -87,9 +89,9 @@ function LibraryForm({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Kind/scope/project are fixed at creation (the PATCH contract only ever
-  // carries name/body) — editing an *existing* row, stored or built-in, never
-  // offers to change them.
+  // Kind/scope/project are fixed at creation (the PATCH contract carries
+  // name/body/export_command) — editing an *existing* row, stored or
+  // built-in, never offers to change them.
   const locked = item !== null
 
   function submit(e: React.FormEvent) {
@@ -101,8 +103,12 @@ function LibraryForm({
       item === null
         ? createLibraryItem(payload)
         : item.builtin
-          ? forkLibraryItem(item.builtin_id!, payload.body)
-          : updateLibraryItem(item.id!, { name: payload.name, body: payload.body })
+          ? forkLibraryItem(item.builtin_id!, payload.body, payload.export_command)
+          : updateLibraryItem(item.id!, {
+              name: payload.name,
+              body: payload.body,
+              export_command: payload.export_command,
+            })
     write.then(
       () => {
         setSaving(false)
@@ -194,6 +200,26 @@ function LibraryForm({
         disabled={item?.builtin}
         onChange={(e) => setDraft({ ...draft, name: e.target.value })}
       />
+
+      {offersExport(draft.kind) && (
+        // A prompt's one extra switch (mesa task 1139): the same text is
+        // reachable from a hook template as `{prompt:<name>}` either way; on,
+        // it is also written to Claude's commands folder — byte for byte, no
+        // frontmatter added — so `/<name>` works as a slash command too.
+        // Turning it off removes that file (unless it was hand-edited).
+        <label className="library-export-switch">
+          <input
+            type="checkbox"
+            checked={draft.exportCommand}
+            onChange={(e) => setDraft({ ...draft, exportCommand: e.target.checked })}
+          />{' '}
+          also a slash command
+          <span className="muted library-meta">
+            {' '}
+            — synced to <code>{commandPath(draft.name === '' ? '<name>' : draft.name)}</code>
+          </span>
+        </label>
+      )}
 
       <div className="library-body-editor">
         <CodeEditor
@@ -693,10 +719,10 @@ function LibrarySyncModal({
 }
 
 /**
- * The Library page: agents, skills, hooks, commands, prompts and CLAUDE.md
- * files, stored in mesa and synced against `.claude` file by file (mesa task
- * 919). Global like Scripts — a project-scoped item binds a project, but the
- * page itself lives above projects.
+ * The Library page: agents, skills, hooks, prompts and CLAUDE.md files,
+ * stored in mesa and synced against `.claude` file by file (mesa task 919).
+ * Global like Scripts — a project-scoped item binds a project, but the page
+ * itself lives above projects.
  */
 export function LibraryView() {
   const { data: items, error, refetch } = useFetch(() => listLibrary(), 'library')
@@ -833,10 +859,11 @@ export function LibraryView() {
     <div className="library-page">
       <h1>Library</h1>
       <p className="muted">
-        Agents, skills, hooks, commands, prompts and CLAUDE.md files, stored
-        here and synced against your <code>.claude</code> directory file by
-        file. mesa never merges automatically — a sync always shows both
-        sides and asks you to pick.
+        Agents, skills, hooks, prompts and CLAUDE.md files, stored here and
+        synced against your <code>.claude</code> directory file by file. mesa
+        never merges automatically — a sync always shows both sides and asks
+        you to pick. A prompt is reachable from a hook template as{' '}
+        <code>{'{prompt:<name>}'}</code>, and can also be a slash command.
       </p>
 
       <div className="task-actions">
@@ -922,6 +949,17 @@ export function LibraryView() {
                         </span>
                         {item.path !== null && (
                           <span className="muted library-meta library-path">{item.path}</span>
+                        )}
+                        {item.kind === 'prompt' && (
+                          // The placeholder form a hook template splices this
+                          // prompt in by (mesa task 1138), as selectable text —
+                          // the row is where someone looks it up.
+                          <code className="library-meta library-placeholder">
+                            {promptPlaceholder(item.name)}
+                          </code>
+                        )}
+                        {item.export_command && (
+                          <span className="library-badge">slash command</span>
                         )}
                         {item.builtin && <span className="library-badge">built-in</span>}
                         {overridden !== undefined && (

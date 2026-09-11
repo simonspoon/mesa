@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Library gate (mesa task 919): exercises agents, skills, hooks, commands,
-# prompts and CLAUDE.md files stored as first-class records — create -> list
+# Library gate (mesa task 919): exercises agents, skills, hooks, prompts and
+# CLAUDE.md files stored as first-class records — create -> list
 # -> show (by id and by name) -> update -> delete, the built-in fork/restore
 # rule, version history, and the sync loop against real files on disk — over
 # both the CLI (`mesa library ...`) and the API (`/api/library...`), against a
@@ -69,7 +69,15 @@
 #      absent one on both verbs; a second disable as a no-op success;
 #      `--quiet` rejected (exit 2, empty stdout) on all three subcommands;
 #      and the three routes joining the gate sweeps (now fourteen routes) in
-#      both serve modes.
+#      both serve modes;
+#  12. the command kind folded into prompt (mesa task 1139): a db holding a
+#      pre-1139 `command` row opens as a prompt with `export_command` on,
+#      same id and history; `--kind command` is validation; an exporting
+#      prompt's file is BYTE-IDENTICAL to its body (cmp) and `sync status`
+#      reads in-sync the moment it is written; `--no-export-command` removes
+#      the file mesa wrote but leaves a hand-edited one for `disk-new`; the
+#      flag survives `--quiet`; and a bundle still saying `"kind":
+#      "command"` imports as an exporting prompt.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -163,10 +171,19 @@ LIB_REVIEWER=$(jqs .id)
 ok "CLI library create --kind/--name/--body/--scope project/--project NAME: flag form, binds and derives the path"
 
 printf 'file body\n' > "$TMP/body.txt"
-run 0 "$MESA" library create command greeter --body-file "$TMP/body.txt"
+run 0 "$MESA" library create prompt greeter --body-file "$TMP/body.txt" --export-command
 [ "$(jqs .body)" = "$(cat "$TMP/body.txt")" ] || fail "CLI create --body-file: body verbatim"
-[ "$(jqs .path)" = ".claude/commands/greeter.md" ] || fail "CLI create: command path"
-ok "CLI library create --body-file: body read from a file"
+[ "$(jqs .export_command)" = "true" ] || fail "CLI create --export-command: flag on"
+[ "$(jqs .path)" = ".claude/commands/greeter.md" ] || fail "CLI create: an exporting prompt's path"
+ok "CLI library create --body-file --export-command: body read from a file, the prompt owning .claude/commands/<name>.md"
+
+# The flag is a prompt's alone (mesa task 1139); the old `command` kind is
+# gone from every parser but the bundle's.
+run 1 "$MESA" library create agent flagged-agent 'x' --export-command
+[ "$(jqe .error.code)" = "validation" ] || fail "CLI create agent --export-command: error.code"
+run 1 "$MESA" library create command old-kind 'x'
+[ "$(jqe .error.code)" = "validation" ] || fail "CLI create --kind command: error.code"
+ok "CLI library create: --export-command on a non-prompt and the retired 'command' kind are each exit 1 validation"
 
 run 0 "$MESA" library create prompt second-note 'x'
 LIB_SECOND=$(jqs .id)
@@ -488,7 +505,7 @@ ok "editing the body in mesa (disk untouched) reports mesa-changed, and applying
 mkdir -p "$CLAUDE_DIR/commands"
 printf 'adopt me' > "$CLAUDE_DIR/commands/adopted.md"
 run 0 "$MESA" library sync status
-ROW=$(jqs '.[] | select(.name=="adopted" and .kind=="command")')
+ROW=$(jqs '.[] | select(.name=="adopted" and .kind=="prompt")')
 [ "$(jq -r .status <<<"$ROW")" = "disk-new" ] || fail "sync status: expected disk-new, got $ROW"
 [ "$(jq -r .item_id <<<"$ROW")" = "null" ] || fail "sync status: disk-new row must have no item_id"
 [ "$(jq -r .mesa_updated_at <<<"$ROW")" = "null" ] ||
@@ -503,9 +520,12 @@ run 0 "$MESA" library sync apply --resolve '.claude/commands/adopted.md=disk'
 [ "$(jqs '.[0].applied')" = "true" ] || fail "sync apply disk on disk-new: must apply"
 run 0 "$MESA" library show adopted
 [ "$(jqs .body)" = "adopt me" ] || fail "sync apply disk on disk-new: adopted body must match the file"
-[ "$(jqs .kind)" = "command" ] || fail "sync apply disk on disk-new: adopted kind"
+[ "$(jqs .kind)" = "prompt" ] || fail "sync apply disk on disk-new: adopted kind"
+[ "$(jqs .export_command)" = "true" ] ||
+  fail "sync apply disk on disk-new: a commands file adopts as a prompt that EXPORTS (mesa task 1139)"
+[ "$(jqs .path)" = ".claude/commands/adopted.md" ] || fail "sync apply disk on disk-new: adopted path"
 [ "$(jqs .project_id)" = "null" ] || fail "sync apply disk on disk-new: adopted is user-scope"
-ok "sync apply (disk) on a disk-new row adopts the file into a new library row"
+ok "sync apply (disk) on a disk-new row adopts the file into a new library row — a commands file as an exporting prompt"
 
 # A hook is any script the user drops in, not only a `*.sh` one, and its
 # name carries the extension so it round-trips back to the same file
@@ -563,12 +583,12 @@ ok "sync apply (disk) on a disk-deleted row deletes the mesa row (the disk side 
 
 # ---- both-changed: both sides moved; skip touches neither ----
 
-run 0 "$MESA" library create command conflictitem 'orig'
+run 0 "$MESA" library create prompt conflictitem 'orig' --export-command
 run 0 "$MESA" library sync apply --resolve '.claude/commands/conflictitem.md=mesa'
 run 0 "$MESA" library update conflictitem --body 'mesa new'
 printf 'disk new' > "$CLAUDE_DIR/commands/conflictitem.md"
 run 0 "$MESA" library sync status
-ROW=$(jqs '.[] | select(.name=="conflictitem" and .kind=="command")')
+ROW=$(jqs '.[] | select(.name=="conflictitem" and .kind=="prompt")')
 [ "$(jq -r .status <<<"$ROW")" = "both-changed" ] || fail "sync status: expected both-changed, got $ROW"
 [ "$(jq -r .mesa_body <<<"$ROW")" = "mesa new" ] || fail "sync status both-changed: mesa_body"
 [ "$(jq -r .disk_body <<<"$ROW")" = "disk new" ] || fail "sync status both-changed: disk_body"
@@ -609,7 +629,7 @@ run 0 "$MESA" library show conflictitem
 [ "$(jqs .body)" = "mesa new" ] || fail "skip must leave the mesa body untouched"
 [ "$(cat "$CLAUDE_DIR/commands/conflictitem.md")" = "disk new" ] || fail "skip must leave the disk file untouched"
 run 0 "$MESA" library sync status
-ROW=$(jqs '.[] | select(.name=="conflictitem" and .kind=="command")')
+ROW=$(jqs '.[] | select(.name=="conflictitem" and .kind=="prompt")')
 [ "$(jq -r .status <<<"$ROW")" = "both-changed" ] ||
   fail "after skip the row must still be both-changed (the baseline never moved), got $ROW"
 ok "skip leaves BOTH the mesa body and the disk file untouched, and the row is still both-changed on the next scan"
@@ -1387,6 +1407,161 @@ run 1 "$MESA" library hook status no-such-hook.sh
 ok "CLI library hook: a mistyped event, a non-hook item and an unknown item are each an error, exit 1"
 
 echo "== library-check: section 11 (hook registration) passed ($CHECKS checks so far) =="
+
+# ================= 12. command folded into prompt (mesa task 1139) =================
+
+# ---- the migration: a pre-1139 `command` row opens as an exporting prompt ----
+#
+# Built for real: a fresh db at the current schema, wound back by hand to the
+# schema the fold migrates from (the column dropped, `user_version` set to the
+# fold's index) with a `command` row and two versions in it, then opened by
+# mesa — which runs the fold — and read back through the CLI.
+command -v sqlite3 >/dev/null || fail "sqlite3 is required for section 12"
+MESA_DB_OLD="$TMP/pre1139.db"
+run 0 env MESA_DB="$MESA_DB_OLD" "$MESA" project list
+sqlite3 "$MESA_DB_OLD" <<'SQL'
+ALTER TABLE library_items DROP COLUMN export_command;
+INSERT INTO library_items (kind, scope, name, body, synced_body, synced_at, created_at, updated_at)
+  VALUES ('command', 'user', 'execute-todo', 'Claim task $ARGS', 'Claim task $ARGS', datetime('now'), datetime('now'), datetime('now'));
+INSERT INTO library_versions (item_id, body, source, created_at) VALUES (1, 'v1', 'edit', datetime('now'));
+INSERT INTO library_versions (item_id, body, source, created_at) VALUES (1, 'Claim task $ARGS', 'edit', datetime('now'));
+PRAGMA user_version = 54;
+SQL
+[ "$(sqlite3 "$MESA_DB_OLD" "SELECT kind FROM library_items WHERE id = 1")" = "command" ] ||
+  fail "fixture: the pre-1139 db must hold a command row"
+run 0 env MESA_DB="$MESA_DB_OLD" "$MESA" library show execute-todo
+[ "$(jqs .id)" = "1" ] || fail "migration: the row keeps its id, got $STDOUT"
+[ "$(jqs .kind)" = "prompt" ] || fail "migration: kind must become prompt, got $STDOUT"
+[ "$(jqs .export_command)" = "true" ] || fail "migration: export_command must be on, got $STDOUT"
+[ "$(jqs .path)" = ".claude/commands/execute-todo.md" ] || fail "migration: the path is unchanged, got $STDOUT"
+[ "$(jqs .body)" = 'Claim task $ARGS' ] || fail "migration: the body is untouched, got $STDOUT"
+[ "$(jqs .synced_body)" = 'Claim task $ARGS' ] || fail "migration: the sync baseline is untouched, got $STDOUT"
+run 0 env MESA_DB="$MESA_DB_OLD" "$MESA" library versions execute-todo
+[ "$(jqs length)" = "2" ] || fail "migration: history must survive (keyed by item id), got $STDOUT"
+run 0 env MESA_DB="$MESA_DB_OLD" "$MESA" library list --kind prompt
+[ "$(jqs '[.[] | select(.name=="execute-todo")] | length')" = "1" ] ||
+  fail "migration: the migrated row must list as a prompt (the view {prompt:<name>} resolves against), got $STDOUT"
+[ "$(sqlite3 "$MESA_DB_OLD" "SELECT count(*) FROM library_items WHERE kind = 'command'")" = "0" ] ||
+  fail "migration: no command row may survive"
+ok "migration 54: a pre-1139 command row opens as a prompt with export_command on — same id, path, body, baseline and history — and no command row survives"
+
+# ---- export is byte-identical, and in-sync the moment it is written ----
+#
+# The stored body is canonical: no frontmatter synthesised, no {placeholder}
+# rewritten to $ARGUMENTS. Anything else would make every export a permanent
+# both-changed row, since the sync compares three plain strings.
+printf -- '---\ndescription: refine\n---\nRefine mesa task $ARGUMENTS {id}\n' > "$TMP/refine-body.md"
+run 0 "$MESA" library create prompt refine-cmd --body-file "$TMP/refine-body.md" --export-command
+[ "$(jqs .path)" = ".claude/commands/refine-cmd.md" ] || fail "exporting prompt: path"
+run 0 "$MESA" library sync status
+ROW=$(jqs '.[] | select(.name=="refine-cmd")')
+[ "$(jq -r .status <<<"$ROW")" = "mesa-new" ] || fail "exporting prompt before the sync: expected mesa-new, got $ROW"
+run 0 "$MESA" library sync apply --resolve '.claude/commands/refine-cmd.md=mesa'
+[ "$(jqs '.[0].applied')" = "true" ] || fail "exporting prompt: sync apply mesa must apply"
+cmp -s "$TMP/refine-body.md" "$CLAUDE_DIR/commands/refine-cmd.md" ||
+  fail "exporting prompt: the file must be BYTE-IDENTICAL to the body (no frontmatter, no placeholder rewrite)"
+run 0 "$MESA" library sync status
+ROW=$(jqs '.[] | select(.name=="refine-cmd")')
+[ "$(jq -r .status <<<"$ROW")" = "in-sync" ] ||
+  fail "exporting prompt right after the export: expected in-sync (no spurious diff), got $ROW"
+ok "an exporting prompt is written byte-identical to its body and reads in-sync on the very next scan"
+
+# ---- --quiet keeps the flag: bounded, and what says the row is a slash command ----
+run 0 "$MESA" library show refine-cmd --quiet
+[ "$(jqs .export_command)" = "true" ] || fail "--quiet must keep export_command, got $STDOUT"
+[ "$(jqs 'has("body")')" = "false" ] || fail "--quiet still drops body"
+ok "--quiet keeps export_command"
+
+# ---- a prompt that does not export is not in the scan at all ----
+run 0 "$MESA" library create prompt internal-only 'mesa internal'
+[ "$(jqs .export_command)" = "false" ] || fail "a prompt exports only when asked"
+[ "$(jqs .path)" = "null" ] || fail "a non-exporting prompt has no path"
+run 0 "$MESA" library sync status
+[ "$(jqs '[.[] | select(.name=="internal-only")] | length')" = "0" ] ||
+  fail "a non-exporting prompt must not appear in sync status"
+ok "a prompt with the flag off has no path and is invisible to sync"
+
+# ---- turning the flag off removes the file mesa wrote ----
+run 0 "$MESA" library update refine-cmd --no-export-command
+[ "$(jqs .export_command)" = "false" ] || fail "--no-export-command: flag off"
+[ "$(jqs .path)" = "null" ] || fail "--no-export-command: no path any more"
+[ "$(jqs .synced_body)" = "null" ] || fail "--no-export-command: the sync baseline is cleared"
+[ ! -e "$CLAUDE_DIR/commands/refine-cmd.md" ] ||
+  fail "--no-export-command: the file mesa wrote must be removed"
+run 0 "$MESA" library sync status
+[ "$(jqs '[.[] | select(.name=="refine-cmd")] | length')" = "0" ] ||
+  fail "after the flag goes off the row is out of the scan"
+run 0 "$MESA" library show refine-cmd
+[ "$(jqs .body)" = "$(cat "$TMP/refine-body.md")" ] || fail "--no-export-command: the body is untouched"
+ok "library update --no-export-command removes the file mesa wrote, clears the baseline and keeps the body"
+
+# ---- ...but leaves a hand-edited one for sync to report as disk-new ----
+run 0 "$MESA" library update refine-cmd --export-command
+[ "$(jqs .path)" = ".claude/commands/refine-cmd.md" ] || fail "--export-command: the path is back"
+run 0 "$MESA" library sync apply --resolve '.claude/commands/refine-cmd.md=mesa'
+printf 'someone edited this by hand' > "$CLAUDE_DIR/commands/refine-cmd.md"
+run 0 "$MESA" library update refine-cmd --no-export-command
+[ "$(cat "$CLAUDE_DIR/commands/refine-cmd.md")" = "someone edited this by hand" ] ||
+  fail "--no-export-command: a hand-edited file must be left alone"
+run 0 "$MESA" library sync status
+ROW=$(jqs '.[] | select(.path==".claude/commands/refine-cmd.md")')
+[ "$(jq -r .status <<<"$ROW")" = "disk-new" ] ||
+  fail "a hand-edited file left behind must read disk-new, got $ROW"
+[ "$(jq -r .item_id <<<"$ROW")" = "null" ] || fail "the orphaned file belongs to no row"
+rm "$CLAUDE_DIR/commands/refine-cmd.md"
+ok "library update --no-export-command leaves a hand-edited file in place, and sync status reports it disk-new"
+
+# ---- the API carries the flag on create and update ----
+"$MESA" serve --port 17799 >"$TMP/serve12.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:17799/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+API12="http://127.0.0.1:17799"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' -X POST "$API12/api/library" \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"prompt","scope":"user","name":"api-cmd","body":"api body","export_command":true}')
+[ "$CODE" = "201" ] || fail "API create with export_command: expected 201, got $CODE $(cat "$TMP/out")"
+[ "$(jq -r .export_command "$TMP/out")" = "true" ] || fail "API create: export_command on"
+[ "$(jq -r .path "$TMP/out")" = ".claude/commands/api-cmd.md" ] || fail "API create: path"
+API_CMD_ID=$(jq -r .id "$TMP/out")
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' -X POST "$API12/api/library" \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"hook","scope":"user","name":"api-flagged.sh","body":"x","export_command":true}')
+[ "$CODE" = "422" ] || fail "API create hook with export_command: expected 422, got $CODE"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' -X POST "$API12/api/library" \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"command","scope":"user","name":"api-old","body":"x"}')
+[ "$CODE" = "422" ] || fail "API create kind=command: expected 422, got $CODE"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' -X PATCH "$API12/api/library/$API_CMD_ID" \
+  -H 'Content-Type: application/json' -d '{"export_command":false}')
+[ "$CODE" = "200" ] || fail "API PATCH export_command:false: expected 200, got $CODE"
+[ "$(jq -r .export_command "$TMP/out")" = "false" ] || fail "API PATCH: flag off"
+[ "$(jq -r .path "$TMP/out")" = "null" ] || fail "API PATCH: path gone"
+kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+ok "API: POST/PATCH /api/library carry export_command; a non-prompt with it and the retired command kind are 422"
+
+# ---- a pre-1139 bundle still imports: its command is a prompt that exports ----
+cat > "$TMP/legacy.json" <<'JSON'
+{"version":1,"exported_at":"2026-01-01T00:00:00","items":[
+  {"name":"legacy-refine","kind":"command","scope":"user","project":null,"body":"refine body","builtin_id":null},
+  {"name":"legacy-note","kind":"prompt","scope":"user","project":null,"body":"note body","builtin_id":null}]}
+JSON
+run 0 "$MESA" library import "$TMP/legacy.json"
+[ "$(jqs '[.[] | select(.status=="created")] | length')" = "2" ] || fail "legacy bundle: both items must import, got $STDOUT"
+run 0 "$MESA" library show legacy-refine
+[ "$(jqs .kind)" = "prompt" ] || fail "legacy bundle: command imports as a prompt"
+[ "$(jqs .export_command)" = "true" ] || fail "legacy bundle: ...that exports"
+run 0 "$MESA" library show legacy-note
+[ "$(jqs .export_command)" = "false" ] || fail "legacy bundle: an absent export_command reads as off"
+run 0 "$MESA" library export
+[ "$(jqs '.items[] | select(.name=="legacy-refine") | .export_command')" = "true" ] ||
+  fail "export: the bundle carries export_command"
+[ "$(jqs '[.items[] | select(.kind=="command")] | length')" = "0" ] || fail "export: no item says command any more"
+ok "a bundle exported before 1139 (kind: command) imports as an exporting prompt, and a fresh export carries the flag"
+
+echo "== library-check: section 12 (command folded into prompt) passed ($CHECKS checks so far) =="
 
 echo
 echo "library-check: $CHECKS checks passed"

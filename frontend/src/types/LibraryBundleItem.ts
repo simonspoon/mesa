@@ -4,6 +4,13 @@ import type { LibraryScope } from "./LibraryScope";
 
 /**
  * One library row as it travels between mesa instances.
+ *
+ * `Deserialize` is written by hand rather than derived (`impl` below)
+ * because a bundle exported before mesa task 1139 carries `"kind":
+ * "command"`, a word [`LibraryKind`] no longer has: it is read as a prompt
+ * with `export_command` on — the same row the migration made of every stored
+ * command — so an old export still imports. Nothing else in mesa reads the
+ * old word.
  */
 export type LibraryBundleItem = { name: string, kind: LibraryKind, scope: LibraryScope, 
 /**
@@ -15,4 +22,9 @@ project: string | null, body: string,
 /**
  * The built-in this row forked from, so a fork imports as a fork.
  */
-builtin_id: string | null, };
+builtin_id: string | null, 
+/**
+ * [`LibraryItem::export_command`]; absent in a bundle older than mesa
+ * task 1139, which reads as `false`.
+ */
+export_command: boolean, };

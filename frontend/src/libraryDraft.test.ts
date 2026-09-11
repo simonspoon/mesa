@@ -5,13 +5,16 @@ import {
   LIBRARY_SCOPES,
   NAME_MAX,
   bodyError,
+  commandPath,
   draftError,
   draftFrom,
   emptyDraft,
+  exportCommandFor,
   isDirty,
   isSavable,
   kindLabel,
   nameError,
+  offersExport,
   payloadFor,
   scopeLabel,
   type LibraryDraft,
@@ -29,6 +32,7 @@ function item(overrides: Partial<LibraryItem> = {}): LibraryItem {
     builtin_id: null,
     builtin: false,
     path: '.claude/agents/my-agent.md',
+    export_command: false,
     synced_body: null,
     synced_at: null,
     created_at: '2026-01-01T00:00:00Z',
@@ -45,6 +49,7 @@ describe('emptyDraft / draftFrom', () => {
       projectId: '',
       name: '',
       body: '',
+      exportCommand: false,
     })
   })
 
@@ -56,7 +61,15 @@ describe('emptyDraft / draftFrom', () => {
       projectId: '',
       name: 'my-agent',
       body: 'hello',
+      exportCommand: false,
     })
+  })
+
+  it('seeds exportCommand from an exporting prompt', () => {
+    const draft = draftFrom(
+      item({ kind: 'prompt', export_command: true, path: '.claude/commands/my-agent.md' }),
+    )
+    expect(draft.exportCommand).toBe(true)
   })
 
   it('seeds projectId from a project-scoped item', () => {
@@ -68,18 +81,33 @@ describe('emptyDraft / draftFrom', () => {
 
 describe('kindLabel / scopeLabel', () => {
   it('labels every kind', () => {
-    expect(LIBRARY_KINDS.map(kindLabel)).toEqual([
-      'Agent',
-      'Skill',
-      'Hook',
-      'Command',
-      'Prompt',
-      'CLAUDE.md',
-    ])
+    expect(LIBRARY_KINDS.map(kindLabel)).toEqual(['Agent', 'Skill', 'Hook', 'Prompt', 'CLAUDE.md'])
+  })
+
+  it('no longer offers a command kind — that is a prompt with export on', () => {
+    expect(LIBRARY_KINDS).not.toContain('command')
   })
 
   it('labels every scope', () => {
     expect(LIBRARY_SCOPES.map(scopeLabel)).toEqual(['User', 'Project'])
+  })
+})
+
+describe('offersExport / exportCommandFor / commandPath', () => {
+  it('offers the switch on a prompt alone', () => {
+    expect(LIBRARY_KINDS.filter(offersExport)).toEqual(['prompt'])
+  })
+
+  it('sends the tick only for a prompt, so a kind changed after ticking drops it', () => {
+    const ticked = { ...emptyDraft(), exportCommand: true }
+    expect(exportCommandFor({ ...ticked, kind: 'prompt' })).toBe(true)
+    expect(exportCommandFor({ ...ticked, kind: 'agent' })).toBe(false)
+    expect(exportCommandFor({ ...emptyDraft(), kind: 'prompt' })).toBe(false)
+  })
+
+  it('names the commands file the server derives', () => {
+    expect(commandPath('refine')).toBe('.claude/commands/refine.md')
+    expect(commandPath('  refine ')).toBe('.claude/commands/refine.md')
   })
 })
 
@@ -142,7 +170,14 @@ describe('bodyError', () => {
 
 describe('draftError / isSavable', () => {
   function valid(): LibraryDraft {
-    return { kind: 'agent', scope: 'user', projectId: '', name: 'ok-name', body: 'body' }
+    return {
+      kind: 'agent',
+      scope: 'user',
+      projectId: '',
+      name: 'ok-name',
+      body: 'body',
+      exportCommand: false,
+    }
   }
 
   it('accepts a valid user-scoped draft', () => {
@@ -185,6 +220,7 @@ describe('payloadFor', () => {
       projectId: '',
       name: '  spacey  ',
       body: '  keep me  ',
+      exportCommand: false,
     })
     expect(payload.name).toBe('spacey')
     expect(payload.body).toBe('  keep me  ')
@@ -197,8 +233,15 @@ describe('payloadFor', () => {
       projectId: '5',
       name: 'n',
       body: '',
+      exportCommand: false,
     })
     expect(payload.project_id).toBeNull()
+  })
+
+  it('carries export_command for a prompt and folds it off elsewhere', () => {
+    const base = { scope: 'user' as const, projectId: '', name: 'n', body: '', exportCommand: true }
+    expect(payloadFor({ ...base, kind: 'prompt' }).export_command).toBe(true)
+    expect(payloadFor({ ...base, kind: 'hook' }).export_command).toBe(false)
   })
 
   it('numbers project_id for a project scope', () => {
@@ -208,6 +251,7 @@ describe('payloadFor', () => {
       projectId: '5',
       name: 'n',
       body: '',
+      exportCommand: false,
     })
     expect(payload.project_id).toBe(5)
   })
@@ -219,6 +263,7 @@ describe('payloadFor', () => {
       projectId: '',
       name: 'n',
       body: '',
+      exportCommand: false,
     })
     expect(payload.project_id).toBeNull()
   })
@@ -249,6 +294,14 @@ describe('isDirty', () => {
     const existing = item()
     const draft = { ...draftFrom(existing), body: 'different' }
     expect(isDirty(existing, draft)).toBe(true)
+  })
+
+  it('is true when a prompt\'s export switch flipped, and not for a tick a non-prompt cannot send', () => {
+    const prompt = item({ kind: 'prompt', path: null })
+    expect(isDirty(prompt, { ...draftFrom(prompt), exportCommand: true })).toBe(true)
+    const agent = item()
+    expect(isDirty(agent, { ...draftFrom(agent), exportCommand: true })).toBe(false)
+    expect(isDirty(null, { ...emptyDraft(), kind: 'prompt', exportCommand: true })).toBe(true)
   })
 
   it('trims the name before comparing, so trailing whitespace alone is not dirty', () => {

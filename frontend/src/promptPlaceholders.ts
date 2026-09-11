@@ -33,6 +33,13 @@ export type PromptPlaceholder = {
   usable: boolean
 }
 
+/** What to type into a hook template to splice this prompt in — the one
+ * spelling, shared by the Settings list and the Library row (mesa task 1139),
+ * so the two can never advertise different forms. */
+export function promptPlaceholder(name: string): string {
+  return `{prompt:${name}}`
+}
+
 /** `MESA_PROMPT_<NAME>` — uppercased, `-` folded to `_`. Mirrors
  * `config::prompt_env_var`, including the charset that makes it impossible. */
 export function promptEnvVar(name: string): string | null {
@@ -55,7 +62,7 @@ export function promptPlaceholders(items: LibraryItem[]): PromptPlaceholder[] {
     const envVar = promptEnvVar(item.name)
     rows.push({
       name: item.name,
-      placeholder: `{prompt:${item.name}}`,
+      placeholder: promptPlaceholder(item.name),
       envVar: envVar ?? '',
       usable: envVar !== null,
     })

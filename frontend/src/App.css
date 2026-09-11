@@ -9818,6 +9818,20 @@ button:focus-visible,
   text-overflow: ellipsis;
 }
 
+/* A prompt row's `{prompt:<name>}` (mesa task 1139): selectable text, so it
+   can be copied into a hook template as-is. */
+.library-placeholder {
+  user-select: all;
+}
+
+/* The prompt form's "also a slash command" switch — one line, box first. */
+.library-export-switch {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
 .library-badge {
   font-size: 0.65rem;
   text-transform: uppercase;

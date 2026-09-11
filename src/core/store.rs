@@ -806,6 +806,32 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_cc_tool_errors_session ON cc_tool_errors(session_id);
     CREATE INDEX idx_cc_tool_errors_ts      ON cc_tool_errors(ts);",
+    // Task 1139: the library's `command` kind folds into `prompt`. A prompt
+    // is text mesa reads (`{prompt:<name>}` in a hook template, mesa task
+    // 1138) and a command was text Claude Code reads (`.claude/commands/
+    // <name>.md`); the two were the same kind of thing reachable from one
+    // consumer each, so now there is one kind and a per-row flag saying
+    // whether it is ALSO written to Claude's commands folder. Every stored
+    // command becomes a prompt with the flag on — same id, so its
+    // `library_versions` (keyed by `item_id`) come along untouched, and its
+    // path and body are byte-identical, so the sync baseline still holds.
+    //
+    // Three statements, not one, for the reason migration index 52 gives:
+    // `library_items_identity` is `(kind, scope, project, name)`, so a
+    // command whose name a prompt in the same scope already holds would
+    // collide mid-UPDATE and brick `Store::open`. Such a row is renamed
+    // `<name>-command-<id>` first — unique among commands by the id, and the
+    // command keeps its body and history while the prompt, already reachable
+    // by that name from a template, keeps the name. The suffix leaves the old
+    // file on disk as a `disk-new` sync row rather than silently claiming it.
+    "ALTER TABLE library_items ADD COLUMN export_command INTEGER NOT NULL DEFAULT 0;
+     UPDATE library_items SET name = name || '-command-' || id
+       WHERE kind = 'command' AND EXISTS (
+         SELECT 1 FROM library_items p
+          WHERE p.kind = 'prompt' AND p.scope = library_items.scope
+            AND COALESCE(p.project_id, -1) = COALESCE(library_items.project_id, -1)
+            AND p.name = library_items.name);
+     UPDATE library_items SET kind = 'prompt', export_command = 1 WHERE kind = 'command';",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1380,17 +1406,18 @@ fn validate_artifact_body(body: &str) -> Result<String> {
     Ok(body.to_string())
 }
 
-// ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+// ---- library (agents, skills, hooks, prompts, CLAUDE.md) ----
 
 const LIBRARY_COLUMNS: &str = "id, name, kind, scope, project_id, body, builtin_id, synced_body, synced_at, \
-     created_at, updated_at";
+     created_at, updated_at, export_command";
 
 /// `builtin` is always `false` here — a row read out of the db is by
 /// definition a fork, never an unshadowed built-in (`core::library::BUILTINS`
 /// never has a row); the caller that assembles a `list` response is what
 /// mixes in the unshadowed built-ins with `builtin: true`. `path` is derived
-/// from `kind`/`scope`/`name` on every read via `core::library::relative_path`
-/// — never stored, so it can never disagree with where a sync actually looks.
+/// from `kind`/`scope`/`name`/`export_command` on every read via
+/// `core::library::relative_path` — never stored, so it can never disagree
+/// with where a sync actually looks.
 fn row_to_library_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
     let kind: String = row.get(2)?;
     let kind = LibraryKind::parse(&kind).ok_or_else(|| {
@@ -1401,7 +1428,8 @@ fn row_to_library_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem>
         rusqlite::Error::InvalidColumnType(3, "scope".into(), rusqlite::types::Type::Text)
     })?;
     let name: String = row.get(1)?;
-    let path = crate::core::library::relative_path(kind, scope, &name)
+    let export_command: bool = row.get(11)?;
+    let path = crate::core::library::relative_path(kind, scope, &name, export_command)
         .map(|p| p.to_string_lossy().into_owned());
     Ok(LibraryItem {
         id: row.get(0)?,
@@ -1412,6 +1440,7 @@ fn row_to_library_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem>
         body: row.get(5)?,
         builtin_id: row.get(6)?,
         builtin: false,
+        export_command,
         path,
         synced_body: row.get(7)?,
         synced_at: row.get(8)?,
@@ -1430,6 +1459,19 @@ const LIBRARY_NAME_MAX: usize = 100;
 /// larger than a script's, but still bounded: nothing about this feature
 /// should be able to write an unbounded blob to disk on sync.
 const LIBRARY_BODY_MAX: usize = 1024 * 1024;
+
+/// `export_command` is a prompt's flag and nothing else's: every other kind
+/// already owns a path of its own, so the flag would have nothing to say
+/// there, and a `true` on one is a caller mistake rather than a no-op.
+fn validate_library_export(kind: LibraryKind, export_command: bool) -> Result<()> {
+    if export_command && kind != LibraryKind::Prompt {
+        return Err(Error::Validation(format!(
+            "export_command applies to a prompt only; {} items already have a path",
+            kind.as_str()
+        )));
+    }
+    Ok(())
+}
 
 /// Whether a name would survive [`validate_library_name`] — the filter
 /// `core::library::scan_disk` needs, since a hook is named after its whole
@@ -1885,6 +1927,11 @@ pub struct LibraryPatch {
     /// `scope: Some(Project)`). Present iff `scope` is also present — the two
     /// are validated as one pair, mirroring `create_library_item`.
     pub project_id: Option<Option<i64>>,
+    /// Replace-only. `Some(true)` is `validation` on any kind but `prompt`
+    /// (`validate_library_export`). Turning it off does not touch disk here —
+    /// `core::library::update_item` is the caller that removes the file a
+    /// prompt stops owning, since `Store` never opens the filesystem.
+    pub export_command: Option<bool>,
 }
 
 /// A new frame to add to a diagram. Coordinates and size are caller-supplied
@@ -5286,7 +5333,7 @@ impl Store {
         Ok(())
     }
 
-    // ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+    // ---- library (agents, skills, hooks, prompts, CLAUDE.md) ----
 
     /// Rows visible from a given context: with `project` given, a project's
     /// own `scope: project` rows plus every `scope: user` row (a project's
@@ -5363,7 +5410,10 @@ impl Store {
     /// given, is how an edit to a built-in *forks* it (`docs` — "editing a
     /// built-in forks it"): the id must name a real built-in
     /// (`core::library::builtin`) and must not already have a fork
-    /// (`conflict` — a built-in forks at most once).
+    /// (`conflict` — a built-in forks at most once). `export_command` is a
+    /// prompt's "also a slash command" flag (mesa task 1139), `validation`
+    /// on any other kind.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_library_item(
         &mut self,
         kind: LibraryKind,
@@ -5372,9 +5422,11 @@ impl Store {
         name: &str,
         body: &str,
         builtin_id: Option<&str>,
+        export_command: bool,
     ) -> Result<LibraryItem> {
         let name = validate_library_name(name)?;
         let body = validate_library_body(body)?;
+        validate_library_export(kind, export_command)?;
         self.ensure_library_scope(scope, project_id)?;
         self.ensure_library_name_free(kind, scope, project_id, &name, None)?;
         if let Some(builtin_id) = builtin_id {
@@ -5382,8 +5434,9 @@ impl Store {
         }
         self.conn.execute(
             "INSERT INTO library_items \
-             (name, kind, scope, project_id, body, builtin_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+             (name, kind, scope, project_id, body, builtin_id, export_command, created_at, \
+             updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))",
             (
                 &name,
                 kind.as_str(),
@@ -5391,6 +5444,7 @@ impl Store {
                 project_id,
                 &body,
                 builtin_id,
+                export_command,
             ),
         )?;
         let id = self.conn.last_insert_rowid();
@@ -5419,6 +5473,8 @@ impl Store {
             Some(body) => validate_library_body(body)?,
             None => current.body.clone(),
         };
+        let next_export = patch.export_command.unwrap_or(current.export_command);
+        validate_library_export(next_kind, next_export)?;
 
         let identity_changed = next_kind != current.kind
             || next_scope != current.scope
@@ -5437,13 +5493,14 @@ impl Store {
 
         self.conn.execute(
             "UPDATE library_items SET name = ?1, kind = ?2, scope = ?3, project_id = ?4, \
-             body = ?5, updated_at = datetime('now') WHERE id = ?6",
+             body = ?5, export_command = ?6, updated_at = datetime('now') WHERE id = ?7",
             (
                 &next_name,
                 next_kind.as_str(),
                 next_scope.as_str(),
                 next_project_id,
                 &next_body,
+                next_export,
                 id,
             ),
         )?;
@@ -5515,6 +5572,20 @@ impl Store {
             "UPDATE library_items SET synced_body = ?1, synced_at = datetime('now') \
              WHERE id = ?2",
             (synced_body, id),
+        )?;
+        self.get_library_item(id)
+    }
+
+    /// Forgets the sync baseline — the mirror of `set_library_synced`, and
+    /// like it does not move `updated_at`. Called when a prompt stops
+    /// exporting (mesa task 1139): the baseline is a fact about a file the
+    /// row no longer owns, and left in place it would make the row read
+    /// `disk-deleted` the moment it exported again.
+    pub fn clear_library_synced(&mut self, id: i64) -> Result<LibraryItem> {
+        self.get_library_item(id)?;
+        self.conn.execute(
+            "UPDATE library_items SET synced_body = NULL, synced_at = NULL WHERE id = ?1",
+            [id],
         )?;
         self.get_library_item(id)
     }
@@ -11117,15 +11188,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            54,
-            "a fresh db should report user_version 54"
+            55,
+            "a fresh db should report user_version 55"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 54);
+        assert_eq!(version, 55);
     }
 
     /// Pins the artifacts migration (mesa task 974) at index 50, the position
@@ -11205,6 +11276,91 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(names, vec!["foo.sh", "foo.sh.sh", "foo.sh.sh.sh"]);
+    }
+
+    /// Pins the command-into-prompt fold (mesa task 1139) at index 54 and
+    /// proves the data move: a stored `command` row opens as a `prompt` with
+    /// `export_command` on, under the same id, so its `library_versions`
+    /// (keyed by `item_id`) are all still there and its path is unchanged.
+    /// A command whose name a prompt already holds in the same scope is
+    /// renamed rather than colliding with `library_items_identity` mid-UPDATE
+    /// — the in-flight hazard migration 52's test names — and the prompt
+    /// keeps the name a template may already resolve.
+    #[test]
+    fn the_command_fold_arrives_at_migration_54_and_keeps_history() {
+        const COMMAND_FOLD: usize = 54;
+        let sql = MIGRATIONS[COMMAND_FOLD];
+        assert!(
+            sql.contains("ADD COLUMN export_command")
+                && sql.contains("SET kind = 'prompt', export_command = 1 WHERE kind = 'command'"),
+            "migration {COMMAND_FOLD} is no longer the command fold — a shipped \
+             migration was edited or reordered, which is never allowed"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..COMMAND_FOLD] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", COMMAND_FOLD as i64)
+                .unwrap();
+            for (kind, name) in [
+                ("command", "execute-todo"),
+                ("command", "shared"),
+                ("prompt", "shared"),
+            ] {
+                conn.execute(
+                    "INSERT INTO library_items (kind, scope, name, body, created_at, updated_at) \
+                     VALUES (?1, 'user', ?2, 'body', datetime('now'), datetime('now'))",
+                    [kind, name],
+                )
+                .unwrap();
+            }
+            for body in ["v1", "v2"] {
+                conn.execute(
+                    "INSERT INTO library_versions (item_id, body, source, created_at) \
+                     VALUES (1, ?1, 'edit', datetime('now'))",
+                    [body],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(&path).unwrap();
+        let todo = store.get_library_item(1).unwrap();
+        assert_eq!(todo.kind, LibraryKind::Prompt);
+        assert!(todo.export_command);
+        assert_eq!(todo.name, "execute-todo");
+        assert_eq!(
+            todo.path.as_deref(),
+            Some(".claude/commands/execute-todo.md")
+        );
+        let versions = store.list_library_versions(1).unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.body.as_str()).collect::<Vec<_>>(),
+            vec!["v2", "v1"],
+            "history rides on the item id, so the fold keeps it whole"
+        );
+
+        // The colliding pair: the prompt keeps its name, the command is
+        // renamed with its id and still exports.
+        let renamed = store.get_library_item(2).unwrap();
+        assert_eq!(renamed.name, "shared-command-2");
+        assert!(renamed.export_command);
+        let kept = store.get_library_item(3).unwrap();
+        assert_eq!(kept.name, "shared");
+        assert!(!kept.export_command);
+        let kinds: Vec<String> = store
+            .conn
+            .prepare("SELECT DISTINCT kind FROM library_items")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["prompt"], "no `command` row survives the fold");
     }
 
     /// Every shape rule `add_live_board` owns, in one place: the session must
@@ -11910,6 +12066,7 @@ mod tests {
                 "reviewer",
                 "you review code",
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(created.name, "reviewer");
@@ -11957,6 +12114,7 @@ mod tests {
                         bad,
                         "body",
                         None,
+                        false,
                     ),
                     Err(Error::Validation(_))
                 ),
@@ -11973,6 +12131,7 @@ mod tests {
                     "a.valid-name_1",
                     "body",
                     None,
+                    false,
                 )
                 .is_ok()
         );
@@ -11992,6 +12151,7 @@ mod tests {
                 "x",
                 "body",
                 None,
+                false,
             ),
             Err(Error::Validation(_))
         ));
@@ -12004,6 +12164,7 @@ mod tests {
                 "x",
                 "body",
                 None,
+                false,
             ),
             Err(Error::Validation(_))
         ));
@@ -12016,6 +12177,7 @@ mod tests {
                 "x",
                 "body",
                 None,
+                false,
             ),
             Err(Error::Validation(_))
         ));
@@ -12028,6 +12190,7 @@ mod tests {
                 "x",
                 "body",
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(created.project_id, Some(p.id));
@@ -12049,6 +12212,7 @@ mod tests {
                 "reviewer",
                 "body",
                 None,
+                false,
             )
             .unwrap();
         assert!(matches!(
@@ -12059,6 +12223,7 @@ mod tests {
                 "reviewer",
                 "different body",
                 None,
+                false,
             ),
             Err(Error::Conflict(_))
         ));
@@ -12072,6 +12237,7 @@ mod tests {
                     "reviewer",
                     "body",
                     None,
+                    false,
                 )
                 .is_ok()
         );
@@ -12129,6 +12295,7 @@ mod tests {
                 "stop-notify",
                 "echo one",
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(
@@ -12179,6 +12346,7 @@ mod tests {
                 "stop-notify",
                 "echo one",
                 None,
+                false,
             )
             .unwrap();
         // Force a distinct timestamp to compare against.
@@ -12205,6 +12373,7 @@ mod tests {
                 "stop-notify",
                 "echo one",
                 None,
+                false,
             )
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -12232,6 +12401,7 @@ mod tests {
                 "stop-notify",
                 "echo one",
                 None,
+                false,
             )
             .unwrap();
         store
@@ -12267,6 +12437,7 @@ mod tests {
                 "live-summary-prompt",
                 "custom prompt",
                 Some("no-such-builtin"),
+                false,
             ),
             Err(Error::Validation(_))
         ));
@@ -12279,6 +12450,7 @@ mod tests {
                 "live-summary-prompt",
                 "custom prompt",
                 Some("live-summary-prompt"),
+                false,
             )
             .unwrap();
         assert_eq!(forked.builtin_id.as_deref(), Some("live-summary-prompt"));
@@ -12291,6 +12463,7 @@ mod tests {
                 "live-summary-prompt-2",
                 "another",
                 Some("live-summary-prompt"),
+                false,
             ),
             Err(Error::Conflict(_))
         ));

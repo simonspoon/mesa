@@ -1417,8 +1417,8 @@ fn router(state: AppState) -> Router {
             get(show_script).patch(update_script).delete(delete_script),
         )
         .route("/api/scripts/{id}/run", post(run_script))
-        // Library: agent definitions, skills, hooks, commands, the live
-        // prompt and CLAUDE.md files, each mirrored onto disk under
+        // Library: agent definitions, skills, hooks, prompts and CLAUDE.md
+        // files, each (a prompt only when it exports) mirrored onto disk under
         // `.claude/`. A row becomes code mesa or Claude Code executes, so all
         // fourteen routes — reads, authoring, the sync pair that touches the
         // disk side, the export/import bundle pair, and the hook-registration
@@ -3978,7 +3978,7 @@ fn script_cwd(state: &AppState, script: &Script) -> Result<Option<String>, ApiEr
     Ok(Some(path))
 }
 
-// ---- library (agents, skills, hooks, commands, prompts, CLAUDE.md) ----
+// ---- library (agents, skills, hooks, prompts, CLAUDE.md) ----
 
 #[derive(Deserialize)]
 struct LibraryQuery {
@@ -3994,6 +3994,10 @@ struct LibraryCreate {
     project_id: Option<i64>,
     name: String,
     body: String,
+    /// A prompt's "also a slash command" flag (mesa task 1139); 422 on any
+    /// other kind. Absent reads as off.
+    #[serde(default)]
+    export_command: bool,
 }
 
 /// `name` and `body` are replace-only and non-nullable — a library row's name
@@ -4005,11 +4009,20 @@ struct LibraryUpdate {
     name: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     body: Option<Option<String>>,
+    /// Replace-only like the two above, and a plain bool rather than a
+    /// `double_option`: `null` means the same as absent, since a flag has
+    /// nothing to clear to.
+    #[serde(default)]
+    export_command: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct LibraryForkBody {
     body: String,
+    /// The fork's `export_command` (mesa task 1139) — a built-in carries none,
+    /// so this is the first chance to set it.
+    #[serde(default)]
+    export_command: bool,
 }
 
 #[derive(Deserialize)]
@@ -4031,8 +4044,8 @@ fn parse_library_kind(kind: &str) -> Result<LibraryKind, ApiError> {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         code: "validation",
         message: format!(
-            "unknown library kind {kind:?}; expected one of agent, skill, hook, command, \
-             prompt, claude-md"
+            "unknown library kind {kind:?}; expected one of agent, skill, hook, prompt, \
+             claude-md"
         ),
     })
 }
@@ -4090,8 +4103,15 @@ async fn create_library(
     let kind = parse_library_kind(&body.kind)?;
     let scope = parse_library_scope(&body.scope)?;
     let mut store = state.store.lock().unwrap();
-    let item =
-        store.create_library_item(kind, scope, body.project_id, &body.name, &body.body, None)?;
+    let item = store.create_library_item(
+        kind,
+        scope,
+        body.project_id,
+        &body.name,
+        &body.body,
+        None,
+        body.export_command,
+    )?;
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
 
@@ -4137,9 +4157,12 @@ async fn update_library(
         kind: None,
         scope: None,
         project_id: None,
+        export_command: body.export_command,
     };
     let mut store = state.store.lock().unwrap();
-    Ok(Json(store.update_library_item(id, patch)?).into_response())
+    // Through `library::update_item`, not the store directly: a prompt whose
+    // `export_command` goes off gives up its file (mesa task 1139).
+    Ok(Json(library::update_item(&mut store, id, patch)?).into_response())
 }
 
 async fn delete_library(
@@ -4279,6 +4302,7 @@ async fn fork_library_builtin(
         builtin.name,
         &body.body,
         Some(&builtin_id),
+        body.export_command,
     )?;
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
@@ -11818,6 +11842,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Path("no-such-builtin".to_string()),
             Ok(Json(LibraryForkBody {
                 body: "whatever".into(),
+                export_command: false,
             })),
         )
         .await
@@ -11839,6 +11864,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Path(builtin_id.to_string()),
             Ok(Json(LibraryForkBody {
                 body: "custom body".into(),
+                export_command: false,
             })),
         )
         .await
@@ -11852,6 +11878,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Path(builtin_id.to_string()),
             Ok(Json(LibraryForkBody {
                 body: "second attempt".into(),
+                export_command: false,
             })),
         )
         .await
@@ -11885,6 +11912,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 "roundtrip",
                 "hello",
                 None,
+                false,
             )
             .unwrap();
 
@@ -11972,12 +12000,13 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .lock()
             .unwrap()
             .create_library_item(
-                LibraryKind::Command,
+                LibraryKind::Prompt,
                 LibraryScope::User,
                 None,
                 "note",
                 "hi",
                 None,
+                false,
             )
             .unwrap();
         for payload in [r#"{"name":null}"#, r#"{"body":null}"#] {
@@ -12055,6 +12084,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 "lan-read-probe",
                 "hi",
                 None,
+                false,
             )
             .unwrap();
 
@@ -12106,6 +12136,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 project_id: None,
                 name: "lan-authored".to_string(),
                 body: "written from a phone".to_string(),
+                export_command: false,
             })),
         )
         .await
@@ -12122,6 +12153,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Ok(Json(LibraryUpdate {
                 name: None,
                 body: Some(Some("edited from a phone".to_string())),
+                export_command: None,
             })),
         )
         .await
@@ -12133,6 +12165,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Path(crate::core::library::BUILTINS[0].id.to_string()),
             Ok(Json(LibraryForkBody {
                 body: "forked from a phone".to_string(),
+                export_command: false,
             })),
         )
         .await
@@ -12240,6 +12273,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                         project_id: None,
                         name: format!("hostile-{label}"),
                         body: "x".to_string(),
+                        export_command: false,
                     })),
                 )
                 .await,
@@ -12254,6 +12288,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                     Ok(Json(LibraryUpdate {
                         name: None,
                         body: Some(Some("hostile".to_string())),
+                        export_command: None,
                     })),
                 )
                 .await,
@@ -12277,6 +12312,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                     Path(crate::core::library::BUILTINS[1].id.to_string()),
                     Ok(Json(LibraryForkBody {
                         body: "hostile".to_string(),
+                        export_command: false,
                     })),
                 )
                 .await,
@@ -12343,6 +12379,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                     project_id: None,
                     name: "default-mode-probe".to_string(),
                     body: "x".to_string(),
+                    export_command: false,
                 })),
             )
             .await

@@ -332,8 +332,9 @@ ok "PUT rejects a template the spawn path would later fail on (bad placeholder, 
 # ---- script mode: a multi-line value runs as bash -c (mesa task 667) ----
 
 # The mode is chosen by the value: a newline makes it a script. Values arrive
-# as MESA_* environment variables, never substituted into the body — which is
-# what keeps untrusted free text out of shell parsing in this mode too.
+# as MESA_* environment variables; a {placeholder} in the body is replaced by a
+# *reference* to one of them ("${MESA_NAME-}"), never by the value, so untrusted
+# free text still never reaches shell parsing in this mode (mesa task 1137).
 SCRIPT_LOG="$TMP/script.log"
 : > "$SCRIPT_LOG"
 
@@ -375,7 +376,7 @@ ok "a multi-line todo-watcher runs as bash -c in the project folder, with MESA_I
 
 [ ! -e "$PWNED" ] ||
   fail "an untrusted task name was parsed as shell syntax — script mode leaks"
-ok "a task name of \`\"; touch <file> #\` round-trips as one string: the body reaches bash verbatim, values arrive out-of-band"
+ok "a task name of \`\"; touch <file> #\` round-trips as one string when a script reads \$MESA_NAME"
 
 grep -Fqx "inbox-watcher|$WORKSPACE|$ITEM_3|inbox $ITEM_3: script-mode triage|swe|<unset>" "$SCRIPT_LOG" ||
   fail "inbox-watcher script mode wrong: $(cat "$SCRIPT_LOG")"
@@ -411,19 +412,76 @@ ok "a script's exit code is the whole contract: nonzero is a failed spawn, stder
 # ---- script-mode validation is a save-time 422, writing nothing ----
 
 BEFORE=$(cat "$CONFIG")
-api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nclaude --name {name}"}}'
-[ "$CODE" = "422" ] || fail "{} in a script: expected 422, got $CODE: $STDOUT"
+# A placeholder this action never offers is still a save-time error — there is
+# no value to substitute, so the fix is not "quote it differently".
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nclaude --prompt {prompt}"}}'
+[ "$CODE" = "422" ] || fail "out-of-scope {} in a script: expected 422, got $CODE: $STDOUT"
 [ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
-  fail "{} in a script: expected code validation, got $STDOUT"
-grep -q "MESA_NAME" <<<"$STDOUT" ||
-  fail "the message must name the env var to use instead: $STDOUT"
+  fail "out-of-scope {} in a script: expected code validation, got $STDOUT"
+grep -q "unsupported placeholder" <<<"$STDOUT" ||
+  fail "the message must say the placeholder is unsupported here: $STDOUT"
+# A supported one inside single quotes is refused: nothing expands there, so
+# there is no reference mesa could emit. A correctness refusal, not a security
+# one — the value never reaches the script text in any case.
+api PUT /api/config "$(jq -n '{commands: {"todo-watcher": "cd /repo\nclaude --name '"'"'{name}'"'"'"}}')"
+[ "$CODE" = "422" ] || fail "{} in single quotes: expected 422, got $CODE: $STDOUT"
+grep -q "single quotes" <<<"$STDOUT" ||
+  fail "the message must name the context it found the placeholder in: $STDOUT"
+# …and so is $'…', which is ANSI-C quoting rather than a single-quoted string:
+# a distinction that was one of three command-execution escapes in the draft
+# that substituted values instead of references (mesa task 1137).
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nprintf %s $'"'"'{name}'"'"'"}}'
+[ "$CODE" = "422" ] || fail "{} in $'...': expected 422, got $CODE: $STDOUT"
+grep -q "ANSI-C" <<<"$STDOUT" ||
+  fail "the message must name ANSI-C quoting: $STDOUT"
+# A placeholder used as a heredoc *delimiter* is a label, not text: refused
+# rather than silently left as braces.
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\ncat <<{name}\nhi\nEOF"}}'
+[ "$CODE" = "422" ] || fail "{} as a heredoc delimiter: expected 422, got $CODE: $STDOUT"
+grep -q "delimiter word" <<<"$STDOUT" ||
+  fail "the message must name the delimiter word: $STDOUT"
+# Arithmetic is a second parser — it re-reads what an expansion produced, so a
+# value of `a[$(cmd)]` would run there. Both spellings the lexer can see are
+# refused; `[[ -gt ]]` and `let` are documented sharp edges, not gates.
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nn=$(( {id} + 1 ))"}}'
+[ "$CODE" = "422" ] || fail "{} in \$((…)): expected 422, got $CODE: $STDOUT"
+grep -q "arithmetic" <<<"$STDOUT" ||
+  fail "the message must name arithmetic: $STDOUT"
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\n(( n = {id} ))"}}'
+[ "$CODE" = "422" ] || fail "{} in ((…)): expected 422, got $CODE: $STDOUT"
+# …and the refusal is inherited: a nested $( ) inside arithmetic is still
+# arithmetic, because it is the substitution's *output* that gets re-parsed.
+api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\necho $(( $(echo {id}) ))"}}'
+[ "$CODE" = "422" ] || fail "{} nested in \$((…)): expected 422, got $CODE: $STDOUT"
+grep -q "arithmetic" <<<"$STDOUT" ||
+  fail "the nested-arithmetic message must name arithmetic: $STDOUT"
 api PUT /api/config '{"commands": {"todo-watcher": "cd /repo\nif true; then\necho stuck"}}'
 [ "$CODE" = "422" ] || fail "bash syntax error: expected 422, got $CODE: $STDOUT"
 grep -q "not valid bash" <<<"$STDOUT" ||
   fail "a bash syntax error must say so: $STDOUT"
 [ "$(cat "$CONFIG")" = "$BEFORE" ] ||
   fail "a rejected script PUT must not touch the file: $(cat "$CONFIG")"
-ok "a script with a {placeholder} or a bash syntax error is 422 validation at save time, leaving the file byte-identical"
+ok "a script with an out-of-scope placeholder, one inside single or \$'…' quotes, one as a heredoc delimiter, one in \$((…))/((…)) arithmetic, or a bash syntax error is 422 validation at save time, leaving the file byte-identical"
+
+# …and the supported placeholder that used to be refused now saves and becomes
+# a reference — bare and inside "…" both deliver the same hostile prompt as one
+# literal string, executing nothing, because the value is never in the script.
+PWNED2="$DIR_C/pwned2"
+HOSTILE_P='"; touch pwned2 #`touch pwned2`$(touch pwned2)'"'"'; touch pwned2; '"'"'\'
+# The third line is the shape of the review's second proof of concept — a
+# subshell inside a command substitution — which used to mis-type everything
+# after its `)`. A reference is inert there like anywhere else.
+SUBST_SCRIPT=$(printf 'set -u\nprintf "%%s\\n" {prompt} >> "%s"\nprintf "%%s\\n" "{prompt}" >> "%s"\nprintf "%%s\\n" "$( (true) ; printf %%s {prompt} )" >> "%s"\necho "backgrounded · 5c81dddd"' "$SCRIPT_LOG" "$SCRIPT_LOG" "$SCRIPT_LOG")
+api PUT /api/config "$(jq -n --arg s "$SUBST_SCRIPT" '{commands: {"agent-spawn": $s}}')"
+[ "$CODE" = "200" ] || fail "a supported {} in a script must save: expected 200, got $CODE: $STDOUT"
+: > "$SCRIPT_LOG"
+api POST "/api/projects/$C/agents" "$(jq -n --arg p "$HOSTILE_P" '{prompt: $p}')"
+[ "$CODE" = "201" ] || fail "substituting script spawn: expected 201, got $CODE: $STDOUT"
+[ ! -e "$PWNED2" ] ||
+  fail "a substituted value was parsed as shell syntax — the quoting chokepoint leaks"
+[ "$(grep -Fxc "$HOSTILE_P" "$SCRIPT_LOG")" = "3" ] ||
+  fail "a substituted {prompt} must arrive byte-identical bare, in \"…\" and inside \$( (…) ): $(cat "$SCRIPT_LOG")"
+ok "a supported {placeholder} in a script saves (200) and becomes a \${MESA_*} reference: a prompt of \`\"; touch <file> #\` + backticks + \$() + quotes + a trailing backslash arrives literally bare, in \"…\" and inside \$( (…) ), executing nothing"
 
 # A valid script round-trips through the editor and drives the next spawn.
 api PUT /api/config "$(jq -n --arg s "$SPAWN_SCRIPT" '{commands: {"agent-spawn": $s}}')"

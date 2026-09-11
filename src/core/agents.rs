@@ -440,12 +440,21 @@ fn spawn_argv(argv: &[String], dir: &str) -> Result<Option<String>, String> {
 /// child and every other `MESA_*` spawn variable explicitly removed.
 ///
 /// Two properties this function exists to hold:
-/// - The script text is handed to `bash` as one argument, **verbatim**. No
-///   value is ever substituted into it, so a task name of `"; rm -rf / #` is
-///   a string a script may read, never syntax a shell parses.
+/// - The script text is handed to `bash` as one argument, and **no value is
+///   ever substituted into it**. Its `{placeholder}`s were replaced upstream by
+///   `config::substitute_script` with *references* — `{name}` becomes
+///   `"${MESA_NAME-}"` — so the value travels in `env` below, out of band, and
+///   a task name of `"; rm -rf / #` is a string a script may read, never syntax
+///   a shell parses: wherever bash performs word expansion it does not re-read
+///   what the expansion produced. Arithmetic evaluation does re-read it, and is
+///   the documented exception — a placeholder is exactly as safe as the
+///   variable it references, which is the most any scheme here can offer
+///   (`docs/config.md`).
 /// - A variable this action doesn't offer, or that has no value on this call,
 ///   is *removed* rather than left inherited or set empty — the script-mode
-///   analogue of the argv drop rule (`docs/config.md`).
+///   analogue of the argv drop rule, and the only way a script can tell an
+///   absent value from an empty one, since `{placeholder}`'s own `${…-}` form
+///   reads an unset variable as empty (`docs/config.md`).
 fn spawn_script(
     script: &str,
     env: &[(String, String)],
@@ -1038,25 +1047,48 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
 
     #[test]
     fn spawn_script_never_parses_an_untrusted_value_as_shell() {
-        // The whole safety claim of script mode: the body reaches bash
-        // verbatim and values arrive out-of-band, so a name full of shell
-        // syntax is one string, not code.
+        // The whole safety claim of script mode, and it is argv mode's: the
+        // value never enters the script text at all. A `{name}` placeholder
+        // becomes a reference, the value travels in the environment, and bash
+        // does not re-parse what a parameter expansion produced. Every one of
+        // these runs through a real `bash -c`.
         let dir = tempfile::tempdir().unwrap();
         let pwned = dir.path().join("pwned");
-        let log = dir.path().join("name.log");
-        let hostile = format!("\"; touch {} #", pwned.display());
-        let script = format!("set -eu\nprintf '%s' \"$MESA_NAME\" > {}", log.display());
-        let env = config::script_env(
-            config::TODO_WATCHER,
-            &config::Vars {
+        for hostile in [
+            format!("\"; touch {} #", pwned.display()),
+            format!("`touch {}`", pwned.display()),
+            format!("$(touch {})", pwned.display()),
+            format!("'; touch {}; '", pwned.display()),
+            "it's a name".to_string(),
+            format!("one line\ntouch {}", pwned.display()),
+        ] {
+            let log = dir.path().join("name.log");
+            let vars = config::Vars {
                 id: Some(1),
                 name: Some(&hostile),
                 ..Default::default()
-            },
-        );
-        spawn_script(&script, &env, dir.path().to_str().unwrap()).unwrap();
-        assert!(!pwned.exists(), "the injected command ran");
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), hostile);
+            };
+            let template = format!("set -eu\nprintf '%s' {{name}} > {}", log.display());
+            let config::Spawn::Script { script, env } =
+                config::resolve(config::TODO_WATCHER, &template, &vars).unwrap()
+            else {
+                panic!("expected a script");
+            };
+            assert!(
+                !script.contains(&hostile),
+                "the value reached the shell source: {script}"
+            );
+            spawn_script(&script, &env, dir.path().to_str().unwrap()).unwrap();
+            assert!(!pwned.exists(), "the injected command ran: {hostile:?}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), hostile);
+            // …and the env handoff is what carried it, unchanged.
+            assert_eq!(
+                env.iter()
+                    .find(|(v, _)| v == "MESA_NAME")
+                    .map(|(_, v)| v.as_str()),
+                Some(hostile.as_str())
+            );
+        }
     }
 
     #[test]

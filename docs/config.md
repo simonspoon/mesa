@@ -91,10 +91,18 @@ split into extra arguments or be re-read as a flag. A name of
 `"; rm -rf / #` is just a long, silly session name.
 
 Script mode does **not** weaken this. It runs `bash`, but no mesa value is ever
-spliced into the script text: the body reaches `bash -c` verbatim and the values
-arrive out-of-band, in the child's environment. The invariant was never "mesa
-runs no shell" — it is **mesa never interpolates a value into a string a shell
-parses**, and both modes hold it.
+spliced into the script text: the values arrive out-of-band, in the child's
+environment, and the most a script body ever carries is a **reference** to one
+of them — a `{placeholder}` there becomes `"${MESA_NAME-}"`
+(`config::substitute_script`, mesa task 1137). Wherever bash performs **word
+expansion** it does not re-read what the expansion produced looking for
+metacharacters, so the reference is inert there whatever the value holds.
+Arithmetic evaluation is the one exception — it re-reads it — which is why
+mesa refuses a placeholder in arithmetic outright; see
+[the box below](#placeholders-here-are-references-to-those-variables). The
+invariant was never "mesa runs no shell" — it is
+**mesa never interpolates a value into a string a shell parses**, and both modes
+hold it.
 
 The consequences of having no shell:
 
@@ -167,12 +175,73 @@ export CLAUDE_PROJECT=mesa
 exec "$MESA_BIN" --bg --agent swe --name "$MESA_NAME" -- "/execute-mesa-task $MESA_ID"
 ```
 
-### Values arrive as environment variables
+### Placeholders here are references to those variables
 
-**Nothing is substituted into a script.** The body goes to `bash` verbatim and
-the values are set on the child process instead — which is what keeps untrusted
-free text out of shell parsing in this mode too. Each placeholder has one
-variable, offered on exactly the commands its `{}` twin is:
+**Placeholders work here too** (mesa task 1137) — one vocabulary, both modes,
+and nobody has to reach for `$MESA_NAME` by hand. What mesa splices into the
+script is a **reference, never a value**:
+
+| You write | mesa emits | Why |
+| --- | --- | --- |
+| `echo {name}` | `echo "${MESA_NAME-}"` | quoted, so a value with spaces stays one word and a `*` never globs |
+| `echo "{name}"` | `echo ${MESA_NAME-}` | already inside `"…"`; quotes of mesa's own would be wrong there |
+| `cd $(dirname {name})` | `cd $(dirname "${MESA_NAME-}")` | `$(…)` is a fresh command context |
+| `cat <<EOF` … `{name}` … | `${MESA_NAME-}` | a heredoc body expands, but a `"` in it is literal text |
+
+The value itself never appears. That is the whole safety property, and it makes
+a `{placeholder}` **exactly as safe as the `MESA_*` variable it references** —
+which is the most any substitution scheme can offer here. Wherever bash performs
+**word expansion**, it does not re-read what the expansion produced looking for
+metacharacters, so a task name of `"; rm -rf / #` is inert.
+
+> **The exception: arithmetic is a second parser.** `$(( ))`, `(( ))`,
+> `let "…"`, `[[ x -gt y ]]` and an array subscript all *re-read* what an
+> expansion produced, and an array subscript inside arithmetic is itself
+> expanded — so a value of `a[$(cmd)]` runs the command. This is not new and not
+> specific to placeholders: a hand-written `[[ "$MESA_NAME" -gt 0 ]]` has had it
+> since script mode shipped. mesa **refuses** the two spellings it can see
+> (`$((…))` and `((…))`, including inside a heredoc body) at save time; `[[ … ]]`,
+> `let "…"` and `${x[…]}` are not lexically bracketed in any way mesa's
+> deliberately coarse lexer should model, and are yours to avoid. Note that
+> POSIX `[ x -gt y ]` does **no** arithmetic evaluation and is safe, while
+> `[[ x -gt y ]]` is not.
+>
+> **Nobody loses the capability.** mesa refuses to *emit* a placeholder into a
+> second parser; you stay free to write `$(( ${MESA_ID-} + 1 ))` by hand. That
+> is your own deliberate act — you asked for it in so many words — exactly like
+> `eval "$MESA_NAME"`. Which is the same category, and equally yours: a template
+> that writes `eval "{name}"` or `bash -c "{name}"` asks bash to parse the value
+> as a program, and no substitution scheme can make that safe, in this mode or
+> any other.
+
+It also means the code that decides *which* form to emit is **not a security
+boundary**. Both forms are inert, so a context mesa's coarse lexer gets wrong
+costs a stray word split or an unwanted glob at worst — never execution. (An earlier draft of this
+feature substituted the *value*, shell-quoted per context; a security review put
+three holes in its lexer in one pass, which is what settled the design. Bash's
+grammar — arithmetic, `${var/…/…}`, process substitution, `case` — is not
+something a hand-rolled lexer gets to be trusted with.)
+
+**Refused at save time**, each naming the context it found:
+
+| Where | Why |
+| --- | --- |
+| `'…'` | nothing expands inside single quotes, so there is nothing to emit |
+| `$'…'` | ANSI-C quoting: nothing expands there either, **and** a `\n` or `\x41` in the value would be *interpreted*, so even a correct emission would corrupt it |
+| `<<'EOF'` body | a quoted delimiter means the body expands nothing |
+| `` `…` `` | write `$(…)`, whose rules mesa does model |
+| `cat <<{name}` | a delimiter is a label bash matches the closing line against, not text it expands |
+| `$((…))`, `((…))` | arithmetic re-parses what an expansion produced — see the box above |
+
+All but the last are **correctness** refusals, not security ones: the value
+never reaches the script in any case.
+
+`$MESA_NAME` is still there, and is still exactly what `{name}` expands to.
+
+### The variables
+
+Each placeholder has one variable, offered on exactly the commands its `{}` twin
+is:
 
 | Placeholder | Variable | Where |
 | --- | --- | --- |
@@ -189,26 +258,35 @@ Two rules mirror the argv ones:
   A `live-agent` script sees all five, since that spawn knows all five.
   mesa explicitly *removes* all five before setting the ones that apply, so a
   variable can't leak in from the environment `mesa serve` was started with.
+  A placeholder this command doesn't offer is a save-time error, as it always
+  was — there is no variable to point at. `PUT /api/config` answers 422
+  `validation` and the file is left byte-identical.
 - **A value with nothing to say on this call leaves its variable unset**, not
   empty — the analogue of the drop rule. `MESA_CLAUDE_AGENT=""` means no
   `MESA_AGENT`; a promptless `POST /api/projects/{id}/agents` means no
   `MESA_PROMPT`. So `set -u` fires and `${MESA_PROMPT:-}` reads as "no prompt"
   rather than "empty prompt".
 
-Quote your uses (`"$MESA_NAME"`), as in any bash script — a task name has
-spaces in it.
+  A `{placeholder}` reads that case as **empty**, because its emitted form
+  carries the `-` default (`${MESA_NAME-}`) — argv's drop-the-token-and-its-flag
+  rule has nothing to work with in free-form shell text, and the `-` is also
+  what keeps the reference safe under `set -u`. A script that must tell "absent"
+  from "blank" reads `${MESA_NAME+set}`, or the variable directly.
 
-### `{placeholder}` in a script is an error
+Quote your own uses of the variables (`"$MESA_NAME"`), as in any bash script — a
+task name has spaces in it. A `{placeholder}` needs no thought **about quoting**
+— it is emitted with whatever quoting its position calls for. It does still need
+the one thought above: a value used as a *number* is re-parsed by bash's
+arithmetic evaluator, exactly as `"$MESA_NAME"` would be.
 
-`{}` syntax is meaningless in script mode and would collide with `${VAR}`
-besides, so a script containing one is **refused at save time**, with a message
-naming the variable to use instead. It is neither silently expanded nor
-silently ignored. `PUT /api/config` answers 422 `validation` and the file is
-left byte-identical.
+### Which braces are placeholders
 
-Only the five known names count, and only when the `{` isn't preceded by `$` —
-a script's own `${MESA_NAME}`, `cp a{,.bak}` brace expansion and `{ …; }`
-grouping are left alone.
+Only the five known names, and only when the `{` is not preceded by `$` — a
+script's own `${MESA_NAME}` is bash's parameter expansion and is left alone.
+Anything else — `{foo}`, jq's `{id: 1}`, `{ …; }` grouping, `cp a{,.bak}` brace
+expansion — passes through **literally**. That is deliberately unlike argv mode,
+where an unknown `{foo}` is an error: an argv token is mesa's own syntax, while
+a script body is bash source in which braces are ordinary text.
 
 ### Also refused at save time
 
@@ -216,9 +294,16 @@ grouping are left alone.
   the key back to the built-in default — that is the same rule in both modes,
   and it wins: a whitespace-only value is a reset, not an error.)
 - A **bash syntax error**, checked with `bash -n` — which parses and executes
-  nothing. A machine with no `bash` on PATH skips the check rather than failing
+  nothing. It runs over the script *with the placeholders already replaced by
+  their `${MESA_…-}` references*, so it sees the shape bash will really be
+  handed. A machine with no `bash` on PATH skips the check rather than failing
   the save; mesa can't prove a script is wrong there, and such a machine can't
   run it either.
+
+  Unlike the refusals above, this one is **save-time only** — the spawn path
+  does not re-run `bash -n`, so a hand-edited config may hold a script that
+  parses badly, and that shows up as a failed spawn. Deliberate: a `bash`
+  subprocess on every dispatch would cost more than it catches.
 
 ### What is unchanged
 

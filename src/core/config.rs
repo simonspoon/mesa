@@ -35,13 +35,45 @@
 //! run as `bash -c <script>` ([`is_script`], [`resolve`]). That buys a `cd`, an
 //! `export`, a conditional binary — the things a single program call can't do.
 //!
-//! The safety property survives intact, by a different mechanism: a script's
-//! values arrive as **environment variables** (`MESA_ID`, `MESA_NAME`, …) set
-//! on the child, never as text spliced into the script body, which reaches
-//! `bash` verbatim. So untrusted free text is still never parsed by a shell.
-//! `{}` syntax would be both meaningless and confusable with `${VAR}` there, so
-//! a `{placeholder}` inside a script is a save-time error naming the variable
-//! to use instead.
+//! `{placeholder}`s work here too (mesa task 1137) — one vocabulary, both
+//! modes, and nobody has to reach for an environment variable by hand. What is
+//! spliced into the script text is a **reference, never a value**:
+//! [`substitute_script`] replaces `{name}` with `"${MESA_NAME-}"`, and the
+//! value itself reaches the child through [`script_env`] exactly as it always
+//! did. So `echo "{name}"`, `echo {name}` and `cd $(dirname {name})` all work,
+//! and the safety property is the *same one the `MESA_*` variables have*, which
+//! is the strongest one available here: everywhere bash performs **word
+//! expansion** it does not re-read what an expansion produced looking for
+//! metacharacters, so a task name of `"; rm -rf / #` is inert.
+//!
+//! **Arithmetic evaluation is a second parser** and is the exception. `$(( ))`,
+//! `(( ))`, `let "…"`, `[[ x -gt y ]]` and an array subscript all re-read the
+//! expansion's result, where `a[$(cmd)]` runs the command — exactly as a
+//! hand-written `[[ "$MESA_NAME" -gt 0 ]]` has always done. A placeholder is
+//! therefore precisely as safe as the variable it references, never safer.
+//! [`scan_script`] refuses the two spellings it can cheaply see (`$((`, `((`);
+//! the rest are documented sharp edges in `docs/config.md`, because teaching
+//! this lexer the rest of bash's arithmetic is the trap this design walked away
+//! from.
+//!
+//! That is why [`scan_script`] is **not** a security boundary. It picks between
+//! two inert forms — quoted, or bare where quotes would be literal text — so
+//! getting a context wrong costs a word split or a glob, never execution. The one thing
+//! it must get right is the single-quote family (`'…'`, `$'…'`, a quoted
+//! heredoc delimiter), where no expansion happens at all and there is therefore
+//! nothing correct to emit; those are refused at save time, as is a `` `…` ``,
+//! whose quoting rules differ from `$(…)`'s just enough not to guess at.
+//!
+//! A first draft of this substituted the **value**, shell-quoted per context. A
+//! security review put three command-execution escapes through its lexer in one
+//! pass — `$'…'` is not `'…'`, a subshell's `)` closed a `$(` that was never
+//! opened, and `#` starts a comment after `)` — every one of them a
+//! *classification* error rather than a bad encoder. The review's own remedy
+//! was to substitute only where the stack is exactly `[Plain]` and refuse every
+//! quoted context; substituting a reference is strictly stronger than that (a
+//! reference is inert in *every* context, so there is no classification left to
+//! get wrong) and it keeps `echo "{name}"` working, which that remedy gives
+//! up.
 //!
 //! Unlike `hooks.json` (a genuine `sh -c` string, [`crate::core::hooks`]) no
 //! value mesa holds is ever interpolated into a string a shell parses.
@@ -460,7 +492,10 @@ pub fn validate(action: &str, template: &str) -> Result<(), String> {
     if is_script(template) {
         let script = template.trim();
         check_script(action, script)?;
-        return bash_syntax_check(action, script);
+        // Parse what `bash` will actually be handed — placeholders already
+        // replaced by their `${MESA_…-}` references — rather than the template
+        // with braces still in it, so the syntax check covers the real shape.
+        return bash_syntax_check(action, &substitute_script(action, script)?);
     }
     let vars = Vars {
         bin: Some("claude"),
@@ -491,8 +526,9 @@ pub enum Spawn {
     /// A tokenized argv, run directly with no shell (the original mode).
     Argv(Vec<String>),
     /// A bash script, run as `bash -c <script>` with `env` set on the child.
-    /// The script text is passed through verbatim — nothing is substituted
-    /// into it, which is what keeps untrusted values out of shell parsing.
+    /// The script text has had its placeholders replaced by `${MESA_…-}`
+    /// **references** ([`substitute_script`]); the values themselves travel in
+    /// `env`, so what reaches `bash` holds no untrusted text at all.
     Script {
         script: String,
         env: Vec<(String, String)>,
@@ -507,7 +543,7 @@ pub fn resolve(action: &str, template: &str, vars: &Vars) -> Result<Spawn, Strin
         let script = template.trim();
         check_script(action, script)?;
         return Ok(Spawn::Script {
-            script: script.to_string(),
+            script: substitute_script(action, script)?,
             env: script_env(action, vars),
         });
     }
@@ -571,15 +607,22 @@ pub fn script_env(action: &str, vars: &Vars) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Rejects a script the spawn path would refuse later: an empty body, or a
-/// `{placeholder}` that script mode does not substitute. Runs on **both** the
-/// save path and the spawn path, so a config file edited by hand fails the same
-/// way the editor would have failed it.
+/// Rejects a script the spawn path would refuse later: an empty body, a
+/// `{placeholder}` this action does not offer, or one sitting somewhere no
+/// parameter expansion could reach.
+///
+/// Runs on **both** the save path and the spawn path, so a hand-edited config
+/// fails these three the same way the editor would have. Its sibling
+/// [`bash_syntax_check`] does **not**: `bash -n` is save-time only, so a
+/// hand-edited file may hold a script that parses badly, and that surfaces as a
+/// failed spawn. Deliberate — a `bash` subprocess on every dispatch would cost
+/// more than it catches, and the failure is already visible and harmless.
 fn check_script(action: &str, script: &str) -> Result<(), String> {
     if script.is_empty() {
         return Err(format!("the {action} command is empty"));
     }
-    if let Some(key) = find_placeholder(script) {
+    for slot in scan_script(script) {
+        let key = slot.key;
         let var = PLACEHOLDER_ENV
             .iter()
             .find(|(k, _)| *k == key)
@@ -592,35 +635,487 @@ fn check_script(action: &str, script: &str) -> Result<(), String> {
                 offered_list(action)
             ));
         }
-        return Err(format!(
-            "the {action} command is a multi-line script, so {{{key}}} is not \
-             substituted; use the ${var} environment variable instead"
-        ));
+        // Asked of the whole stack, and asked *first*: a placeholder nested
+        // inside arithmetic wears whatever context encloses it most closely,
+        // and that context on its own looks perfectly substitutable.
+        if slot.in_arith
+            && let Some((place, fix)) = Ctx::Arith.refusal()
+        {
+            return Err(format!(
+                "{{{key}}} in the {action} command sits {place}, where mesa has \
+                 nothing it could substitute — {fix}",
+                key = slot.key
+            ));
+        }
+        if let Some((place, fix)) = slot.ctx.refusal() {
+            return Err(format!(
+                "{{{key}}} in the {action} command sits {place}, where mesa has \
+                 nothing it could substitute — {fix}"
+            ));
+        }
     }
     Ok(())
 }
 
-/// The first `{placeholder}` in a script, if any. Only the five known names
-/// count, and only when the `{` is not preceded by `$` — so a script's own
-/// `${MESA_NAME}`, `{a,b}` brace expansion and `{ …; }` grouping are left
-/// alone, and the error only ever fires on the mistake it exists to name.
-fn find_placeholder(script: &str) -> Option<&str> {
-    let bytes = script.as_bytes();
-    for (open, _) in script.match_indices('{') {
-        if open > 0 && bytes[open - 1] == b'$' {
-            continue;
-        }
-        let rest = &script[open + 1..];
-        let close = match rest.find('}') {
-            Some(c) => c,
-            None => continue,
-        };
-        let key = &rest[..close];
-        if PLACEHOLDER_ENV.iter().any(|(k, _)| *k == key) {
-            return Some(key);
+/// The shell context a `{placeholder}` sits in — which of the two inert forms
+/// [`substitute_script`] emits there, or whether it can emit anything at all.
+///
+/// **This enum is not a security boundary.** Every context mesa substitutes in
+/// gets a *reference* to a variable, never a value, and wherever bash performs
+/// word expansion it does not re-read what the expansion produced. So a context
+/// this lexer gets wrong costs at worst a stray word split, an unwanted glob,
+/// or a literal quote in some output — never execution. (Arithmetic evaluation
+/// is the exception, which is why [`Ctx::Arith`] is a refusal rather than a
+/// choice of form, and why that refusal is asked of the whole stack — see
+/// [`ScriptSlot::in_arith`].) That is the whole point of the design: a
+/// hand-rolled bash lexer cannot be trusted with bash's grammar (arithmetic,
+/// `${var/…/…}`, process substitution, `case`), and here it does not have to
+/// be. The one distinction it must get right is "is this inside a
+/// single-quote-family run", where no expansion happens at all, and that is a
+/// far smaller question than the rest of bash.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Ctx {
+    /// Ordinary script text.
+    Plain,
+    /// Inside `(…)`. Tracked only so its `)` cannot close a `$(` that is not
+    /// there — the bug that made `"$( (uname) ; … {name} )"` come out
+    /// mis-typed under the previous, value-substituting design.
+    Subshell,
+    /// Inside `$(…)` — a fresh command context, not a continuation of whatever
+    /// encloses it, which is why `"$(echo {name})"` is not double-quoted.
+    CmdSub,
+    /// Inside `$((…))` or `((…))` arithmetic. **Refused**, because arithmetic
+    /// evaluation is a *second parser*: it re-reads what an expansion produced,
+    /// and an array subscript inside it is itself expanded, so `a[$(cmd)]` in
+    /// the value runs the command. That is true of a hand-written
+    /// `$(( $MESA_ID ))` too — but a placeholder must not be the thing that
+    /// makes it look safe. The two spellings the lexer can cheaply see are
+    /// refused; `[[ x -gt y ]]`, `let "…"` and `${x[…]}` are not lexically
+    /// bracketed in any way this deliberately coarse lexer should model, and
+    /// stay documented sharp edges (`docs/config.md`).
+    ///
+    /// Nobody loses the capability. mesa refuses to *emit* a placeholder into a
+    /// second parser; an author who means to do sums stays free to write
+    /// `$(( ${MESA_ID-} + 1 ))` by hand — their own deliberate act, exactly like
+    /// `eval "$MESA_NAME"`. They just have to ask for it in so many words.
+    Arith,
+    /// Inside `"…"`, and also `$"…"`, where the expansion needs no quotes of
+    /// its own.
+    Double,
+    /// Inside `'…'` — no expansion of any kind happens here.
+    Single,
+    /// Inside `$'…'`, bash's **ANSI-C quoting**, where `\n`/`\x41` are
+    /// interpreted and `\'` does not close the run. Lexically it is not `'…'`
+    /// at all; conflating the two is what let a value escape before.
+    AnsiC,
+    /// Inside `` `…` ``.
+    Backtick,
+    /// After an unquoted `#`, to the end of the line.
+    Comment,
+    /// A heredoc body whose delimiter was unquoted: expansions happen, quotes
+    /// are literal text.
+    Heredoc,
+    /// A heredoc body whose delimiter was quoted (`<<'EOF'`): nothing expands.
+    HeredocQuoted,
+    /// The **delimiter word** of a heredoc — `cat <<{name}`. Not a place a
+    /// value could go at all: the word is a label bash matches the closing line
+    /// against. It is a context only so that this one spot errors like every
+    /// other impossible one, instead of silently leaving the braces in place
+    /// (the review's finding 6).
+    HeredocDelimiter,
+}
+
+impl Ctx {
+    /// `Some((where it is, what to do))` for a context mesa cannot substitute
+    /// into — the phrase the save-time error names it by, and the fix.
+    ///
+    /// These are **correctness** refusals now, not security ones: a parameter
+    /// expansion simply does not happen inside single quotes, so there is no
+    /// right thing to emit there. Backticks are refused for the same kind of
+    /// reason — their quoting rules differ from `$(…)`'s just enough that mesa
+    /// would be guessing which form is right — and `$(…)` is right there.
+    fn refusal(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Ctx::Single => Some((
+                "inside '…' single quotes",
+                "move it outside the quotes; it arrives quoted already",
+            )),
+            Ctx::AnsiC => Some((
+                "inside $'…' ANSI-C quotes",
+                "move it outside the quotes; it arrives quoted already",
+            )),
+            Ctx::HeredocQuoted => Some((
+                "inside a heredoc whose delimiter is quoted",
+                "unquote the delimiter, or move it outside the heredoc",
+            )),
+            Ctx::Backtick => Some(("inside `…` command substitution", "write $(…) instead")),
+            Ctx::Arith => Some((
+                "inside $(( )) arithmetic",
+                "arithmetic re-parses what an expansion produced; write the \
+                 matching MESA_* variable yourself if you mean to do sums on it",
+            )),
+            Ctx::HeredocDelimiter => Some((
+                "in a heredoc's delimiter word",
+                "a delimiter is a label bash matches, not text it expands; \
+                 name it something fixed",
+            )),
+            _ => None,
         }
     }
-    None
+
+    /// The reference to emit for `var` here. Two inert forms, and the only
+    /// thing riding on telling them apart is word splitting:
+    /// - **bare** where quotes would be wrong — already inside `"…"`, or in a
+    ///   heredoc body where a `"` is literal text rather than syntax;
+    /// - **double-quoted** everywhere else, so a value with spaces stays one
+    ///   word and a value with `*` or `?` never globs.
+    fn reference(self, var: &str) -> String {
+        match self {
+            Ctx::Double | Ctx::Heredoc => format!("${{{var}-}}"),
+            _ => format!("\"${{{var}-}}\""),
+        }
+    }
+}
+
+/// One `{placeholder}` a script body holds: the byte span of `{…}`, the name,
+/// and the shell context around it.
+struct ScriptSlot<'a> {
+    open: usize,
+    end: usize,
+    key: &'a str,
+    ctx: Ctx,
+    /// True when **any** frame of the stack is [`Ctx::Arith`], not just the
+    /// top. Arithmetic is a property of the *enclosing* context: a nested
+    /// `$(…)` pushes [`Ctx::CmdSub`] on top of it, and arithmetic then
+    /// re-reads that substitution's **output**, so `$(( $(echo {name}) ))` is
+    /// every bit as live as `$(( {name} ))`. One bool rather than any new
+    /// lexer knowledge.
+    in_arith: bool,
+}
+
+/// Every `{placeholder}` in a script, in order, each tagged with its [`Ctx`].
+///
+/// A coarse, deliberately approximate lexer over bash's quoting forms — see
+/// [`Ctx`] for why approximate is safe here. It tracks a **stack**, because
+/// `"…"` and `'…'` nest inside `$(…)` and vice versa and only the innermost one
+/// decides what can be emitted.
+///
+/// Only the five known names count, and only when the `{` is not preceded by
+/// `$` — a script's own `${MESA_NAME}` is a parameter expansion bash owns.
+/// Anything else — `{foo}`, `cp a{,.bak}`, `{ …; }`, `{id: 1}` — is not a
+/// placeholder at all and passes through literally. That is deliberately unlike
+/// argv mode, where an unknown `{foo}` is an error: an argv token is mesa's own
+/// syntax, while a script body is bash source in which braces are ordinary
+/// text.
+fn scan_script(script: &str) -> Vec<ScriptSlot<'_>> {
+    let bytes = script.as_bytes();
+    let len = bytes.len();
+    let mut slots = Vec::new();
+    let mut stack = vec![Ctx::Plain];
+    let mut pending: Option<(String, bool, bool)> = None;
+    let mut delim = String::new();
+    let mut strip = false;
+    let mut line_start = true;
+    let mut i = 0;
+    while i < len {
+        let top = *stack.last().unwrap_or(&Ctx::Plain);
+        let c = bytes[i];
+        if c == b'\n' {
+            if top == Ctx::Comment {
+                stack.pop();
+            }
+            if matches!(
+                stack.last(),
+                Some(Ctx::Plain | Ctx::Subshell | Ctx::CmdSub | Ctx::Arith)
+            ) && let Some((d, s, quoted)) = pending.take()
+            {
+                delim = d;
+                strip = s;
+                stack.push(if quoted {
+                    Ctx::HeredocQuoted
+                } else {
+                    Ctx::Heredoc
+                });
+            }
+            i += 1;
+            line_start = true;
+            continue;
+        }
+        let starts_line = line_start;
+        line_start = false;
+        if matches!(top, Ctx::Heredoc | Ctx::HeredocQuoted) && starts_line {
+            let end = script[i..].find('\n').map_or(len, |n| i + n);
+            let line = &script[i..end];
+            let candidate = if strip {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delim {
+                stack.pop();
+            }
+        }
+        let top = *stack.last().unwrap_or(&Ctx::Plain);
+        // A backslash escapes the next character everywhere it is special at
+        // all — which inside `$'…'` is what keeps `\'` from closing the run.
+        if matches!(
+            top,
+            Ctx::Plain | Ctx::Subshell | Ctx::CmdSub | Ctx::Arith | Ctx::Double | Ctx::AnsiC
+        ) && c == b'\\'
+        {
+            i += 2;
+            continue;
+        }
+        if c == b'{'
+            && let Some(slot) = slot_at(script, i, top, stack.contains(&Ctx::Arith))
+        {
+            i = slot.end;
+            slots.push(slot);
+            continue;
+        }
+        match top {
+            Ctx::Plain | Ctx::Subshell | Ctx::CmdSub | Ctx::Arith => match c {
+                // `$'…'` is ANSI-C quoting, not a single-quoted string.
+                b'\'' if i > 0 && bytes[i - 1] == b'$' => stack.push(Ctx::AnsiC),
+                b'\'' => stack.push(Ctx::Single),
+                b'"' => stack.push(Ctx::Double),
+                b'`' => stack.push(Ctx::Backtick),
+                b')' if top == Ctx::Arith && bytes.get(i + 1) == Some(&b')') => {
+                    stack.pop();
+                    i += 2;
+                    continue;
+                }
+                b')' if matches!(top, Ctx::Subshell | Ctx::CmdSub) => {
+                    stack.pop();
+                }
+                b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                    // `$((` is arithmetic, `$( (` is a subshell inside a
+                    // command substitution — the space is what tells them
+                    // apart, in bash as here.
+                    if bytes.get(i + 2) == Some(&b'(') {
+                        stack.push(Ctx::Arith);
+                        i += 3;
+                    } else {
+                        stack.push(Ctx::CmdSub);
+                        i += 2;
+                    }
+                    continue;
+                }
+                // `((` is arithmetic; `( (` — with the space — is a subshell
+                // inside a subshell, exactly as bash reads them.
+                b'(' if bytes.get(i + 1) == Some(&b'(') => {
+                    stack.push(Ctx::Arith);
+                    i += 2;
+                    continue;
+                }
+                b'(' => stack.push(Ctx::Subshell),
+                b'#' if i == 0
+                    || matches!(
+                        bytes[i - 1],
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                    ) =>
+                {
+                    stack.push(Ctx::Comment)
+                }
+                b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                    i = read_heredoc(script, i, &mut pending, &mut slots);
+                    continue;
+                }
+                _ => {}
+            },
+            Ctx::Double => match c {
+                b'"' => {
+                    stack.pop();
+                }
+                b'`' => stack.push(Ctx::Backtick),
+                b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                    if bytes.get(i + 2) == Some(&b'(') {
+                        stack.push(Ctx::Arith);
+                        i += 3;
+                    } else {
+                        stack.push(Ctx::CmdSub);
+                        i += 2;
+                    }
+                    continue;
+                }
+                _ => {}
+            },
+            Ctx::Single | Ctx::AnsiC => {
+                if c == b'\'' {
+                    stack.pop();
+                }
+            }
+            Ctx::Backtick => {
+                if c == b'`' {
+                    stack.pop();
+                }
+            }
+            // An unquoted heredoc body performs no command parsing, but it
+            // does perform arithmetic expansion — the one thing that can turn
+            // a value there into a command.
+            Ctx::Heredoc => {
+                if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    // `$((` first — it is the longer match, and the one that
+                    // matters. `$(` is an ordinary command context, so a
+                    // placeholder inside it gets the quoted form and keeps the
+                    // no-word-split, no-glob promise that a heredoc body's bare
+                    // form could not make there.
+                    if bytes.get(i + 2) == Some(&b'(') {
+                        stack.push(Ctx::Arith);
+                        i += 3;
+                    } else {
+                        stack.push(Ctx::CmdSub);
+                        i += 2;
+                    }
+                    continue;
+                }
+            }
+            Ctx::Comment | Ctx::HeredocQuoted | Ctx::HeredocDelimiter => {}
+        }
+        i += 1;
+    }
+    slots
+}
+
+/// The placeholder opening at `open`, if that `{` opens one at all.
+fn slot_at(script: &str, open: usize, ctx: Ctx, in_arith: bool) -> Option<ScriptSlot<'_>> {
+    if open > 0 && script.as_bytes()[open - 1] == b'$' {
+        return None;
+    }
+    let rest = &script[open + 1..];
+    let close = rest.find('}')?;
+    let key = &rest[..close];
+    PLACEHOLDER_ENV
+        .iter()
+        .any(|(k, _)| *k == key)
+        .then(|| ScriptSlot {
+            open,
+            end: open + 1 + close + 1,
+            key,
+            ctx,
+            in_arith,
+        })
+}
+
+/// Reads the heredoc delimiter a `<<` at `i` introduces into `pending` — the
+/// word, whether `<<-` strips tabs, and whether the word was **quoted**, which
+/// is what decides whether the body expands anything at all. Answers the offset
+/// to carry on scanning from. `<<<` is a herestring, not a heredoc.
+fn read_heredoc<'a>(
+    script: &'a str,
+    i: usize,
+    pending: &mut Option<(String, bool, bool)>,
+    slots: &mut Vec<ScriptSlot<'a>>,
+) -> usize {
+    let bytes = script.as_bytes();
+    let mut j = i + 2;
+    if bytes.get(j) == Some(&b'<') {
+        return j + 1;
+    }
+    let mut strip = false;
+    if bytes.get(j) == Some(&b'-') {
+        strip = true;
+        j += 1;
+    }
+    while matches!(bytes.get(j), Some(b' ' | b'\t')) {
+        j += 1;
+    }
+    let start = j;
+    while let Some(&c) = bytes.get(j) {
+        if matches!(
+            c,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+        ) {
+            break;
+        }
+        j += 1;
+    }
+    let raw = &script[start..j];
+    // The word is consumed here rather than by the main loop, so a placeholder
+    // written as a delimiter would otherwise be neither expanded nor refused.
+    for (at, _) in raw.match_indices('{') {
+        if let Some(mut slot) = slot_at(script, start + at, Ctx::Plain, false) {
+            slot.ctx = Ctx::HeredocDelimiter;
+            slots.push(slot);
+        }
+    }
+    let quoted = raw.contains('\'') || raw.contains('"') || raw.contains('\\');
+    let word: String = raw
+        .chars()
+        .filter(|c| *c != '\'' && *c != '"' && *c != '\\')
+        .collect();
+    if !word.is_empty() {
+        *pending = Some((word, strip, quoted));
+    }
+    j
+}
+
+/// Replaces a script's `{placeholder}`s with **references to the `MESA_*`
+/// variables the values travel in** — never with the values themselves.
+///
+/// This is the whole safety property of script mode, and it is the same one
+/// argv mode has: *no value mesa holds is ever interpolated into a string a
+/// shell parses*. A value reaches the child through [`script_env`] and the
+/// `env_remove` sweep, exactly as it did before placeholders worked here at
+/// all; wherever bash performs word expansion it does not re-read what the
+/// expansion produced, so a name of `"; rm -rf / #` is inert however hostile it
+/// is. Arithmetic evaluation re-reads it and is the exception — see [`Ctx`],
+/// which refuses the spellings of it this lexer can see.
+/// Which is why this function does not take a [`Vars`] at all — it has no use
+/// for a value, only for the name of the variable holding it.
+///
+/// The `-` in `${MESA_NAME-}` keeps the other rule this mode has: an offered
+/// placeholder with no value on this call is the empty string, even under
+/// `set -u`. Argv's drop-the-token-and-its-preceding-flag rule has nothing to
+/// work with in free-form shell text. A script that must tell "absent" from
+/// "blank" reads `${MESA_NAME+set}`, since the variable itself is genuinely
+/// *unset* in that case.
+fn substitute_script(action: &str, script: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(script.len());
+    let mut cursor = 0;
+    for slot in scan_script(script) {
+        // `check_script` refuses these on both paths that reach here, so these
+        // are unreachable — and an injection chokepoint's unreachable branch
+        // must *fail*, not fall through leaving `{name}` in text bash parses.
+        if slot.in_arith {
+            return Err(format!(
+                "the {action} command has {{{key}}} inside arithmetic, which \
+                 mesa cannot substitute",
+                key = slot.key
+            ));
+        }
+        if let Some((place, _)) = slot.ctx.refusal() {
+            return Err(format!(
+                "the {action} command has {{{key}}} {place}, which mesa cannot \
+                 substitute",
+                key = slot.key
+            ));
+        }
+        // Both of the next two are unreachable for the same reason and fail
+        // the same way: `slot_at` only ever records one of the five known
+        // names, and `check_script` has already refused a name this action does
+        // not offer. Neither may fall through — leaving `{name}` in text bash
+        // parses is the one outcome this function exists to prevent.
+        let Some((_, var)) = PLACEHOLDER_ENV.iter().find(|(k, _)| *k == slot.key) else {
+            return Err(format!(
+                "the {action} command has an unknown placeholder {{{key}}}",
+                key = slot.key
+            ));
+        };
+        if !offered_env_vars(action).contains(var) {
+            return Err(format!(
+                "unsupported placeholder {{{key}}} in the {action} command; \
+                 {action} offers {}",
+                offered_list(action),
+                key = slot.key
+            ));
+        }
+        out.push_str(&script[cursor..slot.open]);
+        out.push_str(&slot.ctx.reference(var));
+        cursor = slot.end;
+    }
+    out.push_str(&script[cursor..]);
+    Ok(out)
 }
 
 /// Parses the script with `bash -n` — a syntax check that executes nothing —
@@ -3320,35 +3815,613 @@ mod tests {
     }
 
     #[test]
-    fn a_placeholder_in_a_script_is_an_error_naming_its_env_var() {
-        let err = validate(TODO_WATCHER, "cd /repo\nclaude --name {name}").unwrap_err();
-        assert!(err.contains("{name}"), "{err}");
-        assert!(err.contains("$MESA_NAME"), "{err}");
-        // A placeholder this action doesn't offer keeps the existing message,
-        // because the fix is not "use the variable" — there isn't one.
+    fn a_supported_placeholder_in_a_script_is_substituted_as_a_variable_reference() {
+        // The rule mesa task 1137 replaced: `{}` is one vocabulary, both modes.
+        // What lands in the script is a reference; the value travels in `env`.
+        let vars = Vars {
+            bin: Some("claude"),
+            name: Some("fix the parser"),
+            id: Some(7),
+            ..Default::default()
+        };
+        let script = "cd /repo\nexec {bin} --name {name} -- \"work on {id}\"";
+        let Spawn::Script { script, env } = resolve(TODO_WATCHER, script, &vars).unwrap() else {
+            panic!("expected a script");
+        };
+        assert_eq!(
+            script,
+            "cd /repo\nexec \"${MESA_BIN-}\" --name \"${MESA_NAME-}\" -- \"work on ${MESA_ID-}\""
+        );
+        // Already inside `"…"`, so `{id}` got the bare form; everywhere else
+        // the quoted one, so a value with spaces stays one word.
+        assert_eq!(
+            env.iter()
+                .find(|(v, _)| v == "MESA_NAME")
+                .map(|(_, v)| v.as_str()),
+            Some("fix the parser")
+        );
+        assert_eq!(
+            validate(TODO_WATCHER, "cd /repo\nexec {bin} --name {name}"),
+            Ok(())
+        );
+        // A placeholder this action doesn't offer is still a save-time error,
+        // on both the editor's path and the spawn path.
         let err = validate(TODO_WATCHER, "cd /repo\nclaude -- {prompt}").unwrap_err();
         assert!(err.contains("unsupported placeholder"), "{err}");
-        // The spawn path refuses it too, not just the editor.
-        let err = resolve(
-            AGENT_SPAWN,
-            "cd /repo\nclaude -- {prompt}",
-            &Vars::default(),
-        )
-        .unwrap_err();
-        assert!(err.contains("$MESA_PROMPT"), "{err}");
+        let err = resolve(TODO_WATCHER, "cd /repo\nclaude -- {prompt}", &vars).unwrap_err();
+        assert!(err.contains("unsupported placeholder"), "{err}");
+    }
+
+    #[test]
+    fn a_hostile_value_substituted_into_a_script_is_one_literal_string() {
+        // The strongest form of the claim: none of these ever appears in the
+        // script text at all, whatever the template did with the placeholder.
+        // A value cannot be parsed as syntax by a shell that never sees it.
+        for hostile in [
+            "\"; rm -rf / #",
+            "`id`",
+            "$(id)",
+            "it's fine",
+            "line one\nrm -rf /",
+            "'; touch /tmp/pwned; '",
+            "$'\\x41'",
+        ] {
+            let vars = Vars {
+                name: Some(hostile),
+                ..Default::default()
+            };
+            for template in [
+                "set -eu\necho {name}",
+                "set -eu\necho \"{name}\"",
+                "set -eu\necho \"$(printf '%s' {name})\"",
+                "set -eu\ncat <<EOF\n{name}\nEOF",
+            ] {
+                let Spawn::Script { script, env } = resolve(TODO_WATCHER, template, &vars).unwrap()
+                else {
+                    panic!("expected a script");
+                };
+                assert!(
+                    !script.contains(hostile),
+                    "the value reached the shell source: {script}"
+                );
+                assert!(script.contains("${MESA_NAME-}"), "{script}");
+                assert_eq!(
+                    env.iter()
+                        .find(|(v, _)| v == "MESA_NAME")
+                        .map(|(_, v)| v.as_str()),
+                    Some(hostile)
+                );
+            }
+        }
     }
 
     #[test]
     fn a_scripts_own_shell_syntax_is_not_mistaken_for_a_placeholder() {
-        // `${VAR}`, brace expansion and `{ …; }` grouping all contain braces;
-        // only a bare, known placeholder name is the mistake being named.
+        // `${VAR}`, brace expansion, `{ …; }` grouping and jq's object syntax
+        // all contain braces; only a bare, known placeholder name is one.
         for script in [
             "cd /repo\nexec \"$MESA_BIN\" --name \"${MESA_NAME}\"",
             "cd /repo\ncp a.txt{,.bak}\n{ echo one; echo two; }",
-            "cd /repo\necho \"{id: 1}\" | tee out.json",
+            "cd /repo\necho '{id: 1}' | tee out.json",
+            "cd /repo\necho {foo} {bin: 1}",
         ] {
             assert_eq!(validate(TODO_WATCHER, script), Ok(()), "{script}");
+            let Spawn::Script { script: out, .. } =
+                resolve(TODO_WATCHER, script, &Vars::default()).unwrap()
+            else {
+                panic!("expected a script");
+            };
+            assert_eq!(out, script.trim(), "{script}");
         }
+    }
+
+    #[test]
+    fn a_dollar_before_a_brace_is_bashs_own_parameter_expansion() {
+        // `${name}` is a parameter expansion bash owns, left alone; the two
+        // placeholders beside it are mesa's and become references.
+        let vars = Vars {
+            name: Some("foo$"),
+            id: Some(9),
+            ..Default::default()
+        };
+        let Spawn::Script { script, .. } = resolve(
+            TODO_WATCHER,
+            "true\nprintf '%s' ${name} $ {name}{id}",
+            &vars,
+        )
+        .unwrap() else {
+            panic!("expected a script");
+        };
+        assert_eq!(
+            script,
+            "true\nprintf '%s' ${name} $ \"${MESA_NAME-}\"\"${MESA_ID-}\""
+        );
+    }
+
+    /// Runs a resolved script through a real bash with the spawn's own `env`,
+    /// the `env_remove` sweep included, and answers what it wrote.
+    fn run_resolved(template: &str, vars: &Vars, log: &std::path::Path) -> String {
+        let Spawn::Script { script, env } = resolve(TODO_WATCHER, template, vars).unwrap() else {
+            panic!("expected a script");
+        };
+        let _ = std::fs::remove_file(log);
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(&script);
+        for var in ALL_ENV_VARS {
+            command.env_remove(var);
+        }
+        for (var, value) in &env {
+            command.env(var, value);
+        }
+        let out = command.output().expect("bash");
+        assert!(
+            out.status.success(),
+            "{script}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_hostile_value_survives_every_position_a_placeholder_may_take() {
+        // End to end, through a real bash: the value comes back byte-identical
+        // and nothing it contains is ever executed. The payloads are shaped
+        // like the dangerous ones but touch a file in a temp dir, because this
+        // test *runs* them.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let pwned = dir.path().join("pwned");
+        let payload = format!("\"; touch {}; \"", pwned.display());
+        let quoted_payload = format!("'; touch {}; '", pwned.display());
+        let ansi_payload = format!("x'; touch {}; :'", pwned.display());
+        let log_arg = log.display().to_string();
+        for body in [
+            "true\nprintf '%s' {name} > LOG",
+            "true\nprintf '%s' \"{name}\" > LOG",
+            "true\nprintf '%s' \"$(printf '%s' {name})\" > LOG",
+            "true\nprintf '%s' \"$( (true) ; printf %s {name} )\" > LOG",
+            "true\ncat > LOG <<EOF\n{name}\nEOF",
+        ] {
+            let template = body.replace("LOG", &log_arg);
+            let heredoc = body.contains("<<EOF");
+            for hostile in [
+                payload.as_str(),
+                quoted_payload.as_str(),
+                ansi_payload.as_str(),
+                "$(id)",
+                "`id`",
+                "\\",
+                "back\\slash \"and\" 'quotes'",
+                "$MESA_NAME ${MESA_NAME} !ref",
+                "two words",
+                "* ? [a-z]",
+            ] {
+                // A heredoc body always ends in a newline, and `$(…)` strips
+                // trailing ones — so only compare what each can carry.
+                if heredoc && hostile.contains('\n') {
+                    continue;
+                }
+                let vars = Vars {
+                    name: Some(hostile),
+                    ..Default::default()
+                };
+                let got = run_resolved(&template, &vars, &log);
+                let got = if heredoc {
+                    got.strip_suffix('\n').unwrap_or(&got).to_string()
+                } else {
+                    got
+                };
+                assert_eq!(got, hostile, "{template} with {hostile:?}");
+                assert!(!pwned.exists(), "the injected command ran: {template}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_three_lexer_holes_that_broke_value_substitution_are_inert_now() {
+        // The security review's three proofs of concept against the previous,
+        // value-substituting design, kept verbatim as regressions. Under
+        // reference substitution none of them can work, because none of them
+        // puts the value in the script at all — which is the point: these were
+        // *lexer* bugs, and the lexer no longer decides whether a value is
+        // safe. (2) was a confirmed RCE; (1) and (3) were mis-lexings that
+        // reached bad shell text.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let pwned = dir.path().join("pwned");
+        let log_arg = log.display().to_string();
+        // (1) `$'…'` is ANSI-C quoting, not a single-quoted string. It is now a
+        // refusal, since no expansion happens there at all.
+        let poc1 = format!("true\nprintf '%s' $'{{name}}' > {log_arg}");
+        let err = validate(TODO_WATCHER, &poc1).unwrap_err();
+        assert!(err.contains("ANSI-C"), "{err}");
+        assert!(
+            resolve(TODO_WATCHER, &poc1, &Vars::default()).is_err(),
+            "{poc1}"
+        );
+        // (2) a `)` that closed a `$(` which was never opened, mis-typing
+        // everything after it as `"…"`. The subshell is tracked now, and the
+        // value never reaches the text either way.
+        let poc2 = format!("true\nprintf '%s' \"$( (uname) ; printf %s {{name}} )\" > {log_arg}");
+        let vars = Vars {
+            name: Some(&format!("x\"; touch {}; \"", pwned.display())),
+            ..Default::default()
+        };
+        let got = run_resolved(&poc2, &vars, &log);
+        // `uname`'s own output leads; what matters is that the value follows it
+        // as literal text (so nothing in it ran) — asserted without pinning the
+        // platform this test happens to run on.
+        assert!(
+            got.ends_with(&format!("x\"; touch {}; \"", pwned.display())),
+            "{got:?}"
+        );
+        assert!(!pwned.exists(), "PoC 2 still executes");
+        // (3) bash starts a comment after `)`, which the old predecessor set
+        // omitted. A comment is an ordinary substitution context now — the
+        // reference is simply never expanded, being commented out.
+        let poc3 = format!("true\n(true)# note {{name}}\nprintf '%s' done > {log_arg}");
+        let vars = Vars {
+            name: Some(&format!("x\ntouch {}", pwned.display())),
+            ..Default::default()
+        };
+        assert_eq!(run_resolved(&poc3, &vars, &log), "done");
+        assert!(!pwned.exists(), "PoC 3 still executes");
+    }
+
+    #[test]
+    fn a_substituted_value_never_globs_and_never_word_splits() {
+        // The one thing riding on the lexer picking the right inert form.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let log_arg = log.display().to_string();
+        let dir_arg = dir.path().display().to_string();
+        for body in [
+            "true\ncd DIR\nprintf '[%s]' {name} > LOG",
+            "true\ncd DIR\nprintf '[%s]' \"{name}\" > LOG",
+        ] {
+            let template = body.replace("LOG", &log_arg).replace("DIR", &dir_arg);
+            for hostile in ["two words", "*", "a.tx?", "  spaced  "] {
+                let vars = Vars {
+                    name: Some(hostile),
+                    ..Default::default()
+                };
+                // One `[…]` means one word: no splitting, no globbing.
+                assert_eq!(
+                    run_resolved(&template, &vars, &log),
+                    format!("[{hostile}]"),
+                    "{template} with {hostile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_placeholder_is_refused_where_no_expansion_could_reach_it() {
+        // The single-quote family: nothing expands there, so there is nothing
+        // mesa could emit. A correctness refusal, not a security one — plus
+        // backticks, whose rules differ from `$(…)`'s just enough not to guess.
+        for (script, place) in [
+            ("set -eu\necho '{name}'", "single quotes"),
+            ("set -eu\nprintf '%s' $'{name}'", "ANSI-C"),
+            ("set -eu\ncat <<'END'\n{name}\nEND", "delimiter is quoted"),
+            ("set -eu\necho `id {name}`", "command substitution"),
+        ] {
+            let err = validate(TODO_WATCHER, script).unwrap_err();
+            assert!(err.contains("{name}"), "{script}: {err}");
+            assert!(err.contains(place), "{script}: {err}");
+            assert!(
+                resolve(TODO_WATCHER, script, &Vars::default()).is_err(),
+                "the spawn path must refuse it too: {script}"
+            );
+        }
+        // An *unquoted* heredoc expands, so it is an ordinary position; so is
+        // a comment, and so is anything after either has ended.
+        for ok in [
+            "set -eu\ncat <<EOF\n{name}\nEOF",
+            "set -eu\n# note {name}\necho done",
+            "set -eu\ncat <<EOF\nhello\nEOF\necho {name}",
+            "set -eu\necho 'quoted' {name}",
+        ] {
+            assert_eq!(validate(TODO_WATCHER, ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn an_unset_placeholder_in_a_script_becomes_the_empty_string() {
+        // The one place the two modes genuinely differ: free-form shell text
+        // has no token to drop, so an absent value is empty — and the `-`
+        // default is what makes that hold under `set -u` too. The `MESA_*`
+        // variable stays genuinely unset, which is how a script tells the two
+        // apart.
+        let vars = Vars {
+            bin: Some("claude"),
+            ..Default::default()
+        };
+        let Spawn::Script { script, env } =
+            resolve(TODO_WATCHER, "set -eu\nexec {bin} --name {name}", &vars).unwrap()
+        else {
+            panic!("expected a script");
+        };
+        assert_eq!(
+            script,
+            "set -eu\nexec \"${MESA_BIN-}\" --name \"${MESA_NAME-}\""
+        );
+        assert!(!env.iter().any(|(var, _)| var == "MESA_NAME"), "{env:?}");
+        // …and a real bash agrees, under `set -u`.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let template = format!(
+            "set -eu\nprintf '[%s][%s]' {{name}} \"${{MESA_NAME+set}}\" > {}",
+            log.display()
+        );
+        assert_eq!(run_resolved(&template, &vars, &log), "[][]");
+    }
+
+    #[test]
+    fn a_placeholder_as_a_heredoc_delimiter_is_refused_not_ignored() {
+        // The review's finding 6: `read_heredoc` eats the delimiter word before
+        // the main loop sees the `{`, so this used to be the one spot where a
+        // placeholder neither expanded nor errored — it just stayed as braces.
+        let script = "true\ncat <<{name}\nhello\n{name}";
+        let err = validate(TODO_WATCHER, script).unwrap_err();
+        assert!(err.contains("{name}"), "{err}");
+        assert!(err.contains("delimiter word"), "{err}");
+        assert!(
+            resolve(TODO_WATCHER, script, &Vars::default()).is_err(),
+            "{err}"
+        );
+        // `<<-` and a quoted delimiter go the same way…
+        for script in [
+            "true\ncat <<-{name}\nhello\n{name}",
+            "true\ncat <<'{name}'\nhello\n{name}",
+        ] {
+            assert!(validate(TODO_WATCHER, script).is_err(), "{script}");
+        }
+        // …while a fixed delimiter with a placeholder in the *body* is fine.
+        assert_eq!(
+            validate(TODO_WATCHER, "true\ncat <<EOF\n{name}\nEOF"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn arithmetic_is_refused_because_it_re_parses_what_an_expansion_produced() {
+        // The second audit's part 2: arithmetic evaluation is a *second*
+        // parser, and an array subscript inside it is itself expanded, so a
+        // value of `a[$(cmd)]` runs the command. Both spellings the lexer can
+        // cheaply see are refused, on the save path and the spawn path alike.
+        for script in [
+            "true\nn=$(( {id} + 1 ))",
+            "true\n(( n = {id} ))",
+            "true\nif (( {id} > 0 )); then echo yes; fi",
+            // …including the one the audit reached through a heredoc body,
+            // where the bare form would otherwise have gone in.
+            "true\ncat <<EOF\n$(( {id} ))\nEOF",
+        ] {
+            let err = validate(TODO_WATCHER, script).unwrap_err();
+            assert!(err.contains("{id}"), "{script}: {err}");
+            assert!(err.contains("arithmetic"), "{script}: {err}");
+            assert!(
+                resolve(TODO_WATCHER, script, &Vars::default()).is_err(),
+                "the spawn path must refuse it too: {script}"
+            );
+        }
+        // `( (` with a space is a subshell, not arithmetic — bash reads it that
+        // way and so does mesa, so the audit's own PoC-2 shape still works.
+        let vars = Vars {
+            name: Some("v"),
+            ..Default::default()
+        };
+        let Spawn::Script { script, .. } = resolve(
+            TODO_WATCHER,
+            "true\necho \"$( (true) ; printf %s {name} )\"\nm=$(( (2) * 3 ))",
+            &vars,
+        )
+        .unwrap() else {
+            panic!("expected a script");
+        };
+        assert_eq!(
+            script,
+            "true\necho \"$( (true) ; printf %s \"${MESA_NAME-}\" )\"\nm=$(( (2) * 3 ))"
+        );
+    }
+
+    #[test]
+    fn arithmetic_refusal_is_inherited_by_every_nested_context() {
+        // The third audit's one live RCE: `Ctx::Arith` is a stack-*top* test,
+        // and a nested `$(…)` pushes `CmdSub` on top of it — but arithmetic
+        // re-reads that substitution's **output**, so the subscript gadget
+        // fires there too. The refusal is asked of the whole stack.
+        for script in [
+            "true\necho $(( $(echo {name}) ))",
+            "true\ncat <<EOF\n$(( $(echo {name}) ))\nEOF",
+            // The two that used to survive only on bash disliking a quote in
+            // an arithmetic operand — luck, not design.
+            "true\necho $(( (1+{name}) ))",
+            "true\necho $(( \"{name}\" ))",
+            // …and nested two deep, and through a subshell.
+            "true\necho $(( $(echo $(echo {name})) ))",
+            "true\n(( n = $( (echo {name}) ) ))",
+        ] {
+            let err = validate(TODO_WATCHER, script).unwrap_err();
+            assert!(err.contains("{name}"), "{script}: {err}");
+            assert!(err.contains("arithmetic"), "{script}: {err}");
+            assert!(
+                resolve(TODO_WATCHER, script, &Vars::default()).is_err(),
+                "the spawn path must refuse it too: {script}"
+            );
+        }
+        // Leaving arithmetic must clear it again — the flag is positional, not
+        // sticky for the rest of the script.
+        assert_eq!(
+            validate(TODO_WATCHER, "true\nn=$(( 1 + 1 ))\necho {name}"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_arithmetic_refusal_names_no_particular_variable() {
+        // Every other refusal is variable-agnostic; this one used to advise
+        // `$MESA_ID` whichever placeholder tripped it.
+        for (script, wrong) in [
+            ("true\necho $(( {name} ))", "MESA_ID"),
+            ("true\necho $(( {id} ))", "MESA_NAME"),
+        ] {
+            let err = validate(TODO_WATCHER, script).unwrap_err();
+            assert!(!err.contains(wrong), "{script}: {err}");
+            assert!(err.contains("MESA_*"), "{script}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_command_substitution_in_a_heredoc_body_gets_the_quoted_form() {
+        // `$(…)` inside a heredoc body is an ordinary command context, so the
+        // bare form the body itself calls for would word-split and glob there.
+        // (This is *not* what closes the nested-arithmetic hole — `$((` is.)
+        let vars = Vars {
+            name: Some("two words"),
+            ..Default::default()
+        };
+        let Spawn::Script { script, .. } = resolve(
+            TODO_WATCHER,
+            "true\ncat <<EOF\n$(printf '[%s]' {name})\n{name}\nEOF",
+            &vars,
+        )
+        .unwrap() else {
+            panic!("expected a script");
+        };
+        assert_eq!(
+            script,
+            "true\ncat <<EOF\n$(printf '[%s]' \"${MESA_NAME-}\")\n${MESA_NAME-}\nEOF"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let template = format!(
+            "true\ncat > {} <<EOF\n$(printf '[%s]' {{name}})\nEOF",
+            log.display()
+        );
+        assert_eq!(run_resolved(&template, &vars, &log), "[two words]\n");
+    }
+
+    #[test]
+    fn an_array_subscript_payload_cannot_execute_from_any_accepted_position() {
+        // `a[$(cmd)]` is the gadget that makes arithmetic a second parser: the
+        // subscript is itself expanded. Arithmetic is refused, so the question
+        // this test answers is the complement — that the payload is inert in
+        // every position mesa *does* accept, bare form and quoted form alike.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let pwned = dir.path().join("pwned");
+        let payload = format!("a[$(touch {})]", pwned.display());
+        let log_arg = log.display().to_string();
+        for body in [
+            "true\nprintf '%s' {name} > LOG",
+            "true\nprintf '%s' \"{name}\" > LOG",
+            "true\nprintf '%s' \"$(printf '%s' {name})\" > LOG",
+            "true\nprintf '%s' \"$( (true) ; printf %s {name} )\" > LOG",
+            "true\ncat > LOG <<EOF\n{name}\nEOF",
+            "true\n# note {name}\nprintf '%s' a[$] > LOG",
+            "true\nx=${y:-{name}}\nprintf '%s' \"$x\" > LOG",
+        ] {
+            let template = body.replace("LOG", &log_arg);
+            let vars = Vars {
+                name: Some(&payload),
+                ..Default::default()
+            };
+            let got = run_resolved(&template, &vars, &log);
+            let got = got.strip_suffix('\n').unwrap_or(&got).to_string();
+            // The comment case writes a fixed marker, not the value — it is
+            // here to prove the commented reference runs nothing either.
+            let expected = if template.contains("# note") {
+                "a[$]".to_string()
+            } else {
+                payload.clone()
+            };
+            assert_eq!(got, expected, "{template}");
+            assert!(
+                !pwned.exists(),
+                "the subscript payload executed: {template}"
+            );
+        }
+        // …and every arithmetic spelling refuses it rather than emitting it.
+        for script in [
+            "true\necho $(( {name} ))",
+            "true\n(( n = {name} ))",
+            "true\ncat <<EOF\n$(( {name} ))\nEOF",
+        ] {
+            let vars = Vars {
+                name: Some(&payload),
+                ..Default::default()
+            };
+            assert!(resolve(TODO_WATCHER, script, &vars).is_err(), "{script}");
+            assert!(validate(TODO_WATCHER, script).is_err(), "{script}");
+        }
+        assert!(!pwned.exists());
+    }
+
+    #[test]
+    fn the_shell_forms_the_review_found_correct_stay_correct() {
+        // The review's "could not break" list, pinned so a later lexer edit
+        // cannot quietly regress it. Each of these must leave a following
+        // placeholder in an ordinary (substituting) position.
+        for script in [
+            // `$"…"` locale quoting, `${#var}`, `$#`, `#` that starts no comment
+            "true\necho $\"text\" {name}",
+            "true\necho ${#PATH} $# {name}",
+            "true\necho \"x\"#y {name}",
+            "true\nx=#y\necho {name}",
+            // `<<<` is a herestring, not a heredoc
+            "true\ncat <<<word\necho {name}",
+            // `<<-` with tab stripping closes on an indented delimiter
+            "true\ncat <<-EOF\n\thello\n\tEOF\necho {name}",
+            // `<<` that is not a redirection because of where it sits
+            "true\necho '<<EOF' {name}",
+            "true\necho \"<<EOF\" {name}",
+            "true\n# <<EOF\necho {name}",
+            // process substitution is a fresh command context
+            "true\ncat <(echo {name})",
+            // a backslash at the very end, and before a closing quote
+            "true\necho {name} \\",
+            "true\necho \"a\\\"\" {name}",
+            // `${x:-…}` — bash's own expansion parser, not mesa's
+            "true\necho ${x:-y} {name}",
+            // UTF-8 either side, including right after a backslash skip
+            "true\necho ümläut \\é {name} ✓",
+        ] {
+            assert_eq!(validate(TODO_WATCHER, script), Ok(()), "{script}");
+            let Spawn::Script { script: out, .. } = resolve(
+                TODO_WATCHER,
+                script,
+                &Vars {
+                    name: Some("v"),
+                    ..Default::default()
+                },
+            )
+            .unwrap() else {
+                panic!("expected a script");
+            };
+            assert!(out.contains("\"${MESA_NAME-}\""), "{script} became {out}");
+        }
+        // CRLF: the `\r` rides along in both the recorded delimiter and the
+        // line compared against it, so the heredoc closes where it looks like
+        // it closes and a later placeholder is an ordinary one. (The review
+        // predicted the delimiter would never match, refusing every later
+        // placeholder — it fails *safe* either way, but measured, it works.)
+        let crlf = "true\r\ncat <<EOF\r\nhi\r\nEOF\r\necho {name}";
+        assert_eq!(validate(TODO_WATCHER, crlf), Ok(()));
+        let Spawn::Script { script: out, .. } = resolve(
+            TODO_WATCHER,
+            crlf,
+            &Vars {
+                name: Some("v"),
+                ..Default::default()
+            },
+        )
+        .unwrap() else {
+            panic!("expected a script");
+        };
+        assert!(out.ends_with("echo \"${MESA_NAME-}\""), "{out}");
     }
 
     #[test]

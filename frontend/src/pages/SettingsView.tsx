@@ -300,10 +300,14 @@ export function SettingsView() {
         <li>
           <strong>More than one line is a bash script</strong>, run as{' '}
           <code>bash -c</code> in the same folder — so you can <code>cd</code>,{' '}
-          <code>export</code>, or pick a binary first. A script reads its values
-          as <code>MESA_*</code> environment variables instead;{' '}
-          <code>{'{}'}</code> placeholders are not substituted there, and a
-          value with nothing to say on a given run is left unset.
+          <code>export</code>, or pick a binary first. The same{' '}
+          <code>{'{}'}</code> placeholders work here: each becomes a reference
+          to the <code>MESA_*</code> variable its value travels in, quoted to
+          suit where you put it. Anywhere works except inside{' '}
+          <code>'…'</code> or backticks, where nothing expands — those are
+          refused when you save. The variables are still there to read directly,
+          which is how a script tells a value with nothing to say on this run
+          (left unset) from an empty one.
         </li>
       </ul>
 
@@ -1186,15 +1190,17 @@ function CommandRow({
         onChange={(e) => onEdit(e.target.value)}
       />
       <div className="settings-command-meta">
-        {/* The vocabulary follows the mode: a script never sees `{}`, and an
-            argv template never sees the variables. Showing both at once would
-            invite the exact mistake the server rejects at save time. */}
+        {/* A script has both vocabularies since mesa task 1137 — the
+            placeholders, which become references to these very variables, and
+            the variables themselves, still the only way to tell an absent value
+            from an empty one. An argv template never sees the variables. */}
         <span className="settings-placeholders">
-          {(mode === 'script' ? command.env_vars.map((v) => `$${v}`) : command.placeholders).map(
-            (p) => (
-              <code key={p}>{p}</code>
-            ),
-          )}
+          {(mode === 'script'
+            ? [...command.placeholders, ...command.env_vars.map((v) => `$${v}`)]
+            : command.placeholders
+          ).map((p) => (
+            <code key={p}>{p}</code>
+          ))}
         </span>
         {!usingDefault && (
           <button

@@ -90,12 +90,12 @@ describe('scriptPlaceholderError', () => {
     expect(scriptPlaceholderError(COMMANDS[0], draftFrom(COMMANDS))).toBeNull()
   })
 
-  it('names the variable a script should read instead', () => {
-    const error = scriptPlaceholderError(COMMANDS[0], {
-      'todo-watcher': 'cd /repo\nclaude --name {name}',
-    })
-    expect(error).toContain('{name}')
-    expect(error).toContain('$MESA_NAME')
+  it('accepts a supported placeholder in a script — it is substituted there too', () => {
+    expect(
+      scriptPlaceholderError(COMMANDS[0], {
+        'todo-watcher': 'cd /repo\nclaude --name {name}',
+      }),
+    ).toBeNull()
   })
 
   it('leaves a script’s own ${VAR} alone', () => {

@@ -61,12 +61,21 @@ const PLACEHOLDER_ENV: Record<string, string> = {
 }
 
 /**
- * The save-time error this row would earn for using `{}` syntax in a script,
- * or `null` if it wouldn't — the client-side twin of `config::check_script`,
- * so the mistake is named as it is typed rather than only after a failed PUT.
+ * The save-time error this row would earn for naming a placeholder in a script
+ * that its action does not offer, or `null` if it wouldn't — the client-side
+ * twin of `config::check_script`'s first rule, so the mistake is named as it is
+ * typed rather than only after a failed PUT.
+ *
+ * Since mesa task 1137 a *supported* placeholder is fine in a script: it
+ * becomes a reference to the same `MESA_*` variable, wherever it sits. Only the
+ * out-of-scope name is still refused, for the reason it always was — there is
+ * no variable to point at. The server's other script rule (single quotes,
+ * `$'…'` and a quoted heredoc delimiter expand nothing, so nothing can be
+ * emitted there) has no twin here, like the `bash -n` check beside it: both
+ * need a shell lexer, and the PUT names the context it found.
  *
  * A `{` preceded by `$` is skipped, exactly as the server skips it: a script's
- * own `${MESA_NAME}` is correct usage, not the mistake being named.
+ * own `${MESA_NAME}` is bash's parameter expansion, not mesa's placeholder.
  */
 export function scriptPlaceholderError(
   command: ConfigCommand,
@@ -75,12 +84,11 @@ export function scriptPlaceholderError(
   const value = effectiveCommand(command, draft)
   if (!isScript(value)) return null
   for (const [placeholder, variable] of Object.entries(PLACEHOLDER_ENV)) {
+    if (command.env_vars.includes(variable)) continue
     let at = value.indexOf(placeholder)
     while (at !== -1) {
       if (at === 0 || value[at - 1] !== '$') {
-        return command.env_vars.includes(variable)
-          ? `${placeholder} is not substituted in a script — use $${variable} instead`
-          : `${placeholder} is not offered to ${command.action}`
+        return `${placeholder} is not offered to ${command.action}`
       }
       at = value.indexOf(placeholder, at + 1)
     }

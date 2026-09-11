@@ -4297,12 +4297,24 @@ fn spawn_live_summary(store: &mut Store, session: &LiveSession) {
         }
     };
     let prompt = live::summary_prompt(store, session.id);
+    // The library's prompts, for any `{prompt:<name>}` the template names.
+    let prompts = match library::prompts(store) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "live session {}: could not spawn its summariser: {e}",
+                session.id
+            );
+            return;
+        }
+    };
     if let Err(e) = agents::spawn_bg(
         config::LIVE_SUMMARY,
         &dir,
         Some(session.id),
         Some(&format!("{name} summary")),
         Some(&prompt),
+        &prompts,
     ) {
         eprintln!(
             "live session {}: could not spawn its summariser: {e}",
@@ -4339,12 +4351,14 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                     // has never seen. A failure here is a failed spawn like any
                     // other and goes through the same rollback below.
                     Ok((dir, name)) => live::ensure_agent_definition(&store).and_then(|_| {
+                        let prompts = library::prompts(&store).map_err(|e| e.to_string())?;
                         agents::spawn_bg(
                             config::LIVE_AGENT,
                             &dir,
                             Some(session.id),
                             Some(&name),
                             Some(&live::agent_prompt(&store, session.id)),
+                            &prompts,
                         )
                     }),
                     Err(e) => Err(e.to_string()),

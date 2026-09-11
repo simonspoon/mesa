@@ -278,6 +278,7 @@ fn spawn_for(
     id: Option<i64>,
     name: Option<&str>,
     prompt: Option<&str>,
+    prompts: &config::Prompts,
 ) -> Result<config::Spawn, String> {
     let configured = config::command_for(action)?;
     let template = match &configured {
@@ -296,6 +297,7 @@ fn spawn_for(
             id,
             name,
             prompt,
+            prompts: Some(prompts),
         },
     )
 }
@@ -331,8 +333,9 @@ pub fn spawn_bg(
     id: Option<i64>,
     name: Option<&str>,
     prompt: Option<&str>,
+    prompts: &config::Prompts,
 ) -> Result<Option<String>, String> {
-    match spawn_for(action, id, name, prompt)? {
+    match spawn_for(action, id, name, prompt, prompts)? {
         config::Spawn::Argv(argv) => spawn_argv(&argv, dir),
         config::Spawn::Script { script, env } => spawn_script(&script, &env, dir),
     }
@@ -463,6 +466,15 @@ fn spawn_script(
     let mut command = Command::new("bash");
     command.arg("-c").arg(script);
     for var in config::ALL_ENV_VARS {
+        command.env_remove(var);
+    }
+    // …and the `MESA_PROMPT_<NAME>` variables a `{prompt:<name>}` placeholder
+    // adds, which are named by the template rather than by this list (mesa
+    // task 1138). Every one of them is set again below — `config::check_script`
+    // refuses a prompt it cannot resolve — so this is belt to that braces: a
+    // variable mesa's own environment happens to hold must never be what a
+    // hook reads a prompt out of.
+    for (var, _) in env {
         command.env_remove(var);
     }
     for (var, value) in env {
@@ -794,7 +806,7 @@ JSON"#,
         name: Option<&str>,
         prompt: Option<&str>,
     ) -> Result<Vec<String>, String> {
-        match spawn_for(action, id, name, prompt)? {
+        match spawn_for(action, id, name, prompt, &config::Prompts::default())? {
             config::Spawn::Argv(argv) => Ok(argv),
             other => panic!("expected argv mode, got {other:?}"),
         }
@@ -819,6 +831,7 @@ JSON"#,
                 id,
                 name,
                 prompt,
+                ..Default::default()
             },
         )
         .unwrap()
@@ -908,6 +921,7 @@ echo "backgrounded · 5we00000 · n""#,
             Some(42),
             Some("mesa: a name with spaces"),
             None,
+            &config::Prompts::default(),
         );
         // Untouched actions still fall through to the built-in default.
         let fallback = argv_for(config::INBOX_WATCHER, Some(7), Some("n"), None).unwrap();
@@ -1028,6 +1042,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         );
         let env = config::script_env(
             config::TODO_WATCHER,
+            &script,
             &config::Vars {
                 bin: Some("claude"),
                 agent: Some("swe"),
@@ -1111,6 +1126,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // offers a prompt at all.
         let env = config::script_env(
             config::TODO_WATCHER,
+            &script,
             &config::Vars {
                 id: Some(1),
                 ..Default::default()
@@ -1168,6 +1184,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
             None,
             None,
             Some("look at the tests"),
+            &config::Prompts::default(),
         );
         unsafe { std::env::remove_var("MESA_CONFIG_FILE") };
         assert_eq!(spawned, Ok(Some("5c819701".to_string())));

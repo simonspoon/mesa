@@ -483,6 +483,53 @@ api POST "/api/projects/$C/agents" "$(jq -n --arg p "$HOSTILE_P" '{prompt: $p}')
   fail "a substituted {prompt} must arrive byte-identical bare, in \"…\" and inside \$( (…) ): $(cat "$SCRIPT_LOG")"
 ok "a supported {placeholder} in a script saves (200) and becomes a \${MESA_*} reference: a prompt of \`\"; touch <file> #\` + backticks + \$() + quotes + a trailing backslash arrives literally bare, in \"…\" and inside \$( (…) ), executing nothing"
 
+# ---- library prompts as placeholders: {prompt:<name>} (mesa task 1138) ----
+
+# Every action offers the library's prompts, and a prompt body is exactly the
+# hostile multi-line free text script mode's invariant has to survive: the body
+# travels in MESA_PROMPT_<NAME>, never in the script text.
+PWNED3="$DIR_C/pwned3"
+PROMPT_BODY='line one "quoted" `touch pwned3` $(touch pwned3) $((1+1)) '"'"'single'"'"'
+line two {prompt} {name} {prompt:other-brief} {nope}'
+# One pass, no recursion: {prompt} is offered to agent-spawn and has a value on
+# this call, so it expands; {name} is not offered to agent-spawn, a nested
+# {prompt:…} never expands, and {nope} is nobody's — all three stay literal
+# rather than erroring, because a library body is data, not a template.
+PROMPT_EXPANDED=${PROMPT_BODY//\{prompt\}/ignored}
+run 0 "$MESA" library create prompt nightly-brief --body "$PROMPT_BODY"
+run 0 "$MESA" library create prompt other-brief --body 'NEVER'
+
+# An unknown name is refused in the editor, where the author can fix it —
+# library names are known at save time.
+api PUT /api/config '{"commands": {"agent-spawn": "mytool -- {prompt:no-such-prompt}"}}'
+[ "$CODE" = "422" ] || fail "unknown library prompt: expected 422, got $CODE: $STDOUT"
+[ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] ||
+  fail "unknown library prompt: expected code validation, got $STDOUT"
+grep -q "{prompt:no-such-prompt}" <<<"$STDOUT" ||
+  fail "the message must name the missing prompt: $STDOUT"
+grep -q "{prompt:nightly-brief}" <<<"$STDOUT" ||
+  fail "the message must list the prompts the library does offer: $STDOUT"
+ok "a {prompt:<name>} naming no library prompt is 422 validation at save time, naming it and listing the ones that exist"
+
+# …and the real one saves, in a multi-line hook, and the spawned command gets
+# the body through the placeholder and through the variable alike.
+PROMPT_LOG="$TMP/prompt.log"
+: > "$PROMPT_LOG"
+PROMPT_SCRIPT=$(printf 'set -u
+printf "%%s" {prompt:nightly-brief} >> "%s"
+printf "%%s" "${MESA_PROMPT_NIGHTLY_BRIEF-}" >> "%s"
+echo "backgrounded · 5c81eeee"' "$PROMPT_LOG" "$PROMPT_LOG")
+api PUT /api/config "$(jq -n --arg s "$PROMPT_SCRIPT" '{commands: {"agent-spawn": $s}}')"
+[ "$CODE" = "200" ] || fail "a {prompt:<name>} script must save: expected 200, got $CODE: $STDOUT"
+api POST "/api/projects/$C/agents" '{"prompt":"ignored"}'
+[ "$CODE" = "201" ] || fail "library-prompt script spawn: expected 201, got $CODE: $STDOUT"
+[ ! -e "$PWNED3" ] ||
+  fail "a library prompt body was parsed as shell syntax — the placeholder leaks"
+printf '%s%s' "$PROMPT_EXPANDED" "$PROMPT_EXPANDED" > "$TMP/prompt.expected"
+cmp -s "$PROMPT_LOG" "$TMP/prompt.expected" ||
+  fail "the library prompt body must arrive byte-identical through the placeholder AND the variable: $(cat "$PROMPT_LOG")"
+ok "a multi-line hook naming {prompt:<name>} spawns with the library body byte-identical in MESA_PROMPT_<NAME> — quotes, backticks, \$(), \$((…)) and newlines all inert — with the body's own placeholders expanded exactly one pass"
+
 # A valid script round-trips through the editor and drives the next spawn.
 api PUT /api/config "$(jq -n --arg s "$SPAWN_SCRIPT" '{commands: {"agent-spawn": $s}}')"
 [ "$CODE" = "200" ] || fail "PUT a script: expected 200, got $CODE: $STDOUT"

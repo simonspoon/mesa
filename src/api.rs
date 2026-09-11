@@ -368,6 +368,15 @@ fn inbox_watcher_tick(state: &AppState) {
             .collect()
     };
 
+    // The library's prompts, for any `{prompt:<name>}` the template names
+    // (mesa task 1138) — read once for the tick, off the store lock below.
+    let prompts = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        library::prompts(&store).unwrap_or_default()
+    };
     for (id, session_name) in pending {
         // The command — including which slash command triages an item — comes
         // from `~/.mesa/config.json`'s `inbox-watcher` entry, defaulting to
@@ -378,6 +387,7 @@ fn inbox_watcher_tick(state: &AppState) {
             Some(id),
             Some(&session_name),
             None,
+            &prompts,
         ) {
             eprintln!("inbox-watcher: spawn failed for inbox item {id}: {e}");
             let mut dispatched = match state.inbox_dispatched.lock() {
@@ -862,12 +872,20 @@ fn todo_watcher_tick(state: &AppState) {
         // The command — including which slash command executes a task — comes
         // from `~/.mesa/config.json`'s `todo-watcher` entry, defaulting to
         // `claude --bg --agent supervisor … -- /execute-mesa-task <id>`.
+        // The library's prompts, for any `{prompt:<name>}` the template names
+        // (mesa task 1138) — re-read per task for the same reason the
+        // definition seed above is, and for the same cost.
+        let prompts = {
+            let store = state.store.lock().unwrap();
+            library::prompts(&store).unwrap_or_default()
+        };
         match agents::spawn_bg(
             config::TODO_WATCHER,
             &local_path,
             Some(task_id),
             Some(&session_name),
             None,
+            &prompts,
         ) {
             // The receipt's short job id is what `claude stop` takes, so
             // remembering it here is the whole of what the reaper needs
@@ -3145,6 +3163,9 @@ async fn spawn_live_agent(
     // exactly like a failed spawn — `unavailable`, and the caller ends the
     // session it just opened.
     live::ensure_agent_definition(&state.store.lock().unwrap()).map_err(agents_unavailable)?;
+    // The library's prompts, for any `{prompt:<name>}` the template names — an
+    // owned table, so it moves into the blocking closure with the rest.
+    let prompts = library::prompts(&state.store.lock().unwrap())?;
     // Two-phase like every other spawn site in this file: the store lock is
     // dropped before the blocking `claude --bg` shell-out, which would
     // otherwise freeze every other API request for its duration.
@@ -3155,6 +3176,7 @@ async fn spawn_live_agent(
             Some(session_id),
             Some(&name),
             Some(&prompt),
+            &prompts,
         )
     })
     .await
@@ -3190,6 +3212,7 @@ async fn spawn_live_summary(state: &AppState, session_id: i64, project_id: Optio
         }
     };
     let prompt = live::summary_prompt(&state.store.lock().unwrap(), session_id);
+    let prompts = library::prompts(&state.store.lock().unwrap()).unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || {
         agents::spawn_bg(
             config::LIVE_SUMMARY,
@@ -3197,6 +3220,7 @@ async fn spawn_live_summary(state: &AppState, session_id: i64, project_id: Optio
             Some(session_id),
             Some(&format!("{name} summary")),
             Some(&prompt),
+            &prompts,
         )
     })
     .await;
@@ -6272,7 +6296,11 @@ async fn update_config(
     Json(body): Json<ConfigUpdate>,
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
-    config::save_commands(&body.commands).map_err(|e| match e {
+    // A template may name a library prompt (`{prompt:<name>}`, mesa task 1138),
+    // and library names are known at save time — so an unknown one is refused
+    // here, in the editor, rather than at the next dispatch.
+    let prompts = library::prompts(&state.store.lock().unwrap())?;
+    config::save_commands(&body.commands, &prompts).map_err(|e| match e {
         config::SaveError::Validation(message) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "validation",
@@ -7002,6 +7030,7 @@ async fn spawn_project_agent(
         });
     }
     let dir = path.clone();
+    let prompts = library::prompts(&state.store.lock().unwrap())?;
     // `~/.mesa/config.json`'s `agent-spawn` entry, defaulting to
     // `claude --bg … -- <prompt>`. `job` is None when that command printed no
     // receipt — the session is still real (see `AgentSpawned`).
@@ -7012,6 +7041,7 @@ async fn spawn_project_agent(
             None,
             None,
             body.prompt.as_deref(),
+            &prompts,
         )
     })
     .await

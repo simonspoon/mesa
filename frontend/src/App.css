@@ -8054,6 +8054,23 @@ button:focus-visible,
   margin-top: 0.35rem;
 }
 
+/* The library prompts a template may name (mesa task 1138) — the same size
+   and rhythm as the two mode notes above it, since it reads as a third one. */
+.settings-prompt-placeholders {
+  margin: 0 0 1rem;
+  font-size: 0.8rem;
+}
+
+.settings-prompt-list {
+  margin: 0.25rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
+.settings-prompt-list li + li {
+  margin-top: 0.2rem;
+}
+
 /* Monospace, because it is argv — and `white-space: pre` so a run of spaces
    inside a quoted argument stays visibly what it is. */
 .settings-command-input {

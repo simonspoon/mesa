@@ -406,11 +406,18 @@ pub enum SaveError {
 ///   are preserved verbatim — the file is documented as free to grow sections
 ///   mesa doesn't know about, and an editor that silently dropped them would
 ///   break that promise.
-pub fn save_commands(updates: &HashMap<String, String>) -> Result<(), SaveError> {
-    save_commands_in(&config_file(), updates)
+pub fn save_commands(
+    updates: &HashMap<String, String>,
+    prompts: &Prompts,
+) -> Result<(), SaveError> {
+    save_commands_in(&config_file(), updates, prompts)
 }
 
-fn save_commands_in(path: &Path, updates: &HashMap<String, String>) -> Result<(), SaveError> {
+fn save_commands_in(
+    path: &Path,
+    updates: &HashMap<String, String>,
+    prompts: &Prompts,
+) -> Result<(), SaveError> {
     let mut actions: Vec<&String> = updates.keys().collect();
     actions.sort();
     for action in &actions {
@@ -422,7 +429,7 @@ fn save_commands_in(path: &Path, updates: &HashMap<String, String>) -> Result<()
         }
         let template = updates[*action].trim();
         if !template.is_empty() {
-            validate(action, template).map_err(SaveError::Validation)?;
+            validate(action, template, prompts).map_err(SaveError::Validation)?;
         }
     }
 
@@ -488,14 +495,14 @@ fn write_atomically(path: &Path, body: &str) -> Result<(), SaveError> {
 ///
 /// The point is *when* the failure lands: at save time, in the editor, rather
 /// than at the next dispatch, in a watcher log the user isn't reading.
-pub fn validate(action: &str, template: &str) -> Result<(), String> {
+pub fn validate(action: &str, template: &str, prompts: &Prompts) -> Result<(), String> {
     if is_script(template) {
         let script = template.trim();
-        check_script(action, script)?;
+        check_script(action, script, prompts)?;
         // Parse what `bash` will actually be handed — placeholders already
         // replaced by their `${MESA_…-}` references — rather than the template
         // with braces still in it, so the syntax check covers the real shape.
-        return bash_syntax_check(action, &substitute_script(action, script)?);
+        return bash_syntax_check(action, &substitute_script(action, script, prompts)?);
     }
     let vars = Vars {
         bin: Some("claude"),
@@ -503,6 +510,7 @@ pub fn validate(action: &str, template: &str) -> Result<(), String> {
         id: Some(1),
         name: Some("name"),
         prompt: Some("prompt"),
+        prompts: Some(prompts),
     };
     expand(action, template, &vars).map(|_| ())
 }
@@ -541,10 +549,10 @@ pub enum Spawn {
 pub fn resolve(action: &str, template: &str, vars: &Vars) -> Result<Spawn, String> {
     if is_script(template) {
         let script = template.trim();
-        check_script(action, script)?;
+        check_script(action, script, vars.prompts())?;
         return Ok(Spawn::Script {
-            script: substitute_script(action, script)?,
-            env: script_env(action, vars),
+            script: substitute_script(action, script, vars.prompts())?,
+            env: script_env(action, script, vars),
         });
     }
     Ok(Spawn::Argv(expand(action, template, vars)?))
@@ -590,6 +598,167 @@ pub const ALL_ENV_VARS: [&str; 5] = [
     "MESA_PROMPT",
 ];
 
+/// The `{prompt:<name>}` form's prefix — the one thing that keeps it from
+/// colliding with the built-in `{prompt}`, which has no colon.
+const PROMPT_PREFIX: &str = "prompt:";
+
+/// The prefix of the environment variable a script reads a library prompt
+/// through. `{prompt:stop-notify}` becomes `MESA_PROMPT_STOP_NOTIFY`, which can
+/// never collide with the built-in `MESA_PROMPT` — a name is non-empty, so the
+/// trailing `_` is always followed by something.
+const PROMPT_ENV_PREFIX: &str = "MESA_PROMPT_";
+
+/// The library's `prompt` items, keyed for placeholder resolution — the table
+/// `{prompt:<name>}` resolves against (mesa task 1138).
+///
+/// Built by `core::library::prompts` from the same view `mesa library list`
+/// shows, so a db row, an unshadowed built-in and a fork overriding a built-in
+/// all resolve here exactly as they do there. The type lives in this module,
+/// holding nothing but names and bodies, so `config` stays free of the library:
+/// what it needs is a lookup table, not a store.
+///
+/// Names are matched **case-insensitively**, the rule
+/// `Store::find_project_by_name` already sets for every other name an agent
+/// types. Two rows whose names differ only in case are the same key; the first
+/// in the library's own (kind, name) order wins, so the answer is deterministic
+/// rather than whichever row was inserted last.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Prompts {
+    by_name: std::collections::BTreeMap<String, String>,
+}
+
+/// The table a [`Vars`] with no prompts falls back to: every `{prompt:…}` is
+/// then an unknown name, which is an *error* — never a silent empty string.
+static NO_PROMPTS: Prompts = Prompts {
+    by_name: std::collections::BTreeMap::new(),
+};
+
+impl Prompts {
+    /// Builds the table from `(name, body)` pairs in the library's own order.
+    pub fn new<I: IntoIterator<Item = (String, String)>>(items: I) -> Self {
+        let mut by_name = std::collections::BTreeMap::new();
+        for (name, body) in items {
+            by_name.entry(name.to_lowercase()).or_insert(body);
+        }
+        Self { by_name }
+    }
+
+    /// The body of the prompt named `name`, case-insensitively.
+    pub fn body(&self, name: &str) -> Option<&str> {
+        self.by_name.get(&name.to_lowercase()).map(String::as_str)
+    }
+
+    /// The names this library offers, for the "unknown prompt" error. Already
+    /// sorted — a `BTreeMap` — so the message is stable across calls.
+    fn offered(&self) -> String {
+        if self.by_name.is_empty() {
+            return "no prompts".to_string();
+        }
+        self.by_name
+            .keys()
+            .map(|n| format!("{{prompt:{n}}}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The name in `{prompt:<name>}`, if `key` is that form at all.
+///
+/// The charset mirrors `Store`'s `validate_library_name` (`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+/// deliberately: anything that is not a name the library could hold is not a
+/// placeholder, so `{prompt: see below}` in a script stays the literal text it
+/// obviously is rather than becoming a save-time error. Drifting apart costs a
+/// library name its placeholder, never a wrong resolution — `Store`'s rule
+/// stays the authority on what a name may be.
+fn prompt_name(key: &str) -> Option<&str> {
+    let name = key.strip_prefix(PROMPT_PREFIX)?;
+    let mut chars = name.chars();
+    let head = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric());
+    let tail = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    (head && tail).then_some(name)
+}
+
+/// The environment variable a script reads this prompt through — uppercased,
+/// `-` folded to `_`. `None` when the name holds a character an environment
+/// variable cannot, which a library name may (`.`).
+fn prompt_env_var(name: &str) -> Option<String> {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .then(|| {
+            format!(
+                "{PROMPT_ENV_PREFIX}{}",
+                name.to_ascii_uppercase().replace('-', "_")
+            )
+        })
+}
+
+/// The variable name for `{prompt:<name>}`, or the reason this template cannot
+/// have it — the one place both modes ask the two questions a prompt
+/// placeholder can fail on, so argv and script mode offer exactly the same
+/// vocabulary.
+///
+/// The env-var charset is checked in **both** modes even though argv mode sets
+/// no variables: a `{prompt:my.name}` that worked in a one-line template and
+/// failed the moment the author added a second line would be a worse surprise
+/// than a name they have to rename once.
+fn prompt_resolution(action: &str, name: &str, prompts: &Prompts) -> Result<String, String> {
+    let Some(var) = prompt_env_var(name) else {
+        return Err(format!(
+            "library prompt {{prompt:{name}}} in the {action} command cannot be used as a \
+             placeholder: a script reads it as an environment variable, and {name:?} holds a \
+             character a variable name cannot — rename it to letters, digits, \"_\" and \"-\""
+        ));
+    };
+    if prompts.body(name).is_none() {
+        return Err(format!(
+            "unknown library prompt {{prompt:{name}}} in the {action} command; \
+             the library offers {}",
+            prompts.offered()
+        ));
+    }
+    Ok(var)
+}
+
+/// One pass over a resolved prompt body, no recursion: the built-in
+/// placeholders this action offers *and* has a value for on this call are
+/// replaced; everything else — an unknown name, a nested `{prompt:…}`, an
+/// offered placeholder with no value — is left exactly as written.
+///
+/// Never an error, and that is the point: a library body is **data** an agent
+/// or a person wrote, not a template the config author reviewed, so a stray
+/// brace in it must not break a hook. The one pass is what bounds it — the
+/// text this produces is never rescanned, so a body holding `{prompt:x}`
+/// cannot expand, recurse or loop.
+///
+/// In script mode this runs on the *value* that travels in the environment,
+/// which no shell ever parses, so the untrusted-input invariant is untouched.
+fn expand_body(action: &str, body: &str, vars: &Vars) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(open) = rest.find('{') {
+        let (before, from_brace) = rest.split_at(open);
+        out.push_str(before);
+        let Some(close) = from_brace.find('}') else {
+            out.push_str(from_brace);
+            return out;
+        };
+        let key = &from_brace[1..close];
+        // Only the five built-in names are ever looked up here, so this cannot
+        // reach `{prompt:…}` and cannot recurse.
+        match PLACEHOLDER_ENV
+            .iter()
+            .any(|(k, _)| *k == key)
+            .then(|| vars.lookup(key, action))
+        {
+            Some(Ok(Some(value))) => out.push_str(&value),
+            _ => out.push_str(&from_brace[..close + 1]),
+        }
+        rest = &from_brace[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The variables to set for one script call: the action's own vocabulary,
 /// minus any value that is absent on this call.
 ///
@@ -597,14 +766,36 @@ pub const ALL_ENV_VARS: [&str; 5] = [
 /// absent value leaves its variable **unset**, never set to `""`, so `set -u`
 /// fires and `${MESA_PROMPT:-}` reads as "no prompt" rather than "empty
 /// prompt".
-pub fn script_env(action: &str, vars: &Vars) -> Vec<(String, String)> {
-    PLACEHOLDER_ENV
+pub fn script_env(action: &str, script: &str, vars: &Vars) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = PLACEHOLDER_ENV
         .iter()
         .filter_map(|(key, var)| {
             let value = vars.lookup(key, action).ok()??;
             Some(((*var).to_string(), value))
         })
-        .collect()
+        .collect();
+    // The library prompts this script names, one variable each. Which ones
+    // those are is a property of the *script*, not of the action — every
+    // action offers every prompt — so the script has to be read to find them.
+    // `check_script` has already refused an unknown name and a collision, so
+    // on the spawn path each of these resolves; a missing one would leave its
+    // variable unset, which `${MESA_PROMPT_X-}` reads as empty.
+    let mut seen = std::collections::BTreeSet::new();
+    for slot in scan_script(script) {
+        let Some(name) = prompt_name(slot.key) else {
+            continue;
+        };
+        let Some(var) = prompt_env_var(name) else {
+            continue;
+        };
+        let Some(body) = vars.prompts().body(name) else {
+            continue;
+        };
+        if seen.insert(var.clone()) {
+            env.push((var, expand_body(action, body, vars)));
+        }
+    }
+    env
 }
 
 /// Rejects a script the spawn path would refuse later: an empty body, a
@@ -617,23 +808,42 @@ pub fn script_env(action: &str, vars: &Vars) -> Vec<(String, String)> {
 /// hand-edited file may hold a script that parses badly, and that surfaces as a
 /// failed spawn. Deliberate — a `bash` subprocess on every dispatch would cost
 /// more than it catches, and the failure is already visible and harmless.
-fn check_script(action: &str, script: &str) -> Result<(), String> {
+fn check_script(action: &str, script: &str, prompts: &Prompts) -> Result<(), String> {
     if script.is_empty() {
         return Err(format!("the {action} command is empty"));
     }
+    // A prompt travels in one variable of its own, so two names that fold onto
+    // the same variable (`a-b` and `a_b`) have to be stopped here: there is one
+    // slot and two bodies, and silently keeping either would be a guess.
+    let mut prompt_vars: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for slot in scan_script(script) {
         let key = slot.key;
-        let var = PLACEHOLDER_ENV
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| *v)
-            .unwrap_or_default();
-        if !offered_env_vars(action).contains(&var) {
-            return Err(format!(
-                "unsupported placeholder {{{key}}} in the {action} command; \
-                 {action} offers {}",
-                offered_list(action)
-            ));
+        if let Some(name) = prompt_name(key) {
+            let var = prompt_resolution(action, name, prompts)?;
+            let canonical = name.to_lowercase();
+            if let Some(other) = prompt_vars.insert(var.clone(), canonical.clone())
+                && other != canonical
+            {
+                return Err(format!(
+                    "{{prompt:{other}}} and {{prompt:{canonical}}} in the {action} command \
+                     both become ${var}; a script reads a prompt through that one variable, \
+                     so rename one of them"
+                ));
+            }
+        } else {
+            let var = PLACEHOLDER_ENV
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .unwrap_or_default();
+            if !offered_env_vars(action).contains(&var) {
+                return Err(format!(
+                    "unsupported placeholder {{{key}}} in the {action} command; \
+                     {action} offers {}",
+                    offered_list(action)
+                ));
+            }
         }
         // Asked of the whole stack, and asked *first*: a placeholder nested
         // inside arithmetic wears whatever context encloses it most closely,
@@ -985,16 +1195,15 @@ fn slot_at(script: &str, open: usize, ctx: Ctx, in_arith: bool) -> Option<Script
     let rest = &script[open + 1..];
     let close = rest.find('}')?;
     let key = &rest[..close];
-    PLACEHOLDER_ENV
-        .iter()
-        .any(|(k, _)| *k == key)
-        .then(|| ScriptSlot {
+    (PLACEHOLDER_ENV.iter().any(|(k, _)| *k == key) || prompt_name(key).is_some()).then(|| {
+        ScriptSlot {
             open,
             end: open + 1 + close + 1,
             key,
             ctx,
             in_arith,
-        })
+        }
+    })
 }
 
 /// Reads the heredoc delimiter a `<<` at `i` introduces into `pending` — the
@@ -1070,7 +1279,7 @@ fn read_heredoc<'a>(
 /// work with in free-form shell text. A script that must tell "absent" from
 /// "blank" reads `${MESA_NAME+set}`, since the variable itself is genuinely
 /// *unset* in that case.
-fn substitute_script(action: &str, script: &str) -> Result<String, String> {
+fn substitute_script(action: &str, script: &str, prompts: &Prompts) -> Result<String, String> {
     let mut out = String::with_capacity(script.len());
     let mut cursor = 0;
     for slot in scan_script(script) {
@@ -1093,25 +1302,31 @@ fn substitute_script(action: &str, script: &str) -> Result<String, String> {
         }
         // Both of the next two are unreachable for the same reason and fail
         // the same way: `slot_at` only ever records one of the five known
-        // names, and `check_script` has already refused a name this action does
-        // not offer. Neither may fall through — leaving `{name}` in text bash
-        // parses is the one outcome this function exists to prevent.
-        let Some((_, var)) = PLACEHOLDER_ENV.iter().find(|(k, _)| *k == slot.key) else {
-            return Err(format!(
-                "the {action} command has an unknown placeholder {{{key}}}",
-                key = slot.key
-            ));
+        // names or a `{prompt:<name>}`, and `check_script` has already refused
+        // a name this action does not offer and a prompt this library does not
+        // hold. Neither may fall through — leaving `{name}` in text bash parses
+        // is the one outcome this function exists to prevent.
+        let var = if let Some(name) = prompt_name(slot.key) {
+            prompt_resolution(action, name, prompts)?
+        } else {
+            let Some((_, var)) = PLACEHOLDER_ENV.iter().find(|(k, _)| *k == slot.key) else {
+                return Err(format!(
+                    "the {action} command has an unknown placeholder {{{key}}}",
+                    key = slot.key
+                ));
+            };
+            if !offered_env_vars(action).contains(var) {
+                return Err(format!(
+                    "unsupported placeholder {{{key}}} in the {action} command; \
+                     {action} offers {}",
+                    offered_list(action),
+                    key = slot.key
+                ));
+            }
+            (*var).to_string()
         };
-        if !offered_env_vars(action).contains(var) {
-            return Err(format!(
-                "unsupported placeholder {{{key}}} in the {action} command; \
-                 {action} offers {}",
-                offered_list(action),
-                key = slot.key
-            ));
-        }
         out.push_str(&script[cursor..slot.open]);
-        out.push_str(&slot.ctx.reference(var));
+        out.push_str(&slot.ctx.reference(&var));
         cursor = slot.end;
     }
     out.push_str(&script[cursor..]);
@@ -1158,6 +1373,21 @@ pub struct Vars<'a> {
     pub id: Option<i64>,
     pub name: Option<&'a str>,
     pub prompt: Option<&'a str>,
+    /// The library's prompts, for `{prompt:<name>}` (mesa task 1138). Unlike
+    /// the five above this is not per-call data but static library text, so
+    /// every action offers it — which is why it sits beside them rather than
+    /// in any of [`offered_placeholders`]'s per-action subsets. `None` is an
+    /// empty library: every `{prompt:…}` is then an unknown name, an error,
+    /// never a silent empty string.
+    pub prompts: Option<&'a Prompts>,
+}
+
+impl<'a> Vars<'a> {
+    /// The prompt table to resolve against — [`NO_PROMPTS`] when this call
+    /// carries none.
+    pub fn prompts(&self) -> &'a Prompts {
+        self.prompts.unwrap_or(&NO_PROMPTS)
+    }
 }
 
 impl Vars<'_> {
@@ -1165,6 +1395,19 @@ impl Vars<'_> {
     /// recognized placeholder with no value on this call. `Err` for a name
     /// this action doesn't offer at all.
     fn lookup(&self, key: &str, action: &str) -> Result<Option<String>, String> {
+        // `{prompt:<name>}` is orthogonal to the per-action vocabulary below:
+        // every action offers it, and an unknown name is an error rather than
+        // a dropped token, because a hook that silently lost its instructions
+        // is worse than one that refuses to start.
+        if let Some(name) = prompt_name(key) {
+            // The same two refusals script mode makes — an unknown name and a
+            // name no environment variable could hold — so the vocabulary is
+            // identical in both modes even though argv sets no variables.
+            prompt_resolution(action, name, self.prompts())?;
+            // `prompt_resolution` has already established the body is there.
+            let body = self.prompts().body(name).unwrap_or_default();
+            return Ok(Some(expand_body(action, body, self)));
+        }
         let (offered, value) = match key {
             "bin" => (true, self.bin.map(str::to_string)),
             "agent" => (true, self.agent.map(str::to_string)),
@@ -3344,6 +3587,24 @@ mod tests {
         assert!(err.contains("malformed mesa config"), "{err}");
     }
 
+    /// `save_commands_in` with an empty prompt library — what every test that
+    /// is not about `{prompt:<name>}` wants. The two that *are* call the real
+    /// one with a table of their own.
+    fn save_in(path: &Path, updates: &HashMap<String, String>) -> Result<(), SaveError> {
+        save_commands_in(path, updates, &Prompts::default())
+    }
+
+    /// [`validate`] with an empty prompt library, for the same reason.
+    fn validate_(action: &str, template: &str) -> Result<(), String> {
+        validate(action, template, &Prompts::default())
+    }
+
+    /// [`script_env`] over a script with no `{prompt:<name>}` in it, so the
+    /// pre-1138 two-argument shape still reads at a glance.
+    fn script_env_(action: &str, vars: &Vars) -> Vec<(String, String)> {
+        script_env(action, "", vars)
+    }
+
     fn update(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -3404,7 +3665,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The file need not exist yet — nor its parent directory.
         let path = dir.path().join("nested").join("config.json");
-        save_commands_in(&path, &update(&[(AGENT_SPAWN, "  mytool -- {prompt}  ")])).unwrap();
+        save_in(&path, &update(&[(AGENT_SPAWN, "  mytool -- {prompt}  ")])).unwrap();
         // Stored trimmed, and visible to the ordinary read path immediately.
         assert_eq!(
             command_in(&path, AGENT_SPAWN).unwrap().as_deref(),
@@ -3420,7 +3681,7 @@ mod tests {
             dir.path(),
             r#"{"other": {"x": 1}, "commands": {"todo-watcher": "mytool {id}"}}"#,
         );
-        save_commands_in(&path, &update(&[(INBOX_WATCHER, "mytool triage {id}")])).unwrap();
+        save_in(&path, &update(&[(INBOX_WATCHER, "mytool triage {id}")])).unwrap();
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         // A section mesa knows nothing about survives the edit verbatim.
@@ -3436,7 +3697,7 @@ mod tests {
             dir.path(),
             r#"{"commands": {"todo-watcher": "mytool {id}", "agent-spawn": "mytool"}}"#,
         );
-        save_commands_in(&path, &update(&[(TODO_WATCHER, "   ")])).unwrap();
+        save_in(&path, &update(&[(TODO_WATCHER, "   ")])).unwrap();
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         // Removed, not stored blank: the default is expressed by absence.
@@ -3451,20 +3712,19 @@ mod tests {
         let before = r#"{"commands": {"todo-watcher": "mytool {id}"}}"#;
         let path = write_config(dir.path(), before);
         // Unsupported placeholder for this action…
-        let err =
-            save_commands_in(&path, &update(&[(TODO_WATCHER, "mytool {prompt}")])).unwrap_err();
+        let err = save_in(&path, &update(&[(TODO_WATCHER, "mytool {prompt}")])).unwrap_err();
         assert!(
             matches!(&err, SaveError::Validation(m) if m.contains("unsupported placeholder")),
             "{err:?}"
         );
         // …an unterminated quote…
-        let err = save_commands_in(&path, &update(&[(AGENT_SPAWN, "mytool \"oops")])).unwrap_err();
+        let err = save_in(&path, &update(&[(AGENT_SPAWN, "mytool \"oops")])).unwrap_err();
         assert!(
             matches!(&err, SaveError::Validation(m) if m.contains("unterminated")),
             "{err:?}"
         );
         // …and a key mesa doesn't configure.
-        let err = save_commands_in(&path, &update(&[("tsak", "mytool")])).unwrap_err();
+        let err = save_in(&path, &update(&[("tsak", "mytool")])).unwrap_err();
         assert!(
             matches!(&err, SaveError::Validation(m) if m.contains("unknown command")),
             "{err:?}"
@@ -3479,7 +3739,7 @@ mod tests {
         let before = r#"{"commands": {}}"#;
         let path = write_config(dir.path(), before);
         // One good entry, one bad one — the good one must not land either.
-        let err = save_commands_in(
+        let err = save_in(
             &path,
             &update(&[(TODO_WATCHER, "mytool {id}"), (AGENT_SPAWN, "mytool {id}")]),
         )
@@ -3492,7 +3752,7 @@ mod tests {
     fn save_commands_refuses_a_malformed_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), "not json");
-        let err = save_commands_in(&path, &update(&[(TODO_WATCHER, "mytool {id}")])).unwrap_err();
+        let err = save_in(&path, &update(&[(TODO_WATCHER, "mytool {id}")])).unwrap_err();
         // Unavailable, not validation: the user's template was fine, the file
         // on this machine isn't — and overwriting it would destroy content.
         assert!(
@@ -3506,7 +3766,7 @@ mod tests {
     fn saved_templates_expand_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        save_commands_in(
+        save_in(
             &path,
             &update(&[(TODO_WATCHER, r#"mytool --name {name} -- "/go {id}""#)]),
         )
@@ -3615,6 +3875,7 @@ mod tests {
             id: Some(12),
             name: Some("mesa live 12"),
             prompt: Some("listen; then say \"hi\""),
+            prompts: None,
         };
         assert_eq!(
             expand(LIVE_AGENT, DEFAULT_LIVE_AGENT, &live).unwrap(),
@@ -3795,7 +4056,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            script_env(AGENT_SPAWN, &spawn),
+            script_env_(AGENT_SPAWN, &spawn),
             [
                 ("MESA_BIN".to_string(), "claude".to_string()),
                 ("MESA_PROMPT".to_string(), "p".to_string()),
@@ -3808,10 +4069,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            script_env(TODO_WATCHER, &bare),
+            script_env_(TODO_WATCHER, &bare),
             [("MESA_BIN".to_string(), "claude".to_string())]
         );
-        assert_eq!(script_env(AGENT_SPAWN, &bare).len(), 1);
+        assert_eq!(script_env_(AGENT_SPAWN, &bare).len(), 1);
     }
 
     #[test]
@@ -3841,12 +4102,12 @@ mod tests {
             Some("fix the parser")
         );
         assert_eq!(
-            validate(TODO_WATCHER, "cd /repo\nexec {bin} --name {name}"),
+            validate_(TODO_WATCHER, "cd /repo\nexec {bin} --name {name}"),
             Ok(())
         );
         // A placeholder this action doesn't offer is still a save-time error,
         // on both the editor's path and the spawn path.
-        let err = validate(TODO_WATCHER, "cd /repo\nclaude -- {prompt}").unwrap_err();
+        let err = validate_(TODO_WATCHER, "cd /repo\nclaude -- {prompt}").unwrap_err();
         assert!(err.contains("unsupported placeholder"), "{err}");
         let err = resolve(TODO_WATCHER, "cd /repo\nclaude -- {prompt}", &vars).unwrap_err();
         assert!(err.contains("unsupported placeholder"), "{err}");
@@ -3905,7 +4166,7 @@ mod tests {
             "cd /repo\necho '{id: 1}' | tee out.json",
             "cd /repo\necho {foo} {bin: 1}",
         ] {
-            assert_eq!(validate(TODO_WATCHER, script), Ok(()), "{script}");
+            assert_eq!(validate_(TODO_WATCHER, script), Ok(()), "{script}");
             let Spawn::Script { script: out, .. } =
                 resolve(TODO_WATCHER, script, &Vars::default()).unwrap()
             else {
@@ -4033,7 +4294,7 @@ mod tests {
         // (1) `$'…'` is ANSI-C quoting, not a single-quoted string. It is now a
         // refusal, since no expansion happens there at all.
         let poc1 = format!("true\nprintf '%s' $'{{name}}' > {log_arg}");
-        let err = validate(TODO_WATCHER, &poc1).unwrap_err();
+        let err = validate_(TODO_WATCHER, &poc1).unwrap_err();
         assert!(err.contains("ANSI-C"), "{err}");
         assert!(
             resolve(TODO_WATCHER, &poc1, &Vars::default()).is_err(),
@@ -4107,7 +4368,7 @@ mod tests {
             ("set -eu\ncat <<'END'\n{name}\nEND", "delimiter is quoted"),
             ("set -eu\necho `id {name}`", "command substitution"),
         ] {
-            let err = validate(TODO_WATCHER, script).unwrap_err();
+            let err = validate_(TODO_WATCHER, script).unwrap_err();
             assert!(err.contains("{name}"), "{script}: {err}");
             assert!(err.contains(place), "{script}: {err}");
             assert!(
@@ -4123,7 +4384,7 @@ mod tests {
             "set -eu\ncat <<EOF\nhello\nEOF\necho {name}",
             "set -eu\necho 'quoted' {name}",
         ] {
-            assert_eq!(validate(TODO_WATCHER, ok), Ok(()), "{ok}");
+            assert_eq!(validate_(TODO_WATCHER, ok), Ok(()), "{ok}");
         }
     }
 
@@ -4164,7 +4425,7 @@ mod tests {
         // the main loop sees the `{`, so this used to be the one spot where a
         // placeholder neither expanded nor errored — it just stayed as braces.
         let script = "true\ncat <<{name}\nhello\n{name}";
-        let err = validate(TODO_WATCHER, script).unwrap_err();
+        let err = validate_(TODO_WATCHER, script).unwrap_err();
         assert!(err.contains("{name}"), "{err}");
         assert!(err.contains("delimiter word"), "{err}");
         assert!(
@@ -4176,11 +4437,11 @@ mod tests {
             "true\ncat <<-{name}\nhello\n{name}",
             "true\ncat <<'{name}'\nhello\n{name}",
         ] {
-            assert!(validate(TODO_WATCHER, script).is_err(), "{script}");
+            assert!(validate_(TODO_WATCHER, script).is_err(), "{script}");
         }
         // …while a fixed delimiter with a placeholder in the *body* is fine.
         assert_eq!(
-            validate(TODO_WATCHER, "true\ncat <<EOF\n{name}\nEOF"),
+            validate_(TODO_WATCHER, "true\ncat <<EOF\n{name}\nEOF"),
             Ok(())
         );
     }
@@ -4199,7 +4460,7 @@ mod tests {
             // where the bare form would otherwise have gone in.
             "true\ncat <<EOF\n$(( {id} ))\nEOF",
         ] {
-            let err = validate(TODO_WATCHER, script).unwrap_err();
+            let err = validate_(TODO_WATCHER, script).unwrap_err();
             assert!(err.contains("{id}"), "{script}: {err}");
             assert!(err.contains("arithmetic"), "{script}: {err}");
             assert!(
@@ -4244,7 +4505,7 @@ mod tests {
             "true\necho $(( $(echo $(echo {name})) ))",
             "true\n(( n = $( (echo {name}) ) ))",
         ] {
-            let err = validate(TODO_WATCHER, script).unwrap_err();
+            let err = validate_(TODO_WATCHER, script).unwrap_err();
             assert!(err.contains("{name}"), "{script}: {err}");
             assert!(err.contains("arithmetic"), "{script}: {err}");
             assert!(
@@ -4255,7 +4516,7 @@ mod tests {
         // Leaving arithmetic must clear it again — the flag is positional, not
         // sticky for the rest of the script.
         assert_eq!(
-            validate(TODO_WATCHER, "true\nn=$(( 1 + 1 ))\necho {name}"),
+            validate_(TODO_WATCHER, "true\nn=$(( 1 + 1 ))\necho {name}"),
             Ok(())
         );
     }
@@ -4268,7 +4529,7 @@ mod tests {
             ("true\necho $(( {name} ))", "MESA_ID"),
             ("true\necho $(( {id} ))", "MESA_NAME"),
         ] {
-            let err = validate(TODO_WATCHER, script).unwrap_err();
+            let err = validate_(TODO_WATCHER, script).unwrap_err();
             assert!(!err.contains(wrong), "{script}: {err}");
             assert!(err.contains("MESA_*"), "{script}: {err}");
         }
@@ -4355,7 +4616,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(resolve(TODO_WATCHER, script, &vars).is_err(), "{script}");
-            assert!(validate(TODO_WATCHER, script).is_err(), "{script}");
+            assert!(validate_(TODO_WATCHER, script).is_err(), "{script}");
         }
         assert!(!pwned.exists());
     }
@@ -4389,7 +4650,7 @@ mod tests {
             // UTF-8 either side, including right after a backslash skip
             "true\necho ümläut \\é {name} ✓",
         ] {
-            assert_eq!(validate(TODO_WATCHER, script), Ok(()), "{script}");
+            assert_eq!(validate_(TODO_WATCHER, script), Ok(()), "{script}");
             let Spawn::Script { script: out, .. } = resolve(
                 TODO_WATCHER,
                 script,
@@ -4409,7 +4670,7 @@ mod tests {
         // predicted the delimiter would never match, refusing every later
         // placeholder — it fails *safe* either way, but measured, it works.)
         let crlf = "true\r\ncat <<EOF\r\nhi\r\nEOF\r\necho {name}";
-        assert_eq!(validate(TODO_WATCHER, crlf), Ok(()));
+        assert_eq!(validate_(TODO_WATCHER, crlf), Ok(()));
         let Spawn::Script { script: out, .. } = resolve(
             TODO_WATCHER,
             crlf,
@@ -4428,7 +4689,7 @@ mod tests {
     fn a_script_with_a_bash_syntax_error_is_refused_at_save_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let err = save_commands_in(
+        let err = save_in(
             &path,
             &update(&[(TODO_WATCHER, "cd /repo\nif true; then\necho stuck")]),
         )
@@ -4440,7 +4701,7 @@ mod tests {
         assert!(!path.exists(), "a rejected save must write nothing");
         // A well-formed script round-trips and stays a script on the way back.
         let script = "cd /repo\nexec \"$MESA_BIN\" --bg -- \"work on $MESA_ID\"";
-        save_commands_in(&path, &update(&[(TODO_WATCHER, script)])).unwrap();
+        save_in(&path, &update(&[(TODO_WATCHER, script)])).unwrap();
         let stored = command_in(&path, TODO_WATCHER).unwrap().unwrap();
         assert_eq!(stored, script);
         assert!(is_script(&stored));
@@ -4453,7 +4714,7 @@ mod tests {
             dir.path(),
             r#"{"commands": {"todo-watcher": "cd /repo\nexec claude"}}"#,
         );
-        save_commands_in(&path, &update(&[(TODO_WATCHER, "\n  \n")])).unwrap();
+        save_in(&path, &update(&[(TODO_WATCHER, "\n  \n")])).unwrap();
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(written["commands"].get(TODO_WATCHER).is_none());
@@ -4613,7 +4874,7 @@ mod tests {
         assert_eq!(written["other"]["x"], 1);
         assert_eq!(written["pricing"]["claude-opus"]["output"], 2.0);
         // …and the commands saver leaves the pricing section alone in turn.
-        save_commands_in(&path, &update(&[(INBOX_WATCHER, "mytool triage {id}")])).unwrap();
+        save_in(&path, &update(&[(INBOX_WATCHER, "mytool triage {id}")])).unwrap();
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["pricing"]["claude-opus"]["output"], 2.0);
@@ -4787,7 +5048,7 @@ mod tests {
         save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(7))])).unwrap();
         assert_eq!(survives("watchers")["watchers"][TODO_CONCURRENCY], 7);
         // …and each of the other savers leaves `watchers` alone.
-        save_commands_in(&path, &update(&[("todo-watcher", "mytool run {id}")])).unwrap();
+        save_in(&path, &update(&[("todo-watcher", "mytool run {id}")])).unwrap();
         assert_eq!(survives("commands")["watchers"][TODO_CONCURRENCY], 7);
         save_pricing_in(
             &path,
@@ -5607,5 +5868,351 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    // ------------------------------------------------------------------
+    // Library prompts as placeholders — `{prompt:<name>}` (mesa task 1138)
+    // ------------------------------------------------------------------
+
+    /// A prompt table from `(name, body)` pairs, standing in for the library
+    /// view `core::library::prompts` builds (tested there, against a store).
+    fn prompts(pairs: &[(&str, &str)]) -> Prompts {
+        Prompts::new(
+            pairs
+                .iter()
+                .map(|(n, b)| ((*n).to_string(), (*b).to_string())),
+        )
+    }
+
+    #[test]
+    fn a_hostile_prompt_body_never_reaches_the_shell() {
+        // The test that matters most, and the whole reason a prompt body is
+        // not spliced into a template: a library body is free text somebody
+        // else wrote, and it is exactly the shape task 1137's invariant has to
+        // survive. Argv mode: one argument, byte-identical. Script mode: the
+        // script text holds only the `${MESA_PROMPT_*-}` reference and not one
+        // byte of the body, and the body reaches the child's environment
+        // unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("out");
+        let pwned = dir.path().join("pwned");
+        let bodies = [
+            format!("\"; touch {}; \"", pwned.display()),
+            format!("'; touch {}; '", pwned.display()),
+            format!("$(touch {})", pwned.display()),
+            format!("`touch {}`", pwned.display()),
+            "$((1+1)) ${HOME} $HOME".to_string(),
+            "a literal \\n escape".to_string(),
+            "line one\nline two\nline three".to_string(),
+            "back\\slash \"and\" 'quotes' * ? [a-z]".to_string(),
+        ];
+        for body in &bodies {
+            let table = prompts(&[("brief", body)]);
+
+            // argv: one argument, byte-identical.
+            let vars = Vars {
+                bin: Some("claude"),
+                prompts: Some(&table),
+                ..Default::default()
+            };
+            assert_eq!(
+                expand(AGENT_SPAWN, "{bin} -- {prompt:brief}", &vars).unwrap(),
+                vec!["claude".to_string(), "--".to_string(), body.clone()],
+                "argv mode mangled {body:?}"
+            );
+
+            // script: the reference, never the value — and a real bash run
+            // that gives the body straight back.
+            let template = format!("true\nprintf '%s' {{prompt:brief}} > {}", log.display());
+            let Spawn::Script { script, env } = resolve(TODO_WATCHER, &template, &vars).unwrap()
+            else {
+                panic!("expected a script");
+            };
+            assert!(
+                script.contains("\"${MESA_PROMPT_BRIEF-}\""),
+                "the reference is missing: {script}"
+            );
+            for line in body.lines().filter(|l| !l.is_empty()) {
+                assert!(
+                    !script.contains(line),
+                    "the body reached the shell source: {script}"
+                );
+            }
+            assert_eq!(
+                env.iter()
+                    .find(|(v, _)| v == "MESA_PROMPT_BRIEF")
+                    .map(|(_, v)| v.as_str()),
+                Some(body.as_str()),
+                "the env handoff mangled {body:?}"
+            );
+            assert_eq!(&run_resolved(&template, &vars, &log), body);
+            assert!(!pwned.exists(), "the injected command ran: {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_name_matches_case_insensitively() {
+        // `Store::find_project_by_name`'s rule, for the same reason: an agent
+        // types a name, and case is not what it meant to say.
+        let table = prompts(&[("Nightly-Brief", "read the board")]);
+        let vars = Vars {
+            bin: Some("claude"),
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        for written in ["Nightly-Brief", "nightly-brief", "NIGHTLY-BRIEF"] {
+            assert_eq!(
+                expand(
+                    AGENT_SPAWN,
+                    &format!("{{bin}} -- {{prompt:{written}}}"),
+                    &vars
+                )
+                .unwrap(),
+                ["claude", "--", "read the board"],
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_prompt_body_resolves_to_nothing_rather_than_failing() {
+        // An empty body is a legal library row, so it is a legal placeholder:
+        // the empty string, in argv as one (empty) argument and in script mode
+        // as an empty variable. It is *not* the argv drop rule — that belongs
+        // to a value this call does not have, and this call has one.
+        let table = prompts(&[("blank", "")]);
+        let vars = Vars {
+            bin: Some("claude"),
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        assert_eq!(
+            expand(AGENT_SPAWN, "{bin} -- {prompt:blank}", &vars).unwrap(),
+            ["claude", "--", ""]
+        );
+        let Spawn::Script { env, .. } =
+            resolve(TODO_WATCHER, "true\necho {prompt:blank}", &vars).unwrap()
+        else {
+            panic!("expected a script");
+        };
+        assert_eq!(
+            env.iter()
+                .find(|(v, _)| v == "MESA_PROMPT_BLANK")
+                .map(|(_, v)| v.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_unknown_prompt_is_refused_at_save_time_and_at_spawn_time() {
+        // Save time is where this belongs — library names are known then, and
+        // the editor is where the author can fix it…
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let table = prompts(&[("nightly", "read the board")]);
+        let err = save_commands_in(
+            &path,
+            &update(&[(TODO_WATCHER, "mytool -- {prompt:missing}")]),
+            &table,
+        )
+        .unwrap_err();
+        let SaveError::Validation(message) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains("{prompt:missing}"), "{message}");
+        assert!(message.contains("{prompt:nightly}"), "{message}");
+        assert!(!path.exists(), "a refused save wrote the file");
+
+        // …but a row deleted since the save must be a hard error on the spawn
+        // path too, never a silently empty prompt.
+        let vars = Vars {
+            bin: Some("claude"),
+            prompts: Some(&prompts(&[])),
+            ..Default::default()
+        };
+        let err = expand(TODO_WATCHER, "{bin} -- {prompt:nightly}", &vars).unwrap_err();
+        assert!(err.contains("{prompt:nightly}"), "{err}");
+        assert!(err.contains("no prompts"), "{err}");
+        let err = resolve(TODO_WATCHER, "true\necho {prompt:nightly}", &vars).unwrap_err();
+        assert!(err.contains("{prompt:nightly}"), "{err}");
+    }
+
+    #[test]
+    fn a_prompt_body_expands_its_own_placeholders_exactly_once() {
+        // One pass, no recursion: an offered built-in with a value on this call
+        // is replaced; a nested `{prompt:…}`, a placeholder this action does
+        // not offer and an unknown brace are all left literal — a library body
+        // is data somebody wrote, not a template the config author reviewed, so
+        // it must never break a hook.
+        let table = prompts(&[
+            (
+                "brief",
+                "task {id} ({name}) — {prompt:other} {prompt} {nope}",
+            ),
+            ("other", "NEVER"),
+        ]);
+        let vars = Vars {
+            bin: Some("claude"),
+            id: Some(7),
+            name: Some("A: do it"),
+            prompt: Some("ignored"),
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        // todo-watcher offers {id}/{name} but not {prompt}.
+        let argv = expand(TODO_WATCHER, "{bin} -- {prompt:brief}", &vars).unwrap();
+        assert_eq!(
+            argv,
+            [
+                "claude",
+                "--",
+                "task 7 (A: do it) — {prompt:other} {prompt} {nope}",
+            ]
+        );
+        // Script mode expands in the env var's *value*, which no shell parses.
+        let Spawn::Script { script, env } =
+            resolve(TODO_WATCHER, "true\necho {prompt:brief}", &vars).unwrap()
+        else {
+            panic!("expected a script");
+        };
+        assert!(script.contains("\"${MESA_PROMPT_BRIEF-}\""), "{script}");
+        assert_eq!(
+            env.iter()
+                .find(|(v, _)| v == "MESA_PROMPT_BRIEF")
+                .map(|(_, v)| v.as_str()),
+            Some("task 7 (A: do it) — {prompt:other} {prompt} {nope}")
+        );
+    }
+
+    #[test]
+    fn two_prompt_names_that_fold_onto_one_variable_are_refused_at_save_time() {
+        // A script reads a prompt through one variable, and `a-b` and `a_b`
+        // both name `MESA_PROMPT_A_B`. Two bodies, one slot — mesa refuses
+        // rather than guessing which the author meant.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let table = prompts(&[("a-b", "dash"), ("a_b", "under")]);
+        let err = save_commands_in(
+            &path,
+            &update(&[(TODO_WATCHER, "true\necho {prompt:a-b} {prompt:a_b}")]),
+            &table,
+        )
+        .unwrap_err();
+        let SaveError::Validation(message) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains("{prompt:a-b}"), "{message}");
+        assert!(message.contains("{prompt:a_b}"), "{message}");
+        assert!(message.contains("$MESA_PROMPT_A_B"), "{message}");
+        assert!(!path.exists(), "a refused save wrote the file");
+
+        // The same name twice — including in two spellings of the same case —
+        // is one variable and perfectly fine.
+        save_commands_in(
+            &path,
+            &update(&[(TODO_WATCHER, "true\necho {prompt:a-b} {prompt:A-B}")]),
+            &table,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_prompt_name_no_environment_variable_could_hold_is_refused() {
+        // A library name may hold a `.`; an environment variable may not. The
+        // refusal is the same in both modes, so a one-line template and the
+        // two-line one it grows into offer the same vocabulary.
+        let table = prompts(&[("my.brief", "text")]);
+        let vars = Vars {
+            bin: Some("claude"),
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        for template in ["{bin} -- {prompt:my.brief}", "true\necho {prompt:my.brief}"] {
+            let err = resolve(TODO_WATCHER, template, &vars).unwrap_err();
+            assert!(err.contains("my.brief"), "{err}");
+            assert!(err.contains("environment variable"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_library_prompt_is_offered_by_every_action() {
+        // The sibling of `placeholders_are_scoped_to_the_action`: the built-in
+        // vocabulary is per-call data and therefore scoped, while a library
+        // prompt is static text every spawn may quote — so it is a second,
+        // orthogonal form rather than another entry in the per-action subsets,
+        // and it is *not* advertised in `offered_placeholders`.
+        let table = prompts(&[("brief", "read the board")]);
+        let vars = Vars {
+            bin: Some("claude"),
+            id: Some(1),
+            name: Some("n"),
+            prompt: Some("p"),
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        for action in ACTIONS {
+            assert_eq!(
+                expand(action, "{bin} -- {prompt:brief}", &vars).unwrap(),
+                ["claude", "--", "read the board"],
+                "{action}"
+            );
+            assert!(
+                !offered_placeholders(action).contains(&"{prompt:brief}"),
+                "{action} advertises a library name"
+            );
+        }
+        // And a colon-free `{prompt}` keeps its own per-action scoping.
+        let err = expand(TODO_WATCHER, "{bin} {prompt}", &vars).unwrap_err();
+        assert!(err.contains("{prompt}"), "{err}");
+    }
+
+    #[test]
+    fn a_prompt_placeholder_obeys_every_shell_refusal_the_builtins_do() {
+        // Not special-cased: the contexts a value cannot be substituted into
+        // refuse a `{prompt:…}` exactly as they refuse a `{name}`.
+        let table = prompts(&[("brief", "text")]);
+        let vars = Vars {
+            prompts: Some(&table),
+            ..Default::default()
+        };
+        for (template, fragment) in [
+            ("true\necho '{prompt:brief}'", "single quotes"),
+            ("true\necho $'{prompt:brief}'", "ANSI-C"),
+            (
+                "true\ncat <<'EOF'\n{prompt:brief}\nEOF",
+                "delimiter is quoted",
+            ),
+            ("true\necho `{prompt:brief}`", "command substitution"),
+            ("true\necho $(( {prompt:brief} ))", "arithmetic"),
+            (
+                "true\ncat <<{prompt:brief}\nx\n{prompt:brief}",
+                "delimiter word",
+            ),
+        ] {
+            let err = resolve(TODO_WATCHER, template, &vars).unwrap_err();
+            assert!(err.contains(fragment), "{template}: {err}");
+            assert!(err.contains("{prompt:brief}"), "{template}: {err}");
+        }
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_prompt_placeholder_stays_literal() {
+        // The lexer's existing rule, extended: anything that is not a name the
+        // library could hold is not a placeholder at all, so ordinary prose in
+        // a script body is still ordinary prose.
+        let vars = Vars {
+            prompts: Some(&prompts(&[])),
+            ..Default::default()
+        };
+        let Spawn::Script { script, .. } = resolve(
+            TODO_WATCHER,
+            "true\necho '{prompt: see below}' ${prompt:-x}",
+            &vars,
+        )
+        .unwrap() else {
+            panic!("expected a script");
+        };
+        assert!(script.contains("{prompt: see below}"), "{script}");
+        assert!(script.contains("${prompt:-x}"), "{script}");
     }
 }

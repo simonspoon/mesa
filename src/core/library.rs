@@ -19,6 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::core::config;
 use crate::core::store::{Error, LibraryPatch, Result as StoreResult, Store};
 use crate::core::types::{
     LibraryBundle, LibraryBundleItem, LibraryDiffKind, LibraryDiffLine, LibraryHookRegistration,
@@ -478,6 +479,26 @@ pub fn effective_items(store: &Store, project: Option<i64>) -> StoreResult<Vec<L
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(items)
+}
+
+/// The library's `prompt` items as the table a hook template resolves
+/// `{prompt:<name>}` against (mesa task 1138, `docs/config.md`).
+///
+/// Built from [`effective_items`] — the same view `mesa library list` shows —
+/// so a db row, an unshadowed built-in and a fork overriding a built-in all
+/// resolve here exactly as they read there, and an author who edits a built-in
+/// prompt on `#/library` sees the next spawn use the edit.
+///
+/// Unscoped (`project: None`): a config template is one machine's, not one
+/// project's, and the four watchers that spawn from it run wherever the task
+/// happens to live.
+pub fn prompts(store: &Store) -> StoreResult<config::Prompts> {
+    Ok(config::Prompts::new(
+        effective_items(store, None)?
+            .into_iter()
+            .filter(|item| item.kind == LibraryKind::Prompt)
+            .map(|item| (item.name, item.body)),
+    ))
 }
 
 /// A file over this size, when read for a sync comparison, is treated as
@@ -2755,6 +2776,69 @@ mod tests {
         assert_eq!(matches.len(), 1, "a fork must shadow, not duplicate");
         assert!(!matches[0].builtin);
         assert_eq!(matches[0].body, "a custom definition");
+    }
+
+    #[test]
+    fn prompts_resolve_from_a_row_an_unshadowed_builtin_and_a_fork() {
+        // The `{prompt:<name>}` table is the view `mesa library list` shows
+        // (mesa task 1138), so all three ways a library item can exist have to
+        // reach a hook template — and only `prompt` items do.
+        let (mut store, _dir) = temp_store();
+
+        // An ordinary db row…
+        store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "nightly-brief",
+                "read the board and report",
+                None,
+            )
+            .unwrap();
+        // …and an item of another kind, which must not be offered as a prompt.
+        store
+            .create_library_item(
+                LibraryKind::Skill,
+                LibraryScope::User,
+                None,
+                "not-a-prompt",
+                "skill body",
+                None,
+            )
+            .unwrap();
+
+        let table = prompts(&store).unwrap();
+        assert_eq!(
+            table.body("nightly-brief"),
+            Some("read the board and report")
+        );
+        assert_eq!(
+            table.body("NIGHTLY-BRIEF"),
+            Some("read the board and report")
+        );
+        assert_eq!(table.body("not-a-prompt"), None);
+        // The unshadowed built-in prompt resolves to its code body.
+        assert_eq!(
+            table.body("live-summary-prompt"),
+            Some(crate::core::live::SUMMARY_PROMPT)
+        );
+
+        // Forking that built-in *replaces* what a template resolves to.
+        store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "live-summary-prompt",
+                "my own summary instructions",
+                Some("live-summary-prompt"),
+            )
+            .unwrap();
+        assert_eq!(
+            prompts(&store).unwrap().body("live-summary-prompt"),
+            Some("my own summary instructions")
+        );
     }
 
     #[test]

@@ -148,6 +148,63 @@ Two rules cover the edges:
 A `{` that opens nothing is a literal brace, and a placeholder may sit inside a
 larger token (`--name mesa-{id}`).
 
+### `{prompt:<name>}` — a library prompt
+
+**Every action also offers the library's prompts** (mesa task 1138):
+`{prompt:<name>}` resolves to the body of the library item of kind `prompt`
+named `<name>` — the same view `mesa library list` and `#/library` show, so a db
+row, an unshadowed built-in and a **fork overriding** a built-in all work, and
+editing the prompt on that page changes what the next spawn runs with no config
+edit at all. The Settings page lists this install's prompts beside the
+placeholder vocabulary, live.
+
+It cannot collide with the built-in `{prompt}`, which has no colon. Unlike the
+five above it is **not** scoped to a subset of the actions: those are per-call
+data a given spawn may not have, while a library prompt is static text any spawn
+may quote.
+
+- **Name matching is case-insensitive exact** — `{prompt:Nightly-Brief}` and
+  `{prompt:nightly-brief}` are the same prompt, the rule
+  `mesa project resolve` already uses for a project name.
+- **An unknown name is an error, never an empty string.** At save time
+  (`PUT /api/config`, the Settings page) that is a `validation` / 422 naming the
+  missing prompt and listing the ones the library has — library names are known
+  then, so the failure belongs in the editor. If the row is deleted *after* the
+  save, the next spawn fails the same way rather than starting an agent with its
+  instructions silently missing.
+- **An empty body is legal** and resolves to the empty string. An empty body is
+  a real library row, so it is a real value — this is *not* the drop rule above,
+  which is about a value this call does not have.
+- **A prompt body may itself hold placeholders, expanded exactly one pass.**
+  Within the resolved body the five built-ins are replaced with their values for
+  this call — but only those the action offers and has a value for. Anything
+  else is left **literal and is never an error**: an unknown `{foo}`, a
+  placeholder the action does not offer, and a nested `{prompt:other}` all come
+  through as written. A library body is data somebody wrote, not a template the
+  config author reviewed, so a stray brace in it must never break a hook; one
+  pass is what makes recursion impossible.
+- **In argv mode the body is one argument**, substituted after tokenization
+  exactly like every other placeholder — however many lines, quotes or
+  backticks it holds.
+- **In script mode the body travels in the environment**, like every built-in:
+  `{prompt:nightly-brief}` becomes a reference to `${MESA_PROMPT_NIGHTLY_BRIEF-}`,
+  quoted to suit where you put it, and the body is set on the child. The
+  variable name is `MESA_PROMPT_` + the name uppercased with `-` folded to `_`.
+  Every refusal script mode already makes — `'…'`, `$'…'`, a quoted heredoc
+  delimiter, backticks, arithmetic, a heredoc's delimiter word — applies to this
+  form identically; it is not special-cased.
+- **Two names that fold onto one variable are a save-time error.** `a-b` and
+  `a_b` both become `MESA_PROMPT_A_B`; there is one slot and two bodies, so mesa
+  refuses rather than guessing. The same name written in two cases is one
+  variable and is fine.
+- **A name no environment variable could hold is refused**, in *both* modes. A
+  library name may contain `.`; a variable name may not. The refusal is the same
+  in argv mode even though it sets no variables, so a one-line template and the
+  two-line one it grows into offer the same vocabulary.
+
+Anything that is not a name the library could hold is not a placeholder at all,
+so `{prompt: see below}` in a script body is the literal prose it looks like.
+
 ## Script mode
 
 **A value whose trimmed text contains a newline is a bash script**, run as

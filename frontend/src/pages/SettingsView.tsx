@@ -8,6 +8,7 @@ import {
   getSpeech,
   getSystemInfo,
   getWatchers,
+  listLibrary,
   listProjects,
   resetCcIndex,
   restartServer,
@@ -111,6 +112,10 @@ import {
 } from '../livePromptDraft'
 import type { ConfigCommand } from '../types/ConfigCommand'
 import { useLiveContext } from '../liveContext'
+import {
+  promptPlaceholders,
+  type PromptPlaceholder,
+} from '../promptPlaceholders'
 import { useFetch } from '../useFetch'
 import {
   MAX_CONCURRENCY,
@@ -310,6 +315,8 @@ export function SettingsView() {
           (left unset) from an empty one.
         </li>
       </ul>
+
+      <PromptPlaceholderList />
 
       {commands.map((c) => (
         <CommandRow
@@ -1152,6 +1159,49 @@ function ListenSection() {
       </div>
       {saveError && <p className="error">{saveError}</p>}
     </>
+  )
+}
+
+/**
+ * The library prompts this install offers a hook template, live from
+ * `GET /api/library` (mesa task 1138) — never a hardcoded list, since the
+ * whole point is that a prompt saved on `#/library` is reachable from a hook
+ * without leaving the page.
+ *
+ * Renders nothing at all when the library holds no prompts, and nothing on a
+ * failed read either: this is a hint beside the editor, and an error banner
+ * over a list of suggestions would be louder than what it costs to lose them.
+ */
+function PromptPlaceholderList() {
+  const { data: items } = useFetch(() => listLibrary(), 'library-prompts')
+  const prompts: PromptPlaceholder[] = items ? promptPlaceholders(items) : []
+  if (prompts.length === 0) return null
+  return (
+    <div className="settings-prompt-placeholders">
+      <p className="muted">
+        This library's prompts, usable as placeholders in either mode — the
+        body is substituted as one argument in argv mode, and travels in the
+        named variable in script mode, so its text is never parsed as shell.
+        Edit them on <code>#/library</code>.
+      </p>
+      <ul className="muted settings-prompt-list">
+        {prompts.map((p) => (
+          <li key={p.name}>
+            <code>{p.placeholder}</code>{' '}
+            {p.usable ? (
+              <span className="muted">
+                → <code>${p.envVar}</code>
+              </span>
+            ) : (
+              <span className="error">
+                cannot be used: a script reads a prompt through an environment
+                variable, and this name holds a character one cannot
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
   )
 }
 

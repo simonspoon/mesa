@@ -1127,6 +1127,28 @@ that machinery through one small hoist made for this feature:
 passes `inboxSpeakUrl(id)` and Live passes `liveSpeakUrl(id)`. That is the only
 change to the inbox's speech path.
 
+The decoded path also **holds before it plays** (mesa task 1146). Measured on
+a real turn, `kokoro-rs`'s first chunk arrived after nearly three seconds
+carrying 80 ms of audio, and the stream then stayed only about a second ahead
+of real time — so a player that scheduled the first buffer the moment it
+decoded said a few words and went silent for the rest of the turn the first
+time the render paused longer than its lead. `speechStream.ts` now keeps
+decoded audio in a queue and schedules nothing until `PREBUFFER_SECONDS` (2 s)
+of it is held or the body has ended, whichever comes first; `onPlaying` fires
+when the first buffer is actually put on the clock. An **underrun** — every
+scheduled source ended with the body still open — is not the end of the item:
+the player goes back to holding on the same terms, and when it resumes the
+item's clock slips by the gap exactly as a late buffer already made it,
+so nothing is dropped and rewind still has every sample. `onEnded` fires only
+once the reader reported the body done *and* the queue is empty *and* nothing
+is scheduled; a remainder held at EOF is flushed and plays out first. A body
+that stops arriving altogether is a hung synthesiser, and a turn that never
+ends would wedge the live queue behind it, so a **stall watchdog** — one
+`setTimeout`, re-armed on every chunk — cancels the reader after
+`STALL_SECONDS` (30) and lets what was held play out into an ordinary
+`onEnded`. The lead, the deadline and the start predicate (`readyToStart`)
+live in `speechPlayback.ts` with the rest of the player's arithmetic.
+
 The hub's consequences follow from the same rules the inbox lives under:
 there is **one `<audio>` element for the page**, and a press on the primary
 control — **Go live**, or **Listen** when the conversation is already

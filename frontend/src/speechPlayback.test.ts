@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   playFailure,
+  PREBUFFER_SECONDS,
+  readyToStart,
   replaySlices,
   REWIND_STEP_SECONDS,
   rewindTarget,
@@ -42,6 +44,26 @@ describe('scheduleAt', () => {
 
   it('leads the very first buffer, which has no slot yet', () => {
     expect(scheduleAt(9, 9)).toBe(9 + SCHEDULE_LEAD_SECONDS)
+  })
+})
+
+describe('readyToStart', () => {
+  it('holds the first chunks rather than starting on almost nothing', () => {
+    // The synthesiser's first chunk is under a tenth of a second; starting on
+    // it leaves the player one pause in the render away from silence.
+    expect(readyToStart(0.08, false)).toBe(false)
+    expect(readyToStart(PREBUFFER_SECONDS - 0.01, false)).toBe(false)
+  })
+
+  it('starts once a lead is queued', () => {
+    expect(readyToStart(PREBUFFER_SECONDS, false)).toBe(true)
+    expect(readyToStart(PREBUFFER_SECONDS + 3, false)).toBe(true)
+  })
+
+  it('starts on whatever is held once the body is complete', () => {
+    // A short item never reaches the lead; waiting for it would wait forever.
+    expect(readyToStart(0.5, true)).toBe(true)
+    expect(readyToStart(0, true)).toBe(true)
   })
 })
 

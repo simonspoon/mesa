@@ -1,7 +1,8 @@
 /**
  * The decisions behind the inbox's read-aloud player: where a rewind press
- * lands (mesa task 827), what a failed play leaves to try (mesa task 829), and
- * when a scheduled buffer has to give up its place (mesa task 830).
+ * lands (mesa task 827), what a failed play leaves to try (mesa task 829),
+ * when a scheduled buffer has to give up its place (mesa task 830), and when
+ * decoded audio has been held long enough to start (mesa task 1146).
  *
  * The speak route streams: chunked, no `Content-Length`, no range support. On
  * the element's path the only audio a player can go back to is therefore what
@@ -60,6 +61,37 @@ export const SCHEDULE_LEAD_SECONDS = 0.15
  */
 export function scheduleAt(now: number, pending: number): number {
   return pending > now ? pending : now + SCHEDULE_LEAD_SECONDS
+}
+
+/**
+ * How much decoded audio the page holds before it schedules any of it (mesa
+ * task 1146). The synthesiser streams at roughly real time and its first
+ * chunk carries under a tenth of a second, so a player that starts on the
+ * first buffer is never more than a sentence ahead and every pause in the
+ * render is heard as a stall. Two seconds is the lead that covers the pauses
+ * measured on a real turn, at the cost of that much more wait before the
+ * first word.
+ */
+export const PREBUFFER_SECONDS = 2
+
+/**
+ * How long the body may go without a byte before it is given up on (mesa
+ * task 1146). A synthesiser that hangs never closes the response, and a turn
+ * that never ends wedges the live queue behind it — so after this long the
+ * reader is cancelled and the item ends on what it has.
+ */
+export const STALL_SECONDS = 30
+
+/**
+ * Whether the audio held so far should start sounding: either enough of it
+ * to ride out a pause in the render is queued, or the body is `complete` and
+ * nothing more will ever come. The same question is asked when playback
+ * first starts and again after an underrun, where the schedule went silent
+ * with the body still open: both times the answer is to wait for a lead
+ * rather than start on the next single chunk.
+ */
+export function readyToStart(queuedSeconds: number, complete: boolean): boolean {
+  return complete || queuedSeconds >= PREBUFFER_SECONDS
 }
 
 /** A piece of decoded audio a rewind puts back on the clock. */

@@ -1251,12 +1251,17 @@ conversation") working with no backend change.
   talking), **being heard outranks working** (words arriving from the person
   are the stronger news, and the agent carries on working either way), and
   **working outranks listening** (listening is the resting state, and work is
-  not rest). Whitespace is not speech. All five freeze under
-  `prefers-reduced-motion` to a single representative still frame that keeps
-  the ranking — no longer a CSS media block (a canvas has nothing for a media
-  query to hook), but a branch inside `drawAperture` itself, driven by a flag
-  the component maintains by subscribing to the query live, since a setting
-  flipped mid-session used to take effect with no reload and still should.
+  not rest). Whitespace is not speech. Under `prefers-reduced-motion` every
+  state keeps its motion but runs it at **half speed** (mesa task 1145 —
+  reduce, not remove, macOS's own convention for a progress spinner): the
+  indicator used to freeze to one representative still frame, and the person
+  reported that as a bug, since an 18px status glyph is not the vestibular
+  motion the preference targets and a still frame cannot say "still
+  working". It is no longer a CSS media block (a canvas has nothing for a
+  media query to hook), but a `rate` inside `drawAperture` itself, driven by
+  a flag the component maintains by subscribing to the query live, since a
+  setting flipped mid-session used to take effect with no reload and still
+  should; `paused` never read the clock and is unchanged.
 
   Working is the one state shown to a browser that types into the fallback box
   as well: unlike listening it is not "a text box exists" — someone is doing

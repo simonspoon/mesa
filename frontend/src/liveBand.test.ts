@@ -85,13 +85,30 @@ describe('drawAperture', () => {
     expect(a.log).toEqual(b.log)
   })
 
-  it('under reduced motion, every state produces identical logs at two different t', () => {
+  it('under reduced motion, every non-paused state still moves: two different t give different logs', () => {
+    // Reduce, not remove (mesa task 1145): a frozen indicator was reported as
+    // a bug, so `reduced` now halves the rate rather than picking one frame.
     for (const state of STATES) {
+      if (state === 'paused') continue
       const a = fakeCtx()
       const b = fakeCtx()
       drawAperture(a.ctx, 18, 18, state, 1, 0.5, '#fff', true)
-      drawAperture(b.ctx, 18, 18, state, 99, 0.5, '#fff', true)
-      expect(a.log).toEqual(b.log)
+      drawAperture(b.ctx, 18, 18, state, 1.3, 0.5, '#fff', true)
+      expect(a.log).not.toEqual(b.log)
+    }
+  })
+
+  it('reduced motion is exactly half speed: reduced at 2t matches unreduced at t', () => {
+    // `t * 0.5` is exact in floating point (a power-of-two scale), so the two
+    // logs are byte-identical rather than merely close.
+    for (const state of ['working', 'listening'] as const) {
+      for (const t of [0.75, 1.23, 7.5]) {
+        const full = fakeCtx()
+        const half = fakeCtx()
+        drawAperture(full.ctx, 18, 18, state, t, 0.5, '#fff', false)
+        drawAperture(half.ctx, 18, 18, state, 2 * t, 0.5, '#fff', true)
+        expect(half.log).toEqual(full.log)
+      }
     }
   })
 

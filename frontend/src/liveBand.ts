@@ -106,10 +106,15 @@ export interface ApertureCtx {
  * `reduced` is a parameter rather than a `matchMedia` read in here so this
  * function stays a pure, testable renderer and the component (which already
  * owns the media-query subscription for its own re-render) is the one place
- * that reads the real query. Under `reduced`, every state freezes to a single
- * representative frame — the mockup's own `reduced ? … : …` branches, ported
- * as-is — which is also why `paused` never looks at `t` at all: it is
- * already a static shape.
+ * that reads the real query. Under `reduced`, every state keeps its motion
+ * but runs it at **half speed** (`rate`), and nothing else changes — reduce,
+ * not remove, which is macOS's own convention (Reduce Motion does not stop a
+ * progress spinner). This used to freeze every state to one representative
+ * still frame, the mockup's own `reduced ? … : …` branches ported as-is, and
+ * the person reported the frozen indicator as a bug (mesa task 1145): an
+ * 18px status glyph is not the vestibular, screen-filling motion the
+ * preference targets, and a still frame cannot say "still working" at all.
+ * `paused` never looks at `t` regardless: it is already a static shape.
  */
 export function drawAperture(
   ctx: ApertureCtx,
@@ -124,6 +129,7 @@ export function drawAperture(
   const cx = w / 2
   const cy = h / 2
   const R = h * 0.46
+  const rate = reduced ? 0.5 : 1
 
   ctx.save()
   ctx.translate(cx, cy)
@@ -143,7 +149,7 @@ export function drawAperture(
   }
 
   if (state === 'listening') {
-    const breath = reduced ? 0.5 : 0.5 + 0.5 * Math.sin(t * 0.42 * 2 * Math.PI)
+    const breath = 0.5 + 0.5 * Math.sin(t * rate * 0.42 * 2 * Math.PI)
     ctx.globalAlpha = 0.22 + 0.2 * breath
     ctx.strokeStyle = color
     ctx.lineWidth = Math.max(1, h * 0.045)
@@ -169,7 +175,7 @@ export function drawAperture(
     ctx.arc(0, 0, R * 0.72, 0, Math.PI * 2)
     ctx.stroke()
 
-    const a = reduced ? -Math.PI / 2 : t * 0.72 * 2 * Math.PI
+    const a = t * rate * 0.72 * 2 * Math.PI
     const trail = 14
     for (let i = trail; i >= 0; i--) {
       const ang = a - i * 0.052
@@ -195,11 +201,11 @@ export function drawAperture(
   // speaking's amplitude is the simulated envelope (`simEnvelope`, see its
   // own doc comment for why).
   const out = state === 'speaking'
-  const amp = out ? (reduced ? 0.55 : 0.35 + 0.65 * simEnvelope(t * 1.7)) : level
+  const amp = out ? 0.35 + 0.65 * simEnvelope(t * rate * 1.7) : level
   const rings = 3
   ctx.lineWidth = Math.max(1, h * 0.05)
   for (let i = 0; i < rings; i++) {
-    let p = reduced ? (i + 1) / (rings + 1) : (t * 0.85 + i / rings) % 1
+    let p = (t * rate * 0.85 + i / rings) % 1
     if (!out) p = 1 - p
     const r = R * (0.24 + 0.76 * p)
     const fade = out ? 1 - p : p

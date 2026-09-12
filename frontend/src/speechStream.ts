@@ -259,7 +259,10 @@ export async function playSpeechStream(
     },
     rewind() {
       if (!started) return
-      const target = rewindTarget(ctx.currentTime - origin, 0)
+      // A hold lets the clock run on past the audio: nothing is scheduled
+      // and the origin only slips when the next flush lands, so the playhead
+      // is wherever the scheduled audio ended, never further.
+      const target = rewindTarget(Math.min(ctx.currentTime - origin, filled), 0)
       if (target === null) return
       for (const source of live) {
         source.onended = null

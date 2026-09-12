@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { LiveBand } from './LiveBand'
 import { LiveBoardPanel } from './LiveBoardPanel'
@@ -53,6 +53,7 @@ import {
   writeInputChoice,
   type AudioInput,
 } from '../liveDevices'
+import { MIN_MAIN_WIDTH } from '../agentSidebarWidth'
 import { chordLabel, matchesShortcut } from '../keymap'
 import { useKeymap } from '../keymapStore'
 import { elapsedLabel, endsInHead, liveHeadTitle } from '../liveHead'
@@ -97,6 +98,12 @@ import {
   turnGroups,
   turnLabel,
 } from '../liveTurns'
+import {
+  clampLiveSidebarWidth,
+  clearLiveSidebarWidth,
+  loadLiveSidebarWidth,
+  saveLiveSidebarWidth,
+} from '../liveSidebarWidth'
 import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadCut, vadStep } from '../liveVad'
 import { sameBox, windowBox } from '../liveWindow'
 import { playFailure } from '../speechPlayback'
@@ -484,6 +491,17 @@ export function LiveHub({
   // The conversation panel. Purely visual: closing it calls no route and stops
   // nothing — the session, the audio and the capture box all carry on.
   const [open, setOpen] = useState(false)
+  // How wide the panel is (mesa task 1144), this browser's own business
+  // exactly as `open` is. `null` is "no opinion": the aside then sets no
+  // inline `--live-sidebar-width` at all and App.css's `min(26rem, 40vw)`
+  // stands — see `liveSidebarWidth.ts` for why the default cannot be a number.
+  // Desktop tiers only: the phone tier's drawer sets its width directly.
+  const [width, setWidth] = useState<number | null>(() => loadLiveSidebarWidth())
+  const [resizing, setResizing] = useState(false)
+  const asideRef = useRef<HTMLElement | null>(null)
+  // The width the drag has reached, so `mouseup` can store it without the
+  // effect having to re-subscribe on every frame of the drag.
+  const widthRef = useRef(width)
   // The person stepped out of the conversation without ending it (mesa task
   // 882): this browser speaks nothing, hears nothing and is driven nowhere
   // until Resume. Deliberately *this browser's* state and nothing more — no
@@ -1972,6 +1990,43 @@ export function LiveHub({
 
   const controls = liveControls(session, pending, unlocked, paused)
 
+  // Drag-resize (mesa task 1144): the handle is on the panel's left edge and
+  // the panel sits at the right of `.shell-body`'s row — with the agents
+  // sidebar possibly to its right, since App renders the live slot just
+  // before `<AgentSidebar>` — so the new width is the distance from the
+  // pointer to the panel's *own* right edge, never the viewport's. The
+  // ceiling is what is left of the row between `main`'s left edge and that
+  // same right edge once `main` keeps its floor, which also subtracts the
+  // agents panel's width for free. Listeners live on `document`, not the
+  // handle, so the drag keeps tracking when the pointer outruns it
+  // (`AgentSidebar`'s own splitter, and its reason).
+  useEffect(() => {
+    if (!resizing) return
+    const onMove = (e: MouseEvent) => {
+      const aside = asideRef.current
+      if (aside === null) return
+      const right = aside.getBoundingClientRect().right
+      const mainLeft = document.querySelector('main')?.getBoundingClientRect().left ?? 0
+      const next = clampLiveSidebarWidth(right - e.clientX, right - mainLeft - MIN_MAIN_WIDTH)
+      widthRef.current = next
+      setWidth(next)
+    }
+    const onUp = () => {
+      setResizing(false)
+      // Stored on release rather than per frame: a drag is one decision, and
+      // localStorage is synchronous.
+      if (widthRef.current !== null) saveLiveSidebarWidth(widthRef.current)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.classList.add('live-sidebar-resizing')
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('live-sidebar-resizing')
+    }
+  }, [resizing])
+
   function act(button: LiveButton) {
     if (button.disabled) return
     // Unlock the element and the clock from inside the gesture whether or not
@@ -1989,6 +2044,7 @@ export function LiveHub({
       // moment capture takes the keyboard (the went-live effect above fires on
       // `unlocked` landing).
       pump.current()
+      setOpen(true)
       return
     }
     // A failed start leaves no session behind (the server ends the one it
@@ -2000,6 +2056,10 @@ export function LiveHub({
     }
     if (button.action === 'start') {
       setPending('start')
+      // Going live is what the panel is for, so the press that starts a
+      // conversation surfaces it (mesa task 1144) rather than leaving it a
+      // second click away behind the toggle. Joining, above, does the same.
+      setOpen(true)
       startLive().then(() => refetch(), failed).finally(() => setPending(null))
       return
     }
@@ -2252,9 +2312,36 @@ export function LiveHub({
       {slot !== null &&
         createPortal(
           <aside
-            className={`live-sidebar${open ? '' : ' collapsed'}`}
+            ref={asideRef}
+            className={`live-sidebar${open ? '' : ' collapsed'}${resizing ? ' resizing' : ''}`}
+            // Nothing stored and nothing dragged means no inline property at
+            // all — the stylesheet's `min(26rem, 40vw)` is the default, not a
+            // number. The phone tier's drawer sets `width` directly, so this
+            // property does not reach it.
+            style={
+              width === null
+                ? undefined
+                : ({ '--live-sidebar-width': `${width}px` } as CSSProperties)
+            }
             aria-label="the live conversation"
           >
+            {/* Only while open: the pointer cannot reach a clipped edge, and
+                a handle on a zero-width aside would straddle the page's own
+                right margin. Hidden on the phone tier by App.css. */}
+            {open && (
+              <div
+                className="live-sidebar-resize-handle"
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  setResizing(true)
+                }}
+                onDoubleClick={() => {
+                  widthRef.current = null
+                  clearLiveSidebarWidth()
+                  setWidth(null)
+                }}
+              />
+            )}
             <div className="live-sidebar-body">
               {/* The head (mesa task 1069): the aperture, one word for what
                   is happening, how loud the room has been, and the two

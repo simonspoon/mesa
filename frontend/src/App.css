@@ -3508,7 +3508,8 @@ main {
 body.agent-sidebar-resizing,
 body.nav-resizing,
 body.files-tree-resizing,
-body.live-board-resizing {
+body.live-board-resizing,
+body.live-sidebar-resizing {
   user-select: none;
   cursor: col-resize;
 }
@@ -8944,9 +8945,12 @@ button:focus-visible,
    agents one, in the same flex row, so the two are independent and the page
    is beside the conversation rather than under it. Mirrors `.agent-sidebar`
    deliberately — same edge, same border, same sticky full-height box — since
-   they are two of a kind; it takes no drag handle, because a transcript and a
-   two-line box have no width worth choosing. The width is declared once here
-   and inherited by the body below, which has to repeat it (see there). */
+   they are two of a kind, down to the drag handle on the left edge (mesa
+   task 1144: a transcript read beside a wide page, or a whiteboard, does have
+   a width worth choosing). `LiveHub` sets `--live-sidebar-width` inline only
+   once a width has been dragged (`liveSidebarWidth.ts`, remembered per
+   browser); otherwise the `min()` below stands. The width is declared once
+   here and inherited by the body below, which has to repeat it (see there). */
 .live-sidebar {
   /* `min`, not a flat 26rem: between the phone tier and a wide window there
      is a band where 26rem is most of the row, and `main`'s floor is only
@@ -8965,6 +8969,30 @@ button:focus-visible,
   display: flex;
   flex-direction: column;
   transition: width 0.15s;
+}
+
+/* No width animation under the pointer: the transition above is for open
+   and close, and a drag is a width that already moves once per event. */
+.live-sidebar.resizing {
+  transition: none;
+}
+
+/* The splitter, `.agent-sidebar-resize-handle`'s twin: a 6px strip straddling
+   the panel's left edge, rendered only while the panel is open. Double-click
+   forgets the stored width so the `min()` default is back in charge. */
+.live-sidebar-resize-handle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+.live-sidebar-resize-handle:hover,
+.live-sidebar.resizing .live-sidebar-resize-handle {
+  background: var(--cyan-dim, rgba(0, 229, 255, 0.3));
 }
 
 /* Closed is a zero-width clip, never `display: none` or `visibility: hidden`:
@@ -9682,6 +9710,13 @@ button:focus-visible,
   .live-sidebar:not(.collapsed) .live-sidebar-body {
     width: 100%;
     padding: 0.5rem 0.5rem 0.75rem;
+  }
+
+  /* A drawer over the whole screen has no width to drag, and the `width`
+     above is set directly rather than through `--live-sidebar-width`, so a
+     width stored on a desktop never reaches this tier. */
+  .live-sidebar-resize-handle {
+    display: none;
   }
 
   /* The whiteboard takes the same drawer treatment as the two panels beside

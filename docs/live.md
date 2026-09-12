@@ -1274,8 +1274,17 @@ conversation") working with no backend change.
   toggle sits beside the live button whenever there is a session at all —
   running, or ended with a transcript still worth reading
   (`liveControls().panel`) — and the panel holds the status line, the
-  transcript, the listen row and the capture box. Closing it calls no route;
-  only `End` ends the conversation. The closed state is a **zero-width clip**
+  transcript, the listen row and the capture box. Pressing **Go live** or
+  **Listen** opens it too (mesa task 1144): the press is what the panel is
+  for, so it should not be a second click away. Closing it calls no route;
+  only `End` ends the conversation. On the desktop tiers its **width is a
+  drag handle on its left edge**, the whiteboard's rule (`liveSidebarWidth.ts`
+  — `null` until dragged so App.css's `min(26rem, 40vw)` decides, remembered
+  per browser in `localStorage`, machine-local, double-click forgets it), the
+  drag clamped so `main` keeps its floor and measured from the panel's own
+  right edge since the agents sidebar may sit beyond it; the phone-tier drawer
+  sets its width directly and hides the handle, so a stored width never
+  applies there. The closed state is a **zero-width clip**
   on the aside, never `display: none` or `visibility: hidden` — the same
   decision the popup's `clip-path` was, for the same reason: the capture box
   inside keeps its focus, and the dictation flowing into it, while the panel

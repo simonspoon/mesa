@@ -1372,7 +1372,7 @@ export function updateLiveMemory(
 /** Retires one entry — it stays in the searchable archive — and echoes it.
  *  The same 30%-removal guard as an edit. */
 export function deleteLiveMemory(id: number): Promise<LiveNotebookEntry> {
-  return request(`/api/live/memory/${id}`, { method: 'DELETE' })
+  return request(`/api/live/memory/${id}`, jsonDelete())
 }
 
 // ---- scripts (user-authored shell) ----

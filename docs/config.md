@@ -368,7 +368,9 @@ tab is a form over `commands` — a text box per action, the built-in default
 shown as the box's placeholder, the action's placeholder vocabulary listed
 under it, and the script that will actually run spelled out beneath — and the
 other tabs hold one section each for the rest of the file (Watchers, Keyboard
-shortcuts, Live conversation, Speech, Model pricing).
+shortcuts, Live conversation, Speech, Model pricing) — plus a **Memory** tab
+(mesa task 1147) that is not over this file at all but over the live
+notebook, a db table (`docs/live.md`).
 **Each section has
 its own endpoint, draft and save button**: they are separate writes, so one
 form's rejection must never strand another's edits.

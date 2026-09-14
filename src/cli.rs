@@ -2027,11 +2027,13 @@ EXAMPLES
     /// Every word must match (implicit AND); quotes and operators in the
     /// words are searched for, never parsed. Each hit names its `kind`
     /// (`turn` | `summary` | `note`), the row it points at (`ref_id`), the
-    /// session, and a snippet with the matches in brackets.
+    /// session, and a snippet with the matches in brackets. Put --limit
+    /// BEFORE the words: everything after `search` that is not a leading
+    /// flag is a search word.
     #[command(after_help = "\
 EXAMPLES
   mesa live memory search hooks single mode
-  mesa live memory search pelican --limit 5")]
+  mesa live memory search --limit 5 pelican")]
     Search {
         /// The words to search for (everything after `search`)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]

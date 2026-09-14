@@ -60,11 +60,13 @@
 #      an ended session's turns, and the `live-summary` template firing on
 #      `live stop` — argv shape, session name, one-argument prompt — with its
 #      two guards (no turns spawns nothing; a second stop is not_found and
-#      spawns nothing), the recall join proving a stored summary reaches the
-#      NEXT conversation's spawned prompt argv (and lands after the
-#      session line, never before), a write-then-immediate-read-back
-#      regression for a session older than the retained set, and the
-#      project-delete cascade;
+#      spawns nothing), the recall join proving the notebook AND the single
+#      most recent summary reach the NEXT conversation's spawned prompt argv
+#      (both after the session line, never before, the notebook first, and
+#      no older summary riding along — mesa task 1147 cut recall from 5 to
+#      1), the archive being append-only (a summary for a session older than
+#      dozens of already-summarised ones still readable, every row kept),
+#      and the project-delete cascade;
 #  12. POST /api/live/transcribe (mesa task 954), against a stub `auris`
 #      (MESA_AURIS_BIN): a real round-trip whose decoded audio reaches the
 #      stub on stdin byte-identical to what was sent (never as an argument),
@@ -95,7 +97,26 @@
 #      in default mode AND under `--lan`, the absence of any board write
 #      route, and the render route answering 404 `not_found` once the
 #      conversation has ended (the row survives like a turn's; every read of
-#      it stops).
+#      it stops);
+#  14. live memory v2 (mesa task 1147): the `mesa live memory` notebook CLI
+#      round trip (list/show/add/replace/delete/touch) with the `--quiet` key
+#      set (drops `body` alone; `list --quiet`/`search --quiet` are usage
+#      errors; `--quiet` typed after the text lands in the body, and after
+#      search words is a word), `touch`
+#      with no live session being not_found, every guard — the empty body,
+#      the 600-char entry bound, the 500-word budget (naming both numbers),
+#      the 30%-removal rule refusing a delete above the 100-word floor and
+#      allowing one below it, a replace judged on the words it removes — a
+#      retired row surviving in `list --all` and in the archive, `search`
+#      hitting a turn, a summary and a note with their `kind`s, `ref_id`s
+#      and bracketed snippets, a query carrying `"` and `AND` searched as
+#      words rather than erroring, decay retiring every entry unused for N
+#      ended sessions at the next `live start` (named on stderr, active list
+#      empty, `--all` showing `decayed`), the four `/api/live/memory` routes
+#      with both halves of the security boundary in default mode AND under
+#      `--lan` (the Settings posture: `require_agent_access`, reads
+#      included), and `GET /api/live` carrying no notebook (the 2s poll stays
+#      bounded).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -1648,10 +1669,27 @@ run 0 "$MESA" live start --no-agent
 RECALL_SESSION=$(jqs .id)
 run 0 "$MESA" live stop >/dev/null
 run 0 "$MESA" live summary set "$RECALL_SESSION" "$RECALL_TEXT"
+# The notebook (mesa task 1147) rides in the same prompt, ahead of the
+# summary — so one spawn proves both joins and their order.
+NOTE_TEXT="NOTE-MARKER: prefers short spoken replies."
+run 0 "$MESA" live memory add "$NOTE_TEXT"
+NOTE_ID=$(jqs .id)
 
 run 0 "$MESA" live start
 grep -q "$RECALL_TEXT" "$STUB_DIR/last-prompt" ||
   fail "a stored summary must reach the very next live-agent spawn's prompt as recall"
+grep -q -- "- \[#$NOTE_ID, added [0-9-]*, from session [0-9]*, last used session [0-9]*\] $NOTE_TEXT" \
+  "$STUB_DIR/last-prompt" ||
+  fail "the notebook entry must reach the spawned prompt as a provenance-labelled line (got: $(cat "$STUB_DIR/last-prompt"))"
+# Recall is the single most recent summary: the older ones written above
+# (sessions $SUM1, $SUM2) must NOT ride along — they are the archive's now.
+[ "$(grep -c '^Session [0-9]*: ' "$STUB_DIR/last-prompt")" = "1" ] ||
+  fail "exactly one summary must ride in the prompt (mesa task 1147: recall is last-1), got: $(cat "$STUB_DIR/last-prompt")"
+grep -q "Session $RECALL_SESSION: $RECALL_TEXT" "$STUB_DIR/last-prompt" ||
+  fail "the one recalled summary must be the most recent session's"
+! grep -q "replaced pass" "$STUB_DIR/last-prompt" ||
+  fail "an older summary (session $SUM2's) must not ride in the prompt"
+NOTE_POS=$(grep -bo "$NOTE_TEXT" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
 # Ordering matters: a summary is derived from dictated speech — untrusted
 # text — and untrusted text may not sit above the rules (the plan's posture).
 # An argv log is the only place this can be checked as a fact about what was
@@ -1662,8 +1700,10 @@ RECALL_POS=$(grep -bo "$RECALL_TEXT" "$STUB_DIR/last-prompt" | head -1 | cut -d:
 [ -n "$RECALL_POS" ] || fail "recall join: could not find the recall text in the spawned prompt"
 [ "$RECALL_POS" -gt "$SESSION_POS" ] ||
   fail "recall must be appended AFTER the session line, never before — untrusted text may not outrank the rules"
+[ "$NOTE_POS" -gt "$SESSION_POS" ] && [ "$NOTE_POS" -lt "$RECALL_POS" ] ||
+  fail "the notebook must come after the session line and before the summary"
 run 0 "$MESA" live stop >/dev/null
-ok "a stored summary reaches the next conversation's spawned prompt, appended after the session line"
+ok "the notebook and the single most recent summary reach the next conversation's spawned prompt, in that order, after the session line"
 
 # ---- guard: a session with no turns spawns no summariser ----
 rm -f "$STUB_DIR/last-argc"
@@ -1681,22 +1721,18 @@ run 1 "$MESA" live stop
   fail "a second stop of an already-ended session must not spawn another summariser"
 ok "a second stop of an already-ended session: not_found, and nothing is spawned"
 
-# ---- prune regression: a write is always readable back immediately, even
-#      for a session older than SUMMARY_KEEP already-summarised ones ----
+# ---- append-only: a write for an OLD session is readable back immediately,
+#      and no row is ever pruned (mesa task 1147) ----
 #
-# The prune after every write keeps only the newest SUMMARY_KEEP rows — by
-# WRITE order, not by session id (a session id is not the order summaries
-# arrive in: the oldest conversation can be the last one summarised). This
-# pins the regression that a write could delete the very row it had just
-# inserted; the exact keep-set arithmetic is covered by Rust unit tests.
-SUMMARY_KEEP=$(grep -Eo 'pub const LIVE_SUMMARY_KEEP: i64 = [0-9]+' src/core/store.rs |
-  grep -Eo '[0-9]+$')
-[ -n "$SUMMARY_KEEP" ] || fail "could not read LIVE_SUMMARY_KEEP from src/core/store.rs"
+# The first cut kept the newest 20 summaries; every summary is now part of
+# the searchable archive, so nothing prunes it. A session summarised long
+# after dozens of newer ones is the ordering a burst of short conversations
+# produces while an older one's background summariser catches up.
 
 run 0 "$MESA" live start --no-agent
 OLD_SESSION=$(jqs .id)
 run 0 "$MESA" live stop >/dev/null
-for i in $(seq 1 "$SUMMARY_KEEP"); do
+for i in $(seq 1 25); do
   run 0 "$MESA" live start --no-agent
   NEWER_SESSION=$(jqs .id)
   run 0 "$MESA" live stop >/dev/null
@@ -1707,8 +1743,16 @@ run 0 "$MESA" live summary set "$OLD_SESSION" "an older conversation, summarised
   fail "a summary write must be readable back in its own response"
 run 0 "$MESA" live summary show "$OLD_SESSION"
 [ "$(jqs .body)" = "an older conversation, summarised last" ] ||
-  fail "a summary for a session older than $SUMMARY_KEEP already-summarised ones must still be readable back immediately after the write"
-ok "live summary set: a write is always readable back immediately, even for a session older than $SUMMARY_KEEP others"
+  fail "a summary for a session older than 25 already-summarised ones must still be readable back"
+run 0 "$MESA" live summary show "$SUM1"
+[ "$(jqs '.body | length')" = "$SUMMARY_MAX" ] ||
+  fail "the very first summary (last set to exactly $SUMMARY_MAX chars) must survive 25+ later ones: the archive is append-only"
+# SUM1, SUM2, SUM4's would-be (none — the stub summariser writes nothing),
+# RECALL_SESSION, OLD_SESSION and the 25 fillers: 29 distinct sessions.
+run 0 "$MESA" live summary list --limit 500
+[ "$(jqs length)" = "29" ] ||
+  fail "every summary written so far must still be listed: expected 29, got $(jqs length)"
+ok "live summary: append-only — a late write for an old session lands, and no earlier row is pruned"
 
 # ---- cascade: deleting a session's project must not destroy its summary ----
 #
@@ -2309,6 +2353,371 @@ ok "ending the conversation closes the whiteboard on every surface: the render r
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
+
+# =====================================================================
+# 14. Live memory v2 (mesa task 1147): the notebook and the archive
+# =====================================================================
+#
+# The numbers are read out of the source rather than hardcoded, the way
+# section 11 reads LIVE_SUMMARY_MAX.
+NB_BUDGET=$(grep -Eo 'pub const LIVE_NOTEBOOK_BUDGET_WORDS: usize = [0-9]+' src/core/live.rs |
+  grep -Eo '[0-9]+$')
+NB_DECAY=$(grep -Eo 'pub const LIVE_NOTEBOOK_DECAY_SESSIONS: i64 = [0-9]+' src/core/live.rs |
+  grep -Eo '[0-9]+$')
+NB_ENTRY_MAX=$(grep -Eo 'pub const LIVE_NOTEBOOK_ENTRY_MAX: usize = [0-9]+' src/core/live.rs |
+  grep -Eo '[0-9]+$')
+[ -n "$NB_BUDGET" ] && [ -n "$NB_DECAY" ] && [ -n "$NB_ENTRY_MAX" ] ||
+  fail "could not read the notebook constants from src/core/live.rs"
+[ "$NB_BUDGET" = "500" ] && [ "$NB_ENTRY_MAX" = "600" ] ||
+  fail "this section's arithmetic assumes a 500-word budget and a 600-char entry; update it with the constants"
+
+words() { printf 'w%.0s ' $(seq 1 "$1") | sed 's/ $//'; } # N single-letter words
+
+# ---- list: section 11's entry has DECAYED by now — sections 11-13 ended
+#      well over N conversations after it was written and section 13's
+#      `live start` ran the decay — so it is out of the active list and in
+#      --all as `decayed`; --quiet refused on the two arrays ----
+run 0 "$MESA" live memory list
+[ "$(jqs type)" = "array" ] || fail "live memory list: bare array"
+[ "$(jqs 'map(.id) | index('"$NOTE_ID"')')" = "null" ] ||
+  fail "live memory list: section 11's entry #$NOTE_ID must have decayed by now (unused for $NB_DECAY+ conversations)"
+run 0 "$MESA" live memory list --all
+[ "$(jqs 'map(select(.id == '"$NOTE_ID"'))[0].retired_reason')" = "decayed" ] ||
+  fail "list --all must show section 11's entry as decayed (got $(jqs 'map(select(.id == '"$NOTE_ID"'))'))"
+run 2 "$MESA" live memory list --quiet
+[ -z "$STDOUT" ] || fail "live memory list --quiet: stdout must be empty on a usage error"
+[ "$(jqe .error.code)" = "usage" ] || fail "live memory list --quiet: error.code"
+# `--quiet` BEFORE the words (after them it is a search word, the trailing
+# var-arg rule `say`/`add` share).
+run 2 "$MESA" live memory search --quiet pelican
+[ "$(jqe .error.code)" = "usage" ] || fail "live memory search --quiet: error.code"
+run 2 "$MESA" live memory search
+[ "$(jqe .error.code)" = "usage" ] || fail "live memory search with no words: usage"
+ok "live memory list/search: bare arrays; --quiet is a usage error on both, exit 2"
+
+# ---- delete below the floor: any edit is allowed, and the row is retired,
+#      not destroyed ----
+run 0 "$MESA" live memory list
+[ "$(jqs length)" = "0" ] || fail "the active notebook must be empty here (got $(jqs length))"
+run 0 "$MESA" live memory add "DELETE-MARKER: a small entry to remove."
+D1=$(jqs .id)
+run 0 "$MESA" live memory delete "$D1"
+[ "$(jqs .id)" = "$D1" ] || fail "live memory delete: echoes the row"
+[ "$(jqs .retired_reason)" = "deleted" ] || fail "live memory delete: retired_reason"
+[ "$(jqs .retired_at)" != "null" ] || fail "live memory delete: retired_at stamped"
+[ "$(jqs .body)" = "DELETE-MARKER: a small entry to remove." ] ||
+  fail "live memory delete: the full record is echoed"
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | index('"$D1"')')" = "null" ] ||
+  fail "a retired entry must leave the active list"
+run 0 "$MESA" live memory list --all
+[ "$(jqs 'map(select(.id == '"$D1"'))[0].retired_reason')" = "deleted" ] ||
+  fail "list --all must show the retired row with its reason"
+run 0 "$MESA" live memory show "$D1"
+[ "$(jqs .retired_reason)" = "deleted" ] || fail "show reads a retired row"
+run 1 "$MESA" live memory delete "$D1"
+[ "$(jqe .error.code)" = "not_found" ] || fail "deleting a retired row: not_found"
+run 1 "$MESA" live memory replace "$D1" anything
+[ "$(jqe .error.code)" = "not_found" ] || fail "replacing a retired row: not_found"
+run 1 "$MESA" live memory delete "$NOTE_ID"
+[ "$(jqe .error.code)" = "not_found" ] || fail "deleting a decayed row: not_found"
+ok "live memory delete: allowed below the 100-word floor; a soft delete — echoed, out of \`list\`, in \`list --all\` and \`show\`, and not_found for every later write"
+
+# ---- add / show / --quiet / touch ----
+run 0 "$MESA" live memory add Prefers short spoken replies.
+A1=$(jqs .id)
+[ "$(jqs .body)" = "Prefers short spoken replies." ] ||
+  fail "live memory add: trailing words are joined into the body"
+[ "$(jqs .retired_at)" = "null" ] || fail "a fresh entry is active"
+[ "$(jqs .source_session_id)" != "null" ] ||
+  fail "an entry added between conversations is dated to the newest session"
+[ "$(jqs .last_used_session_id)" = "$(jqs .source_session_id)" ] ||
+  fail "a fresh entry's last use is its source session"
+run 0 "$MESA" live memory show "$A1"
+printf '%s' "$STDOUT" >"$TMP/nb-full.json"
+run 0 "$MESA" live memory show "$A1" --quiet
+printf '%s' "$STDOUT" >"$TMP/nb-quiet.json"
+[ "$(jqs 'has("body")')" = "false" ] || fail "live memory show --quiet: body must be dropped"
+jq -e --slurpfile q "$TMP/nb-quiet.json" 'del(.body) == $q[0]' "$TMP/nb-full.json" >/dev/null ||
+  fail "live memory --quiet: must be the full record minus \`body\` and nothing else"
+run 0 "$MESA" live memory add --quiet "Task 42 holds the roadmap decisions."
+A2=$(jqs .id)
+[ "$(jqs 'has("body")')" = "false" ] || fail "live memory add --quiet: body must be dropped"
+run 0 "$MESA" live memory add A note that mentions --quiet in passing.
+A3=$(jqs .id)
+[ "$(jqs .body)" = "A note that mentions --quiet in passing." ] ||
+  fail "live memory add: --quiet typed after the text must land in the body"
+run 0 "$MESA" live memory get "$A2"
+[ "$(jqs .body)" = "Task 42 holds the roadmap decisions." ] || fail "get is an alias for show"
+ok "live memory add/show/get: full record by default; --quiet drops \`body\` alone and must come before the text"
+
+run 1 "$MESA" live memory touch "$A1"
+[ "$(jqe .error.code)" = "not_found" ] || fail "touch with no live session: not_found"
+grep -q 'mesa live start' <<<"$STDERR" || fail "touch with no live session must name mesa live start"
+run 0 "$MESA" live start --no-agent
+TOUCH_SESSION=$(jqs .id)
+run 0 "$MESA" live memory touch "$A1"
+[ "$(jqs .last_used_session_id)" = "$TOUCH_SESSION" ] ||
+  fail "touch must stamp the live session as the last use"
+[ "$(jqs 'has("body")')" = "true" ] || fail "touch prints the full record"
+run 0 "$MESA" live memory touch "$A1" --quiet
+[ "$(jqs 'has("body")')" = "false" ] || fail "touch --quiet drops body"
+run 1 "$MESA" live memory touch 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "touch on an unknown id: not_found"
+run 0 "$MESA" live stop >/dev/null
+ok "live memory touch: not_found with no live session, stamps the live one as last use"
+
+# ---- the entry bound ----
+run 1 "$MESA" live memory add ""
+[ "$(jqe .error.code)" = "validation" ] || fail "an empty entry: validation"
+run 1 "$MESA" live memory add "   "
+[ "$(jqe .error.code)" = "validation" ] || fail "a whitespace entry: validation"
+run 1 "$MESA" live memory add "$(printf 'x%.0s' $(seq 1 $((NB_ENTRY_MAX + 1))))"
+[ "$(jqe .error.code)" = "validation" ] || fail "an over-long entry: validation"
+grep -q "$NB_ENTRY_MAX" <<<"$STDERR" || fail "the entry bound must name itself"
+run 0 "$MESA" live memory add "$(printf 'x%.0s' $(seq 1 "$NB_ENTRY_MAX"))"
+A4=$(jqs .id)
+[ "$(jqs '.body | length')" = "$NB_ENTRY_MAX" ] || fail "an entry of exactly $NB_ENTRY_MAX chars is accepted"
+ok "live memory add: empty is validation; the $NB_ENTRY_MAX-char bound is inclusive and names itself"
+
+# ---- search: a turn, a summary and a note, by kind ----
+run 0 "$MESA" live start --no-agent
+SEARCH_SESSION=$(jqs .id)
+run 0 "$MESA" live say "The pelican rule is that hooks run as one script."
+PELICAN_TURN=$(jqs .id)
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live summary set "$SEARCH_SESSION" "Decided the pelican hooks rule."
+run 0 "$MESA" live memory add "pelican: hooks are one script, task 1143"
+PELICAN_NOTE=$(jqs .id)
+run 0 "$MESA" live memory search pelican
+[ "$(jqs type)" = "array" ] || fail "search: bare array"
+[ "$(jqs 'map(.kind) | sort | join(",")')" = "note,summary,turn" ] ||
+  fail "search must hit the turn, the summary and the note (got $(jqs 'map(.kind)'))"
+[ "$(jqs 'map(select(.kind == "turn"))[0].ref_id')" = "$PELICAN_TURN" ] || fail "search: the turn's ref_id"
+[ "$(jqs 'map(select(.kind == "turn"))[0].role')" = "mesa" ] || fail "search: a turn carries its role"
+[ "$(jqs 'map(select(.kind == "turn"))[0].session_id')" = "$SEARCH_SESSION" ] || fail "search: session_id"
+[ "$(jqs 'map(select(.kind == "summary"))[0].ref_id')" = "$SEARCH_SESSION" ] ||
+  fail "search: a summary's ref_id is its session"
+[ "$(jqs 'map(select(.kind == "note"))[0].ref_id')" = "$PELICAN_NOTE" ] || fail "search: the note's ref_id"
+[ "$(jqs 'map(select(.kind == "note"))[0].role')" = "null" ] || fail "search: a note has no role"
+[ "$(jqs 'map(select(.kind == "turn"))[0].snippet')" = "The [pelican] rule is that hooks run as one script." ] ||
+  fail "search: the snippet brackets the match (got $(jqs 'map(select(.kind == "turn"))[0].snippet'))"
+run 0 "$MESA" live memory search --limit 1 pelican
+[ "$(jqs length)" = "1" ] || fail "search --limit caps the hits"
+run 0 "$MESA" live memory search pelican --limit 1
+[ "$(jqs length)" = "0" ] || fail "search: a flag typed after the words is a word (the trailing var-arg rule)"
+run 0 "$MESA" live memory search pelican zzzz-no-such-word
+[ "$(jqs length)" = "0" ] || fail "search: every word must match (implicit AND)"
+# Quotes and operators in the words are words, never FTS syntax.
+run 0 "$MESA" live memory search '"pelican" AND NOT ( OR'
+[ "$(jqs type)" = "array" ] || fail "search: a query carrying quotes and operators must not error"
+run 0 "$MESA" live memory search '"pelican"'
+[ "$(jqs length)" = "3" ] || fail "search: a quoted word is searched with the quotes stripped"
+run 1 "$MESA" live memory search '"'
+[ "$(jqe .error.code)" = "validation" ] || fail "search with nothing left to search: validation"
+# A retired note stays in the archive.
+run 0 "$MESA" live memory search NOTE-MARKER
+[ "$(jqs 'map(select(.kind == "note"))[0].ref_id')" = "$NOTE_ID" ] ||
+  fail "a deleted notebook entry must still be found in the archive"
+ok "live memory search: hits a turn, a summary and a note by kind with ref_id/session/role/snippet; implicit AND; quotes and operators are words"
+
+# Clear the small entries (all below the floor) so the guard arithmetic
+# below starts from an empty notebook.
+for id in "$A1" "$A2" "$A3" "$A4" "$PELICAN_NOTE"; do
+  run 0 "$MESA" live memory delete "$id"
+done
+run 0 "$MESA" live memory list
+[ "$(jqs length)" = "0" ] || fail "the notebook must be empty before the guard checks"
+
+# ---- the removal guard above the floor, and the budget ----
+run 0 "$MESA" live memory add "$(words 99)"
+E1=$(jqs .id)
+run 0 "$MESA" live memory add "$(words 99)"
+E2=$(jqs .id)
+run 0 "$MESA" live memory add "$(words 99)"
+E3=$(jqs .id)
+# 297 words: deleting 99 is 33%, refused.
+run 1 "$MESA" live memory delete "$E1"
+[ "$(jqe .error.code)" = "validation" ] || fail "deleting 33% of the notebook: validation"
+grep -q "99 of the notebook's 297 words" <<<"$STDERR" ||
+  fail "the removal guard must name the words removed and held (got $STDERR)"
+grep -q "30%" <<<"$STDERR" || fail "the removal guard must name its share"
+run 0 "$MESA" live memory show "$E1"
+[ "$(jqs .retired_at)" = "null" ] || fail "a refused delete must not retire the row"
+# Replacing 99 words with 10 removes 89 of 297 (29.97%): allowed, in place.
+run 0 "$MESA" live memory replace "$E1" "$(words 10)"
+[ "$(jqs .id)" = "$E1" ] || fail "replace keeps the id"
+[ "$(jqs .body)" = "$(words 10)" ] || fail "replace: the new body"
+# Replacing 99 with 1 would remove 98 of 208 (47%): refused.
+run 1 "$MESA" live memory replace "$E2" "one"
+[ "$(jqe .error.code)" = "validation" ] || fail "a replace removing 47%: validation"
+grep -q "98 of the notebook's 208 words" <<<"$STDERR" ||
+  fail "the replace guard must name the words (got $STDERR)"
+ok "live memory: above the 100-word floor a delete or replace removing more than 30% is validation naming the numbers; a smaller replace lands in place"
+
+# 208 → 307 → 406 → 505 (refused) → 500 (exactly) → 501 (refused).
+run 0 "$MESA" live memory add "$(words 99)"
+E4=$(jqs .id)
+run 0 "$MESA" live memory add "$(words 99)"
+E5=$(jqs .id)
+run 1 "$MESA" live memory add "$(words 99)"
+[ "$(jqe .error.code)" = "validation" ] || fail "an add past the budget: validation"
+grep -q "505 words" <<<"$STDERR" || fail "the budget message must name the resulting count (got $STDERR)"
+grep -q "$NB_BUDGET-word" <<<"$STDERR" || fail "the budget message must name the budget"
+run 0 "$MESA" live memory add "$(words 94)"
+E6=$(jqs .id)
+run 0 "$MESA" live memory list
+[ "$(jqs '[.[].body | split(" ") | length] | add')" = "$NB_BUDGET" ] ||
+  fail "the notebook must be at exactly $NB_BUDGET words (got $(jqs '[.[].body | split(" ") | length] | add'))"
+run 1 "$MESA" live memory add "one"
+[ "$(jqe .error.code)" = "validation" ] || fail "one word past the budget: validation"
+run 1 "$MESA" live memory replace "$E6" "$(words 95)"
+[ "$(jqe .error.code)" = "validation" ] || fail "a replace past the budget: validation"
+grep -q "501 words" <<<"$STDERR" || fail "a replace past the budget names the count"
+ok "live memory: the $NB_BUDGET-word budget is inclusive, judged on the notebook the write would leave, and names both numbers"
+
+# ---- decay: N ended sessions with no use retires an entry at the next start ----
+#
+# Every active entry was last used at (or before) the session ended above,
+# so after N more ended conversations the next `live start` retires them all
+# — named on stderr, gone from the active list, `decayed` in --all.
+for _ in $(seq 1 "$NB_DECAY"); do
+  run 0 "$MESA" live start --no-agent
+  run 0 "$MESA" live stop >/dev/null
+done
+run 0 "$MESA" live memory list
+[ "$(jqs length)" = "6" ] || fail "decay runs at a start, not a stop: all 6 entries still active"
+run 0 "$MESA" live start --no-agent
+grep -q "retired" <<<"$STDERR" || fail "live start must report the decayed entries on stderr (got: $STDERR)"
+for id in "$E1" "$E2" "$E3" "$E4" "$E5" "$E6"; do
+  grep -q "#$id\b" <<<"$STDERR" || fail "live start's decay report must name #$id (got: $STDERR)"
+done
+run 0 "$MESA" live memory list
+[ "$(jqs length)" = "0" ] || fail "after decay the active notebook is empty"
+run 0 "$MESA" live memory list --all
+for id in "$E1" "$E2" "$E3" "$E4" "$E5" "$E6"; do
+  [ "$(jqs 'map(select(.id == '"$id"'))[0].retired_reason')" = "decayed" ] ||
+    fail "list --all must show #$id as decayed"
+done
+run 0 "$MESA" live memory show "$E1"
+[ "$(jqs .retired_reason)" = "decayed" ] || fail "a decayed row reads as decayed"
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live start --no-agent
+[ -z "$STDERR" ] || fail "a second start with nothing left to decay must be silent (got: $STDERR)"
+run 0 "$MESA" live stop >/dev/null
+ok "live memory decay: an entry unused for $NB_DECAY ended sessions is retired at the next live start — named on stderr, out of the active list, \`decayed\` in --all"
+
+# ---- the API: four routes on require_agent_access, default mode ----
+PORT=17781
+BASE="http://127.0.0.1:$PORT"
+"$MESA" serve --port "$PORT" >"$TMP/serve14.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$BASE/api/live" >/dev/null || fail "server did not start (log: $(cat "$TMP/serve14.log"))"
+
+api 200 GET "/api/live/memory"
+[ "$BODY" = "[]" ] || fail "GET /api/live/memory: the active notebook is empty after decay (got $BODY)"
+api 201 POST "/api/live/memory" '{"body":"  Prefers the board sorted by priority.  "}'
+M1=$(jqb .id)
+[ "$(jqb .body)" = "Prefers the board sorted by priority." ] || fail "POST /api/live/memory: trimmed body"
+[ "$(jqb .retired_at)" = "null" ] || fail "POST /api/live/memory: active"
+api 200 GET "/api/live/memory"
+[ "$(jqb length)" = "1" ] && [ "$(jqb '.[0].id')" = "$M1" ] || fail "GET /api/live/memory lists the new row"
+api 200 PATCH "/api/live/memory/$M1" '{"body":"Prefers the board sorted by priority, always."}'
+[ "$(jqb .id)" = "$M1" ] || fail "PATCH keeps the id"
+[ "$(jqb .body)" = "Prefers the board sorted by priority, always." ] || fail "PATCH: the new body"
+api 422 POST "/api/live/memory" '{"body":"   "}'
+[ "$(jqb .error.code)" = "validation" ] || fail "POST an empty body: validation"
+api 422 POST "/api/live/memory" '{}'
+[ "$(jqb .error.code)" = "validation" ] || fail "POST with no body key: validation"
+api 422 PATCH "/api/live/memory/$M1" "{\"body\":\"$(printf 'x%.0s' $(seq 1 $((NB_ENTRY_MAX + 1))))\"}"
+[ "$(jqb .error.code)" = "validation" ] || fail "PATCH past the entry bound: validation"
+grep -q "$NB_ENTRY_MAX" <<<"$BODY" || fail "the API names the bound like the CLI"
+api 404 PATCH "/api/live/memory/999999" '{"body":"nothing here"}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "PATCH an unknown id: not_found"
+api 404 DELETE "/api/live/memory/999999"
+[ "$(jqb .error.code)" = "not_found" ] || fail "DELETE an unknown id: not_found"
+api 200 DELETE "/api/live/memory/$M1"
+[ "$(jqb .id)" = "$M1" ] && [ "$(jqb .retired_reason)" = "deleted" ] || fail "DELETE echoes the retired row"
+api 200 GET "/api/live/memory"
+[ "$BODY" = "[]" ] || fail "a deleted row leaves the active list"
+api 404 DELETE "/api/live/memory/$M1"
+[ "$(jqb .error.code)" = "not_found" ] || fail "DELETE a retired row: not_found"
+# The 2s poll carries no notebook.
+api 200 GET "/api/live"
+[ "$(jqb 'keys | sort | join(",")')" = "boards,session,turns" ] ||
+  fail "GET /api/live must carry exactly session/turns/boards — no notebook (got $(jqb 'keys'))"
+ok "/api/live/memory: GET/POST/PATCH/DELETE round trip, 422 validation with the CLI's messages, 404 for unknown and retired ids, and GET /api/live carries no notebook"
+
+# Both halves of the boundary, default mode: Host allowlist, Content-Type
+# gate, and the agent gate (a foreign Origin refused on every verb, reads
+# included — the Settings posture, since this is text injected into a
+# prompt).
+raw GET "/api/live/memory" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "GET /api/live/memory with a foreign Host: expected 403, got $STATUS"
+raw POST "/api/live/memory" -d 'body=form+post'
+[ "$STATUS" = "415" ] || fail "form-encoded POST /api/live/memory: expected 415, got $STATUS"
+raw PATCH "/api/live/memory/1" -d 'body=form+post'
+[ "$STATUS" = "415" ] || fail "form-encoded PATCH /api/live/memory: expected 415, got $STATUS"
+raw DELETE "/api/live/memory/1" -d 'x=1'
+[ "$STATUS" = "415" ] || fail "DELETE /api/live/memory without JSON: expected 415, got $STATUS"
+[ "$(origin_status GET "/api/live/memory" 'https://evil.example')" = "403" ] ||
+  fail "GET /api/live/memory with a foreign Origin must be 403 (reads are gated too)"
+[ "$(origin_status POST "/api/live/memory" 'https://evil.example' '{"body":"x"}')" = "403" ] ||
+  fail "POST /api/live/memory with a foreign Origin must be 403"
+[ "$(origin_status PATCH "/api/live/memory/1" 'https://evil.example' '{"body":"x"}')" = "403" ] ||
+  fail "PATCH /api/live/memory with a foreign Origin must be 403"
+[ "$(origin_status DELETE "/api/live/memory/1" 'https://evil.example' '{}')" = "403" ] ||
+  fail "DELETE /api/live/memory with a foreign Origin must be 403"
+[ "$(origin_status GET "/api/live/memory" "http://localhost:$PORT")" = "200" ] ||
+  fail "GET /api/live/memory from a local Origin must be served"
+ok "/api/live/memory (default mode): foreign Host 403, non-JSON writes 415, foreign Origin 403 on all four verbs, a local Origin served"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
+
+# ---- the same routes under --lan: relaxed, never absent ----
+LAN_PORT=17782
+LAN_BASE="http://127.0.0.1:$LAN_PORT"
+"$MESA" serve --lan --port "$LAN_PORT" >"$TMP/lan14.log" 2>&1 &
+LAN_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$LAN_BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$LAN_BASE/api/live" >/dev/null || fail "LAN server did not start (log: $(cat "$TMP/lan14.log"))"
+
+[ "$(lan_status GET "/api/live/memory" 'evil.example')" = "403" ] ||
+  fail "--lan: GET /api/live/memory must refuse a DNS-name Host (rebinding defense)"
+[ "$(lan_status POST "/api/live/memory" 'evil.example' '{"body":"x"}')" = "403" ] ||
+  fail "--lan: POST /api/live/memory must refuse a DNS-name Host"
+[ "$(lan_status GET "/api/live/memory" "127.0.0.1:$LAN_PORT")" = "200" ] ||
+  fail "--lan: GET /api/live/memory from a local Host must be served"
+[ "$(lan_status GET "/api/live/memory" "192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: GET /api/live/memory from an IP-literal Host (a real LAN browser) must be served"
+[ "$(lan_status POST "/api/live/memory" "192.0.2.7:$LAN_PORT" '{"body":"added from the LAN"}')" = "201" ] ||
+  fail "--lan: a LAN page may add to the notebook"
+LAN_ID=$(curl -s -H "Host: 192.0.2.7:$LAN_PORT" "$LAN_BASE/api/live/memory" | jq -r '.[-1].id')
+[ "$(lan_status PATCH "/api/live/memory/$LAN_ID" "192.0.2.7:$LAN_PORT" '{"body":"edited from the LAN"}')" = "200" ] ||
+  fail "--lan: a LAN page may edit the notebook"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Host: 192.0.2.7:$LAN_PORT" \
+     -d 'body=form+post' "$LAN_BASE/api/live/memory")" = "415" ] ||
+  fail "--lan: the Content-Type gate still fires on the notebook"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Host: 192.0.2.7:$LAN_PORT" \
+     -H 'Origin: https://evil.example' -H 'Content-Type: application/json' \
+     -d '{"body":"cross-site"}' "$LAN_BASE/api/live/memory")" = "403" ] ||
+  fail "--lan: a foreign Origin must still be refused on the notebook"
+[ "$(lan_status DELETE "/api/live/memory/$LAN_ID" "192.0.2.7:$LAN_PORT" '{}')" = "200" ] ||
+  fail "--lan: a LAN page may delete from the notebook"
+ok "--lan: all four /api/live/memory verbs present and relaxed (DNS Host 403, IP-literal Host served), Content-Type and Origin gates still shut"
+
+kill "$LAN_PID" 2>/dev/null || true
+wait "$LAN_PID" 2>/dev/null || true
+LAN_PID=
 
 
 echo "all $CHECKS checks passed"

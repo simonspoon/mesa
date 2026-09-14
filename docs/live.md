@@ -568,8 +568,68 @@ logs replayed in order, questions whose answers are known from later
 sessions, scored for recall, staleness, invented facts and prompt size
 against no-memory / last-5 / no-decay / full-design baselines — which is what
 the budget, the decay window and the removal share are meant to be tuned by.
-That harness is a separate subtask; the numbers here are the starting values
-it will move.
+That harness is `scripts/memory-eval.sh` (mesa task 1149, below); the
+numbers here are the starting values it is meant to move.
+
+### The eval harness (`scripts/memory-eval.sh`, mesa task 1149)
+
+One command, bash + jq + curl, model calls through `claude -p` (print mode,
+`MESA_EVAL_MODEL`, default `haiku`), everything under `scripts/memory-eval/`.
+It never writes the person's db: `~/Library/Application Support/mesa/mesa.db`
+is copied once and the real turns are read off the copy, while every baseline
+gets its own throwaway `MESA_DB`, `MESA_CONFIG_FILE` and `mesa serve` port.
+`--dry-run` prints the plan, the model-call count and a cost floor first.
+
+- **Replay** (`baseline.sh`, the four run in parallel). The real sessions
+  from `--from` (default 60, where the real conversations start; only ones
+  the person spoke in count; `--sessions N` keeps the newest N) are replayed
+  in order into each baseline: `live start` under a stub `claude` that
+  records the prompt this branch injects, the person's turns over
+  `POST /api/live/utterance` (there is no CLI verb for them), mesa's over
+  `live say`, then for `nodecay`/`full` an **agent step** — `claude -p` handed
+  rule 9, that prompt and the transcript, allowed only `mesa live memory *` —
+  then `live stop`, whose `live-summary` template is a **synchronous**
+  `claude -p` running the real summariser prompt. `none` writes no summary
+  and injects the session line alone; `last5` runs main's old summariser
+  prompt (`last5-summary-prompt.txt`, quoted from `main`) and builds the old
+  five-summary prompt shape itself; `nodecay` `touch`es every active entry
+  each session so nothing ever decays; `full` is exactly what this branch
+  does. After each stop the db is snapshotted (`mesa backup`), so a later
+  quiz searches the archive **as it stood then**, never the finished run.
+- **Quiz** (`quiz.json`, authored from the real sessions' turns: recall,
+  superseded facts — the hooks two-modes-then-one case among them — task
+  pointers and stated preferences). Each question is asked "after session
+  S" with the prompt injected at the start of the session that followed S;
+  the answerer (`full`/`nodecay` also allowed `mesa live memory search`) must
+  say `unknown` rather than guess, and a second `claude -p` grades it
+  `correct | stale | invented | unknown` with a `leak` flag for volunteered
+  unrelated facts. Prompt size is the injected prompt's **chars/4** (the
+  answer call's real usage rides in the raw JSON but includes Claude Code's
+  own ~24k-token system prompt, which swamps the difference).
+- **Stress** (`stress.sh`): synthetic sessions with a preference stated and
+  later reversed, topic churn, and planted instructions in dictated text
+  (canary tokens). `--stress N` (default 30) runs the real agent step and
+  summariser; `--stress-fast N` (default 200) runs a deterministic scripted
+  editor instead — it adds one bullet per stated preference, retires the
+  oldest entry when the budget refuses an add, and every 25th session tries
+  the whole-notebook wipe the removal guard must refuse — proving the bound
+  and the store guards at scale. The scripted editor never copies dictated
+  text, so `injections leaked` is only meaningful in model mode.
+- **Tuning knobs**, and what is honest about them: `--budget W` is a
+  harness-side check against the words `list` reports, `--decay never`
+  drives `nodecay`'s touching, and `--edit-max PCT` is the share the fast
+  editor's wipe attempts. The product's own numbers
+  (`LIVE_NOTEBOOK_BUDGET_WORDS`, `LIVE_NOTEBOOK_DECAY_SESSIONS`,
+  `LIVE_NOTEBOOK_EDIT_MAX_REMOVAL`) are constants in `core::live`, so a
+  different budget, window or share is a rebuild — the harness measures
+  against them, it cannot move them.
+
+The score table (`column -t`) is one row per baseline: correct, stale,
+invented, unknown and leak percentages, mean injected prompt tokens, final
+and max notebook words; then one line per stress mode (`bounded: yes/no`,
+`injections leaked: k/n`). `results.json` in `--out` (default
+`/tmp/impl-eval/out`) holds the raw per-session and
+per-question records beside every prompt, answer and grade.
 
 ## The whiteboard (`mesa live board`, mesa task 1071)
 

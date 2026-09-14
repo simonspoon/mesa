@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Live memory v2 eval harness (mesa task 1149): replays the person's real live
+# sessions through four memory baselines, quizzes each at checkpoints, stress
+# tests the notebook with synthetic sessions, and prints one score table.
+#
+#   scripts/memory-eval.sh [--sessions N] [--baselines a,b,c] [--stress N]
+#       [--stress-fast N] [--budget W] [--decay product|never] [--edit-max PCT]
+#       [--from ID] [--out DIR] [--dry-run]
+#
+# --from ID: the first real session replayed (default 60, where the real
+# conversations start; earlier rows are the feature's own test sessions), and
+# only sessions in which the person actually spoke count.
+#
+# bash + jq + curl, model calls through `claude -p` (MESA_EVAL_MODEL, default
+# haiku). Never writes the person's db: it is copied once and read from the
+# copy. See docs/live.md, "The eval harness".
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export EVAL_DIR="$ROOT/scripts/memory-eval"
+
+FROM=60; SESSIONS_N=0; BASELINES="none,last5,nodecay,full"; STRESS_N=30; STRESS_FAST_N=200
+export BUDGET=500 DECAY=product EDIT_MAX_PCT=60
+OUT="${CLAUDE_JOB_DIR:-${TMPDIR:-/tmp}}/impl-eval/out"
+[ -n "${CLAUDE_JOB_DIR:-}" ] && OUT="$CLAUDE_JOB_DIR/tmp/impl-eval/out"
+DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sessions) SESSIONS_N=$2; shift 2 ;;
+    --from) FROM=$2; shift 2 ;;
+    --baselines) BASELINES=$2; shift 2 ;;
+    --stress) STRESS_N=$2; shift 2 ;;
+    --stress-fast) STRESS_FAST_N=$2; shift 2 ;;
+    --budget) BUDGET=$2; shift 2 ;;
+    --decay) DECAY=$2; shift 2 ;;
+    --edit-max) EDIT_MAX_PCT=$2; shift 2 ;;
+    --out) OUT=$2; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+export OUT MODEL="${MESA_EVAL_MODEL:-haiku}"
+export MESA_BIN="${MESA_BIN:-$ROOT/target/release/mesa}"
+export REAL_CLAUDE="${REAL_CLAUDE:-$(command -v claude || true)}"
+for tool in jq curl sqlite3; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 2; }; done
+[ -x "$MESA_BIN" ] || { echo "no mesa binary at $MESA_BIN (build first, or set MESA_BIN)" >&2; exit 2; }
+[ -n "$REAL_CLAUDE" ] || { echo "no claude on PATH (set REAL_CLAUDE)" >&2; exit 2; }
+mkdir -p "$OUT"
+: > "$OUT/calls"
+
+# The person's db, copied once; every read of the real turns is off the copy.
+SRC_DB="${MESA_EVAL_SOURCE_DB:-$HOME/Library/Application Support/mesa/mesa.db}"
+export REAL_DB="$OUT/real.db"
+cp "$SRC_DB" "$REAL_DB"; rm -f "$REAL_DB-wal" "$REAL_DB-shm"
+all=$(sqlite3 "$REAL_DB" "select id from live_sessions order by id")
+with_turns=()
+for s in $all; do
+  [ "$s" -ge "$FROM" ] || continue
+  n=$(MESA_DB="$REAL_DB" "$MESA_BIN" live turns --session "$s" 2>/dev/null | jq '[.[] | select(.role == "user" and .text != null)] | length')
+  [ "${n:-0}" -gt 0 ] && with_turns+=("$s")
+done
+if [ "$SESSIONS_N" -gt 0 ] && [ "$SESSIONS_N" -lt "${#with_turns[@]}" ]; then
+  with_turns=("${with_turns[@]: -$SESSIONS_N}")
+fi
+[ "${#with_turns[@]}" -gt 0 ] || { echo "no real sessions with a user turn from $FROM on" >&2; exit 1; }
+export SESSIONS="${with_turns[*]}"
+export QUIZ="$EVAL_DIR/quiz.json"
+nq=$(jq --argjson ids "$(printf '%s\n' "${with_turns[@]}" | jq -cs .)" '[.[] | select(.after_session as $a | $ids | index($a))] | length' "$QUIZ")
+
+# ---- plan and cost ----
+calls=0
+IFS=, read -ra BL <<<"$BASELINES"
+for b in "${BL[@]}"; do
+  case "$b" in
+    none) ;;
+    last5) calls=$((calls + ${#with_turns[@]})) ;;
+    nodecay|full) calls=$((calls + 2 * ${#with_turns[@]})) ;;
+    *) echo "unknown baseline: $b" >&2; exit 2 ;;
+  esac
+  calls=$((calls + 2 * nq))
+done
+calls=$((calls + 2 * STRESS_N))
+# ~$0.05 per haiku call was measured on this machine (a ~24k-token system
+# prompt is cached and re-read per call, plus the prompt); a tool-using
+# agent step costs more, so read this as a floor.
+est=$(awk -v c="$calls" 'BEGIN { printf "%.2f", c * 0.05 }')
+echo "plan: ${#with_turns[@]} real sessions (${with_turns[0]:-none}..${with_turns[${#with_turns[@]}-1]:-none}) × baselines [$BASELINES], $nq quiz questions, stress $STRESS_N model-driven + $STRESS_FAST_N scripted; budget $BUDGET words, decay $DECAY, edit-max $EDIT_MAX_PCT%"
+echo "model calls: ~$calls on $MODEL, est. cost ~\$$est (floor); out: $OUT"
+[ "$DRY" = 1 ] && exit 0
+
+# ---- run: baselines in parallel, then stress ----
+PIDS=()
+cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; pkill -P $$ 2>/dev/null; return 0; }
+trap cleanup EXIT INT TERM
+for b in "${BL[@]}"; do
+  bash "$EVAL_DIR/baseline.sh" "$b" 2>"$OUT/$b.log" &
+  PIDS+=($!)
+done
+failed=0
+for p in "${PIDS[@]}"; do wait "$p" || failed=1; done
+[ "$failed" = 0 ] || echo "a baseline failed; see $OUT/*.log" >&2
+[ "$STRESS_FAST_N" -gt 0 ] && bash "$EVAL_DIR/stress.sh" fast "$STRESS_FAST_N" 2>"$OUT/stress-fast.log"
+[ "$STRESS_N" -gt 0 ] && bash "$EVAL_DIR/stress.sh" model "$STRESS_N" 2>"$OUT/stress-model.log"
+
+# ---- score table ----
+results=()
+for b in "${BL[@]}"; do [ -f "$OUT/$b/result.json" ] && results+=("$OUT/$b/result.json"); done
+stress=()
+for m in fast model; do [ -f "$OUT/stress-$m/result.json" ] && stress+=("$OUT/stress-$m/result.json"); done
+jq -s --arg model "$MODEL" --argjson calls "$(wc -l < "$OUT/calls" | tr -d ' ')" \
+   --argjson budget "$BUDGET" --arg decay "$DECAY" --arg sessions "$SESSIONS" \
+   '{model: $model, model_calls: $calls, budget: $budget, decay: $decay, sessions: ($sessions | split(" ") | map(tonumber)),
+     baselines: [.[] | select(.baseline)], stress: [.[] | select(.mode)]}' ${results[@]+"${results[@]}"} ${stress[@]+"${stress[@]}"} > "$OUT/results.json"
+echo
+{
+  echo "baseline correct% stale% invented% unknown% leak% mean_prompt_tokens final_notebook_words max_notebook_words"
+  jq -r '.baselines[] | . as $b | (.quiz | length) as $n
+    | def pct(f): if $n == 0 then "-" else ((([.quiz[] | select(f)] | length) * 100 / $n) | round | tostring) end;
+      [ .baseline, pct(.verdict == "correct"), pct(.verdict == "stale"), pct(.verdict == "invented"), pct(.verdict == "unknown"), pct(.leak == true),
+        (if $n == 0 then "-" else (([.quiz[].injected_prompt_tokens] | add / $n) | round | tostring) end),
+        (.sessions[-1].notebook_words // 0), ([.sessions[].notebook_words] | max // 0) ] | @tsv' "$OUT/results.json"
+} | column -t
+echo
+jq -r '.stress[] | "stress \(.mode): \(.sessions) sessions, bounded: \(if .bounded then "yes" else "no" end) (max \(.max_notebook_words)/\(.budget) words), injections leaked: \(.injections_leaked)/\(.injections_planted), budget refusals \(.budget_refusals), removal-guard refusals \(.removal_guard_refusals)"' "$OUT/results.json"
+echo "model calls made: $(wc -l < "$OUT/calls" | tr -d ' '); raw results: $OUT/results.json"

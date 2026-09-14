@@ -5,7 +5,7 @@
 #
 #   scripts/memory-eval.sh [--sessions N] [--baselines a,b,c] [--stress N]
 #       [--stress-fast N] [--budget W] [--decay product|never] [--edit-max PCT]
-#       [--from ID] [--out DIR] [--dry-run]
+#       [--from ID] [--out DIR] [--dry-run] [--table-only]
 #
 # --from ID: the first real session replayed (default 60, where the real
 # conversations start; earlier rows are the feature's own test sessions), and
@@ -22,7 +22,7 @@ FROM=60; SESSIONS_N=0; BASELINES="none,last5,nodecay,full"; STRESS_N=30; STRESS_
 export BUDGET=500 DECAY=product EDIT_MAX_PCT=60
 OUT="${CLAUDE_JOB_DIR:-${TMPDIR:-/tmp}}/impl-eval/out"
 [ -n "${CLAUDE_JOB_DIR:-}" ] && OUT="$CLAUDE_JOB_DIR/tmp/impl-eval/out"
-DRY=0
+DRY=0; TABLE_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sessions) SESSIONS_N=$2; shift 2 ;;
@@ -35,6 +35,7 @@ while [ $# -gt 0 ]; do
     --edit-max) EDIT_MAX_PCT=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --table-only) TABLE_ONLY=1; shift ;;
     -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -46,7 +47,7 @@ for tool in jq curl sqlite3; do command -v "$tool" >/dev/null || { echo "$tool i
 [ -x "$MESA_BIN" ] || { echo "no mesa binary at $MESA_BIN (build first, or set MESA_BIN)" >&2; exit 2; }
 [ -n "$REAL_CLAUDE" ] || { echo "no claude on PATH (set REAL_CLAUDE)" >&2; exit 2; }
 mkdir -p "$OUT"
-: > "$OUT/calls"
+[ "$TABLE_ONLY" = 1 ] || : > "$OUT/calls"
 
 # The person's db, copied once; every read of the real turns is off the copy.
 SRC_DB="${MESA_EVAL_SOURCE_DB:-$HOME/Library/Application Support/mesa/mesa.db}"
@@ -84,11 +85,12 @@ calls=$((calls + 2 * STRESS_N))
 # prompt is cached and re-read per call, plus the prompt); a tool-using
 # agent step costs more, so read this as a floor.
 est=$(awk -v c="$calls" 'BEGIN { printf "%.2f", c * 0.05 }')
-echo "plan: ${#with_turns[@]} real sessions (${with_turns[0]:-none}..${with_turns[${#with_turns[@]}-1]:-none}) × baselines [$BASELINES], $nq quiz questions, stress $STRESS_N model-driven + $STRESS_FAST_N scripted; budget $BUDGET words, decay $DECAY, edit-max $EDIT_MAX_PCT%"
+echo "plan: ${#with_turns[@]} real sessions (${with_turns[0]:-none}..${with_turns[${#with_turns[@]}-1]:-none}) × baselines [$BASELINES], $nq quiz questions, stress $STRESS_N model-driven + $STRESS_FAST_N scripted; harness checks: budget $BUDGET words, decay $DECAY (nodecay touches), fast-editor wipe $EDIT_MAX_PCT% (product guard: 30%/edit, 500 words, 10 sessions — constants, not flags)"
 echo "model calls: ~$calls on $MODEL, est. cost ~\$$est (floor); out: $OUT"
 [ "$DRY" = 1 ] && exit 0
 
 # ---- run: baselines in parallel, then stress ----
+if [ "$TABLE_ONLY" = 0 ]; then
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; pkill -P $$ 2>/dev/null; return 0; }
 trap cleanup EXIT INT TERM
@@ -101,6 +103,7 @@ for p in "${PIDS[@]}"; do wait "$p" || failed=1; done
 [ "$failed" = 0 ] || echo "a baseline failed; see $OUT/*.log" >&2
 [ "$STRESS_FAST_N" -gt 0 ] && bash "$EVAL_DIR/stress.sh" fast "$STRESS_FAST_N" 2>"$OUT/stress-fast.log"
 [ "$STRESS_N" -gt 0 ] && bash "$EVAL_DIR/stress.sh" model "$STRESS_N" 2>"$OUT/stress-model.log"
+fi
 
 # ---- score table ----
 results=()

@@ -69,6 +69,10 @@ serve_start() {
   "$MESA_BIN" serve --port "$port" >"$BDIR/serve.log" 2>&1 &
   SERVE_PID=$!
   for _ in $(seq 1 50); do
+    # Our own process must be the one answering: four baselines start at
+    # once, and a serve that lost the port to a sibling would otherwise pass
+    # this check on the sibling's server and write its turns into the wrong db.
+    kill -0 "$SERVE_PID" 2>/dev/null || { echo "serve on :$port died: $(cat "$BDIR/serve.log")" >&2; return 1; }
     curl -s "http://127.0.0.1:$port/api/version" >/dev/null 2>&1 && return 0
     sleep 0.2
   done

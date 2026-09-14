@@ -31,8 +31,8 @@ esac
 SERVE_PID=""
 cleanup() { [ -n "$SERVE_PID" ] && kill "$SERVE_PID" 2>/dev/null; return 0; }
 trap cleanup EXIT INT TERM
-PORT=$(free_port)
-serve_start "$PORT"
+for _ in 1 2 3 4 5; do PORT=$(free_port); serve_start "$PORT" && break; SERVE_PID=""; done
+[ -n "$SERVE_PID" ] || exit 1
 log() { echo "[$NAME] $*" >&2; }
 
 # The prompt the quiz sees "after session S": for full/nodecay the one this
@@ -81,7 +81,7 @@ for S in $SESSIONS; do
       if "$MESA_BIN" live say "$text" >/dev/null 2>&1; then replayed=$((replayed+1)); else skipped=$((skipped+1)); fi
     fi
   done < <(MESA_DB="$REAL_DB" "$MESA_BIN" live turns --session "$S" | jq -c '.[] | select(.text != null and .text != "") | {role, text}')
-  agent_calls=0
+  agent_calls=0; denials=0
   if [ "$NAME" = nodecay ] || [ "$NAME" = full ]; then
     {
       cat "$EVAL_DIR/agent-step.txt"
@@ -91,15 +91,16 @@ for S in $SESSIONS; do
     } > "$BDIR/agent-step-$S.txt"
     claude_call "$BDIR/agent-step-$S.txt" 'Bash(mesa live memory:*)' > "$BDIR/agent-step-$S.json" 2>"$BDIR/agent-step-$S.err" || log "agent step for session $S failed (see agent-step-$S.err)"
     agent_calls=1
+    denials=$(jq '.permission_denials | length' "$BDIR/agent-step-$S.json" 2>/dev/null || echo 0); [ -n "$denials" ] || denials=0
   fi
   "$MESA_BIN" live stop >/dev/null 2>"$BDIR/stop-$S.err" || log "stop for session $S: $(cat "$BDIR/stop-$S.err")"
   "$MESA_BIN" backup "$BDIR/db-after-$S.db" >/dev/null
   words=$(notebook_words); entries=$(notebook_entries)
   prompt_chars=$(wc -c < "$BDIR/stub/last-prompt" | tr -d ' ')
   jq -nc --arg real "$S" --arg id "$SID" --argjson words "$words" --argjson entries "$entries" \
-     --argjson chars "$prompt_chars" --argjson replayed "$replayed" --argjson skipped "$skipped" \
+     --argjson chars "$prompt_chars" --argjson replayed "$replayed" --argjson skipped "$skipped" --argjson denials "$denials" \
      --argjson over "$([ "$words" -gt "$BUDGET" ] && echo true || echo false)" \
-     '{real_session: ($real|tonumber), session: ($id|tonumber), notebook_words: $words, notebook_entries: $entries, injected_prompt_tokens: (($chars / 4) | floor), turns_replayed: $replayed, turns_skipped: $skipped, over_budget: $over}' >> "$BDIR/sessions.jsonl"
+     '{real_session: ($real|tonumber), session: ($id|tonumber), notebook_words: $words, notebook_entries: $entries, injected_prompt_tokens: (($chars / 4) | floor), turns_replayed: $replayed, turns_skipped: $skipped, agent_step_denied_commands: $denials, over_budget: $over}' >> "$BDIR/sessions.jsonl"
   log "session $S → $SID: $replayed turns, notebook $words words / $entries entries"
   PREV=$S
 done
@@ -144,8 +145,8 @@ for i in $(seq 0 $((n - 1))); do
     printf 'correct = matches the expected answer in substance (ids and gist, wording free); stale = matches the superseded answer; unknown = says it does not know or gives nothing; invented = asserts something matching neither. leak = true when the answer volunteers facts unrelated to the question.\n'
   } > "$BDIR/grade-$i.txt"
   claude_call "$BDIR/grade-$i.txt" "" > "$BDIR/grade-$i.json" 2>/dev/null || true
-  grade=$(claude_result < "$BDIR/grade-$i.json" | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//' | jq -c '{verdict, leak}' 2>/dev/null || echo '{"verdict":"ungraded","leak":false}')
-  [ -n "$grade" ] || grade='{"verdict":"ungraded","leak":false}'
+  grade=$(claude_result < "$BDIR/grade-$i.json" | grep -o '{[^{}]*}' | head -1 | jq -c '{verdict: (.verdict // "ungraded"), leak: (.leak == true)}' 2>/dev/null || true)
+  jq -e . <<<"$grade" >/dev/null 2>&1 || grade='{"verdict":"ungraded","leak":false}'
   prompt_tokens=$(( $(wc -c < "$pf" | tr -d ' ') / 4 ))
   jq -nc --argjson q "$q" --argjson g "$grade" --arg a "$answer" --argjson pt "$prompt_tokens" --argjson it "$in_tokens" \
     '{after_session: $q.after_session, kind: $q.kind, question: $q.question, answer: $a, verdict: $g.verdict, leak: ($g.leak // false), injected_prompt_tokens: $pt, answer_call_input_tokens: $it}' >> "$BDIR/quiz.jsonl"

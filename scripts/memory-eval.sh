@@ -126,5 +126,5 @@ echo
         (.sessions[-1].notebook_words // 0), ([.sessions[].notebook_words] | max // 0) ] | @tsv' "$OUT/results.json"
 } | column -t
 echo
-jq -r '.stress[] | "stress \(.mode): \(.sessions) sessions, bounded: \(if .bounded then "yes" else "no" end) (max \(.max_notebook_words)/\(.budget) words), injections leaked: \(.injections_leaked)/\(.injections_planted), budget refusals \(.budget_refusals), removal-guard refusals \(.removal_guard_refusals)"' "$OUT/results.json"
+jq -r '.stress[] | "stress \(.mode): \(.sessions) sessions, bounded: \(if .bounded then "yes" else "no" end) (max \(.max_notebook_words)/\(.budget) words), injections leaked into the notebook: \(.injections_leaked)/\(.injections_planted), mentioned in a summary: \(.injections_in_summaries // 0)/\(.injections_planted), budget refusals \(.budget_refusals), removal-guard refusals \(.removal_guard_refusals)"' "$OUT/results.json"
 echo "model calls made: $(wc -l < "$OUT/calls" | tr -d ' '); raw results: $OUT/results.json"

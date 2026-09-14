@@ -31,20 +31,20 @@ with_timeout() {
   return $rc
 }
 
-# claude_call <prompt-file> <tools> — one `claude -p` in print mode, the prompt
-# on stdin (an argument would be swallowed by the variadic --tools flag), the
-# JSON envelope on stdout. <tools> is "" for a tool-less call, else the
-# --allowedTools patterns, space-separated. Every call is counted in
+# claude_call <prompt-file> [pattern...] — one `claude -p` in print mode, the
+# prompt on stdin (an argument would be swallowed by the variadic --tools
+# flag), the JSON envelope on stdout. No pattern = a tool-less call; else each
+# argument is one --allowedTools pattern, passed as its own word — a pattern
+# holds spaces (`Bash(mesa live memory:*)`), so it must never be word-split. Every call is counted in
 # $OUT/calls (one line per call) for the cost line.
 claude_call() {
-  local prompt_file=$1 tools=$2
-  echo "$(date +%s) $tools" >> "$OUT/calls"
+  local prompt_file=$1; shift
+  echo "$(date +%s) $*" >> "$OUT/calls"
   local args=(-p --model "$MODEL" --output-format json --no-session-persistence)
-  if [ -z "$tools" ]; then
+  if [ $# -eq 0 ]; then
     args+=(--tools "")
   else
-    # shellcheck disable=SC2206 # deliberate split on the patterns
-    args+=(--allowedTools $tools)
+    args+=(--allowedTools "$@")
   fi
   with_timeout "${CLAUDE_TIMEOUT:-300}" "$prompt_file" "$REAL_CLAUDE" "${args[@]}"
 }

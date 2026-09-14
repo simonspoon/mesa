@@ -92,7 +92,9 @@ echo "model calls: ~$calls on $MODEL, est. cost ~\$$est (floor); out: $OUT"
 # ---- run: baselines in parallel, then stress ----
 if [ "$TABLE_ONLY" = 0 ]; then
 PIDS=()
-cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; pkill -P $$ 2>/dev/null; return 0; }
+# `|| true` everywhere: under set -e a failed kill in an EXIT trap would
+# otherwise turn a finished run into exit 1.
+cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done; pkill -P $$ 2>/dev/null || true; return 0; }
 trap cleanup EXIT INT TERM
 for b in "${BL[@]}"; do
   bash "$EVAL_DIR/baseline.sh" "$b" 2>"$OUT/$b.log" &

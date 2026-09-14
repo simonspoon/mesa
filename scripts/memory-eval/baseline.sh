@@ -128,11 +128,11 @@ for i in $(seq 0 $((n - 1))); do
     fi
     printf '. Do not guess: if neither tells you, answer exactly: unknown\n'
   } > "$BDIR/quiz-$i.txt"
-  tools=""
-  if [ "$NAME" = full ] || [ "$NAME" = nodecay ]; then tools='Bash(mesa live memory search:*)'; fi
+  tools=()
+  if [ "$NAME" = full ] || [ "$NAME" = nodecay ]; then tools=('Bash(mesa live memory search:*)'); fi
   # The answerer searches the archive as it stood at the checkpoint, never
   # the finished run: the snapshot `backup` took after that session's stop.
-  MESA_DB="$BDIR/db-after-$after.db" claude_call "$BDIR/quiz-$i.txt" "$tools" > "$BDIR/quiz-$i.json" 2>/dev/null || true
+  MESA_DB="$BDIR/db-after-$after.db" claude_call "$BDIR/quiz-$i.txt" ${tools[@]+"${tools[@]}"} > "$BDIR/quiz-$i.json" 2>/dev/null || true
   answer=$(claude_result < "$BDIR/quiz-$i.json")
   in_tokens=$(jq -r '((.usage.input_tokens // 0) + (.usage.cache_read_input_tokens // 0) + (.usage.cache_creation_input_tokens // 0))' "$BDIR/quiz-$i.json" 2>/dev/null || echo 0)
   [ -n "$in_tokens" ] || in_tokens=0
@@ -144,7 +144,7 @@ for i in $(seq 0 $((n - 1))); do
     printf 'Reply with JSON only, no prose: {"verdict": "correct" | "stale" | "invented" | "unknown", "leak": true | false}\n'
     printf 'correct = matches the expected answer in substance (ids and gist, wording free); stale = matches the superseded answer; unknown = says it does not know or gives nothing; invented = asserts something matching neither. leak = true when the answer volunteers facts unrelated to the question.\n'
   } > "$BDIR/grade-$i.txt"
-  claude_call "$BDIR/grade-$i.txt" "" > "$BDIR/grade-$i.json" 2>/dev/null || true
+  claude_call "$BDIR/grade-$i.txt" > "$BDIR/grade-$i.json" 2>/dev/null || true
   grade=$(claude_result < "$BDIR/grade-$i.json" | grep -o '{[^{}]*}' | head -1 | jq -c '{verdict: (.verdict // "ungraded"), leak: (.leak == true)}' 2>/dev/null || true)
   jq -e . <<<"$grade" >/dev/null 2>&1 || grade='{"verdict":"ungraded","leak":false}'
   prompt_tokens=$(( $(wc -c < "$pf" | tr -d ' ') / 4 ))

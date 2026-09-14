@@ -28,10 +28,10 @@ use crate::core::{
     Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew,
     EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
     InboxItem, InboxKind, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope,
-    LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveRole, LiveSession, LiveStatus,
-    LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result,
-    Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt,
-    agents, board, config, files, library, live, look, receipt, system,
+    LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry, LiveRole,
+    LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch,
+    ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
+    TaskPatch, TaskReceipt, agents, board, config, files, library, live, look, receipt, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1734,6 +1734,9 @@ EXAMPLES
     /// A session's remembered summary (mesa task 921) — set/show/list
     #[command(subcommand)]
     Summary(LiveSummaryCmd),
+    /// The notebook and the archive (mesa task 1147) — list/show/add/replace/delete/touch/search
+    #[command(subcommand)]
+    Memory(LiveMemoryCmd),
     /// The conversation's whiteboard (mesa task 1071) — push/show/list/clear/keep
     #[command(subcommand)]
     Board(LiveBoardCmd),
@@ -1921,6 +1924,119 @@ EXAMPLES
   mesa live summary list --limit 5")]
     List {
         /// Maximum number of summaries to print (clamped to 1..=20)
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: i64,
+    },
+}
+
+/// Live memory (mesa task 1147): the **notebook** — the bullets earlier
+/// conversations left for later ones, every active one riding in every live
+/// agent's prompt under a hard word budget — and the **archive**, every turn,
+/// summary and notebook entry ever written, searched on demand.
+///
+/// The notebook is edited one entry at a time and never rewritten whole: a
+/// single replace or delete may not remove more than 30% of it once it holds
+/// 100 words. `search` is the archive's only read, and like `live look` it is
+/// CLI-only.
+#[derive(Subcommand)]
+enum LiveMemoryCmd {
+    /// List the notebook as a bare JSON array, oldest first (active entries only)
+    #[command(after_help = "\
+EXAMPLES
+  mesa live memory list
+  mesa live memory list --all")]
+    List {
+        /// Include retired entries (decayed, deleted) — the archive's view
+        #[arg(long)]
+        all: bool,
+    },
+    /// Print one notebook entry, retired or not
+    #[command(visible_alias = "get")]
+    Show {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Add one entry; prints the stored record
+    ///
+    /// One bullet: a preference, a working norm, the reason behind a decision,
+    /// a pointer to a task id — something the person said outright. Never
+    /// task status, never a guess about the person. Type the text after `add`
+    /// (quoting is optional; words are joined) — put --quiet BEFORE it,
+    /// exactly as `live say` requires. `validation` when the notebook would
+    /// exceed its word budget.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live memory add Prefers short spoken replies; no lists read aloud.
+  mesa live memory add --quiet \"Task 42 holds the roadmap decisions.\"")]
+    Add {
+        /// The entry text (everything after `add`); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full
+        ///
+        /// Must come BEFORE the text: everything after `add` that is not a
+        /// leading flag is swallowed as the entry.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Rewrite one entry in place; prints the updated record
+    ///
+    /// Keeps the id and the provenance, stamps the session that edited it.
+    /// `validation` when the result would exceed the budget, or when the edit
+    /// removes more than 30% of the notebook's words (once it holds 100).
+    #[command(after_help = "\
+EXAMPLES
+  mesa live memory replace 3 Prefers short spoken replies.
+  mesa live memory replace --quiet 3 \"Prefers short spoken replies.\"")]
+    Replace {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// The new text (everything after ID); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full (BEFORE the text)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Retire one entry (it stays in the archive); echoes the retired record
+    ///
+    /// The same 30%-removal guard as `replace`.
+    Delete {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Mark one entry as used by the live conversation, so it does not decay
+    ///
+    /// An entry no conversation has touched for 10 ended sessions is retired
+    /// as `decayed` at the next live start. `not_found` with no live session.
+    Touch {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Search the archive — every turn, summary and notebook entry — as a bare JSON array
+    ///
+    /// Every word must match (implicit AND); quotes and operators in the
+    /// words are searched for, never parsed. Each hit names its `kind`
+    /// (`turn` | `summary` | `note`), the row it points at (`ref_id`), the
+    /// session, and a snippet with the matches in brackets.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live memory search hooks single mode
+  mesa live memory search pelican --limit 5")]
+    Search {
+        /// The words to search for (everything after `search`)
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        words: Vec<String>,
+        /// Maximum number of hits to print (clamped to 1..=50)
         #[arg(long, value_name = "N", default_value_t = 20)]
         limit: i64,
     },
@@ -3006,6 +3122,10 @@ const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
 /// unbounded prose body. `session_id`/`created_at`/`updated_at` all stay.
 const QUIET_DROP_LIVE_SUMMARY: &[&str] = &["body"];
 
+/// Keys dropped from a `LiveNotebookEntry` under `--quiet` (mesa task 1147):
+/// its own bullet text. Ids, timestamps and the retirement reason all stay.
+const QUIET_DROP_LIVE_NOTEBOOK: &[&str] = &["body"];
+
 /// A board's one unbounded field is its `body` — a whole document, an SVG or
 /// a base64 image. Everything else (ids, a fixed kind word, a 200-char title,
 /// a content type, a timestamp) is bounded and stays.
@@ -3142,6 +3262,10 @@ fn print_live_board(board: &LiveBoard, is_quiet: bool) {
 
 fn print_live_summary(summary: &LiveSummary, is_quiet: bool) {
     print_record(summary, is_quiet, QUIET_DROP_LIVE_SUMMARY);
+}
+
+fn print_notebook_entry(entry: &LiveNotebookEntry, is_quiet: bool) {
+    print_record(entry, is_quiet, QUIET_DROP_LIVE_NOTEBOOK);
 }
 
 /// Print one task receipt: the full record, or the record minus
@@ -4337,6 +4461,32 @@ fn spawn_live_summary(store: &mut Store, session: &LiveSession) {
     }
 }
 
+/// Retires notebook entries no conversation has used for
+/// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions, reporting the ids on
+/// stderr only — the API's start route does the same into its log. The
+/// notebook is a prompt input, so this runs at the start site rather than on a
+/// timer: "unused for N conversations" is only decidable when one begins.
+fn retire_decayed_notebook(store: &mut Store) {
+    match store.retire_decayed_notebook(live::LIVE_NOTEBOOK_DECAY_SESSIONS) {
+        Ok(retired) if !retired.is_empty() => eprintln!(
+            "notebook: retired {} unused for {} conversations: {}",
+            if retired.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            live::LIVE_NOTEBOOK_DECAY_SESSIONS,
+            retired
+                .iter()
+                .map(|e| format!("#{}", e.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("notebook: could not run decay: {e}"),
+    }
+}
+
 fn run_live(cmd: LiveCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
@@ -4352,6 +4502,10 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // project — and every failure AFTER it goes through
             // `bind_live_agent_or_end`, which ends the session again.
             let session = store.start_live_session(project_id)?;
+            // Decay first (mesa task 1147), so the prompt built below carries
+            // only entries some conversation has used lately. Best-effort:
+            // a failure here is a warning, never a failed start.
+            retire_decayed_notebook(&mut store);
             let session = if no_agent {
                 session
             } else {
@@ -4498,6 +4652,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             print_json(&look::shoot(&window, &path)?);
         }
         LiveCmd::Summary(cmd) => run_live_summary(&mut store, cmd)?,
+        LiveCmd::Memory(cmd) => run_live_memory(&mut store, cmd)?,
         LiveCmd::Board(cmd) => run_live_board(&mut store, cmd)?,
     }
     Ok(())
@@ -4515,6 +4670,35 @@ fn run_live_summary(store: &mut Store, cmd: LiveSummaryCmd) -> Result<()> {
         }
         LiveSummaryCmd::List { limit } => {
             print_json(&store.list_live_summaries(limit)?);
+        }
+    }
+    Ok(())
+}
+
+/// The notebook's six verbs and the archive's one (mesa task 1147). Unlike
+/// the rest of the group, none but `touch` needs a live session: the notebook
+/// is edited between conversations too (the Settings page), and the archive
+/// is read whenever.
+fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
+    match cmd {
+        LiveMemoryCmd::List { all } => print_json(&store.list_notebook(all)?),
+        LiveMemoryCmd::Show { id, quiet } => {
+            print_notebook_entry(&store.get_notebook_entry(id)?, quiet);
+        }
+        LiveMemoryCmd::Add { text, quiet } => {
+            print_notebook_entry(&store.add_notebook_entry(&text.join(" "))?, quiet);
+        }
+        LiveMemoryCmd::Replace { id, text, quiet } => {
+            print_notebook_entry(&store.replace_notebook_entry(id, &text.join(" "))?, quiet);
+        }
+        LiveMemoryCmd::Delete { id, quiet } => {
+            print_notebook_entry(&store.delete_notebook_entry(id)?, quiet);
+        }
+        LiveMemoryCmd::Touch { id, quiet } => {
+            print_notebook_entry(&store.touch_notebook_entry(id)?, quiet);
+        }
+        LiveMemoryCmd::Search { words, limit } => {
+            print_json(&store.search_live_memory(&words.join(" "), limit)?);
         }
     }
     Ok(())
@@ -6034,6 +6218,47 @@ mod tests {
                 QUIET_DROP_LIVE_SUMMARY
             ))),
             minus(&full, QUIET_DROP_LIVE_SUMMARY),
+        );
+    }
+
+    fn sample_notebook_entry() -> LiveNotebookEntry {
+        LiveNotebookEntry {
+            id: 3,
+            body: "Prefers short spoken replies.".into(),
+            created_at: "2026-09-01 00:00:00".into(),
+            updated_at: "2026-09-01 00:00:01".into(),
+            source_session_id: Some(12),
+            last_used_session_id: Some(15),
+            retired_at: None,
+            retired_reason: None,
+        }
+    }
+
+    #[test]
+    fn live_notebook_quiet_drops_body() {
+        let full = keys(&sample_notebook_entry());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                // The one free-text field: the bullet. Dropped.
+                "body",
+                "created_at",
+                "updated_at",
+                "source_session_id",
+                "last_used_session_id",
+                "retired_at",
+                "retired_reason",
+            ]),
+            "LiveNotebookEntry gained/lost a field: decide whether it belongs in \
+             the --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_notebook_entry(),
+                QUIET_DROP_LIVE_NOTEBOOK
+            ))),
+            minus(&full, QUIET_DROP_LIVE_NOTEBOOK),
         );
     }
 

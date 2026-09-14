@@ -12050,7 +12050,7 @@ mod tests {
     fn notebook_budget_bounds_the_active_notebook() {
         let (mut store, _dir) = temp_store();
         // 5 entries × 99 words = 495 words.
-        let ninety_nine = vec!["w"; 99].join(" ");
+        let ninety_nine = ["w"; 99].join(" ");
         let mut ids = Vec::new();
         for _ in 0..5 {
             ids.push(store.add_notebook_entry(&ninety_nine).unwrap().id);
@@ -12082,7 +12082,7 @@ mod tests {
 
         // 120 words in three entries of 40: deleting one is 33%, refused;
         // replacing one with 10 words removes 30 (25%), allowed.
-        let forty = vec!["w"; 40].join(" ");
+        let forty = ["w"; 40].join(" ");
         let a = store.add_notebook_entry(&forty).unwrap();
         store.add_notebook_entry(&forty).unwrap();
         store.add_notebook_entry(&forty).unwrap();
@@ -12097,7 +12097,7 @@ mod tests {
             err.to_string().contains("39 of the notebook's 120 words"),
             "{err}"
         );
-        let ten = vec!["v"; 10].join(" ");
+        let ten = ["v"; 10].join(" ");
         let replaced = store.replace_notebook_entry(a.id, &ten).unwrap();
         assert_eq!(replaced.body, ten);
         assert_eq!(replaced.id, a.id);

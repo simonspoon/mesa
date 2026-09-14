@@ -43,8 +43,8 @@ use crate::core::{
     Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP,
     LibraryBundle, LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveBoardKind,
-    LiveContext, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion,
-    ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    LiveContext, LiveNotebookEntry, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow,
+    MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
     ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script,
     ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary, Waypoint,
     agents, attachments, board, config, files, git, guard, hooks, library, listen, live, receipt,
@@ -1369,6 +1369,20 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/live",
             get(get_live).post(start_live).delete(stop_live),
+        )
+        // The notebook (mesa task 1147): the bullets every live agent is
+        // spawned holding. Text injected into an agent's prompt is the
+        // Settings/config posture, so all four verbs carry
+        // `require_agent_access`. No search route (the archive is the
+        // agent's, over the CLI) and nothing on `GET /api/live` — the 2s poll
+        // stays bounded.
+        .route(
+            "/api/live/memory",
+            get(list_live_memory).post(add_live_memory),
+        )
+        .route(
+            "/api/live/memory/{id}",
+            patch(replace_live_memory).delete(delete_live_memory),
         )
         .route("/api/live/utterance", post(live_utterance))
         .route("/api/live/route", post(live_route))
@@ -3087,6 +3101,32 @@ async fn start_live(
         .unwrap()
         .start_live_session(body.project_id)?
         .id;
+    // Decay first (mesa task 1147), so the prompt built by the spawn carries
+    // only entries some conversation has used lately. Best-effort, like the
+    // CLI's start: a failure is a log line, never a failed start.
+    match state
+        .store
+        .lock()
+        .unwrap()
+        .retire_decayed_notebook(live::LIVE_NOTEBOOK_DECAY_SESSIONS)
+    {
+        Ok(retired) if !retired.is_empty() => eprintln!(
+            "notebook: retired {} unused for {} conversations: {}",
+            if retired.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            live::LIVE_NOTEBOOK_DECAY_SESSIONS,
+            retired
+                .iter()
+                .map(|e| format!("#{}", e.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("notebook: could not run decay: {e}"),
+    }
     let job = match spawn_live_agent(&state, session_id, body.project_id).await {
         Ok(job) => job,
         Err(err) => {
@@ -3107,6 +3147,69 @@ async fn start_live(
         .unwrap()
         .bind_live_agent(session_id, job.as_deref())?;
     Ok((StatusCode::CREATED, Json(session)).into_response())
+}
+
+#[derive(Deserialize)]
+struct NotebookWrite {
+    body: String,
+}
+
+/// `GET /api/live/memory` — the active notebook, oldest first (mesa task
+/// 1147). Gated like Settings: these bullets are injected into every live
+/// agent's prompt, so reading them is reading a prompt.
+async fn list_live_memory(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<LiveNotebookEntry>>> {
+    require_agent_access(&state, &addr, &headers)?;
+    Ok(Json(state.store.lock().unwrap().list_notebook(false)?))
+}
+
+/// `POST /api/live/memory` — adds one entry; 422 `validation` past the
+/// budget, with the same message the CLI prints.
+async fn add_live_memory(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<NotebookWrite>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let entry = state.store.lock().unwrap().add_notebook_entry(&body.body)?;
+    Ok((StatusCode::CREATED, Json(entry)).into_response())
+}
+
+/// `PATCH /api/live/memory/{id}` — rewrites one entry in place; 422 past the
+/// budget or the removal guard, 404 for a retired or unknown id.
+async fn replace_live_memory(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<NotebookWrite>, JsonRejection>,
+) -> ApiResult<Json<LiveNotebookEntry>> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    Ok(Json(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .replace_notebook_entry(id, &body.body)?,
+    ))
+}
+
+/// `DELETE /api/live/memory/{id}` — retires one entry (it stays in the
+/// archive) and echoes it; the same removal guard as a replace.
+async fn delete_live_memory(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<LiveNotebookEntry>> {
+    require_agent_access(&state, &addr, &headers)?;
+    Ok(Json(state.store.lock().unwrap().delete_notebook_entry(id)?))
 }
 
 /// Resolves the working directory and session name a live conversation's

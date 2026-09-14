@@ -6,13 +6,15 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
 use super::files;
+use super::live;
 use super::types::{
     AnchorSide, Artifact, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat,
     EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
-    LiveBoardSummary, LiveContext, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn,
-    LiveWindow, Priority, Project, Script, ScriptArg, ScriptArgKind, Status, Task, TaskEvent,
-    TaskReceipt, Waypoint, is_valid_artifact_content_type, task_name,
+    LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry, LiveRole, LiveSession,
+    LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg,
+    ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint, is_valid_artifact_content_type,
+    task_name,
 };
 
 #[derive(Debug)]
@@ -832,6 +834,42 @@ const MIGRATIONS: &[&str] = &[
             AND COALESCE(p.project_id, -1) = COALESCE(library_items.project_id, -1)
             AND p.name = library_items.name);
      UPDATE library_items SET kind = 'prompt', export_command = 1 WHERE kind = 'command';",
+    // Task 1147: live memory v2 — a searchable archive over a budgeted
+    // notebook.
+    //
+    // `live_notebook` holds the bullets earlier conversations leave for later
+    // ones; the whole active notebook rides in every live agent's prompt, so
+    // it is bounded by `live::LIVE_NOTEBOOK_BUDGET_WORDS` (in `Store`, not the
+    // schema) and edited one row at a time. Retiring is a SOFT delete —
+    // `retired_at` + `retired_reason` (`decayed` | `deleted` | `replaced`) —
+    // so a retired entry stays in the archive below. Both session FKs are
+    // `SET NULL`: an entry outlives the conversation that wrote it.
+    //
+    // `live_memory_fts` is a standalone FTS5 table (no content= link, no
+    // triggers) indexing every turn, every summary and every notebook entry
+    // by `(kind, ref_id)`, written from the same `Store` methods that write
+    // the source rows and backfilled here from what already exists. It is
+    // the archive `mesa live memory search` reads: append-only, like
+    // `live_turns` — nothing prunes `live_summaries` any more either. There
+    // is no delete path for a live session today, so no index row is ever
+    // orphaned; if one arrives, it must clean this table too.
+    "CREATE TABLE live_notebook (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        body                  TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL,
+        source_session_id     INTEGER REFERENCES live_sessions(id) ON DELETE SET NULL,
+        last_used_session_id  INTEGER REFERENCES live_sessions(id) ON DELETE SET NULL,
+        retired_at            TEXT,
+        retired_reason        TEXT
+    );
+    CREATE VIRTUAL TABLE live_memory_fts USING fts5(
+        kind UNINDEXED, ref_id UNINDEXED, session_id UNINDEXED, text
+    );
+    INSERT INTO live_memory_fts (kind, ref_id, session_id, text)
+        SELECT 'turn', id, session_id, text FROM live_turns WHERE text <> '';
+    INSERT INTO live_memory_fts (kind, ref_id, session_id, text)
+        SELECT 'summary', session_id, session_id, body FROM live_summaries;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1053,15 +1091,21 @@ const LIVE_TURNS_MAX: i64 = 500;
 const LIVE_SUMMARY_COLUMNS: &str = "session_id, body, created_at, updated_at";
 
 /// Longest a live summary's body may be. Smaller than [`LIVE_TEXT_MAX`]: a
-/// summary is never spoken, but up to `live::LIVE_SUMMARY_RECALL` of them ride
-/// in every future `live::agent_prompt`, so a runaway one would bloat every
-/// conversation after it rather than just this one.
+/// summary is never spoken, but the most recent one rides in every future
+/// `live::agent_prompt` (`live::LIVE_SUMMARY_RECALL`), so a runaway one would
+/// bloat the next conversation rather than just this one.
 pub const LIVE_SUMMARY_MAX: usize = 4096;
 
-/// How many summary rows survive on disk, oldest dropped first. Far bigger
-/// than `live::LIVE_SUMMARY_RECALL` (5) so nothing recall could ever have used
-/// is lost — this bound exists only to keep the table from growing forever.
-pub const LIVE_SUMMARY_KEEP: i64 = 20;
+/// Most summaries one `list_live_summaries` call returns — the same kind of
+/// page bound `LIVE_TURNS_MAX` is. Not a retention bound: since mesa task 1147
+/// `live_summaries` is append-only, part of the searchable archive.
+const LIVE_SUMMARY_LIST_MAX: i64 = 500;
+
+const LIVE_NOTEBOOK_COLUMNS: &str = "id, body, created_at, updated_at, source_session_id, \
+                                      last_used_session_id, retired_at, retired_reason";
+
+/// Most hits one `search_live_memory` call returns.
+pub const LIVE_MEMORY_SEARCH_MAX: i64 = 50;
 
 fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession> {
     let status: String = row.get(3)?;
@@ -1156,6 +1200,39 @@ fn row_to_live_board_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveBo
         title: row.get(3)?,
         created_at: row.get(4)?,
     })
+}
+
+fn row_to_notebook_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveNotebookEntry> {
+    Ok(LiveNotebookEntry {
+        id: row.get(0)?,
+        body: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        source_session_id: row.get(4)?,
+        last_used_session_id: row.get(5)?,
+        retired_at: row.get(6)?,
+        retired_reason: row.get(7)?,
+    })
+}
+
+/// Turns a person's words into an FTS5 query that cannot be a syntax error:
+/// every whitespace-separated word becomes a quoted phrase (embedded `"`
+/// stripped, since a quote is the one character a phrase cannot hold), joined
+/// by FTS5's implicit AND. So `"` and `AND`/`OR`/`NOT` in the input are
+/// searched for as words, never read as operators. `None` when nothing is
+/// left to search for.
+fn fts_query(words: &str) -> Option<String> {
+    let terms: Vec<String> = words
+        .split_whitespace()
+        .map(|w| w.replace('"', ""))
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{w}\""))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
 }
 
 fn row_to_live_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSummary> {
@@ -4638,7 +4715,18 @@ impl Store {
                 target.as_deref(),
             ),
         )?;
-        self.get_live_turn(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        // The archive index (mesa task 1147): a spoken turn is searchable by
+        // `mesa live memory search` for as long as the row exists. A pure
+        // action turn has no words, so it is not indexed.
+        if !text.is_empty() {
+            self.conn.execute(
+                "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
+                 VALUES ('turn', ?1, ?2, ?3)",
+                (id, session_id, text),
+            )?;
+        }
+        self.get_live_turn(id)
     }
 
     pub fn get_live_turn(&self, id: i64) -> Result<LiveTurn> {
@@ -4748,21 +4836,13 @@ impl Store {
     /// time. `body` is trimmed and bounded ([`LIVE_SUMMARY_MAX`] chars,
     /// counted the way [`LIVE_TEXT_MAX`] is) and may not be empty.
     ///
-    /// After the write, prunes down to the newest [`LIVE_SUMMARY_KEEP`] rows
-    /// **by `updated_at`** — the 20 most *recently written* summaries, not the
-    /// 20 highest session ids. Summarisers run in the background per ended
-    /// session, so an older session's summary can legitimately be written
-    /// after 20 newer sessions already have one; ordering the keep-set by
-    /// session id would prune that write the instant it landed. The `AND
-    /// session_id != ?2` beside it is belt and braces on top of that fix: a
-    /// same-second `updated_at` tie must still never be able to delete the row
-    /// this very call just wrote.
-    ///
-    /// This is deliberately a **different order** from [`list_live_summaries`]
-    /// — retention is about bounding storage and must be self-consistent (by
-    /// write recency), while recall is about which *conversations* are most
-    /// relevant to hand the next agent (by session recency). They are two
-    /// different questions, so they read the table two different ways.
+    /// **Append-only** since mesa task 1147: the 20-row prune the first cut
+    /// had is gone, because every summary is part of the searchable archive
+    /// (`search_live_memory`) and recall into the next prompt is now the
+    /// single most recent one (`live::LIVE_SUMMARY_RECALL`), so retention has
+    /// nothing left to bound. The archive index row for this session is
+    /// replaced on every write, so an upsert never leaves the old text
+    /// searchable.
     pub fn set_live_summary(&mut self, session_id: i64, body: &str) -> Result<LiveSummary> {
         self.get_live_session(session_id)?;
         let body = body.trim();
@@ -4782,11 +4862,13 @@ impl Store {
             (session_id, body),
         )?;
         self.conn.execute(
-            "DELETE FROM live_summaries WHERE session_id NOT IN \
-             (SELECT session_id FROM live_summaries \
-              ORDER BY updated_at DESC, session_id DESC LIMIT ?1) \
-             AND session_id != ?2",
-            (LIVE_SUMMARY_KEEP, session_id),
+            "DELETE FROM live_memory_fts WHERE kind = 'summary' AND ref_id = ?1",
+            [session_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
+             VALUES ('summary', ?1, ?1, ?2)",
+            (session_id, body),
         )?;
         self.get_live_summary(session_id)
     }
@@ -4807,22 +4889,277 @@ impl Store {
     }
 
     /// The most recent **conversations'** summaries, newest session first —
-    /// `live::agent_prompt` reverses the slice it wants into oldest-first
-    /// before appending it, so this stays the same "most recent N" shape
-    /// every other `list_*` uses. `limit` is clamped into
-    /// `1..=`[`LIVE_SUMMARY_KEEP`], the same reasoning `list_live_turns` gives
-    /// for clamping into `LIVE_TURNS_MAX`.
+    /// `live::agent_prompt` takes the first one as recall. `limit` is clamped
+    /// into `1..=`[`LIVE_SUMMARY_LIST_MAX`], the same reasoning
+    /// `list_live_turns` gives for clamping into `LIVE_TURNS_MAX`.
     ///
-    /// Ordered by `session_id`, **not** `updated_at` like
-    /// [`set_live_summary`]'s prune: recall answers "which conversations are
-    /// most relevant to the next agent", which is a question about session
-    /// recency, not about which row happened to be written most recently.
+    /// Ordered by `session_id`, **not** `updated_at`: recall answers "which
+    /// conversation is the most recent", which is a question about session
+    /// recency, not about which row happened to be written most recently —
+    /// summarisers run in the background per ended session, so an older
+    /// conversation's summary can legitimately be written last.
     pub fn list_live_summaries(&self, limit: i64) -> Result<Vec<LiveSummary>> {
-        let limit = limit.clamp(1, LIVE_SUMMARY_KEEP);
+        let limit = limit.clamp(1, LIVE_SUMMARY_LIST_MAX);
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {LIVE_SUMMARY_COLUMNS} FROM live_summaries ORDER BY session_id DESC LIMIT ?1"
         ))?;
         let rows = stmt.query_map([limit], row_to_live_summary)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- live memory: the notebook and the archive (mesa task 1147) ----
+
+    /// The session a notebook write is attributed to: the live one if there
+    /// is one, else the newest session of all — so an entry added from the
+    /// Settings page between conversations is still dated to a conversation.
+    /// `None` only on an install that has never held one.
+    fn notebook_session(&self) -> Result<Option<i64>> {
+        if let Some(live) = self.current_live_session()? {
+            return Ok(Some(live.id));
+        }
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(id) FROM live_sessions", [], |r| r.get(0))?)
+    }
+
+    /// The active entries' total word count minus `except` (an entry being
+    /// replaced or deleted), for the two guards.
+    fn notebook_words(&self, except: Option<i64>) -> Result<usize> {
+        Ok(self
+            .list_notebook(false)?
+            .iter()
+            .filter(|e| Some(e.id) != except)
+            .map(|e| live::word_count(&e.body))
+            .sum())
+    }
+
+    /// The shape rule for one entry's text: trimmed, non-empty, at most
+    /// [`live::LIVE_NOTEBOOK_ENTRY_MAX`] characters.
+    fn validate_notebook_body(body: &str) -> Result<&str> {
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(Error::Validation(
+                "a notebook entry may not be empty".into(),
+            ));
+        }
+        if body.chars().count() > live::LIVE_NOTEBOOK_ENTRY_MAX {
+            return Err(Error::Validation(format!(
+                "a notebook entry must be at most {} characters",
+                live::LIVE_NOTEBOOK_ENTRY_MAX
+            )));
+        }
+        Ok(body)
+    }
+
+    /// Adds one notebook entry, attributed to [`Self::notebook_session`].
+    /// `validation` when the active notebook would exceed its word budget —
+    /// the notebook rides in every live prompt, so it is bounded here rather
+    /// than trimmed later.
+    pub fn add_notebook_entry(&mut self, body: &str) -> Result<LiveNotebookEntry> {
+        let body = Self::validate_notebook_body(body)?;
+        let after = self.notebook_words(None)? + live::word_count(body);
+        if live::over_budget(after) {
+            return Err(Error::Validation(live::budget_message(after)));
+        }
+        let session = self.notebook_session()?;
+        self.conn.execute(
+            "INSERT INTO live_notebook (body, created_at, updated_at, source_session_id, \
+                                        last_used_session_id) \
+             VALUES (?1, datetime('now'), datetime('now'), ?2, ?2)",
+            (body, session),
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
+             VALUES ('note', ?1, ?2, ?3)",
+            (id, session.unwrap_or(0), body),
+        )?;
+        self.get_notebook_entry(id)
+    }
+
+    /// Rewrites one active entry in place — same id, same `created_at`, same
+    /// `source_session_id`, so its provenance survives the edit — stamping
+    /// `updated_at` and `last_used_session_id`. Two `validation` guards: the
+    /// resulting notebook must fit the budget, and the edit may not remove
+    /// more than [`live::LIVE_NOTEBOOK_EDIT_MAX_REMOVAL`] of the notebook's
+    /// words once it holds [`live::LIVE_NOTEBOOK_EDIT_FLOOR_WORDS`] — the
+    /// rule that stops one command from hollowing the notebook out.
+    pub fn replace_notebook_entry(&mut self, id: i64, body: &str) -> Result<LiveNotebookEntry> {
+        let body = Self::validate_notebook_body(body)?;
+        let entry = self.get_active_notebook_entry(id)?;
+        let others = self.notebook_words(Some(id))?;
+        let before = others + live::word_count(&entry.body);
+        let after = others + live::word_count(body);
+        if live::over_budget(after) {
+            return Err(Error::Validation(live::budget_message(after)));
+        }
+        if live::removes_too_much(before, after) {
+            return Err(Error::Validation(live::removal_message(before, after)));
+        }
+        let session = self.notebook_session()?;
+        self.conn.execute(
+            "UPDATE live_notebook SET body = ?2, updated_at = datetime('now'), \
+                last_used_session_id = COALESCE(?3, last_used_session_id) \
+             WHERE id = ?1",
+            (id, body, session),
+        )?;
+        self.conn.execute(
+            "DELETE FROM live_memory_fts WHERE kind = 'note' AND ref_id = ?1",
+            [id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
+             VALUES ('note', ?1, ?2, ?3)",
+            (id, entry.source_session_id.unwrap_or(0), body),
+        )?;
+        self.get_notebook_entry(id)
+    }
+
+    /// Retires one active entry as `deleted` and echoes it. The row and its
+    /// archive index entry both stay — a deleted bullet is still something an
+    /// earlier conversation said. Guarded by the same removal rule a replace
+    /// is.
+    pub fn delete_notebook_entry(&mut self, id: i64) -> Result<LiveNotebookEntry> {
+        let entry = self.get_active_notebook_entry(id)?;
+        let others = self.notebook_words(Some(id))?;
+        let before = others + live::word_count(&entry.body);
+        if live::removes_too_much(before, others) {
+            return Err(Error::Validation(live::removal_message(before, others)));
+        }
+        self.retire_notebook_entry(id, "deleted")?;
+        self.get_notebook_entry(id)
+    }
+
+    fn retire_notebook_entry(&mut self, id: i64, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE live_notebook SET retired_at = datetime('now'), retired_reason = ?2 \
+             WHERE id = ?1 AND retired_at IS NULL",
+            (id, reason),
+        )?;
+        Ok(())
+    }
+
+    /// Marks one active entry as used by the **live** conversation, which is
+    /// what keeps it from decaying. `NotFound` with no live session, like
+    /// every other `mesa live` verb — an agent can only vouch for an entry
+    /// from inside a conversation.
+    pub fn touch_notebook_entry(&mut self, id: i64) -> Result<LiveNotebookEntry> {
+        let session = self.current_live_session()?.ok_or_else(|| {
+            Error::NotFound("no live session; start one with `mesa live start`".into())
+        })?;
+        self.get_active_notebook_entry(id)?;
+        self.conn.execute(
+            "UPDATE live_notebook SET last_used_session_id = ?2 WHERE id = ?1",
+            (id, session.id),
+        )?;
+        self.get_notebook_entry(id)
+    }
+
+    pub fn get_notebook_entry(&self, id: i64) -> Result<LiveNotebookEntry> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LIVE_NOTEBOOK_COLUMNS} FROM live_notebook WHERE id = ?1"),
+                [id],
+                row_to_notebook_entry,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("notebook entry {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// An entry that is still in the notebook: a retired one is `NotFound`
+    /// for every write, since it is archive now, not notebook.
+    fn get_active_notebook_entry(&self, id: i64) -> Result<LiveNotebookEntry> {
+        let entry = self.get_notebook_entry(id)?;
+        if entry.retired_at.is_some() {
+            return Err(Error::NotFound(format!(
+                "notebook entry {id} was retired ({})",
+                entry.retired_reason.as_deref().unwrap_or("unknown")
+            )));
+        }
+        Ok(entry)
+    }
+
+    /// The notebook, oldest first — the order it rides into the prompt in.
+    /// Active rows only unless `include_retired`.
+    pub fn list_notebook(&self, include_retired: bool) -> Result<Vec<LiveNotebookEntry>> {
+        let filter = if include_retired {
+            ""
+        } else {
+            "WHERE retired_at IS NULL"
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIVE_NOTEBOOK_COLUMNS} FROM live_notebook {filter} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], row_to_notebook_entry)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Retires, as `decayed`, every active entry that no conversation has
+    /// used for `n` **ended** sessions: counted as the ended sessions with an
+    /// id above the entry's last use (its source session when it was never
+    /// touched). Run at both live-start sites before the prompt is built, so a
+    /// bullet nobody has needed in `n` conversations stops riding into every
+    /// one. Answers the rows it retired.
+    pub fn retire_decayed_notebook(&mut self, n: i64) -> Result<Vec<LiveNotebookEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIVE_NOTEBOOK_COLUMNS} FROM live_notebook \
+             WHERE retired_at IS NULL AND (
+                SELECT COUNT(*) FROM live_sessions \
+                 WHERE id > COALESCE(last_used_session_id, source_session_id, 0) \
+                   AND ended_at IS NOT NULL) >= ?1 \
+             ORDER BY id"
+        ))?;
+        let decayed = stmt
+            .query_map([n], row_to_notebook_entry)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for entry in &decayed {
+            self.retire_notebook_entry(entry.id, "decayed")?;
+        }
+        decayed
+            .iter()
+            .map(|e| self.get_notebook_entry(e.id))
+            .collect()
+    }
+
+    /// Full-text search over the archive — every turn, summary and notebook
+    /// entry (retired ones included), best match first by FTS5's `bm25`,
+    /// each hit carrying a `snippet()` of the matching text. The words are
+    /// quoted phrase by phrase (`fts_query`), so nothing a person types can be
+    /// an FTS syntax error; an empty query is `validation`. `limit` is
+    /// clamped into `1..=`[`LIVE_MEMORY_SEARCH_MAX`].
+    pub fn search_live_memory(&self, words: &str, limit: i64) -> Result<Vec<LiveMemoryHit>> {
+        let query = fts_query(words)
+            .ok_or_else(|| Error::Validation("search needs at least one word".into()))?;
+        let limit = limit.clamp(1, LIVE_MEMORY_SEARCH_MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT live_memory_fts.kind, live_memory_fts.ref_id, live_memory_fts.session_id, \
+                    COALESCE(t.created_at, s.created_at, n.created_at, ''), t.role, \
+                    snippet(live_memory_fts, 3, '[', ']', '…', 16) \
+             FROM live_memory_fts \
+             LEFT JOIN live_turns t ON live_memory_fts.kind = 'turn' AND t.id = live_memory_fts.ref_id \
+             LEFT JOIN live_summaries s \
+                    ON live_memory_fts.kind = 'summary' AND s.session_id = live_memory_fts.ref_id \
+             LEFT JOIN live_notebook n ON live_memory_fts.kind = 'note' AND n.id = live_memory_fts.ref_id \
+             WHERE live_memory_fts MATCH ?1 \
+             ORDER BY bm25(live_memory_fts), live_memory_fts.ref_id DESC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map((query, limit), |row| {
+            let role: Option<String> = row.get(4)?;
+            Ok(LiveMemoryHit {
+                kind: row.get(0)?,
+                ref_id: row.get(1)?,
+                session_id: row.get(2)?,
+                created_at: row.get(3)?,
+                role: role.and_then(|r| LiveRole::parse(&r)),
+                snippet: row.get(5)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -11188,15 +11525,60 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            55,
-            "a fresh db should report user_version 55"
+            56,
+            "a fresh db should report user_version 56"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 55);
+        assert_eq!(version, 56);
+    }
+
+    /// Pins the live-memory migration (mesa task 1147) at index 55, and
+    /// checks the one thing about it that matters beyond the tables existing:
+    /// it backfills the archive index from the turns and summaries a db
+    /// already holds, so `search` sees history written before the upgrade.
+    #[test]
+    fn the_live_memory_tables_arrive_at_migration_55_and_backfill_the_archive() {
+        const MEMORY: usize = 55;
+        assert!(
+            MIGRATIONS[MEMORY].contains("CREATE TABLE live_notebook")
+                && MIGRATIONS[MEMORY].contains("CREATE VIRTUAL TABLE live_memory_fts"),
+            "migration {MEMORY} is no longer the live memory migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MEMORY] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", MEMORY as i64)
+                .unwrap();
+            conn.execute_batch(
+                "INSERT INTO live_sessions (id, status, started_at, updated_at, ended_at) \
+                    VALUES (1, 'ended', datetime('now'), datetime('now'), datetime('now'));
+                 INSERT INTO live_turns (session_id, role, text, created_at) \
+                    VALUES (1, 'user', 'remember the pelican', datetime('now'));
+                 INSERT INTO live_turns (session_id, role, text, action, target, created_at) \
+                    VALUES (1, 'mesa', '', 'navigate', '#/inbox', datetime('now'));
+                 INSERT INTO live_summaries (session_id, body, created_at, updated_at) \
+                    VALUES (1, 'talked about a pelican', datetime('now'), datetime('now'));",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let hits = store.search_live_memory("pelican", 10).unwrap();
+        let kinds: Vec<&str> = hits.iter().map(|h| h.kind.as_str()).collect();
+        assert!(
+            kinds.contains(&"turn") && kinds.contains(&"summary"),
+            "{hits:?}"
+        );
+        assert_eq!(hits.len(), 2, "the empty navigate turn is not indexed");
+        assert!(store.list_notebook(true).unwrap().is_empty());
     }
 
     /// Pins the artifacts migration (mesa task 974) at index 50, the position
@@ -11602,6 +11984,266 @@ mod tests {
         );
     }
 
+    // ---- live memory: the notebook and the archive (mesa task 1147) ----
+
+    fn ended_session(store: &mut Store) -> i64 {
+        let id = store.start_live_session(None).unwrap().id;
+        store.end_live_session(id).unwrap();
+        id
+    }
+
+    /// An entry is attributed to the live session when there is one, else to
+    /// the newest session, else to nothing; `touch` needs a live one.
+    #[test]
+    fn notebook_entries_are_attributed_to_a_session() {
+        let (mut store, _dir) = temp_store();
+        let orphan = store
+            .add_notebook_entry("  before any conversation  ")
+            .unwrap();
+        assert_eq!(orphan.body, "before any conversation", "trimmed");
+        assert_eq!(orphan.source_session_id, None);
+        assert_eq!(orphan.last_used_session_id, None);
+        assert_eq!(orphan.retired_at, None);
+
+        let ended = ended_session(&mut store);
+        let between = store.add_notebook_entry("between conversations").unwrap();
+        assert_eq!(between.source_session_id, Some(ended));
+        assert_eq!(between.last_used_session_id, Some(ended));
+        assert!(matches!(
+            store.touch_notebook_entry(between.id),
+            Err(Error::NotFound(_))
+        ));
+
+        let live = store.start_live_session(None).unwrap();
+        let during = store.add_notebook_entry("during a conversation").unwrap();
+        assert_eq!(during.source_session_id, Some(live.id));
+        let touched = store.touch_notebook_entry(orphan.id).unwrap();
+        assert_eq!(touched.last_used_session_id, Some(live.id));
+        assert_eq!(
+            touched.source_session_id, None,
+            "touch never rewrites provenance"
+        );
+        assert!(matches!(
+            store.touch_notebook_entry(999),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// The body rule: trimmed, non-empty, at most the entry max.
+    #[test]
+    fn notebook_entry_body_is_bounded() {
+        let (mut store, _dir) = temp_store();
+        assert!(matches!(
+            store.add_notebook_entry("   "),
+            Err(Error::Validation(_))
+        ));
+        let long = "x".repeat(live::LIVE_NOTEBOOK_ENTRY_MAX + 1);
+        let err = store.add_notebook_entry(&long).unwrap_err();
+        assert!(err.to_string().contains("600"), "{err}");
+        let exact = "y".repeat(live::LIVE_NOTEBOOK_ENTRY_MAX);
+        assert_eq!(store.add_notebook_entry(&exact).unwrap().body, exact);
+    }
+
+    /// The budget is judged on the notebook the write would leave behind,
+    /// active entries only, and names the numbers.
+    #[test]
+    fn notebook_budget_bounds_the_active_notebook() {
+        let (mut store, _dir) = temp_store();
+        // 5 entries × 99 words = 495 words.
+        let ninety_nine = vec!["w"; 99].join(" ");
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(store.add_notebook_entry(&ninety_nine).unwrap().id);
+        }
+        let err = store
+            .add_notebook_entry("one two three four five six")
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("501 words"), "{err}");
+        assert!(err.to_string().contains("500-word"), "{err}");
+        store.add_notebook_entry("one two three four five").unwrap();
+        assert!(matches!(
+            store.replace_notebook_entry(ids[0], &format!("{ninety_nine} extra")),
+            Err(Error::Validation(_))
+        ));
+        // A retired entry no longer counts.
+        store.delete_notebook_entry(ids[0]).unwrap();
+        store.add_notebook_entry("room again").unwrap();
+    }
+
+    /// The removal guard holds above the floor and stands down below it.
+    #[test]
+    fn notebook_edits_may_not_remove_more_than_a_share_above_the_floor() {
+        let (mut store, _dir) = temp_store();
+        // Below the floor: a notebook of 3 words can lose them all.
+        let small = store.add_notebook_entry("one two three").unwrap();
+        store.delete_notebook_entry(small.id).unwrap();
+        assert!(store.list_notebook(false).unwrap().is_empty());
+
+        // 120 words in three entries of 40: deleting one is 33%, refused;
+        // replacing one with 10 words removes 30 (25%), allowed.
+        let forty = vec!["w"; 40].join(" ");
+        let a = store.add_notebook_entry(&forty).unwrap();
+        store.add_notebook_entry(&forty).unwrap();
+        store.add_notebook_entry(&forty).unwrap();
+        let err = store.delete_notebook_entry(a.id).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(
+            err.to_string().contains("40 of the notebook's 120 words"),
+            "{err}"
+        );
+        let err = store.replace_notebook_entry(a.id, "tiny").unwrap_err();
+        assert!(
+            err.to_string().contains("39 of the notebook's 120 words"),
+            "{err}"
+        );
+        let ten = vec!["v"; 10].join(" ");
+        let replaced = store.replace_notebook_entry(a.id, &ten).unwrap();
+        assert_eq!(replaced.body, ten);
+        assert_eq!(replaced.id, a.id);
+        assert_eq!(replaced.created_at, a.created_at);
+        // 90 words now — under the floor, so the delete goes through.
+        let gone = store.delete_notebook_entry(a.id).unwrap();
+        assert_eq!(gone.retired_reason.as_deref(), Some("deleted"));
+        assert!(gone.retired_at.is_some());
+        // A retired row is archive: every write on it is not_found.
+        assert!(matches!(
+            store.replace_notebook_entry(a.id, "again"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.delete_notebook_entry(a.id),
+            Err(Error::NotFound(_))
+        ));
+        // `list` hides it unless asked; `get` still answers.
+        assert_eq!(store.list_notebook(false).unwrap().len(), 2);
+        assert_eq!(store.list_notebook(true).unwrap().len(), 4);
+        assert_eq!(store.get_notebook_entry(a.id).unwrap().id, a.id);
+    }
+
+    /// Decay counts ended sessions past an entry's last use; touching resets
+    /// the clock, and a retired row stays searchable.
+    #[test]
+    fn notebook_entries_decay_after_n_ended_sessions_unless_touched() {
+        let (mut store, _dir) = temp_store();
+        let first = ended_session(&mut store);
+        let stale = store.add_notebook_entry("a pelican preference").unwrap();
+        assert_eq!(stale.source_session_id, Some(first));
+        for _ in 0..2 {
+            ended_session(&mut store);
+        }
+        assert!(
+            store.retire_decayed_notebook(3).unwrap().is_empty(),
+            "2 < 3"
+        );
+        let live = store.start_live_session(None).unwrap();
+        let fresh = store.add_notebook_entry("a heron preference").unwrap();
+        store.touch_notebook_entry(stale.id).unwrap();
+        store.end_live_session(live.id).unwrap();
+        // 3 ended sessions after `first`, but the touch moved the clock.
+        assert!(store.retire_decayed_notebook(3).unwrap().is_empty());
+        for _ in 0..3 {
+            ended_session(&mut store);
+        }
+        let decayed = store.retire_decayed_notebook(3).unwrap();
+        assert_eq!(
+            decayed.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![stale.id, fresh.id]
+        );
+        assert!(
+            decayed
+                .iter()
+                .all(|e| e.retired_reason.as_deref() == Some("decayed"))
+        );
+        assert!(store.list_notebook(false).unwrap().is_empty());
+        assert!(
+            store.retire_decayed_notebook(3).unwrap().is_empty(),
+            "idempotent"
+        );
+        let hits = store.search_live_memory("pelican", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "note");
+        assert_eq!(hits[0].ref_id, stale.id);
+    }
+
+    /// Search reaches every kind, ranks, snippets, tolerates hostile input,
+    /// and follows an upsert/replace rather than keeping stale text.
+    #[test]
+    fn search_live_memory_covers_turns_summaries_and_notes() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let turn = store
+            .add_live_turn(
+                session.id,
+                LiveRole::User,
+                "the hooks run in two modes",
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .add_live_turn(
+                session.id,
+                LiveRole::Mesa,
+                "",
+                Some(LiveAction::Navigate),
+                Some("#/inbox"),
+            )
+            .unwrap();
+        store
+            .set_live_summary(session.id, "decided hooks get a single script mode")
+            .unwrap();
+        let note = store
+            .add_notebook_entry("hooks: one script mode, task 1143")
+            .unwrap();
+
+        let hits = store.search_live_memory("hooks", 10).unwrap();
+        let mut kinds: Vec<&str> = hits.iter().map(|h| h.kind.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["note", "summary", "turn"]);
+        let t = hits.iter().find(|h| h.kind == "turn").unwrap();
+        assert_eq!(t.ref_id, turn.id);
+        assert_eq!(t.session_id, session.id);
+        assert_eq!(t.role, Some(LiveRole::User));
+        assert!(t.snippet.contains("[hooks]"), "{}", t.snippet);
+        assert!(!t.created_at.is_empty());
+        let n = hits.iter().find(|h| h.kind == "note").unwrap();
+        assert_eq!(n.ref_id, note.id);
+        assert_eq!(n.role, None);
+        let s = hits.iter().find(|h| h.kind == "summary").unwrap();
+        assert_eq!(s.ref_id, session.id);
+
+        // Implicit AND: both words must match.
+        assert_eq!(
+            store.search_live_memory("hooks pelican", 10).unwrap().len(),
+            0
+        );
+        // Quotes and operators are words, never syntax.
+        assert!(store.search_live_memory("\"hooks\" AND NOT (", 10).is_ok());
+        assert!(store.search_live_memory("hooks\" OR", 10).is_ok());
+        assert!(matches!(
+            store.search_live_memory("   ", 10),
+            Err(Error::Validation(_))
+        ));
+        // The limit clamps.
+        assert_eq!(store.search_live_memory("hooks", 0).unwrap().len(), 1);
+
+        // An upsert and a replace re-index rather than accumulating.
+        store
+            .set_live_summary(session.id, "decided nothing about pelicans")
+            .unwrap();
+        store
+            .replace_notebook_entry(note.id, "pelicans: task 1143")
+            .unwrap();
+        assert_eq!(
+            store.search_live_memory("hooks", 10).unwrap().len(),
+            1,
+            "the turn only"
+        );
+        let pelicans = store.search_live_memory("pelicans", 10).unwrap();
+        assert_eq!(pelicans.len(), 2);
+    }
+
     /// Upserting keeps `created_at` and moves `updated_at` — the receipts
     /// `--regenerate` posture.
     #[test]
@@ -11645,74 +12287,26 @@ mod tests {
         ));
     }
 
-    /// Bounded storage: only the newest [`LIVE_SUMMARY_KEEP`] rows survive.
+    /// Append-only (mesa task 1147): a summary written for a session older
+    /// than dozens of already-summarised ones is still there, as is every
+    /// other row — nothing prunes the archive.
     #[test]
-    fn set_live_summary_prunes_to_the_keep_bound() {
+    fn set_live_summary_never_prunes() {
         let (mut store, _dir) = temp_store();
         let mut ids = Vec::new();
-        for i in 0..(LIVE_SUMMARY_KEEP + 5) {
-            let session = store.start_live_session(None).unwrap();
-            store
-                .set_live_summary(session.id, &format!("session {i}"))
-                .unwrap();
-            store.end_live_session(session.id).unwrap();
-            ids.push(session.id);
+        for _ in 0..30 {
+            let id = store.start_live_session(None).unwrap().id;
+            store.end_live_session(id).unwrap();
+            ids.push(id);
         }
-        let remaining = store.list_live_summaries(LIVE_SUMMARY_KEEP + 10).unwrap();
-        assert_eq!(remaining.len(), LIVE_SUMMARY_KEEP as usize);
-        let newest: Vec<i64> = ids[5..].iter().rev().cloned().collect();
-        assert_eq!(
-            remaining.iter().map(|s| s.session_id).collect::<Vec<_>>(),
-            newest
-        );
-        for dropped in &ids[..5] {
-            assert!(matches!(
-                store.get_live_summary(*dropped),
-                Err(Error::NotFound(_))
-            ));
-        }
-    }
-
-    /// The bug this guards against: pruning the keep-set by session id rather
-    /// than by write time would delete a summary the instant it was written,
-    /// whenever it named an older session than 20 others that already had
-    /// one — exactly the order a burst of short conversations produces while
-    /// an older session's background summariser is still catching up.
-    #[test]
-    fn set_live_summary_never_prunes_the_write_it_just_made() {
-        let (mut store, _dir) = temp_store();
-        // Sessions 1..=21: write every session's summary EXCEPT the first
-        // (oldest) one first, so the table already holds LIVE_SUMMARY_KEEP
-        // rows naming the 20 *highest* session ids before session 1 ever
-        // gets one.
-        let sessions: Vec<i64> = (0..=LIVE_SUMMARY_KEEP)
-            .map(|_| {
-                // Only one session may be live at a time, so each must end
-                // before the next starts; `end_live_session` is idempotent,
-                // so ending the oldest one again below is harmless.
-                let id = store.start_live_session(None).unwrap().id;
-                store.end_live_session(id).unwrap();
-                id
-            })
-            .collect();
-        for &id in &sessions[1..] {
+        for &id in &ids[1..] {
             store
                 .set_live_summary(id, &format!("session {id}"))
                 .unwrap();
-            store.end_live_session(id).unwrap();
         }
-        // Now the oldest session's summariser finally catches up. Ordering
-        // the keep-set by session id would prune this write the instant it
-        // landed, since it names the lowest id in the whole table.
-        let oldest = sessions[0];
-        store.end_live_session(oldest).unwrap();
-        let written = store.set_live_summary(oldest, "late summary").unwrap();
-        assert_eq!(written.session_id, oldest);
-        assert_eq!(
-            store.get_live_summary(oldest).unwrap().body,
-            "late summary",
-            "a write must never be able to delete itself"
-        );
+        store.set_live_summary(ids[0], "late summary").unwrap();
+        assert_eq!(store.list_live_summaries(500).unwrap().len(), 30);
+        assert_eq!(store.get_live_summary(ids[0]).unwrap().body, "late summary");
     }
 
     #[test]
@@ -11736,7 +12330,7 @@ mod tests {
         assert_eq!(
             store.list_live_summaries(i64::MAX).unwrap().len(),
             3,
-            "clamped down to LIVE_SUMMARY_KEEP, not the whole table"
+            "clamped down to LIVE_SUMMARY_LIST_MAX, not the whole table"
         );
     }
 

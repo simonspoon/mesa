@@ -3611,6 +3611,68 @@ pub struct LiveSummary {
     pub updated_at: String,
 }
 
+/// One entry in the live **notebook** (mesa task 1147): a bullet earlier
+/// conversations left for later ones — a preference, a working norm, the
+/// reason behind a decision, a pointer to a task id. The whole active
+/// notebook rides in every live agent's prompt (`live::agent_prompt`), so it
+/// is **budgeted** (`live::LIVE_NOTEBOOK_BUDGET_WORDS`) and edited one entry
+/// at a time, never rewritten whole.
+///
+/// Retiring is a **soft delete**: the row stays (and stays searchable in the
+/// archive, `Store::search_live_memory`) with `retired_at`/`retired_reason`
+/// stamped, and drops out of the prompt and the default list. `decayed` is the
+/// automatic kind — an entry no conversation has used for
+/// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `deleted` an explicit
+/// one, and `replaced` is reserved for a future rewrite-as-new-row path (a
+/// replace today updates the row in place, keeping its provenance).
+///
+/// ts-exported: the Settings page's Memory tab lists and edits these over
+/// `/api/live/memory`. Its sibling [`LiveMemoryHit`] is not — search is
+/// CLI-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveNotebookEntry {
+    #[ts(type = "number")]
+    pub id: i64,
+    /// The bullet itself. Untrusted: it is written by an agent reading
+    /// dictated speech, so `live::agent_prompt` appends it as data, never as an
+    /// instruction. Bounded by `live::LIVE_NOTEBOOK_ENTRY_MAX` characters.
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The conversation that wrote it (`ON DELETE SET NULL`), or the newest
+    /// one at the time when it was added from the UI between conversations.
+    #[ts(type = "number | null")]
+    pub source_session_id: Option<i64>,
+    /// The conversation that last relied on it (`mesa live memory touch`, or a
+    /// replace), which is what decay is measured from.
+    #[ts(type = "number | null")]
+    pub last_used_session_id: Option<i64>,
+    pub retired_at: Option<String>,
+    /// `decayed` | `deleted` | `replaced`, null while the entry is active.
+    pub retired_reason: Option<String>,
+}
+
+/// One match from `mesa live memory search` (mesa task 1147): a row of the
+/// append-only archive — a turn, a session summary or a notebook entry —
+/// with an FTS5 `snippet()` of the matching text.
+///
+/// **Not ts-exported**, like [`LiveSummary`]: search is CLI-only (the agent's
+/// way of looking something up on demand), so there is no TypeScript
+/// consumer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveMemoryHit {
+    /// `turn` | `summary` | `note`.
+    pub kind: String,
+    /// The turn id, the summary's session id, or the notebook entry id.
+    pub ref_id: i64,
+    pub session_id: i64,
+    pub created_at: String,
+    /// Who said it, for a turn; null for a summary or a note.
+    pub role: Option<LiveRole>,
+    pub snippet: String,
+}
+
 /// What one live **board** holds — the four things a picture can be in a
 /// spoken conversation (mesa task 1071). The kind decides what `body` is and
 /// how `GET /api/live/boards/{id}/render` serves it, and it is fixed at push

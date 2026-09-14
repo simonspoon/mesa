@@ -49,7 +49,8 @@ If a job will take a while, say so first, do the work, then say what happened.
 `mesa live navigate '#/projects/3' --say \"Opening that project.\"`. The route \
 must be one of the app's hash routes: `#/`, `#/live`, `#/inbox`, `#/cc`, \
 `#/scripts`, `#/library`, `#/settings`, `#/settings/keyboard`, \
-`#/settings/voice`, `#/settings/pricing`, `#/settings/system`, `#/terminal`, \
+`#/settings/voice`, `#/settings/memory`, `#/settings/pricing`, `#/settings/system`, \
+`#/terminal`, \
 `#/projects/<id>`, `#/projects/<id>/tasks/<task id>`, `#/projects/<id>/diagrams`, \
 `#/projects/<id>/git`, `#/projects/<id>/files`, `#/projects/<id>/terminal`, \
 `#/projects/<id>/dashboard`, `#/projects/<id>/settings`. Navigate when the \

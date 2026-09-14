@@ -15,6 +15,7 @@ describe('settingsTabFromPath', () => {
     expect(settingsTabFromPath('/settings/hooks')).toBe('hooks')
     expect(settingsTabFromPath('/settings/keyboard')).toBe('keyboard')
     expect(settingsTabFromPath('/settings/voice')).toBe('voice')
+    expect(settingsTabFromPath('/settings/memory')).toBe('memory')
     expect(settingsTabFromPath('/settings/pricing')).toBe('pricing')
     expect(settingsTabFromPath('/settings/system')).toBe('system')
   })
@@ -35,8 +36,15 @@ describe('settingsTabFromPath', () => {
 })
 
 describe('strip', () => {
-  it('lists the five tabs in order, hooks first', () => {
-    expect(SETTINGS_TABS).toEqual(['hooks', 'keyboard', 'voice', 'pricing', 'system'])
+  it('lists the six tabs in order, hooks first', () => {
+    expect(SETTINGS_TABS).toEqual([
+      'hooks',
+      'keyboard',
+      'voice',
+      'memory',
+      'pricing',
+      'system',
+    ])
   })
 
   it('emits the bare route for hooks, the segment otherwise', () => {

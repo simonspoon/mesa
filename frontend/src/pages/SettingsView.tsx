@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
+  addLiveMemory,
+  deleteLiveMemory,
   getConfig,
   getKeymap,
   getListen,
@@ -9,6 +11,7 @@ import {
   getSystemInfo,
   getWatchers,
   listLibrary,
+  listLiveMemory,
   listProjects,
   resetCcIndex,
   restartServer,
@@ -17,6 +20,7 @@ import {
   updateKeymap,
   updateListen,
   updateLiveConfig,
+  updateLiveMemory,
   updatePricing,
   updateSpeech,
   updateWatchers,
@@ -44,6 +48,14 @@ import {
   type KeymapDraft,
 } from '../keymapDraft'
 import { publishKeymap } from '../keymapStore'
+import {
+  bodyError as memoryBodyError,
+  budgetMeter,
+  isSendable as isMemorySendable,
+  metaLine,
+  notebookWords,
+  overBudget,
+} from '../memoryDraft'
 import {
   SETTINGS_TABS,
   settingsTabHref,
@@ -221,7 +233,7 @@ function SettingsHeader() {
  * The file is read fresh on every spawn, so a save takes effect immediately —
  * no server restart, which the page states so nobody goes looking for one.
  *
- * The page is five tabs (mesa task 1140), the active one named by the hash
+ * The page is six tabs (mesa task 1140; Memory added by mesa task 1147), the active one named by the hash
  * route (`settingsTab.ts`); this component is the shell and the Hooks tab's
  * own form.
  */
@@ -358,6 +370,9 @@ export function SettingsView({ tab }: { tab: SettingsTab }) {
         <LivePromptSection />
         <SpeechSection />
         <ListenSection />
+      </div>
+      <div hidden={tab !== 'memory'}>
+        <MemorySection />
       </div>
       <div hidden={tab !== 'pricing'}>
         <PricingSection />
@@ -574,6 +589,233 @@ function KeymapSection() {
         {saved && !dirty && <span className="settings-saved">saved</span>}
       </div>
       {saveError && <p className="error">{saveError}</p>}
+    </>
+  )
+}
+
+/**
+ * Memory: the live notebook (mesa task 1147) — the bullets earlier
+ * conversations left for later ones, every active one riding in every live
+ * agent's prompt under a hard word budget. Not a config section: the rows
+ * live in the db (`live_notebook`) and each is its own record, so this is a
+ * list with an inline edit and a delete per row and an add box at the bottom
+ * rather than one draft with one save button. Every write is one request for
+ * one entry — the notebook is edited one item at a time, never rewritten
+ * whole — and a 422 (the budget, the entry length, the 30%-removal guard)
+ * shows inline beside the row that asked. The meter is computed here off the
+ * same word rule the server judges by (`memoryDraft.ts`).
+ *
+ * Deliberately no poll: an agent may be writing to the notebook mid
+ * conversation, but this page is for reading and correcting it between
+ * conversations, and refetching on every write is enough.
+ */
+function MemorySection() {
+  const { data: entries, error, refetch } = useFetch(
+    () => listLiveMemory(),
+    'live-memory',
+  )
+  const [editing, setEditing] = useState<{ id: number; body: string } | null>(
+    null,
+  )
+  const [rowError, setRowError] = useState<{ id: number; message: string } | null>(
+    null,
+  )
+  const [adding, setAdding] = useState('')
+  const [addError, setAddError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  function fail(e: unknown): string {
+    return e instanceof Error ? e.message : String(e)
+  }
+
+  function saveEdit() {
+    if (!editing || !isMemorySendable(editing.body)) return
+    const { id, body } = editing
+    setBusy(true)
+    setRowError(null)
+    updateLiveMemory(id, body).then(
+      () => {
+        setBusy(false)
+        setEditing(null)
+        refetch()
+      },
+      (e: unknown) => {
+        setBusy(false)
+        setRowError({ id, message: fail(e) })
+      },
+    )
+  }
+
+  function remove(id: number) {
+    setBusy(true)
+    setRowError(null)
+    deleteLiveMemory(id).then(
+      () => {
+        setBusy(false)
+        if (editing?.id === id) setEditing(null)
+        refetch()
+      },
+      (e: unknown) => {
+        setBusy(false)
+        setRowError({ id, message: fail(e) })
+      },
+    )
+  }
+
+  function add() {
+    if (!isMemorySendable(adding)) return
+    setBusy(true)
+    setAddError(null)
+    addLiveMemory(adding).then(
+      () => {
+        setBusy(false)
+        setAdding('')
+        refetch()
+      },
+      (e: unknown) => {
+        setBusy(false)
+        setAddError(fail(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Memory</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!entries) {
+    return (
+      <>
+        <h2>Memory</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const words = notebookWords(entries)
+  const addFieldError = memoryBodyError(adding)
+
+  return (
+    <>
+      <h2>Memory</h2>
+      <p className="muted">
+        The live notebook: what earlier conversations left for later ones —
+        preferences, working norms, the reasons behind decisions, pointers to
+        task ids. Every active entry is read by the agent holding the next
+        conversation, so it is budgeted. Entries are edited one at a time; an
+        entry no conversation has used for ten sessions retires on its own,
+        and a retired entry stays searchable with{' '}
+        <code>mesa live memory search</code>.
+      </p>
+      <p className={overBudget(words) ? 'error' : 'muted'}>
+        {budgetMeter(words)}
+      </p>
+
+      {entries.length === 0 && (
+        <p className="muted">Nothing remembered yet.</p>
+      )}
+      {entries.map((entry) => {
+        const isEditing = editing?.id === entry.id
+        const editFieldError = isEditing ? memoryBodyError(editing.body) : null
+        return (
+          <section key={entry.id} className="settings-command">
+            <p className="muted settings-command-blurb">{metaLine(entry)}</p>
+            {isEditing ? (
+              <>
+                <textarea
+                  className="settings-command-input"
+                  rows={3}
+                  value={editing.body}
+                  onChange={(e) =>
+                    setEditing({ id: entry.id, body: e.target.value })
+                  }
+                />
+                {editFieldError && <p className="error">{editFieldError}</p>}
+                <div className="settings-actions">
+                  <button
+                    type="button"
+                    disabled={busy || !isMemorySendable(editing.body)}
+                    onClick={saveEdit}
+                  >
+                    save
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setEditing(null)
+                      setRowError(null)
+                    }}
+                  >
+                    cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p>{entry.body}</p>
+                <div className="settings-actions">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setEditing({ id: entry.id, body: entry.body })
+                      setRowError(null)
+                    }}
+                  >
+                    edit
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => remove(entry.id)}
+                  >
+                    delete
+                  </button>
+                </div>
+              </>
+            )}
+            {rowError?.id === entry.id && (
+              <p className="error">{rowError.message}</p>
+            )}
+          </section>
+        )
+      })}
+
+      <section className="settings-command">
+        <label htmlFor="memory-add">
+          <span className="settings-command-title">Add an entry</span>
+        </label>
+        <p className="muted settings-command-blurb">
+          One bullet — something the person said outright. Never task status
+          (tasks hold that), never a guess about the person.
+        </p>
+        <textarea
+          id="memory-add"
+          className="settings-command-input"
+          rows={3}
+          value={adding}
+          onChange={(e) => {
+            setAdding(e.target.value)
+            setAddError(null)
+          }}
+        />
+        {addFieldError && <p className="error">{addFieldError}</p>}
+        <div className="settings-actions">
+          <button
+            type="button"
+            disabled={busy || !isMemorySendable(adding)}
+            onClick={add}
+          >
+            {busy ? 'saving…' : 'add entry'}
+          </button>
+        </div>
+        {addError && <p className="error">{addError}</p>}
+      </section>
     </>
   )
 }

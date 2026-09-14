@@ -26,6 +26,7 @@ import type { ConfigPrice } from './types/ConfigPrice'
 import type { ConfigSpeech } from './types/ConfigSpeech'
 import type { ConfigListen } from './types/ConfigListen'
 import type { ConfigLive } from './types/ConfigLive'
+import type { LiveNotebookEntry } from './types/LiveNotebookEntry'
 import type { ConfigWatchers } from './types/ConfigWatchers'
 import type { Diagram } from './types/Diagram'
 import type { DiagramEvent } from './types/DiagramEvent'
@@ -1340,6 +1341,38 @@ export function updateLiveConfig(
   live: Record<string, string | number | null>,
 ): Promise<ConfigLive> {
   return request('/api/config/live', jsonInit('PUT', live))
+}
+
+// ---- live memory: the notebook (mesa task 1147) ----
+
+/**
+ * The active notebook, oldest first — the bullets every live agent is spawned
+ * holding (`docs/live.md`). Gated like Settings (`require_agent_access`):
+ * this is text injected into a prompt.
+ */
+export function listLiveMemory(): Promise<LiveNotebookEntry[]> {
+  return request('/api/live/memory')
+}
+
+/** Adds one entry. 422 `validation` names the word budget when the notebook
+ *  would exceed it, or the entry length bound. */
+export function addLiveMemory(body: string): Promise<LiveNotebookEntry> {
+  return request('/api/live/memory', jsonInit('POST', { body }))
+}
+
+/** Rewrites one entry in place (same id, same provenance). 422 past the
+ *  budget or when the edit removes more than 30% of the notebook's words. */
+export function updateLiveMemory(
+  id: number,
+  body: string,
+): Promise<LiveNotebookEntry> {
+  return request(`/api/live/memory/${id}`, jsonInit('PATCH', { body }))
+}
+
+/** Retires one entry — it stays in the searchable archive — and echoes it.
+ *  The same 30%-removal guard as an edit. */
+export function deleteLiveMemory(id: number): Promise<LiveNotebookEntry> {
+  return request(`/api/live/memory/${id}`, { method: 'DELETE' })
 }
 
 // ---- scripts (user-authored shell) ----

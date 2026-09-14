@@ -4972,7 +4972,7 @@ impl Store {
         self.conn.execute(
             "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
              VALUES ('note', ?1, ?2, ?3)",
-            (id, session.unwrap_or(0), body),
+            (id, session, body),
         )?;
         self.get_notebook_entry(id)
     }
@@ -5010,7 +5010,7 @@ impl Store {
         self.conn.execute(
             "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
              VALUES ('note', ?1, ?2, ?3)",
-            (id, entry.source_session_id.unwrap_or(0), body),
+            (id, entry.source_session_id, body),
         )?;
         self.get_notebook_entry(id)
     }
@@ -12203,7 +12203,7 @@ mod tests {
         assert_eq!(kinds, ["note", "summary", "turn"]);
         let t = hits.iter().find(|h| h.kind == "turn").unwrap();
         assert_eq!(t.ref_id, turn.id);
-        assert_eq!(t.session_id, session.id);
+        assert_eq!(t.session_id, Some(session.id));
         assert_eq!(t.role, Some(LiveRole::User));
         assert!(t.snippet.contains("[hooks]"), "{}", t.snippet);
         assert!(!t.created_at.is_empty());

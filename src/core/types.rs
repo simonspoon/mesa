@@ -3666,7 +3666,9 @@ pub struct LiveMemoryHit {
     pub kind: String,
     /// The turn id, the summary's session id, or the notebook entry id.
     pub ref_id: i64,
-    pub session_id: i64,
+    /// The conversation it belongs to; null for a notebook entry written
+    /// before any conversation existed.
+    pub session_id: Option<i64>,
     pub created_at: String,
     /// Who said it, for a turn; null for a summary or a note.
     pub role: Option<LiveRole>,

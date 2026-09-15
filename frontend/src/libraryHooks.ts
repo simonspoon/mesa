@@ -1,6 +1,9 @@
 import type { LibraryHookRegistration } from './types/LibraryHookRegistration'
 import type { LibraryHookStatus } from './types/LibraryHookStatus'
 import type { LibraryItem } from './types/LibraryItem'
+import type { LibraryOrphanHook } from './types/LibraryOrphanHook'
+import type { LibraryScope } from './types/LibraryScope'
+import type { Project } from './types/Project'
 
 /**
  * Pure decisions for the Library page's hook-registration surface (mesa task
@@ -180,4 +183,58 @@ export function unregisterHookQuery(event?: string, matcher?: string): string {
   if (event !== undefined) parts.push(`event=${encodeURIComponent(event)}`)
   if (matcher !== undefined) parts.push(`matcher=${encodeURIComponent(matcher)}`)
   return parts.length === 0 ? '' : `?${parts.join('&')}`
+}
+
+// ---- hooks wired from outside `.claude/hooks/` (mesa task 1128) ----
+
+/** One settings file the page reads orphan hook commands out of. */
+export type OrphanScope = { scope: LibraryScope; project_id: number | null }
+
+/**
+ * Every settings file the page asks about: the user's own, then one per
+ * project that has a `local_path` — a project without one has no
+ * settings.json to read, and asking would only be a `validation` the page
+ * would have to swallow. `null` is the project list before it has loaded.
+ */
+export function orphanScopesFor(projects: Project[] | null): OrphanScope[] {
+  const out: OrphanScope[] = [{ scope: 'user', project_id: null }]
+  for (const p of projects ?? []) {
+    if (p.local_path !== null && p.local_path !== '') {
+      out.push({ scope: 'project', project_id: p.id })
+    }
+  }
+  return out
+}
+
+/** A stable key for one orphan row across refetches: the same script named
+ * from two scopes' files is two rows, so the scope is part of it. */
+export function orphanKey(row: LibraryOrphanHook): string {
+  return `${row.scope}:${row.project_id ?? ''}:${row.path}`
+}
+
+/** How the row's scope reads: `user`, or `project · <name>` (the id when
+ * the project list does not name it). */
+export function orphanScopeLabel(row: LibraryOrphanHook, projects: Project[] | null): string {
+  if (row.scope === 'user') return 'user'
+  const project = (projects ?? []).find((p) => p.id === row.project_id)
+  return `project · ${project?.name ?? row.project_id ?? '?'}`
+}
+
+/**
+ * Why the adopt button is disabled, or `null` when the press would go
+ * through. A script that is not on disk cannot be moved; a `conflict` is the
+ * server's own reason, answered on the read so the page never offers a
+ * press that would 409.
+ */
+export function orphanAdoptDisabledReason(row: LibraryOrphanHook): string | null {
+  if (!row.exists) return 'missing on disk'
+  return row.conflict
+}
+
+/** Where the adopted script will land and what its commands will say — the
+ * whole of what the press does, so the reader can judge it first. */
+export function orphanAdoptLabel(row: LibraryOrphanHook): string {
+  return `move to .claude/hooks/${row.name} and rewrite ${
+    row.registrations.length === 1 ? 'its command' : `${row.registrations.length} commands`
+  }`
 }

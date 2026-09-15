@@ -1938,6 +1938,39 @@ pub struct LibraryHookStatus {
     pub events: Vec<String>,
 }
 
+/// A hook command in `.claude/settings.json` whose script lives **outside**
+/// `.claude/hooks/` (mesa task 1128) — invisible to the library, which only
+/// ever sees that directory, and offered for *adoption*: moving the script
+/// in and rewriting the command(s) that name it, on the user's explicit
+/// action and never on a read. One row per script, however many events name
+/// it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryOrphanHook {
+    pub scope: LibraryScope,
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    /// The settings file the command(s) were read from.
+    pub settings_path: String,
+    /// The script's absolute path on this machine, the token expanded
+    /// (`~/`, `$HOME/`, `$CLAUDE_PROJECT_DIR/`) and canonicalised — the key
+    /// `adopt` takes.
+    pub path: String,
+    /// Whether that file is on disk. A registration naming a missing file is
+    /// still listed — it fires and errors every session, which is worth
+    /// seeing — but cannot be adopted.
+    pub exists: bool,
+    /// The library name adoption would give it: the file's own name, since a
+    /// hook's name is its whole filename.
+    pub name: String,
+    /// Every command naming this script, across events and groups.
+    pub registrations: Vec<LibraryHookRegistration>,
+    /// Why adoption would be refused right now — the name unusable, the
+    /// destination `.claude/hooks/<name>` already taken, or a hook item of
+    /// that name already at this scope — or `None` when it would go through.
+    pub conflict: Option<String>,
+}
+
 /// How a synced path's mesa body (M) compares to the file on disk (D) against
 /// the last-agreed baseline (B) — `core::library::classify`'s result, and the
 /// one decision table `mesa library sync status` reports.

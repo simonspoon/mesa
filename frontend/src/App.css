@@ -10241,6 +10241,24 @@ button:focus-visible,
   flex: 1 1 auto;
 }
 
+/* Hook scripts wired from outside `.claude/hooks/` (mesa task 1128): the
+   section reuses the item row, with the registrations listed under it the
+   way the hooks panel lists them. The badge is the one warning on the page:
+   a registration naming a missing file fires and errors every session. */
+.library-orphan-missing {
+  color: var(--red);
+  border-color: currentColor;
+}
+
+.library-orphans .library-hook-regs {
+  margin: 0.4rem 0 0;
+}
+
+.library-orphan-reason {
+  margin: 0.4rem 0 0;
+  font-size: 0.75rem;
+}
+
 .library-hook-form {
   display: flex;
   gap: 0.5rem;

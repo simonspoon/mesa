@@ -77,7 +77,21 @@
 #      reads in-sync the moment it is written; `--no-export-command` removes
 #      the file mesa wrote but leaves a hand-edited one for `disk-new`; the
 #      flag survives `--quiet`; and a bundle still saying `"kind":
-#      "command"` imports as an exporting prompt.
+#      "command"` imports as an exporting prompt;
+#  13. hooks wired from outside `.claude/hooks/` (mesa task 1128): against a
+#      settings file holding an unrelated key, somebody else's registration,
+#      an in-tree command, `bash $HOME/scripts/warm.sh --fast` under two
+#      events and a `~/gone/missing.py`, `hook orphans` lists exactly the two
+#      out-of-tree rows (exists true/false, two registrations on the first,
+#      the in-tree one absent); `adopt` on the missing one is exit 1
+#      not_found; a pre-created `.claude/hooks/warm.sh` makes it conflict
+#      with the settings file untouched; a real adoption moves the script
+#      (executable), rewrites both commands keeping `bash ` and `--fast`,
+#      leaves every other byte IDENTICAL (cmp against a sed of the
+#      original), shows two registrations on the new item and in-sync in
+#      `sync status`, and drops out of `orphans`; `--quiet` rejected on
+#      both; and the two routes serving over the API (both sweeps in
+#      section 8 now cover sixteen routes).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -868,6 +882,11 @@ raw POST "/api/library/$GATE_ID/hook" -H "Host: evil.example" -H 'Content-Type: 
 [ "$STATUS" = "403" ] || fail "default: POST .../hook with a foreign Host must be 403"
 raw DELETE "/api/library/$GATE_ID/hook" -H "Host: evil.example" -H 'Content-Type: application/json'
 [ "$STATUS" = "403" ] || fail "default: DELETE .../hook with a foreign Host must be 403"
+raw GET "/api/library/hooks/orphans?scope=user" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "default: GET /api/library/hooks/orphans with a foreign Host must be 403"
+raw POST /api/library/hooks/adopt -H "Host: evil.example" -H 'Content-Type: application/json' \
+  -d '{"scope":"user","path":"/nope"}'
+[ "$STATUS" = "403" ] || fail "default: POST /api/library/hooks/adopt with a foreign Host must be 403"
 api 200 GET "/api/library/$GATE_ID"
 [ "$(jqb .body)" = "x" ] || fail "default: a refused authoring request must write nothing"
 ok "default mode: every mutating route AND both sync routes reject a foreign Host, writing nothing"
@@ -950,7 +969,7 @@ LIS=$(lan_req POST /api/library/import "127.0.0.1:$LAN_PORT" '' '{"bundle":{"ver
   fail "--lan: importing from this machine's own local Host must still work (the flag never locks the owner out)"
 ok "--lan: authoring (incl. import) from a loopback peer with a local Host still works (the flag never locks the owner out)"
 
-# All FOURTEEN routes: a DNS-name Host (rebinding) and a foreign Origin
+# All SIXTEEN routes: a DNS-name Host (rebinding) and a foreign Origin
 # (cross-site) are each refused — reads exactly as strictly as mutations, the
 # two sync routes and the two bundle routes, since every one of them shares
 # `require_agent_access`.
@@ -969,6 +988,8 @@ for CASE in \
   "GET|/api/library/$GATE_ID/hook|" \
   "POST|/api/library/$GATE_ID/hook|{\"event\":\"Stop\"}" \
   "DELETE|/api/library/$GATE_ID/hook|{}" \
+  "GET|/api/library/hooks/orphans?scope=user|" \
+  "POST|/api/library/hooks/adopt|{\"scope\":\"user\",\"path\":\"/nope\"}" \
 ; do
   IFS='|' read -r METHOD PATH_ BODY_ <<<"$CASE"
   S=$(lan_req "$METHOD" "$PATH_" "evil.example:$LAN_PORT" '' "$BODY_")
@@ -978,7 +999,7 @@ for CASE in \
   [ "$S" = "403" ] ||
     fail "--lan: $METHOD $PATH_ from a foreign Origin must be 403, got $S"
 done
-ok "--lan: all fourteen library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
+ok "--lan: all sixteen library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
 
 api2() { # api2 <expected-status> <method> <path> [json-body] — against LAN_PORT, local Host
   local expected=$1 method=$2 path=$3 body=${4:-}
@@ -1428,6 +1449,7 @@ DROP TABLE live_notebook;
 DROP TABLE live_memory_fts;
 ALTER TABLE live_sessions DROP COLUMN lease;
 ALTER TABLE live_sessions DROP COLUMN predecessor_agent_id;
+ALTER TABLE live_turns DROP COLUMN notice;
 INSERT INTO library_items (kind, scope, name, body, synced_body, synced_at, created_at, updated_at)
   VALUES ('command', 'user', 'execute-todo', 'Claim task $ARGS', 'Claim task $ARGS', datetime('now'), datetime('now'), datetime('now'));
 INSERT INTO library_versions (item_id, body, source, created_at) VALUES (1, 'v1', 'edit', datetime('now'));
@@ -1569,6 +1591,147 @@ run 0 "$MESA" library export
 ok "a bundle exported before 1139 (kind: command) imports as an exporting prompt, and a fresh export carries the flag"
 
 echo "== library-check: section 12 (command folded into prompt) passed ($CHECKS checks so far) =="
+
+# ================= 13. hooks wired from outside .claude/hooks (mesa task 1128) =================
+# A settings.json command may name a script anywhere, and the library only
+# sees `.claude/hooks/`. mesa lists such commands and, on an explicit
+# `adopt`, moves the script in and rewrites the command(s) — the acceptance
+# property being that nothing else in the file moves, and that a refused
+# adoption touches nothing at all.
+
+ORPHAN_SETTINGS="$HOME/.claude/settings.json"
+mkdir -p "$HOME/.claude/hooks" "$HOME/scripts"
+printf '#!/bin/sh\necho warm\n' > "$HOME/scripts/warm.sh"
+chmod +x "$HOME/scripts/warm.sh"
+printf 'in tree' > "$HOME/.claude/hooks/in-tree.sh"
+cat > "$ORPHAN_SETTINGS" <<'JSON'
+{
+  "model": "opus",
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "*", "hooks": [
+        {"type": "command", "command": "bash $HOME/scripts/warm.sh --fast"},
+        {"type": "command", "command": "somebody-elses-guard.py"}
+      ] }
+    ],
+    "Stop": [
+      { "hooks": [{"type": "command", "command": "bash $HOME/scripts/warm.sh --fast"}] },
+      { "matcher": "Bash", "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/in-tree.sh"}] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{"type": "command", "command": "~/gone/missing.py"}] }
+    ]
+  },
+  "env": {"FOO": "bar"}
+}
+JSON
+cp "$ORPHAN_SETTINGS" "$TMP/orphans.before"
+WARM_SRC="$HOME_REAL/scripts/warm.sh"
+WARM_DEST="$HOME_REAL/.claude/hooks/warm.sh"
+
+run 0 "$MESA" library hook orphans
+[ "$(jqs length)" = "2" ] || fail "hook orphans: exactly the two out-of-tree rows, got $STDOUT"
+[ "$(jqs '[.[] | select(.name=="in-tree.sh")] | length')" = "0" ] ||
+  fail "hook orphans: a command resolving inside .claude/hooks must not be listed"
+WARM=$(jqs '.[] | select(.name=="warm.sh")')
+[ -n "$WARM" ] || fail "hook orphans: warm.sh must be listed"
+[ "$(jq -r .path <<<"$WARM")" = "$WARM_SRC" ] || fail "hook orphans: \$HOME expanded and canonical, got $(jq -r .path <<<"$WARM")"
+[ "$(jq -r .exists <<<"$WARM")" = "true" ] || fail "hook orphans: warm.sh exists"
+[ "$(jq -r .scope <<<"$WARM")" = "user" ] || fail "hook orphans: scope"
+[ "$(jq -r .project_id <<<"$WARM")" = "null" ] || fail "hook orphans: project_id"
+[ "$(jq -r .settings_path <<<"$WARM")" = "$HOME_REAL/.claude/settings.json" ] || fail "hook orphans: settings_path"
+[ "$(jq -r .conflict <<<"$WARM")" = "null" ] || fail "hook orphans: no conflict yet"
+[ "$(jq -r '.registrations | length' <<<"$WARM")" = "2" ] || fail "hook orphans: one row, both registrations"
+[ "$(jq -r '[.registrations[].event] | sort | join(",")' <<<"$WARM")" = "SessionStart,Stop" ] ||
+  fail "hook orphans: the two events"
+[ "$(jq -r '.registrations[0].command' <<<"$WARM")" = 'bash $HOME/scripts/warm.sh --fast' ] ||
+  fail "hook orphans: the command verbatim"
+MISSING=$(jqs '.[] | select(.name=="missing.py")')
+[ -n "$MISSING" ] || fail "hook orphans: a missing script is listed, not dropped"
+[ "$(jq -r .path <<<"$MISSING")" = "$HOME_REAL/gone/missing.py" ] || fail "hook orphans: ~/ expanded"
+[ "$(jq -r .exists <<<"$MISSING")" = "false" ] || fail "hook orphans: missing.py exists:false"
+ok "CLI library hook orphans: exactly the two out-of-tree scripts, one row each, the in-tree one absent, the missing one flagged"
+
+for SUB in orphans adopt; do
+  run 2 "$MESA" library hook "$SUB" --quiet "$WARM_SRC"
+  [ -z "$STDOUT" ] || fail "library hook $SUB --quiet: stdout must be empty, got $STDOUT"
+  [ "$(jqe .error.code)" = "usage" ] || fail "library hook $SUB --quiet: expected usage, got $STDERR"
+done
+ok "CLI library hook orphans/adopt reject --quiet: exit 2, empty stdout, usage on stderr"
+
+run 1 "$MESA" library hook adopt "$HOME_REAL/gone/missing.py"
+[ "$(jqe .error.code)" = "not_found" ] || fail "hook adopt on a missing script: expected not_found, got $STDERR"
+run 1 "$MESA" library hook adopt "$HOME_REAL/.claude/hooks/in-tree.sh"
+[ "$(jqe .error.code)" = "not_found" ] || fail "hook adopt on an in-tree script: expected not_found, got $STDERR"
+cmp -s "$ORPHAN_SETTINGS" "$TMP/orphans.before" || fail "hook adopt (refused): the settings file must be untouched"
+ok "CLI library hook adopt: a missing script and an in-tree one are each not_found, exit 1, settings untouched"
+
+printf 'taken' > "$WARM_DEST"
+run 0 "$MESA" library hook orphans
+[ "$(jqs '.[] | select(.name=="warm.sh") | .conflict')" = ".claude/hooks/warm.sh already exists" ] ||
+  fail "hook orphans: an existing destination is reported as the conflict, got $STDOUT"
+run 1 "$MESA" library hook adopt "$WARM_SRC"
+[ "$(jqe .error.code)" = "conflict" ] || fail "hook adopt onto an existing destination: expected conflict, got $STDERR"
+[ "$(cat "$WARM_DEST")" = "taken" ] || fail "hook adopt: an existing destination must never be overwritten"
+[ -f "$WARM_SRC" ] || fail "hook adopt (conflict): the source must stay"
+cmp -s "$ORPHAN_SETTINGS" "$TMP/orphans.before" || fail "hook adopt (conflict): the settings file must be untouched"
+rm "$WARM_DEST"
+ok "CLI library hook adopt: an existing .claude/hooks/<name> is conflict, exit 1; nothing moved, nothing rewritten"
+
+run 0 "$MESA" library hook adopt "$WARM_SRC"
+[ "$(jqs .name)" = "warm.sh" ] || fail "hook adopt: prints the new item's hook status"
+[ "$(jqs .registered)" = "true" ] || fail "hook adopt: registered"
+[ "$(jqs '.registrations | length')" = "2" ] || fail "hook adopt: both registrations on the new item"
+[ "$(jqs '.registrations[0].command')" = "bash $WARM_DEST --fast" ] ||
+  fail "hook adopt: the command keeps its prefix and arguments around the new path, got $(jqs '.registrations[0].command')"
+[ ! -e "$WARM_SRC" ] || fail "hook adopt: the source must be gone"
+[ -f "$WARM_DEST" ] || fail "hook adopt: the destination must exist"
+[ -x "$WARM_DEST" ] || fail "hook adopt: the executable bit travels with the script"
+[ "$(cat "$WARM_DEST")" = "$(printf '#!/bin/sh\necho warm')" ] || fail "hook adopt: the body is the script"
+sed -e "s#[$]HOME/scripts/warm.sh#$WARM_DEST#g" "$TMP/orphans.before" > "$TMP/orphans.expected"
+cmp -s "$ORPHAN_SETTINGS" "$TMP/orphans.expected" ||
+  fail "hook adopt: only the path token may change; every other byte must be IDENTICAL:\n$(diff "$TMP/orphans.expected" "$ORPHAN_SETTINGS" || true)"
+[ "$(jq -r '.hooks.SessionStart[0].hooks[1].command' "$ORPHAN_SETTINGS")" = "somebody-elses-guard.py" ] ||
+  fail "hook adopt: somebody else's hook must survive"
+ok "CLI library hook adopt: moves the script in (executable), rewrites both commands and leaves every other byte byte-identical"
+
+run 0 "$MESA" library hook status warm.sh
+[ "$(jqs '.registrations | length')" = "2" ] || fail "hook status after adopt: two registrations"
+run 0 "$MESA" library show warm.sh
+[ "$(jqs .kind)" = "hook" ] || fail "adopted item: kind"
+[ "$(jqs .scope)" = "user" ] || fail "adopted item: scope"
+[ "$(jqs .synced_body)" = "$(jqs .body)" ] || fail "adopted item: the sync baseline is set"
+run 0 "$MESA" library sync status
+[ "$(jqs '.[] | select(.name=="warm.sh") | .status')" = "in-sync" ] || fail "adopted item: sync status must read in-sync"
+run 0 "$MESA" library hook orphans
+[ "$(jqs length)" = "1" ] || fail "hook orphans after adopt: only the missing one is left, got $STDOUT"
+[ "$(jqs '.[0].name')" = "missing.py" ] || fail "hook orphans after adopt: the missing one"
+ok "after adoption: hook status sees both registrations, the row is in-sync, and orphans no longer lists it"
+
+# ---- over the API: the two routes serve (the gates are in section 8) ----
+"$MESA" serve --port 17799 >"$TMP/serve13.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:17799/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+API13="http://127.0.0.1:17799"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' "$API13/api/library/hooks/orphans?scope=user")
+[ "$CODE" = "200" ] || fail "GET /api/library/hooks/orphans: expected 200, got $CODE ($(cat "$TMP/out"))"
+[ "$(jq -r length "$TMP/out")" = "1" ] || fail "GET orphans: the one remaining row"
+[ "$(jq -r '.[0].name' "$TMP/out")" = "missing.py" ] || fail "GET orphans: missing.py"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' "$API13/api/library/hooks/orphans?scope=project")
+[ "$CODE" = "422" ] || fail "GET orphans scope=project without a project: expected 422, got $CODE"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' -X POST "$API13/api/library/hooks/adopt" \
+  -H 'Content-Type: application/json' -d "{\"scope\":\"user\",\"path\":\"$HOME_REAL/gone/missing.py\"}")
+[ "$CODE" = "404" ] || fail "POST adopt on a missing script: expected 404, got $CODE ($(cat "$TMP/out"))"
+[ "$(jq -r .error.code "$TMP/out")" = "not_found" ] || fail "POST adopt: error.code"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"scope":"user","path":"/x"}' "$API13/api/library/hooks/adopt")
+[ "$CODE" = "415" ] || fail "POST adopt without Content-Type: expected 415, got $CODE"
+kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+ok "API: GET /api/library/hooks/orphans lists, POST /api/library/hooks/adopt answers 404 for a missing script and 415 without JSON"
+
+echo "== library-check: section 13 (hooks wired from outside .claude/hooks) passed ($CHECKS checks so far) =="
 
 echo
 echo "library-check: $CHECKS checks passed"

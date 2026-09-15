@@ -1470,6 +1470,36 @@ EXAMPLES
         #[arg(long)]
         matcher: Option<String>,
     },
+    /// List hook commands in settings.json whose script lives outside
+    /// .claude/hooks/ — one row per script, with every event naming it
+    ///
+    /// A pure read: nothing moves until `adopt`. A script that is not on
+    /// disk is listed with `exists: false`; `conflict` says why `adopt`
+    /// would refuse it right now.
+    Orphans {
+        /// user|project (default: user)
+        #[arg(long, value_parser = parse_library_scope, default_value = "user")]
+        scope: LibraryScope,
+        /// The project, by id or name; required iff --scope project
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Move one such script into .claude/hooks/ and rewrite the command(s)
+    /// naming it, creating the library row; prints its hook status
+    #[command(after_help = "\
+EXAMPLES
+  mesa library hook adopt /Users/me/.claude/warm.sh
+  mesa library hook adopt /repo/tools/guard.py --scope project --project mesa")]
+    Adopt {
+        /// The script's path exactly as `orphans` lists it
+        path: String,
+        /// user|project (default: user)
+        #[arg(long, value_parser = parse_library_scope, default_value = "user")]
+        scope: LibraryScope,
+        /// The project, by id or name; required iff --scope project
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 /// `mesa library sync status|apply` — mesa task 919's per-file reconciliation
@@ -5624,7 +5654,7 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                 None => print_json(&Vec::<crate::core::LibraryVersion>::new()),
             }
         }
-        LibraryCmd::Hook(hook_cmd) => run_library_hook_cmd(&store, hook_cmd)?,
+        LibraryCmd::Hook(hook_cmd) => run_library_hook_cmd(&mut store, hook_cmd)?,
         LibraryCmd::Sync(sync_cmd) => run_library_sync_cmd(&mut store, sync_cmd)?,
         LibraryCmd::Export {
             project_pos,
@@ -5661,8 +5691,20 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
 /// library (mesa task 1115). Every arm answers the same status object, so
 /// `enable`/`disable` report the file's state *after* their write rather than
 /// echoing what was asked for.
-fn run_library_hook_cmd(store: &Store, cmd: LibraryHookCmd) -> Result<()> {
+fn run_library_hook_cmd(store: &mut Store, cmd: LibraryHookCmd) -> Result<()> {
     match cmd {
+        LibraryHookCmd::Orphans { scope, project } => {
+            let project_id = library_scope_project(store, scope, project.as_deref())?;
+            print_json(&library::orphan_hooks(store, scope, project_id)?);
+        }
+        LibraryHookCmd::Adopt {
+            path,
+            scope,
+            project,
+        } => {
+            let project_id = library_scope_project(store, scope, project.as_deref())?;
+            print_json(&library::adopt_hook(store, scope, project_id, &path)?);
+        }
         LibraryHookCmd::Status { item } => {
             let item = resolve_library(store, &item)?;
             print_json(&library::hook_registrations(store, &item)?);
@@ -5695,6 +5737,30 @@ fn run_library_hook_cmd(store: &Store, cmd: LibraryHookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The project a `--scope`/`--project` pair names: required at `project`
+/// scope, refused at `user` scope — the rule `library create` applies.
+fn library_scope_project(
+    store: &Store,
+    scope: LibraryScope,
+    project: Option<&str>,
+) -> Result<Option<i64>> {
+    match scope {
+        LibraryScope::User => {
+            if project.is_some() {
+                return Err(Error::Validation(
+                    "--project is only valid with --scope project".into(),
+                ));
+            }
+            Ok(None)
+        }
+        LibraryScope::Project => {
+            let p = project
+                .ok_or_else(|| Error::Validation("--scope project requires --project".into()))?;
+            Ok(Some(resolve_project(store, p)?))
+        }
+    }
 }
 
 fn run_library_sync_cmd(store: &mut Store, cmd: LibrarySyncCmd) -> Result<()> {

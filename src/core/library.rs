@@ -24,8 +24,8 @@ use crate::core::config;
 use crate::core::store::{Error, LibraryPatch, Result as StoreResult, Store};
 use crate::core::types::{
     LibraryBundle, LibraryBundleItem, LibraryDiffKind, LibraryDiffLine, LibraryHookRegistration,
-    LibraryHookStatus, LibraryImportResult, LibraryItem, LibraryKind, LibraryScope,
-    LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
+    LibraryHookStatus, LibraryImportResult, LibraryItem, LibraryKind, LibraryOrphanHook,
+    LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
 };
 
 /// One built-in library entry — code, not a db row. `core::library::BUILTINS`
@@ -209,7 +209,26 @@ pub fn resolve(base: &Path, rel: &Path) -> Result<PathBuf, String> {
     // Canonicalise whatever prefix of `candidate` already exists — closing
     // the symlink-escape hole the same way `files.rs::safe_path()` does —
     // then confirm the canonical result still starts with `base_canon`.
-    let mut existing = candidate.as_path();
+    let resolved = canonical_prefix(&candidate)?;
+
+    if resolved == base_canon || resolved.starts_with(&base_canon) {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "{} escapes {}",
+            resolved.display(),
+            base_canon.display()
+        ))
+    }
+}
+
+/// Canonicalises the deepest existing ancestor of `path` and rejoins the
+/// missing remainder — the second half of [`resolve`], shared with
+/// [`orphan_hooks`], which asks the same question of a path a settings file
+/// names ("where does this really point, symlinks followed?") without a
+/// base to contain it under.
+fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path;
     let mut missing_tail: Vec<&std::ffi::OsStr> = Vec::new();
     while !existing.exists() {
         let Some(name) = existing.file_name() else {
@@ -227,16 +246,7 @@ pub fn resolve(base: &Path, rel: &Path) -> Result<PathBuf, String> {
     for name in missing_tail.into_iter().rev() {
         resolved.push(name);
     }
-
-    if resolved == base_canon || resolved.starts_with(&base_canon) {
-        Ok(resolved)
-    } else {
-        Err(format!(
-            "{} escapes {}",
-            resolved.display(),
-            base_canon.display()
-        ))
-    }
+    Ok(resolved)
 }
 
 /// Writes a built-in **agent definition** to its user-scope path if it is not
@@ -1618,25 +1628,382 @@ fn apply(
     let Some(raw) = spliced else {
         return Ok(status_of(item, target, &settings));
     };
-    let hooks = parse_settings(&raw, &target.settings)?;
-    if let Some(parent) = target.settings.parent() {
+    let written = write_settings(&target.settings, raw)?;
+    Ok(status_of(item, target, &written))
+}
+
+/// Writes a spliced settings text to its file, re-parsing it first as the
+/// self-check that the splice produced valid JSON, and answers the parsed
+/// result so the caller reads what landed.
+///
+/// Written through a sibling temp file and renamed, the reasoning
+/// `config::write_atomically` states for mesa's *own* config holding doubly
+/// here: `fs::write` truncates first, so a crash mid-write would leave the
+/// user's settings a partial document — and unlike the config, this is a
+/// file mesa did not author and cannot regenerate. (Copied rather than
+/// called: that function reports a `config::SaveError`, and mapping it in
+/// would be more code than the three lines it saves.)
+fn write_settings(path: &Path, raw: String) -> StoreResult<Settings> {
+    let hooks = parse_settings(&raw, path)?;
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Written through a sibling temp file and renamed, the reasoning
-    // `config::write_atomically` states for mesa's *own* config holding
-    // doubly here: `fs::write` truncates first, so a crash mid-write would
-    // leave the user's settings a partial document — and unlike the config,
-    // this is a file mesa did not author and cannot regenerate. (Copied
-    // rather than called: that function reports a `config::SaveError`, and
-    // mapping it in would be more code than the three lines it saves.)
-    let mut tmp = target.settings.as_os_str().to_os_string();
+    let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     fs::write(&tmp, &raw)?;
-    fs::rename(&tmp, &target.settings).inspect_err(|_| {
+    fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
-    Ok(status_of(item, target, &Settings { raw, hooks }))
+    Ok(Settings { raw, hooks })
+}
+
+// ---- hooks wired from outside `.claude/hooks/` (mesa task 1128) ----
+//
+// A settings.json command may name a script anywhere — `bash
+// ~/.claude/warm.sh`, `/usr/local/bin/guard.py` — and the library, which only
+// ever looks at `.claude/hooks/`, cannot see it. Rather than teach a library
+// row an arbitrary stored path (which would breach "path is derived, never
+// stored" and need a second containment story beside `resolve`), mesa lists
+// such commands and offers to **adopt** them: move the script into
+// `.claude/hooks/<name>` and rewrite the command(s) in place. Nothing moves
+// on a read; every library item stays in-tree.
+
+/// The base directory and settings file of one scope — [`hook_target`]'s
+/// first half, for a caller that has a scope but no item yet.
+fn scope_settings(
+    store: &Store,
+    scope: LibraryScope,
+    project_id: Option<i64>,
+) -> StoreResult<(PathBuf, PathBuf)> {
+    let project_local_path = match (scope, project_id) {
+        (LibraryScope::Project, Some(id)) => store.get_project(id)?.local_path,
+        (LibraryScope::Project, None) => {
+            return Err(Error::Validation("project scope needs a project".into()));
+        }
+        (LibraryScope::User, Some(_)) => {
+            return Err(Error::Validation(
+                "a project is only valid with project scope".into(),
+            ));
+        }
+        (LibraryScope::User, None) => None,
+    };
+    let project_local_path = project_local_path.map(PathBuf::from);
+    let base = scope_base(scope, project_local_path.as_deref()).ok_or_else(|| {
+        Error::Validation(
+            "this project has no local path recorded; there is no settings.json to read".into(),
+        )
+    })?;
+    let settings = resolve(&base, Path::new(".claude/settings.json")).map_err(Error::Validation)?;
+    Ok((base, settings))
+}
+
+/// The byte span, within a command string, of the first whitespace-separated
+/// token that names a file by path — one starting `/`, `~/`, `$HOME/` or
+/// `$CLAUDE_PROJECT_DIR/`, a pair of surrounding quotes stripped. A command
+/// with no such token is arbitrary shell mesa does not try to read (`npm run
+/// lint`, `echo done`), and is simply not adoptable. The one token passed
+/// over is `…/env` (`/usr/bin/env python3 ~/x.py`), which names the
+/// interpreter shim rather than the script.
+fn command_path_token(command: &str) -> Option<(usize, usize)> {
+    let mut rest = command;
+    let mut offset = 0;
+    while !rest.is_empty() {
+        let skipped = rest.len() - rest.trim_start().len();
+        offset += skipped;
+        rest = &rest[skipped..];
+        if rest.is_empty() {
+            break;
+        }
+        let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..len];
+        let (mut start, mut end) = (offset, offset + len);
+        let quoted = token.len() >= 2
+            && (token.starts_with('"') && token.ends_with('"')
+                || token.starts_with('\'') && token.ends_with('\''));
+        if quoted {
+            start += 1;
+            end -= 1;
+        }
+        let inner = &command[start..end];
+        if ["/", "~/", "$HOME/", "$CLAUDE_PROJECT_DIR/"]
+            .iter()
+            .any(|prefix| inner.starts_with(prefix))
+            && Path::new(inner).file_name().is_some_and(|n| n != "env")
+        {
+            return Some((start, end));
+        }
+        offset += len;
+        rest = &rest[len..];
+    }
+    None
+}
+
+/// Expands a path token to an absolute path. `~/` and `$HOME/` expand
+/// against `home`; `$CLAUDE_PROJECT_DIR/` against `project_dir`, which only
+/// a project-scope settings file has — in a user-scope one Claude Code
+/// supplies it per session, so mesa cannot know it and leaves that command
+/// alone (`None`).
+fn expand_path_token(
+    token: &str,
+    home: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(rest) = token.strip_prefix("~/") {
+        return home.map(|h| h.join(rest));
+    }
+    if let Some(rest) = token.strip_prefix("$HOME/") {
+        return home.map(|h| h.join(rest));
+    }
+    if let Some(rest) = token.strip_prefix("$CLAUDE_PROJECT_DIR/") {
+        return project_dir.map(|p| p.join(rest));
+    }
+    token.starts_with('/').then(|| PathBuf::from(token))
+}
+
+/// What a settings-file command resolves to on this machine, if it names a
+/// path mesa can read: the canonical absolute path (symlinks in the existing
+/// prefix followed, the [`resolve`] rule).
+fn command_script_path(
+    command: &str,
+    home: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let (start, end) = command_path_token(command)?;
+    let expanded = expand_path_token(&command[start..end], home, project_dir)?;
+    canonical_prefix(&expanded).ok()
+}
+
+/// Every hook command in this scope's settings.json whose script lives
+/// outside `<base>/.claude/hooks/` — one row per script, however many events
+/// name it, in the order the file's events sort. A pure read.
+///
+/// A command naming a script *inside* `.claude/hooks/` is the library's
+/// already (a registration, `hook_registrations`'s business) and is never
+/// listed, whatever spelling it uses — `$CLAUDE_PROJECT_DIR/.claude/hooks/x`
+/// as mesa writes it, an absolute path, or a `~/` one. A command with no
+/// path token is skipped. A path that does not exist on disk is listed with
+/// `exists: false`, never dropped: a registration naming a missing file
+/// fires and errors every session, which is exactly worth showing.
+pub fn orphan_hooks(
+    store: &Store,
+    scope: LibraryScope,
+    project_id: Option<i64>,
+) -> StoreResult<Vec<LibraryOrphanHook>> {
+    let (base, settings_path) = scope_settings(store, scope, project_id)?;
+    let settings = read_settings(&settings_path)?;
+    let hooks_dir = resolve(&base, Path::new(".claude/hooks")).map_err(Error::Validation)?;
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let project_dir = (scope == LibraryScope::Project).then(|| base.clone());
+    let settings_text = settings_path.to_string_lossy().into_owned();
+
+    let mut rows: Vec<LibraryOrphanHook> = Vec::new();
+    for (event, groups) in &settings.hooks {
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let matcher = group_matcher(group).to_string();
+            let Some(commands) = group.get("hooks").and_then(|h| h.as_array()) else {
+                continue;
+            };
+            for entry in commands {
+                let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                let Some(path) =
+                    command_script_path(command, home.as_deref(), project_dir.as_deref())
+                else {
+                    continue;
+                };
+                if path.starts_with(&hooks_dir) {
+                    continue;
+                }
+                let registration = LibraryHookRegistration {
+                    event: event.clone(),
+                    matcher: matcher.clone(),
+                    command: command.to_string(),
+                };
+                let path_text = path.to_string_lossy().into_owned();
+                if let Some(row) = rows.iter_mut().find(|r| r.path == path_text) {
+                    row.registrations.push(registration);
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let conflict = adoption_conflict(store, scope, project_id, &hooks_dir, &name)?;
+                rows.push(LibraryOrphanHook {
+                    scope,
+                    project_id,
+                    settings_path: settings_text.clone(),
+                    exists: path.exists(),
+                    path: path_text,
+                    name,
+                    registrations: vec![registration],
+                    conflict,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Why adopting a script under `name` would be refused right now, or `None`.
+/// Answered on the read so the page can disable the button with the reason
+/// rather than offer a press that 409s.
+fn adoption_conflict(
+    store: &Store,
+    scope: LibraryScope,
+    project_id: Option<i64>,
+    hooks_dir: &Path,
+    name: &str,
+) -> StoreResult<Option<String>> {
+    if !crate::core::store::library_name_is_valid(name) {
+        return Ok(Some(format!("{name:?} is not a usable library name")));
+    }
+    if hooks_dir.join(name).exists() {
+        return Ok(Some(format!(".claude/hooks/{name} already exists")));
+    }
+    if store
+        .find_library_item(LibraryKind::Hook, scope, project_id, name)?
+        .is_some()
+    {
+        return Ok(Some(format!(
+            "a hook item named {name:?} already exists at {} scope",
+            scope.as_str()
+        )));
+    }
+    Ok(None)
+}
+
+/// Adopts one script an [`orphan_hooks`] row names: copies it to
+/// `.claude/hooks/<name>` (mode bits kept), rewrites every command naming it
+/// to the in-tree path — the absolute path at `user` scope,
+/// `$CLAUDE_PROJECT_DIR/.claude/hooks/<name>` at `project` scope, exactly
+/// what `register_hook` would write, keeping any prefix (`bash `) and
+/// trailing arguments — then removes the original and creates the library
+/// row with its sync baseline set, so `sync status` reads `in-sync`. Answers
+/// the new item's `hook_registrations`.
+///
+/// `path` must be one of the rows' `path`s (`not_found` otherwise, as is a
+/// script that is not on disk); a row carrying a `conflict` is refused with
+/// it (`conflict`). The order is what makes a failure safe: the copy is
+/// written first, the settings file second, and **if the settings write
+/// fails the copy is removed** — so a failed adoption leaves both the script
+/// and settings.json exactly as they were. Only once settings.json names the
+/// new path is the original removed; a failure *there* is reported, and
+/// nothing is rolled back, because the state is already consistent (the
+/// file settings.json names exists) and the row can be picked up by a sync.
+pub fn adopt_hook(
+    store: &mut Store,
+    scope: LibraryScope,
+    project_id: Option<i64>,
+    path: &str,
+) -> StoreResult<LibraryHookStatus> {
+    let (base, settings_path) = scope_settings(store, scope, project_id)?;
+    let wanted = canonical_prefix(Path::new(path))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let rows = orphan_hooks(store, scope, project_id)?;
+    let Some(row) = rows.into_iter().find(|r| r.path == wanted) else {
+        return Err(Error::NotFound(format!(
+            "{path} is not a hook command outside .claude/hooks in {}",
+            settings_path.display()
+        )));
+    };
+    if !row.exists {
+        return Err(Error::NotFound(format!(
+            "{} is named by {} but is not on disk",
+            row.path,
+            settings_path.display()
+        )));
+    }
+    if let Some(reason) = row.conflict {
+        return Err(Error::Conflict(reason));
+    }
+
+    let source = PathBuf::from(&row.path);
+    let body = fs::read_to_string(&source).map_err(|e| {
+        Error::Validation(format!(
+            "{} could not be read as text ({e})",
+            source.display()
+        ))
+    })?;
+    let permissions = fs::metadata(&source)?.permissions();
+    let rel = relative_path(LibraryKind::Hook, scope, &row.name, false)
+        .ok_or_else(|| Error::Validation(format!("{:?} has no path", row.name)))?;
+    let dest = resolve(&base, &rel).map_err(Error::Validation)?;
+    let new_token = match scope {
+        LibraryScope::Project => format!("$CLAUDE_PROJECT_DIR/{}", rel.to_string_lossy()),
+        LibraryScope::User => dest.to_string_lossy().into_owned(),
+    };
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&dest, &body)?;
+    fs::set_permissions(&dest, permissions)?;
+
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let project_dir = (scope == LibraryScope::Project).then(|| base.clone());
+    let rewrite = |command: &str| -> Option<String> {
+        let (start, end) = command_path_token(command)?;
+        let expanded = expand_path_token(
+            &command[start..end],
+            home.as_deref(),
+            project_dir.as_deref(),
+        )?;
+        let canonical = canonical_prefix(&expanded).ok()?;
+        (canonical.to_string_lossy() == row.path)
+            .then(|| format!("{}{new_token}{}", &command[..start], &command[end..]))
+    };
+    let settings = read_settings(&settings_path)?;
+    let spliced = splice_replace_commands(&settings.raw, &rewrite).map_err(|e| {
+        Error::Validation(format!(
+            "{} could not be edited ({e}); nothing was changed",
+            settings_path.display()
+        ))
+    });
+    let written = match spliced {
+        Ok(Some(raw)) => write_settings(&settings_path, raw),
+        // The row was built from this very file naming the script, so a
+        // splice that changes nothing is a defensive impossibility — and
+        // still not a reason to leave the copy behind.
+        Ok(None) => Err(Error::Validation(format!(
+            "{} no longer names {}; nothing was changed",
+            settings_path.display(),
+            row.path
+        ))),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
+        let _ = fs::remove_file(&dest);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::remove_file(&source) {
+        return Err(Error::Validation(format!(
+            "{} now names {} and the script was copied there, but the original could not be \
+             removed ({e}); remove it by hand, then run a library sync to pick the copy up",
+            settings_path.display(),
+            dest.display()
+        )));
+    }
+
+    let created = store.create_library_item(
+        LibraryKind::Hook,
+        scope,
+        project_id,
+        &row.name,
+        &body,
+        None,
+        false,
+    )?;
+    let id = created.id.expect("a created item always has an id");
+    let item = store.set_library_synced(id, &body)?;
+    hook_registrations(store, &item)
 }
 
 // ---- the splice ----
@@ -1906,6 +2273,73 @@ fn splice_unregister(
     let mut out = raw.to_string();
     for (start, end) in cuts {
         out.replace_range(start..end, "");
+    }
+    Ok(Some(out))
+}
+
+/// Replaces the `command` string of every entry `rewrite` answers for,
+/// answering the new text — or `Ok(None)` when it answered for none.
+///
+/// The one span touched per entry is the `command` value's own: not the
+/// entry, not its group, so the entry's `type` key, its neighbours and every
+/// byte around them come through identical. The new string is JSON-encoded
+/// on its own, the way a fresh fragment is elsewhere.
+fn splice_replace_commands(
+    raw: &str,
+    rewrite: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let (_, _, top) = top_level_object(raw)?;
+    let Some(hooks_entry) = top.iter().find(|e| e.key == "hooks") else {
+        return Ok(None);
+    };
+    if is_null_value(raw, hooks_entry.value) {
+        return Ok(None);
+    }
+    let hooks_open = expect_open(raw, hooks_entry.value.0, b'{', "\"hooks\"")?;
+    let (_, events) = object_entries(raw, hooks_open)?;
+
+    let mut replacements: Vec<(Span, String)> = Vec::new();
+    for event in &events {
+        let event_open = expect_open(raw, event.value.0, b'[', &event.key)?;
+        let (_, groups) = array_elements(raw, event_open)?;
+        for group in &groups {
+            if raw.as_bytes()[group.0] != b'{' {
+                continue;
+            }
+            let (_, entries) = object_entries(raw, group.0)?;
+            let Some(commands_entry) = entries.iter().find(|e| e.key == "hooks") else {
+                continue;
+            };
+            let commands_open =
+                expect_open(raw, commands_entry.value.0, b'[', "a group's \"hooks\"")?;
+            let (_, commands) = array_elements(raw, commands_open)?;
+            for span in &commands {
+                if raw.as_bytes()[span.0] != b'{' {
+                    continue;
+                }
+                let (_, fields) = object_entries(raw, span.0)?;
+                let Some(field) = fields.iter().find(|e| e.key == "command") else {
+                    continue;
+                };
+                let Some(command) = raw_command(raw, *span) else {
+                    continue;
+                };
+                if let Some(new) = rewrite(&command) {
+                    replacements.push((field.value, serde_json::Value::String(new).to_string()));
+                }
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    replacements.sort_by_key(|((start, _), _)| std::cmp::Reverse(*start));
+    let mut out = raw.to_string();
+    for ((start, end), text) in replacements {
+        out.replace_range(start..end, &text);
     }
     Ok(Some(out))
 }
@@ -4843,5 +5277,365 @@ mod tests {
             register_hook(&store, &item, "Stop", Some(&long)),
             Err(Error::Validation(_))
         ));
+    }
+
+    // ---- hooks wired from outside `.claude/hooks/` (mesa task 1128) ----
+
+    /// A settings file naming, across two events, one script outside the
+    /// tree (`warm.sh`, on disk), one that is missing, one inside
+    /// `.claude/hooks/` and one command with no path at all.
+    const ORPHAN_SETTINGS: &str = r#"{
+  "model": "opus",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "bash $CLAUDE_PROJECT_DIR/tools/warm.sh --fast"},
+          {"type": "command", "command": "npm run lint"}
+        ]
+      }
+    ],
+    "Stop": [
+      { "hooks": [{"type": "command", "command": "bash $CLAUDE_PROJECT_DIR/tools/warm.sh --fast"}] },
+      { "matcher": "Bash", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/mine.sh"}] },
+      { "matcher": "Edit", "hooks": [{"type": "command", "command": "python3 GONE/guard.py"}] }
+    ]
+  },
+  "env": {"FOO": "bar"}
+}
+"#;
+
+    /// A project whose settings file is [`ORPHAN_SETTINGS`] with the missing
+    /// script's path made absolute under `base`, and `tools/warm.sh` on disk.
+    fn orphan_project(store: &mut Store, base: &Path) -> (i64, PathBuf) {
+        let pid = project_at(store, base);
+        fs::create_dir_all(base.join(".claude/hooks")).unwrap();
+        fs::create_dir_all(base.join("tools")).unwrap();
+        fs::write(base.join(".claude/hooks/mine.sh"), "in tree").unwrap();
+        fs::write(base.join("tools/warm.sh"), "#!/bin/sh\necho warm\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                base.join("tools/warm.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let settings = base.join(".claude/settings.json");
+        let raw = ORPHAN_SETTINGS.replace("GONE", &base.join("gone").to_string_lossy());
+        fs::write(&settings, raw).unwrap();
+        (pid, settings)
+    }
+
+    fn canon(path: &Path) -> String {
+        canonical_prefix(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn command_path_token_finds_the_script_and_only_the_script() {
+        fn span(c: &str) -> Option<&str> {
+            command_path_token(c).map(|(s, e)| &c[s..e])
+        }
+        assert_eq!(span("bash $HOME/x.sh --fast"), Some("$HOME/x.sh"));
+        assert_eq!(span("  ~/x.sh"), Some("~/x.sh"));
+        assert_eq!(
+            span("bash \"$CLAUDE_PROJECT_DIR/a b.sh\""),
+            None,
+            "a quoted space splits"
+        );
+        assert_eq!(
+            span("bash '$HOME/x.sh' --quiet"),
+            Some("$HOME/x.sh"),
+            "quotes stripped"
+        );
+        assert_eq!(
+            span("/usr/bin/env python3 ~/x.py"),
+            Some("~/x.py"),
+            "env is the shim"
+        );
+        assert_eq!(span("npm run lint"), None);
+        assert_eq!(span("echo $HOME"), None, "a bare variable is not a path");
+        assert_eq!(span(""), None);
+    }
+
+    #[test]
+    fn orphan_hooks_lists_out_of_tree_commands_once_each_at_project_scope() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, settings) = orphan_project(&mut store, &base);
+
+        let rows = orphan_hooks(&store, LibraryScope::Project, Some(pid)).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // `BTreeMap` order: SessionStart before Stop, so warm.sh is first.
+        let warm = &rows[0];
+        assert_eq!(warm.path, canon(&base.join("tools/warm.sh")));
+        assert!(warm.exists);
+        assert_eq!(warm.name, "warm.sh");
+        assert_eq!(warm.scope, LibraryScope::Project);
+        assert_eq!(warm.project_id, Some(pid));
+        assert_eq!(warm.settings_path, canon(&settings));
+        assert_eq!(warm.conflict, None);
+        let events: Vec<&str> = warm
+            .registrations
+            .iter()
+            .map(|r| r.event.as_str())
+            .collect();
+        assert_eq!(
+            events,
+            ["SessionStart", "Stop"],
+            "one row, both registrations"
+        );
+        assert_eq!(warm.registrations[0].matcher, "*");
+        assert_eq!(
+            warm.registrations[0].command,
+            "bash $CLAUDE_PROJECT_DIR/tools/warm.sh --fast"
+        );
+
+        let gone = &rows[1];
+        assert_eq!(gone.path, canon(&base.join("gone/guard.py")));
+        assert!(!gone.exists, "a missing script is listed, not dropped");
+        assert_eq!(gone.name, "guard.py");
+        assert_eq!(gone.registrations.len(), 1);
+        assert_eq!(gone.registrations[0].matcher, "Edit");
+
+        // `mine.sh` resolves inside `.claude/hooks/` and is the library's
+        // already; `npm run lint` names no path.
+        assert!(rows.iter().all(|r| r.name != "mine.sh"));
+    }
+
+    #[test]
+    fn orphan_hooks_expands_tilde_and_home_at_user_scope() {
+        with_home_dir(|home| {
+            let (store, _dir) = temp_store();
+            fs::create_dir_all(home.join(".claude/hooks")).unwrap();
+            fs::create_dir_all(home.join("bin")).unwrap();
+            fs::write(home.join("bin/warm.sh"), "echo").unwrap();
+            fs::write(home.join(".claude/hooks/in.sh"), "in").unwrap();
+            fs::write(
+                home.join(".claude/settings.json"),
+                r#"{"hooks":{"Stop":[{"hooks":[
+                    {"type":"command","command":"~/bin/warm.sh"},
+                    {"type":"command","command":"$HOME/.claude/hooks/in.sh"},
+                    {"type":"command","command":"$CLAUDE_PROJECT_DIR/x.sh"}
+                ]}]}}"#,
+            )
+            .unwrap();
+
+            let rows = orphan_hooks(&store, LibraryScope::User, None).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].path, canon(&home.join("bin/warm.sh")));
+            assert!(rows[0].exists);
+            assert_eq!(rows[0].scope, LibraryScope::User);
+            assert_eq!(rows[0].project_id, None);
+            // `$CLAUDE_PROJECT_DIR` has no value in a user-scope file, so
+            // that command is left alone rather than guessed at; the
+            // `$HOME/.claude/hooks/` one is in-tree.
+        });
+    }
+
+    #[test]
+    fn orphan_hooks_answers_why_adoption_would_be_refused() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, _) = orphan_project(&mut store, &base);
+
+        fs::write(base.join(".claude/hooks/warm.sh"), "taken").unwrap();
+        let rows = orphan_hooks(&store, LibraryScope::Project, Some(pid)).unwrap();
+        assert_eq!(
+            rows[0].conflict.as_deref(),
+            Some(".claude/hooks/warm.sh already exists")
+        );
+        fs::remove_file(base.join(".claude/hooks/warm.sh")).unwrap();
+
+        hook_item(&mut store, pid, "warm.sh");
+        let rows = orphan_hooks(&store, LibraryScope::Project, Some(pid)).unwrap();
+        assert!(
+            rows[0]
+                .conflict
+                .as_deref()
+                .is_some_and(|c| c.contains("already exists at project scope")),
+            "{rows:?}"
+        );
+        assert!(matches!(
+            adopt_hook(&mut store, LibraryScope::Project, Some(pid), &rows[0].path),
+            Err(Error::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn adopt_hook_moves_the_script_and_rewrites_only_the_path_token() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, settings) = orphan_project(&mut store, &base);
+        let before = fs::read_to_string(&settings).unwrap();
+        let source = base.join("tools/warm.sh");
+        let dest = base.join(".claude/hooks/warm.sh");
+
+        let status = adopt_hook(
+            &mut store,
+            LibraryScope::Project,
+            Some(pid),
+            &canon(&source),
+        )
+        .unwrap();
+        assert!(!source.exists(), "the original is gone");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "#!/bin/sh\necho warm\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dest).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "the executable bit travels with the script"
+            );
+        }
+
+        // Every other byte of the file is untouched: the expected text is
+        // the original with exactly the path token substituted, twice.
+        let expected = before.replace(
+            "$CLAUDE_PROJECT_DIR/tools/warm.sh",
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/warm.sh",
+        );
+        assert_eq!(fs::read_to_string(&settings).unwrap(), expected);
+
+        assert!(status.registered);
+        assert_eq!(status.name, "warm.sh");
+        assert_eq!(status.registrations.len(), 2);
+        assert_eq!(
+            status.registrations[0].command,
+            "bash $CLAUDE_PROJECT_DIR/.claude/hooks/warm.sh --fast"
+        );
+        let item = store
+            .find_library_item(
+                LibraryKind::Hook,
+                LibraryScope::Project,
+                Some(pid),
+                "warm.sh",
+            )
+            .unwrap()
+            .expect("the row is created");
+        assert_eq!(item.body, "#!/bin/sh\necho warm\n");
+        assert_eq!(item.synced_body.as_deref(), Some("#!/bin/sh\necho warm\n"));
+        let sync = sync_status(&store, Some(pid)).unwrap();
+        let row = sync.iter().find(|r| r.name == "warm.sh").unwrap();
+        assert_eq!(row.status, LibrarySyncStatus::InSync);
+
+        // Adopted, it is no longer an orphan; the missing one still is.
+        let rows = orphan_hooks(&store, LibraryScope::Project, Some(pid)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "guard.py");
+    }
+
+    #[test]
+    fn adopt_hook_at_user_scope_writes_the_absolute_path() {
+        with_home_dir(|home| {
+            let (mut store, _dir) = temp_store();
+            fs::create_dir_all(home.join(".claude")).unwrap();
+            fs::create_dir_all(home.join("bin")).unwrap();
+            fs::write(home.join("bin/warm.sh"), "echo").unwrap();
+            fs::write(
+                home.join(".claude/settings.json"),
+                "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"bash ~/bin/warm.sh --fast\"}]}]}}",
+            )
+            .unwrap();
+            let rows = orphan_hooks(&store, LibraryScope::User, None).unwrap();
+            let status = adopt_hook(&mut store, LibraryScope::User, None, &rows[0].path).unwrap();
+            let dest = canon(&home.join(".claude/hooks/warm.sh"));
+            assert_eq!(
+                status.registrations[0].command,
+                format!("bash {dest} --fast")
+            );
+            assert!(home.join(".claude/hooks/warm.sh").exists());
+            assert!(!home.join("bin/warm.sh").exists());
+            assert!(
+                orphan_hooks(&store, LibraryScope::User, None)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn adopt_hook_refuses_a_missing_script_and_an_unknown_path() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, settings) = orphan_project(&mut store, &base);
+        let before = fs::read_to_string(&settings).unwrap();
+
+        let gone = canon(&base.join("gone/guard.py"));
+        assert!(matches!(
+            adopt_hook(&mut store, LibraryScope::Project, Some(pid), &gone),
+            Err(Error::NotFound(_))
+        ));
+        let mine = canon(&base.join(".claude/hooks/mine.sh"));
+        assert!(
+            matches!(
+                adopt_hook(&mut store, LibraryScope::Project, Some(pid), &mine),
+                Err(Error::NotFound(_))
+            ),
+            "an in-tree script is not an orphan"
+        );
+        assert_eq!(fs::read_to_string(&settings).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_settings_write_leaves_the_script_and_settings_untouched_and_no_copy() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, settings) = orphan_project(&mut store, &base);
+        let before = fs::read_to_string(&settings).unwrap();
+        let source = base.join("tools/warm.sh");
+        let dest = base.join(".claude/hooks/warm.sh");
+        // The write goes through `settings.json.tmp`; a directory in its
+        // place makes exactly that step fail, after the copy was written.
+        fs::create_dir_all(base.join(".claude/settings.json.tmp")).unwrap();
+
+        let err = adopt_hook(
+            &mut store,
+            LibraryScope::Project,
+            Some(pid),
+            &canon(&source),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert!(source.exists(), "the original stays");
+        assert!(!dest.exists(), "the copy is removed again");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), before);
+        assert!(
+            store
+                .find_library_item(
+                    LibraryKind::Hook,
+                    LibraryScope::Project,
+                    Some(pid),
+                    "warm.sh"
+                )
+                .unwrap()
+                .is_none(),
+            "no row"
+        );
+    }
+
+    #[test]
+    fn splice_replace_commands_touches_only_the_command_value() {
+        let raw = "{\n  \"hooks\": {\n    \"Stop\": [\n      {\"matcher\": \"*\", \"hooks\": [\n        {\"type\": \"command\", \"command\": \"a\"},\n        {\"command\": \"b\", \"type\": \"command\"}\n      ]}\n    ]\n  },\n  \"x\": 1\n}\n";
+        let out = splice_replace_commands(raw, &|c| (c == "b").then(|| "B \"q\"".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            raw.replace("\"command\": \"b\"", "\"command\": \"B \\\"q\\\"\"")
+        );
+        assert_eq!(splice_replace_commands(raw, &|_| None).unwrap(), None);
+        assert_eq!(
+            splice_replace_commands("{\"hooks\": null}", &|_| Some("x".into())).unwrap(),
+            None
+        );
     }
 }

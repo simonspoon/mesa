@@ -47,6 +47,7 @@ import type { InboxItem } from './types/InboxItem'
 import type { InboxKind } from './types/InboxKind'
 import type { LibraryBundle } from './types/LibraryBundle'
 import type { LibraryHookStatus } from './types/LibraryHookStatus'
+import type { LibraryOrphanHook } from './types/LibraryOrphanHook'
 import type { LibraryImportResult } from './types/LibraryImportResult'
 import type { LibraryItem } from './types/LibraryItem'
 import type { LibraryKind } from './types/LibraryKind'
@@ -1641,6 +1642,32 @@ export function registerLibraryHook(
   matcher?: string,
 ): Promise<LibraryHookStatus> {
   return request(`/api/library/${id}/hook`, jsonInit('POST', { event, matcher }))
+}
+
+/** Hook commands in one scope's `.claude/settings.json` whose script lives
+ * outside `.claude/hooks/` (mesa task 1128) — a pure read; nothing moves
+ * until `adoptLibraryHook`. `projectId` is required at project scope and
+ * refused at user scope, the CLI's own pair. */
+export function listOrphanHooks(
+  scope: LibraryScope,
+  projectId: number | null,
+): Promise<LibraryOrphanHook[]> {
+  const q = projectId === null ? `scope=${scope}` : `scope=${scope}&project=${projectId}`
+  return request(`/api/library/hooks/orphans?${q}`)
+}
+
+/** Moves one such script into `.claude/hooks/`, rewrites the command(s)
+ * naming it and creates the library row. Answers the new row's hook status,
+ * so the page renders what landed. */
+export function adoptLibraryHook(
+  scope: LibraryScope,
+  projectId: number | null,
+  path: string,
+): Promise<LibraryHookStatus> {
+  return request(
+    '/api/library/hooks/adopt',
+    jsonInit('POST', { scope, project_id: projectId, path }),
+  )
 }
 
 /** Removes this hook's registrations — all of them, or only those the query

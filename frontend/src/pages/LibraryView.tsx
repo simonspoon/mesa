@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react'
 import {
+  adoptLibraryHook,
   applyLibrarySync,
   createLibraryItem,
   deleteLibraryItem,
@@ -10,6 +11,7 @@ import {
   importLibrary,
   listLibrary,
   listLibraryVersions,
+  listOrphanHooks,
   listProjects,
   registerLibraryHook,
   unregisterLibraryHook,
@@ -27,6 +29,12 @@ import {
   matcherPayload,
   matcherText,
   offersHooks,
+  orphanAdoptDisabledReason,
+  orphanAdoptLabel,
+  orphanKey,
+  orphanScopeLabel,
+  orphanScopesFor,
+  registrationLabel,
 } from '../libraryHooks'
 import { diffLines, foldOverrides, itemKey } from '../libraryOverride'
 import {
@@ -62,6 +70,7 @@ import {
 } from '../librarySync'
 import type { LibraryHookStatus } from '../types/LibraryHookStatus'
 import type { LibraryItem } from '../types/LibraryItem'
+import type { LibraryOrphanHook } from '../types/LibraryOrphanHook'
 import type { LibrarySyncResult } from '../types/LibrarySyncResult'
 import type { LibrarySyncRow } from '../types/LibrarySyncRow'
 import type { Project } from '../types/Project'
@@ -401,6 +410,115 @@ function loadHookStatuses(ids: number[]): Promise<LibraryHookStatus[]> {
       ),
     ),
   ).then((all) => all.filter((s): s is LibraryHookStatus => s !== null))
+}
+
+/**
+ * Every hook command wired from outside `.claude/hooks/`, across the user's
+ * settings file and every project's that has a local path (mesa task 1128).
+ * One read per scope, in a batch, a scope whose file cannot be read (a
+ * settings.json mesa refuses to parse) dropped rather than failing the rest
+ * — `loadHookStatuses`'s posture.
+ */
+function loadOrphanHooks(projects: Project[] | null): Promise<LibraryOrphanHook[]> {
+  return Promise.all(
+    orphanScopesFor(projects).map((s) =>
+      listOrphanHooks(s.scope, s.project_id).then(
+        (rows) => rows,
+        () => [] as LibraryOrphanHook[],
+      ),
+    ),
+  ).then((all) => all.flat())
+}
+
+/**
+ * The scripts settings.json runs from outside `.claude/hooks/` (mesa task
+ * 1128), each with an offer to adopt it: move it in, rewrite the command(s)
+ * naming it, create the library row. Nothing moves on a read; the press is
+ * the user's explicit act, and the button is disabled with the reason
+ * whenever the server says the move would be refused.
+ */
+function LibraryOrphanHooks({
+  rows,
+  projects,
+  onAdopted,
+}: {
+  rows: LibraryOrphanHook[]
+  projects: Project[] | null
+  onAdopted: () => void
+}) {
+  const [adopting, setAdopting] = useState<string | null>(null)
+  const [adoptError, setAdoptError] = useState<{ key: string; message: string } | null>(null)
+
+  function adopt(row: LibraryOrphanHook) {
+    const key = orphanKey(row)
+    setAdopting(key)
+    setAdoptError(null)
+    adoptLibraryHook(row.scope, row.project_id, row.path).then(
+      () => {
+        setAdopting(null)
+        onAdopted()
+      },
+      (err) => {
+        setAdopting(null)
+        setAdoptError({ key, message: err instanceof Error ? err.message : String(err) })
+      },
+    )
+  }
+
+  return (
+    <section className="library-group library-orphans">
+      <h2 className="library-group-title">Hooks outside .claude/hooks</h2>
+      <p className="muted">
+        These scripts are wired in a <code>settings.json</code> but live outside{' '}
+        <code>.claude/hooks/</code>, so the library cannot see them. Adopting one moves the
+        script in and rewrites the command(s) naming it; nothing moves until you press.
+      </p>
+      <ul className="card-list library-list">
+        {rows.map((row) => {
+          const key = orphanKey(row)
+          const disabled = orphanAdoptDisabledReason(row)
+          return (
+            <li key={key} className="library-item">
+              <div className="library-item-row">
+                <div className="library-item-head">
+                  <span className="library-name">{row.name}</span>
+                  <span className="muted library-meta">{orphanScopeLabel(row, projects)}</span>
+                  <span className="muted library-meta library-path" title={row.path}>
+                    {row.path}
+                  </span>
+                  {!row.exists && (
+                    <span className="library-badge library-orphan-missing">missing on disk</span>
+                  )}
+                </div>
+                <div className="library-actions">
+                  <button
+                    type="button"
+                    disabled={disabled !== null || adopting === key}
+                    title={disabled ?? orphanAdoptLabel(row)}
+                    onClick={() => adopt(row)}
+                  >
+                    {adopting === key ? 'adopting…' : 'adopt'}
+                  </button>
+                </div>
+              </div>
+              <ul className="library-hook-regs">
+                {row.registrations.map((reg, i) => (
+                  <li key={`${reg.event}-${reg.matcher}-${i}`} className="library-hook-reg">
+                    <span className="library-hook-event">{registrationLabel(reg)}</span>
+                    <code className="library-hook-command" title={reg.command}>
+                      {reg.command}
+                    </code>
+                  </li>
+                ))}
+              </ul>
+              {disabled !== null && <p className="muted library-orphan-reason">{disabled}</p>}
+              {adoptError?.key === key && <p className="error">{adoptError.message}</p>}
+            </li>
+          )
+        })}
+      </ul>
+    </section>
+  )
 }
 
 /**
@@ -760,6 +878,16 @@ export function LibraryView() {
     `library-hooks-${hookIds.join(',')}`,
   )
   const hookStatusById = new Map((hookStatuses ?? []).map((h) => [h.item_id, h]))
+  // Hook scripts wired from outside `.claude/hooks/` (mesa task 1128), read
+  // per settings file the page knows of. Refetched after an adoption along
+  // with the items and the registrations, since all three change at once.
+  const orphanScopeKey = orphanScopesFor(projects)
+    .map((s) => `${s.scope}:${s.project_id ?? ''}`)
+    .join(',')
+  const { data: orphanHooks, refetch: refetchOrphans } = useFetch(
+    () => loadOrphanHooks(projects),
+    `library-orphans-${orphanScopeKey}`,
+  )
   // The row being forked so its panel can open, by `itemKey` — the shipped
   // `stop-notify` is an unshadowed built-in with no id, and the route needs
   // one, so pressing `hooks` on it forks it exactly as editing it would and
@@ -1093,6 +1221,18 @@ export function LibraryView() {
             </ul>
           </section>
         ))
+      )}
+
+      {orphanHooks !== null && orphanHooks.length > 0 && (
+        <LibraryOrphanHooks
+          rows={orphanHooks}
+          projects={projects}
+          onAdopted={() => {
+            refetch()
+            refetchHooks()
+            refetchOrphans()
+          }}
+        />
       )}
 
       {syncing && (

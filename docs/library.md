@@ -452,6 +452,89 @@ object, an event whose value is not an array — each is `validation` naming
 the file, with the file left exactly as it was. A best-effort repair would
 destroy configuration mesa did not write and cannot reconstruct.
 
+### Hooks wired from outside `.claude/hooks/`
+
+A settings.json command may name a script anywhere — `bash
+~/.claude/helios-warm.sh`, `/Users/x/bin/warm.py` — and the library, which
+only ever looks at `.claude/hooks/`, cannot see it (mesa task 1128). mesa
+does **not** model such a script as a library item: that would need a stored
+absolute path on the row, breaking "path is derived, never stored", and a
+second containment story beside `resolve`. Instead it **discovers** them and
+offers to **adopt** them — move the script into `.claude/hooks/<name>` and
+rewrite the command(s) naming it — on the user's explicit action, so every
+library item stays in-tree and `resolve` is untouched.
+
+**Discovery** (`core::library::orphan_hooks`, `mesa library hook orphans
+[--scope user|project --project P]`, `GET
+/api/library/hooks/orphans?scope=&project=`) reads one scope's settings file
+and walks every event → group → command. For each command it takes the
+**first whitespace-separated token that names a path** — one starting `/`,
+`~/`, `$HOME/` or `$CLAUDE_PROJECT_DIR/`, a pair of surrounding quotes
+stripped — and expands it: `~/` and `$HOME/` against `$HOME`,
+`$CLAUDE_PROJECT_DIR/` against the project's `local_path` (only a
+project-scope file has one; in a user-scope file Claude Code supplies it per
+session, so such a command is left alone). A `…/env` first token
+(`/usr/bin/env python3 ~/x.py`) is passed over as the interpreter shim. A
+command with no path token (`npm run lint`) is arbitrary shell mesa does not
+try to read and is skipped. The expanded path is canonicalised (symlinks in
+its existing prefix followed, `resolve`'s own rule) and, if it lands inside
+`<scope_base>/.claude/hooks/`, it is the library's already — a registration,
+`hook_registrations`'s business — and is **never listed**, whatever spelling
+it uses. Everything else is one `LibraryOrphanHook` row per script, however
+many events name it: `scope`, `project_id`, `settings_path`, `path` (the
+canonical absolute one, the key `adopt` takes), `exists`, `name` (the file's
+own name — a hook's name is its whole filename), `registrations[]` (`event`,
+`matcher`, `command` verbatim) and `conflict`. A script that is **not on
+disk is listed with `exists: false`**, never dropped and never an error: a
+registration naming a missing file fires and errors every session, which is
+exactly worth seeing. `conflict` says why adoption would be refused right
+now — the name would not survive `Store`'s name rule, `.claude/hooks/<name>`
+already exists, or a hook item of that name already exists at that scope —
+so the page disables the button with the reason rather than offering a press
+that 409s. Discovery is a pure read.
+
+**Adoption** (`core::library::adopt_hook`, `mesa library hook adopt <PATH>
+[--scope … --project …]`, `POST /api/library/hooks/adopt` `{scope,
+project_id, path}`) takes a row's `path` — anything else is `not_found`, as
+is a row whose script is not on disk, and a row carrying a `conflict` is
+`conflict` — and does, in this order:
+
+1. copies the script to `.claude/hooks/<name>` (through `relative_path` +
+   `resolve`, parent directory created, the mode bits and so the executable
+   bit kept);
+2. rewrites settings.json, replacing in every command naming this script
+   **exactly the path token**, original spelling, with the in-tree path —
+   the absolute `<home>/.claude/hooks/<name>` at `user` scope,
+   `$CLAUDE_PROJECT_DIR/.claude/hooks/<name>` at `project` scope, exactly
+   what `register_hook` writes — keeping any prefix (`bash `) and trailing
+   arguments (`--fast`). This is a third splice beside the two above,
+   `splice_replace_commands`: the one span touched per entry is the
+   `command` value's own, so the entry's `type` key, its neighbours, every
+   other registration and every unrelated byte come through identical, and
+   the write goes through the same re-parse self-check and tmp+rename;
+3. removes the original;
+4. creates the `hook` library row with its sync baseline set, so `sync
+   status` reads `in-sync` at once, and answers its `LibraryHookStatus`.
+
+The order is the safety property. **If the settings write fails, the copy is
+removed again**, so a failed adoption leaves both the script and
+settings.json exactly as they were. Only once settings.json names the new
+path is the original removed; a failure *there* is reported (the message
+says what to do) and nothing is rolled back, because the state is already
+consistent — the file settings.json names exists — and a library sync picks
+the copy up as `disk-new`. An existing `.claude/hooks/<name>` is never
+overwritten: it is a `conflict` on the read and on the press.
+
+Both surfaces print JSON; neither takes `--quiet` (exit 2, like the trio).
+On `#/library` the rows sit in their own section, "Hooks outside
+.claude/hooks", read for the user scope and every project with a
+`local_path` (`libraryHooks.ts::orphanScopesFor`; a scope whose file mesa
+refuses to parse is dropped rather than failing the rest), each with its
+scope, path, registrations, a "missing on disk" badge and an **adopt**
+button disabled with the reason (`orphanAdoptDisabledReason`). A successful
+adoption refetches the items, the registrations and the orphans together,
+since all three change at once.
+
 ## The sync model
 
 Sync compares three strings per path: the **mesa body** (M, from the item's
@@ -657,9 +740,12 @@ somewhere else.
 | `POST /api/library/sync` | 200, results array | `require_agent_access` |
 | `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_agent_access` |
 | `POST /api/library/import` | 200, results array | `require_agent_access` |
+| `GET /api/library/hooks/orphans` (`?scope=&project=`) | 200, bare array of `LibraryOrphanHook` | `require_agent_access` |
+| `POST /api/library/hooks/adopt` (`{"scope", "project_id", "path"}`) | 200, the new row's `LibraryHookStatus` | `require_agent_access` |
 
-**All fourteen routes are `require_agent_access`** (mesa task 1004; the
-hook-registration trio joined them in mesa task 1115) — the same
+**All sixteen routes are `require_agent_access`** (mesa task 1004; the
+hook-registration trio joined them in mesa task 1115, the orphan pair in
+mesa task 1128) — the same
 gate the agents, terminal and scripts-run routes carry. This is not a
 read/write split: unlike scripts (`docs/scripts.md`'s "the read/write
 asymmetry is the point", where a LAN peer may *trigger* a stored script but
@@ -777,6 +863,13 @@ or a name — a built-in resolves by name too, since its name and its
   state *after* their write. `ITEM` must be a `hook`; anything else is
   `validation`. `disable` with no `--event` removes every registration of
   that hook.
+- `hook orphans [--scope user|project] [--project P]` lists the hook
+  commands in that scope's settings.json whose script lives outside
+  `.claude/hooks/` (a bare `LibraryOrphanHook[]`, "Hooks wired from outside
+  `.claude/hooks/`" above), and `hook adopt <PATH> [--scope …] [--project …]`
+  moves one in, rewrites its command(s) and creates the row, printing the
+  new row's `LibraryHookStatus`. `--scope` defaults to `user`; `--project`
+  is required with `project` and refused with `user`, `create`'s own rule.
 - `export [PROJECT] [--project P] [--output PATH]` prints the `LibraryBundle`
   JSON to stdout by default; `--output PATH` writes it there instead (refusing
   to clobber an existing path, mirroring `backup`) and prints
@@ -944,6 +1037,21 @@ API:
   empty one by both verbs rather than refused; a mistyped event naming the
   vocabulary, a non-hook item and an unknown item each exit 1; and `--quiet`
   rejected on all three subcommands (usage, exit 2, empty stdout).
+- **Hooks wired from outside `.claude/hooks/`** (mesa task 1128): against a
+  settings file holding an unrelated key, somebody else's registration, an
+  in-tree `.claude/hooks/` command, `bash $HOME/scripts/warm.sh --fast`
+  under two events and a `~/gone/missing.py`, `hook orphans` listing exactly
+  the two out-of-tree rows (`exists` true/false, two registrations on the
+  first, the in-tree one absent); `adopt` on the missing one exit 1
+  `not_found`; a pre-created `.claude/hooks/warm.sh` making it `conflict`
+  with the settings file untouched (`cmp`); then a real adoption — source
+  gone, destination present and executable, both commands now naming the
+  in-tree path with `bash ` and `--fast` kept, the file otherwise
+  **byte-identical** (`cmp` against a `sed` of the original), `hook status`
+  on the new item seeing both registrations and `sync status` reading
+  `in-sync`, `orphans` no longer listing it; `--quiet` rejected on both;
+  and the two routes serving over the API and joining the gate sweeps (now
+  sixteen routes) in both serve modes.
 - **The command kind folded into prompt** (mesa task 1139): a db wound back
   to the pre-1139 schema with `sqlite3` and holding a `command` row with two
   versions opens as a prompt with `export_command` on — same id, path, body,

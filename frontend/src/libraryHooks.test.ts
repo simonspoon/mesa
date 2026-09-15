@@ -10,12 +10,19 @@ import {
   matcherText,
   matcherPayload,
   offersHooks,
+  orphanAdoptDisabledReason,
+  orphanAdoptLabel,
+  orphanKey,
+  orphanScopeLabel,
+  orphanScopesFor,
   registrationLabel,
   unregisterHookQuery,
 } from './libraryHooks'
 import type { LibraryHookRegistration } from './types/LibraryHookRegistration'
 import type { LibraryHookStatus } from './types/LibraryHookStatus'
 import type { LibraryItem } from './types/LibraryItem'
+import type { LibraryOrphanHook } from './types/LibraryOrphanHook'
+import type { Project } from './types/Project'
 
 const EVENTS = [
   'PreToolUse',
@@ -296,5 +303,110 @@ describe('unregisterHookQuery', () => {
 
   it('carries a matcher alone (encodeURIComponent leaves the default one as-is)', () => {
     expect(unregisterHookQuery(undefined, '*')).toBe('?matcher=*')
+  })
+})
+
+// ---- hooks wired from outside `.claude/hooks/` (mesa task 1128) ----
+
+function orphan(overrides: Partial<LibraryOrphanHook> = {}): LibraryOrphanHook {
+  return {
+    scope: 'user',
+    project_id: null,
+    settings_path: '/home/me/.claude/settings.json',
+    path: '/home/me/scripts/warm.sh',
+    exists: true,
+    name: 'warm.sh',
+    registrations: [
+      { event: 'SessionStart', matcher: '*', command: 'bash $HOME/scripts/warm.sh --fast' },
+    ],
+    conflict: null,
+    ...overrides,
+  }
+}
+
+function project(overrides: Partial<Project> = {}): Project {
+  return {
+    id: 3,
+    name: 'mesa',
+    description: null,
+    root_commit: null,
+    local_path: '/repo/mesa',
+    archived: false,
+    sort_order: 3,
+    parent_id: null,
+    ...overrides,
+  }
+}
+
+describe('orphanScopesFor', () => {
+  it('is the user scope alone before projects load', () => {
+    expect(orphanScopesFor(null)).toEqual([{ scope: 'user', project_id: null }])
+  })
+
+  it('adds one project scope per project with a local path', () => {
+    const scopes = orphanScopesFor([
+      project({ id: 1, local_path: '/repo/a' }),
+      project({ id: 2, local_path: null }),
+      project({ id: 4, local_path: '' }),
+      project({ id: 5, local_path: '/repo/b' }),
+    ])
+    expect(scopes).toEqual([
+      { scope: 'user', project_id: null },
+      { scope: 'project', project_id: 1 },
+      { scope: 'project', project_id: 5 },
+    ])
+  })
+})
+
+describe('orphanKey', () => {
+  it('tells the same script apart by scope', () => {
+    expect(orphanKey(orphan())).toBe('user::/home/me/scripts/warm.sh')
+    expect(orphanKey(orphan({ scope: 'project', project_id: 3 }))).toBe(
+      'project:3:/home/me/scripts/warm.sh',
+    )
+  })
+})
+
+describe('orphanScopeLabel', () => {
+  it('names the user scope plainly', () => {
+    expect(orphanScopeLabel(orphan(), [project()])).toBe('user')
+  })
+
+  it('names the project, falling back to its id', () => {
+    const row = orphan({ scope: 'project', project_id: 3 })
+    expect(orphanScopeLabel(row, [project()])).toBe('project · mesa')
+    expect(orphanScopeLabel(row, [])).toBe('project · 3')
+    expect(orphanScopeLabel(row, null)).toBe('project · 3')
+  })
+})
+
+describe('orphanAdoptDisabledReason', () => {
+  it('is null when the press would go through', () => {
+    expect(orphanAdoptDisabledReason(orphan())).toBeNull()
+  })
+
+  it('is "missing on disk" for a script that is not there, before any conflict', () => {
+    expect(orphanAdoptDisabledReason(orphan({ exists: false }))).toBe('missing on disk')
+    expect(orphanAdoptDisabledReason(orphan({ exists: false, conflict: 'taken' }))).toBe(
+      'missing on disk',
+    )
+  })
+
+  it("is the server's own conflict reason otherwise", () => {
+    expect(
+      orphanAdoptDisabledReason(orphan({ conflict: '.claude/hooks/warm.sh already exists' })),
+    ).toBe('.claude/hooks/warm.sh already exists')
+  })
+})
+
+describe('orphanAdoptLabel', () => {
+  it('names the destination and counts the commands', () => {
+    expect(orphanAdoptLabel(orphan())).toBe(
+      'move to .claude/hooks/warm.sh and rewrite its command',
+    )
+    const reg = orphan().registrations[0]
+    expect(orphanAdoptLabel(orphan({ registrations: [reg, { ...reg, event: 'Stop' }] }))).toBe(
+      'move to .claude/hooks/warm.sh and rewrite 2 commands',
+    )
   })
 })

@@ -1464,6 +1464,8 @@ fn router(state: AppState) -> Router {
         // `--lan` exists to serve. See `docs/library.md`.
         .route("/api/library", get(list_library).post(create_library))
         .route("/api/library/export", get(export_library))
+        .route("/api/library/hooks/orphans", get(library_orphan_hooks))
+        .route("/api/library/hooks/adopt", post(adopt_library_hook))
         .route("/api/library/import", post(import_library))
         .route(
             "/api/library/{id}",
@@ -4470,6 +4472,66 @@ async fn unregister_library_hook(
         &item,
         q.event.as_deref(),
         q.matcher.as_deref(),
+    )?)
+    .into_response())
+}
+
+/// `?scope=user|project&project=<id>` — which settings file to read hook
+/// commands out of. `scope` defaults to `user`; `project` is required with
+/// `project` and refused with `user`, exactly as the CLI's pair is.
+#[derive(Deserialize)]
+struct LibraryOrphanQuery {
+    #[serde(default = "user_scope")]
+    scope: LibraryScope,
+    #[serde(default)]
+    project: Option<i64>,
+}
+
+fn user_scope() -> LibraryScope {
+    LibraryScope::User
+}
+
+#[derive(Deserialize)]
+struct LibraryAdoptBody {
+    #[serde(default = "user_scope")]
+    scope: LibraryScope,
+    #[serde(default)]
+    project_id: Option<i64>,
+    path: String,
+}
+
+/// Hook commands in a scope's `.claude/settings.json` whose script lives
+/// outside `.claude/hooks/` (mesa task 1128) — a pure read, on the same
+/// [`require_agent_access`] gate as the rest of the library: the answer
+/// names paths under the user's home directory and what Claude Code runs.
+async fn library_orphan_hooks(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<LibraryOrphanQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(library::orphan_hooks(&store, q.scope, q.project)?).into_response())
+}
+
+/// Moves one such script into `.claude/hooks/`, rewrites the command(s)
+/// naming it and creates the library row; answers the new row's hook
+/// status. Only on this explicit request — never on a read.
+async fn adopt_library_hook(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LibraryAdoptBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    Ok(Json(library::adopt_hook(
+        &mut store,
+        body.scope,
+        body.project_id,
+        &body.path,
     )?)
     .into_response())
 }

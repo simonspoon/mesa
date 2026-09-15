@@ -572,6 +572,21 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   return (
     <div className="inbox-page">
       <h1>Inbox · {INBOX_SUBNAV.find((s) => s.filter === filter)?.label}</h1>
+      {/* The three views as a tab strip at the top of the page (mesa task
+          1159), the Settings page's shape; the active one follows the route. */}
+      <div className="tabs">
+        {INBOX_SUBNAV.map((s) => (
+          <button
+            key={s.filter}
+            className={s.filter === filter ? 'active' : ''}
+            onClick={() => {
+              if (s.filter !== filter) window.location.hash = s.hash
+            }}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
       <p className="muted">
         {filter === 'new'
           ? 'Update requests agents send to the shared inbox, still unread. Assign each to a project to turn it into a backlog task there — or archive it to set it aside.'

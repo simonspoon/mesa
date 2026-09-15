@@ -12,7 +12,7 @@
 //   `window.location.hash`; arriving at `#/projects/7` directly (bookmark,
 //   Back, task-panel link, phone tab bar) still renders the Board.
 
-import type { CcTab } from './pages/CCDashboardView'
+import { CC_TABS, ccTabHref, type CcTab } from './ccTab'
 
 export type { CcTab }
 export type ProjectTab =
@@ -42,7 +42,6 @@ const TAB_SEGMENTS = [
   'terminal',
   'settings',
 ] as const
-const CC_TABS = ['overview', 'skills-agents', 'projects', 'sessions'] as const
 
 const PROJECT_KEY = 'mesa-last-project-tabs'
 // 694's single-string key. Not migrated (worst case: one landing on the Board
@@ -141,6 +140,5 @@ export function projectHref(projectId: number): string {
 }
 
 export function ccHref(): string {
-  const tab = getLastCcTab()
-  return tab === 'overview' ? '#/cc' : `#/cc/${tab}`
+  return ccTabHref(getLastCcTab())
 }

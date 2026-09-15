@@ -2,7 +2,7 @@ import type { InboxItem } from './types/InboxItem'
 
 /**
  * The Inbox's three sub-views (mesa task 845) — "New", "Read" and "Archived",
- * the sub-links under Inbox in the nav. They are a *filter over one list*, not
+ * the tab strip at the top of the page (mesa task 1159). They are a *filter over one list*, not
  * three lists: the page fetches the whole inbox exactly as it always has and
  * shows the slice the URL names, so the poll, the read marks and playback are
  * untouched by which one is open.
@@ -17,7 +17,7 @@ import type { InboxItem } from './types/InboxItem'
 export type InboxFilter = 'new' | 'read' | 'archived'
 
 /**
- * The sub-links, in nav order. `new` is the plain `#/inbox` URL: it is the
+ * The tabs, in strip order. `new` is the plain `#/inbox` URL: it is the
  * triage queue, so the Inbox link itself must keep landing there rather than
  * on a fourth "everything" view nobody asked for.
  */

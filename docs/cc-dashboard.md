@@ -851,7 +851,11 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
 - Web UI: a global **CC Dashboard** entry in the sidebar (above Projects, next to
   Inbox) at `#/cc` — KPI cards, a daily stacked-token chart and model donut (tiny
   hand-rolled SVG in `frontend/src/components/charts.tsx`, no chart dependency),
-  and sortable skill/agent/project/session tables. The **skills** table is the
+  and sortable skill/agent/project/session tables. Its four sub-pages —
+  Overview (`#/cc`), Skills & Agents, Projects, Sessions — are a tab strip at
+  the top of the page (`frontend/src/ccTab.ts`, mesa task 1159; formerly a
+  subnav under the sidebar row), the active tab following the route; the
+  sidebar row itself links to the remembered sub-page (`lastView.ts`). The **skills** table is the
   headline view for optimizing where token spend goes. The timeframe picker in
   the head is a **dropdown** (`.cc-window-select`), on both the global and the
   project-scoped page — the two subscription windows made the list too long for

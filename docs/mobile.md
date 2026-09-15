@@ -265,7 +265,7 @@ behind a drawer.
 - Four slots: **Board** (the active project; with no active project the slot
   reads *Projects* and opens the left drawer, since there is no `#/projects`
   index route), **Inbox** (carries the unassigned badge), **Agents** (opens
-  the right drawer), **More** (opens the left drawer — CC Dashboard + subnav,
+  the right drawer), **More** (opens the left drawer — CC Dashboard,
   Terminal, project list, archived group).
 - The bar is fixed with `padding-bottom: env(safe-area-inset-bottom)` so iOS's
   home indicator does not sit on the tap targets. `--phone-tabbar-reserve`

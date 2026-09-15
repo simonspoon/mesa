@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { getCcDashboard, getCcLive, getCcUsage, getProjectCcDashboard } from '../api'
 import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
 import { DataTable, Kpi } from '../components/ccTable'
+import { CC_TABS, ccTabHref, ccTabLabel, type CcTab } from '../ccTab'
 import { shortModel } from '../sessionGraph'
 // Formatters and the token palette live in the unit-tested module and are
 // shared with the session detail page — two copies of `fmtTok` is exactly the
@@ -57,9 +58,9 @@ const fmtAgo = (s: number) =>
 const modelLabel = (m: string) => shortModel(m) ?? m
 
 // The dashboard is split into an overview (charts + KPIs, plus the live and
-// subscription cards) and three table sub-pages. All share one windowed fetch;
-// the route picks which body renders. The window selector stays on every page.
-export type CcTab = 'overview' | 'skills-agents' | 'projects' | 'sessions'
+// subscription cards) and three table sub-pages (`CcTab`, `ccTab.ts`). All
+// share one windowed fetch; the route picks which body renders. The window
+// selector stays on every page.
 
 /**
  * `projectId` switches the view into project-scoped mode: it fetches from
@@ -115,6 +116,25 @@ export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: nu
           ))}
         </select>
       </div>
+      {/* The tab strip (mesa task 1159), the Settings page's shape: only on
+          the global dashboard, since scoped mode has no tab picker (see the
+          component comment above). */}
+      {!scoped && (
+        <div className="tabs">
+          {CC_TABS.map((t) => (
+            <button
+              key={t}
+              className={t === tab ? 'active' : ''}
+              onClick={() => {
+                // `window` is the timeframe state above, so reach the global.
+                if (t !== tab) globalThis.location.hash = ccTabHref(t)
+              }}
+            >
+              {ccTabLabel(t)}
+            </button>
+          ))}
+        </div>
+      )}
       {tab === 'overview' && (
         <p className="muted">
           Telemetry from Claude Code session transcripts

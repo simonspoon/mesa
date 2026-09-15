@@ -22,7 +22,7 @@ import {
   unarchiveProject,
   updateProject,
 } from '../api'
-import { INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
+import type { InboxFilter } from '../inboxFilter'
 import { dropIntentFor, zoneForOffset, type DropIntent, type DropZone } from '../navOrder'
 import {
   expandAncestors,
@@ -41,7 +41,7 @@ import {
 import { ccHref, projectHref } from '../lastView'
 import type { GitStatus } from '../types/GitStatus'
 import type { Project } from '../types/Project'
-import type { CcTab } from '../pages/CCDashboardView'
+import type { CcTab } from '../ccTab'
 import { isPhone } from '../phoneTier'
 import { useFetch } from '../useFetch'
 import { CreateProjectModal } from './CreateProjectModal'
@@ -69,28 +69,18 @@ function projectIdFromHash(hash: string): number | null {
   return Number.isFinite(id) ? id : null
 }
 
-// CC Dashboard sub-pages, in nav order. The main "CC Dashboard" link goes to
-// the *remembered* sub-page (task 694), so the overview (charts + KPIs) is a
-// subnav row like the rest — its hash is the bare `#/cc`, there is no
-// `#/cc/overview` segment (mesa task 699).
-const CC_SUBNAV: { tab: CcTab; label: string; hash: string }[] = [
-  { tab: 'overview', label: 'Overview', hash: '#/cc' },
-  { tab: 'skills-agents', label: 'Skills / Agents', hash: '#/cc/skills-agents' },
-  { tab: 'projects', label: 'Projects', hash: '#/cc/projects' },
-  { tab: 'sessions', label: 'Sessions', hash: '#/cc/sessions' },
-]
-
 /**
  * Persistent left nav: four top-level entries sharing one `.nav-item` style —
  * the CC Dashboard, the global Inbox, Terminal, and Projects. The CC Dashboard
- * owns a fixed subnav of its sub-pages, as does the Inbox (its three views —
- * New / Read / Archived, mesa task 845); Projects owns a subnav (the project
- * list + create form). Both collapse: Projects' row *is* the disclosure header,
- * while the CC Dashboard keeps its link and pairs it with a caret button
- * (mesa task 776). `ccTab` is the active CC sub-page (or null when off the dashboard)
- * and drives which CC link is highlighted. `terminalActive` highlights the
- * Terminal link the same way `inboxFilter` does the Inbox — the page itself is a
- * permanent sibling mount in `App.tsx` (mesa task 396), not rendered here.
+ * and the Inbox are single rows — their sub-pages (Overview / Skills & Agents /
+ * Projects / Sessions, and New / Read / Archived) are tabs at the top of each
+ * page since mesa task 1159, no longer a subnav here; the CC row's href is the
+ * *remembered* sub-page (task 694). Projects owns a subnav (the project list +
+ * create form) whose row *is* the disclosure header. `ccTab` is the active CC
+ * sub-page (or null when off the dashboard) and highlights the CC row.
+ * `terminalActive` highlights the Terminal link the same way `inboxFilter`
+ * does the Inbox — the page itself is a permanent sibling mount in `App.tsx`
+ * (mesa task 396), not rendered here.
  * `version` is bumped by pages after project rename/delete so the list
  * refetches (it is part of the useFetch key). The inbox count live-polls so
  * the badge of items needing triage stays current as agents send.
@@ -230,8 +220,7 @@ export function Sidebar({
 }: {
   activeProjectId: number | null
   // Which Inbox sub-view is open, or null when the inbox is not (mesa task
-  // 845) — the twin of `ccTab` above: it both highlights the Inbox row and
-  // says which of its three sub-links is the active one.
+  // 845) — the twin of `ccTab` above: it highlights the Inbox row.
   inboxFilter: InboxFilter | null
   settingsActive: boolean
   scriptsActive: boolean
@@ -316,13 +305,9 @@ export function Sidebar({
     }
   }
   const [creatingProject, setCreatingProject] = useState(false)
-  // Ephemeral collapse of the CC Dashboard subnav — same non-persisted pattern
-  // as the two section headers below; `navCollapse.ts` localStorage is
-  // reserved for the project subtrees the user curated themselves.
-  const [ccCollapsed, setCcCollapsed] = useState(false)
-  // Ephemeral collapse of the Inbox subnav (mesa task 845), same pattern.
-  const [inboxCollapsed, setInboxCollapsed] = useState(false)
-  // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have).
+  // Ephemeral collapse of the Projects subnav (persistence is a nice-to-have;
+  // `navCollapse.ts` localStorage is reserved for the project subtrees the
+  // user curated themselves).
   const [projectsCollapsed, setProjectsCollapsed] = useState(false)
   // Ephemeral collapse of the archived group, same non-persisted pattern as
   // `projectsCollapsed` above — starts collapsed so a rarely-visited group
@@ -576,75 +561,17 @@ export function Sidebar({
         >
           «
         </button>
-        {/* Unlike the Projects header this row stays an <a>: its href is the
-            user's remembered CC tab (task 694), so the caret is a sibling
-            button rather than the row itself. */}
-        <div className="nav-item-row">
-          <a
-            className={`nav-item${ccTab !== null ? ' active' : ''}`}
-            href={ccHref()}
-          >
-            <span className="nav-item-label">CC Dashboard</span>
-          </a>
-          <button
-            type="button"
-            className="nav-subtree-caret"
-            aria-expanded={!ccCollapsed}
-            aria-label={
-              ccCollapsed ? 'Expand CC Dashboard pages' : 'Collapse CC Dashboard pages'
-            }
-            onClick={() => setCcCollapsed((c) => !c)}
-          >
-            {ccCollapsed ? '▸' : '▾'}
-          </button>
-        </div>
-        {!ccCollapsed && (
-          <ul className="nav-projects nav-subnav">
-            {CC_SUBNAV.map((s) => (
-              <li key={s.tab}>
-                <a className={ccTab === s.tab ? 'active' : ''} href={s.hash}>
-                  {s.label}
-                </a>
-              </li>
-            ))}
-          </ul>
-        )}
-        {/* Shaped exactly like the CC Dashboard row above: the row stays a
-            link (to the triage queue) and the caret is a sibling button, so
-            the three sub-views are a disclosure rather than a fourth click to
-            reach the inbox at all. */}
-        <div className="nav-item-row">
-          <a
-            className={`nav-item${inboxFilter !== null ? ' active' : ''}`}
-            href="#/inbox"
-          >
-            <span className="nav-item-label">Inbox</span>
-            {unread > 0 && <span className="inbox-badge">{unread}</span>}
-          </a>
-          <button
-            type="button"
-            className="nav-subtree-caret"
-            aria-expanded={!inboxCollapsed}
-            aria-label={inboxCollapsed ? 'Expand Inbox views' : 'Collapse Inbox views'}
-            onClick={() => setInboxCollapsed((c) => !c)}
-          >
-            {inboxCollapsed ? '▸' : '▾'}
-          </button>
-        </div>
-        {!inboxCollapsed && (
-          <ul className="nav-projects nav-subnav">
-            {INBOX_SUBNAV.map((s) => (
-              <li key={s.filter}>
-                <a
-                  className={inboxFilter === s.filter ? 'active' : ''}
-                  href={s.hash}
-                >
-                  {s.label}
-                </a>
-              </li>
-            ))}
-          </ul>
-        )}
+        {/* The href is the user's remembered CC tab (task 694); the tabs
+            themselves live on the page (mesa task 1159). */}
+        <a className={`nav-item${ccTab !== null ? ' active' : ''}`} href={ccHref()}>
+          <span className="nav-item-label">CC Dashboard</span>
+        </a>
+        {/* Links to the triage queue; the Read/Archived views are tabs on the
+            page (mesa task 1159). */}
+        <a className={`nav-item${inboxFilter !== null ? ' active' : ''}`} href="#/inbox">
+          <span className="nav-item-label">Inbox</span>
+          {unread > 0 && <span className="inbox-badge">{unread}</span>}
+        </a>
         <a className={`nav-item${terminalActive ? ' active' : ''}`} href="#/terminal">
           <span className="nav-item-label">Terminal</span>
         </a>

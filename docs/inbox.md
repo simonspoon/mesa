@@ -149,12 +149,12 @@ instructions**; `author` is free-text attribution.
   (mesa task 847): there is no compose form, because an item names the task it
   came from and a person typing into the inbox has no such task to name. Items
   arrive from agents over the CLI and the API.
-- The nav's Inbox row owns a **subnav of three views** (mesa task 845), shaped
-  exactly like the CC Dashboard's: the row stays a link and the caret is a
-  sibling button, so the sub-views are a disclosure rather than a click in the
-  way of the inbox. **New** is `#/inbox` — the plain URL every existing link
-  already uses, so the triage queue is still where Inbox lands — **Read** is
-  `#/inbox/read` and **Archived** is `#/inbox/archived`. They are a *filter
+- The page has **three views** (mesa task 845), a tab strip at the top of
+  the page (mesa task 1159 — they used to be a subnav under the nav's Inbox
+  row, which is now a single link to the triage queue). **New** is `#/inbox` —
+  the plain URL every existing link already uses, so the triage queue is still
+  where Inbox lands — **Read** is `#/inbox/read` and **Archived** is
+  `#/inbox/archived`; the active tab follows the route. They are a *filter
   over one list*, not three lists: the page makes the same unfiltered fetch and
   the same 3s poll, and `frontend/src/inboxFilter.ts` slices it, so read marks,
   the mark-sent dedup set and playback are untouched by which view is open.

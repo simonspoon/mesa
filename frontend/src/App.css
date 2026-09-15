@@ -251,32 +251,6 @@ header {
   color: var(--muted);
 }
 
-/* A top-level nav entry that keeps its link AND carries a disclosure caret
-   (CC Dashboard). The caret can't be the row itself the way it is for the
-   Projects header, because the label has to stay navigable. The caret takes
-   over the row's 0.5rem right inset and right-aligns its glyph, which lands it
-   exactly over the `.nav-caret` of the Projects header below. */
-.nav-item-row {
-  display: flex;
-  align-items: center;
-}
-
-.nav-item-row > .nav-item {
-  flex: 1;
-  min-width: 0;
-  /* The caret supplies the row's right inset, so the link gives its own back
-     to the label — without this "CC Dashboard" ellipsises at the default nav
-     width. */
-  padding-right: 0;
-}
-
-.nav-item-row > .nav-subtree-caret {
-  width: 1rem;
-  padding-right: 0.5rem;
-  font-size: 0.85rem;
-  text-align: right;
-}
-
 .inbox-badge {
   flex: none;
   min-width: 1.4em;
@@ -640,14 +614,8 @@ button.nav-subtree-caret:hover:not(:disabled) {
   text-shadow: 0 0 8px var(--cyan);
 }
 
-/* CC Dashboard sub-pages: indent the fixed sub-links beneath the main entry so
-   the nesting reads as belonging to the dashboard. */
-.nav-subnav a {
-  padding-left: 1.25rem;
-}
-
 /* Archived-projects disclosure, nested under the Projects section: same
-   `.nav-section` spacing/caret, indented one notch like the CC subnav so it
+   `.nav-section` spacing/caret, indented one notch so it
    reads as a group within Projects rather than a sibling top-level entry.
    Muted text — informational, not a primary nav target. */
 .nav-subsection {

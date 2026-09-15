@@ -870,6 +870,17 @@ const MIGRATIONS: &[&str] = &[
         SELECT 'turn', id, session_id, text FROM live_turns WHERE text <> '';
     INSERT INTO live_memory_fts (kind, ref_id, session_id, text)
         SELECT 'summary', session_id, session_id, body FROM live_summaries;",
+    // Task 1150: handing a conversation off to a fresh agent mid-call. `lease`
+    // is a counter `hand_off_live_session` bumps as it rebinds `agent_id` in
+    // the same statement, so a `listen`/`say` presenting a stale lease is
+    // refused — the outgoing agent cannot keep driving once its successor
+    // holds the session. `predecessor_agent_id` is the outgoing agent's job
+    // id, kept only until the successor's first lease-carrying `listen`
+    // stops it (`take_live_predecessor` hands it out exactly once); it never
+    // rides on `LiveSession`. A row from before this column holds lease 1,
+    // which is what an un-handed-off conversation is.
+    "ALTER TABLE live_sessions ADD COLUMN lease INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE live_sessions ADD COLUMN predecessor_agent_id TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1049,7 +1060,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 // ---- mesa live (task 855) ----
 
 const LIVE_SESSION_COLUMNS: &str = "id, project_id, agent_id, status, route, started_at, \
-     updated_at, ended_at, context, working_since, window_box";
+     updated_at, ended_at, context, working_since, window_box, lease";
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
      created_at, delivered_at, played_at";
@@ -1073,7 +1084,7 @@ const LIVE_WINDOW_EXTENT_MAX: i32 = 20000;
 
 /// Longest turn text. Bounded because a mesa turn is **spoken**: a runaway
 /// body would wedge the synthesiser rather than say anything.
-const LIVE_TEXT_MAX: usize = 8192;
+pub const LIVE_TEXT_MAX: usize = 8192;
 
 /// Largest audio recording `POST /api/live/transcribe` accepts, in bytes
 /// (`docs/listen.md`, mesa task 954). This is a cap on **one recording**, not
@@ -1086,7 +1097,7 @@ pub const LIVE_AUDIO_MAX: usize = 25 * 1024 * 1024;
 
 /// Most turns one `list_live_turns` call returns. The page polls with a
 /// cursor, so a bigger page would only ever be a slower first paint.
-const LIVE_TURNS_MAX: i64 = 500;
+pub const LIVE_TURNS_MAX: i64 = 500;
 
 const LIVE_SUMMARY_COLUMNS: &str = "session_id, body, created_at, updated_at";
 
@@ -1136,6 +1147,7 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
         updated_at: row.get(6)?,
         ended_at: row.get(7)?,
         working_since: row.get(9)?,
+        lease: row.get(11)?,
     })
 }
 
@@ -4529,8 +4541,11 @@ impl Store {
         self.conn.execute(
             // An ended conversation is nobody's turn: whatever the agent was
             // in the middle of, the loop it was in is over (mesa task 894).
+            // A handoff still in flight is over too: nobody's first `listen`
+            // will come to stop the outgoing agent, and `stop` already stops
+            // whichever agent the row names (mesa task 1150).
             "UPDATE live_sessions SET status = ?2, working_since = NULL, \
-             ended_at = datetime('now'), \
+             predecessor_agent_id = NULL, ended_at = datetime('now'), \
              updated_at = datetime('now') WHERE id = ?1 AND status = ?3",
             (id, LiveStatus::Ended.as_str(), LiveStatus::Live.as_str()),
         )?;
@@ -4547,6 +4562,73 @@ impl Store {
             (id, agent_id),
         )?;
         self.get_live_session(id)
+    }
+
+    /// Hands the conversation to a successor agent (mesa task 1150): the
+    /// current `agent_id` becomes the predecessor, `successor_agent_id` takes
+    /// its place and the lease is bumped — **one statement**, so no reader can
+    /// ever see the new agent under the old lease or the old agent under the
+    /// new one. Only a `live` session can be handed off (`validation`
+    /// otherwise): a successor for an ended conversation would be an agent
+    /// with nothing to listen to.
+    pub fn hand_off_live_session(
+        &mut self,
+        id: i64,
+        successor_agent_id: Option<&str>,
+    ) -> Result<LiveSession> {
+        let session = self.get_live_session(id)?;
+        if session.status != LiveStatus::Live {
+            return Err(Error::Validation(format!("live session {id} has ended")));
+        }
+        self.conn.execute(
+            "UPDATE live_sessions SET predecessor_agent_id = agent_id, agent_id = ?2, \
+             lease = lease + 1, updated_at = datetime('now') WHERE id = ?1",
+            (id, successor_agent_id),
+        )?;
+        self.get_live_session(id)
+    }
+
+    /// Refuses a lease the session no longer holds — the guard every
+    /// lease-carrying `listen`/`say`/`navigate`/`sidebars` runs before it
+    /// writes, so an agent that was handed off cannot keep driving. Only
+    /// enforced when a lease is presented: a person driving a `--no-agent`
+    /// session from a terminal presents none.
+    pub fn check_live_lease(&self, id: i64, lease: i64) -> Result<()> {
+        let current = self.get_live_session(id)?.lease;
+        if lease != current {
+            return Err(Error::Conflict(format!(
+                "live session {id} lease {lease} is no longer held (current lease is \
+                 {current}); this conversation was handed off"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The outgoing agent's job id, handed out **exactly once**: the clear is
+    /// guarded on the very value that was read (SQLite's `RETURNING` reports
+    /// the row *after* an `UPDATE`, so it cannot carry the old value out), and
+    /// only the caller whose clear actually lands gets it — of two successors'
+    /// first listens only one ever learns whom to stop, and a later listen
+    /// finds `None`. `None` too when nothing was handed off.
+    pub fn take_live_predecessor(&mut self, id: i64) -> Result<Option<String>> {
+        let prev: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT predecessor_agent_id FROM live_sessions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(prev) = prev else {
+            return Ok(None);
+        };
+        let cleared = self.conn.execute(
+            "UPDATE live_sessions SET predecessor_agent_id = NULL \
+             WHERE id = ?1 AND predecessor_agent_id = ?2",
+            (id, &prev),
+        )?;
+        Ok((cleared == 1).then_some(prev))
     }
 
     /// The page reporting where the user's browser is, what is on it, and
@@ -10763,6 +10845,85 @@ mod tests {
         ));
     }
 
+    /// A handoff (mesa task 1150) rebinds the agent, bumps the lease and
+    /// remembers the outgoing agent, atomically; an ended session cannot be
+    /// handed off.
+    #[test]
+    fn hand_off_live_session_bumps_the_lease_and_records_the_predecessor() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert_eq!(session.lease, 1);
+        store.bind_live_agent(session.id, Some("first")).unwrap();
+
+        let handed = store
+            .hand_off_live_session(session.id, Some("second"))
+            .unwrap();
+        assert_eq!(handed.lease, 2);
+        assert_eq!(handed.agent_id.as_deref(), Some("second"));
+        assert_eq!(handed.status, LiveStatus::Live);
+        assert_eq!(
+            store.take_live_predecessor(session.id).unwrap().as_deref(),
+            Some("first")
+        );
+        // A successor whose spawn printed no receipt is still a handoff.
+        let again = store.hand_off_live_session(session.id, None).unwrap();
+        assert_eq!(again.lease, 3);
+        assert_eq!(again.agent_id, None);
+
+        store.end_live_session(session.id).unwrap();
+        let err = store
+            .hand_off_live_session(session.id, Some("third"))
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err:?}");
+        assert!(matches!(
+            store.hand_off_live_session(999, None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// The lease is refused only when it is stale; the current one and an
+    /// unknown session answer as expected.
+    #[test]
+    fn check_live_lease_refuses_a_stale_lease_as_conflict() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.check_live_lease(session.id, 1).unwrap();
+        store.hand_off_live_session(session.id, None).unwrap();
+        let err = store.check_live_lease(session.id, 1).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("current lease is 2"), "{err}");
+        assert!(err.to_string().contains("handed off"), "{err}");
+        store.check_live_lease(session.id, 2).unwrap();
+        assert!(matches!(
+            store.check_live_lease(999, 1),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// The predecessor is handed out once and never again, and ending the
+    /// session drops one nobody took.
+    #[test]
+    fn take_live_predecessor_answers_once_and_ending_clears_it() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
+        store.bind_live_agent(session.id, Some("first")).unwrap();
+        store
+            .hand_off_live_session(session.id, Some("second"))
+            .unwrap();
+        assert_eq!(
+            store.take_live_predecessor(session.id).unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
+
+        store
+            .hand_off_live_session(session.id, Some("third"))
+            .unwrap();
+        store.end_live_session(session.id).unwrap();
+        assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
+    }
+
     /// A route is a hash path the page already renders, not free text — the
     /// one rule `set_live_route` and a `navigate` turn's target share.
     #[test]
@@ -11525,15 +11686,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            56,
-            "a fresh db should report user_version 56"
+            57,
+            "a fresh db should report user_version 57"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 56);
+        assert_eq!(version, 57);
     }
 
     /// Pins the live-memory migration (mesa task 1147) at index 55, and

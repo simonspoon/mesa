@@ -21,7 +21,16 @@ project_id: number | null,
  * this conversation, when the spawn printed one. Null when the session
  * was started with no agent, or when the command printed no receipt.
  */
-agent_id: string | null, status: LiveStatus, 
+agent_id: string | null, 
+/**
+ * Which handoff generation holds the session (mesa task 1150): 1 for a
+ * conversation that has never been handed off, bumped by `mesa live
+ * handoff` as it rebinds `agent_id` to the successor. A `listen`/`say`
+ * presenting a lease the session no longer holds is `conflict`, which is
+ * what stops the outgoing agent from driving on; a caller presenting
+ * none is never checked.
+ */
+lease: number, status: LiveStatus, 
 /**
  * Where the user's browser currently is (a `#/…` hash route), as last
  * reported by the page. The agent reads it to know what the user is

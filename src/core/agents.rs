@@ -371,6 +371,21 @@ pub fn find_job_for_session(session_id: &str) -> Result<Option<String>, String> 
 }
 
 fn find_job(bin: &str, session_id: &str) -> Result<Option<String>, String> {
+    job_for_session(&list_all_agents(bin)?, session_id)
+}
+
+/// The `sessionId` of the background session whose short job id is `job_id`,
+/// or `Ok(None)` when no row names it — the reverse of
+/// [`find_job_for_session`], for `mesa live context` (mesa task 1150): a live
+/// session knows its agent by the receipt `claude --bg` printed, and the
+/// transcript `cc::session_pulse` reads is filed under the uuid. Same lookup,
+/// same reason it is never an inference.
+pub fn find_session_for_job(job_id: &str) -> Result<Option<String>, String> {
+    session_for_job(&list_all_agents(&claude_bin())?, job_id)
+}
+
+/// `claude agents --json --all`, raw — the payload both lookups above read.
+fn list_all_agents(bin: &str) -> Result<Vec<u8>, String> {
     let out = Command::new(bin)
         .args(["agents", "--json", "--all"])
         .stdin(Stdio::null())
@@ -382,7 +397,7 @@ fn find_job(bin: &str, session_id: &str) -> Result<Option<String>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    job_for_session(&out.stdout, session_id)
+    Ok(out.stdout)
 }
 
 /// Pure half of [`find_job_for_session`] — bytes in, job id out — so the
@@ -400,6 +415,22 @@ fn job_for_session(bytes: &[u8], session_id: &str) -> Result<Option<String>, Str
     Ok(rows.into_iter().find_map(|row| {
         (row.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
             .then(|| row.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .flatten()
+    }))
+}
+
+/// Pure half of [`find_session_for_job`], read as loosely as
+/// [`job_for_session`] and for the same reason.
+fn session_for_job(bytes: &[u8], job_id: &str) -> Result<Option<String>, String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|e| format!("unexpected claude agents payload: {e}"))?;
+    Ok(rows.into_iter().find_map(|row| {
+        (row.get("id").and_then(|v| v.as_str()) == Some(job_id))
+            .then(|| {
+                row.get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .flatten()
     }))
 }
@@ -583,6 +614,24 @@ mod tests {
         );
         assert!(job_for_session(b"not json", "zzz").is_err());
         assert!(job_for_session(br#"{"id":"abc"}"#, "zzz").is_err());
+    }
+
+    /// The reverse lookup (mesa task 1150): a short job id resolves to the
+    /// uuid its transcript is filed under, and nothing else is inferred.
+    #[test]
+    fn a_short_job_id_resolves_to_its_session_uuid() {
+        let bytes = SESSIONS_JSON.as_bytes();
+        assert_eq!(
+            session_for_job(bytes, "e34b8ed9").unwrap(),
+            Some("e34b8ed9-d391-4797-9d39-546d5b463357".to_string())
+        );
+        assert_eq!(session_for_job(bytes, "nope").unwrap(), None);
+        assert_eq!(session_for_job(b"[]", "e34b8ed9").unwrap(), None);
+        assert_eq!(
+            session_for_job(br#"[{"id":"abc"},{"id":"abc","sessionId":"zzz"}]"#, "abc").unwrap(),
+            Some("zzz".to_string())
+        );
+        assert!(session_for_job(b"not json", "abc").is_err());
     }
 
     #[test]

@@ -1056,7 +1056,7 @@ S1=$(jqs .id)
 if grep -q "mesa live listen" "$STUB_DIR/last-prompt"; then
   fail "the loop must NOT be injected into the prompt any more: $(cat "$STUB_DIR/last-prompt")"
 fi
-grep -q "Drive mesa live session $S1\." "$STUB_DIR/last-prompt" ||
+grep -q "Drive mesa live session $S1 (lease 1)\." "$STUB_DIR/last-prompt" ||
   fail "live start must inject the session line: $(cat "$STUB_DIR/last-prompt")"
 run 0 "$MESA" live stop
 ok "the spawned prompt carries the session line only — the instructions are the agent definition"

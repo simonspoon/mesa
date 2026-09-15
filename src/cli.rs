@@ -27,11 +27,12 @@ use serde_json::json;
 use crate::core::{
     Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew,
     EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    InboxItem, InboxKind, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope,
-    LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry, LiveRole,
-    LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch,
-    ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
-    TaskPatch, TaskReceipt, agents, board, config, files, library, live, look, receipt, system,
+    InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch,
+    LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry,
+    LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project,
+    ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status,
+    Store, Task, TaskPatch, TaskReceipt, agents, board, cc, config, files, library, live, look,
+    receipt, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1612,6 +1613,14 @@ EXAMPLES
         /// Seconds to wait for an utterance; 0 polls once and returns
         #[arg(long, value_name = "SECONDS", default_value_t = 570)]
         wait: u64,
+        /// The lease from the first line of your prompt (mesa task 1150)
+        ///
+        /// Checked before anything is taken: a lease the session no longer
+        /// holds is `conflict` — the conversation was handed off, so stop.
+        /// A lease-carrying listen also stops the agent it succeeded, once.
+        /// Absent (a person at a terminal), nothing is checked.
+        #[arg(long, value_name = "N")]
+        lease: Option<i64>,
         /// Print the turn without its `text` instead of in full
         #[arg(long)]
         quiet: bool,
@@ -1631,6 +1640,12 @@ EXAMPLES
         /// The spoken message (everything after `say`); quoting is optional
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
+        /// The lease from the first line of your prompt (mesa task 1150)
+        ///
+        /// A stale lease is `conflict` and nothing is said: the conversation
+        /// was handed off. Must come BEFORE the message text, like --quiet.
+        #[arg(long, value_name = "N")]
+        lease: Option<i64>,
         /// Print the turn without its `text` instead of in full
         ///
         /// Must come BEFORE the message text: everything after `say` that is
@@ -1654,6 +1669,11 @@ EXAMPLES
         /// What to say while the page changes
         #[arg(long, value_name = "TEXT")]
         say: Option<String>,
+        /// The lease from the first line of your prompt (mesa task 1150)
+        ///
+        /// A stale lease is `conflict` and the browser stays put.
+        #[arg(long, value_name = "N")]
+        lease: Option<i64>,
         /// Print the turn without its `text` instead of in full
         #[arg(long)]
         quiet: bool,
@@ -1675,10 +1695,56 @@ EXAMPLES
         /// What to say while the panels move
         #[arg(long, value_name = "TEXT")]
         say: Option<String>,
+        /// The lease from the first line of your prompt (mesa task 1150)
+        ///
+        /// A stale lease is `conflict` and the panels stay where they are.
+        #[arg(long, value_name = "N")]
+        lease: Option<i64>,
         /// Print the turn without its `text` instead of in full
         #[arg(long)]
         quiet: bool,
     },
+    /// Hand the conversation to a fresh agent; prints the session with its new lease
+    ///
+    /// For the agent driving a long call (mesa task 1150): its context grows
+    /// without limit, but the turns queue in the database, so the driver can be
+    /// replaced mid-call without the person noticing. Type a short note after
+    /// `handoff` — the current topic, what is pending, any promise made — and
+    /// mesa spawns a successor on the SAME session through the same
+    /// `live-agent` template, with that note and the last 10 turns appended to
+    /// the ordinary prompt. The session's `lease` is bumped as the successor
+    /// is bound, so the caller's own `listen`/`say --lease` is `conflict` from
+    /// here on; the successor's first `listen --lease` stops the caller. Then
+    /// end your turn and do nothing else.
+    ///
+    /// Takes no --lease: it must work for whoever holds the session. A failed
+    /// spawn is `unavailable` and leaves the session exactly as it was — still
+    /// live, same agent, same lease — unlike `start`, which ends the session
+    /// it could not staff. Put --quiet BEFORE the note.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live handoff \"We are triaging the inbox; item 12 is next, and I promised to open task 40.\"
+  mesa live handoff --quiet Fresh start requested.")]
+    Handoff {
+        /// The note for the successor (everything after `handoff`); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        note: Vec<String>,
+        /// Print the session in its compact shape instead of in full
+        ///
+        /// Must come BEFORE the note text.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Print how full the driving agent's context is: `{session_id, agent_id, lease, context_tokens}`
+    ///
+    /// How the agent decides a handoff is due (mesa task 1150): the occupied
+    /// context of its own newest request, read live off the transcript the
+    /// Agents sidebar already reads (`cc::session_pulse`), located through
+    /// `claude agents --json --all` from the session's spawn receipt.
+    /// `context_tokens` is null when the transcript cannot be read; a session
+    /// with no agent bound, or one `claude agents` does not list, is
+    /// `unavailable`. CLI-only, like `look`; takes no --quiet.
+    Context,
     /// Print the conversation so far as a bare JSON array, oldest first
     ///
     /// Both roles, including turns already delivered or spoken — this is the
@@ -4557,8 +4623,23 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // reads this `null` as "stop looping".
             None => print_json(&serde_json::Value::Null),
         },
-        LiveCmd::Listen { wait, quiet } => {
+        LiveCmd::Listen { wait, lease, quiet } => {
             let session = current_live_session(&store)?;
+            if let Some(lease) = lease {
+                store.check_live_lease(session.id, lease)?;
+                // The successor's first lease-carrying listen is what stops the
+                // outgoing agent (mesa task 1150): an agent must not stop
+                // itself, and by now the successor is provably listening.
+                // Handed out once, so a later listen finds nothing to stop.
+                if let Some(prev) = store.take_live_predecessor(session.id)?
+                    && let Err(e) = agents::stop(&prev)
+                {
+                    eprintln!(
+                        "live session {}: could not stop its previous agent: {e}",
+                        session.id
+                    );
+                }
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
             loop {
                 // `next_user_turn` stamps `delivered_at` inside one statement,
@@ -4581,14 +4662,25 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             }
             print_json(&serde_json::Value::Null);
         }
-        LiveCmd::Say { text, quiet } => {
+        LiveCmd::Say { text, lease, quiet } => {
             let session = current_live_session(&store)?;
+            if let Some(lease) = lease {
+                store.check_live_lease(session.id, lease)?;
+            }
             let turn =
                 store.add_live_turn(session.id, LiveRole::Mesa, &text.join(" "), None, None)?;
             print_live_turn(&turn, quiet);
         }
-        LiveCmd::Navigate { route, say, quiet } => {
+        LiveCmd::Navigate {
+            route,
+            say,
+            lease,
+            quiet,
+        } => {
             let session = current_live_session(&store)?;
+            if let Some(lease) = lease {
+                store.check_live_lease(session.id, lease)?;
+            }
             // A navigate with no --say is a pure action turn: empty text, which
             // `Store` allows for `mesa` precisely so the page can move without
             // anything being read aloud.
@@ -4601,8 +4693,16 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             )?;
             print_live_turn(&turn, quiet);
         }
-        LiveCmd::Sidebars { state, say, quiet } => {
+        LiveCmd::Sidebars {
+            state,
+            say,
+            lease,
+            quiet,
+        } => {
             let session = current_live_session(&store)?;
+            if let Some(lease) = lease {
+                store.check_live_lease(session.id, lease)?;
+            }
             // Like `navigate`, silent without `--say`; unlike it, there is no
             // route — the verb is the whole instruction.
             let turn = store.add_live_turn(
@@ -4628,6 +4728,82 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 None => current_live_session(&store)?.id,
             };
             print_json(&store.list_live_turns(session_id, after, limit)?);
+        }
+        LiveCmd::Handoff { note, quiet } => {
+            let session = current_live_session(&store)?;
+            let note = note.join(" ");
+            let note = note.trim();
+            if note.is_empty() {
+                return Err(Error::Validation(
+                    "a handoff note must not be empty".to_string(),
+                ));
+            }
+            if note.chars().count() > LIVE_TEXT_MAX {
+                return Err(Error::Validation(format!(
+                    "a handoff note must be at most {LIVE_TEXT_MAX} characters"
+                )));
+            }
+            let lease = session.lease + 1;
+            // The same template and the same `--agent mesa-live` as `start`,
+            // deliberately: everything the successor shares with its
+            // predecessor sits in front of everything per-session, so its
+            // cached prefix is the same bytes. Only the name says which
+            // generation it is.
+            let (dir, name) = live_agent_dir(&store, session.project_id, session.id)?;
+            let successor = format!("{name} · lease {lease}");
+            let spawned = live::ensure_agent_definition(&store).and_then(|_| {
+                let prompts = library::prompts(&store).map_err(|e| e.to_string())?;
+                agents::spawn_bg(
+                    config::LIVE_AGENT,
+                    &dir,
+                    Some(session.id),
+                    Some(&successor),
+                    Some(&live::handoff_prompt(&store, session.id, lease, note)),
+                    &prompts,
+                )
+            });
+            // NOT `bind_live_agent_or_end`: a successor that could not start
+            // leaves the conversation exactly as it was — still live, still
+            // the caller's, same lease — rather than ending it. Nothing is
+            // stopped here either: the caller IS the outgoing agent, and the
+            // successor's first `listen --lease` stops it.
+            let job = spawned.map_err(|e| {
+                Error::Unavailable(format!(
+                    "live session {} could not spawn a successor agent, so it was not \
+                     handed off: {e}",
+                    session.id
+                ))
+            })?;
+            let session = store.hand_off_live_session(session.id, job.as_deref())?;
+            print_live_session(&session, quiet);
+        }
+        LiveCmd::Context => {
+            let session = current_live_session(&store)?;
+            let Some(agent_id) = session.agent_id.as_deref() else {
+                return Err(Error::Unavailable(format!(
+                    "live session {} has no agent bound, so there is no context to measure",
+                    session.id
+                )));
+            };
+            // Job id → session uuid is a lookup, never an inference (the
+            // cost guard's rule, in reverse); the pulse itself fails open, so
+            // an unreadable transcript is `null` rather than an error.
+            let uuid = agents::find_session_for_job(agent_id)
+                .map_err(Error::Unavailable)?
+                .ok_or_else(|| {
+                    Error::Unavailable(format!(
+                        "claude agents does not list job {agent_id}, the agent driving live \
+                         session {}",
+                        session.id
+                    ))
+                })?;
+            let pulse = cc::session_pulse(&uuid);
+            print_json(&serde_json::json!({
+                "session_id": session.id,
+                "agent_id": agent_id,
+                "lease": session.lease,
+                "context_tokens": pulse.context_tokens,
+            }));
         }
         LiveCmd::Look { output } => {
             let session = current_live_session(&store)?;
@@ -5625,6 +5801,7 @@ mod tests {
             id: 1,
             project_id: Some(2),
             agent_id: Some("e34b8ed9".into()),
+            lease: 1,
             status: LiveStatus::Live,
             route: Some("#/projects/2/files".into()),
             context: Some(LiveContext {
@@ -6086,6 +6263,9 @@ mod tests {
                 // could read to tell whether another listener already took
                 // the utterance it is about to work on (mesa task 894).
                 "working_since",
+                // An integer: which handoff generation holds the session, and
+                // the one number a successor must present (mesa task 1150).
+                "lease",
             ]),
             "LiveSession gained/lost a field: every field it has today is \
              bounded — ids, fixed words, timestamps, a 200-char route, a \

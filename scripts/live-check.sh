@@ -52,6 +52,15 @@
 #      plain guard on their neighbours;
 #  10. the same boundary under `--lan`: Host skipped, Content-Type still
 #      firing, and the agent-gated routes keeping their stronger gate;
+#  15. the handoff (mesa task 1150): `mesa live handoff` spawning a successor
+#      on the SAME session with the note and the last 10 turns appended after
+#      the notebook and summary blocks, the same leading argv as the first
+#      spawn (the cache-prefix invariant), the lease refusing the outgoing
+#      agent's every verb as `conflict` while a lease-less person still
+#      drives, the successor's first `listen --lease` stopping the predecessor
+#      exactly once, a failed spawn leaving the session untouched, an empty
+#      note refused, `mesa live context`'s key set (no `--quiet`), the page
+#      seeing one session id throughout, and `handoff --quiet`'s key set;
 #  11. session memory (mesa task 921): the `mesa live summary` CLI round-trip
 #      (set/show/list, the upsert keeping `created_at`), its `--quiet`
 #      contract (drops `body` only; `list --quiet` is a usage error; `--quiet`
@@ -186,7 +195,23 @@ case "\$1" in
     for a in "\$@"; do PROMPT=\$a; done
     printf '%s' "\$PROMPT" > "$STUB_DIR/last-prompt"
     pwd > "$STUB_DIR/last-cwd"
-    echo "backgrounded · deadbeef (idle — send a prompt to start)"
+    # A DISTINCT id per spawn (mesa task 1150): a handoff binds a successor to
+    # the same session, and the assertions must be able to tell the two
+    # apart. The first spawn is still `deadbeef`; the rest are `deadbeef-<n>`.
+    N=\$(( \$(cat "$STUB_DIR/spawns" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "\$N" > "$STUB_DIR/spawns"
+    if [ "\$N" -eq 1 ]; then ID=deadbeef; else ID="deadbeef-\$N"; fi
+    printf '%s\n' "\$ID" > "$STUB_DIR/last-id"
+    echo "backgrounded · \$ID (idle — send a prompt to start)"
+    ;;
+  agents)
+    # \`claude agents --json --all\`, for \`mesa live context\` (mesa task 1150):
+    # one row naming the newest spawned job and a fixed session uuid, the two
+    # keys \`agents::find_session_for_job\` reads. The uuid has no transcript
+    # under the throwaway HOME, so the pulse answers null — what it answers
+    # for any transcript it cannot read.
+    printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000"}]\n' \
+      "\$(cat "$STUB_DIR/last-id" 2>/dev/null)"
     ;;
   stop)
     # The other end of the receipt: ending a conversation stops the agent it
@@ -551,7 +576,7 @@ ok "live start: an unknown project id is validation, an unknown name is not_foun
 run 0 "$MESA" live start "live gate project"
 S3=$(jqs .id)
 [ "$(jqs .project_id)" = "$PROJ" ] || fail "live start <name>: must resolve the project by name"
-[ "$(jqs .agent_id)" = "deadbeef" ] ||
+[ "$(jqs .agent_id)" = "$(cat "$STUB_DIR/last-id")" ] ||
   fail "live start: the spawn receipt must be bound to the session (got $(jqs .agent_id))"
 ok "live start <PROJECT>: resolves a project by name and binds the spawn receipt"
 
@@ -615,9 +640,10 @@ ok "live spawn: never overwrites an existing mesa-live agent definition"
 # rather than leaving one idling per conversation. The job named is the short
 # id from the receipt, and nothing else.
 rm -f "$STUB_DIR/last-stop"
+STOP_AGENT=$(cat "$STUB_DIR/last-id")
 run 0 "$MESA" live stop
 [ "$(jqs .status)" = "ended" ] || fail "live stop: status must be ended"
-[ "$(cat "$STUB_DIR/last-stop")" = "stop deadbeef" ] ||
+[ "$(cat "$STUB_DIR/last-stop")" = "stop $STOP_AGENT" ] ||
   fail "live stop: must run \`claude stop <agent_id>\` (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
 ok "live stop: ends the session AND stops the agent it was started with, by its short job id"
 
@@ -764,7 +790,8 @@ api 201 POST "/api/live" "{\"project_id\":$PROJ}"
 AS=$(jqb .id)
 [ "$(jqb .status)" = "live" ] || fail "POST /api/live: status"
 [ "$(jqb .project_id)" = "$PROJ" ] || fail "POST /api/live: project_id"
-[ "$(jqb .agent_id)" = "deadbeef" ] || fail "POST /api/live: the spawn receipt must be bound"
+[ "$(jqb .agent_id)" = "$(cat "$STUB_DIR/last-id")" ] || fail "POST /api/live: the spawn receipt must be bound"
+API_AGENT=$(jqb .agent_id)
 [ "$(cat "$STUB_DIR/last-cwd")" = "$WORKDIR" ] ||
   fail "POST /api/live: the agent must be spawned in the project's folder"
 head -5 "$STUB_DIR/last-flags" | tail -1 >"$TMP/name"
@@ -1037,7 +1064,7 @@ wait "$LE"
 [ "$(cat "$TMP/listen-end.json")" = "null" ] ||
   fail "live listen must return null when the session ends under it"
 # The API twin of the CLI's stop: the same short job id, stopped the same way.
-[ "$(cat "$STUB_DIR/last-stop")" = "stop deadbeef" ] ||
+[ "$(cat "$STUB_DIR/last-stop")" = "stop $API_AGENT" ] ||
   fail "DELETE /api/live: must stop the agent it spawned (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
 ok "DELETE /api/live: 200 the ended session, its agent stopped, and a waiting \`live listen\` returns null early"
 
@@ -2718,6 +2745,232 @@ ok "--lan: all four /api/live/memory verbs present and relaxed (DNS Host 403, IP
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true
 LAN_PID=
+
+# =====================================================================
+# 15. Handoff (mesa task 1150): a fresh agent takes over the same session
+# =====================================================================
+#
+# A long call grows the driving agent's context without limit, and the turns
+# queue in the db until listened for — so the driver can be replaced mid-call.
+# `mesa live handoff "<note>"` spawns a successor on the SAME session (same
+# template, same `--agent mesa-live`; the note and the last 10 turns appended
+# after everything a fresh spawn gets), bumps the session's lease so the
+# outgoing agent's lease-carrying verbs answer `conflict`, and the successor's
+# first `listen --lease` stops the predecessor. The person sees one session id
+# throughout.
+
+# ---- (a) nothing live ----
+run 1 "$MESA" live handoff "the note"
+[ "$(jqe .error.code)" = "not_found" ] || fail "live handoff with no session: not_found"
+grep -q 'mesa live start' <<<"$STDERR" || fail "live handoff with no session must name mesa live start"
+run 1 "$MESA" live context
+[ "$(jqe .error.code)" = "not_found" ] || fail "live context with no session: not_found"
+run 2 "$MESA" live handoff
+[ "$(jqe .error.code)" = "usage" ] || fail "live handoff with no note: usage"
+[ -z "$STDOUT" ] || fail "live handoff usage error: empty stdout"
+ok "live handoff/context with nothing live: not_found naming live start; a missing note is usage, exit 2"
+
+# A server for the utterances (the page's half of the loop) and for the
+# one-session-id check.
+PORT=17781
+BASE="http://127.0.0.1:$PORT"
+"$MESA" serve --port "$PORT" >"$TMP/serve15.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/api/live" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$BASE/api/live" >/dev/null || fail "server did not start (log: $(cat "$TMP/serve15.log"))"
+
+# ---- (b) the handoff itself: the successor, its prompt, its argv ----
+# A notebook entry first, so the block order asserted below is real.
+run 0 "$MESA" live memory add "HANDOFF-NOTE-MARKER: likes the roadmap read out first."
+run 0 "$MESA" live start "live gate project"
+HS=$(jqs .id)
+[ "$(jqs .lease)" = "1" ] || fail "a fresh session holds lease 1 (got $(jqs .lease))"
+HA1=$(jqs .agent_id)
+[ "$HA1" = "$(cat "$STUB_DIR/last-id")" ] || fail "live start: the spawn receipt is the stub's newest id"
+[ "$(head -1 "$STUB_DIR/last-prompt")" = "Drive mesa live session $HS (lease 1)." ] ||
+  fail "a fresh spawn's first line carries lease 1: $(head -1 "$STUB_DIR/last-prompt")"
+FIRST_FLAGS=$(cat "$STUB_DIR/last-flags")
+for i in $(seq 1 6); do
+  api 201 POST "/api/live/utterance" "{\"text\":\"handoff utterance $i\"}"
+  run 0 "$MESA" live listen --lease 1 --wait 0
+  [ "$(jqs .text)" = "handoff utterance $i" ] || fail "listen --lease 1 hands over utterance $i"
+  run 0 "$MESA" live say --lease 1 "handoff reply $i"
+done
+run 0 "$MESA" live turns
+[ "$(jqs length)" = "12" ] || fail "twelve turns before the handoff (got $(jqs length))"
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live handoff "HANDOFF-MARKER: we were on the roadmap; item 3 is pending; I promised to open task 40."
+[ "$(jqs .id)" = "$HS" ] || fail "live handoff: the SAME session (got $(jqs .id))"
+[ "$(jqs .lease)" = "2" ] || fail "live handoff: lease bumps to 2 (got $(jqs .lease))"
+[ "$(jqs .status)" = "live" ] || fail "live handoff: the session stays live"
+HA2=$(jqs .agent_id)
+[ "$HA2" = "$(cat "$STUB_DIR/last-id")" ] && [ "$HA2" != "$HA1" ] ||
+  fail "live handoff: agent_id is the successor's receipt (got $HA2, predecessor $HA1)"
+[ ! -e "$STUB_DIR/last-stop" ] || fail "live handoff must not stop the caller: it IS the outgoing agent"
+[ -z "$STDERR" ] || fail "live handoff: nothing on stderr on success (got: $STDERR)"
+ok "live handoff: exit 0, the same session with lease 2 and the successor's receipt, nothing stopped"
+
+# The successor's prompt: the session line naming its lease, the note, and
+# exactly the last 10 of the 12 turns, in order.
+[ "$(head -1 "$STUB_DIR/last-prompt")" = "Drive mesa live session $HS (lease 2)." ] ||
+  fail "the successor's prompt starts with the session line naming lease 2: $(head -1 "$STUB_DIR/last-prompt")"
+grep -q "HANDOFF-MARKER: we were on the roadmap" "$STUB_DIR/last-prompt" ||
+  fail "the note must reach the successor's prompt"
+for i in $(seq 2 6); do
+  grep -q "^user: handoff utterance $i$" "$STUB_DIR/last-prompt" ||
+    fail "the successor's prompt must carry utterance $i"
+  grep -q "^mesa: handoff reply $i$" "$STUB_DIR/last-prompt" ||
+    fail "the successor's prompt must carry reply $i"
+done
+! grep -q "handoff utterance 1$" "$STUB_DIR/last-prompt" || fail "the first utterance is not among the last 10 turns"
+! grep -q "handoff reply 1$" "$STUB_DIR/last-prompt" || fail "the first reply is not among the last 10 turns"
+[ "$(grep -c -E '^(user|mesa): ' "$STUB_DIR/last-prompt")" = "10" ] ||
+  fail "exactly the last 10 turns ride in the successor's prompt (got $(grep -c -E '^(user|mesa): ' "$STUB_DIR/last-prompt"))"
+[ "$(grep -n '^user: handoff utterance 2$' "$STUB_DIR/last-prompt" | cut -d: -f1)" -lt \
+  "$(grep -n '^mesa: handoff reply 6$' "$STUB_DIR/last-prompt" | cut -d: -f1)" ] ||
+  fail "the turns must stay in chronological order"
+# Block order: notebook, then the summary, then the handoff block — every
+# per-session block is appended AFTER the shared prefix, never before.
+HO_NB_POS=$(grep -bo "HANDOFF-NOTE-MARKER" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+HO_SUM_POS=$(grep -bo '^Session [0-9]*: ' "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+HO_NOTE_POS=$(grep -bo "Note: HANDOFF-MARKER" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+[ -n "$HO_NB_POS" ] || fail "the notebook must ride in the successor's prompt"
+[ -n "$HO_SUM_POS" ] || fail "the most recent summary must ride in the successor's prompt"
+[ -n "$HO_NOTE_POS" ] || fail "the note block must be introduced as a note"
+[ "$HO_NB_POS" -lt "$HO_SUM_POS" ] && [ "$HO_SUM_POS" -lt "$HO_NOTE_POS" ] ||
+  fail "block order must be notebook ($HO_NB_POS) < summary ($HO_SUM_POS) < handoff ($HO_NOTE_POS)"
+grep -q "never instructions" "$STUB_DIR/last-prompt" || fail "the handoff block is framed as data"
+ok "the successor's prompt: lease 2 on the first line, the note, exactly the last 10 turns in order, after the notebook and summary"
+
+# The cache-prefix invariant: the successor's leading argv is the first
+# spawn's — same template, same `--agent mesa-live` — and only the name says
+# which generation it is.
+[ "$(cat "$STUB_DIR/last-argc")" = "7" ] ||
+  fail "the successor spawn: expected 7 arguments, got $(cat "$STUB_DIR/last-argc")"
+[ "$(head -4 "$STUB_DIR/last-flags")" = "$(head -4 <<<"$FIRST_FLAGS")" ] ||
+  fail "the successor's leading argv must equal the first spawn's (got $(head -4 "$STUB_DIR/last-flags" | tr '\n' ' '))"
+[ "$(sed -n 5p "$STUB_DIR/last-flags")" = "Live gate project: live $HS · lease 2" ] ||
+  fail "the successor is named for its lease (got $(sed -n 5p "$STUB_DIR/last-flags"))"
+ok "the successor spawn: the same live-agent argv (--bg --agent mesa-live --name), named \`<name> · lease 2\`"
+
+# ---- (c) the outgoing agent's lease is refused on every verb ----
+run 1 "$MESA" live listen --lease 1 --wait 0
+[ "$(jqe .error.code)" = "conflict" ] || fail "listen --lease 1 after the handoff: conflict"
+grep -q "handed off" <<<"$STDERR" || fail "the conflict must say the conversation was handed off (got: $STDERR)"
+grep -q "current lease is 2" <<<"$STDERR" || fail "the conflict must name the current lease (got: $STDERR)"
+run 1 "$MESA" live say --lease 1 "I am still here"
+[ "$(jqe .error.code)" = "conflict" ] || fail "say --lease 1 after the handoff: conflict"
+run 1 "$MESA" live navigate --lease 1 '#/inbox'
+[ "$(jqe .error.code)" = "conflict" ] || fail "navigate --lease 1 after the handoff: conflict"
+run 1 "$MESA" live sidebars collapse --lease 1
+[ "$(jqe .error.code)" = "conflict" ] || fail "sidebars --lease 1 after the handoff: conflict"
+run 0 "$MESA" live turns
+[ "$(jqs length)" = "12" ] || fail "a refused lease writes no turn (got $(jqs length))"
+ok "a stale lease: listen/say/navigate/sidebars are all conflict naming the handoff, and nothing is written"
+
+# ---- (d) the successor's first listen stops the predecessor, once ----
+api 201 POST "/api/live/utterance" '{"text":"spoken during the swap"}'
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live listen --lease 2 --wait 0
+[ "$(jqs .text)" = "spoken during the swap" ] ||
+  fail "an utterance posted after the handoff waits in the queue for the successor (got $STDOUT)"
+[ "$(cat "$STUB_DIR/last-stop" 2>/dev/null)" = "stop $HA1" ] ||
+  fail "the successor's first listen must stop the predecessor by its job id (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live listen --lease 2 --wait 0
+[ "$STDOUT" = "null" ] || fail "nothing else queued"
+[ ! -e "$STUB_DIR/last-stop" ] || fail "the predecessor is stopped exactly once, never re-stopped"
+run 0 "$MESA" live say --lease 2 "Picking up where we left off."
+[ "$(jqs .role)" = "mesa" ] || fail "say --lease 2 writes the turn"
+ok "the successor's first listen --lease 2 takes the queued utterance and stops the predecessor exactly once"
+
+# ---- (e) a lease-less person still drives ----
+api 201 POST "/api/live/utterance" '{"text":"no lease at all"}'
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live listen --wait 0
+[ "$(jqs .text)" = "no lease at all" ] || fail "a lease-less listen still hears"
+[ ! -e "$STUB_DIR/last-stop" ] || fail "a lease-less listen stops nobody"
+run 0 "$MESA" live say "a person at a terminal"
+[ "$(jqs .text)" = "a person at a terminal" ] || fail "a lease-less say still speaks"
+ok "without --lease nothing is checked: listen/say behave exactly as before"
+
+# ---- (f) a failed successor spawn leaves the session untouched ----
+touch "$STUB_DIR/fail"
+run 1 "$MESA" live handoff "doomed"
+[ "$(jqe .error.code)" = "unavailable" ] || fail "a failed successor spawn: unavailable"
+rm -f "$STUB_DIR/fail"
+run 0 "$MESA" live status
+[ "$(jqs .status)" = "live" ] || fail "a failed handoff must NOT end the session"
+[ "$(jqs .agent_id)" = "$HA2" ] || fail "a failed handoff keeps the current agent (got $(jqs .agent_id))"
+[ "$(jqs .lease)" = "2" ] || fail "a failed handoff keeps the current lease (got $(jqs .lease))"
+run 0 "$MESA" live listen --lease 2 --wait 0
+[ "$STDOUT" = "null" ] || fail "the current lease still listens after a failed handoff"
+ok "a failed successor spawn: exit 1 unavailable, the session still live under the same agent and lease"
+
+# ---- (g) the note is validated; nothing is spawned for a bad one ----
+SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
+run 1 "$MESA" live handoff "   "
+[ "$(jqe .error.code)" = "validation" ] || fail "a blank note: validation"
+run 1 "$MESA" live handoff "$(head -c 8193 /dev/zero | tr '\0' x)"
+[ "$(jqe .error.code)" = "validation" ] || fail "a note over LIVE_TEXT_MAX: validation"
+[ "$(cat "$STUB_DIR/spawns")" = "$SPAWNS_BEFORE" ] || fail "a refused note must spawn nothing"
+run 0 "$MESA" live status
+[ "$(jqs .lease)" = "2" ] || fail "a refused note leaves the lease alone"
+ok "live handoff: a blank or over-long note is validation, and nothing is spawned"
+
+# ---- (h) mesa live context ----
+run 0 "$MESA" live context
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["agent_id","context_tokens","lease","session_id"]' ] ||
+  fail "live context: key set (got $STDOUT)"
+[ "$(jqs .session_id)" = "$HS" ] || fail "live context: session_id"
+[ "$(jqs .agent_id)" = "$HA2" ] || fail "live context: the current agent"
+[ "$(jqs .lease)" = "2" ] || fail "live context: the current lease"
+[ "$(jqs .context_tokens)" = "null" ] ||
+  fail "live context: the stub's uuid has no transcript, so context_tokens is null (got $(jqs .context_tokens))"
+run 2 "$MESA" live context --quiet
+[ -z "$STDOUT" ] || fail "live context --quiet: stdout must be empty on a usage error"
+[ "$(jqe .error.code)" = "usage" ] || fail "live context --quiet: unknown argument, exit 2"
+ok "live context: {session_id, agent_id, lease, context_tokens} for the current agent; --quiet is a usage error"
+
+# ---- (i) the page sees one session id throughout ----
+api 200 GET "/api/live"
+[ "$(jqb .session.id)" = "$HS" ] || fail "GET /api/live: the same session id across the handoff"
+[ "$(jqb .session.lease)" = "2" ] || fail "GET /api/live: the lease rides on the session"
+[ "$(jqb '.turns | length')" = "16" ] || fail "GET /api/live: every turn, both sides of the swap (got $(jqb '.turns | length'))"
+ok "GET /api/live: one session id and one transcript across the handoff — the page sees no break"
+
+# ---- (j) handoff --quiet: the same key set as status --quiet ----
+run 0 "$MESA" live status --quiet
+printf '%s' "$STDOUT" >"$TMP/ho-status-quiet.json"
+run 0 "$MESA" live handoff --quiet "a third generation"
+[ "$(jqs .lease)" = "3" ] || fail "handoff --quiet: lease 3"
+jq -e --slurpfile s "$TMP/ho-status-quiet.json" '(keys) == ($s[0] | keys)' <<<"$STDOUT" >/dev/null ||
+  fail "handoff --quiet must print the same key set as status --quiet"
+run 0 "$MESA" live handoff A note that mentions --quiet in passing.
+[ "$(jqs .lease)" = "4" ] || fail "handoff: --quiet typed after the note lands in the note"
+grep -q -- "Note: A note that mentions --quiet in passing." "$STUB_DIR/last-prompt" ||
+  fail "handoff: --quiet after the note is note text"
+ok "live handoff --quiet: the session's quiet shape (nothing to drop), and --quiet must come before the note"
+
+# Ending stops the newest agent — the one the row names.
+rm -f "$STUB_DIR/last-stop"
+HA_LAST=$(cat "$STUB_DIR/last-id")
+run 0 "$MESA" live stop
+[ "$(jqs .status)" = "ended" ] || fail "live stop after handoffs: ended"
+[ "$(cat "$STUB_DIR/last-stop")" = "stop $HA_LAST" ] ||
+  fail "live stop stops the agent currently holding the session (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+run 0 "$MESA" live start --no-agent
+run 1 "$MESA" live context
+[ "$(jqe .error.code)" = "unavailable" ] || fail "live context with no agent bound: unavailable"
+run 0 "$MESA" live stop >/dev/null
+ok "live stop after handoffs stops the current agent; live context on a --no-agent session is unavailable"
+
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
 
 
 echo "all $CHECKS checks passed"

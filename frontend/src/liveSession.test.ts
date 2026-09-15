@@ -15,6 +15,7 @@ function session(patch: Partial<LiveSession> = {}): LiveSession {
     updated_at: '2026-01-01 00:00:00',
     ended_at: null,
     working_since: null,
+    lease: 1,
     ...patch,
   }
 }

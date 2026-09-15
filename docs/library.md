@@ -819,7 +819,7 @@ as an error and both spawn sites treat it exactly like a failed spawn —
 `unavailable`, and the session that was just opened is ended again.
 
 What `core::live::agent_prompt(store, session_id)` injects is now only what the
-definition cannot know: `Drive mesa live session <id>.`, plus the recall block
+definition cannot know: `Drive mesa live session <id> (lease <n>).`, plus the recall block
 of earlier session summaries when there are any. Forking `mesa-live`
 **replaces** the built-in rather than extending it — the same rule the old
 config key followed, just moved: what the forked row holds is the whole of what

@@ -849,6 +849,20 @@ and max notebook words; then one line per stress mode (`bounded: yes/no`,
 `/tmp/impl-eval/out`) holds the raw per-session and
 per-question records beside every prompt, answer and grade.
 
+**Agent-driven mode** (`scripts/memory-eval/agent-mode.sh`, runbook in
+`scripts/memory-eval/AGENT-MODE.md`) is the same harness with every model
+step taken out of the script: `setup` / `begin` / `end` / `dream-prompt` /
+`snapshot` / `quiz` / `record-answer` / `record-grade` / `table` / `teardown`
+do the mechanical half — the throwaway db and `serve`, replaying the real
+turns under the recording stub, capturing the summariser and dream prompts
+through a `record` `live-summary` template, the per-session row, the
+`mesa backup` snapshot, the score table — and the agent step, the summary,
+the dream pass, the quiz answer and the grade are each performed by a Claude
+Code agent a supervisor dispatches, using only the `mesa` verbs the product
+allows. No `claude -p`; every file lands where `baseline.sh` puts it, and
+`table` prints the same score table through the shared `lib.sh` code plus
+per-baseline dream totals.
+
 ## The whiteboard (`mesa live board`, mesa task 1071)
 
 Everything above is a conversation held in words. Some answers are not words:

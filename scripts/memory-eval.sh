@@ -57,16 +57,9 @@ mkdir -p "$OUT"
 SRC_DB="${MESA_EVAL_SOURCE_DB:-$HOME/Library/Application Support/mesa/mesa.db}"
 export REAL_DB="$OUT/real.db"
 cp "$SRC_DB" "$REAL_DB"; rm -f "$REAL_DB-wal" "$REAL_DB-shm"
-all=$(sqlite3 "$REAL_DB" "select id from live_sessions order by id")
-with_turns=()
-for s in $all; do
-  [ "$s" -ge "$FROM" ] || continue
-  n=$(MESA_DB="$REAL_DB" "$MESA_BIN" live turns --session "$s" 2>/dev/null | jq '[.[] | select(.role == "user" and .text != null)] | length')
-  [ "${n:-0}" -gt 0 ] && with_turns+=("$s")
-done
-if [ "$SESSIONS_N" -gt 0 ] && [ "$SESSIONS_N" -lt "${#with_turns[@]}" ]; then
-  with_turns=("${with_turns[@]: -$SESSIONS_N}")
-fi
+# shellcheck source=memory-eval/lib.sh
+. "$EVAL_DIR/lib.sh"
+with_turns=($(real_sessions_with_turns "$FROM" "$SESSIONS_N"))
 [ "${#with_turns[@]}" -gt 0 ] || { echo "no real sessions with a user turn from $FROM on" >&2; exit 1; }
 export SESSIONS="${with_turns[*]}"
 export QUIZ="$EVAL_DIR/quiz.json"
@@ -126,14 +119,5 @@ jq -s --arg model "$MODEL" --argjson calls "$(wc -l < "$OUT/calls" | tr -d ' ')"
    '{model: $model, model_calls: $calls, budget: $budget, decay: $decay, sessions: ($sessions | split(" ") | map(tonumber)),
      baselines: [.[] | select(.baseline)], stress: [.[] | select(.mode)]}' ${results[@]+"${results[@]}"} ${stress[@]+"${stress[@]}"} > "$OUT/results.json"
 echo
-{
-  echo "baseline correct% stale% invented% unknown% leak% mean_prompt_tokens final_notebook_words max_notebook_words"
-  jq -r '.baselines[] | . as $b | (.quiz | length) as $n
-    | def pct(f): if $n == 0 then "-" else ((([.quiz[] | select(f)] | length) * 100 / $n) | round | tostring) end;
-      [ .baseline, pct(.verdict == "correct"), pct(.verdict == "stale"), pct(.verdict == "invented"), pct(.verdict == "unknown"), pct(.leak == true),
-        (if $n == 0 then "-" else (([.quiz[].injected_prompt_tokens] | add / $n) | round | tostring) end),
-        (.sessions[-1].notebook_words // 0), ([.sessions[].notebook_words] | max // 0) ] | @tsv' "$OUT/results.json"
-} | column -t
-echo
-jq -r '.stress[] | "stress \(.mode): \(.sessions) sessions, bounded: \(if .bounded then "yes" else "no" end) (max \(.max_notebook_words)/\(.budget) words), injections leaked into the notebook: \(.injections_leaked)/\(.injections_planted), mentioned in a summary: \(.injections_in_summaries // 0)/\(.injections_planted), budget refusals \(.budget_refusals), removal-guard refusals \(.removal_guard_refusals)"' "$OUT/results.json"
+score_table "$OUT/results.json"
 echo "model calls made: $(wc -l < "$OUT/calls" | tr -d ' '); raw results: $OUT/results.json"

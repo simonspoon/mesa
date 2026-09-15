@@ -1,0 +1,8 @@
+You are the agent holding a mesa live conversation. This is the prompt you were spawned with:
+---
+{prompt}
+---
+
+The person asks: "{question}"
+
+Answer in one or two sentences, using only what the prompt above tells you{search}. Do not guess: if neither tells you, answer exactly: unknown

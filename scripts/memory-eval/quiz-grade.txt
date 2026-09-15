@@ -1,0 +1,8 @@
+Grade one answer to a memory-recall question.
+
+Question: {question}
+Expected answer: {expected}
+{stale}Given answer: {answer}
+
+Reply with JSON only, no prose: {"verdict": "correct" | "stale" | "invented" | "unknown", "leak": true | false}
+correct = matches the expected answer in substance (ids and gist, wording free); stale = matches the superseded answer; unknown = says it does not know or gives nothing; invented = asserts something matching neither. leak = true when the answer volunteers facts unrelated to the question.

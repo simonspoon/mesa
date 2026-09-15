@@ -11,7 +11,7 @@ persona and the slash command can all change without rebuilding mesa:
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `claude --bg --agent swe -- {prompt}` |
 | `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent mesa-live --name {name} -- {prompt}` |
 | `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
-| `live-dream` | `mesa live memory dream` — the explicit, between-conversations pass that tidies the live notebook: merges duplicate entries, deletes superseded ones, one guarded command at a time (mesa task 1152, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
+| `live-dream` | The pass that tidies the live notebook — `mesa live memory dream` explicitly, and on its own at a handoff or when a conversation ends once `live::dream_wanted` says the notebook needs it (mesa task 1155): merges duplicate entries, deletes superseded ones, one guarded command at a time (mesa task 1152, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
 
 The defaults are **plain, editable command lines** (mesa task 1141): the
 program and the agent are both spelled out, so a user who wants a different
@@ -63,8 +63,9 @@ summariser by name (`docs/library.md`) — and a replacement template's job is t
 says.
 
 `live-dream` (mesa task 1152) is the same shape once more, for the third
-short-lived job: `mesa live memory dream` spawns it **between**
-conversations, never from a start or a stop, to tidy the live notebook —
+short-lived job: `mesa live memory dream` spawns it between conversations,
+and since mesa task 1155 a handoff and both stop sites spawn it on their own
+when the notebook needs it (never from a start), to tidy the live notebook —
 merge entries that say the same thing, delete what a newer entry supersedes,
 one guarded command at a time (`docs/live.md`, "Dreaming"). `{prompt}` is
 `core::live::dream_prompt` (the instructions, the project a contradiction

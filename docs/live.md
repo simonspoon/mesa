@@ -400,17 +400,26 @@ then, in order:
    name from `live_agent_dir`, the name suffixed `· lease <n>` so the Agents
    sidebar can tell the generations apart), with `live::handoff_prompt` as
    its prompt.
-2. On success, `Store::hand_off_live_session`: **one** `UPDATE` that moves
+2. If the notebook wants a dream pass — `live::dream_wanted`, a cheap
+   deterministic check decided *before* anything is spawned (mesa task
+   1155, "Dreaming" below) — spawns one through the `live-dream` template,
+   **best-effort**: a failed dream spawn is one stderr line and the handoff
+   goes through un-resting. It is spawned only once the successor exists,
+   so step 4's "nothing" still holds.
+3. On success, `Store::hand_off_live_session`: **one** `UPDATE` that moves
    the current `agent_id` into `predecessor_agent_id`, binds the
-   successor's receipt as `agent_id` and bumps `lease` — atomic, so no
-   reader ever sees the new agent under the old lease or the old agent
-   under the new one. The updated `LiveSession` is printed.
-3. On a failed spawn, **nothing**: the session is left exactly as it was —
-   still live, still the caller's, same lease — and the command is
-   `unavailable`, exit 1. This is deliberately *not* `start`'s
-   `bind_live_agent_or_end`: a conversation that could not be handed off
-   still has an agent driving it, so ending it would destroy a working call
-   over a spawn that can simply be retried.
+   successor's receipt as `agent_id`, bumps `lease` and — when a dream was
+   spawned — stamps `resting_since` and holds its receipt in
+   `dream_agent_id` — atomic, so no reader ever sees the new agent under
+   the old lease, the old agent under the new one, or a resting session
+   without its successor. The updated `LiveSession` is printed, and now
+   shows `resting_since`.
+4. On a failed successor spawn, **nothing**: the session is left exactly
+   as it was — still live, still the caller's, same lease, no dream spawned
+   — and the command is `unavailable`, exit 1. This is deliberately *not*
+   `start`'s `bind_live_agent_or_end`: a conversation that could not be
+   handed off still has an agent driving it, so ending it would destroy a
+   working call over a spawn that can simply be retried.
 
 Nothing is stopped by `handoff` itself, because the caller *is* the outgoing
 agent, and an agent must not stop itself — the reason the summariser is
@@ -479,7 +488,7 @@ else.
 ### `mesa live context`, and when to hand off
 
 The agent decides. `mesa live context` prints `{session_id, agent_id,
-lease, context_tokens}`: the occupied context of the driving agent's newest
+lease, context_tokens, dream}`: the occupied context of the driving agent's newest
 request, read live off its transcript by `cc::session_pulse` — the same
 reading the Agents sidebar row shows — after `agents::find_session_for_job`
 (the reverse of the cost guard's `find_job_for_session`: `claude agents
@@ -488,21 +497,37 @@ a lookup, never an inference) has turned the spawn receipt into the uuid
 the transcript is filed under. `context_tokens` is `null` when the
 transcript cannot be read (the pulse fails open); a session with no agent
 bound, or one `claude agents` does not list, is `unavailable`. CLI-only
-like `look`, and it takes no `--quiet`.
+like `look`, and it takes no `--quiet`. `dream` (mesa task 1155) is the
+reason the notebook wants a dream pass — `live::dream_wanted` over the
+active entries, the same check the handoff itself runs — or `null`, so the
+agent knows *before* handing off whether the handoff will rest the
+conversation.
 
 The agent definition's rule 11 names three triggers: the topic changing
 clearly, the person asking for a fresh start, or `context_tokens` above
-80000 (checked about every ten turns). On any of them: `handoff`, then end
-the turn — no further `listen`, and no announcement to the person.
+80000 (checked about every ten turns). On any of them: run `context`; when
+it reports a `dream` reason, say aloud first that you need to rest for a
+few minutes and will be right back; then `handoff`, then end the turn — no
+further `listen`. When no dream is due there is no announcement.
 
 ### What the person sees
 
-Nothing. The session id, the transcript and the page are the same before
-and after; `GET /api/live` carries the `lease` on the session but the hub
-does nothing with it. A turn spoken **during** the swap — after the
-outgoing agent's last `listen` and before the successor's first — simply
-waits in the queue like any other: `next_user_turn` hands it to the
-successor's first `listen --lease <n>`, in order, exactly once.
+Nothing, for a plain handoff. The session id, the transcript and the page
+are the same before and after; `GET /api/live` carries the `lease` on the
+session but the hub does nothing with it. A turn spoken **during** the swap
+— after the outgoing agent's last `listen` and before the successor's first
+— simply waits in the queue like any other: `next_user_turn` hands it to
+the successor's first `listen --lease <n>`, in order, exactly once.
+
+A handoff that dreams (mesa task 1155) is the one the person *does* see:
+the outgoing agent says it needs to rest for a few minutes, `GET /api/live`
+carries `resting_since` on the session, and the panel's aperture shows a
+**resting** state — listening's breathing halo in the agent's violet
+(`liveIndicator.ts`, ranked under being heard and over working, since the
+person can still talk and nothing is being worked on) — with the status
+line saying memory is being tidied. The watchdog posts no `stalled` notice
+while it is set: the successor is idle on purpose. Anything said meanwhile
+queues, and the successor takes it the moment the rest ends.
 
 ## What a turn may be
 
@@ -905,22 +930,78 @@ is a restore that would take the notebook over its budget. Restoring a
 merge's source leaves the merged row active too — the person decides which
 to keep, the store does not guess.
 
-**When it runs.** Only when asked: `mesa live memory dream` (CLI-only, no
-`--quiet`, like `search`). It is `conflict` while a conversation is live —
-the notebook is that conversation's prompt input, and two writers editing
-it under each other is the one thing "one command at a time" cannot make
-safe — so the live agent's rule 9 tells a person who asks it to rest or
-tidy that the pass runs once this conversation ends. With fewer than two
-active entries there is nothing to merge, and it prints
-`{"spawned": false, "reason": …}` (exit 0) rather than spawning an agent to
-find that out. Otherwise it spawns through the **sixth** config template,
-`live-dream` (`docs/config.md`; `{id}` the newest session's, `{name}` the
-literal `live memory dream`, `{prompt}` the block above), in the newest
-conversation's project folder exactly as the summariser resolves it, and
-prints `{"spawned": true, "receipt": …}`. A failed spawn is `unavailable`,
-exit 1 — unlike the summariser this is not best-effort, since the person
-asked. There is no idle timer, no watcher and no UI: a pass that fires on
-its own is a pass nobody reviews.
+**When it runs.** At two moments on its own (mesa task 1155), and on
+request. Both automatic triggers are gated by one **cheap, deterministic
+check — no model call** — `live::dream_wanted(&active entries)`, which
+answers a reason string when either
+
+- the active notebook holds at least `LIVE_DREAM_MIN_WORDS` (300, 60% of
+  the 500-word budget) — "notebook holds 312 of 500 words" — or
+- two entries look alike: the Jaccard similarity of their lowercase
+  alphanumeric token **sets** is at least `LIVE_DREAM_SIMILARITY` (0.5),
+  entries under three tokens never compared — "entries 12 and 18 look
+  alike", the first such pair by id;
+
+and `None` with fewer than two entries, since there is nothing to merge.
+The two moments:
+
+1. **When a conversation ends.** Both stop sites (`mesa live stop`, `DELETE
+   /api/live`) spawn the pass after the summariser when the session was
+   live and the check says so — **best-effort** exactly like the
+   summariser (a failed spawn is a stderr/log line, the printed record and
+   the response unchanged). The summariser and the dream then run
+   **concurrently**, and that is deliberate: every notebook edit either
+   makes goes through the guarded `Store` paths (the budget, the removal
+   share, a merge's net-words rule), so the worst case is one of the
+   summariser's two `add`s landing after the dream read the notebook — a
+   bullet the *next* pass sees — never a lost or half-written entry.
+2. **At a handoff.** Conversations now run indefinitely through handoffs,
+   so "between conversations" alone would never come. The handoff runs
+   the same check; when it wants a dream, the outgoing agent has already
+   said aloud that it needs to rest for a few minutes (rule 11, via
+   `mesa live context`'s `dream` key), the pass is spawned beside the
+   successor, and the session enters a **resting** state: `resting_since`
+   stamped and `dream_agent_id` holding the pass's receipt, in the same
+   `UPDATE` that binds the successor (`live_sessions`, migration index 59).
+   The successor's first `listen` is the **sync point**: while
+   `resting_since` is set it probes `agents::job_running(dream_agent_id)`
+   (`claude agents --json --all`; any failure — no binary, bad JSON, no
+   such row — reads as *not running*, so a probe that cannot answer never
+   strands the conversation) every `DREAM_POLL` (5s), until the job is gone
+   or the rest reaches `LIVE_REST_MAX` (10 minutes, measured from
+   `resting_since` on SQLite's own clock, so a listen killed and restarted
+   mid-rest resumes the budget rather than restarting it), then
+   `Store::wake_live_session` — one guarded `UPDATE`, one-shot like
+   `take_live_predecessor` — clears both and the ordinary loop proceeds
+   (predecessor stop, then the `--wait` budget, which starts **after**
+   waking). A lease-less `listen` takes the same path. Why `listen` rather
+   than `handoff` blocking: the outgoing agent runs `handoff` inside a Bash
+   tool call with its own timeout, and a child it detached to wait could
+   not outlive the `claude stop` the successor's first listen runs — the
+   successor's listen is the one process provably around for the whole
+   rest. `end_live_session` clears both columns too, so a conversation
+   ended mid-rest wakes nobody.
+
+Never otherwise mid-conversation: the explicit `mesa live memory dream`
+(CLI-only, no `--quiet`, like `search`) is unchanged — `conflict` while a
+conversation is live, a resting one included, since the notebook is that
+conversation's prompt input and two writers editing it under each other is
+the one thing "one command at a time" cannot make safe. The live agent's
+rule 9 tells a person who asks it to rest or tidy that the pass runs on its
+own at the next handoff or the end, and to hand off now if `context`
+reports a `dream`. With fewer than two active entries the explicit verb
+prints `{"spawned": false, "reason": …}` (exit 0) rather than spawning an
+agent to find that out. Otherwise it spawns through the **sixth** config
+template, `live-dream` (`docs/config.md`; `{id}` the newest session's,
+`{name}` the literal `live memory dream`, `{prompt}` the block above), in
+the newest conversation's project folder exactly as the summariser resolves
+it, and prints `{"spawned": true, "receipt": …}`. A failed spawn is
+`unavailable`, exit 1 — unlike the automatic passes this is not
+best-effort, since the person asked. The automatic passes share that spawn
+(`cli.rs::spawn_dream_pass`, and its API twin for the stop route) and make
+their own decision. There is still no idle timer, no watcher and no UI
+beyond the resting state: a pass that fires with no conversation to hear
+about it is a pass nobody reviews.
 
 The eval harness gained a matching opt-in `dream` baseline (below): `full`
 plus a synchronous dream step after every Nth session.

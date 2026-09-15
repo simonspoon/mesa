@@ -773,6 +773,7 @@ export function LiveHub({
       shouldNoticeStalled({
         working: current.working_since !== null,
         speaking,
+        resting: current.resting_since !== null,
         now,
         lastActivityAt: watchdog.current.lastActivityAt,
         alreadyNoticed: noticeInSpan(turns, 'stalled', spanStart),
@@ -2369,6 +2370,10 @@ export function LiveHub({
     // utterance and cleared when it goes back to waiting, so it arrives on the
     // 2s poll the page already makes and needs no state of its own here.
     working: session?.working_since != null,
+    // Resting at a handoff while the dream pass runs (mesa task 1155): the
+    // same poll, the same shape, and it outranks the span the outgoing
+    // agent may have left on the row.
+    resting: session?.resting_since != null,
   })
 
   const groups = turnGroups(turns)

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { drawAperture, simEnvelope, smoothLevel, type ApertureCtx } from './liveBand'
 import type { LiveIndicator } from './liveIndicator'
 
-const STATES: LiveIndicator[] = ['speaking', 'paused', 'hearing', 'working', 'listening']
+const STATES: LiveIndicator[] = ['speaking', 'paused', 'hearing', 'resting', 'working', 'listening']
 
 /** A fake 2D context that records every call and property write instead of
  *  drawing anything — enough to assert what `drawAperture` *did* without a
@@ -101,7 +101,7 @@ describe('drawAperture', () => {
   it('reduced motion is exactly half speed: reduced at 2t matches unreduced at t', () => {
     // `t * 0.5` is exact in floating point (a power-of-two scale), so the two
     // logs are byte-identical rather than merely close.
-    for (const state of ['working', 'listening'] as const) {
+    for (const state of ['working', 'listening', 'resting'] as const) {
       for (const t of [0.75, 1.23, 7.5]) {
         const full = fakeCtx()
         const half = fakeCtx()
@@ -109,6 +109,16 @@ describe('drawAperture', () => {
         drawAperture(half.ctx, 18, 18, state, 2 * t, 0.5, '#fff', true)
         expect(half.log).toEqual(full.log)
       }
+    }
+  })
+
+  it('resting is drawn exactly as listening is (mesa task 1155)', () => {
+    for (const t of [0.2, 1.7]) {
+      const listening = fakeCtx()
+      const resting = fakeCtx()
+      drawAperture(listening.ctx, 18, 18, 'listening', t, 0.5, '#fff', false)
+      drawAperture(resting.ctx, 18, 18, 'resting', t, 0.5, '#fff', false)
+      expect(resting.log).toEqual(listening.log)
     }
   })
 

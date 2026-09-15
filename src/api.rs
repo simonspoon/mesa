@@ -3414,6 +3414,64 @@ async fn spawn_live_summary(state: &AppState, session_id: i64, project_id: Optio
     }
 }
 
+/// The automatic dream at the end of a conversation (mesa task 1155), the
+/// twin of the CLI's `spawn_live_dream_after`: once the session has ended,
+/// spawns the `live-dream` template when `live::dream_wanted` says the
+/// notebook needs it. **Best-effort** like [`spawn_live_summary`] — a log
+/// line, never this route's answer — off the store lock for the shell-out,
+/// and concurrent with the summariser, which every guarded `Store` notebook
+/// write makes safe (`docs/live.md`, "Dreaming").
+async fn spawn_live_dream_after(state: &AppState, session_id: i64, project_id: Option<i64>) {
+    let (reason, dir, prompt, prompts) = {
+        let store = state.store.lock().unwrap();
+        let reason = match store.list_notebook(false) {
+            Ok(entries) => live::dream_wanted(&entries),
+            Err(e) => {
+                eprintln!(
+                    "live session {session_id}: could not read the notebook for a dream pass: {e}"
+                );
+                return;
+            }
+        };
+        let Some(reason) = reason else {
+            return;
+        };
+        let dir = match live_agent_dir(&store, project_id, session_id) {
+            Ok((dir, _)) => dir,
+            Err(e) => {
+                eprintln!(
+                    "live session {session_id}: could not spawn the dream pass ({reason}): {}",
+                    e.message
+                );
+                return;
+            }
+        };
+        let prompt = live::dream_prompt(&store, project_id);
+        let prompts = library::prompts(&store).unwrap_or_default();
+        (reason, dir, prompt, prompts)
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        agents::spawn_bg(
+            config::LIVE_DREAM,
+            &dir,
+            Some(session_id),
+            Some("live memory dream"),
+            Some(&prompt),
+            &prompts,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("live session {session_id}: could not spawn the dream pass ({reason}): {e}")
+        }
+        Err(e) => {
+            eprintln!("live session {session_id}: dream pass spawn panicked: {e}")
+        }
+    }
+}
+
 /// Ends the conversation, answering with the ended session. Shares
 /// `require_agent_access` with `start_live`: hanging up on an agent mid-turn is
 /// the other half of the same capability, and the pair must not drift apart.
@@ -3437,7 +3495,7 @@ async fn stop_live(
     require_agent_access(&state, &addr, &headers)?;
     // The store lock is dropped before the blocking `claude stop` shell-out,
     // like every other agent call in this file.
-    let (session, has_turns) = {
+    let (session, has_turns, was_live) = {
         let mut store = state.store.lock().unwrap();
         let Some(current) = store.current_live_session()? else {
             return Err(no_live_session());
@@ -3463,10 +3521,13 @@ async fn stop_live(
                     false
                 }
             };
-        (ended, has_turns)
+        (ended, has_turns, was_live)
     };
     if has_turns {
         spawn_live_summary(&state, session.id, session.project_id).await;
+    }
+    if was_live {
+        spawn_live_dream_after(&state, session.id, session.project_id).await;
     }
     if let Some(agent_id) = session.agent_id.clone() {
         let id = session.id;

@@ -149,7 +149,16 @@
 #      the Content-Type gate; `GET /api/live` answering `blocked: null` for a
 #      plain stub job and `"permission prompt"` once the stub reports the
 #      session's job blocked; and the notice absent from
-#      `mesa live memory search` while the agent's own turn is found.
+#      `mesa live memory search` while the agent's own turn is found;
+#  17. the automatic dream (mesa task 1155): `mesa live context` carrying
+#      `dream` (null under threshold), a handoff under threshold resting
+#      nothing and spawning no dream, two lookalike entries making `context`
+#      report a reason and the next handoff spawn the `live-dream` template
+#      beside the successor with `resting_since` set (on `live status` and
+#      `GET /api/live`), the explicit verb still `conflict` while resting,
+#      `listen --lease` waking the session once the stub reports the dream
+#      job done (predecessor still stopped once), and `live stop` spawning
+#      a dream over threshold and none under it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -236,9 +245,13 @@ case "\$1" in
     # for any transcript it cannot read. A \`blocked-id\` file naming a job
     # makes that row a session stuck on a permission prompt, the shape
     # \`GET /api/live\`'s derived \`blocked\` reads (mesa task 1157).
+    # A \`done-ids\` file listing the job makes its row \`state: "done"\`, the
+    # shape \`agents::job_running\` reads as finished (mesa task 1155).
     ID=\$(cat "$STUB_DIR/last-id" 2>/dev/null)
     if [ "\$ID" = "\$(cat "$STUB_DIR/blocked-id" 2>/dev/null)" ]; then
       printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"blocked","waitingFor":"permission prompt"}]\n' "\$ID"
+    elif grep -qx "\$ID" "$STUB_DIR/done-ids" 2>/dev/null; then
+      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"done"}]\n' "\$ID"
     else
       printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"working"}]\n' "\$ID"
     fi
@@ -249,7 +262,9 @@ case "\$1" in
     # job was stopped; a `stop-fail` marker makes it the failure that must
     # still leave a cleanly ended session behind.
     printf '%s\n' "\$*" > "$STUB_DIR/last-stop"
-    [ -e "$STUB_DIR/stop-fail" ] && { echo "No job matching" >&2; exit 1; }
+    # An `if`, not `[ … ] &&`: as the case's last command the bare test
+    # would make every ordinary stop exit 1 (mesa task 1155 caught it).
+    if [ -e "$STUB_DIR/stop-fail" ]; then echo "No job matching" >&2; exit 1; fi
     ;;
   *) exit 2 ;;
 esac
@@ -3222,8 +3237,9 @@ ok "live handoff: a blank or over-long note is validation, and nothing is spawne
 
 # ---- (h) mesa live context ----
 run 0 "$MESA" live context
-[ "$(jq -c 'keys' <<<"$STDOUT")" = '["agent_id","context_tokens","lease","session_id"]' ] ||
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["agent_id","context_tokens","dream","lease","session_id"]' ] ||
   fail "live context: key set (got $STDOUT)"
+[ "$(jqs .dream)" = "null" ] || fail "live context: a small notebook wants no dream (got $(jqs .dream))"
 [ "$(jqs .session_id)" = "$HS" ] || fail "live context: session_id"
 [ "$(jqs .agent_id)" = "$HA2" ] || fail "live context: the current agent"
 [ "$(jqs .lease)" = "2" ] || fail "live context: the current lease"
@@ -3232,7 +3248,7 @@ run 0 "$MESA" live context
 run 2 "$MESA" live context --quiet
 [ -z "$STDOUT" ] || fail "live context --quiet: stdout must be empty on a usage error"
 [ "$(jqe .error.code)" = "usage" ] || fail "live context --quiet: unknown argument, exit 2"
-ok "live context: {session_id, agent_id, lease, context_tokens} for the current agent; --quiet is a usage error"
+ok "live context: {session_id, agent_id, lease, context_tokens, dream} for the current agent; --quiet is a usage error"
 
 # ---- (i) the page sees one session id throughout ----
 api 200 GET "/api/live"
@@ -3415,6 +3431,121 @@ run 0 "$MESA" live stop >/dev/null
 run 1 "$MESA" live notice stalled
 [ "$(jqe .error.code)" = "not_found" ] || fail "live notice after the end: not_found"
 ok "live notice after the conversation ended: not_found"
+
+# =====================================================================
+# 17. The automatic dream (mesa task 1155): rest at a handoff, dream at a stop
+# =====================================================================
+#
+# `mesa live memory dream` stays explicit-only between conversations, but the
+# pass now also runs on its own, gated by one deterministic check
+# (`live::dream_wanted`: 300 active words, or two entries whose token sets
+# overlap by half): at a handoff — the outgoing agent announces a rest, the
+# dream is spawned beside the successor, the session rests until the
+# successor's first `listen` finds the dream job finished — and when a
+# conversation ends. The stub `claude agents` answers the dream job done from
+# a `done-ids` file, so the wait is one probe rather than ten minutes.
+
+# ---- (a) under threshold: context says no dream; a handoff rests nothing ----
+rm -f "$STUB_DIR/done-ids"
+run 0 "$MESA" live memory list
+DW=$(jqs '[.[] | .body | [scan("\\S+")] | length] | add // 0')
+[ "$DW" -lt 300 ] || fail "fixture: the notebook already holds $DW words, over the dream threshold"
+run 0 "$MESA" live start "live gate project"
+DS=$(jqs .id)
+DA1=$(jqs .agent_id)
+run 0 "$MESA" live context
+[ "$(jqs .dream)" = "null" ] || fail "live context: no dream is due under threshold (got $(jqs .dream))"
+SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
+run 0 "$MESA" live handoff "under threshold"
+[ "$(jqs .id)" = "$DS" ] || fail "dream handoff (a): the same session"
+[ "$(jqs .lease)" = "2" ] || fail "dream handoff (a): lease 2"
+[ "$(jqs .resting_since)" = "null" ] || fail "a handoff under threshold must not rest the session (got $(jqs .resting_since))"
+[ "$(cat "$STUB_DIR/spawns")" = "$((SPAWNS_BEFORE + 1))" ] ||
+  fail "a handoff under threshold spawns the successor and nothing else (got $(( $(cat "$STUB_DIR/spawns") - SPAWNS_BEFORE )) spawns)"
+DA2=$(jqs .agent_id)
+[ "$DA2" = "$(cat "$STUB_DIR/last-id")" ] && [ "$DA2" != "$DA1" ] ||
+  fail "dream handoff (a): agent_id is the successor's receipt"
+[ -z "$STDERR" ] || fail "dream handoff (a): nothing on stderr (got: $STDERR)"
+ok "the automatic dream: under threshold live context reports dream null and a handoff rests nothing and spawns no dream"
+
+# ---- (b) two lookalike entries: context reports why, the handoff rests ----
+run 0 "$MESA" live memory add "DREAM-DUP-A: prefers the roadmap read out first every morning."
+DD_A=$(jqs .id)
+run 0 "$MESA" live memory add "DREAM-DUP-B: prefers the roadmap read out first every evening."
+DD_B=$(jqs .id)
+run 0 "$MESA" live context
+[ "$(jqs .dream)" = "entries $DD_A and $DD_B look alike" ] ||
+  fail "live context: two lookalike entries are a dream reason naming both ids (got $(jqs .dream))"
+SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
+run 0 "$MESA" live handoff "resting handoff"
+[ "$(jqs .lease)" = "3" ] || fail "dream handoff (b): lease 3"
+[ "$(jqs .status)" = "live" ] || fail "dream handoff (b): the session stays live"
+[ "$(jqs .resting_since)" != "null" ] || fail "a handoff that dreams must rest the session (got $STDOUT)"
+[ "$(cat "$STUB_DIR/spawns")" = "$((SPAWNS_BEFORE + 2))" ] ||
+  fail "a handoff that dreams spawns the successor AND the dream (got $(( $(cat "$STUB_DIR/spawns") - SPAWNS_BEFORE )) spawns)"
+DREAM_ID=$(cat "$STUB_DIR/last-id")
+DA3=$(jqs .agent_id)
+[ "$DA3" = "deadbeef-$(( $(cat "$STUB_DIR/spawns") - 1 ))" ] ||
+  fail "dream handoff (b): agent_id is the successor's receipt, spawned before the dream (got $DA3)"
+[ "$DA3" != "$DREAM_ID" ] || fail "dream handoff (b): the dream's receipt must not be bound as the agent"
+[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
+  fail "the handoff's dream spawn must go through the live-dream template (got $(cat "$STUB_DIR/last-flags" | tr '\n' ' '))"
+grep -q "You are tidying mesa's notebook between conversations" "$STUB_DIR/last-prompt" ||
+  fail "the handoff's dream spawn must carry DREAM_PROMPT"
+grep -q "DREAM-DUP-A" "$STUB_DIR/last-prompt" && grep -q "DREAM-DUP-B" "$STUB_DIR/last-prompt" ||
+  fail "the handoff's dream spawn must carry the active notebook"
+[ -z "$STDERR" ] || fail "dream handoff (b): nothing on stderr (got: $STDERR)"
+run 0 "$MESA" live status
+[ "$(jqs .resting_since)" != "null" ] || fail "live status: resting_since rides on the session"
+api 200 GET "/api/live"
+[ "$(jqb .session.resting_since)" != "null" ] || fail "GET /api/live: resting_since must ride on the session"
+[ "$(jq -c '.session | has("dream_agent_id")' <<<"$BODY")" = "false" ] ||
+  fail "GET /api/live: the dream's receipt is store-only, never on the session"
+run 1 "$MESA" live memory dream
+[ "$(jqe .error.code)" = "conflict" ] || fail "the explicit dream verb is still conflict while a session rests"
+ok "the automatic dream: two lookalike entries make context report why, and the handoff spawns live-dream beside the successor and rests the session — on live status and GET /api/live"
+
+# ---- (c) the successor's first listen waits out the rest, then wakes ----
+printf '%s\n' "$DREAM_ID" > "$STUB_DIR/done-ids"
+api 201 POST "/api/live/utterance" '{"text":"said while resting"}'
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live listen --lease 3 --wait 0
+[ "$(jqs .text)" = "said while resting" ] ||
+  fail "listen --lease 3: once the dream job is done the queued utterance is handed over (got $STDOUT)"
+[ "$(cat "$STUB_DIR/last-stop" 2>/dev/null)" = "stop $DA2" ] ||
+  fail "the woken successor's first listen still stops the predecessor (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+[ -z "$STDERR" ] || fail "a rest that ends before its cap warns about nothing (got: $STDERR)"
+run 0 "$MESA" live status
+[ "$(jqs .resting_since)" = "null" ] || fail "listen must wake the session: resting_since back to null (got $(jqs .resting_since))"
+[ "$(jqs .lease)" = "3" ] || fail "a wake moves nothing but the rest"
+api 200 GET "/api/live"
+[ "$(jqb .session.resting_since)" = "null" ] || fail "GET /api/live: woken"
+rm -f "$STUB_DIR/done-ids"
+ok "the automatic dream: listen --lease wakes a resting session once claude agents reports the dream done, hands the queued turn over and stops the predecessor once"
+
+# ---- (d) live stop: a dream over threshold, none under it ----
+run 0 "$MESA" live say --lease 3 "A turn, so the summariser has something to read."
+SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
+run 0 "$MESA" live stop
+[ "$(jqs .status)" = "ended" ] || fail "live stop (over threshold): ended"
+[ "$(jqs .resting_since)" = "null" ] || fail "an ended session is never resting"
+[ "$(cat "$STUB_DIR/spawns")" = "$((SPAWNS_BEFORE + 2))" ] ||
+  fail "live stop over threshold spawns the summariser AND the dream (got $(( $(cat "$STUB_DIR/spawns") - SPAWNS_BEFORE )) spawns)"
+[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
+  fail "live stop's dream spawn must go through the live-dream template (got $(cat "$STUB_DIR/last-flags" | tr '\n' ' '))"
+[ "$(cat "$STUB_DIR/last-cwd")" = "$WORKDIR" ] ||
+  fail "live stop's dream runs in the conversation's project folder (got $(cat "$STUB_DIR/last-cwd"))"
+run 0 "$MESA" live memory delete "$DD_A"
+run 0 "$MESA" live memory delete "$DD_B"
+run 0 "$MESA" live start "live gate project"
+run 0 "$MESA" live say "One turn, under threshold."
+SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
+run 0 "$MESA" live stop
+[ "$(cat "$STUB_DIR/spawns")" = "$((SPAWNS_BEFORE + 1))" ] ||
+  fail "live stop under threshold spawns the summariser alone (got $(( $(cat "$STUB_DIR/spawns") - SPAWNS_BEFORE )) spawns)"
+[ "$(sed -n 5p "$STUB_DIR/last-flags")" = "Live gate project: live $(jqs .id) summary" ] ||
+  fail "live stop under threshold: the one spawn is the summariser (got $(sed -n 5p "$STUB_DIR/last-flags"))"
+ok "the automatic dream: live stop spawns the dream beside the summariser over threshold and only the summariser under it"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

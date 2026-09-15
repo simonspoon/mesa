@@ -92,7 +92,7 @@ describe('watchdogAfterPoll', () => {
       now: 2000,
     })
     const now = 2000 + STALL_MS + 5000
-    const stale = { working: true, speaking: false, now, alreadyNoticed: false }
+    const stale = { working: true, speaking: false, resting: false, now, alreadyNoticed: false }
     // The poll carrying the reply: the clock is reset first…
     const replied = watchdogAfterPoll(working, {
       workingSince: '2026-01-01 00:00:05',
@@ -170,7 +170,14 @@ describe('noticeInSpan', () => {
 })
 
 describe('shouldNoticeStalled', () => {
-  const quiet = { working: true, speaking: false, now: 100_000, lastActivityAt: 0, alreadyNoticed: false }
+  const quiet = {
+    working: true,
+    speaking: false,
+    resting: false,
+    now: 100_000,
+    lastActivityAt: 0,
+    alreadyNoticed: false,
+  }
 
   it('fires only once the silence reaches STALL_MS while working', () => {
     expect(shouldNoticeStalled(quiet)).toBe(true)
@@ -182,6 +189,13 @@ describe('shouldNoticeStalled', () => {
     expect(shouldNoticeStalled({ ...quiet, working: false })).toBe(false)
     expect(shouldNoticeStalled({ ...quiet, speaking: true })).toBe(false)
     expect(shouldNoticeStalled({ ...quiet, alreadyNoticed: true })).toBe(false)
+  })
+
+  it('never fires while the session is resting at a handoff (mesa task 1155)', () => {
+    // The successor is idle on purpose, waiting out the dream pass — silence
+    // there is not a stall, however long it lasts.
+    expect(shouldNoticeStalled({ ...quiet, resting: true })).toBe(false)
+    expect(shouldNoticeStalled({ ...quiet, resting: true, now: 10 * STALL_MS })).toBe(false)
   })
 })
 

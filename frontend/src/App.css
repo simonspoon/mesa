@@ -8917,6 +8917,12 @@ button:focus-visible,
   color: var(--violet);
 }
 
+/* Resting (mesa task 1155): listening's breathing halo in the agent's own
+   colour — the agent is away for a few minutes, not the microphone. */
+.live-band-resting {
+  color: var(--violet);
+}
+
 /* The microphone open and the room quiet: low, slow and muted — present
    enough to say the page is listening, dim enough that nobody reads it as
    speech. */

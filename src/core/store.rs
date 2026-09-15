@@ -895,6 +895,15 @@ const MIGRATIONS: &[&str] = &[
     // because a turn is spoken and shown exactly once (`played_at`), which is
     // what a status report read aloud needs.
     "ALTER TABLE live_turns ADD COLUMN notice TEXT;",
+    // Task 1155: the automatic dream pass. A handoff whose notebook wants a
+    // dream puts the session to **rest** — `resting_since` stamped and
+    // `dream_agent_id` holding the dream agent's receipt, in the same UPDATE
+    // that binds the successor — and the successor's first `listen` waits
+    // for that job to finish (or ten minutes) before `wake_live_session`
+    // clears both. `dream_agent_id` never rides on `LiveSession`, like
+    // `predecessor_agent_id`; `resting_since` does, so the page can show it.
+    "ALTER TABLE live_sessions ADD COLUMN resting_since TEXT;
+    ALTER TABLE live_sessions ADD COLUMN dream_agent_id TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1074,7 +1083,16 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 // ---- mesa live (task 855) ----
 
 const LIVE_SESSION_COLUMNS: &str = "id, project_id, agent_id, status, route, started_at, \
-     updated_at, ended_at, context, working_since, window_box, lease";
+     updated_at, ended_at, context, working_since, window_box, lease, resting_since";
+
+/// What [`Store::live_rest`] answers for a resting session (mesa task 1155).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveRest {
+    /// The dream agent's spawn receipt — what `listen` waits on.
+    pub dream_agent_id: Option<String>,
+    /// How long the session has rested, in whole seconds.
+    pub seconds: i64,
+}
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
      created_at, delivered_at, played_at, notice";
@@ -1163,6 +1181,7 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
         ended_at: row.get(7)?,
         working_since: row.get(9)?,
         lease: row.get(11)?,
+        resting_since: row.get(12)?,
     })
 }
 
@@ -4578,9 +4597,12 @@ impl Store {
             // in the middle of, the loop it was in is over (mesa task 894).
             // A handoff still in flight is over too: nobody's first `listen`
             // will come to stop the outgoing agent, and `stop` already stops
-            // whichever agent the row names (mesa task 1150).
+            // whichever agent the row names (mesa task 1150). A rest is over
+            // as well (mesa task 1155): nobody will wake an ended session,
+            // and the dream agent finishes on its own.
             "UPDATE live_sessions SET status = ?2, working_since = NULL, \
-             predecessor_agent_id = NULL, ended_at = datetime('now'), \
+             predecessor_agent_id = NULL, resting_since = NULL, dream_agent_id = NULL, \
+             ended_at = datetime('now'), \
              updated_at = datetime('now') WHERE id = ?1 AND status = ?3",
             (id, LiveStatus::Ended.as_str(), LiveStatus::Live.as_str()),
         )?;
@@ -4609,16 +4631,32 @@ impl Store {
     /// itself, not a pre-read — a spawn takes real wall time, and a session
     /// ended in between must not have an ended row rebound to a successor
     /// nobody will ever stop.
+    ///
+    /// `dream_agent_id` (mesa task 1155) is the receipt of a dream pass the
+    /// handoff spawned alongside the successor: when given, the same UPDATE
+    /// stamps `resting_since` and holds the receipt, so the session is
+    /// resting from the instant the successor holds it and never for a
+    /// moment before. `None` is the plain handoff, both columns left as
+    /// they were (NULL, since a resting session is woken before anything
+    /// else happens to it).
     pub fn hand_off_live_session(
         &mut self,
         id: i64,
         successor_agent_id: Option<&str>,
+        dream_agent_id: Option<&str>,
     ) -> Result<LiveSession> {
         let changed = self.conn.execute(
             "UPDATE live_sessions SET predecessor_agent_id = agent_id, agent_id = ?2, \
-             lease = lease + 1, updated_at = datetime('now') \
+             lease = lease + 1, updated_at = datetime('now'), \
+             resting_since = CASE WHEN ?4 IS NULL THEN resting_since ELSE datetime('now') END, \
+             dream_agent_id = COALESCE(?4, dream_agent_id) \
              WHERE id = ?1 AND status = ?3",
-            (id, successor_agent_id, LiveStatus::Live.as_str()),
+            (
+                id,
+                successor_agent_id,
+                LiveStatus::Live.as_str(),
+                dream_agent_id,
+            ),
         )?;
         if changed == 0 {
             // `get_live_session` is the not_found for an unknown id; a row that
@@ -4643,6 +4681,60 @@ impl Store {
             )));
         }
         Ok(())
+    }
+
+    /// Whether the session is resting (mesa task 1155), and if so the dream
+    /// agent's receipt and how long it has rested — seconds on **SQLite's**
+    /// clock, the one `resting_since` was stamped by, so a `listen` killed
+    /// and restarted mid-rest resumes the same ten-minute budget rather
+    /// than starting a fresh one. `None` for a session that is not resting.
+    pub fn live_rest(&self, id: i64) -> Result<Option<LiveRest>> {
+        self.get_live_session(id)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dream_agent_id, \
+                        CAST((julianday('now') - julianday(resting_since)) * 86400 AS INTEGER) \
+                 FROM live_sessions WHERE id = ?1 AND resting_since IS NOT NULL",
+                [id],
+                |r| {
+                    Ok(LiveRest {
+                        dream_agent_id: r.get(0)?,
+                        seconds: r.get::<_, i64>(1)?.max(0),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Wakes a resting session (mesa task 1155): clears `resting_since` and
+    /// `dream_agent_id`, answering the dream agent's receipt the row held.
+    /// One-shot like [`take_live_predecessor`] — the clear is guarded on the
+    /// very stamp that was read, so of two listeners racing on one rest
+    /// exactly one learns the receipt and a later call finds `None`. `None`
+    /// too for a session that was not resting, and for a rest whose dream
+    /// printed no receipt (which a handoff never records, since there would
+    /// be nothing to wait for).
+    pub fn wake_live_session(&mut self, id: i64) -> Result<Option<String>> {
+        let rest: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT resting_since, dream_agent_id FROM live_sessions \
+                 WHERE id = ?1 AND resting_since IS NOT NULL",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((since, dream)) = rest else {
+            return Ok(None);
+        };
+        let cleared = self.conn.execute(
+            "UPDATE live_sessions SET resting_since = NULL, dream_agent_id = NULL, \
+             updated_at = datetime('now') \
+             WHERE id = ?1 AND resting_since = ?2",
+            (id, &since),
+        )?;
+        Ok((cleared == 1).then_some(dream).flatten())
     }
 
     /// The outgoing agent's job id, handed out **exactly once**: the clear is
@@ -11072,7 +11164,7 @@ mod tests {
         store.bind_live_agent(session.id, Some("first")).unwrap();
 
         let handed = store
-            .hand_off_live_session(session.id, Some("second"))
+            .hand_off_live_session(session.id, Some("second"), None)
             .unwrap();
         assert_eq!(handed.lease, 2);
         assert_eq!(handed.agent_id.as_deref(), Some("second"));
@@ -11082,17 +11174,17 @@ mod tests {
             Some("first")
         );
         // A successor whose spawn printed no receipt is still a handoff.
-        let again = store.hand_off_live_session(session.id, None).unwrap();
+        let again = store.hand_off_live_session(session.id, None, None).unwrap();
         assert_eq!(again.lease, 3);
         assert_eq!(again.agent_id, None);
 
         store.end_live_session(session.id).unwrap();
         let err = store
-            .hand_off_live_session(session.id, Some("third"))
+            .hand_off_live_session(session.id, Some("third"), None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)), "{err:?}");
         assert!(matches!(
-            store.hand_off_live_session(999, None),
+            store.hand_off_live_session(999, None, None),
             Err(Error::NotFound(_))
         ));
     }
@@ -11108,7 +11200,7 @@ mod tests {
         let ended = store.end_live_session(session.id).unwrap();
 
         let err = store
-            .hand_off_live_session(session.id, Some("second"))
+            .hand_off_live_session(session.id, Some("second"), None)
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)), "{err:?}");
         assert!(err.to_string().contains("has ended"), "{err}");
@@ -11126,7 +11218,7 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let session = store.start_live_session(None).unwrap();
         store.check_live_lease(session.id, 1).unwrap();
-        store.hand_off_live_session(session.id, None).unwrap();
+        store.hand_off_live_session(session.id, None, None).unwrap();
         let err = store.check_live_lease(session.id, 1).unwrap_err();
         assert!(matches!(err, Error::Conflict(_)), "{err:?}");
         assert!(err.to_string().contains("current lease is 2"), "{err}");
@@ -11147,7 +11239,7 @@ mod tests {
         assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
         store.bind_live_agent(session.id, Some("first")).unwrap();
         store
-            .hand_off_live_session(session.id, Some("second"))
+            .hand_off_live_session(session.id, Some("second"), None)
             .unwrap();
         assert_eq!(
             store.take_live_predecessor(session.id).unwrap().as_deref(),
@@ -11156,10 +11248,57 @@ mod tests {
         assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
 
         store
-            .hand_off_live_session(session.id, Some("third"))
+            .hand_off_live_session(session.id, Some("third"), None)
             .unwrap();
         store.end_live_session(session.id).unwrap();
         assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
+    }
+
+    /// A handoff carrying a dream receipt (mesa task 1155) rests the session
+    /// in the same write that binds the successor; a plain handoff rests
+    /// nothing; the wake answers the receipt exactly once; ending clears a
+    /// rest nobody woke.
+    #[test]
+    fn hand_off_with_a_dream_rests_the_session_and_wake_answers_once() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert_eq!(session.resting_since, None);
+        assert_eq!(store.live_rest(session.id).unwrap(), None);
+        assert_eq!(store.wake_live_session(session.id).unwrap(), None);
+
+        let plain = store
+            .hand_off_live_session(session.id, Some("second"), None)
+            .unwrap();
+        assert_eq!(plain.resting_since, None);
+        assert_eq!(store.live_rest(session.id).unwrap(), None);
+
+        let resting = store
+            .hand_off_live_session(session.id, Some("third"), Some("dream-1"))
+            .unwrap();
+        assert_eq!(resting.lease, 3);
+        assert_eq!(resting.agent_id.as_deref(), Some("third"));
+        assert!(resting.resting_since.is_some());
+        let rest = store.live_rest(session.id).unwrap().expect("resting");
+        assert_eq!(rest.dream_agent_id.as_deref(), Some("dream-1"));
+        assert!(rest.seconds >= 0 && rest.seconds < 60, "{rest:?}");
+
+        assert_eq!(
+            store.wake_live_session(session.id).unwrap().as_deref(),
+            Some("dream-1")
+        );
+        let woken = store.get_live_session(session.id).unwrap();
+        assert_eq!(woken.resting_since, None);
+        assert_eq!(woken.lease, 3, "a wake moves nothing but the rest");
+        assert_eq!(store.wake_live_session(session.id).unwrap(), None);
+        assert_eq!(store.live_rest(session.id).unwrap(), None);
+
+        store
+            .hand_off_live_session(session.id, Some("fourth"), Some("dream-2"))
+            .unwrap();
+        let ended = store.end_live_session(session.id).unwrap();
+        assert_eq!(ended.resting_since, None);
+        assert_eq!(store.wake_live_session(session.id).unwrap(), None);
+        assert!(matches!(store.live_rest(999), Err(Error::NotFound(_))));
     }
 
     /// A route is a hash path the page already renders, not free text — the
@@ -11953,15 +12092,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            59,
-            "a fresh db should report user_version 59"
+            60,
+            "a fresh db should report user_version 60"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 59);
+        assert_eq!(version, 60);
     }
 
     /// Pins the dream-pass migration (mesa task 1152) at index 57: the
@@ -11974,6 +12113,39 @@ mod tests {
             "migration {MERGE} is no longer the notebook merge migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
+    }
+
+    /// Pins the rest columns (mesa task 1155) at index 59, and checks that a
+    /// db from before them reads its sessions back as not resting.
+    #[test]
+    fn the_live_rest_columns_arrive_at_migration_59() {
+        const REST: usize = 59;
+        assert!(
+            MIGRATIONS[REST].contains("ADD COLUMN resting_since")
+                && MIGRATIONS[REST].contains("ADD COLUMN dream_agent_id"),
+            "migration {REST} is no longer the live rest migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..REST] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", REST as i64)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO live_sessions (status, started_at, updated_at) \
+                 VALUES ('live', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let session = store.current_live_session().unwrap().expect("the old row");
+        assert_eq!(session.resting_since, None);
+        assert_eq!(store.live_rest(session.id).unwrap(), None);
     }
 
     /// Pins the notice column (mesa task 1157) at index 58, and checks that a

@@ -3618,6 +3618,14 @@ pub struct LiveSession {
     /// on yet reads as null, so a session started with `--no-agent` never
     /// claims someone is working on it.
     pub working_since: Option<String>,
+    /// When the session went to **rest** at a handoff (mesa task 1155), or
+    /// null. A handoff whose notebook wants a dream pass (`live::dream_wanted`)
+    /// spawns one beside the successor and stamps this in the same write;
+    /// the successor's first `listen` waits for the dream agent to finish
+    /// (or ten minutes) and clears it. The person can still talk — turns
+    /// queue as ever — but nothing is being worked on, which is what the
+    /// page shows. Cleared by ending the session.
+    pub resting_since: Option<String>,
 }
 
 /// One utterance in a live conversation — a dictated line from the user, or a

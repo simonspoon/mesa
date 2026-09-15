@@ -1765,7 +1765,7 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Print how full the driving agent's context is: `{session_id, agent_id, lease, context_tokens}`
+    /// Print how full the driving agent's context is: `{session_id, agent_id, lease, context_tokens, dream}`
     ///
     /// How the agent decides a handoff is due (mesa task 1150): the occupied
     /// context of its own newest request, read live off the transcript the
@@ -1773,7 +1773,10 @@ EXAMPLES
     /// `claude agents --json --all` from the session's spawn receipt.
     /// `context_tokens` is null when the transcript cannot be read; a session
     /// with no agent bound, or one `claude agents` does not list, is
-    /// `unavailable`. CLI-only, like `look`; takes no --quiet.
+    /// `unavailable`. `dream` is why the notebook wants a dream pass — the
+    /// reason the next handoff will rest the conversation to run one (mesa
+    /// task 1155) — or null when it does not. CLI-only, like `look`; takes
+    /// no --quiet.
     Context,
     /// Record mesa's own report about the agent as a spoken turn; prints it
     ///
@@ -4472,6 +4475,16 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
 /// audible pause, slow enough that a waiting agent is not a spinning CPU.
 const LISTEN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How often a `live listen` on a **resting** session asks `claude agents`
+/// whether the dream agent has finished (mesa task 1155). A shell-out, not a
+/// store read, so every five seconds rather than every tick.
+const DREAM_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest a session rests, measured from `resting_since` on the store's
+/// own clock: a dream agent that wedges, or a `claude agents` that keeps
+/// listing a finished job, must not hold the conversation for ever.
+const LIVE_REST_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Seconds since the epoch, for naming the default screenshot file. Enough to
 /// keep two looks at one conversation from landing on the same path, and short
 /// enough to read out of a `ls` — a temp file's name is a convenience, not an
@@ -4716,6 +4729,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             let ended = store.end_live_session(session.id)?;
             if was_live {
                 spawn_live_summary(&mut store, &ended);
+                spawn_live_dream_after(&mut store, &ended);
             }
             stop_live_agent(&ended);
             print_live_session(&ended, quiet);
@@ -4729,6 +4743,12 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
         LiveCmd::Listen { wait, lease, quiet } => {
             let session = current_live_session(&store)?;
             if let Some(lease) = lease {
+                store.check_live_lease(session.id, lease)?;
+            }
+            wait_out_live_rest(&mut store, session.id)?;
+            if let Some(lease) = lease {
+                // Re-checked after the rest: a lease may have moved while the
+                // dream ran, and a stale successor must not take a turn.
                 store.check_live_lease(session.id, lease)?;
                 // The successor's first lease-carrying listen is what stops the
                 // outgoing agent (mesa task 1150): an agent must not stop
@@ -4859,6 +4879,12 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // generation it is.
             let (dir, name) = live_agent_dir(&store, session.project_id, session.id)?;
             let successor = format!("{name} · lease {lease}");
+            // Whether the notebook wants a dream pass is decided before
+            // anything is spawned (mesa task 1155) — a cheap deterministic
+            // read, no model call — and the pass itself is spawned only
+            // once the successor exists, so a failed successor spawn still
+            // changes nothing at all.
+            let dream_wanted = live::dream_wanted(&store.list_notebook(false)?);
             let spawned = live::ensure_agent_definition(&store).and_then(|_| {
                 let prompts = library::prompts(&store).map_err(|e| e.to_string())?;
                 agents::spawn_bg(
@@ -4882,24 +4908,43 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                     session.id
                 ))
             })?;
+            // The dream pass rides the handoff (mesa task 1155): best-effort,
+            // like the summariser — a failed spawn is one stderr line and the
+            // handoff goes through un-resting. A spawn that printed no
+            // receipt rests nothing either, since there would be no job to
+            // wait for.
+            let dream = dream_wanted.and_then(|reason| {
+                match spawn_dream_pass(&store, &dir, Some(session.id), session.project_id) {
+                    Ok(receipt) => receipt,
+                    Err(e) => {
+                        eprintln!(
+                            "live session {}: could not spawn the dream pass ({reason}), so the \
+                             handoff does not rest: {e}",
+                            session.id
+                        );
+                        None
+                    }
+                }
+            });
             // The rebind is guarded on `status = 'live'`: a session ended
             // while the successor was spawning is refused, and a successor
             // bound to nothing must not be left running — best-effort, the
             // shape of `stop_live_agent`.
-            let session = match store.hand_off_live_session(session.id, job.as_deref()) {
-                Ok(session) => session,
-                Err(e) => {
-                    if let Some(job) = job.as_deref()
-                        && let Err(stop) = agents::stop(job)
-                    {
-                        eprintln!(
-                            "live session {}: could not stop the successor agent {job}: {stop}",
-                            session.id
-                        );
+            let session =
+                match store.hand_off_live_session(session.id, job.as_deref(), dream.as_deref()) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        if let Some(job) = job.as_deref()
+                            && let Err(stop) = agents::stop(job)
+                        {
+                            eprintln!(
+                                "live session {}: could not stop the successor agent {job}: {stop}",
+                                session.id
+                            );
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-            };
+                };
             print_live_session(&session, quiet);
         }
         LiveCmd::Context => {
@@ -4923,11 +4968,15 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                     ))
                 })?;
             let pulse = cc::session_pulse(&uuid);
+            // Why the next handoff would rest the conversation to dream (mesa
+            // task 1155), so the agent can announce it — or hand off now.
+            let dream = live::dream_wanted(&store.list_notebook(false)?);
             print_json(&serde_json::json!({
                 "session_id": session.id,
                 "agent_id": agent_id,
                 "lease": session.lease,
                 "context_tokens": pulse.context_tokens,
+                "dream": dream,
             }));
         }
         LiveCmd::Look { output } => {
@@ -5015,17 +5064,19 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
 }
 
 /// `mesa live memory dream` (mesa task 1152): spawns the agent that tidies
-/// the notebook, through the `live-dream` template. Explicit-trigger only —
-/// no timer, no watcher — and only between conversations: with a session
-/// live it is `conflict`, since the notebook is that conversation's prompt
-/// input and the two would edit it under each other. Fewer than two active
-/// entries is nothing to merge, so nothing is spawned and the reason is
-/// printed rather than an error. The pass belongs to no conversation, so it
-/// borrows the newest one's folder (through [`live_agent_dir`], exactly as
+/// the notebook, through the `live-dream` template. The explicit verb — and
+/// only between conversations: with a session live it is `conflict`, since
+/// the notebook is that conversation's prompt input and the two would edit
+/// it under each other (a resting session is live too). Fewer than two
+/// active entries is nothing to merge, so nothing is spawned and the reason
+/// is printed rather than an error. The pass belongs to no conversation, so
+/// it borrows the newest one's folder (through [`live_agent_dir`], exactly as
 /// the summariser does) and passes its id as `{id}`; on an install that has
 /// never held one it runs in the workspace with `{id}` empty. Unlike the
 /// summariser this is not best-effort: the person asked for it, so a failed
-/// spawn is `unavailable`, exit 1.
+/// spawn is `unavailable`, exit 1. The two automatic triggers (mesa task
+/// 1155) — a handoff and `live stop` — share [`spawn_dream_pass`] and make
+/// their own decision through `live::dream_wanted`.
 fn spawn_live_dream(store: &mut Store) -> Result<()> {
     if let Some(session) = store.current_live_session()? {
         return Err(Error::Conflict(format!(
@@ -5057,19 +5108,120 @@ fn spawn_live_dream(store: &mut Store) -> Result<()> {
             None,
         ),
     };
-    let prompt = live::dream_prompt(store, project_id);
-    let prompts = library::prompts(store)
+    let receipt = spawn_dream_pass(store, &dir, session_id, project_id)
         .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))?;
-    let receipt = agents::spawn_bg(
+    print_json(&serde_json::json!({ "spawned": true, "receipt": receipt }));
+    Ok(())
+}
+
+/// The spawn itself: the `live-dream` template in `dir`, `{id}` the given
+/// session's, the prompt `live::dream_prompt` for `project_id`. Answers the
+/// receipt (`None` when the template printed none); the caller decides what
+/// a failure means.
+fn spawn_dream_pass(
+    store: &Store,
+    dir: &str,
+    session_id: Option<i64>,
+    project_id: Option<i64>,
+) -> std::result::Result<Option<String>, String> {
+    let prompt = live::dream_prompt(store, project_id);
+    let prompts = library::prompts(store).map_err(|e| e.to_string())?;
+    agents::spawn_bg(
         config::LIVE_DREAM,
-        &dir,
+        dir,
         session_id,
         Some("live memory dream"),
         Some(&prompt),
         &prompts,
     )
-    .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))?;
-    print_json(&serde_json::json!({ "spawned": true, "receipt": receipt }));
+}
+
+/// The automatic dream at the end of a conversation (mesa task 1155): once
+/// `session` has just ended, spawns the pass when `live::dream_wanted` says
+/// the notebook needs it. **Best-effort**, exactly like [`spawn_live_summary`]
+/// beside it — a failure is a warning on stderr, never the exit code or the
+/// printed record — and it runs concurrently with the summariser, which is
+/// safe because every notebook write goes through the guarded `Store` paths
+/// (`docs/live.md`, "Dreaming").
+fn spawn_live_dream_after(store: &mut Store, session: &LiveSession) {
+    let reason = match store.list_notebook(false) {
+        Ok(entries) => live::dream_wanted(&entries),
+        Err(e) => {
+            eprintln!(
+                "live session {}: could not read the notebook for a dream pass: {e}",
+                session.id
+            );
+            return;
+        }
+    };
+    let Some(reason) = reason else {
+        return;
+    };
+    let dir = match live_agent_dir(store, session.project_id, session.id) {
+        Ok((dir, _)) => dir,
+        Err(e) => {
+            eprintln!(
+                "live session {}: could not spawn the dream pass ({reason}): {e}",
+                session.id
+            );
+            return;
+        }
+    };
+    if let Err(e) = spawn_dream_pass(store, &dir, Some(session.id), session.project_id) {
+        eprintln!(
+            "live session {}: could not spawn the dream pass ({reason}): {e}",
+            session.id
+        );
+    }
+}
+
+/// Waits out a session's rest (mesa task 1155) before a `listen` hands out
+/// turns: while `resting_since` is set, the dream agent is probed every
+/// [`DREAM_POLL`] until `claude agents` no longer lists it running, or the
+/// rest reaches [`LIVE_REST_MAX`] — measured from the stamp on the store's
+/// own clock, so a listen killed and restarted mid-rest does not restart the
+/// budget — and then the session is woken. One code path for a lease-carrying
+/// successor and a lease-less person alike. `listen` is the sync point
+/// rather than `handoff` blocking, because the outgoing agent's Bash tool
+/// would time out on a ten-minute wait and a child it left behind could not
+/// outlive its `claude stop`; the successor's first listen is the one
+/// process that is provably around for the whole rest.
+fn wait_out_live_rest(store: &mut Store, session_id: i64) -> Result<()> {
+    let Some(rest) = store.live_rest(session_id)? else {
+        return Ok(());
+    };
+    let mut elapsed = std::time::Duration::from_secs(rest.seconds.max(0) as u64);
+    let mut timed_out = false;
+    if let Some(dream) = rest.dream_agent_id.as_deref() {
+        loop {
+            if !agents::job_running(dream) {
+                break;
+            }
+            if elapsed >= LIVE_REST_MAX {
+                timed_out = true;
+                break;
+            }
+            std::thread::sleep(DREAM_POLL);
+            // A session stopped or already woken while this waited has
+            // nothing left to wake.
+            match store.live_rest(session_id)? {
+                Some(rest) => {
+                    elapsed = std::time::Duration::from_secs(rest.seconds.max(0) as u64);
+                }
+                None => return Ok(()),
+            }
+            if store.get_live_session(session_id)?.status != LiveStatus::Live {
+                return Ok(());
+            }
+        }
+    }
+    if store.wake_live_session(session_id)?.is_some() && timed_out {
+        eprintln!(
+            "live session {session_id}: the dream pass was still running after {} minutes; \
+             waking the conversation anyway",
+            LIVE_REST_MAX.as_secs() / 60
+        );
+    }
     Ok(())
 }
 
@@ -6047,6 +6199,7 @@ mod tests {
             updated_at: "2026-01-02 00:00:00".into(),
             ended_at: None,
             working_since: Some("2026-01-02 00:00:01".into()),
+            resting_since: None,
         }
     }
 
@@ -6494,6 +6647,9 @@ mod tests {
                 // An integer: which handoff generation holds the session, and
                 // the one number a successor must present (mesa task 1150).
                 "lease",
+                // Bounded (a timestamp or null): the session resting while a
+                // dream pass runs at a handoff (mesa task 1155).
+                "resting_since",
             ]),
             "LiveSession gained/lost a field: every field it has today is \
              bounded — ids, fixed words, timestamps, a 200-char route, a \

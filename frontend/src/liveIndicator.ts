@@ -35,6 +35,12 @@
  *   rest. Its input is the session's own `working_since`, so it stays lit for
  *   the whole span — including the stretch after "one moment, let me look",
  *   which is exactly where a spinner tied to speech goes dark.
+ * - **Resting sits between hearing and working** (mesa task 1155). At a
+ *   handoff whose notebook wants a dream pass the session rests
+ *   (`resting_since`) until the successor's first listen wakes it: the
+ *   person can still talk — turns queue as ever — so being heard outranks
+ *   it, but nothing is being worked on, so it outranks working, which
+ *   `working_since` may still claim from the span the outgoing agent left.
  * - **Listening is the resting state**, shown only where the microphone really
  *   is the way in (`recognizesSpeech`). A browser that types into the box gets
  *   no resting indicator: there is nothing ambient to report, and a permanent
@@ -47,7 +53,7 @@
  */
 
 /** What the band is showing, or `null` for a band with nothing to say. */
-export type LiveIndicator = 'speaking' | 'paused' | 'hearing' | 'working' | 'listening'
+export type LiveIndicator = 'speaking' | 'paused' | 'hearing' | 'resting' | 'working' | 'listening'
 
 export function headerIndicator(input: {
   live: boolean
@@ -66,11 +72,17 @@ export function headerIndicator(input: {
   /** The agent has taken an utterance and not gone back to waiting on the
    *  person — the session's `working_since` (mesa task 894). */
   working: boolean
+  /** The session is resting at a handoff while a dream pass runs — the
+   *  session's `resting_since` (mesa task 1155). */
+  resting: boolean
 }): LiveIndicator | null {
   if (input.speaking) return 'speaking'
   if (!input.live || !input.joined) return null
   if (input.paused) return 'paused'
   if (input.interim.trim() !== '' || input.draft.trim() !== '') return 'hearing'
+  // Above working: a resting session may still carry the span the outgoing
+  // agent left, and nobody is working on it until the successor wakes it.
+  if (input.resting) return 'resting'
   // Reported whether or not the microphone is this browser's way in: unlike
   // listening, there *is* something ambient to report — someone is doing work
   // — and a person typing into the fallback box needs that answer most.
@@ -88,6 +100,7 @@ export function indicatorLabel(state: LiveIndicator): string {
   if (state === 'speaking') return 'mesa is speaking'
   if (state === 'paused') return 'mesa is paused'
   if (state === 'hearing') return 'mesa is hearing you'
+  if (state === 'resting') return 'mesa is resting'
   if (state === 'working') return 'mesa is working on it'
   return 'mesa is listening'
 }

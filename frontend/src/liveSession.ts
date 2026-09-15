@@ -152,6 +152,11 @@ export function liveControls(
  * when the reason nothing is happening is that the person asked for it. It
  * ranks *below* the not-live pair because those describe the session itself,
  * which pause never touches.
+ *
+ * `resting_since` (mesa task 1155) comes after speaking — a spoken reply
+ * that outlives the handoff is still sounding — and before the no-agent
+ * warning, since a resting session has a successor bound and the reason
+ * nothing answers is the rest, not a missing agent.
  */
 export function liveStatusLine(
   session: LiveSession | null,
@@ -168,6 +173,9 @@ export function liveStatusLine(
     return 'Paused — not speaking, not listening. Press Resume to pick the conversation back up.'
   }
   if (speaking) return 'Speaking…'
+  if (session.resting_since !== null) {
+    return 'Resting for a few minutes while memory is tidied. Anything you say waits for the agent.'
+  }
   if (session.agent_id === null) {
     return 'Live, but no agent is attached — nothing will answer.'
   }

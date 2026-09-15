@@ -28,6 +28,10 @@ import type { LiveIndicator } from './liveIndicator'
  * - **listening**: a slow, low-alpha breathing ring around a dim dot — the
  *   resting state, present enough to say the microphone is open, faint
  *   enough that nobody mistakes it for speech.
+ * - **resting** (mesa task 1155): the same breathing halo, drawn in the
+ *   agent's own violet (the CSS class picks the colour) — the agent is
+ *   away for a few minutes and nothing is happening, so no new metaphor,
+ *   just listening's shape in working's colour.
  * - **paused**: a single static arc, opened rather than closed — the one
  *   state that draws no full circle, so a glance at the *shape* alone (never
  *   mind the colour) tells paused apart from every other state, not just its
@@ -148,7 +152,7 @@ export function drawAperture(
     return
   }
 
-  if (state === 'listening') {
+  if (state === 'listening' || state === 'resting') {
     const breath = 0.5 + 0.5 * Math.sin(t * rate * 0.42 * 2 * Math.PI)
     ctx.globalAlpha = 0.22 + 0.2 * breath
     ctx.strokeStyle = color

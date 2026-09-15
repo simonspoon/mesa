@@ -16,6 +16,7 @@ function session(patch: Partial<LiveSession> = {}): LiveSession {
     ended_at: null,
     working_since: null,
     lease: 1,
+    resting_since: null,
     ...patch,
   }
 }
@@ -163,6 +164,16 @@ describe('liveStatusLine', () => {
     expect(liveStatusLine(session({ agent_id: null }), false, null, false)).toMatch(
       /no agent is attached/,
     )
+  })
+
+  it('says it is resting, under speaking and over the no-agent warning (mesa task 1155)', () => {
+    const resting = session({ resting_since: '2026-01-01 00:00:10' })
+    expect(liveStatusLine(resting, false, null, false)).toMatch(/^Resting/)
+    expect(liveStatusLine(resting, true, null, false)).toBe('Speaking…')
+    expect(liveStatusLine(session({ ...resting, agent_id: null }), false, null, false)).toMatch(
+      /^Resting/,
+    )
+    expect(liveStatusLine(resting, false, null, true)).toMatch(/^Paused/)
   })
 
   it('otherwise says it is listening', () => {

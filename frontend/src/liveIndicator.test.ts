@@ -11,6 +11,7 @@ function input(patch: Partial<Parameters<typeof headerIndicator>[0]> = {}) {
     draft: '',
     paused: false,
     working: false,
+    resting: false,
     ...patch,
   }
 }
@@ -107,6 +108,21 @@ describe('headerIndicator', () => {
     expect(headerIndicator(input({ working: true, joined: false }))).toBeNull()
   })
 
+  it('shows resting under being heard and over working (mesa task 1155)', () => {
+    expect(headerIndicator(input({ resting: true }))).toBe('resting')
+    // The outgoing agent's span may still be on the row; nobody is in it.
+    expect(headerIndicator(input({ resting: true, working: true }))).toBe('resting')
+    // The person can still talk while the agent rests — turns queue.
+    expect(headerIndicator(input({ resting: true, interim: 'a word' }))).toBe('hearing')
+    expect(headerIndicator(input({ resting: true, draft: 'a word' }))).toBe('hearing')
+    expect(headerIndicator(input({ resting: true, speaking: true }))).toBe('speaking')
+    expect(headerIndicator(input({ resting: true, paused: true }))).toBe('paused')
+    // Reported to a browser typing into the box too, like working.
+    expect(headerIndicator(input({ resting: true, recognizes: false }))).toBe('resting')
+    expect(headerIndicator(input({ resting: true, live: false }))).toBeNull()
+    expect(headerIndicator(input({ resting: true, joined: false }))).toBeNull()
+  })
+
   it('says nothing about a pause in a conversation this browser is not in', () => {
     expect(headerIndicator(input({ paused: true, live: false }))).toBeNull()
     expect(headerIndicator(input({ paused: true, joined: false }))).toBeNull()
@@ -118,6 +134,7 @@ describe('indicatorLabel', () => {
     expect(indicatorLabel('speaking')).toBe('mesa is speaking')
     expect(indicatorLabel('paused')).toBe('mesa is paused')
     expect(indicatorLabel('hearing')).toBe('mesa is hearing you')
+    expect(indicatorLabel('resting')).toBe('mesa is resting')
     expect(indicatorLabel('working')).toBe('mesa is working on it')
     expect(indicatorLabel('listening')).toBe('mesa is listening')
   })

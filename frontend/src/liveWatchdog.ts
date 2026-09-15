@@ -16,7 +16,9 @@ import type { LiveTurn } from './types/LiveTurn'
  *   null — the **rising edge** — and no such notice exists in this span yet;
  * - `stalled` — the session is working (`working_since` non-null), mesa is
  *   not speaking, nothing has happened for `STALL_MS`, and no such notice
- *   exists in this span yet.
+ *   exists in this span yet — and the session is not **resting**
+ *   (`resting_since`, mesa task 1155): a successor deliberately idle while
+ *   the dream pass runs is silent on purpose, not stuck.
  *
  * "Nothing has happened" is the page's own clock, `lastActivityAt`, reset
  * when a working span **begins** (`working_since` changes to a new value),
@@ -117,15 +119,18 @@ export function noticeInSpan(
   return turns.some((turn) => turn.notice === kind && turn.created_at >= spanStart)
 }
 
-/** Whether to post `stalled` now. */
+/** Whether to post `stalled` now. Never while resting: the successor is
+ *  waiting out the dream pass on purpose. */
 export function shouldNoticeStalled(input: {
   working: boolean
   speaking: boolean
+  /** The session's `resting_since` is set (mesa task 1155). */
+  resting: boolean
   now: number
   lastActivityAt: number
   alreadyNoticed: boolean
 }): boolean {
-  if (!input.working || input.speaking || input.alreadyNoticed) return false
+  if (!input.working || input.speaking || input.resting || input.alreadyNoticed) return false
   return input.now - input.lastActivityAt >= STALL_MS
 }
 

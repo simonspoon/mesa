@@ -394,6 +394,33 @@ pub fn job_blocked_on(job_id: &str) -> Result<Option<String>, String> {
     blocked_on(&list_all_agents(&claude_bin())?, job_id)
 }
 
+/// Whether the background job `job_id` is still running, per `claude agents
+/// --json --all`: a row with that short id whose `state` is not
+/// `done`/`failed`/`stopped`. What a resting `listen` polls (mesa task 1155)
+/// to learn the dream agent has finished. **Every failure is `false`** — a
+/// missing binary, bad JSON, no such row — because a probe that cannot
+/// answer must never keep a conversation waiting on a job it cannot see.
+pub fn job_running(job_id: &str) -> bool {
+    list_all_agents(&claude_bin())
+        .map(|bytes| running(&bytes, job_id))
+        .unwrap_or(false)
+}
+
+/// Pure half of [`job_running`]: bytes in, a verdict out, and unparseable
+/// bytes are `false` for the reason above.
+fn running(bytes: &[u8], job_id: &str) -> bool {
+    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) else {
+        return false;
+    };
+    rows.iter().any(|row| {
+        row.get("id").and_then(|v| v.as_str()) == Some(job_id)
+            && !matches!(
+                row.get("state").and_then(|v| v.as_str()),
+                Some("done" | "failed" | "stopped")
+            )
+    })
+}
+
 /// `claude agents --json --all`, raw — the payload both lookups above read.
 fn list_all_agents(bin: &str) -> Result<Vec<u8>, String> {
     let out = Command::new(bin)
@@ -604,6 +631,30 @@ mod tests {
             Some("blocked")
         );
         assert!(blocked_on(b"not json", "aaaa").is_err());
+    }
+
+    /// `running` (mesa task 1155): a listed job in any live state is running,
+    /// a finished one and an unlisted one are not, and garbage is `false`
+    /// rather than an error — the probe must never strand a conversation.
+    #[test]
+    fn running_is_true_only_for_a_listed_job_in_a_live_state() {
+        assert!(running(SESSIONS_JSON.as_bytes(), "e34b8ed9"));
+        assert!(!running(SESSIONS_JSON.as_bytes(), "nope"));
+        let mixed = br#"[{"id": "aaaa", "state": "working"},
+                         {"id": "bbbb", "state": "done"},
+                         {"id": "cccc", "state": "failed"},
+                         {"id": "dddd", "state": "stopped"},
+                         {"id": "eeee"}]"#;
+        assert!(running(mixed, "aaaa"));
+        assert!(!running(mixed, "bbbb"));
+        assert!(!running(mixed, "cccc"));
+        assert!(!running(mixed, "dddd"));
+        assert!(
+            running(mixed, "eeee"),
+            "no state at all is still a listed job"
+        );
+        assert!(!running(b"not json", "aaaa"));
+        assert!(!running(b"[]", "aaaa"));
     }
 
     #[test]

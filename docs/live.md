@@ -299,9 +299,13 @@ job up in `claude agents --json --all` (`agents::job_blocked_on`, the same
 loosely-read payload `find_job_for_session` uses) and answers the job's
 `waitingFor` string when its `state` is `blocked` — `"permission prompt"` —
 else null. The lookup runs off the store lock on `spawn_blocking`, through a
-small `AppState` cache keyed on the job id with a 5-second TTL
-(`LIVE_BLOCKED_TTL`), so the page's 2-second poll costs at most one shell-out
-per five seconds and a handoff's successor is simply a new key. A missing or
+small `AppState` cache keyed on the job id **and `working_since`** with a
+5-second TTL (`LIVE_BLOCKED_TTL`), so the page's 2-second poll costs at most
+one shell-out per five seconds, a handoff's successor is simply a new key, and
+so is the working span the answered prompt opens — `next_user_turn` stamps it
+from the CLI's own process, so the server cannot be told to invalidate and the
+key does it instead, rather than answering the old block for up to five
+seconds into the span that ended it. A missing or
 failing `claude` is null, never an error: the poll must not fail over a
 decoration, and a page that cannot learn the state simply never posts the
 notice. `mesa live status` does not carry it — it is a fact about the CLI's
@@ -310,13 +314,27 @@ view of a job, read on the API's poll.
 ### The page-side watchdog
 
 `frontend/src/liveWatchdog.ts` holds the decisions and `LiveHub` performs
-them on the poll it already makes, **only while this browser has joined** —
-the same condition under which it speaks turns — so a page that merely has
-mesa open never reports on a conversation it is not in:
+them on every poll it already makes **and once a second in between**, **only
+while this browser has joined** — the same condition under which it speaks
+turns — so a page that merely has mesa open never reports on a conversation
+it is not in. The tick is not decoration: `useFetch` drops a poll that
+changed nothing, and silence is precisely a run of polls that change
+nothing, so a check that waited for a poll never re-read the clock while it
+ran out. Each judgement sees **one poll's view** — the session and the
+transcript merged from that same poll, never the `turns` state a later
+render sets — because judged against the previous poll's transcript the
+reply that just ended a long silence is unseen, and the stale clock reported
+a stall one second after the agent answered:
 
-- **`permission`** is posted when `blocked` is non-null and no `permission`
-  notice exists in this span (`noticeInSpan`: any turn with that `notice`
-  and `created_at >= working_since ?? started_at`, the server's own rule).
+- **`permission`** is posted on the **rising edge** of `blocked` — this poll
+  non-null where the previous one was null — and no `permission` notice
+  exists in this span (`noticeInSpan`: any turn with that `notice` and
+  `created_at >= working_since ?? started_at`, the server's own rule). Edge
+  rather than level because `blocked` is a cached read: the prompt being
+  answered opens a new working span while the cache may still say
+  "permission prompt", and a level rule reported it again there. A value
+  that merely persists across a span change is never news; the server's
+  per-span dedupe is the second line, not the first.
 - **`stalled`** is posted when the session is working, mesa is **not
   speaking**, nothing has happened for `STALL_MS` (30 s), and no `stalled`
   notice exists in this span. "Nothing has happened" is a page-local clock,

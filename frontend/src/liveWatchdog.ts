@@ -12,8 +12,8 @@ import type { LiveTurn } from './types/LiveTurn'
  * span by `Store::add_live_notice`):
  *
  * - `permission` — `GET /api/live` answers a non-null `blocked` (the job's
- *   `waitingFor`, read off `claude agents`) and no such notice exists in this
- *   span yet;
+ *   `waitingFor`, read off `claude agents`) where the previous poll answered
+ *   null — the **rising edge** — and no such notice exists in this span yet;
  * - `stalled` — the session is working (`working_since` non-null), mesa is
  *   not speaking, nothing has happened for `STALL_MS`, and no such notice
  *   exists in this span yet.
@@ -24,7 +24,16 @@ import type { LiveTurn } from './types/LiveTurn'
  * last because a long spoken reply is the opposite of silence, and a clock
  * that kept running through it would call a two-minute answer a stall the
  * moment it finished. Every decision here is a pure function of its inputs,
- * with `now` passed in, so `LiveHub` only performs them.
+ * with `now` passed in, so `LiveHub` only performs them — on every poll, and
+ * on a one-second tick between polls, since silence is exactly the case
+ * where no poll changes anything and a check that waits for one never runs.
+ *
+ * The permission notice is edge-triggered rather than level-triggered because
+ * `blocked` is a cached read (5 s server-side): the prompt being answered
+ * opens a new working span while the cache still says "permission prompt",
+ * and a level rule would report the prompt again in the new span. A value
+ * that merely persists across a span change is not news; only null → non-null
+ * is. The server's per-span dedupe stays as the second line.
  */
 
 /** How long the agent may be working in silence before the page says so. */
@@ -38,13 +47,15 @@ export interface Watchdog {
   workingSince: string | null
   /** The highest mesa-turn id seen, so a new turn is an edge. */
   lastTurnId: number | null
+  /** The `blocked` the last poll answered, so a new block is an edge. */
+  blocked: string | null
   /** When something last happened, on the page's clock. */
   lastActivityAt: number
 }
 
 /** A fresh clock for a conversation this page has just started watching. */
 export function initialWatchdog(sessionId: number, now: number): Watchdog {
-  return { sessionId, workingSince: null, lastTurnId: null, lastActivityAt: now }
+  return { sessionId, workingSince: null, lastTurnId: null, blocked: null, lastActivityAt: now }
 }
 
 /**
@@ -53,10 +64,21 @@ export function initialWatchdog(sessionId: number, now: number): Watchdog {
  * back to null) is not activity — nothing is judged while not working anyway —
  * but it is remembered, so the next span is an edge again. A user turn is
  * never activity: the person talking says nothing about the agent.
+ *
+ * `turns` must be the transcript **of the same poll** as `workingSince` and
+ * `blocked`: judged against an older transcript, the mesa turn that ended a
+ * long silence is not yet seen, and the stale clock reports a stall one
+ * second after the reply. Re-running this on a tick with an unchanged poll
+ * is a no-op — the turn id only ever rises, so nothing is an edge twice.
  */
 export function watchdogAfterPoll(
   prev: Watchdog,
-  input: { workingSince: string | null; turns: readonly LiveTurn[]; now: number },
+  input: {
+    workingSince: string | null
+    turns: readonly LiveTurn[]
+    blocked: string | null
+    now: number
+  },
 ): Watchdog {
   let lastTurnId = prev.lastTurnId
   for (const turn of input.turns) {
@@ -70,6 +92,7 @@ export function watchdogAfterPoll(
     sessionId: prev.sessionId,
     workingSince: input.workingSince,
     lastTurnId,
+    blocked: input.blocked,
     lastActivityAt: newTurn || newSpan ? input.now : prev.lastActivityAt,
   }
 }
@@ -106,10 +129,15 @@ export function shouldNoticeStalled(input: {
   return input.now - input.lastActivityAt >= STALL_MS
 }
 
-/** Whether to post `permission` now. */
+/**
+ * Whether to post `permission` now: only on the rising edge — this poll
+ * answers a block where the previous one (`wasBlocked`) answered none — and
+ * never already reported in this span.
+ */
 export function shouldNoticePermission(input: {
   blocked: string | null
+  wasBlocked: string | null
   alreadyNoticed: boolean
 }): boolean {
-  return input.blocked !== null && !input.alreadyNoticed
+  return input.blocked !== null && input.wasBlocked === null && !input.alreadyNoticed
 }

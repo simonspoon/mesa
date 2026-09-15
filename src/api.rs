@@ -107,8 +107,11 @@ struct AppState {
     /// answer comes off `claude agents --json --all`, a different payload from
     /// the per-folder list. A `None` is a cached "not blocked" (or a failed
     /// lookup, which reads the same), so a 2s poll costs at most one
-    /// shell-out per [`LIVE_BLOCKED_TTL`]; keyed on the job id alone, so a
-    /// handoff's successor is a fresh key and a stale one is pruned on insert.
+    /// shell-out per [`LIVE_BLOCKED_TTL`]; keyed on the job id **and the
+    /// working span**, so a handoff's successor is a fresh key, the span the
+    /// answered prompt opens is a fresh read rather than five seconds of the
+    /// old "permission prompt" (the page's rising-edge rule is the first line
+    /// against that; this is the second), and a stale one is pruned on insert.
     live_blocked_cache: Arc<Mutex<HashMap<String, (Instant, Option<String>)>>>,
     /// Working-tree git status per project folder, keyed by `local_path`
     /// (sidebar decoration). `None` is a cached miss — a folder that is not a
@@ -3089,7 +3092,7 @@ async fn get_live(
     // Whether the agent's job is stuck (mesa task 1157), derived here and
     // never stored — off the store lock, since it may be a shell-out.
     let blocked = match session.agent_id.as_deref() {
-        Some(job) => live_agent_blocked(&state, job).await,
+        Some(job) => live_agent_blocked(&state, job, session.working_since.as_deref()).await,
         None => None,
     };
     Ok(Json(LiveState {
@@ -3105,11 +3108,20 @@ async fn get_live(
 /// `live_blocked_cache` so the page's 2s poll costs at most one
 /// `claude agents --json --all` per [`LIVE_BLOCKED_TTL`]. A missing or failing
 /// `claude` is `None` too: the poll must never fail over a decoration, and a
-/// page that cannot learn the state simply never posts the notice.
-async fn live_agent_blocked(state: &AppState, job: &str) -> Option<String> {
+/// page that cannot learn the state simply never posts the notice. The key
+/// carries `working_since` so a new working span — `next_user_turn` handing
+/// over the utterance that answered the prompt — is a miss, not five seconds
+/// of the old answer: the CLI stamps that span from its own process, so the
+/// server cannot be told to invalidate and the key does it instead.
+async fn live_agent_blocked(
+    state: &AppState,
+    job: &str,
+    working_since: Option<&str>,
+) -> Option<String> {
+    let key = format!("{job}@{}", working_since.unwrap_or(""));
     {
         let cache = state.live_blocked_cache.lock().unwrap();
-        if let Some((at, blocked)) = cache.get(job)
+        if let Some((at, blocked)) = cache.get(&key)
             && at.elapsed() < LIVE_BLOCKED_TTL
         {
             return blocked.clone();
@@ -3122,9 +3134,10 @@ async fn live_agent_blocked(state: &AppState, job: &str) -> Option<String> {
         .and_then(Result::ok)
         .flatten();
     let mut cache = state.live_blocked_cache.lock().unwrap();
-    // A handoff or a new conversation binds a new job id; the old keys go.
+    // A handoff, a new conversation or a new span binds a new key; the old
+    // ones go.
     cache.retain(|_, (at, _)| at.elapsed() < LIVE_BLOCKED_TTL);
-    cache.insert(job.to_string(), (Instant::now(), blocked.clone()));
+    cache.insert(key, (Instant::now(), blocked.clone()));
     blocked
 }
 

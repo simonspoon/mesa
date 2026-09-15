@@ -10159,9 +10159,10 @@ button:focus-visible,
 
 /* The two change dates, and the unified diff a two-sided row shows instead
    of the whole bodies above. One column of lines, marked in the gutter and
-   coloured per side — mesa-only is what choosing `disk` would lose, and the
-   other way round. */
-.library-sync-dates {
+   coloured by the row's orientation (mesa task 1151): red is what the pick
+   would lose, green what it keeps, the direction line naming which is which. */
+.library-sync-dates,
+.library-sync-direction {
   margin: 0.35rem 0 0;
   font-size: 0.75rem;
 }
@@ -10199,11 +10200,11 @@ button:focus-visible,
   color: var(--muted);
 }
 
-.library-diff-mesa {
+.library-diff-removed {
   color: var(--red);
 }
 
-.library-diff-disk {
+.library-diff-added {
   color: var(--green);
 }
 

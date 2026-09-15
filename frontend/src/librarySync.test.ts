@@ -4,6 +4,7 @@ import {
   defaultChoice,
   diffLineClass,
   diffMark,
+  diffOrientation,
   hasDiff,
   isOneSided,
   needsAttention,
@@ -240,13 +241,13 @@ describe('diffLineClass / diffMark', () => {
 
   it('marks a mesa-only line as a removal', () => {
     const l = line({ kind: 'mesa-only', disk_line: null })
-    expect(diffLineClass(l)).toBe('library-diff-line library-diff-mesa')
+    expect(diffLineClass(l)).toBe('library-diff-line library-diff-removed')
     expect(diffMark(l)).toBe('-')
   })
 
   it('marks a disk-only line as an addition', () => {
     const l = line({ kind: 'disk-only', mesa_line: null })
-    expect(diffLineClass(l)).toBe('library-diff-line library-diff-disk')
+    expect(diffLineClass(l)).toBe('library-diff-line library-diff-added')
     expect(diffMark(l)).toBe('+')
   })
 
@@ -259,6 +260,70 @@ describe('diffLineClass / diffMark', () => {
     const l = line({ mesa_line: null, disk_line: null, text: '… 500 more diff lines not shown …' })
     expect(diffLineClass(l)).toBe('library-diff-line library-diff-marker')
     expect(diffMark(l)).toBe(' ')
+  })
+
+  it('reads mesa → disk when the orientation is omitted, unchanged', () => {
+    const m = line({ kind: 'mesa-only', disk_line: null })
+    const d = line({ kind: 'disk-only', mesa_line: null })
+    expect(diffMark(m)).toBe(diffMark(m, { from: 'mesa', to: 'disk' }))
+    expect(diffMark(d)).toBe(diffMark(d, { from: 'mesa', to: 'disk' }))
+    expect(diffLineClass(m)).toBe(diffLineClass(m, { from: 'mesa', to: 'disk' }))
+    expect(diffLineClass(d)).toBe(diffLineClass(d, { from: 'mesa', to: 'disk' }))
+  })
+
+  it('swaps the marks and classes when read disk → mesa', () => {
+    const o = { from: 'disk', to: 'mesa' } as const
+    const m = line({ kind: 'mesa-only', disk_line: null })
+    const d = line({ kind: 'disk-only', mesa_line: null })
+    expect(diffMark(m, o)).toBe('+')
+    expect(diffLineClass(m, o)).toBe('library-diff-line library-diff-added')
+    expect(diffMark(d, o)).toBe('-')
+    expect(diffLineClass(d, o)).toBe('library-diff-line library-diff-removed')
+    expect(diffMark(line(), o)).toBe(' ')
+    expect(diffLineClass(line(), o)).toBe('library-diff-line library-diff-context')
+    const marker = line({ mesa_line: null, disk_line: null })
+    expect(diffMark(marker, o)).toBe(' ')
+    expect(diffLineClass(marker, o)).toBe('library-diff-line library-diff-marker')
+  })
+})
+
+describe('diffOrientation', () => {
+  const diskNewer = row({ mesa_updated_at: '2026-09-06 21:04:00', disk_mtime: '2026-09-06 22:11:00' })
+  const mesaNewer = row({ mesa_updated_at: '2026-09-07 01:00:00', disk_mtime: '2026-09-06 22:11:00' })
+  const mesaOnly = { kind: 'mesa-only', mesa_line: 1, disk_line: null, text: 'a' } as const
+  const diskOnly = { kind: 'disk-only', mesa_line: null, disk_line: 1, text: 'a' } as const
+
+  it('reads from the older side to the newer one while nothing is picked', () => {
+    expect(diffOrientation(diskNewer, 'skip')).toEqual({ from: 'mesa', to: 'disk' })
+    expect(diffMark(mesaOnly, diffOrientation(diskNewer, 'skip'))).toBe('-')
+    expect(diffOrientation(mesaNewer, 'skip')).toEqual({ from: 'disk', to: 'mesa' })
+    expect(diffMark(diskOnly, diffOrientation(mesaNewer, 'skip'))).toBe('-')
+  })
+
+  it('falls back to mesa → disk when a date is missing or the two are equal', () => {
+    expect(
+      diffOrientation(row({ mesa_updated_at: null, disk_mtime: '2026-09-06 22:11:00' }), 'skip'),
+    ).toEqual({ from: 'mesa', to: 'disk' })
+    expect(
+      diffOrientation(row({ mesa_updated_at: '2026-09-06 22:11:00', disk_mtime: null }), 'skip'),
+    ).toEqual({ from: 'mesa', to: 'disk' })
+    expect(diffOrientation(row(), 'skip')).toEqual({ from: 'mesa', to: 'disk' })
+    expect(
+      diffOrientation(
+        row({ mesa_updated_at: '2026-09-06 22:11:00', disk_mtime: '2026-09-06 22:11:00' }),
+        'skip',
+      ),
+    ).toEqual({ from: 'mesa', to: 'disk' })
+  })
+
+  it('reads toward the picked side whatever the dates say', () => {
+    expect(diffOrientation(mesaNewer, 'disk')).toEqual({ from: 'mesa', to: 'disk' })
+    expect(diffMark(mesaOnly, diffOrientation(mesaNewer, 'disk'))).toBe('-')
+    expect(diffOrientation(diskNewer, 'mesa')).toEqual({ from: 'disk', to: 'mesa' })
+    expect(diffMark(diskOnly, diffOrientation(diskNewer, 'mesa'))).toBe('-')
+    expect(diffLineClass(mesaOnly, diffOrientation(diskNewer, 'mesa'))).toBe(
+      'library-diff-line library-diff-added',
+    )
   })
 })
 

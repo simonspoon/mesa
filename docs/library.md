@@ -527,6 +527,19 @@ The diff is **two-way on purpose**: `baseline` rides on the row separately,
 and mesa-vs-disk is what a resolution actually picks between — see the next
 paragraph.
 
+The modal draws that diff **oriented** (mesa task 1151,
+`librarySync.ts::diffOrientation`): the server's lines are always mesa-vs-disk,
+but which side's only-lines are red `-` and which green `+` follows the row's
+radio. A picked side is where the apply ends, so the diff reads from the side
+being overwritten to the pick (`disk` picked: mesa → disk; `mesa` picked:
+disk → mesa) and a red line is one the apply removes. While nothing is picked
+(`skip`, the default for a `both-changed` row) it reads from the older side to
+the newer one by `newerSide`, so a line deleted on disk yesterday shows as a
+removal rather than as a mesa addition; with no usable dates it is mesa → disk.
+A direction line with the `-`/`+` legend sits above the diff and turns with
+the radio. The `diff vs built-in` panel and the version history pass no
+orientation and keep their fixed reading.
+
 **There is deliberately no automatic merging and no three-way merge.** The
 common case — Claude edited a skill on disk, or the user edited it in mesa —
 is one-sided (`mesa-changed`/`disk-changed`), and the baseline is exactly what

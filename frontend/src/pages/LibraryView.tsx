@@ -50,6 +50,7 @@ import {
   defaultChoice,
   diffLineClass,
   diffMark,
+  diffOrientation,
   hasDiff,
   needsAttention,
   resolutionsFor,
@@ -331,8 +332,8 @@ function LibraryVersions({
               </span>
               {e.added !== null && e.removed !== null && (
                 <span className="library-history-counts">
-                  <span className="library-diff-disk">+{e.added}</span>
-                  <span className="library-diff-mesa">-{e.removed}</span>
+                  <span className="library-diff-added">+{e.added}</span>
+                  <span className="library-diff-removed">-{e.removed}</span>
                 </span>
               )}
             </button>
@@ -545,6 +546,10 @@ function LibrarySyncRowView({
   const [showBodies, setShowBodies] = useState(false)
   const dates = changeDatesLabel(row)
   const diff = hasDiff(row) ? row.diff : null
+  // Read from the side the pick overwrites to the pick itself, or older →
+  // newer while nothing is picked (mesa task 1151) — recomputed from `choice`
+  // on every render, so a radio change turns the diff around at once.
+  const orientation = diffOrientation(row, choice)
   return (
     <li className="library-sync-row">
       <div className="library-sync-row-head">
@@ -565,14 +570,23 @@ function LibrarySyncRowView({
         </button>
       )}
       {diff !== null && !showBodies ? (
-        <pre className="library-sync-difflines">
-          {diff.map((line, i) => (
-            <div key={i} className={diffLineClass(line)}>
-              <span className="library-diff-mark">{diffMark(line)}</span>
-              {line.text}
-            </div>
-          ))}
-        </pre>
+        <>
+          <p className="library-sync-direction muted">
+            {orientation.from} → {orientation.to}
+            {' · '}
+            <span className="library-diff-removed">-</span> only in {orientation.from}
+            {' · '}
+            <span className="library-diff-added">+</span> only in {orientation.to}
+          </p>
+          <pre className="library-sync-difflines">
+            {diff.map((line, i) => (
+              <div key={i} className={diffLineClass(line, orientation)}>
+                <span className="library-diff-mark">{diffMark(line, orientation)}</span>
+                {line.text}
+              </div>
+            ))}
+          </pre>
+        </>
       ) : (
         <div className="library-sync-diff">
           <div className="library-sync-side">
@@ -1029,8 +1043,8 @@ export function LibraryView() {
                     {showingDiff === key && overridden !== undefined && (
                       <div className="library-override-diff">
                         <p className="muted">
-                          <span className="library-diff-mesa">-</span> your copy{' · '}
-                          <span className="library-diff-disk">+</span> the built-in
+                          <span className="library-diff-removed">-</span> your copy{' · '}
+                          <span className="library-diff-added">+</span> the built-in
                         </p>
                         <pre className="library-sync-difflines">
                           {diffLines(item.body, overridden).map((line, i) => (

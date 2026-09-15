@@ -172,23 +172,64 @@ export function hasDiff(row: LibrarySyncRow): boolean {
   return row.diff !== null && row.diff.length > 0
 }
 
-/** The CSS class for one diff line. A `context` line carrying neither line
- * number is `diff_lines`'s truncation marker, not content, and reads as its
- * own thing rather than as an unchanged line of somebody's file. */
-export function diffLineClass(line: LibraryDiffLine): string {
-  if (line.kind === 'mesa-only') return 'library-diff-line library-diff-mesa'
-  if (line.kind === 'disk-only') return 'library-diff-line library-diff-disk'
+/**
+ * Which way a diff is read: `from` is the side whose only-lines are removals
+ * (`-`, red), `to` the side whose only-lines are additions (`+`, green). The
+ * server's `LibraryDiffLine` is always computed mesa-vs-disk; this only
+ * decides how that one diff is drawn.
+ */
+export type DiffOrientation = { from: 'mesa' | 'disk'; to: 'mesa' | 'disk' }
+
+/** The way every diff was drawn before mesa task 1151, and still the way the
+ * `diff vs built-in` panel and the version history draw theirs. */
+const MESA_TO_DISK: DiffOrientation = { from: 'mesa', to: 'disk' }
+
+/**
+ * How the sync modal should draw a row's diff (mesa task 1151). A picked side
+ * is the side the apply will end with, so the diff reads *from* the side
+ * being overwritten *to* the pick — a red line is one the apply removes, a
+ * green one is one it keeps. With nothing picked (`skip`, the default for a
+ * `both-changed` row), it reads from the older side to the newer one, so the
+ * most recent edit shows as the change rather than as its own undoing; with no
+ * usable dates (`newerSide` null or `same`) it falls back to mesa → disk.
+ */
+export function diffOrientation(
+  row: LibrarySyncRow,
+  choice: 'mesa' | 'disk' | 'skip',
+): DiffOrientation {
+  if (choice === 'disk') return MESA_TO_DISK
+  if (choice === 'mesa') return { from: 'disk', to: 'mesa' }
+  const newer = newerSide(row)
+  if (newer === 'mesa') return { from: 'disk', to: 'mesa' }
+  return MESA_TO_DISK
+}
+
+/** The CSS class for one diff line, read in `orientation` (mesa → disk when
+ * omitted). A `context` line carrying neither line number is `diff_lines`'s
+ * truncation marker, not content, and reads as its own thing rather than as
+ * an unchanged line of somebody's file. */
+export function diffLineClass(
+  line: LibraryDiffLine,
+  orientation: DiffOrientation = MESA_TO_DISK,
+): string {
+  const mark = diffMark(line, orientation)
+  if (mark === '-') return 'library-diff-line library-diff-removed'
+  if (mark === '+') return 'library-diff-line library-diff-added'
   if (line.mesa_line === null && line.disk_line === null) {
     return 'library-diff-line library-diff-marker'
   }
   return 'library-diff-line library-diff-context'
 }
 
-/** The one-character gutter mark for a diff line — the diff convention, with
- * a blank for context and for the truncation marker. */
-export function diffMark(line: LibraryDiffLine): string {
-  if (line.kind === 'mesa-only') return '-'
-  if (line.kind === 'disk-only') return '+'
+/** The one-character gutter mark for a diff line, read in `orientation`
+ * (mesa → disk when omitted) — the diff convention, with a blank for context
+ * and for the truncation marker. */
+export function diffMark(
+  line: LibraryDiffLine,
+  orientation: DiffOrientation = MESA_TO_DISK,
+): string {
+  if (line.kind === 'mesa-only') return orientation.to === 'disk' ? '-' : '+'
+  if (line.kind === 'disk-only') return orientation.to === 'disk' ? '+' : '-'
   return ' '
 }
 

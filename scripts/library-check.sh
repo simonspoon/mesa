@@ -1413,14 +1413,21 @@ echo "== library-check: section 11 (hook registration) passed ($CHECKS checks so
 # ---- the migration: a pre-1139 `command` row opens as an exporting prompt ----
 #
 # Built for real: a fresh db at the current schema, wound back by hand to the
-# schema the fold migrates from (the column dropped, `user_version` set to the
+# schema the fold migrates from (the column and every later migration's tables
+# and columns dropped, `user_version` set to the
 # fold's index) with a `command` row and two versions in it, then opened by
 # mesa — which runs the fold — and read back through the CLI.
 command -v sqlite3 >/dev/null || fail "sqlite3 is required for section 12"
+sqlite3 :memory: "CREATE VIRTUAL TABLE t USING fts5(a)" 2>/dev/null ||
+  fail "section 12 needs a sqlite3 built with FTS5 (the first sqlite3 on PATH lacks it)"
 MESA_DB_OLD="$TMP/pre1139.db"
 run 0 env MESA_DB="$MESA_DB_OLD" "$MESA" project list
 sqlite3 "$MESA_DB_OLD" <<'SQL'
 ALTER TABLE library_items DROP COLUMN export_command;
+DROP TABLE live_notebook;
+DROP TABLE live_memory_fts;
+ALTER TABLE live_sessions DROP COLUMN lease;
+ALTER TABLE live_sessions DROP COLUMN predecessor_agent_id;
 INSERT INTO library_items (kind, scope, name, body, synced_body, synced_at, created_at, updated_at)
   VALUES ('command', 'user', 'execute-todo', 'Claim task $ARGS', 'Claim task $ARGS', datetime('now'), datetime('now'), datetime('now'));
 INSERT INTO library_versions (item_id, body, source, created_at) VALUES (1, 'v1', 'edit', datetime('now'));

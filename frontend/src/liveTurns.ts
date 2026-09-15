@@ -146,20 +146,25 @@ export function sidebarsIntent(turn: LiveTurn): SidebarsIntent | null {
 export interface TurnGroup {
   /** Who is speaking, which is what the bubble's side and colour come from. */
   role: LiveTurn['role']
+  /** Whether this run is mesa's own report about the agent rather than its
+   *  words (mesa task 1157) — its own group, labelled apart. */
+  notice: boolean
   turns: LiveTurn[]
 }
 
 /**
  * The transcript as alternating runs: consecutive turns by the same side are
  * one group, so a reply split over three sentences reads as one utterance
- * rather than three stacked bubbles.
+ * rather than three stacked bubbles. A notice turn never joins the agent's
+ * run on either side of it: it is labelled apart, so it is grouped apart.
  */
 export function turnGroups(turns: readonly LiveTurn[]): TurnGroup[] {
   const groups: TurnGroup[] = []
   for (const turn of turns) {
     const last = groups[groups.length - 1]
-    if (last && last.role === turn.role) last.turns.push(turn)
-    else groups.push({ role: turn.role, turns: [turn] })
+    const notice = turn.notice !== null
+    if (last && last.role === turn.role && last.notice === notice) last.turns.push(turn)
+    else groups.push({ role: turn.role, notice, turns: [turn] })
   }
   return groups
 }
@@ -167,8 +172,10 @@ export function turnGroups(turns: readonly LiveTurn[]): TurnGroup[] {
 /**
  * Who a group is, in words. "you" for the dictated side, "mesa" for the spoken
  * one — the same vocabulary the agent chat's bubbles use, so the two
- * conversations in this app read the same way.
+ * conversations in this app read the same way — and "notice" for mesa's own
+ * report about the agent (mesa task 1157), which is not something it said.
  */
-export function turnLabel(role: LiveTurn['role']): string {
+export function turnLabel(role: LiveTurn['role'], notice = false): string {
+  if (notice) return 'notice'
   return role === 'user' ? 'you' : 'mesa'
 }

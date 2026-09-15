@@ -55,6 +55,7 @@ import type { LibrarySyncResult } from './types/LibrarySyncResult'
 import type { LibrarySyncRow } from './types/LibrarySyncRow'
 import type { LibraryVersion } from './types/LibraryVersion'
 import type { LiveContext } from './types/LiveContext'
+import type { LiveNotice } from './types/LiveNotice'
 import type { LiveSession } from './types/LiveSession'
 import type { LiveState } from './types/LiveState'
 import type { LiveTranscript } from './types/LiveTranscript'
@@ -971,6 +972,17 @@ export function stopLive(): Promise<LiveSession> {
  */
 export function sendLiveUtterance(text: string): Promise<LiveTurn> {
   return request('/api/live/utterance', jsonInit('POST', { text }))
+}
+
+/**
+ * mesa's own report about the agent — blocked on a permission prompt, or
+ * silent too long (mesa task 1157, `liveWatchdog.ts`) — recorded by the server
+ * as a `mesa` turn so it is spoken once. Deduped server-side per working span:
+ * the answer is the created turn or the existing one, and the page treats the
+ * two alike.
+ */
+export function sendLiveNotice(kind: LiveNotice): Promise<LiveTurn> {
+  return request('/api/live/notice', jsonInit('POST', { kind }))
 }
 
 /**

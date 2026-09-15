@@ -646,26 +646,46 @@ describe('showsHearing', () => {
 })
 
 describe('statusPill', () => {
+  const idle = { speaking: false, blocked: false, stalled: false, heard: false, transcribing: false }
+
   it('says mesa is speaking, over anything the microphone claims', () => {
     // The microphone is shut while she talks, so "hearing" would be
     // describing a microphone that is not open.
-    expect(statusPill({ speaking: true, heard: false, transcribing: false })).toBe('mesa speaking')
-    expect(statusPill({ speaking: true, heard: true, transcribing: true })).toBe('mesa speaking')
+    expect(statusPill({ ...idle, speaking: true })).toBe('mesa speaking')
+    expect(statusPill({ ...idle, speaking: true, heard: true, transcribing: true })).toBe(
+      'mesa speaking',
+    )
+    // And over both reports about the agent: a notice is spoken through this
+    // same pill (mesa task 1157).
+    expect(statusPill({ ...idle, speaking: true, blocked: true, stalled: true })).toBe(
+      'mesa speaking',
+    )
+  })
+
+  it('says the agent is blocked over stalled, and both over hearing', () => {
+    expect(statusPill({ ...idle, blocked: true })).toBe('agent blocked on a permission prompt')
+    expect(statusPill({ ...idle, blocked: true, stalled: true, heard: true })).toBe(
+      'agent blocked on a permission prompt',
+    )
+    expect(statusPill({ ...idle, stalled: true })).toBe('agent still working…')
+    expect(statusPill({ ...idle, stalled: true, heard: true, transcribing: true })).toBe(
+      'agent still working…',
+    )
   })
 
   it('says transcribing while a finished segment is in flight', () => {
-    expect(statusPill({ speaking: false, heard: true, transcribing: true })).toBe('transcribing…')
+    expect(statusPill({ ...idle, heard: true, transcribing: true })).toBe('transcribing…')
   })
 
   it('says hearing while the person is talking and nothing is in flight', () => {
-    expect(statusPill({ speaking: false, heard: true, transcribing: false })).toBe('hearing')
+    expect(statusPill({ ...idle, heard: true })).toBe('hearing')
   })
 
   it('says nothing when nothing is happening', () => {
-    expect(statusPill({ speaking: false, heard: false, transcribing: false })).toBeNull()
+    expect(statusPill(idle)).toBeNull()
     // A segment cannot be in flight without the person counting as heard —
     // `showsHearing` returns true for `hearing > 0` — but the pill still
     // reads `heard` alone rather than inferring it.
-    expect(statusPill({ speaking: false, heard: false, transcribing: true })).toBeNull()
+    expect(statusPill({ ...idle, transcribing: true })).toBeNull()
   })
 })

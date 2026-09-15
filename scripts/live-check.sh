@@ -138,7 +138,18 @@
 #      spawning), the built-in `live-dream` template's argv with
 #      DREAM_PROMPT plus every active entry line and no retired one in the
 #      workspace cwd, and a configured template receiving `{prompt}`
-#      byte-identical and `{id}` as the newest session's.
+#      byte-identical and `{id}` as the newest session's;
+#  16. notice turns (mesa task 1157): `mesa live notice permission|stalled`
+#      writing a mesa turn with the fixed text, no action and `notice` set,
+#      the `--quiet` key set (drops `text`, keeps `notice`), the dedupe (a
+#      second call answers the SAME id and writes nothing) and a fresh
+#      `next_user_turn` span allowing a fresh one, a bad kind a usage error
+#      and `not_found` with nothing live; `POST /api/live/notice`'s round
+#      trip, its 422 for a bad/missing kind, its 404 with nothing live and
+#      the Content-Type gate; `GET /api/live` answering `blocked: null` for a
+#      plain stub job and `"permission prompt"` once the stub reports the
+#      session's job blocked; and the notice absent from
+#      `mesa live memory search` while the agent's own turn is found.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -222,9 +233,15 @@ case "\$1" in
     # one row naming the newest spawned job and a fixed session uuid, the two
     # keys \`agents::find_session_for_job\` reads. The uuid has no transcript
     # under the throwaway HOME, so the pulse answers null — what it answers
-    # for any transcript it cannot read.
-    printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000"}]\n' \
-      "\$(cat "$STUB_DIR/last-id" 2>/dev/null)"
+    # for any transcript it cannot read. A \`blocked-id\` file naming a job
+    # makes that row a session stuck on a permission prompt, the shape
+    # \`GET /api/live\`'s derived \`blocked\` reads (mesa task 1157).
+    ID=\$(cat "$STUB_DIR/last-id" 2>/dev/null)
+    if [ "\$ID" = "\$(cat "$STUB_DIR/blocked-id" 2>/dev/null)" ]; then
+      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"blocked","waitingFor":"permission prompt"}]\n' "\$ID"
+    else
+      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"working"}]\n' "\$ID"
+    fi
     ;;
   stop)
     # The other end of the receipt: ending a conversation stops the agent it
@@ -2686,10 +2703,11 @@ api 200 GET "/api/live/memory"
 [ "$BODY" = "[]" ] || fail "a deleted row leaves the active list"
 api 404 DELETE "/api/live/memory/$M1"
 [ "$(jqb .error.code)" = "not_found" ] || fail "DELETE a retired row: not_found"
-# The 2s poll carries no notebook.
+# The 2s poll carries no notebook (`blocked` is the derived agent state of
+# mesa task 1157, a string or null, not a body).
 api 200 GET "/api/live"
-[ "$(jqb 'keys | sort | join(",")')" = "boards,session,turns" ] ||
-  fail "GET /api/live must carry exactly session/turns/boards — no notebook (got $(jqb 'keys'))"
+[ "$(jqb 'keys | sort | join(",")')" = "blocked,boards,session,turns" ] ||
+  fail "GET /api/live must carry exactly session/turns/boards/blocked — no notebook (got $(jqb 'keys'))"
 ok "/api/live/memory: GET/POST/PATCH/DELETE round trip, 422 validation with the CLI's messages, 404 for unknown and retired ids, and GET /api/live carries no notebook"
 
 # Both halves of the boundary, default mode: Host allowlist, Content-Type
@@ -3255,6 +3273,148 @@ run 1 "$MESA" live context
 [ "$(jqe .error.code)" = "unavailable" ] || fail "live context with no agent bound: unavailable"
 run 0 "$MESA" live stop >/dev/null
 ok "live stop after handoffs stops the current agent; a handoff after the end is not_found spawning nothing; live context on a --no-agent session is unavailable"
+
+# =====================================================================
+# 16. Notice turns (mesa task 1157): telling the person the agent is stuck
+# =====================================================================
+#
+# The live agent cannot report its own blocked state — a `claude --bg`
+# session stuck on a permission prompt says nothing, and so does one that has
+# simply gone quiet — so the PAGE detects it (`liveWatchdog.ts`, off the poll
+# it already makes) and asks mesa to say so. The report is a `mesa` turn with
+# a fixed sentence and `notice` set, written by the one Store method both
+# surfaces share and deduped per working span, so two browsers racing the
+# same poll cost one row and one utterance.
+
+# ---- nothing live ----
+run 1 "$MESA" live notice permission
+[ "$(jqe .error.code)" = "not_found" ] || fail "live notice with nothing live: not_found"
+grep -q 'mesa live start' <<<"$STDERR" || fail "live notice with nothing live: the hint must name live start"
+api 404 POST "/api/live/notice" '{"kind":"stalled"}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "POST /api/live/notice with nothing live: not_found"
+ok "live notice with nothing live: not_found on both surfaces"
+
+# ---- the CLI: both kinds, the turn's shape, and --quiet ----
+rm -f "$STUB_DIR/blocked-id"
+api 201 POST "/api/live" "{\"project_id\":$PROJ}"
+NS=$(jqb .id)
+NA=$(jqb .agent_id)
+# The first poll of this conversation: the stub reports its job working, so
+# the derived `blocked` is null — and that answer is cached for a few seconds.
+api 200 GET "/api/live"
+[ "$(jqb .blocked)" = "null" ] || fail "GET /api/live: blocked must be null for a working job (got $(jqb .blocked))"
+BLOCKED_NULL_AT=$(date +%s)
+
+run 0 "$MESA" live notice permission
+NP=$(jqs .id)
+[ "$(jqs .session_id)" = "$NS" ] || fail "notice: session_id"
+[ "$(jqs .role)" = "mesa" ] || fail "notice: role must be mesa"
+[ "$(jqs .notice)" = "permission" ] || fail "notice: kind (got $(jqs .notice))"
+[ "$(jqs .text)" = "The agent is blocked on a permission prompt. Check the terminal." ] ||
+  fail "notice: the fixed permission text (got $(jqs .text))"
+[ "$(jqs .action)" = "null" ] || fail "notice: no action"
+[ "$(jqs .target)" = "null" ] || fail "notice: no target"
+[ "$(jqs .played_at)" = "null" ] || fail "notice: unplayed, so the page speaks it once"
+ok "live notice permission: a mesa turn with the fixed sentence, no action, notice=permission"
+
+run 0 "$MESA" live notice --quiet stalled
+NST=$(jqs .id)
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["action","created_at","delivered_at","id","notice","played_at","role","session_id","target"]' ] ||
+  fail "notice --quiet: key set (got $(jq -c keys <<<"$STDOUT"))"
+[ "$(jqs .notice)" = "stalled" ] || fail "notice --quiet keeps notice"
+[ "$NST" != "$NP" ] || fail "the two kinds are independent of each other"
+run 0 "$MESA" live notice stalled
+[ "$(jqs .text)" = "The agent is still working, or not responding." ] ||
+  fail "notice: the fixed stalled text (got $(jqs .text))"
+[ "$(jqs .id)" = "$NST" ] || fail "dedupe: a second stalled notice in one span must answer the existing id"
+run 0 "$MESA" live notice permission
+[ "$(jqs .id)" = "$NP" ] || fail "dedupe: a second permission notice in one span must answer the existing id"
+run 0 "$MESA" live turns
+[ "$(jqs 'map(select(.notice != null)) | length')" = "2" ] ||
+  fail "dedupe: exactly two notice rows after four calls (got $(jqs 'map(select(.notice != null)) | length'))"
+[ "$(jqs 'map(select(.notice == null)) | length')" = "0" ] || fail "nothing else was written"
+ok "live notice stalled + --quiet: drops text, keeps notice; a repeat of either kind answers the same id and writes nothing"
+
+# ---- a new working span allows a fresh one ----
+#
+# The span is `COALESCE(working_since, started_at)`; taking the next
+# utterance stamps `working_since`. The clock is second-grained, so a beat
+# passes first — a notice and a stamp in the same second are one span.
+api 201 POST "/api/live/utterance" '{"text":"carry on"}'
+sleep 1.1
+run 0 "$MESA" live listen --wait 1
+run 0 "$MESA" live notice stalled
+[ "$(jqs .id)" != "$NST" ] || fail "a new working span must allow a fresh stalled notice"
+NST2=$(jqs .id)
+run 0 "$MESA" live notice stalled
+[ "$(jqs .id)" = "$NST2" ] || fail "…and dedupes again within it"
+ok "live notice: a fresh working span (the agent taking the next utterance) allows a fresh notice"
+
+# ---- a bad kind, and no kind ----
+run 2 "$MESA" live notice nonsense
+[ -z "$STDOUT" ] || fail "live notice with a bad kind: stdout must be empty"
+[ "$(jqe .error.code)" = "usage" ] || fail "live notice with a bad kind: usage, exit 2"
+run 2 "$MESA" live notice
+[ "$(jqe .error.code)" = "usage" ] || fail "live notice with no kind: usage, exit 2"
+ok "live notice: a bad or missing kind is a usage error (exit 2, the sidebars rule)"
+
+# ---- the API twin: the same Store method, the same dedupe ----
+api 200 POST "/api/live/notice" '{"kind":"permission"}'
+NP2=$(jqb .id)
+[ "$NP2" != "$NP" ] || fail "POST /api/live/notice: the new span allows a fresh permission notice"
+[ "$(jqb .notice)" = "permission" ] || fail "POST /api/live/notice: notice"
+[ "$(jqb .role)" = "mesa" ] || fail "POST /api/live/notice: role"
+[ "$(jqb .text)" = "The agent is blocked on a permission prompt. Check the terminal." ] ||
+  fail "POST /api/live/notice: the fixed text"
+api 200 POST "/api/live/notice" '{"kind":"permission"}'
+[ "$(jqb .id)" = "$NP2" ] || fail "POST /api/live/notice: a repeat is 200 with the existing turn"
+run 0 "$MESA" live notice permission
+[ "$(jqs .id)" = "$NP2" ] || fail "one store: the CLI sees the API's notice as the existing one"
+api 422 POST "/api/live/notice" '{"kind":"nonsense"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "POST /api/live/notice bad kind: validation"
+api 422 POST "/api/live/notice" '{}'
+[ "$(jqb .error.code)" = "validation" ] || fail "POST /api/live/notice no kind: validation"
+raw POST "/api/live/notice" -d 'kind=permission'
+[ "$STATUS" = "415" ] || fail "POST /api/live/notice without JSON Content-Type: expected 415, got $STATUS"
+[ "$(jqb .error.code)" = "validation" ] || fail "POST /api/live/notice no Content-Type: error.code"
+run 0 "$MESA" live turns
+[ "$(jqs 'map(select(.notice != null)) | length')" = "4" ] ||
+  fail "four notice rows across both surfaces (got $(jqs 'map(select(.notice != null)) | length'))"
+ok "POST /api/live/notice: 200 the turn (created or existing), 422 for a bad/missing kind, 415 without JSON"
+
+# ---- GET /api/live: the derived blocked state ----
+#
+# Read off `claude agents --json --all` by the session's job id, never
+# stored, cached for a few seconds per job. The stub now reports the job
+# blocked; the earlier null is served until its TTL runs out.
+printf '%s\n' "$NA" > "$STUB_DIR/blocked-id"
+ELAPSED=$(( $(date +%s) - BLOCKED_NULL_AT ))
+[ "$ELAPSED" -ge 6 ] || sleep $(( 6 - ELAPSED ))
+api 200 GET "/api/live"
+[ "$(jqb .blocked)" = "permission prompt" ] ||
+  fail "GET /api/live: blocked must carry the job's waitingFor once the stub reports it blocked (got $(jqb .blocked))"
+[ "$(jqb .session.id)" = "$NS" ] || fail "GET /api/live: the same session"
+rm -f "$STUB_DIR/blocked-id"
+# The CLI never reads it: `live status` is the stored session alone.
+run 0 "$MESA" live status
+[ "$(jq -c 'has("blocked")' <<<"$STDOUT")" = "false" ] || fail "blocked is derived on the API read, never a session field"
+ok "GET /api/live: blocked is null for a working job and the job's waitingFor when claude agents reports it blocked"
+
+# ---- the archive never sees a notice ----
+run 0 "$MESA" live say "The heron says the agent is fine."
+run 0 "$MESA" live memory search heron
+[ "$(jqs 'map(select(.kind == "turn")) | length')" = "1" ] || fail "search: the agent's own turn is indexed"
+run 0 "$MESA" live memory search responding
+[ "$(jqs length)" = "0" ] || fail "search: a stalled notice must not be in the archive"
+run 0 "$MESA" live memory search permission
+[ "$(jqs length)" = "0" ] || fail "search: a permission notice must not be in the archive"
+ok "live memory search: a notice is not conversation content and is never indexed"
+
+# ---- ended: nothing more can be reported ----
+run 0 "$MESA" live stop >/dev/null
+run 1 "$MESA" live notice stalled
+[ "$(jqe .error.code)" = "not_found" ] || fail "live notice after the end: not_found"
+ok "live notice after the conversation ended: not_found"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

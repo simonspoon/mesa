@@ -10,6 +10,7 @@ import {
   liveSpeakUrl,
   markLiveTurnPlayed,
   reportLiveRoute,
+  sendLiveNotice,
   sendLiveUtterance,
   startLive,
   stopLive,
@@ -107,12 +108,22 @@ import {
   saveLiveSidebarWidth,
 } from '../liveSidebarWidth'
 import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadCut, vadStep } from '../liveVad'
+import {
+  initialWatchdog,
+  noticeInSpan,
+  shouldNoticePermission,
+  shouldNoticeStalled,
+  watchdogAfterPoll,
+  watchdogAfterSpeech,
+  type Watchdog,
+} from '../liveWatchdog'
 import { sameBox, windowBox } from '../liveWindow'
 import { playFailure } from '../speechPlayback'
 import { playSpeechStream, type SpeechStream } from '../speechStream'
 import { parseTimestamp } from '../time'
 import type { ConfigLive } from '../types/ConfigLive'
 import type { LiveContext } from '../types/LiveContext'
+import type { LiveNotice } from '../types/LiveNotice'
 import type { LiveTurn } from '../types/LiveTurn'
 import type { LiveWindow } from '../types/LiveWindow'
 import { useFetch } from '../useFetch'
@@ -734,6 +745,67 @@ export function LiveHub({
   useEffect(() => {
     held.current = turns
   }, [turns])
+
+  // ---- the watchdog (mesa task 1157) ----
+
+  // The page's clock on the agent's silence (`liveWatchdog.ts`), and the
+  // notices this page has already posted this span — keyed on kind and span
+  // start, so a post whose turn has not yet come back on the poll is not
+  // posted again two seconds later. The server dedupes anyway; this keeps the
+  // page from asking. Both refs: read and written off the poll and the media
+  // events, rendered nowhere.
+  const watchdog = useRef<Watchdog | null>(null)
+  const noticed = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const current = data?.session ?? null
+    // Only a browser that is in the conversation authors a notice — the same
+    // condition under which it speaks turns — so a page that merely has mesa
+    // open on another machine never reports on a conversation it is not in.
+    if (current === null || !isLive(current) || !unlocked) return
+    const now = Date.now()
+    if (watchdog.current?.sessionId !== current.id) {
+      watchdog.current = initialWatchdog(current.id, now)
+      noticed.current = new Set()
+    }
+    watchdog.current = watchdogAfterPoll(watchdog.current, {
+      workingSince: current.working_since,
+      turns,
+      now,
+    })
+    // The span the server dedupes by: the working span, or the whole session
+    // while nobody is working.
+    const spanStart = current.working_since ?? current.started_at
+    const post = (kind: LiveNotice) => {
+      const key = `${kind}@${spanStart}`
+      if (noticed.current.has(key)) return
+      noticed.current.add(key)
+      // Ambient like the played stamp: the turn arrives on the next poll
+      // either way, and a failure is retried by the next span, not reported.
+      sendLiveNotice(kind).then(
+        () => refetch(),
+        () => {},
+      )
+    }
+    if (
+      shouldNoticePermission({
+        blocked: data?.blocked ?? null,
+        alreadyNoticed: noticeInSpan(turns, 'permission', spanStart),
+      })
+    ) {
+      post('permission')
+    }
+    if (
+      shouldNoticeStalled({
+        working: current.working_since !== null,
+        speaking,
+        now,
+        lastActivityAt: watchdog.current.lastActivityAt,
+        alreadyNoticed: noticeInSpan(turns, 'stalled', spanStart),
+      })
+    ) {
+      post('stalled')
+    }
+  }, [data, turns, unlocked, speaking, refetch])
 
   // ---- the whiteboard (mesa task 1071) ----
 
@@ -1896,6 +1968,11 @@ export function LiveHub({
     if (sounding.current !== id) return
     sounding.current = null
     setSpeaking(false)
+    // The end of a spoken reply is activity for the watchdog (mesa task
+    // 1157): a long answer must never count as the silence after it.
+    if (watchdog.current !== null) {
+      watchdog.current = watchdogAfterSpeech(watchdog.current, Date.now())
+    }
     markPlayed(id)
     run()
   }
@@ -2307,6 +2384,13 @@ export function LiveHub({
   // the capture effect's cleanup clears it the moment the microphone closes.
   const pill = statusPill({
     speaking: speakingText !== null,
+    // The two reports about the agent (mesa task 1157): its job blocked on a
+    // prompt, straight off the poll; and a stalled notice already posted in
+    // this working span while it is still working.
+    blocked: (data?.blocked ?? null) !== null,
+    stalled:
+      session?.working_since != null &&
+      noticeInSpan(turns, 'stalled', session.working_since),
     heard: showsHearing({
       recording,
       interim,
@@ -2565,7 +2649,7 @@ export function LiveHub({
                       key={group.turns[0].id}
                       className={`live-group live-${group.role}`}
                     >
-                      <div className="live-who">{turnLabel(group.role)}</div>
+                      <div className="live-who">{turnLabel(group.role, group.notice)}</div>
                       {group.turns.map((turn) => (
                         <div key={turn.id} className="live-turn">
                           {/* Plain text, never markdown: a mesa turn is prose meant

@@ -43,12 +43,12 @@ use crate::core::{
     Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
     GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP,
     LibraryBundle, LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveBoardKind,
-    LiveContext, LiveNotebookEntry, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow,
-    MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
-    ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, Script,
-    ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary, Waypoint,
-    agents, attachments, board, config, files, git, guard, hooks, library, listen, live, receipt,
-    scripts, speech, supervisor, system, version,
+    LiveContext, LiveNotebookEntry, LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript,
+    LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
+    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
+    Script, ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary,
+    Waypoint, agents, attachments, board, config, files, git, guard, hooks, library, listen, live,
+    receipt, scripts, speech, supervisor, system, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -101,6 +101,15 @@ struct AppState {
     /// window. A project that changes `local_path` orphans its old key; the
     /// insert path caps the map so those can't grow without bound.
     agents_cache: Arc<Mutex<HashMap<String, (Instant, Vec<AgentSession>)>>>,
+    /// Whether the live agent's job is blocked, keyed by its short job id
+    /// (`live_sessions.agent_id`) — `GET /api/live`'s derived `blocked`
+    /// (mesa task 1157). Its own map rather than `agents_cache` because the
+    /// answer comes off `claude agents --json --all`, a different payload from
+    /// the per-folder list. A `None` is a cached "not blocked" (or a failed
+    /// lookup, which reads the same), so a 2s poll costs at most one
+    /// shell-out per [`LIVE_BLOCKED_TTL`]; keyed on the job id alone, so a
+    /// handoff's successor is a fresh key and a stale one is pruned on insert.
+    live_blocked_cache: Arc<Mutex<HashMap<String, (Instant, Option<String>)>>>,
     /// Working-tree git status per project folder, keyed by `local_path`
     /// (sidebar decoration). `None` is a cached miss — a folder that is not a
     /// repo — so non-repo paths don't respawn git on every poll. Same
@@ -1145,6 +1154,7 @@ pub fn serve(
         usage_lock: Arc::new(tokio::sync::Mutex::new(())),
         usage_refreshing: Arc::new(AtomicBool::new(false)),
         agents_cache: Arc::new(Mutex::new(HashMap::new())),
+        live_blocked_cache: Arc::new(Mutex::new(HashMap::new())),
         agents_gen: Arc::new(AtomicU64::new(0)),
         git_cache: Arc::new(Mutex::new(HashMap::new())),
         git_view_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1385,6 +1395,10 @@ fn router(state: AppState) -> Router {
             patch(replace_live_memory).delete(delete_live_memory),
         )
         .route("/api/live/utterance", post(live_utterance))
+        // mesa's own status report about the agent, written as a turn (mesa
+        // task 1157): the page posts it off the same poll it speaks turns
+        // from. An ordinary write like the utterance, and deduped by `Store`.
+        .route("/api/live/notice", post(live_notice))
         .route("/api/live/route", post(live_route))
         .route("/api/live/turns/{id}/played", post(live_turn_played))
         // Speaking one turn: the same synthesiser, headers and gate pair as
@@ -2981,6 +2995,14 @@ struct LiveUtterance {
 }
 
 #[derive(Deserialize)]
+struct LiveNoticeBody {
+    /// Which report (mesa task 1157): `permission` or `stalled`. A closed
+    /// enum, so serde is the gate and an unknown kind is 422 before the
+    /// handler runs.
+    kind: LiveNotice,
+}
+
+#[derive(Deserialize)]
 struct LiveRouteBody {
     /// Where the user's browser currently is, as a hash route. Required —
     /// reporting no route is not a thing the page has to say.
@@ -3044,27 +3066,66 @@ async fn get_live(
     State(state): State<AppState>,
     Query(q): Query<LiveQuery>,
 ) -> ApiResult<Response> {
-    let store = state.store.lock().unwrap();
-    let Some(session) = store.current_live_session()? else {
-        return Ok(Json(LiveState {
-            session: None,
-            turns: vec![],
-            boards: vec![],
-        })
-        .into_response());
+    let (session, turns, boards) = {
+        let store = state.store.lock().unwrap();
+        let Some(session) = store.current_live_session()? else {
+            return Ok(Json(LiveState {
+                session: None,
+                turns: vec![],
+                boards: vec![],
+                blocked: None,
+            })
+            .into_response());
+        };
+        let turns = store.list_live_turns(session.id, q.after, LIVE_TURNS_LIMIT)?;
+        // The whole board history, bodiless (mesa task 1071) — every board
+        // this conversation pushed, in the order the panel steps through
+        // them, read in the same lock scope as the turns so one poll is one
+        // consistent view. `LIVE_BOARD_KEEP` is all there is: the store
+        // prunes to it on every push.
+        let boards = store.list_live_boards(session.id, LIVE_BOARD_KEEP)?;
+        (session, turns, boards)
     };
-    let turns = store.list_live_turns(session.id, q.after, LIVE_TURNS_LIMIT)?;
-    // The whole board history, bodiless (mesa task 1071) — every board this
-    // conversation pushed, in the order the panel steps through them, read in
-    // the same lock scope as the turns so one poll is one consistent view.
-    // `LIVE_BOARD_KEEP` is all there is: the store prunes to it on every push.
-    let boards = store.list_live_boards(session.id, LIVE_BOARD_KEEP)?;
+    // Whether the agent's job is stuck (mesa task 1157), derived here and
+    // never stored — off the store lock, since it may be a shell-out.
+    let blocked = match session.agent_id.as_deref() {
+        Some(job) => live_agent_blocked(&state, job).await,
+        None => None,
+    };
     Ok(Json(LiveState {
         session: Some(session),
         turns,
         boards,
+        blocked,
     })
     .into_response())
+}
+
+/// What the live agent's job is waiting on, or `None` — through
+/// `live_blocked_cache` so the page's 2s poll costs at most one
+/// `claude agents --json --all` per [`LIVE_BLOCKED_TTL`]. A missing or failing
+/// `claude` is `None` too: the poll must never fail over a decoration, and a
+/// page that cannot learn the state simply never posts the notice.
+async fn live_agent_blocked(state: &AppState, job: &str) -> Option<String> {
+    {
+        let cache = state.live_blocked_cache.lock().unwrap();
+        if let Some((at, blocked)) = cache.get(job)
+            && at.elapsed() < LIVE_BLOCKED_TTL
+        {
+            return blocked.clone();
+        }
+    }
+    let job_owned = job.to_string();
+    let blocked = tokio::task::spawn_blocking(move || agents::job_blocked_on(&job_owned))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    let mut cache = state.live_blocked_cache.lock().unwrap();
+    // A handoff or a new conversation binds a new job id; the old keys go.
+    cache.retain(|_, (at, _)| at.elapsed() < LIVE_BLOCKED_TTL);
+    cache.insert(job.to_string(), (Instant::now(), blocked.clone()));
+    blocked
 }
 
 /// Starts the conversation: opens the session, then spawns the `claude` agent
@@ -3430,6 +3491,29 @@ async fn live_utterance(
     };
     let turn = store.add_live_turn(session.id, LiveRole::User, &body.text, None, None)?;
     Ok((StatusCode::CREATED, Json(turn)).into_response())
+}
+
+/// mesa's own report about the agent — blocked on a permission prompt, or
+/// silent too long — recorded as a `mesa` turn so it is spoken once (mesa
+/// task 1157). The page decides *when* (`liveWatchdog.ts`, off its own poll)
+/// and `Store::add_live_notice` decides *whether*: one per kind per working
+/// span, so two browsers racing the same poll cost one row. Answers the turn
+/// either way — created or the existing one — with 200, since the page does
+/// not care which and the caller learns nothing new from a 201.
+///
+/// Gated exactly like the utterance: an ordinary store write of a fixed
+/// sentence, starting no process and carrying no free text of its own.
+async fn live_notice(
+    State(state): State<AppState>,
+    body: Result<Json<LiveNoticeBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let Some(session) = store.current_live_session()? else {
+        return Err(no_live_session());
+    };
+    let (turn, _created) = store.add_live_notice(session.id, body.kind)?;
+    Ok(Json(turn).into_response())
 }
 
 /// The page reporting where the user's browser is **and what is open on it**,
@@ -4734,6 +4818,13 @@ struct TerminalAttachQuery {
 /// polls — multiple tabs or clients on the same folder within the window — into
 /// one subprocess, not to skip a lone tab's polls.
 const AGENTS_TTL: Duration = Duration::from_secs(2);
+
+/// How long one answer to "is the live agent's job blocked" is reused
+/// (`live_blocked_cache`, mesa task 1157). Longer than the page's 2s poll on
+/// purpose: unlike `AGENTS_TTL` this *is* meant to skip a lone tab's polls,
+/// since every miss is a ~0.5s `claude agents --json --all` and a permission
+/// prompt noticed three seconds late costs nothing.
+const LIVE_BLOCKED_TTL: Duration = Duration::from_secs(5);
 
 /// Sentinel key the global agents list caches under in `agents_cache`
 /// (which is otherwise keyed by folder `local_path`). No real path can equal
@@ -7989,6 +8080,7 @@ mod tests {
             usage_lock: Arc::new(tokio::sync::Mutex::new(())),
             usage_refreshing: Arc::new(AtomicBool::new(false)),
             agents_cache: Arc::new(Mutex::new(HashMap::new())),
+            live_blocked_cache: Arc::new(Mutex::new(HashMap::new())),
             agents_gen: Arc::new(AtomicU64::new(0)),
             git_cache: Arc::new(Mutex::new(HashMap::new())),
             git_view_cache: Arc::new(Mutex::new(HashMap::new())),

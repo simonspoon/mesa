@@ -3398,6 +3398,40 @@ impl LiveAction {
     }
 }
 
+/// Why a `mesa` turn is mesa's own status report about the agent rather than
+/// the agent's words (mesa task 1157). The agent cannot report its own
+/// blocked state — a `claude --bg` session stuck on a permission prompt says
+/// nothing, and so does one that has simply gone quiet — so detection is
+/// external, and the report is written *as a turn* so it is spoken and shown
+/// exactly once, the `played_at` rule, like anything else mesa says. Two
+/// kinds: `permission` (the job is `blocked` on a prompt in `claude agents`)
+/// and `stalled` (working, silent for `liveWatchdog.ts`'s `STALL_MS`). Null on
+/// every turn the agent or the person actually said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LiveNotice {
+    Permission,
+    Stalled,
+}
+
+impl LiveNotice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveNotice::Permission => "permission",
+            LiveNotice::Stalled => "stalled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LiveNotice> {
+        match s {
+            "permission" => Some(LiveNotice::Permission),
+            "stalled" => Some(LiveNotice::Stalled),
+            _ => None,
+        }
+    }
+}
+
 /// Which *page* the person is on when the live session reports its context.
 ///
 /// The vocabulary is deliberately not open: it is the app's own page
@@ -3575,6 +3609,11 @@ pub struct LiveTurn {
     /// The `#/…` route `action: navigate` moves the browser to. Present iff
     /// the action is `navigate` — the sidebar actions take no target.
     pub target: Option<String>,
+    /// Set when this turn is mesa's own report about the agent — blocked on a
+    /// permission prompt, or silent too long (mesa task 1157) — rather than
+    /// something the agent said. Spoken and shown like any mesa turn, labelled
+    /// as a notice in the transcript, and never indexed into the archive.
+    pub notice: Option<LiveNotice>,
     /// When the turn was recorded (SQLite `datetime` text, UTC).
     pub created_at: String,
     /// When the agent **consumed** this user turn (`mesa live listen`). Stamped
@@ -3835,6 +3874,14 @@ pub struct LiveState {
     /// there is deliberately no second route to fetch them from: a body is
     /// fetched once, by the render route, for the one board being looked at.
     pub boards: Vec<LiveBoardSummary>,
+    /// What the agent's `claude --bg` job is waiting on when `claude agents`
+    /// reports it `blocked` — its `waitingFor` string, e.g. "permission
+    /// prompt" — else null (mesa task 1157). **Derived per request, never
+    /// stored**: looked up by the session's `agent_id` through a short-TTL
+    /// cache, and null for a session with no agent, a job the CLI does not
+    /// list, or a `claude` that is missing or failing — none of which is an
+    /// error.
+    pub blocked: Option<String>,
 }
 
 #[cfg(test)]

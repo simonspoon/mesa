@@ -29,10 +29,10 @@ use crate::core::{
     EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
     InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch,
     LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry,
-    LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project,
-    ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status,
-    Store, Task, TaskPatch, TaskReceipt, agents, board, cc, config, files, library, live, look,
-    receipt, system,
+    LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority,
+    Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch,
+    Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc, config, files, library, live,
+    look, receipt, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1745,6 +1745,26 @@ EXAMPLES
     /// with no agent bound, or one `claude agents` does not list, is
     /// `unavailable`. CLI-only, like `look`; takes no --quiet.
     Context,
+    /// Record mesa's own report about the agent as a spoken turn; prints it
+    ///
+    /// KIND is `permission` (the agent's Claude Code session is blocked on a
+    /// permission prompt) or `stalled` (it has been working, silently, for
+    /// too long). Not the agent's verb — the web page posts these off its
+    /// poll (mesa task 1157) — so it takes no --lease. Written at most once
+    /// per kind per working span: a repeat prints the existing turn and
+    /// writes nothing.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live notice permission
+  mesa live notice stalled --quiet")]
+    Notice {
+        /// `permission` or `stalled`
+        #[arg(value_name = "KIND", value_parser = parse_live_notice)]
+        kind: LiveNotice,
+        /// Print the turn without its `text` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Print the conversation so far as a bare JSON array, oldest first
     ///
     /// Both roles, including turns already delivered or spoken — this is the
@@ -2890,6 +2910,11 @@ fn parse_sidebars_action(s: &str) -> std::result::Result<LiveAction, String> {
         "expand" => Ok(LiveAction::ExpandSidebars),
         _ => Err(format!("'{s}' is not one of collapse|expand")),
     }
+}
+
+/// `live notice <KIND>` names one of the two reports (mesa task 1157).
+fn parse_live_notice(s: &str) -> std::result::Result<LiveNotice, String> {
+    LiveNotice::parse(s).ok_or_else(|| format!("'{s}' is not one of permission|stalled"))
 }
 
 /// `--kind` on `live board push` names one of the two **text** kinds. The
@@ -4762,6 +4787,11 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             )?;
             print_live_turn(&turn, quiet);
         }
+        LiveCmd::Notice { kind, quiet } => {
+            let session = current_live_session(&store)?;
+            let (turn, _created) = store.add_live_notice(session.id, kind)?;
+            print_live_turn(&turn, quiet);
+        }
         LiveCmd::Turns {
             session,
             after,
@@ -5962,6 +5992,7 @@ mod tests {
             text: "Opening the board.".into(),
             action: Some(LiveAction::Navigate),
             target: Some("#/projects/2".into()),
+            notice: None,
             created_at: "2026-01-01 00:00:00".into(),
             delivered_at: Some("2026-01-01 00:00:01".into()),
             played_at: Some("2026-01-01 00:00:02".into()),
@@ -6435,6 +6466,10 @@ mod tests {
                 // a pure navigate turn does anything at all.
                 "action",
                 "target",
+                // One of two fixed words or null (mesa task 1157): bounded,
+                // and what tells mesa's own report about the agent from a
+                // turn the agent said. Kept.
+                "notice",
                 "created_at",
                 // Both bounded (a timestamp or null), and both are fields a
                 // command exists to write: `live listen` stamps `delivered_at`

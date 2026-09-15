@@ -251,6 +251,94 @@ It rides on `LiveSession`, so it reaches the page on the existing 2s
 `GET /api/live` poll and the agent on `mesa live status` — no new route, no new
 state, and nothing pushed.
 
+## Telling the person the agent is stuck or silent (mesa task 1157)
+
+By voice, silence is confusing. `working_since` says the agent *took* the
+utterance; it does not say whether it is thinking, waiting on a Claude Code
+**permission prompt** nobody can see, or wedged — and the agent cannot report
+any of that itself, because a `claude --bg` session stuck on a prompt says
+nothing, and so does one that has simply gone quiet. Until this task the
+person found out by attaching a terminal. Detection is therefore external, in
+two halves, and the report is a **turn**.
+
+### The notice turn
+
+A **notice** is a `mesa`-role turn mesa itself writes *about* the agent,
+not the agent's own words: `LiveTurn.notice` names the kind — `permission`
+(the job is blocked on a prompt) or `stalled` (working, silent too long) —
+and is null on every turn either side actually said. `text` is one fixed
+plain sentence per kind (`core::live::NOTICE_PERMISSION_TEXT`,
+`NOTICE_STALLED_TEXT`, chosen in one place by `live::notice_text`), there is
+no action, and the column arrives by migration index 58. It is a turn rather
+than a flag on the session for one reason: a turn is **spoken and shown
+exactly once** — `played_at`, the same run, the same stamp — which is exactly
+what a status report read aloud needs. The transcript labels it `notice`
+rather than `mesa` (`liveTurns.ts::turnLabel`, and `turnGroups` keeps it out
+of the agent's own run on either side), and it is deliberately **not indexed
+into `live_memory_fts`**: it is not conversation content, so `mesa live
+memory search` never finds one.
+
+The one write path is `Store::add_live_notice(session_id, kind) -> (turn,
+created)`, which both `mesa live notice <permission|stalled>` and
+`POST /api/live/notice {"kind"}` call. It refuses an ended or unknown session
+exactly as `add_live_turn` does, and it **dedupes per working span**: if a
+notice of that kind already exists with `created_at >= COALESCE(working_since,
+started_at)`, it answers the existing turn with `created = false` and writes
+nothing. The span is the working span because that is the unit the report is
+about — the agent taking the *next* utterance opens a new one, and a second
+report about the same stretch of silence would be the page nagging. The
+dedupe is in `Store`, not the page, so two browsers racing the same poll cost
+one row and one utterance, and the API answers the turn with **200** whether
+it created it or found it: the page does not care which.
+
+### The derived `blocked` state
+
+`LiveState` gains `blocked: Option<String>` — **derived per request, never
+stored**. When the session is live and has an `agent_id`, `get_live` looks the
+job up in `claude agents --json --all` (`agents::job_blocked_on`, the same
+loosely-read payload `find_job_for_session` uses) and answers the job's
+`waitingFor` string when its `state` is `blocked` — `"permission prompt"` —
+else null. The lookup runs off the store lock on `spawn_blocking`, through a
+small `AppState` cache keyed on the job id with a 5-second TTL
+(`LIVE_BLOCKED_TTL`), so the page's 2-second poll costs at most one shell-out
+per five seconds and a handoff's successor is simply a new key. A missing or
+failing `claude` is null, never an error: the poll must not fail over a
+decoration, and a page that cannot learn the state simply never posts the
+notice. `mesa live status` does not carry it — it is a fact about the CLI's
+view of a job, read on the API's poll.
+
+### The page-side watchdog
+
+`frontend/src/liveWatchdog.ts` holds the decisions and `LiveHub` performs
+them on the poll it already makes, **only while this browser has joined** —
+the same condition under which it speaks turns — so a page that merely has
+mesa open never reports on a conversation it is not in:
+
+- **`permission`** is posted when `blocked` is non-null and no `permission`
+  notice exists in this span (`noticeInSpan`: any turn with that `notice`
+  and `created_at >= working_since ?? started_at`, the server's own rule).
+- **`stalled`** is posted when the session is working, mesa is **not
+  speaking**, nothing has happened for `STALL_MS` (30 s), and no `stalled`
+  notice exists in this span. "Nothing has happened" is a page-local clock,
+  `lastActivityAt`, reset when a working span **begins** (`working_since`
+  changes to a new value), when a **new mesa turn** arrives, and when
+  **mesa's playback ends** — the last because a long spoken reply is the
+  opposite of silence, and a clock that kept running through it would call a
+  two-minute answer a stall the moment it finished. A user turn is never
+  activity: the person talking says nothing about the agent.
+
+The page also remembers what it has posted this span, keyed on kind and span
+start, so a post whose turn has not yet come back on the poll is not posted
+again two seconds later. While `blocked` is non-null the status pill above
+the composer reads `agent blocked on a permission prompt`, and after a
+`stalled` notice has been posted in a span that is still working it reads
+`agent still working…` — both ranked under `mesa speaking` (the notice is
+spoken through that same pill) and above `hearing` (`statusPill`).
+
+The agent is told what these are (rule 8 of `AGENT_PROMPT`): a turn carrying
+`notice` is mesa's report about it, not something it said — carry on, do not
+repeat it, do not apologise for it.
+
 ## One session at a time
 
 `start_live_session` refuses to start a second conversation while one is
@@ -465,6 +553,12 @@ turns (schema enforces none of it, per CLAUDE.md):
 heard, never moved and never cleared, and idempotent so the poll can fire it
 without tracking whether it already has. `list_live_turns` takes an exclusive
 `after` cursor and clamps `limit` into `1..=500`.
+
+`notice` (mesa task 1157) marks a `mesa` turn mesa itself wrote about the
+agent — `permission` or `stalled` — rather than one the agent said; it is
+written only by `Store::add_live_notice`, never by `add_live_turn`, and is
+null everywhere else. See [Telling the person the agent is stuck or
+silent](#telling-the-person-the-agent-is-stuck-or-silent-mesa-task-1157).
 
 `live_turns.session_id` is **`ON DELETE CASCADE`** — a turn is part of a
 conversation, not a record of its own. `live_sessions.project_id` is
@@ -1335,6 +1429,7 @@ flag is an unknown argument, exit 2, exactly as on `turns`.
 | `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route; `--lease <N>` | the `LiveTurn` |
 | `live handoff <NOTE>…` | trailing var arg, `--quiet` **before** the note; takes no `--lease` | the `LiveSession` with its bumped `lease` and the successor's `agent_id` |
 | `live context` | — (no `--quiet`) | `{session_id, agent_id, lease, context_tokens}` |
+| `live notice <permission\|stalled>` | `--quiet`; takes no `--lease` (not the agent's verb — the page's, mesa task 1157) | the notice `LiveTurn`, created or the existing one for this working span |
 | `live turns` | `--after <ID>`, `--limit <N>` (clamped to 1..=500) | a bare array of turns, oldest first |
 | `live look` | `--output <PATH>` (default: a temp file named for the session) | the `LiveShot`: `path`, `window_id`, `width`, `height` |
 | `live board push [BODY]…` | exactly one source (body, `--file`, `--image`, `--diagram`), `--kind`, `--title`, `--say` — put every flag **before** the body | the created `LiveBoard` |
@@ -1459,6 +1554,7 @@ takes exactly one value.
 | `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
 | `DELETE /api/live` | the ended session | `require_agent_access` |
 | `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
+| `POST /api/live/notice` `{kind}` | the notice turn, **200** created or existing (deduped per working span, mesa task 1157); an unknown `kind` is 422 | standard write |
 | `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded — an omitted `context`/`window` leaves the stored one alone, an explicit `null` clears it | standard write |
 | `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
 | `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
@@ -1524,9 +1620,9 @@ handler runs (`JsonRejection` maps to mesa's validation body), which is the
 same code an over-long field gets from `Store` — an unknown page is a client
 bug either way. The gate is unchanged: an ordinary write.
 
-The three ordinary writes resolve the current session themselves, so with none
-live each is `not_found` with a hint naming `POST /api/live`, the same shape
-the CLI's not-found hints use.
+The ordinary writes (utterance, notice, route) resolve the current session
+themselves, so with none live each is `not_found` with a hint naming
+`POST /api/live`, the same shape the CLI's not-found hints use.
 
 Why each gate is what it is:
 

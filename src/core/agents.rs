@@ -384,6 +384,16 @@ pub fn find_session_for_job(job_id: &str) -> Result<Option<String>, String> {
     session_for_job(&list_all_agents(&claude_bin())?, job_id)
 }
 
+/// What the background job `job_id` is waiting on, when `claude agents`
+/// reports it `blocked` — its `waitingFor` string ("permission prompt") — or
+/// `Ok(None)` for a job that is working, done, or not listed. The one signal
+/// behind `GET /api/live`'s derived `blocked` (mesa task 1157): the live
+/// agent cannot report its own stuck state, so mesa reads it off the CLI's
+/// own view of the job. Same lookup, same reason it is never an inference.
+pub fn job_blocked_on(job_id: &str) -> Result<Option<String>, String> {
+    blocked_on(&list_all_agents(&claude_bin())?, job_id)
+}
+
 /// `claude agents --json --all`, raw — the payload both lookups above read.
 fn list_all_agents(bin: &str) -> Result<Vec<u8>, String> {
     let out = Command::new(bin)
@@ -432,6 +442,28 @@ fn session_for_job(bytes: &[u8], job_id: &str) -> Result<Option<String>, String>
                     .map(str::to_string)
             })
             .flatten()
+    }))
+}
+
+/// Pure half of [`job_blocked_on`], read as loosely as [`job_for_session`]
+/// and for the same reason. A row that is `blocked` without saying on what
+/// still answers `"blocked"`, so the signal is never lost to a missing key.
+fn blocked_on(bytes: &[u8], job_id: &str) -> Result<Option<String>, String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|e| format!("unexpected claude agents payload: {e}"))?;
+    Ok(rows.into_iter().find_map(|row| {
+        if row.get("id").and_then(|v| v.as_str()) != Some(job_id) {
+            return None;
+        }
+        if row.get("state").and_then(|v| v.as_str()) != Some("blocked") {
+            return None;
+        }
+        Some(
+            row.get("waitingFor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("blocked")
+                .to_string(),
+        )
     }))
 }
 
@@ -551,6 +583,28 @@ mod tests {
         "waitingFor": "permission prompt"
       }
     ]"#;
+
+    /// `blocked_on` reads a job's `state`/`waitingFor` pair (mesa task 1157):
+    /// the captured blocked row answers its prompt, a working row and an
+    /// unknown id answer nothing, and a blocked row with no `waitingFor`
+    /// still reads as blocked.
+    #[test]
+    fn blocked_on_reads_the_waiting_for_string_of_a_blocked_job() {
+        let bytes = SESSIONS_JSON.as_bytes();
+        assert_eq!(
+            blocked_on(bytes, "e34b8ed9").unwrap().as_deref(),
+            Some("permission prompt")
+        );
+        assert_eq!(blocked_on(bytes, "nope").unwrap(), None);
+        let working = br#"[{"id": "aaaa", "sessionId": "s", "state": "working"},
+                           {"id": "bbbb", "sessionId": "t", "state": "blocked"}]"#;
+        assert_eq!(blocked_on(working, "aaaa").unwrap(), None);
+        assert_eq!(
+            blocked_on(working, "bbbb").unwrap().as_deref(),
+            Some("blocked")
+        );
+        assert!(blocked_on(b"not json", "aaaa").is_err());
+    }
 
     #[test]
     fn parses_interactive_and_background_sessions() {

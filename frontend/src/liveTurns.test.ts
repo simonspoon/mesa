@@ -20,6 +20,7 @@ function turn(id: number, patch: Partial<LiveTurn> = {}): LiveTurn {
     text: 'the board is open',
     action: null,
     target: null,
+    notice: null,
     created_at: '2026-01-01 00:00:00',
     delivered_at: null,
     played_at: null,
@@ -218,6 +219,25 @@ describe('turnGroups', () => {
       ['mesa', [2, 3]],
       ['user', [4]],
     ])
+    expect(groups.every((g) => !g.notice)).toBe(true)
+  })
+
+  it('keeps a notice out of the agent’s run on either side of it', () => {
+    // mesa's own report about the agent (mesa task 1157) is labelled apart,
+    // so it is grouped apart — even between two turns the agent said.
+    const groups = turnGroups([
+      turn(1),
+      turn(2, { notice: 'stalled' }),
+      turn(3),
+      turn(4, { notice: 'permission' }),
+      turn(5, { notice: 'stalled' }),
+    ])
+    expect(groups.map((g) => [g.notice, g.turns.map((t) => t.id)])).toEqual([
+      [false, [1]],
+      [true, [2]],
+      [false, [3]],
+      [true, [4, 5]],
+    ])
   })
 
   it('is empty for an empty transcript', () => {
@@ -229,5 +249,10 @@ describe('turnLabel', () => {
   it('names each side the way the agent chat does', () => {
     expect(turnLabel('user')).toBe('you')
     expect(turnLabel('mesa')).toBe('mesa')
+  })
+
+  it('names a notice as one, not as mesa', () => {
+    expect(turnLabel('mesa', true)).toBe('notice')
+    expect(turnLabel('mesa', false)).toBe('mesa')
   })
 })

@@ -11,10 +11,10 @@ use super::types::{
     AnchorSide, Artifact, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat,
     EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
-    LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry, LiveRole, LiveSession,
-    LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script, ScriptArg,
-    ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint, is_valid_artifact_content_type,
-    task_name,
+    LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry, LiveNotice, LiveRole,
+    LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script,
+    ScriptArg, ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint,
+    is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -888,6 +888,13 @@ const MIGRATIONS: &[&str] = &[
     // (`restore_notebook_entry` un-retires a source). NULL for every other
     // retirement reason.
     "ALTER TABLE live_notebook ADD COLUMN merged_into INTEGER REFERENCES live_notebook(id);",
+    // Task 1157: a `mesa` turn mesa itself writes about the agent — blocked on
+    // a permission prompt, or silent too long — rather than the agent's own
+    // words. `notice` names the kind (`permission` | `stalled`); NULL on every
+    // turn either side actually said. A turn rather than a flag on the session
+    // because a turn is spoken and shown exactly once (`played_at`), which is
+    // what a status report read aloud needs.
+    "ALTER TABLE live_turns ADD COLUMN notice TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1070,7 +1077,7 @@ const LIVE_SESSION_COLUMNS: &str = "id, project_id, agent_id, status, route, sta
      updated_at, ended_at, context, working_since, window_box, lease";
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
-     created_at, delivered_at, played_at";
+     created_at, delivered_at, played_at, notice";
 
 /// Longest route mesa will store or navigate to. A route is a hash path the
 /// page already knows how to render, not free text, so the bound is generous
@@ -1162,6 +1169,7 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
 fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
     let role: String = row.get(2)?;
     let action: Option<String> = row.get(4)?;
+    let notice: Option<String> = row.get(9)?;
     Ok(LiveTurn {
         id: row.get(0)?,
         session_id: row.get(1)?,
@@ -1169,6 +1177,7 @@ fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
         text: row.get(3)?,
         action: action.map(|a| LiveAction::parse(&a).expect("invalid live turn action in db")),
         target: row.get(5)?,
+        notice: notice.map(|n| LiveNotice::parse(&n).expect("invalid live turn notice in db")),
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
         played_at: row.get(8)?,
@@ -4856,6 +4865,70 @@ impl Store {
                 }
                 e => Error::Db(e),
             })
+    }
+
+    /// Records mesa's own report about the agent as a `mesa` turn (mesa task
+    /// 1157) — blocked on a permission prompt, or silent too long — so it is
+    /// spoken and shown exactly once like anything else mesa says. The text is
+    /// the fixed sentence for the kind (`live::notice_text`), there is no
+    /// action, and `notice` names the kind.
+    ///
+    /// **Deduped per working span**: the same kind is written at most once
+    /// since `COALESCE(working_since, started_at)` — the agent taking the next
+    /// utterance opens a new span, and a second report about the same stretch
+    /// of silence would be the page nagging. A repeat answers the existing
+    /// turn with `false` and writes nothing, which is what lets two browsers
+    /// race the poll harmlessly. Refuses an ended or unknown session exactly
+    /// as `add_live_turn` does, and is deliberately **not** indexed into
+    /// `live_memory_fts`: it is not conversation content.
+    pub fn add_live_notice(
+        &mut self,
+        session_id: i64,
+        kind: LiveNotice,
+    ) -> Result<(LiveTurn, bool)> {
+        let session = self
+            .conn
+            .query_row(
+                &format!("SELECT {LIVE_SESSION_COLUMNS} FROM live_sessions WHERE id = ?1"),
+                [session_id],
+                row_to_live_session,
+            )
+            .optional()?
+            .ok_or_else(|| Error::Validation(format!("live session {session_id} not found")))?;
+        if session.status != LiveStatus::Live {
+            return Err(Error::Validation(format!(
+                "live session {session_id} has ended"
+            )));
+        }
+        let existing = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {LIVE_TURN_COLUMNS} FROM live_turns \
+                     WHERE session_id = ?1 AND notice = ?2 \
+                       AND created_at >= (SELECT COALESCE(working_since, started_at) \
+                                          FROM live_sessions WHERE id = ?1) \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                (session_id, kind.as_str()),
+                row_to_live_turn,
+            )
+            .optional()?;
+        if let Some(turn) = existing {
+            return Ok((turn, false));
+        }
+        self.conn.execute(
+            "INSERT INTO live_turns (session_id, role, text, notice, created_at) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            (
+                session_id,
+                LiveRole::Mesa.as_str(),
+                live::notice_text(kind),
+                kind.as_str(),
+            ),
+        )?;
+        let id = self.conn.last_insert_rowid();
+        Ok((self.get_live_turn(id)?, true))
     }
 
     /// Hands the agent the oldest undelivered user utterance, stamping it
@@ -11880,15 +11953,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            58,
-            "a fresh db should report user_version 58"
+            59,
+            "a fresh db should report user_version 59"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 58);
+        assert_eq!(version, 59);
     }
 
     /// Pins the dream-pass migration (mesa task 1152) at index 57: the
@@ -11901,6 +11974,184 @@ mod tests {
             "migration {MERGE} is no longer the notebook merge migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
+    }
+
+    /// Pins the notice column (mesa task 1157) at index 58, and checks that a
+    /// db from before it reads its old turns back with `notice: None`.
+    #[test]
+    fn the_live_notice_column_arrives_at_migration_58() {
+        const NOTICE: usize = 58;
+        assert!(
+            MIGRATIONS[NOTICE].contains("ADD COLUMN notice"),
+            "migration {NOTICE} is no longer the live notice migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..NOTICE] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", NOTICE as i64)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO live_sessions (status, started_at, updated_at) \
+                 VALUES ('live', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO live_turns (session_id, role, text, created_at) \
+                 VALUES (1, 'mesa', 'from before', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let turns = store.list_live_turns(1, None, 10).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].notice, None);
+    }
+
+    /// A notice is a mesa turn mesa writes about the agent (mesa task 1157):
+    /// fixed text, no action, the kind on the row, and at most one per kind
+    /// per working span — a fresh `next_user_turn` span allows the next one.
+    #[test]
+    fn add_live_notice_writes_one_mesa_turn_per_kind_per_working_span() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store
+            .add_live_turn(session.id, LiveRole::User, "do the thing", None, None)
+            .unwrap();
+        store.next_user_turn(session.id).unwrap().unwrap();
+
+        let (first, created) = store
+            .add_live_notice(session.id, LiveNotice::Stalled)
+            .unwrap();
+        assert!(created);
+        assert_eq!(first.role, LiveRole::Mesa);
+        assert_eq!(first.notice, Some(LiveNotice::Stalled));
+        assert_eq!(first.text, live::notice_text(LiveNotice::Stalled));
+        assert_eq!(first.action, None);
+        assert_eq!(first.target, None);
+        assert_eq!(first.played_at, None);
+
+        // The same kind in the same span is the existing turn, and no write.
+        let (again, created) = store
+            .add_live_notice(session.id, LiveNotice::Stalled)
+            .unwrap();
+        assert!(!created);
+        assert_eq!(again.id, first.id);
+        // The utterance and the one notice: nothing was written.
+        assert_eq!(
+            store.list_live_turns(session.id, None, 10).unwrap().len(),
+            2
+        );
+
+        // The other kind is independent of it.
+        let (blocked, created) = store
+            .add_live_notice(session.id, LiveNotice::Permission)
+            .unwrap();
+        assert!(created);
+        assert_ne!(blocked.id, first.id);
+        assert_eq!(blocked.notice, Some(LiveNotice::Permission));
+        assert_eq!(blocked.text, live::notice_text(LiveNotice::Permission));
+
+        // A new working span — the agent taking the next utterance — allows
+        // a fresh one. The clock is second-grained, so the earlier notice is
+        // backdated to land clearly before the new stamp.
+        store
+            .conn
+            .execute(
+                "UPDATE live_turns SET created_at = datetime('now', '-10 seconds') \
+                 WHERE notice IS NOT NULL",
+                [],
+            )
+            .unwrap();
+        store
+            .add_live_turn(session.id, LiveRole::User, "and another", None, None)
+            .unwrap();
+        store.next_user_turn(session.id).unwrap().unwrap();
+        let (third, created) = store
+            .add_live_notice(session.id, LiveNotice::Stalled)
+            .unwrap();
+        assert!(created, "a new working span allows a fresh notice");
+        assert_ne!(third.id, first.id);
+    }
+
+    /// With the agent waiting (`working_since` null) the span is the whole
+    /// session, so a notice is written once per session then.
+    #[test]
+    fn add_live_notice_spans_the_whole_session_while_nobody_is_working() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert!(session.working_since.is_none());
+        let (first, created) = store
+            .add_live_notice(session.id, LiveNotice::Permission)
+            .unwrap();
+        assert!(created);
+        let (again, created) = store
+            .add_live_notice(session.id, LiveNotice::Permission)
+            .unwrap();
+        assert!(!created);
+        assert_eq!(again.id, first.id);
+    }
+
+    /// A notice on an ended or unknown session is `add_live_turn`'s refusal,
+    /// and nothing is written.
+    #[test]
+    fn add_live_notice_refuses_an_ended_or_unknown_session() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.end_live_session(session.id).unwrap();
+        assert!(matches!(
+            store.add_live_notice(session.id, LiveNotice::Stalled),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.add_live_notice(999_999, LiveNotice::Stalled),
+            Err(Error::Validation(_))
+        ));
+        assert!(
+            store
+                .list_live_turns(session.id, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A notice is not conversation content: the archive index never sees it,
+    /// while a turn the agent actually said is found as before.
+    #[test]
+    fn add_live_notice_is_not_indexed_into_the_archive() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store
+            .add_live_notice(session.id, LiveNotice::Permission)
+            .unwrap();
+        store
+            .add_live_notice(session.id, LiveNotice::Stalled)
+            .unwrap();
+        store
+            .add_live_turn(session.id, LiveRole::Mesa, "a spoken sentence", None, None)
+            .unwrap();
+        let indexed: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM live_memory_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexed, 1, "only the agent's own turn is indexed");
+        assert!(
+            store
+                .search_live_memory("permission", 10)
+                .unwrap()
+                .is_empty()
+                && store
+                    .search_live_memory("responding", 10)
+                    .unwrap()
+                    .is_empty()
+        );
+        assert_eq!(store.search_live_memory("spoken", 10).unwrap().len(), 1);
     }
 
     /// Pins the live-memory migration (mesa task 1147) at index 55, and

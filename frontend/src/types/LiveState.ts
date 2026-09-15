@@ -24,4 +24,14 @@ export type LiveState = { session: LiveSession | null, turns: Array<LiveTurn>,
  * there is deliberately no second route to fetch them from: a body is
  * fetched once, by the render route, for the one board being looked at.
  */
-boards: Array<LiveBoardSummary>, };
+boards: Array<LiveBoardSummary>, 
+/**
+ * What the agent's `claude --bg` job is waiting on when `claude agents`
+ * reports it `blocked` — its `waitingFor` string, e.g. "permission
+ * prompt" — else null (mesa task 1157). **Derived per request, never
+ * stored**: looked up by the session's `agent_id` through a short-TTL
+ * cache, and null for a session with no agent, a job the CLI does not
+ * list, or a `claude` that is missing or failing — none of which is an
+ * error.
+ */
+blocked: string | null, };

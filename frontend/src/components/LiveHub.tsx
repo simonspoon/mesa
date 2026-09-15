@@ -42,6 +42,7 @@ import {
   type ReclaimCause,
 } from '../liveCapture'
 import { currentContext, sameContext, subscribeContext } from '../liveContext'
+import { mayHold, SegmentChain } from '../liveDrain'
 import {
   audioInputs,
   chosenInput,
@@ -663,10 +664,12 @@ export function LiveHub({
   // a level is the cheap honest answer where a partial transcript would need
   // a streaming decoder mesa does not have (mesa task 956).
   const [level, setLevel] = useState(0)
-  // How many segments are in flight to the transcribe route right now —
-  // almost always 0 or 1, since segments are posted in order, but never
-  // assumed to be: it is a count, not a flag, so a slow request does not read
-  // as "stopped hearing" for the length of it.
+  // How many segments are queued for or in flight to the transcribe route
+  // right now — almost always 0 or 1, since segments are posted in order, but
+  // never assumed to be: it is a count, not a flag, so a slow request does not
+  // read as "stopped hearing" for the length of it. Written by `chainRef`
+  // below (mesa task 1154), so it is exactly the chain's own count and stays
+  // above zero for the whole of a mic-off drain.
   const [hearing, setHearing] = useState(0)
   // When the person was last audibly talking, or `null` while the microphone
   // is shut. Written from the same place `level` is, and read only through
@@ -1151,6 +1154,26 @@ export function LiveHub({
   useEffect(() => {
     flushRef.current = flushRecording
   }, [flushRecording])
+  // The one ordered chain every heard segment settles through (mesa task
+  // 1154, `liveDrain.ts`). Component-level rather than a capture run's own,
+  // because the listen switch tears the run down with segments still on their
+  // way back from `auris`: the press `close()`s the chain, and when anything
+  // is outstanding the flush becomes the step after the last of it — so the
+  // next run's segments, enqueued behind that step, can never overtake what
+  // the previous run heard. `hearing` is the chain's count, told to it here.
+  const chainRef = useRef<SegmentChain | null>(null)
+  if (chainRef.current === null) {
+    chainRef.current = new SegmentChain({
+      flush: () => flushRef.current(),
+      onOutstanding: setHearing,
+    })
+  }
+  // The running capture effect's way of windowing the utterance still open
+  // onto the chain, for the press to call *before* it closes the chain: the
+  // effect's own cleanup runs a render later, and a cut chained there would
+  // land behind the flush instead of in front of it. `null` while no capture
+  // is running (the browser path, mesa speaking, a pause).
+  const cutRef = useRef<(() => void) | null>(null)
 
   // The recording's other boundary (mesa task 917): silence, not just the
   // switch. A timeout re-armed on every dependency change, reading the live
@@ -1176,11 +1199,26 @@ export function LiveHub({
 
   const toggleListening = useCallback(
     (next: boolean) => {
-      // The switch off is the send; the switch on starts a fresh recording,
-      // because a recording belongs to the stretch of listening it was made
-      // in. Either way nothing is left held.
-      if (next) flushRecording()
-      else {
+      // The ref first, before the cut and the close below: a segment that
+      // settles from here on must read this press, and `setMutedNow` a few
+      // lines down would only be re-affirming it. The same reason
+      // `listeningRef` is written here rather than left to its effect.
+      mutedRef.current = next
+      if (next) {
+        // The switch off is the send (mesa task 1154): the utterance still
+        // open is cut onto the chain first, then the chain is closed — which
+        // flushes at once when nothing is outstanding, and otherwise makes
+        // the flush the step after the last segment already heard, so what
+        // was still being transcribed at the press is sent with the rest
+        // rather than dropped behind a recording already gone.
+        cutRef.current?.()
+        chainRef.current?.close()
+      } else if (!chainRef.current?.draining) {
+        // The switch on starts a fresh recording, because a recording belongs
+        // to the stretch of listening it was made in — unless the last
+        // stretch is still draining, in which case what it holds is that
+        // stretch's, waiting on the flush queued behind its segments, and the
+        // new run's own segments are queued behind that flush.
         setRecordingNow('')
         setInterimNow('')
       }
@@ -1200,7 +1238,6 @@ export function LiveHub({
     },
     [
       blocked,
-      flushRecording,
       live,
       paused,
       reclaim,
@@ -1277,8 +1314,10 @@ export function LiveHub({
     // Segments are transcribed **in order**: two overlapping posts could land
     // the halves of one thought the wrong way round, the same reasoning
     // `post()` already carries in this file for a split recording. Every
-    // segment's `send` is chained onto this rather than fired directly.
-    let queue = Promise.resolve()
+    // segment's `send` is enqueued on the component's chain rather than fired
+    // directly — the chain, not a run-local promise, since mesa task 1154:
+    // see `chainRef`.
+    const chain = chainRef.current!
 
     /**
      * One finished utterance, windowed out of the rolling buffer, downsampled
@@ -1288,26 +1327,26 @@ export function LiveHub({
      * downstream (`heldWith`, `shouldFlushSilence`, `heldFlush`) is built
      * assuming a final arrives this way.
      *
-     * `outlives` (mesa task 961) is for the one segment that is windowed in
-     * this effect's own *cleanup* rather than from `onFrame` — the sentence
-     * the person was still finishing when mesa began to speak, cut by
-     * `vadCut` because `wantsMic` going false tears this whole effect down
-     * before the VAD would ever have reported it `ended` on its own. That
-     * send necessarily starts after `running` has already gone false, so the
-     * two `!running` early-outs below are skipped for it — the same
-     * "not guarded on `running`" carve-out the browser-recognizer path takes
-     * in its `onresult`, and for the same reason: this text was heard before
-     * mesa's audio started, so it is the person's, not an echo, and belongs
-     * in the recording. The delivery-time predicate two lines down
-     * (`armed.current.live && !pausedRef.current && !mutedRef.current`) is
-     * still what decides whether it actually lands — unchanged, and doing
-     * all the discriminating: a pause, a mute or the listen switch, or the
-     * conversation having ended by the time this resolves, all fail it, so
-     * only "mesa started speaking and nothing else happened" reaches the
-     * recording.
+     * `outlives` (mesa task 961) is for a segment windowed by `cutOpen`
+     * rather than from `onFrame` — the sentence the person was still
+     * finishing when mesa began to speak, or when they pressed the listen
+     * switch, cut by `vadCut` because the effect is torn down before the VAD
+     * would ever have reported it `ended` on its own. That send necessarily
+     * starts after `running` has gone false, so the two `!running` early-outs
+     * below are skipped for it — the same "not guarded on `running`"
+     * carve-out the browser-recognizer path takes in its `onresult`, and for
+     * the same reason: this text was heard before the teardown, so it is the
+     * person's, not an echo, and belongs in the recording. The delivery-time
+     * predicate (`mayHold`, `liveDrain.ts`) is still what decides whether it
+     * actually lands, and does all the discriminating: a pause, or the
+     * conversation having ended by the time this resolves, fail it; a mute
+     * fails it too — *unless* the chain is still draining the press that
+     * muted (mesa task 1154), in which case this segment was heard before
+     * that press and is folded in for the flush queued behind it. So "mesa
+     * started speaking and nothing else happened" and "the person switched
+     * the microphone off" both reach the recording; a pause and an end do not.
      */
     const send = async (wav: Uint8Array, outlives = false) => {
-      setHearing((n) => n + 1)
       try {
         const { text: raw } = await transcribeAudio(toBase64(wav))
         if (!running && !outlives) return
@@ -1320,7 +1359,14 @@ export function LiveHub({
         // segment: the words it showed have just been recorded, and leaving
         // them under the box would read as a second sentence still coming.
         setInterimNow('')
-        if (armed.current.live && !pausedRef.current && !mutedRef.current) {
+        if (
+          mayHold({
+            live: armed.current.live,
+            paused: pausedRef.current,
+            muted: mutedRef.current,
+            draining: chain.draining,
+          })
+        ) {
           // Held, not posted (task 889): the recording is one turn, and the
           // person's own switch is what ends it. `flush` is only the cap.
           const grown = heldWith(recordingRef.current, text)
@@ -1344,10 +1390,25 @@ export function LiveHub({
         // conversation while turns kept flowing.
         const message = err instanceof Error ? err.message : String(err)
         setActionError(isSilentTranscribe(message) ? null : message)
-      } finally {
-        setHearing((n) => n - 1)
       }
     }
+
+    /**
+     * Window the utterance still open, if any, onto the chain, and reset the
+     * VAD so the same audio is never windowed twice. Called from the listen
+     * switch's press through `cutRef` (mesa task 1154) and from the cleanup
+     * below; the second call after a press finds a fresh VAD and cuts
+     * nothing. The reasoning for cutting at all is the cleanup's, below.
+     */
+    const cutOpen = () => {
+      const cut = vadCut(vad)
+      if (cut !== null && ctx !== null) {
+        const wav = wavFromFrames(frames, cut.startedAt - PRE_ROLL_MS, cut.endedAt, ctx.sampleRate)
+        if (wav.length > 44) chain.enqueue(() => send(wav, true))
+      }
+      vad = initialVad()
+    }
+    cutRef.current = cutOpen
 
     const onFrame = (samples: Float32Array) => {
       const at = Date.now()
@@ -1397,7 +1458,7 @@ export function LiveHub({
         )
         // A header-only WAV is a window with nothing in it — nothing anybody
         // said, so nothing worth waking a decoder for.
-        if (wav.length > 44) queue = queue.then(() => send(wav))
+        if (wav.length > 44) chain.enqueue(() => send(wav))
       }
       frames = dropBefore(frames, (vad.startedAt ?? at) - PRE_ROLL_MS)
     }
@@ -1498,6 +1559,7 @@ export function LiveHub({
 
     return () => {
       running = false
+      cutRef.current = null
       setInterimNow('')
       // The meter goes quiet with the microphone. It is driven from frames
       // that have stopped arriving, so without this it would freeze at
@@ -1522,24 +1584,22 @@ export function LiveHub({
       // off whatever state the VAD was actually left in. This has to happen
       // here, before `ctx?.close()`/the stream teardown just below: windowing
       // needs `ctx.sampleRate` to downsample by and `frames` to draw from, and
-      // both are gone the moment those run. The send is chained onto `queue`
+      // both are gone the moment those run. The send is enqueued on the chain
       // like every other segment, never fired directly — so it can't overtake
       // a segment already in flight — and marked `outlives` so the two
       // `!running` guards inside `send` don't discard it now that `running`
       // is already false; see `send`'s comment for why the delivery-time
-      // predicate alone is still enough to keep the other four teardown
-      // reasons (pause, mute, the listen switch, ending) from also sending
-      // whatever they cut off. `vad = initialVad()` after windowing, mirroring
-      // the reset `vadStep` performs on an ordinary `ended`, is what stops
-      // this same audio being windowed twice — this cleanup runs exactly
-      // once per effect run, but leaving `vad` as it was would say otherwise
-      // to anything reading it afterwards.
-      const cut = vadCut(vad)
-      if (cut !== null && ctx !== null) {
-        const wav = wavFromFrames(frames, cut.startedAt - PRE_ROLL_MS, cut.endedAt, ctx.sampleRate)
-        if (wav.length > 44) queue = queue.then(() => send(wav, true))
-      }
-      vad = initialVad()
+      // predicate alone is still enough to keep a pause and an end from also
+      // sending whatever they cut off. The listen switch is no longer one of
+      // those (mesa task 1154): its press already called `cutOpen` through
+      // `cutRef` and closed the chain behind the cut, so by the time this
+      // cleanup runs for a mute the VAD is fresh and there is nothing left to
+      // cut. `vad = initialVad()` after windowing, mirroring the reset
+      // `vadStep` performs on an ordinary `ended`, is what stops this same
+      // audio being windowed twice — this cleanup runs exactly once per effect
+      // run, but leaving `vad` as it was would say otherwise to anything
+      // reading it afterwards.
+      cutOpen()
       void ctx?.close()
       stream?.getTracks().forEach((t) => t.stop())
       if (blobUrl) URL.revokeObjectURL(blobUrl)
@@ -1690,14 +1750,23 @@ export function LiveHub({
         // clears the preview on its way past — and the stop that gap caused
         // delivering the final. That sentence goes; it is the same sentence the
         // pre-889 page dropped on a mute, and closing it would mean holding a
-        // preview mesa is already talking over.
+        // preview mesa is already talking over. (Mesa task 1154's drain is the
+        // auris path's: this engine never enqueues on the chain, so `mayHold`
+        // reads `draining` as false here and the verdict is unchanged.)
         if (running) {
           // The preview is cleared here rather than waiting for the next
           // event: the words it showed have just been recorded, and leaving
           // them under the box would read as a second sentence still coming.
           setInterimNow('')
         }
-        if (armed.current.live && !pausedRef.current && !mutedRef.current) {
+        if (
+          mayHold({
+            live: armed.current.live,
+            paused: pausedRef.current,
+            muted: mutedRef.current,
+            draining: false,
+          })
+        ) {
           // Held, not posted (task 889): the recording is one turn, and the
           // person's own switch is what ends it. `flush` is only the cap.
           const grown = heldWith(recordingRef.current, text)
@@ -2155,10 +2224,10 @@ export function LiveHub({
   // being heard blinked its way through every sentence. `voicedAt` held for
   // `HEARING_HOLD_MS` bridges the VAD's own hangover into the in-flight
   // segment, and the effect beside its state is what renders the moment it
-  // runs out. Still auris-path-only, exactly as before: `voicedAt`, `level`
-  // and `hearing` are written only inside the capture effect, so on the
-  // browser path (mesa task 957) this falls through to that path's real
-  // `interim` guess instead.
+  // runs out. Still auris-path-only, exactly as before: `voicedAt` and
+  // `level` are written only inside the capture effect and `hearing` only by
+  // the chain that effect enqueues on, so on the browser path (mesa task 957)
+  // this falls through to that path's real `interim` guess instead.
   const voiced = showsHearing({
     recording: '',
     interim: '',

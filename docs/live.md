@@ -1795,26 +1795,40 @@ conversation") working with no backend change.
     said.
 
     Three consequences follow, and each is a decision:
-    - **The switch sends what is already transcribed, not what is still being
-      captured.** Segments transcribe **in order**, chained through a promise
-      (mirroring `post()`'s own chaining), so `flushRecording` posts
-      `recording` — the segments `auris` has already answered — and
-      `interim`, which mesa task 956 leaves permanently empty now that there
-      is no partial guess to hold: `heldFlush(recording, interim)` is
-      byte-identical to what it always did, it is simply never handed
-      anything in that second argument any more. A segment the VAD has not
-      yet ended when the switch is pressed is not specially cut and sent —
-      pressing the switch (like a mute) tears down the capture stream, and
-      whatever audio was mid-segment at that moment is dropped rather than
-      transcribed. Mesa starting to speak is the one teardown this does *not*
-      apply to (mesa task 961, `vadCut` in `liveVad.ts`): the effect's cleanup
-      windows and posts whatever utterance was still in progress before the
-      microphone closes, the same way the browser-recognizer engine's
-      `stop()` used to deliver a pending final — that sentence was heard
-      before mesa's own audio started, so it is the person's, not an echo.
-      The delivery-time guard (`armed.current.live && !paused && !muted`) is
-      what still drops it if a pause, a mute or the end of the conversation
-      also happened to land in that gap.
+    - **The switch sends everything heard before the press, once it has all
+      been transcribed** (mesa task 1154; before it, only what was already
+      transcribed). Segments transcribe **in order**, chained through one
+      component-level `SegmentChain` (`liveDrain.ts`) that outlives any one
+      capture run, so `flushRecording` posts `recording` — the segments
+      `auris` has answered — and `interim`, which mesa task 956 leaves
+      permanently empty now that there is no partial guess to hold:
+      `heldFlush(recording, interim)` is byte-identical to what it always
+      did, it is simply never handed anything in that second argument any
+      more. The press first cuts the utterance the VAD has not yet ended
+      (`vadCut`, through `cutRef`, exactly the windowing task 961 gave mesa
+      starting to speak) onto the chain, then **closes** it: with nothing
+      outstanding the flush happens at once, as it always did; with a segment
+      still on its way back from `auris` or a cut just queued, nothing is
+      posted at the press, the flush becomes the step after the last of
+      them, and the status pill stays on "transcribing…" (`hearing` is the
+      chain's own count) until it runs — so the whole of what was said
+      arrives as one turn, in order, still split only by `heldWith`'s cap.
+      The delivery-time guard is `mayHold` (`liveDrain.ts`): a segment that
+      settles after the conversation ended or after a pause is dropped, and
+      one that settles after a mute is dropped too *unless* that mute is
+      still draining, since then it was heard before the press. Mesa starting
+      to speak is the other teardown that keeps its cut (mesa task 961): the
+      effect's cleanup windows and posts whatever utterance was still in
+      progress before the microphone closes, the same way the
+      browser-recognizer engine's `stop()` used to deliver a pending final —
+      that sentence was heard before mesa's own audio started, so it is the
+      person's, not an echo. Switching the microphone back **on** before a
+      drain finishes loses nothing and reorders nothing: the held recording
+      is not cleared while a flush is pending, and the new run's segments are
+      enqueued behind that flush — a mute, an unmute and a second mute leave
+      two flushes pending on the one chain, so they post two turns in order.
+      The browser-recognizer path never enqueues on the chain (its press
+      already carried the interim preview), so its verdict is unchanged.
     - **The cap is the server's** (`LIVE_TEXT_MAX`, 8192). A recording that
       would cross it is posted as it stands and the new sentence starts a
       fresh one, so a nine-minute monologue arrives as several turns rather

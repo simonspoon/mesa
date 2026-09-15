@@ -315,8 +315,10 @@ pub fn agent_prompt(store: &crate::core::Store, session_id: i64) -> String {
 /// (mesa task 1150): everything [`agent_prompt`] would give a fresh
 /// conversation — same session line shape, same notebook, same summary —
 /// followed by the outgoing agent's note and the session's last
-/// [`LIVE_HANDOFF_TURNS`] turns. Same template, same `--agent mesa-live`, and
-/// everything that is per-session sits *after* the shared prefix, so the
+/// [`LIVE_HANDOFF_TURNS`] turns — read straight off the end of the
+/// transcript by `Store::last_live_turns`, since a long transcript is the
+/// very case a handoff exists for. Same template, same `--agent mesa-live`,
+/// and everything that is per-session sits *after* the shared prefix, so the
 /// successor's cached prefix is its predecessor's. The store fallbacks are
 /// [`agent_prompt`]'s: a hiccup costs recall, never the spawn.
 pub fn handoff_prompt(
@@ -329,26 +331,9 @@ pub fn handoff_prompt(
     let summaries = store
         .list_live_summaries(LIVE_SUMMARY_RECALL as i64)
         .unwrap_or_default();
-    // `list_live_turns` walks forward from a cursor in pages of at most
-    // `LIVE_TURNS_MAX`, so the tail is reached by paging to the end and
-    // keeping only the newest `LIVE_HANDOFF_TURNS` as each page lands.
-    let mut turns: Vec<crate::core::LiveTurn> = Vec::new();
-    let mut after = None;
-    loop {
-        let page = store
-            .list_live_turns(session_id, after, crate::core::LIVE_TURNS_MAX)
-            .unwrap_or_default();
-        let Some(last) = page.last() else { break };
-        after = Some(last.id);
-        let short = (page.len() as i64) < crate::core::LIVE_TURNS_MAX;
-        turns.extend(page);
-        if turns.len() > LIVE_HANDOFF_TURNS {
-            turns.drain(..turns.len() - LIVE_HANDOFF_TURNS);
-        }
-        if short {
-            break;
-        }
-    }
+    let turns = store
+        .last_live_turns(session_id, LIVE_HANDOFF_TURNS as i64)
+        .unwrap_or_default();
     handoff_prompt_with(session_id, lease, &notebook, &summaries, note, &turns)
 }
 

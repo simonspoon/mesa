@@ -4570,21 +4570,27 @@ impl Store {
     /// ever see the new agent under the old lease or the old agent under the
     /// new one. Only a `live` session can be handed off (`validation`
     /// otherwise): a successor for an ended conversation would be an agent
-    /// with nothing to listen to.
+    /// with nothing to listen to. The status is a condition of the write
+    /// itself, not a pre-read — a spawn takes real wall time, and a session
+    /// ended in between must not have an ended row rebound to a successor
+    /// nobody will ever stop.
     pub fn hand_off_live_session(
         &mut self,
         id: i64,
         successor_agent_id: Option<&str>,
     ) -> Result<LiveSession> {
-        let session = self.get_live_session(id)?;
-        if session.status != LiveStatus::Live {
+        let changed = self.conn.execute(
+            "UPDATE live_sessions SET predecessor_agent_id = agent_id, agent_id = ?2, \
+             lease = lease + 1, updated_at = datetime('now') \
+             WHERE id = ?1 AND status = ?3",
+            (id, successor_agent_id, LiveStatus::Live.as_str()),
+        )?;
+        if changed == 0 {
+            // `get_live_session` is the not_found for an unknown id; a row that
+            // exists but was not written has ended.
+            self.get_live_session(id)?;
             return Err(Error::Validation(format!("live session {id} has ended")));
         }
-        self.conn.execute(
-            "UPDATE live_sessions SET predecessor_agent_id = agent_id, agent_id = ?2, \
-             lease = lease + 1, updated_at = datetime('now') WHERE id = ?1",
-            (id, successor_agent_id),
-        )?;
         self.get_live_session(id)
     }
 
@@ -4894,6 +4900,21 @@ impl Store {
         ))?;
         let rows = stmt.query_map((session_id, after, limit), row_to_live_turn)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A session's newest `n` turns, in chronological order — the tail
+    /// `live::handoff_prompt` hands a successor (mesa task 1150). One query
+    /// from the end, so a long transcript — the very case a handoff exists
+    /// for — is never paged through from the front.
+    pub fn last_live_turns(&self, session_id: i64, n: i64) -> Result<Vec<LiveTurn>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {LIVE_TURN_COLUMNS} FROM live_turns \
+             WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map((session_id, n), row_to_live_turn)?;
+        let mut turns = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        turns.reverse();
+        Ok(turns)
     }
 
     /// Marks a turn **spoken**, stamping `played_at` the first time and never
@@ -10881,6 +10902,28 @@ mod tests {
         ));
     }
 
+    /// The race the status guard closes: a session ended while the successor
+    /// was spawning is refused by the write itself, and the ended row keeps
+    /// its agent and lease rather than being rebound to an orphan.
+    #[test]
+    fn hand_off_live_session_refuses_an_ended_row_without_touching_it() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.bind_live_agent(session.id, Some("first")).unwrap();
+        let ended = store.end_live_session(session.id).unwrap();
+
+        let err = store
+            .hand_off_live_session(session.id, Some("second"))
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err:?}");
+        assert!(err.to_string().contains("has ended"), "{err}");
+        let after = store.get_live_session(session.id).unwrap();
+        assert_eq!(after.agent_id.as_deref(), Some("first"));
+        assert_eq!(after.lease, 1);
+        assert_eq!(after.updated_at, ended.updated_at);
+        assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
+    }
+
     /// The lease is refused only when it is stale; the current one and an
     /// unknown session answer as expected.
     #[test]
@@ -11584,6 +11627,35 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The tail a handoff reads: the newest `n`, oldest first, and never
+    /// another session's.
+    #[test]
+    fn last_live_turns_is_the_newest_n_in_chronological_order() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        let ids: Vec<i64> = (0..15)
+            .map(|i| {
+                store
+                    .add_live_turn(session.id, LiveRole::User, &format!("line {i}"), None, None)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+
+        let tail = store.last_live_turns(session.id, 10).unwrap();
+        assert_eq!(
+            tail.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ids[5..].to_vec()
+        );
+        assert_eq!(tail[0].text, "line 5");
+        assert_eq!(tail[9].text, "line 14");
+        // Fewer than `n` is everything, still oldest first.
+        assert_eq!(store.last_live_turns(session.id, 100).unwrap().len(), 15);
+        store.end_live_session(session.id).unwrap();
+        let other = store.start_live_session(None).unwrap();
+        assert!(store.last_live_turns(other.id, 10).unwrap().is_empty());
     }
 
     /// The `read_at` rule again: the page decides a turn has been heard, and a

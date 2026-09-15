@@ -2962,11 +2962,18 @@ run 0 "$MESA" live stop
 [ "$(jqs .status)" = "ended" ] || fail "live stop after handoffs: ended"
 [ "$(cat "$STUB_DIR/last-stop")" = "stop $HA_LAST" ] ||
   fail "live stop stops the agent currently holding the session (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+# With the session ended there is nothing current to hand off: not_found,
+# and nothing spawned. (The store-level race — ended between the spawn and
+# the rebind — is a Rust test, `hand_off_live_session_refuses_an_ended_row…`.)
+SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
+run 1 "$MESA" live handoff "after the end"
+[ "$(jqe .error.code)" = "not_found" ] || fail "live handoff on an ended session: not_found"
+[ "$(cat "$STUB_DIR/spawns")" = "$SPAWNS_BEFORE" ] || fail "live handoff on an ended session must spawn nothing"
 run 0 "$MESA" live start --no-agent
 run 1 "$MESA" live context
 [ "$(jqe .error.code)" = "unavailable" ] || fail "live context with no agent bound: unavailable"
 run 0 "$MESA" live stop >/dev/null
-ok "live stop after handoffs stops the current agent; live context on a --no-agent session is unavailable"
+ok "live stop after handoffs stops the current agent; a handoff after the end is not_found spawning nothing; live context on a --no-agent session is unavailable"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

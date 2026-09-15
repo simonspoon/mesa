@@ -4774,7 +4774,24 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                     session.id
                 ))
             })?;
-            let session = store.hand_off_live_session(session.id, job.as_deref())?;
+            // The rebind is guarded on `status = 'live'`: a session ended
+            // while the successor was spawning is refused, and a successor
+            // bound to nothing must not be left running — best-effort, the
+            // shape of `stop_live_agent`.
+            let session = match store.hand_off_live_session(session.id, job.as_deref()) {
+                Ok(session) => session,
+                Err(e) => {
+                    if let Some(job) = job.as_deref()
+                        && let Err(stop) = agents::stop(job)
+                    {
+                        eprintln!(
+                            "live session {}: could not stop the successor agent {job}: {stop}",
+                            session.id
+                        );
+                    }
+                    return Err(e);
+                }
+            };
             print_live_session(&session, quiet);
         }
         LiveCmd::Context => {

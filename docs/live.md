@@ -82,9 +82,20 @@ handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
 
 A live session is a loop the **agent** runs, not one mesa drives:
 
-1. `mesa live listen` — the agent asks for the next thing the person said. A
-   turn, or `null` when nobody spoke for the whole wait (570s by default, and
-   long on purpose: see *quiet time is spent inside `listen`* below).
+1. `mesa live listen --lease <n>` — the agent asks for the next thing the
+   person said, and since mesa task 1156 it runs the command **in the
+   background** (the Bash tool's `run_in_background`) and ends its turn: the
+   harness wakes it the moment the command exits, with a turn or with `null`
+   when nobody spoke for the whole wait (570s by default, and long on purpose:
+   see *quiet time is spent inside `listen`* below). At most **one** listen is
+   pending per lease — a new one is started only in the turn in which the
+   previous one's output arrived (or at the very start of the conversation),
+   never on a fork's completion while one is still waiting. A second
+   concurrent listen would hand a turn to an orphaned command whose output the
+   agent may never act on, and `next_user_turn` hands each turn out exactly
+   once, so that turn would be lost. The rule the agent follows needs no
+   bookkeeping: if the last thing it did with `listen` was start one and its
+   output has not come back, one is already waiting.
 2. It does the work with the ordinary mesa CLI and its own tools.
 3. `mesa live look` — optionally, it photographs the person's browser window
    and opens the PNG, for the questions no report answers: what actually
@@ -109,6 +120,40 @@ The consequence at the other end is the same shape mesa already has everywhere:
 **there is no push channel to the browser either**, so the hub polls
 `GET /api/live?after=<cursor>` at 2s through the ordinary `useFetch` polling,
 like every other view.
+
+### Delegating the long jobs (mesa task 1156)
+
+Until mesa task 1156 the agent blocked in a *foreground* `listen` for up to ten
+minutes and did every job itself, and live session 96 showed both costs at
+once. A long job leaves the person talking to a busy agent: the utterance sits
+in the queue until the work is done. And a foreground `listen` is the one
+command the agent is inside, so a background subagent finishing while it waits
+is not noticed until that `listen` returns — up to ten minutes of lag on a
+result that was ready. Rule 12 of the definition therefore hands any long job
+that is **isolated from project code** — research, testing, investigation — to
+whichever is most efficient: a fork (the `Agent` tool with
+`subagent_type: "fork"`, when the job needs what is already in the agent's
+context — it starts from the shared prefix, a cache read, and does the work
+outside the live agent's context) or a specialized agent (any other
+`subagent_type`, when it does not). Either reports back only what the agent
+needs to say. The agent says it is starting the job, delegates with a brief
+that names what to report, and — if no listen is waiting — starts the
+background listen and ends its turn; whichever comes first, the person
+speaking or the delegate finishing, wakes it. The brief tells the delegate
+what it is and that it must never run a `mesa live` command, start a listen or
+delegate again, because a fork inherits these very instructions and would
+otherwise begin driving the conversation; only the agent that spawned it
+speaks. Two hard rules ride with it: **nothing spawned from a conversation,
+and not the agent itself, ever edits code in a project** — a change the person
+wants becomes a mesa task (`backlog` for an idea, `todo` for work the
+todo-watcher's own agents pick up) — and two delegates never work in the same
+tree or repository at once (own worktree, own files, or one after another). A
+result that lands mid-discussion on another topic is held for a natural pause;
+one that lands while the conversation is quiet is announced right away, never
+left until the person next speaks. `Agent` is in the definition's `tools:` list
+for exactly this. Quiet time is still spent inside `listen` — the wait happens
+in the command, as before — only now the agent's turn ends instead of blocking
+on it.
 
 The instructions the agent is spawned with are the **`mesa-live` agent
 definition** (mesa task 1068) — `core::live::AGENT_DEFINITION`, YAML
@@ -1338,8 +1383,9 @@ takes exactly one value.
   session left idle at the old 60s default spent ten turns an hour saying
   nothing (and, prompted to check `mesa live status` each time round, more than
   that). So the default wait is **570s** and `AGENT_PROMPT` names no `--wait` at
-  all: it tells the agent to give the command ten minutes and to run *nothing
-  else* while it is quiet — no status check, no "still quiet" narration. 570
+  all: it tells the agent to run the command in the background, end its turn
+  (mesa task 1156) and run *nothing else* while it is quiet — no status
+  check, no "still quiet" narration. 570
   rather than 600 because a Claude Code session caps one command at ten
   minutes: the wait must end by printing `null`, not by being killed. The
   session's end is still noticed promptly — `listen` returns early on it, and

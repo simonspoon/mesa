@@ -805,8 +805,9 @@ with no field flag, is still the usage error rather than a legal no-op call.
 instructions live now. Since mesa task 1068 they are the `mesa-live` **agent
 definition** (kind `agent`, user scope) rather than the `live-agent-prompt`
 *prompt* they were between tasks 919 and 1068: `core::live::AGENT_DEFINITION`
-is YAML frontmatter (`name`, `description`, `model`, `tools: Bash, Read` — the
-image reader `mesa live look` needs) followed by `core::live::AGENT_PROMPT`,
+is YAML frontmatter (`name`, `description`, `model`, `tools: Bash, Read, Agent`
+— the image reader `mesa live look` needs, and rule 12 delegates long
+jobs through, mesa task 1156) followed by `core::live::AGENT_PROMPT`,
 the loop text, unchanged.
 
 Being an `agent` rather than a `prompt` gives it a real path,

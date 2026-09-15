@@ -474,7 +474,9 @@ stripped — and expands it: `~/` and `$HOME/` against `$HOME`,
 `$CLAUDE_PROJECT_DIR/` against the project's `local_path` (only a
 project-scope file has one; in a user-scope file Claude Code supplies it per
 session, so such a command is left alone). A `…/env` first token
-(`/usr/bin/env python3 ~/x.py`) is passed over as the interpreter shim. A
+(`/usr/bin/env python3 ~/x.py`) is passed over as the interpreter shim. It
+is the *first* such token whatever its role, so `mytool --config
+/etc/x.conf` picks `/etc/x.conf` — read the path before pressing adopt. A
 command with no path token (`npm run lint`) is arbitrary shell mesa does not
 try to read and is skipped. The expanded path is canonicalised (symlinks in
 its existing prefix followed, `resolve`'s own rule) and, if it lands inside
@@ -512,7 +514,10 @@ is a row whose script is not on disk, and a row carrying a `conflict` is
    `command` value's own, so the entry's `type` key, its neighbours, every
    other registration and every unrelated byte come through identical, and
    the write goes through the same re-parse self-check and tmp+rename;
-3. removes the original;
+3. removes the original — the path **as the command spells it**, expanded
+   but not resolved, so when that is a symlink the link itself goes and its
+   target (not mesa's to delete) stays, while the body was read through the
+   resolved path;
 4. creates the `hook` library row with its sync baseline set, so `sync
    status` reads `in-sync` at once, and answers its `LibraryHookStatus`.
 

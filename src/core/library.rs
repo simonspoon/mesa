@@ -1885,7 +1885,10 @@ fn adoption_conflict(
 /// what `register_hook` would write, keeping any prefix (`bash `) and
 /// trailing arguments — then removes the original and creates the library
 /// row with its sync baseline set, so `sync status` reads `in-sync`. Answers
-/// the new item's `hook_registrations`.
+/// the new item's `hook_registrations`. The original removed is the path
+/// **as the command spells it**: when that is a symlink, the link goes and
+/// its target — not mesa's to delete — stays, while the body was read
+/// through the resolved path.
 ///
 /// `path` must be one of the rows' `path`s (`not_found` otherwise, as is a
 /// script that is not on disk); a row carrying a `conflict` is refused with
@@ -1924,6 +1927,9 @@ pub fn adopt_hook(
         return Err(Error::Conflict(reason));
     }
 
+    // Everything that can be *read* is read before anything is written, so
+    // the only steps left between the copy and the settings rename are the
+    // ones the cleanup below covers.
     let source = PathBuf::from(&row.path);
     let body = fs::read_to_string(&source).map_err(|e| {
         Error::Validation(format!(
@@ -1932,6 +1938,7 @@ pub fn adopt_hook(
         ))
     })?;
     let permissions = fs::metadata(&source)?.permissions();
+    let settings = read_settings(&settings_path)?;
     let rel = relative_path(LibraryKind::Hook, scope, &row.name, false)
         .ok_or_else(|| Error::Validation(format!("{:?} has no path", row.name)))?;
     let dest = resolve(&base, &rel).map_err(Error::Validation)?;
@@ -1939,15 +1946,26 @@ pub fn adopt_hook(
         LibraryScope::Project => format!("$CLAUDE_PROJECT_DIR/{}", rel.to_string_lossy()),
         LibraryScope::User => dest.to_string_lossy().into_owned(),
     };
-
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&dest, &body)?;
-    fs::set_permissions(&dest, permissions)?;
-
     let home = std::env::var("HOME").ok().map(PathBuf::from);
     let project_dir = (scope == LibraryScope::Project).then(|| base.clone());
+    // The path as the command spells it, expanded but *not* resolved: what
+    // is removed at the end. `row.path` follows symlinks, so removing it
+    // would delete a link's target — somebody else's file — and leave the
+    // dangling link in place. `remove_file` on the unresolved path removes
+    // the link itself and never follows it.
+    let original = row
+        .registrations
+        .iter()
+        .find_map(|r| {
+            let (start, end) = command_path_token(&r.command)?;
+            let expanded = expand_path_token(
+                &r.command[start..end],
+                home.as_deref(),
+                project_dir.as_deref(),
+            )?;
+            (canonical_prefix(&expanded).ok()?.to_string_lossy() == row.path).then_some(expanded)
+        })
+        .unwrap_or_else(|| source.clone());
     let rewrite = |command: &str| -> Option<String> {
         let (start, end) = command_path_token(command)?;
         let expanded = expand_path_token(
@@ -1959,31 +1977,40 @@ pub fn adopt_hook(
         (canonical.to_string_lossy() == row.path)
             .then(|| format!("{}{new_token}{}", &command[..start], &command[end..]))
     };
-    let settings = read_settings(&settings_path)?;
-    let spliced = splice_replace_commands(&settings.raw, &rewrite).map_err(|e| {
-        Error::Validation(format!(
-            "{} could not be edited ({e}); nothing was changed",
-            settings_path.display()
-        ))
-    });
-    let written = match spliced {
-        Ok(Some(raw)) => write_settings(&settings_path, raw),
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&dest, &body)?;
+    // From here to the settings rename, any failure removes the copy again,
+    // so a failed adoption leaves both the script and settings.json exactly
+    // as they were.
+    let written = (|| -> StoreResult<Settings> {
+        fs::set_permissions(&dest, permissions)?;
+        let spliced = splice_replace_commands(&settings.raw, &rewrite).map_err(|e| {
+            Error::Validation(format!(
+                "{} could not be edited ({e}); nothing was changed",
+                settings_path.display()
+            ))
+        })?;
         // The row was built from this very file naming the script, so a
         // splice that changes nothing is a defensive impossibility — and
         // still not a reason to leave the copy behind.
-        Ok(None) => Err(Error::Validation(format!(
-            "{} no longer names {}; nothing was changed",
-            settings_path.display(),
-            row.path
-        ))),
-        Err(e) => Err(e),
-    };
+        let raw = spliced.ok_or_else(|| {
+            Error::Validation(format!(
+                "{} no longer names {}; nothing was changed",
+                settings_path.display(),
+                row.path
+            ))
+        })?;
+        write_settings(&settings_path, raw)
+    })();
     if let Err(e) = written {
         let _ = fs::remove_file(&dest);
         return Err(e);
     }
 
-    if let Err(e) = fs::remove_file(&source) {
+    if let Err(e) = fs::remove_file(&original) {
         return Err(Error::Validation(format!(
             "{} now names {} and the script was copied there, but the original could not be \
              removed ({e}); remove it by hand, then run a library sync to pick the copy up",
@@ -5619,6 +5646,85 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "no row"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_settings_directory_fails_the_adoption_with_no_copy_left_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, settings) = orphan_project(&mut store, &base);
+        let before = fs::read_to_string(&settings).unwrap();
+        let source = base.join("tools/warm.sh");
+        let dest = base.join(".claude/hooks/warm.sh");
+        // The copy lands in `.claude/hooks/` (writable); the settings write
+        // needs `.claude/` itself for its temp file and rename, and fails.
+        let claude = base.join(".claude");
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = adopt_hook(
+            &mut store,
+            LibraryScope::Project,
+            Some(pid),
+            &canon(&source),
+        );
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+        assert!(source.exists(), "the original stays");
+        assert!(!dest.exists(), "the copy is removed again");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), before);
+        assert!(
+            store
+                .find_library_item(
+                    LibraryKind::Hook,
+                    LibraryScope::Project,
+                    Some(pid),
+                    "warm.sh"
+                )
+                .unwrap()
+                .is_none(),
+            "no row"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopting_a_symlinked_script_removes_the_link_and_leaves_its_target() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let (pid, settings) = orphan_project(&mut store, &base);
+        // `tools/warm.sh` becomes a link to `elsewhere/warm.sh`.
+        let link = base.join("tools/warm.sh");
+        let target = base.join("elsewhere/warm.sh");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::rename(&link, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let rows = orphan_hooks(&store, LibraryScope::Project, Some(pid)).unwrap();
+        let row = rows.iter().find(|r| r.name == "warm.sh").unwrap();
+        assert_eq!(row.path, canon(&target), "the row's path follows the link");
+        assert!(row.exists);
+
+        adopt_hook(&mut store, LibraryScope::Project, Some(pid), &row.path).unwrap();
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "the link the command named is gone"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho warm\n",
+            "the target is not mesa's to delete"
+        );
+        assert_eq!(
+            fs::read_to_string(base.join(".claude/hooks/warm.sh")).unwrap(),
+            "#!/bin/sh\necho warm\n"
+        );
+        assert!(
+            fs::read_to_string(&settings)
+                .unwrap()
+                .contains("$CLAUDE_PROJECT_DIR/.claude/hooks/warm.sh")
         );
     }
 

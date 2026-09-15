@@ -13,8 +13,11 @@
  * stamped, and drops out of the prompt and the default list. `decayed` is the
  * automatic kind — an entry no conversation has used for
  * `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `deleted` an explicit
- * one, and `replaced` is reserved for a future rewrite-as-new-row path (a
- * replace today updates the row in place, keeping its provenance).
+ * one, `merged` a source folded into another row by a dream pass (mesa task
+ * 1152, `merged_into` naming the row that replaced it), and `replaced` is
+ * reserved for a future rewrite-as-new-row path (a replace today updates the
+ * row in place, keeping its provenance). Any retirement is undone by
+ * `Store::restore_notebook_entry`.
  *
  * ts-exported: the Settings page's Memory tab lists and edits these over
  * `/api/live/memory`. Its sibling [`LiveMemoryHit`] is not — search is
@@ -38,6 +41,13 @@ source_session_id: number | null,
  */
 last_used_session_id: number | null, retired_at: string | null, 
 /**
- * `decayed` | `deleted` | `replaced`, null while the entry is active.
+ * `decayed` | `deleted` | `replaced` | `merged`, null while the entry is
+ * active.
  */
-retired_reason: string | null, };
+retired_reason: string | null, 
+/**
+ * For a `merged` retirement, the entry this one was folded into
+ * (`Store::merge_notebook_entries`); null otherwise. Bounded, so it
+ * stays in the `--quiet` shape.
+ */
+merged_into: number | null, };

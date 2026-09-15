@@ -881,6 +881,13 @@ const MIGRATIONS: &[&str] = &[
     // which is what an un-handed-off conversation is.
     "ALTER TABLE live_sessions ADD COLUMN lease INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE live_sessions ADD COLUMN predecessor_agent_id TEXT;",
+    // Task 1152: the dream pass — an explicit consolidation of the notebook
+    // between conversations. `merge_notebook_entries` retires each source
+    // row as `merged` and points it at the row that replaced it, so a merge
+    // is reviewable (`list --all` shows what became what) and undoable
+    // (`restore_notebook_entry` un-retires a source). NULL for every other
+    // retirement reason.
+    "ALTER TABLE live_notebook ADD COLUMN merged_into INTEGER REFERENCES live_notebook(id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1113,7 +1120,8 @@ pub const LIVE_SUMMARY_MAX: usize = 4096;
 const LIVE_SUMMARY_LIST_MAX: i64 = 500;
 
 const LIVE_NOTEBOOK_COLUMNS: &str = "id, body, created_at, updated_at, source_session_id, \
-                                      last_used_session_id, retired_at, retired_reason";
+                                      last_used_session_id, retired_at, retired_reason, \
+                                      merged_into";
 
 /// Most hits one `search_live_memory` call returns.
 pub const LIVE_MEMORY_SEARCH_MAX: i64 = 50;
@@ -1224,6 +1232,7 @@ fn row_to_notebook_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveNotebo
         last_used_session_id: row.get(5)?,
         retired_at: row.get(6)?,
         retired_reason: row.get(7)?,
+        merged_into: row.get(8)?,
     })
 }
 
@@ -4514,6 +4523,23 @@ impl Store {
             .optional()?)
     }
 
+    /// The newest conversation of all, live or ended, or `None` on an
+    /// install that has never held one. What `mesa live memory dream`
+    /// (mesa task 1152) runs in the name and folder of: a dream pass belongs
+    /// to no conversation, so it borrows the most recent one's.
+    pub fn latest_live_session(&self) -> Result<Option<LiveSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {LIVE_SESSION_COLUMNS} FROM live_sessions ORDER BY id DESC LIMIT 1"
+                ),
+                [],
+                row_to_live_session,
+            )
+            .optional()?)
+    }
+
     pub fn get_live_session(&self, id: i64) -> Result<LiveSession> {
         self.conn
             .query_row(
@@ -5140,6 +5166,102 @@ impl Store {
             (id, reason),
         )?;
         Ok(())
+    }
+
+    /// Folds two or more active entries into one new row (mesa task 1152,
+    /// the dream pass's one structural edit). In one transaction every
+    /// source is retired as `merged` with `merged_into` pointing at the new
+    /// row, and the new row takes the **earliest-created** source's
+    /// `source_session_id` — provenance survives a merge — with
+    /// `last_used_session_id` stamped and the archive indexed exactly as an
+    /// add is. Fewer than two distinct ids is `validation`; an unknown or
+    /// retired id is `not_found`. Both guards are judged on the notebook the
+    /// merge would leave: the budget on `active − merged + new` words, and
+    /// the removal rule on the **net** words removed, so a merge that
+    /// condenses three bullets into one cannot hollow the notebook out any
+    /// more than a delete could.
+    pub fn merge_notebook_entries(&mut self, ids: &[i64], body: &str) -> Result<LiveNotebookEntry> {
+        let body = Self::validate_notebook_body(body)?;
+        let mut distinct = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() < 2 {
+            return Err(Error::Validation(
+                "a merge needs at least two distinct notebook entry ids".into(),
+            ));
+        }
+        let sources = distinct
+            .iter()
+            .map(|&id| self.get_active_notebook_entry(id))
+            .collect::<Result<Vec<_>>>()?;
+        let merged_words: usize = sources.iter().map(|e| live::word_count(&e.body)).sum();
+        let before = self.notebook_words(None)?;
+        let after = before - merged_words + live::word_count(body);
+        if live::over_budget(after) {
+            return Err(Error::Validation(live::budget_message(after)));
+        }
+        if live::removes_too_much(before, after) {
+            return Err(Error::Validation(live::removal_message(before, after)));
+        }
+        // The earliest-created source vouches for the merged bullet: ids are
+        // monotonic, so the tie-break on id is only for two rows written in
+        // the same second.
+        let source_session = sources
+            .iter()
+            .min_by_key(|e| (&e.created_at, e.id))
+            .and_then(|e| e.source_session_id);
+        let session = self.notebook_session()?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO live_notebook (body, created_at, updated_at, source_session_id, \
+                                        last_used_session_id) \
+             VALUES (?1, datetime('now'), datetime('now'), ?2, ?3)",
+            (body, source_session, session),
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
+             VALUES ('note', ?1, ?2, ?3)",
+            (id, source_session, body),
+        )?;
+        for source in &sources {
+            tx.execute(
+                "UPDATE live_notebook SET retired_at = datetime('now'), \
+                    retired_reason = 'merged', merged_into = ?2 \
+                 WHERE id = ?1 AND retired_at IS NULL",
+                (source.id, id),
+            )?;
+        }
+        tx.commit()?;
+        self.get_notebook_entry(id)
+    }
+
+    /// Un-retires one row, whatever retired it — the undo for a delete, a
+    /// decay or a merge (mesa task 1152): `retired_at`, `retired_reason` and
+    /// `merged_into` are cleared and nothing else on the row moves, so its
+    /// provenance reads exactly as before. An active id is `validation`
+    /// (there is nothing to restore), and a restore that would take the
+    /// active notebook over its budget is refused with the budget message,
+    /// the same rule an add answers to. Restoring a merge's source leaves
+    /// the merged row active too — the caller decides which to keep.
+    pub fn restore_notebook_entry(&mut self, id: i64) -> Result<LiveNotebookEntry> {
+        let entry = self.get_notebook_entry(id)?;
+        if entry.retired_at.is_none() {
+            return Err(Error::Validation(format!(
+                "notebook entry {id} is not retired"
+            )));
+        }
+        let after = self.notebook_words(None)? + live::word_count(&entry.body);
+        if live::over_budget(after) {
+            return Err(Error::Validation(live::budget_message(after)));
+        }
+        self.conn.execute(
+            "UPDATE live_notebook SET retired_at = NULL, retired_reason = NULL, \
+                merged_into = NULL \
+             WHERE id = ?1",
+            [id],
+        )?;
+        self.get_notebook_entry(id)
     }
 
     /// Marks one active entry as used by the **live** conversation, which is
@@ -11758,15 +11880,27 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            57,
-            "a fresh db should report user_version 57"
+            58,
+            "a fresh db should report user_version 58"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 57);
+        assert_eq!(version, 58);
+    }
+
+    /// Pins the dream-pass migration (mesa task 1152) at index 57: the
+    /// `merged_into` pointer a merge leaves on each retired source.
+    #[test]
+    fn the_notebook_merge_pointer_arrives_at_migration_57() {
+        const MERGE: usize = 57;
+        assert!(
+            MIGRATIONS[MERGE].contains("ADD COLUMN merged_into"),
+            "migration {MERGE} is no longer the notebook merge migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
     }
 
     /// Pins the live-memory migration (mesa task 1147) at index 55, and
@@ -12397,6 +12531,205 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, "note");
         assert_eq!(hits[0].ref_id, stale.id);
+    }
+
+    /// A merge (mesa task 1152) retires its sources as `merged` pointing at
+    /// the new row, carries the oldest source's provenance forward, indexes
+    /// the merged text while the retired bodies stay searchable, and refuses
+    /// fewer than two distinct ids, a retired id and an unknown id.
+    #[test]
+    fn notebook_merge_retires_sources_into_one_row_with_provenance() {
+        let (mut store, _dir) = temp_store();
+        let first = ended_session(&mut store);
+        let a = store
+            .add_notebook_entry("prefers short spoken replies")
+            .unwrap();
+        let second = ended_session(&mut store);
+        let b = store
+            .add_notebook_entry("wants replies kept brief when spoken")
+            .unwrap();
+        assert_eq!(a.source_session_id, Some(first));
+        assert_eq!(b.source_session_id, Some(second));
+        let gone = store
+            .add_notebook_entry("a bullet already deleted")
+            .unwrap();
+        store.delete_notebook_entry(gone.id).unwrap();
+
+        assert!(matches!(
+            store.merge_notebook_entries(&[a.id], "one"),
+            Err(Error::Validation(_))
+        ));
+        assert!(
+            matches!(
+                store.merge_notebook_entries(&[a.id, a.id], "one"),
+                Err(Error::Validation(_)),
+            ),
+            "a repeated id is one id"
+        );
+        assert!(matches!(
+            store.merge_notebook_entries(&[a.id, gone.id], "one"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.merge_notebook_entries(&[a.id, 999], "one"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.merge_notebook_entries(&[a.id, b.id], "   "),
+            Err(Error::Validation(_))
+        ));
+        // Nothing above touched a row.
+        assert_eq!(store.list_notebook(false).unwrap().len(), 2);
+
+        let merged = store
+            .merge_notebook_entries(&[b.id, a.id], "prefers short spoken replies (pelican)")
+            .unwrap();
+        assert_eq!(merged.body, "prefers short spoken replies (pelican)");
+        assert_eq!(
+            merged.source_session_id,
+            Some(first),
+            "the earliest-created source vouches for the merged bullet"
+        );
+        assert_eq!(
+            merged.last_used_session_id,
+            Some(second),
+            "stamped like an add"
+        );
+        assert_eq!(merged.retired_at, None);
+        assert_eq!(merged.merged_into, None);
+        for id in [a.id, b.id] {
+            let source = store.get_notebook_entry(id).unwrap();
+            assert_eq!(source.retired_reason.as_deref(), Some("merged"));
+            assert!(source.retired_at.is_some());
+            assert_eq!(source.merged_into, Some(merged.id));
+        }
+        let active = store.list_notebook(false).unwrap();
+        assert_eq!(
+            active.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![merged.id]
+        );
+        assert_eq!(store.list_notebook(true).unwrap().len(), 4);
+        // The merged text is indexed, and the retired bodies stay findable.
+        let hits = store.search_live_memory("pelican", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, merged.id);
+        let hits = store.search_live_memory("brief", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, b.id);
+        // A merged source is archive now: every write on it is not_found.
+        assert!(matches!(
+            store.merge_notebook_entries(&[a.id, merged.id], "again"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A merge is judged on the notebook it would leave: the budget on the
+    /// net words, and the removal rule on the net words removed once the
+    /// notebook holds the floor.
+    #[test]
+    fn notebook_merge_is_judged_on_net_words() {
+        let (mut store, _dir) = temp_store();
+        let ninety_nine = ["w"; 99].join(" ");
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(store.add_notebook_entry(&ninety_nine).unwrap().id);
+        }
+        // 495 words. Merging two 99-word entries (198 out) into 204 words
+        // nets +6: 501, over budget — judged on the merge, not on an add.
+        let err = store
+            .merge_notebook_entries(&ids[..2], &["m"; 204].join(" "))
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("501 words"), "{err}");
+        // Into 203 words nets +5: exactly 500, allowed.
+        let merged = store
+            .merge_notebook_entries(&ids[..2], &["m"; 203].join(" "))
+            .unwrap();
+        assert_eq!(store.notebook_words(None).unwrap(), 500);
+        // 500 words; merging three 99-word entries into 10 words removes
+        // 287 (57%): refused by the removal rule, naming the net numbers.
+        let err = store
+            .merge_notebook_entries(&ids[2..5], &["m"; 10].join(" "))
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(
+            err.to_string()
+                .contains("remove 287 of the notebook's 500 words"),
+            "{err}"
+        );
+        // Into 150 words removes 147 (29.4%): allowed.
+        store
+            .merge_notebook_entries(&ids[2..5], &["m"; 150].join(" "))
+            .unwrap();
+        assert_eq!(store.notebook_words(None).unwrap(), 353);
+        assert_eq!(store.list_notebook(false).unwrap().len(), 2);
+        assert_eq!(
+            store.get_notebook_entry(ids[0]).unwrap().merged_into,
+            Some(merged.id)
+        );
+    }
+
+    /// Restore is the undo: a retired row of any reason comes back with its
+    /// three retirement fields cleared and nothing else moved; an active
+    /// row is `validation`, and so is a restore past the budget.
+    #[test]
+    fn notebook_restore_unretires_any_reason_within_the_budget() {
+        let (mut store, _dir) = temp_store();
+        let a = store.add_notebook_entry("first bullet").unwrap();
+        let b = store.add_notebook_entry("second bullet").unwrap();
+        assert!(matches!(
+            store.restore_notebook_entry(a.id),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.restore_notebook_entry(999),
+            Err(Error::NotFound(_))
+        ));
+        let merged = store
+            .merge_notebook_entries(&[a.id, b.id], "both bullets")
+            .unwrap();
+        let restored = store.restore_notebook_entry(a.id).unwrap();
+        assert_eq!(restored.retired_at, None);
+        assert_eq!(restored.retired_reason, None);
+        assert_eq!(restored.merged_into, None);
+        assert_eq!(restored.created_at, a.created_at);
+        assert_eq!(restored.updated_at, a.updated_at);
+        assert_eq!(restored.source_session_id, a.source_session_id);
+        assert_eq!(
+            store
+                .list_notebook(false)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![a.id, merged.id],
+            "the merged row stays active too; the caller picks"
+        );
+        // A deleted and a decayed row restore the same way.
+        store.delete_notebook_entry(merged.id).unwrap();
+        assert_eq!(
+            store
+                .restore_notebook_entry(merged.id)
+                .unwrap()
+                .retired_reason,
+            None
+        );
+        // Past the budget: fill to 500, retire one, and the restore is
+        // refused with the budget message.
+        store.delete_notebook_entry(merged.id).unwrap();
+        store.delete_notebook_entry(a.id).unwrap();
+        let ninety_nine = ["w"; 99].join(" ");
+        for _ in 0..5 {
+            store.add_notebook_entry(&ninety_nine).unwrap();
+        }
+        store.add_notebook_entry("one two three four five").unwrap();
+        let err = store.restore_notebook_entry(a.id).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.to_string().contains("502 words"), "{err}");
+        assert!(
+            store.get_notebook_entry(a.id).unwrap().retired_at.is_some(),
+            "a refused restore changes nothing"
+        );
     }
 
     /// Search reaches every kind, ranks, snippets, tolerates hostile input,

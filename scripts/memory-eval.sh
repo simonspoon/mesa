@@ -5,11 +5,14 @@
 #
 #   scripts/memory-eval.sh [--sessions N] [--baselines a,b,c] [--stress N]
 #       [--stress-fast N] [--budget W] [--decay product|never] [--edit-max PCT]
-#       [--from ID] [--out DIR] [--dry-run] [--table-only]
+#       [--dream-every N] [--from ID] [--out DIR] [--dry-run] [--table-only]
 #
 # --from ID: the first real session replayed (default 60, where the real
 # conversations start; earlier rows are the feature's own test sessions), and
 # only sessions in which the person actually spoke count.
+# --baselines: none,last5,nodecay,full by default; `dream` (mesa task 1152) is
+# opt-in — `full` plus a synchronous dream pass after every --dream-every Nth
+# session (default 3).
 #
 # bash + jq + curl, model calls through `claude -p` (MESA_EVAL_MODEL, default
 # haiku). Never writes the person's db: it is copied once and read from the
@@ -19,7 +22,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export EVAL_DIR="$ROOT/scripts/memory-eval"
 
 FROM=60; SESSIONS_N=0; BASELINES="none,last5,nodecay,full"; STRESS_N=30; STRESS_FAST_N=200
-export BUDGET=500 DECAY=product EDIT_MAX_PCT=60
+export BUDGET=500 DECAY=product EDIT_MAX_PCT=60 DREAM_EVERY=3
 OUT="${CLAUDE_JOB_DIR:-${TMPDIR:-/tmp}}/impl-eval/out"
 [ -n "${CLAUDE_JOB_DIR:-}" ] && OUT="$CLAUDE_JOB_DIR/tmp/impl-eval/out"
 DRY=0; TABLE_ONLY=0
@@ -33,6 +36,7 @@ while [ $# -gt 0 ]; do
     --budget) BUDGET=$2; shift 2 ;;
     --decay) DECAY=$2; shift 2 ;;
     --edit-max) EDIT_MAX_PCT=$2; shift 2 ;;
+    --dream-every) DREAM_EVERY=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --table-only) TABLE_ONLY=1; shift ;;
@@ -76,16 +80,21 @@ for b in "${BL[@]}"; do
     none) ;;
     last5) calls=$((calls + ${#with_turns[@]})) ;;
     nodecay|full) calls=$((calls + 2 * ${#with_turns[@]})) ;;
+    # `full`'s calls plus one dream call per --dream-every sessions.
+    dream) calls=$((calls + 2 * ${#with_turns[@]} + ${#with_turns[@]} / DREAM_EVERY)) ;;
     *) echo "unknown baseline: $b" >&2; exit 2 ;;
   esac
   calls=$((calls + 2 * nq))
 done
+[ "$DREAM_EVERY" -ge 1 ] 2>/dev/null || { echo "--dream-every must be a whole number of sessions, 1 or more" >&2; exit 2; }
 calls=$((calls + 2 * STRESS_N))
 # ~$0.05 per haiku call was measured on this machine (a ~24k-token system
 # prompt is cached and re-read per call, plus the prompt); a tool-using
 # agent step costs more, so read this as a floor.
 est=$(awk -v c="$calls" 'BEGIN { printf "%.2f", c * 0.05 }')
-echo "plan: ${#with_turns[@]} real sessions (${with_turns[0]:-none}..${with_turns[${#with_turns[@]}-1]:-none}) × baselines [$BASELINES], $nq quiz questions, stress $STRESS_N model-driven + $STRESS_FAST_N scripted; harness checks: budget $BUDGET words, decay $DECAY (nodecay touches), fast-editor wipe $EDIT_MAX_PCT% (product guard: 30%/edit, 500 words, 10 sessions — constants, not flags)"
+dream_note=""
+case ",$BASELINES," in *,dream,*) dream_note=", dream pass every $DREAM_EVERY sessions (dream)" ;; esac
+echo "plan: ${#with_turns[@]} real sessions (${with_turns[0]:-none}..${with_turns[${#with_turns[@]}-1]:-none}) × baselines [$BASELINES], $nq quiz questions, stress $STRESS_N model-driven + $STRESS_FAST_N scripted; harness checks: budget $BUDGET words, decay $DECAY (nodecay touches), fast-editor wipe $EDIT_MAX_PCT%$dream_note (product guard: 30%/edit, 500 words, 10 sessions — constants, not flags)"
 echo "model calls: ~$calls on $MODEL, est. cost ~\$$est (floor); out: $OUT"
 [ "$DRY" = 1 ] && exit 0
 

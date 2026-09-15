@@ -119,6 +119,11 @@ EOF
 #   old   — main's SUMMARY_PROMPT (last5-summary-prompt.txt), run synchronously
 #           by the real `claude -p`, no notebook verbs allowed;
 #   new   — this branch's own prompt ({prompt}), notebook verbs allowed.
+# live-dream (mesa task 1152) only RECORDS: it writes {prompt} to
+# $BDIR/dream-prompt and prints a receipt, so `mesa live memory dream` goes
+# through the template like every other spawn while baseline.sh runs the
+# recorded prompt synchronously through claude_call itself. Installed for
+# every mode; only the `dream` baseline ever invokes it.
 write_config() {
   local path=$1 stub=$2 mode=$3
   local summary
@@ -132,7 +137,8 @@ printf '%s' \"\$PROMPT\" | '$REAL_CLAUDE' -p --model '$MODEL' --output-format js
   esac
   jq -n --arg agent "'$stub/claude' --bg --agent mesa-live --name {name} -- {prompt}" \
         --arg summary "$summary" \
-        '{commands: {"live-agent": $agent, "live-summary": $summary}}' > "$path"
+        --arg dream "printf '%s' {prompt} > '$BDIR/dream-prompt'; echo 'backgrounded · dream'" \
+        '{commands: {"live-agent": $agent, "live-summary": $summary, "live-dream": $dream}}' > "$path"
 }
 
 # json_escape_file <file> — the file's text as one JSON string.

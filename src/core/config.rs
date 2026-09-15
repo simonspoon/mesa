@@ -1,13 +1,14 @@
 //! User config: the hook mesa runs when it starts a coding agent, and the
 //! per-model price table the CC Dashboard estimates cost from.
 //!
-//! mesa spawns an agent from exactly five places — the todo-watcher's
+//! mesa spawns an agent from exactly six places — the todo-watcher's
 //! dispatch, the inbox-watcher's triage, the Agents surface's "add agent"
-//! button, the live conversation's agent, and the short-lived agent that
-//! writes a live conversation's memory once it ends (mesa task 921). Each
-//! used to be a hardcoded `claude --bg …` argv, so swapping the binary, the
-//! persona, or the slash command meant a rebuild. Each is now a **hook** in
-//! `~/.mesa/config.json`:
+//! button, the live conversation's agent, the short-lived agent that
+//! writes a live conversation's memory once it ends (mesa task 921), and the
+//! dream pass that tidies the live notebook between conversations (mesa task
+//! 1152). Each used to be a hardcoded `claude --bg …` argv, so swapping the
+//! binary, the persona, or the slash command meant a rebuild. Each is now a
+//! **hook** in `~/.mesa/config.json`:
 //!
 //! ```json
 //! {
@@ -16,7 +17,8 @@
 //!     "inbox-watcher":  "claude --bg --agent swe --name {name} -- \"/inbox-triage {id}\"",
 //!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
 //!     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
-//!     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}"
+//!     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}",
+//!     "live-dream":     "claude --bg --agent swe --name {name} -- {prompt}"
 //!   }
 //! }
 //! ```
@@ -192,16 +194,22 @@ pub const LIVE_AGENT: &str = "live-agent";
 /// `live start` — it cannot be the live agent's own last act, since stopping
 /// a session stops that agent (`claude stop <agent_id>`).
 pub const LIVE_SUMMARY: &str = "live-summary";
+/// The dream pass over the live notebook (mesa task 1152, `docs/live.md`):
+/// `mesa live memory dream` spawns it between conversations, never mid-call,
+/// to merge duplicate entries and drop superseded ones one guarded command
+/// at a time.
+pub const LIVE_DREAM: &str = "live-dream";
 
 /// Every configurable command, in the order the docs and the Settings page
 /// list them. The single source of truth for "which keys mesa configures" —
 /// [`default_command`] answers the same question one key at a time.
-pub const ACTIONS: [&str; 5] = [
+pub const ACTIONS: [&str; 6] = [
     TODO_WATCHER,
     INBOX_WATCHER,
     AGENT_SPAWN,
     LIVE_AGENT,
     LIVE_SUMMARY,
+    LIVE_DREAM,
 ];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
@@ -255,6 +263,11 @@ pub const DEFAULT_LIVE_AGENT: &str = "claude --bg --agent mesa-live --name {name
 /// (`core::live::summary_prompt`), so it works with no user configuration.
 /// It runs as the literal `swe`.
 pub const DEFAULT_LIVE_SUMMARY: &str = "claude --bg --agent swe --name {name} -- {prompt}";
+/// Built-in default for [`LIVE_DREAM`] — [`DEFAULT_LIVE_SUMMARY`]'s shape
+/// again: `{id}` is the newest conversation's id, `{name}` a fixed
+/// `live memory dream`, and `{prompt}` is `core::live::dream_prompt`, the
+/// instructions plus the active notebook. Runs as the literal `swe`.
+pub const DEFAULT_LIVE_DREAM: &str = "claude --bg --agent swe --name {name} -- {prompt}";
 
 /// The built-in template for `action`, or `None` if `action` isn't one of
 /// [`ACTIONS`]. Public so the docs check and the API can report the shipped
@@ -266,6 +279,7 @@ pub fn default_command(action: &str) -> Option<&'static str> {
         AGENT_SPAWN => Some(DEFAULT_AGENT_SPAWN),
         LIVE_AGENT => Some(DEFAULT_LIVE_AGENT),
         LIVE_SUMMARY => Some(DEFAULT_LIVE_SUMMARY),
+        LIVE_DREAM => Some(DEFAULT_LIVE_DREAM),
         _ => None,
     }
 }
@@ -1429,9 +1443,10 @@ impl Vars<'_> {
 pub fn offered_placeholders(action: &str) -> &'static [&'static str] {
     match action {
         AGENT_SPAWN => &["{prompt}"],
-        // The union: a live session (and its summariser) is a mesa record
-        // *and* carries a prompt.
-        LIVE_AGENT | LIVE_SUMMARY => &["{id}", "{name}", "{prompt}"],
+        // The union: a live session (and its summariser, and the dream pass
+        // that borrows the newest session's id) is a mesa record *and*
+        // carries a prompt.
+        LIVE_AGENT | LIVE_SUMMARY | LIVE_DREAM => &["{id}", "{name}", "{prompt}"],
         _ => &["{id}", "{name}"],
     }
 }
@@ -3557,6 +3572,10 @@ mod tests {
         assert_eq!(settings[4].action, LIVE_SUMMARY);
         assert_eq!(settings[4].default, DEFAULT_LIVE_SUMMARY);
         assert_eq!(settings[4].placeholders, ["{id}", "{name}", "{prompt}"]);
+        // The dream pass (mesa task 1152) is the sixth, same union.
+        assert_eq!(settings[5].action, LIVE_DREAM);
+        assert_eq!(settings[5].default, DEFAULT_LIVE_DREAM);
+        assert_eq!(settings[5].placeholders, ["{id}", "{name}", "{prompt}"]);
     }
 
     #[test]

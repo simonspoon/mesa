@@ -3631,8 +3631,11 @@ pub struct LiveSummary {
 /// stamped, and drops out of the prompt and the default list. `decayed` is the
 /// automatic kind — an entry no conversation has used for
 /// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `deleted` an explicit
-/// one, and `replaced` is reserved for a future rewrite-as-new-row path (a
-/// replace today updates the row in place, keeping its provenance).
+/// one, `merged` a source folded into another row by a dream pass (mesa task
+/// 1152, `merged_into` naming the row that replaced it), and `replaced` is
+/// reserved for a future rewrite-as-new-row path (a replace today updates the
+/// row in place, keeping its provenance). Any retirement is undone by
+/// `Store::restore_notebook_entry`.
 ///
 /// ts-exported: the Settings page's Memory tab lists and edits these over
 /// `/api/live/memory`. Its sibling [`LiveMemoryHit`] is not — search is
@@ -3657,8 +3660,14 @@ pub struct LiveNotebookEntry {
     #[ts(type = "number | null")]
     pub last_used_session_id: Option<i64>,
     pub retired_at: Option<String>,
-    /// `decayed` | `deleted` | `replaced`, null while the entry is active.
+    /// `decayed` | `deleted` | `replaced` | `merged`, null while the entry is
+    /// active.
     pub retired_reason: Option<String>,
+    /// For a `merged` retirement, the entry this one was folded into
+    /// (`Store::merge_notebook_entries`); null otherwise. Bounded, so it
+    /// stays in the `--quiet` shape.
+    #[ts(type = "number | null")]
+    pub merged_into: Option<i64>,
 }
 
 /// One match from `mesa live memory search` (mesa task 1147): a row of the

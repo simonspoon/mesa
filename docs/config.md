@@ -1,6 +1,6 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly five places. Each one's command line
+mesa starts a coding agent from exactly six places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
 persona and the slash command can all change without rebuilding mesa:
 
@@ -11,6 +11,7 @@ persona and the slash command can all change without rebuilding mesa:
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `claude --bg --agent swe -- {prompt}` |
 | `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent mesa-live --name {name} -- {prompt}` |
 | `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
+| `live-dream` | `mesa live memory dream` — the explicit, between-conversations pass that tidies the live notebook: merges duplicate entries, deletes superseded ones, one guarded command at a time (mesa task 1152, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
 
 The defaults are **plain, editable command lines** (mesa task 1141): the
 program and the agent are both spelled out, so a user who wants a different
@@ -26,7 +27,8 @@ from the vocabulary (see *Retired placeholders* below).
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
     "agent-spawn":    "claude --bg -- {prompt}",
     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
-    "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}"
+    "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}",
+    "live-dream":     "claude --bg --agent swe --name {name} -- {prompt}"
   }
 }
 ```
@@ -59,6 +61,16 @@ it was about. Like `live-agent`'s, that prompt is a library item when forked
 summariser by name (`docs/library.md`) — and a replacement template's job is the same as
 `live-agent`'s: start something that will read `{prompt}` and do what it
 says.
+
+`live-dream` (mesa task 1152) is the same shape once more, for the third
+short-lived job: `mesa live memory dream` spawns it **between**
+conversations, never from a start or a stop, to tidy the live notebook —
+merge entries that say the same thing, delete what a newer entry supersedes,
+one guarded command at a time (`docs/live.md`, "Dreaming"). `{prompt}` is
+`core::live::dream_prompt` (the instructions, the project a contradiction
+task should land in, then the active notebook), `{id}` is the newest
+conversation's id and `{name}` is the literal `live memory dream`. It runs in
+that newest conversation's project folder exactly as the summariser would.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
 for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
@@ -118,9 +130,9 @@ knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{id}` | watchers, `live-agent`, `live-summary` | the task id / inbox item id / live session id |
-| `{name}` | watchers, `live-agent`, `live-summary` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), or the live session's own name |
-| `{prompt}` | `agent-spawn`, `live-agent`, `live-summary` | the POST body's `prompt` (`agent-spawn`; absent when omitted) / the live agent's or summariser's instruction block, always present |
+| `{id}` | watchers, `live-agent`, `live-summary`, `live-dream` | the task id / inbox item id / live session id (for `live-dream`, the newest session's; empty on an install that has never held one) |
+| `{name}` | watchers, `live-agent`, `live-summary`, `live-dream` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), the live session's own name, or the literal `live memory dream` |
+| `{prompt}` | `agent-spawn`, `live-agent`, `live-summary`, `live-dream` | the POST body's `prompt` (`agent-spawn`; absent when omitted) / the live agent's, summariser's or dream pass's instruction block, always present |
 
 ### Quoted for where it sits
 

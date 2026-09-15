@@ -125,7 +125,20 @@
 #      with both halves of the security boundary in default mode AND under
 #      `--lan` (the Settings posture: `require_agent_access`, reads
 #      included), and `GET /api/live` carrying no notebook (the 2s poll stays
-#      bounded).
+#      bounded); then the dream pass (mesa task 1152): `merge` retiring its
+#      sources as `merged` with `merged_into` pointing at the new row, which
+#      carries the OLDEST source's provenance, both text bodies still
+#      searchable, its refusals (one id, a repeated id, a retired or unknown
+#      id, an empty body, no --ids) touching nothing, its budget and
+#      removal guards judged on the NET words, `restore` un-retiring a
+#      merged or deleted row (retirement fields cleared, nothing else moved)
+#      and refused past the budget or on an active row, the `--quiet` key
+#      set on both, and `dream` — `--quiet` a usage error, `{spawned:
+#      false}` under two entries, `conflict` while a session is live (never
+#      spawning), the built-in `live-dream` template's argv with
+#      DREAM_PROMPT plus every active entry line and no retired one in the
+#      workspace cwd, and a configured template receiving `{prompt}`
+#      byte-identical and `{id}` as the newest session's.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -2745,6 +2758,274 @@ ok "--lan: all four /api/live/memory verbs present and relaxed (DNS Host 403, IP
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true
 LAN_PID=
+
+# ---- the dream pass (mesa task 1152): merge, restore, dream ----
+#
+# The active notebook is empty here (everything above was deleted or has
+# decayed) and no session is live. `$D1` is a row section 14 deleted, so it
+# is the retired id a merge must refuse.
+
+# `dream` takes no --quiet (like `search`), and with fewer than two active
+# entries it spawns nothing and says so on stdout, exit 0.
+run 2 "$MESA" live memory dream --quiet
+[ -z "$STDOUT" ] || fail "live memory dream --quiet: stdout must be empty on a usage error"
+[ "$(jqe .error.code)" = "usage" ] || fail "live memory dream --quiet: error.code"
+rm -f "$STUB_DIR/last-argc"
+run 0 "$MESA" live memory dream
+[ "$(jqs .spawned)" = "false" ] || fail "dream over an empty notebook: spawned must be false (got $STDOUT)"
+grep -q "at least two" <<<"$(jqs .reason)" || fail "dream: the reason must name the two-entry floor (got $STDOUT)"
+[ ! -e "$STUB_DIR/last-argc" ] || fail "dream must not spawn anything with fewer than two entries"
+run 0 "$MESA" live memory add "MERGE-A: prefers short spoken replies."
+MA=$(jqs .id)
+MA_SOURCE=$(jqs .source_session_id)
+run 0 "$MESA" live memory dream
+[ "$(jqs .spawned)" = "false" ] || fail "dream over one entry: spawned must be false"
+grep -q "1 active entry;" <<<"$(jqs .reason)" || fail "dream: the reason counts the entries (got $STDOUT)"
+[ ! -e "$STUB_DIR/last-argc" ] || fail "dream must not spawn anything with one entry"
+ok "live memory dream: --quiet is a usage error; under two active entries prints {spawned: false, reason} and spawns nothing"
+
+# A newer session, so the second source is attributed to a different
+# conversation than the first — which is what makes the provenance
+# assertion on the merged row mean something.
+run 0 "$MESA" live start --no-agent
+run 0 "$MESA" live stop >/dev/null
+run 0 "$MESA" live memory add "MERGE-B: wants replies kept brief when spoken."
+MB=$(jqs .id)
+[ "$(jqs .source_session_id)" != "$MA_SOURCE" ] || fail "merge setup: the two sources must come from different sessions"
+run 0 "$MESA" live memory add "KEEP-C: task 42 holds the roadmap."
+MC=$(jqs .id)
+
+# ---- merge: the refusals, none of which touch a row ----
+run 1 "$MESA" live memory merge --ids "$MA" one bullet
+[ "$(jqe .error.code)" = "validation" ] || fail "merge with one id: validation"
+grep -q "at least two" <<<"$STDERR" || fail "merge with one id must name the rule (got $STDERR)"
+run 1 "$MESA" live memory merge --ids "$MA,$MA" one bullet
+[ "$(jqe .error.code)" = "validation" ] || fail "merge with a repeated id: validation (one id is one id)"
+run 1 "$MESA" live memory merge --ids "$MA,$D1" one bullet
+[ "$(jqe .error.code)" = "not_found" ] || fail "merge naming a retired id: not_found"
+run 1 "$MESA" live memory merge --ids "$MA,999999" one bullet
+[ "$(jqe .error.code)" = "not_found" ] || fail "merge naming an unknown id: not_found"
+run 1 "$MESA" live memory merge --ids "$MA,$MB" ""
+[ "$(jqe .error.code)" = "validation" ] || fail "merge into an empty body: validation"
+run 2 "$MESA" live memory merge --ids "$MA,$MB"
+[ "$(jqe .error.code)" = "usage" ] || fail "merge with no text: usage"
+run 2 "$MESA" live memory merge "$MA,$MB" one bullet
+[ "$(jqe .error.code)" = "usage" ] || fail "merge without --ids: usage (the ids are a flag, before the text)"
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | join(",")')" = "$MA,$MB,$MC" ] || fail "a refused merge must touch nothing (got $(jqs 'map(.id)'))"
+ok "live memory merge: one id, a repeated id and an empty body are validation; a retired or unknown id is not_found; no --ids or no text is usage; nothing is touched"
+
+# ---- merge: the round trip ----
+run 0 "$MESA" live memory merge --ids "$MB,$MA" MERGED-AB: prefers short spoken replies.
+MM=$(jqs .id)
+[ "$(jqs .body)" = "MERGED-AB: prefers short spoken replies." ] ||
+  fail "merge: trailing words are joined into the new body"
+[ "$(jqs .retired_at)" = "null" ] && [ "$(jqs .merged_into)" = "null" ] || fail "the merged row is active"
+[ "$(jqs .source_session_id)" = "$MA_SOURCE" ] ||
+  fail "the merged row must carry the EARLIEST source's source_session_id ($MA_SOURCE), got $(jqs .source_session_id)"
+[ "$(jqs .last_used_session_id)" != "null" ] || fail "the merged row's last use is stamped like an add's"
+for id in "$MA" "$MB"; do
+  run 0 "$MESA" live memory show "$id"
+  [ "$(jqs .retired_reason)" = "merged" ] || fail "source #$id must be retired as merged (got $(jqs .retired_reason))"
+  [ "$(jqs .retired_at)" != "null" ] || fail "source #$id: retired_at stamped"
+  [ "$(jqs .merged_into)" = "$MM" ] || fail "source #$id must point at the merged row #$MM (got $(jqs .merged_into))"
+done
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | join(",")')" = "$MC,$MM" ] || fail "after the merge the active list is the survivor and the merged row (got $(jqs 'map(.id)'))"
+run 0 "$MESA" live memory list --all
+[ "$(jqs 'map(select(.retired_reason == "merged")) | map(.id) | join(",")')" = "$MA,$MB" ] ||
+  fail "list --all must show both sources as merged"
+[ "$(jqs 'map(select(.id == '"$MM"'))[0].body')" = "MERGED-AB: prefers short spoken replies." ] ||
+  fail "list --all must show the merged row too"
+run 0 "$MESA" live memory search MERGED-AB
+[ "$(jqs 'map(select(.kind == "note"))[0].ref_id')" = "$MM" ] || fail "the merged text must be indexed in the archive"
+run 0 "$MESA" live memory search brief
+[ "$(jqs 'map(select(.kind == "note"))[0].ref_id')" = "$MB" ] || fail "a merged source's body must stay searchable"
+run 1 "$MESA" live memory merge --ids "$MA,$MM" again
+[ "$(jqe .error.code)" = "not_found" ] || fail "a merged source is archive: merging it again is not_found"
+ok "live memory merge: the sources are retired as merged pointing at the new row, which carries the oldest source's provenance; list --all shows what became what; both old and new text stay searchable"
+
+# ---- restore: the undo ----
+run 1 "$MESA" live memory restore "$MM"
+[ "$(jqe .error.code)" = "validation" ] || fail "restoring an active row: validation"
+grep -q "is not retired" <<<"$STDERR" || fail "restoring an active row must say so (got $STDERR)"
+run 1 "$MESA" live memory restore 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "restoring an unknown id: not_found"
+run 0 "$MESA" live memory restore "$MA"
+[ "$(jqs .id)" = "$MA" ] || fail "restore echoes the row"
+[ "$(jqs .retired_at)" = "null" ] && [ "$(jqs .retired_reason)" = "null" ] && [ "$(jqs .merged_into)" = "null" ] ||
+  fail "restore must clear retired_at, retired_reason and merged_into (got $STDOUT)"
+[ "$(jqs .body)" = "MERGE-A: prefers short spoken replies." ] || fail "restore: the body is untouched"
+[ "$(jqs .source_session_id)" = "$MA_SOURCE" ] || fail "restore: provenance is untouched"
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | join(",")')" = "$MA,$MC,$MM" ] ||
+  fail "a restored source is active again beside the merged row (got $(jqs 'map(.id)'))"
+run 0 "$MESA" live memory restore "$MB" --quiet
+[ "$(jqs 'has("body")')" = "false" ] || fail "restore --quiet drops body"
+[ "$(jqs 'has("merged_into")')" = "true" ] && [ "$(jqs .merged_into)" = "null" ] ||
+  fail "restore --quiet keeps merged_into (a bounded pointer), cleared"
+run 1 "$MESA" live memory restore "$MB"
+[ "$(jqe .error.code)" = "validation" ] || fail "restoring a row twice: validation"
+# A deleted row restores the same way as a merged one.
+run 0 "$MESA" live memory delete "$MB" >/dev/null
+run 0 "$MESA" live memory restore "$MB"
+[ "$(jqs .retired_reason)" = "null" ] || fail "a deleted row restores too"
+ok "live memory restore: un-retires a merged or deleted row (retirement fields cleared, body and provenance untouched), --quiet drops body alone; an active row is validation, an unknown id not_found"
+
+# ---- restore past the budget is refused ----
+# Retire MB (7 words), fill the notebook to exactly the budget with 30-word
+# entries (30 is at most 30% of any notebook at or above the 100-word floor,
+# so every one of them can be deleted again afterwards), then the restore
+# would land at 507.
+run 0 "$MESA" live memory delete "$MB" >/dev/null
+run 0 "$MESA" live memory list
+CUR=$(jqs '[.[].body | split(" ") | length] | add')
+FILLERS=()
+while [ "$CUR" -le $((NB_BUDGET - 30)) ]; do
+  run 0 "$MESA" live memory add "$(words 30)"
+  FILLERS+=("$(jqs .id)")
+  CUR=$((CUR + 30))
+done
+if [ "$CUR" -lt "$NB_BUDGET" ]; then
+  run 0 "$MESA" live memory add "$(words $((NB_BUDGET - CUR)))"
+  FILLERS+=("$(jqs .id)")
+fi
+run 0 "$MESA" live memory list
+[ "$(jqs '[.[].body | split(" ") | length] | add')" = "$NB_BUDGET" ] ||
+  fail "restore setup: the notebook must sit at exactly $NB_BUDGET words (got $(jqs '[.[].body | split(" ") | length] | add'))"
+run 1 "$MESA" live memory restore "$MB"
+[ "$(jqe .error.code)" = "validation" ] || fail "a restore past the budget: validation"
+grep -q "$((NB_BUDGET + 7)) words" <<<"$STDERR" || fail "a refused restore names the resulting count (got $STDERR)"
+grep -q "$NB_BUDGET-word" <<<"$STDERR" || fail "a refused restore names the budget"
+run 0 "$MESA" live memory show "$MB"
+[ "$(jqs .retired_reason)" = "deleted" ] || fail "a refused restore must change nothing"
+for id in "${FILLERS[@]}"; do
+  run 0 "$MESA" live memory delete "$id" >/dev/null
+done
+ok "live memory restore: refused with the budget message when the row would not fit, and nothing changes"
+
+# ---- merge --quiet, and the two guards judged on the NET words ----
+run 0 "$MESA" live memory merge --quiet --ids "$MA,$MM" MERGED-2: prefers short spoken replies.
+M2=$(jqs .id)
+[ "$(jqs 'has("body")')" = "false" ] || fail "merge --quiet drops body"
+[ "$(jqs 'has("merged_into")')" = "true" ] || fail "merge --quiet keeps merged_into"
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | join(",")')" = "$MC,$M2" ] || fail "after the second merge: the survivor and the new row (got $(jqs 'map(.id)'))"
+# 11 words (MC 6 + M2 5) plus three 40-word entries = 131, above the floor.
+run 0 "$MESA" live memory add "$(words 40)"
+X1=$(jqs .id)
+run 0 "$MESA" live memory add "$(words 40)"
+X2=$(jqs .id)
+run 0 "$MESA" live memory add "$(words 40)"
+X3=$(jqs .id)
+# Folding two 40s into 5 removes 75 of 131 (57%): refused on the NET words.
+run 1 "$MESA" live memory merge --ids "$X1,$X2" "$(words 5)"
+[ "$(jqe .error.code)" = "validation" ] || fail "a merge removing 57% of the notebook: validation"
+grep -q "75 of the notebook's 131 words" <<<"$STDERR" ||
+  fail "the merge removal guard must name the NET words removed and held (got $STDERR)"
+run 0 "$MESA" live memory show "$X1"
+[ "$(jqs .retired_at)" = "null" ] || fail "a refused merge must not retire a source"
+# The budget: fill to exactly $NB_BUDGET with 30-word entries (deletable
+# again, as above), then folding the 11 words of MC and M2 into 12 would
+# land at 501: refused, naming the count.
+FILLERS=()
+CUR=131
+while [ "$CUR" -le $((NB_BUDGET - 30)) ]; do
+  run 0 "$MESA" live memory add "$(words 30)"
+  FILLERS+=("$(jqs .id)")
+  CUR=$((CUR + 30))
+done
+if [ "$CUR" -lt "$NB_BUDGET" ]; then
+  run 0 "$MESA" live memory add "$(words $((NB_BUDGET - CUR)))"
+  FILLERS+=("$(jqs .id)")
+fi
+run 1 "$MESA" live memory merge --ids "$MC,$M2" "$(words 12)"
+[ "$(jqe .error.code)" = "validation" ] || fail "a merge past the budget: validation"
+grep -q "$((NB_BUDGET + 1)) words" <<<"$STDERR" || fail "the merge budget guard names the resulting count (got $STDERR)"
+run 0 "$MESA" live memory show "$MC"
+[ "$(jqs .retired_at)" = "null" ] || fail "a merge refused by the budget must not retire a source"
+for id in "${FILLERS[@]}"; do
+  run 0 "$MESA" live memory delete "$id" >/dev/null
+done
+# Folding two 40s into 50 removes 30 of 131 (23%): allowed, landing at 101.
+run 0 "$MESA" live memory merge --ids "$X1,$X2" "$(words 50)"
+Y=$(jqs .id)
+run 0 "$MESA" live memory list
+[ "$(jqs '[.[].body | split(" ") | length] | add')" = "101" ] || fail "after the allowed merge: 101 words"
+ok "live memory merge: --quiet drops body alone; the removal guard and the budget are judged on the net words the merge would leave, naming the numbers"
+
+# Back below the floor, then clear to the two survivors for the spawn.
+run 0 "$MESA" live memory replace "$Y" "$(words 25)" >/dev/null
+for id in "$X3" "$Y"; do
+  run 0 "$MESA" live memory delete "$id" >/dev/null
+done
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | join(",")')" = "$MC,$M2" ] || fail "dream setup: exactly the two survivors (got $(jqs 'map(.id)'))"
+
+# ---- dream: conflict while a conversation is live, and nothing spawned ----
+rm -f "$STUB_DIR/last-argc"
+run 0 "$MESA" live start --no-agent
+NEWEST=$(jqs .id)
+run 1 "$MESA" live memory dream
+[ "$(jqe .error.code)" = "conflict" ] || fail "dream while a session is live: conflict (got $STDERR)"
+grep -q "between conversations" <<<"$STDERR" || fail "dream's conflict must say it runs between conversations (got $STDERR)"
+[ ! -e "$STUB_DIR/last-argc" ] || fail "dream must not spawn while a session is live"
+run 0 "$MESA" live stop >/dev/null
+ok "live memory dream: conflict while a conversation is live, and spawns nothing"
+
+# ---- dream: the spawn through the built-in live-dream template ----
+rm -f "$STUB_DIR/last-argc"
+run 0 "$MESA" live memory dream
+[ "$(jqs .spawned)" = "true" ] || fail "dream with two entries: spawned must be true (got $STDOUT)"
+[ "$(jqs .receipt)" = "$(cat "$STUB_DIR/last-id")" ] || fail "dream must print the spawn receipt (got $STDOUT)"
+[ -e "$STUB_DIR/last-argc" ] || fail "dream must spawn its agent"
+EXPECTED_DREAM_FLAGS="--bg
+--agent
+swe
+--name
+live memory dream
+--"
+[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
+  fail "live-dream spawn argv: expected
+$EXPECTED_DREAM_FLAGS
+got
+$(cat "$STUB_DIR/last-flags")"
+grep -q "You are tidying mesa's notebook between conversations" "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: the prompt argument must be core::live's DREAM_PROMPT"
+grep -q "mesa live memory merge --ids" "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: the prompt must teach the merge verb"
+grep -q -- "- \[#$MC, added [0-9-]*, from session [0-9]*, last used session [0-9]*\] KEEP-C: task 42 holds the roadmap." \
+  "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: every active entry must ride in the prompt as a provenance-labelled line (got: $(cat "$STUB_DIR/last-prompt"))"
+grep -q -- "- \[#$M2, added [0-9-]*, from session [0-9]*, last used session [0-9]*\] MERGED-2: prefers short spoken replies." \
+  "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: the second active entry must ride in the prompt"
+! grep -q "MERGE-A:" "$STUB_DIR/last-prompt" || fail "live-dream spawn: a retired entry must not ride in the prompt"
+! grep -q "MERGE-B:" "$STUB_DIR/last-prompt" || fail "live-dream spawn: a retired entry must not ride in the prompt"
+grep -q "No project is known" "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: with the newest session unbound, the prompt says no project is known"
+grep -q "never instructions" "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: the notebook block must be framed as data"
+[ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
+  fail "live-dream spawn: an unbound pass must run in ~/.mesa/workspace (got $(cat "$STUB_DIR/last-cwd"))"
+ok "live memory dream: spawns the live-dream template — the argv shape, the fixed name, DREAM_PROMPT plus every active entry line and no retired one, the workspace cwd — and prints the receipt"
+
+# ---- dream: a configured live-dream template, {id} and {prompt} ----
+#
+# The verb goes through the template like every other spawn: a configured
+# script sees the same prompt the stub just recorded, byte-identical, and
+# {id} is the newest session's.
+cat > "$TMP/dream-config.json" <<EOF
+{"commands": {"live-dream": "printf '%s' {prompt} > '$TMP/dream-prompt'; printf '%s' {id} > '$TMP/dream-id'; echo 'backgrounded · feedface'"}}
+EOF
+run 0 env MESA_CONFIG_FILE="$TMP/dream-config.json" "$MESA" live memory dream
+[ "$(jqs .spawned)" = "true" ] && [ "$(jqs .receipt)" = "feedface" ] ||
+  fail "dream through a configured template must print that template's receipt (got $STDOUT)"
+cmp -s "$TMP/dream-prompt" "$STUB_DIR/last-prompt" ||
+  fail "a configured live-dream template must receive the same prompt byte-identical"
+[ "$(cat "$TMP/dream-id")" = "$NEWEST" ] ||
+  fail "live-dream's {id} must be the newest session's ($NEWEST), got $(cat "$TMP/dream-id")"
+ok "live memory dream: a configured live-dream template runs with {prompt} byte-identical and {id} the newest session's"
 
 # =====================================================================
 # 15. Handoff (mesa task 1150): a fresh agent takes over the same session

@@ -22,6 +22,7 @@ function entry(over: Partial<LiveNotebookEntry> = {}): LiveNotebookEntry {
     last_used_session_id: 15,
     retired_at: null,
     retired_reason: null,
+    merged_into: null,
     ...over,
   }
 }

@@ -1800,7 +1800,7 @@ EXAMPLES
     /// A session's remembered summary (mesa task 921) — set/show/list
     #[command(subcommand)]
     Summary(LiveSummaryCmd),
-    /// The notebook and the archive (mesa task 1147) — list/show/add/replace/delete/touch/search
+    /// The notebook and the archive (mesa task 1147) — list/show/add/replace/delete/touch/search, plus merge/restore/dream (mesa task 1152)
     #[command(subcommand)]
     Memory(LiveMemoryCmd),
     /// The conversation's whiteboard (mesa task 1071) — push/show/list/clear/keep
@@ -2108,6 +2108,54 @@ EXAMPLES
         #[arg(long, value_name = "N", default_value_t = 20)]
         limit: i64,
     },
+    /// Fold two or more entries into one new entry; prints the new record
+    ///
+    /// The dream pass's edit (mesa task 1152). Every source is retired as
+    /// `merged` with `merged_into` pointing at the new row, which takes the
+    /// oldest source's provenance. Judged like a replace on the notebook it
+    /// would leave: `validation` past the budget, or when the net words
+    /// removed exceed the 30% one edit may (once it holds 100). Put --ids
+    /// and --quiet BEFORE the text, exactly as `add` requires.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live memory merge --ids 3,7 Prefers short spoken replies, no lists read aloud.
+  mesa live memory merge --quiet --ids 3,7 \"Prefers short spoken replies.\"")]
+    Merge {
+        /// The entry ids to fold together, comma-separated (at least two)
+        /// One value, split on commas — `num_args` stays 1 so the flag never
+        /// swallows the text that follows it.
+        #[arg(long, value_name = "ID,ID,...", value_delimiter = ',', required = true)]
+        ids: Vec<i64>,
+        /// The merged entry's text (everything after the flags); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full (BEFORE the text)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Un-retire one entry — the undo for a delete, a decay or a merge; prints the record
+    ///
+    /// `validation` when the entry is active, or when restoring it would take
+    /// the notebook over its budget. Restoring a merge's source leaves the
+    /// merged entry active too; delete whichever should go.
+    Restore {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Spawn the dream pass: an agent that tidies the notebook between conversations
+    ///
+    /// Runs the `live-dream` config template (`docs/config.md`) with
+    /// `core::live::DREAM_PROMPT` and the active notebook, in the newest
+    /// conversation's folder. The agent merges duplicates and deletes what a
+    /// newer entry supersedes, one guarded command at a time; it never adds
+    /// a fact. `conflict` while a conversation is live — a dream pass runs
+    /// only between them. With fewer than two active entries nothing is
+    /// spawned and `{"spawned": false, "reason": ...}` is printed. CLI-only,
+    /// and takes no --quiet.
+    Dream,
 }
 
 #[derive(Subcommand)]
@@ -4895,7 +4943,73 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
         LiveMemoryCmd::Search { words, limit } => {
             print_json(&store.search_live_memory(&words.join(" "), limit)?);
         }
+        LiveMemoryCmd::Merge { ids, text, quiet } => {
+            print_notebook_entry(&store.merge_notebook_entries(&ids, &text.join(" "))?, quiet);
+        }
+        LiveMemoryCmd::Restore { id, quiet } => {
+            print_notebook_entry(&store.restore_notebook_entry(id)?, quiet);
+        }
+        LiveMemoryCmd::Dream => spawn_live_dream(store)?,
     }
+    Ok(())
+}
+
+/// `mesa live memory dream` (mesa task 1152): spawns the agent that tidies
+/// the notebook, through the `live-dream` template. Explicit-trigger only —
+/// no timer, no watcher — and only between conversations: with a session
+/// live it is `conflict`, since the notebook is that conversation's prompt
+/// input and the two would edit it under each other. Fewer than two active
+/// entries is nothing to merge, so nothing is spawned and the reason is
+/// printed rather than an error. The pass belongs to no conversation, so it
+/// borrows the newest one's folder (through [`live_agent_dir`], exactly as
+/// the summariser does) and passes its id as `{id}`; on an install that has
+/// never held one it runs in the workspace with `{id}` empty. Unlike the
+/// summariser this is not best-effort: the person asked for it, so a failed
+/// spawn is `unavailable`, exit 1.
+fn spawn_live_dream(store: &mut Store) -> Result<()> {
+    if let Some(session) = store.current_live_session()? {
+        return Err(Error::Conflict(format!(
+            "live session {} is live; a dream pass runs between conversations — end it first",
+            session.id
+        )));
+    }
+    let active = store.list_notebook(false)?.len();
+    if active < 2 {
+        print_json(&serde_json::json!({
+            "spawned": false,
+            "reason": format!(
+                "the notebook holds {active} active {}; a dream pass needs at least two",
+                if active == 1 { "entry" } else { "entries" }
+            ),
+        }));
+        return Ok(());
+    }
+    let latest = store.latest_live_session()?;
+    let (dir, session_id, project_id) = match &latest {
+        Some(s) => (
+            live_agent_dir(store, s.project_id, s.id)?.0,
+            Some(s.id),
+            s.project_id,
+        ),
+        None => (
+            config::workspace_dir().to_string_lossy().into_owned(),
+            None,
+            None,
+        ),
+    };
+    let prompt = live::dream_prompt(store, project_id);
+    let prompts = library::prompts(store)
+        .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))?;
+    let receipt = agents::spawn_bg(
+        config::LIVE_DREAM,
+        &dir,
+        session_id,
+        Some("live memory dream"),
+        Some(&prompt),
+        &prompts,
+    )
+    .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))?;
+    print_json(&serde_json::json!({ "spawned": true, "receipt": receipt }));
     Ok(())
 }
 
@@ -6430,6 +6544,7 @@ mod tests {
             last_used_session_id: Some(15),
             retired_at: None,
             retired_reason: None,
+            merged_into: None,
         }
     }
 
@@ -6448,6 +6563,9 @@ mod tests {
                 "last_used_session_id",
                 "retired_at",
                 "retired_reason",
+                // A bounded pointer (mesa task 1152): kept, like `artifact` on
+                // a task.
+                "merged_into",
             ]),
             "LiveNotebookEntry gained/lost a field: decide whether it belongs in \
              the --quiet shape before updating this list",

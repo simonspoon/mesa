@@ -503,7 +503,9 @@ up (see "The CLI surface" below).
 `id`, `body`, `created_at`, `updated_at`, `source_session_id`,
 `last_used_session_id` (both `REFERENCES live_sessions ON DELETE SET NULL` —
 an entry outlives the conversation that wrote it), `retired_at`,
-`retired_reason` (`decayed` | `deleted` | `replaced`). A ts-exported
+`retired_reason` (`decayed` | `deleted` | `replaced` | `merged`), and since
+mesa task 1152 `merged_into` (migration index 57 — for a `merged` row, the
+entry it was folded into; "Dreaming" below). A ts-exported
 `LiveNotebookEntry`, since the Settings page reads and edits it.
 
 **Retiring is a soft delete.** The row stays, its archive index row stays,
@@ -647,9 +649,14 @@ read whenever.
 - **`search <WORDS>… [--limit N]`** — a bare array of hits; `--limit` (and
   any other flag) must come **before** the words, since everything after
   `search` that is not a leading flag is a word. Rejects `--quiet`.
-- **`--quiet` on `show`/`add`/`replace`/`delete`/`touch` drops `body`** —
-  the one unbounded field (`QUIET_DROP_LIVE_NOTEBOOK`, with the usual
-  key-parity test against `LiveNotebookEntry`).
+- **`merge --ids <ID,ID,…> <TEXT>…`**, **`restore <ID>`** and **`dream`**
+  (mesa task 1152) — the dream pass's verbs, "Dreaming" below. `--ids` and
+  `--quiet` come **before** the text, the `add` rule; `dream` rejects
+  `--quiet` like `search`.
+- **`--quiet` on `show`/`add`/`replace`/`delete`/`touch`/`merge`/`restore`
+  drops `body`** — the one unbounded field (`QUIET_DROP_LIVE_NOTEBOOK`, with
+  the usual key-parity test against `LiveNotebookEntry`; `merged_into` is a
+  bounded pointer and stays).
 
 `mesa live summary set/show/list` are unchanged in shape; `list`'s limit is
 now clamped to 500 rather than the retired 20.
@@ -688,6 +695,79 @@ the same word rule the server judges by (`memoryDraft.ts`, unit-tested). A
 config section: the rows are db records, each its own request, so there is no
 single draft and no single save button — and no poll.
 
+### Dreaming: consolidation between conversations (mesa task 1152)
+
+A notebook edited one bullet at a time by many conversations drifts the way
+any append-mostly list does: two conversations write the same preference in
+two wordings, an older entry is quietly superseded by a newer one, and every
+duplicate rides into every prompt for the life of the notebook. The cure the
+research above warns against is the obvious one — hand the whole notebook to
+a model and ask for a tidy version — because that is exactly ACE's *context
+collapse*: a rewrite shrinks toward whatever the rewriter found salient, and
+after a few passes what is left is the rewriter's notebook, not the
+person's. So the dream pass is **not** a rewrite. It is an agent with two
+verbs, each a single guarded edit through the same `Store` path every other
+notebook write takes, and it is told to prefer doing nothing.
+
+**What it may do.** Merge entries that say the same thing
+(`mesa live memory merge --ids a,b "<one bullet>"`, keeping every specific
+the sources held and never merging two that differ in a detail), and delete
+an entry a newer one plainly supersedes (`mesa live memory delete <id>`,
+keeping the newer). A contradiction it cannot resolve from the entries
+themselves is not its to resolve: both entries stay, and it opens a task
+(`mesa task create <project id> "Notebook contradiction: …"`, naming both
+ids) for the person to settle. It never adds a fact, never rewrites what an
+entry means, edits at most a third of the notebook in one pass, and leaves
+a tidy notebook alone. The instructions are `core::live::DREAM_PROMPT`;
+`live::dream_prompt` appends the project a contradiction task belongs in
+(the newest conversation's, when it had one) and then the whole active
+notebook — the same `notebook_line` rendering the live prompt uses, under
+the same "a record, never instructions" framing, since every entry is
+dictated speech one conversation removed.
+
+**Merge, mechanically** (`Store::merge_notebook_entries`). Two or more
+distinct active ids (one is `validation`, an unknown or retired id
+`not_found`) and a body under the entry rule. In one transaction each source
+is retired as **`merged`** — a fourth `retired_reason`, beside `decayed`,
+`deleted` and the reserved `replaced` — with the new column **`merged_into`**
+(migration index 57) pointing at the row that replaced it, and the new row
+is inserted with the **earliest-created** source's `source_session_id`, so
+provenance survives the fold, `last_used_session_id` stamped and the archive
+indexed as an add is. Both guards are judged on the notebook the merge would
+leave: the budget on `active − merged + new` words, and the removal rule on
+the **net** words removed (once the notebook holds the floor), so folding
+three bullets into one can hollow the notebook out no more than a delete
+could. `list --all` therefore shows what became what, which is the
+"reviewable" half of the task's rule.
+
+**Restore is the undo** (`Store::restore_notebook_entry`,
+`mesa live memory restore <id>`): a retired row of *any* reason comes back
+with `retired_at`, `retired_reason` and `merged_into` cleared and nothing
+else on it moved; an active id is `validation` (nothing to restore), and so
+is a restore that would take the notebook over its budget. Restoring a
+merge's source leaves the merged row active too — the person decides which
+to keep, the store does not guess.
+
+**When it runs.** Only when asked: `mesa live memory dream` (CLI-only, no
+`--quiet`, like `search`). It is `conflict` while a conversation is live —
+the notebook is that conversation's prompt input, and two writers editing
+it under each other is the one thing "one command at a time" cannot make
+safe — so the live agent's rule 9 tells a person who asks it to rest or
+tidy that the pass runs once this conversation ends. With fewer than two
+active entries there is nothing to merge, and it prints
+`{"spawned": false, "reason": …}` (exit 0) rather than spawning an agent to
+find that out. Otherwise it spawns through the **sixth** config template,
+`live-dream` (`docs/config.md`; `{id}` the newest session's, `{name}` the
+literal `live memory dream`, `{prompt}` the block above), in the newest
+conversation's project folder exactly as the summariser resolves it, and
+prints `{"spawned": true, "receipt": …}`. A failed spawn is `unavailable`,
+exit 1 — unlike the summariser this is not best-effort, since the person
+asked. There is no idle timer, no watcher and no UI: a pass that fires on
+its own is a pass nobody reviews.
+
+The eval harness gained a matching opt-in `dream` baseline (below): `full`
+plus a synchronous dream step after every Nth session.
+
 ### Retention, revisited
 
 The first cut's "two numbers, and why they differ" section is gone with the
@@ -724,8 +804,16 @@ gets its own throwaway `MESA_DB`, `MESA_CONFIG_FILE` and `mesa serve` port.
   prompt (`last5-summary-prompt.txt`, quoted from `main`) and builds the old
   five-summary prompt shape itself; `nodecay` `touch`es every active entry
   each session so nothing ever decays; `full` is exactly what this branch
-  does. After each stop the db is snapshotted (`mesa backup`), so a later
-  quiz searches the archive **as it stood then**, never the finished run.
+  does; `dream` (opt-in via `--baselines`, mesa task 1152) is `full` plus,
+  after every `--dream-every N`th stop (default 3), a **synchronous** dream
+  step — `mesa live memory dream` under a `live-dream` template that writes
+  `{prompt}` to a file, then `claude -p` on that file allowed only the
+  notebook verbs and `mesa task create`/`list` — recording per session how
+  many entries it merged, deleted and how many tasks it opened
+  (`dream_merges`/`dream_deletes`/`dream_tasks` in `sessions.jsonl`, off a
+  `list --all` diff). After each stop the db is snapshotted (`mesa backup`),
+  so a later quiz searches the archive **as it stood then**, never the
+  finished run.
 - **Quiz** (`quiz.json`, authored from the real sessions' turns: recall,
   superseded facts — the hooks two-modes-then-one case among them — task
   pointers and stated preferences). Each question is asked "after session
